@@ -1,0 +1,12 @@
+# Core neural runtime.  All checkpoints are written with safetensors, never pickle.
+torch>=2.1,<3
+safetensors>=0.4,<1
+numpy>=1.24,<3
+Pillow>=10,<13
+pypdf>=4,<7
+imageio>=2.34,<3
+imageio-ffmpeg>=0.5,<1
+soundfile>=0.12,<1
+
+# Optional on supported Windows GPU systems:
+# torch-directml>=0.2.5

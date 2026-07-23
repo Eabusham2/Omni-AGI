@@ -1,0 +1,110 @@
+{
+  "name": "omni-agi-studio",
+  "version": "0.1.0",
+  "description": "A Windows 11 studio for building persistent, adaptive OmniCortex research models.",
+  "main": "out/main/index.js",
+  "author": "Omni-AGI contributors",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "npm run test:node && npm run test:python",
+    "test:node": "vitest run",
+    "test:python": "node scripts/run-python-tests.mjs",
+    "test:python:portable": "python -m unittest discover -s engine/tests -p \"test_*.py\" -v",
+    "test:ui": "npm run build && npm run test:ui:built",
+    "test:ui:built": "playwright test --config playwright.config.ts",
+    "test:watch": "vitest",
+    "build:engine:win": "powershell -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
+    "package:win": "npm run build && npm run build:engine:win && electron-builder --win nsis zip --x64 --publish never",
+    "package:win:arm64": "npm run build && npm run build:engine:win && electron-builder --win nsis zip --arm64 --publish never"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2",
+    "pdf-parse": "^1.1.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@electron-toolkit/preload": "^3.0.2",
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^24.1.0",
+    "@types/pdf-parse": "^1.1.5",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^4.0.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.0.6",
+    "vitest": "^3.2.4"
+  },
+  "build": {
+    "appId": "ai.omniagi.studio",
+    "productName": "Omni AGI Studio",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json",
+      "LICENSE.md",
+      "COMMERCIAL_LICENSE.md",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "extraResources": [
+      {
+        "from": "engine",
+        "to": "engine",
+        "filter": [
+          "**/*",
+          "!tests{,/**/*}",
+          "!**/__pycache__{,/**/*}"
+        ]
+      },
+      {
+        "from": "catalog",
+        "to": "catalog"
+      },
+      {
+        "from": "tools",
+        "to": "tools"
+      },
+      {
+        "from": "engine-dist/omni-engine",
+        "to": "engine-runtime"
+      },
+      {
+        "from": "BitNet-main/LICENSE",
+        "to": "licenses/BitNet-MIT.txt"
+      },
+      {
+        "from": "snntorch-master/LICENSE",
+        "to": "licenses/snnTorch-MIT.txt"
+      },
+      {
+        "from": "ncps-master/LICENSE",
+        "to": "licenses/NCPS-Apache-2.0.txt"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.svg",
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-Windows-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Omni AGI Studio"
+    }
+  }
+}

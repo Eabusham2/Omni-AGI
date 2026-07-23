@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Omni AGI Studio</title>
+  <desc id="desc">A luminous neural core enclosed by three adaptive orbital pathways.</desc>
+  <defs>
+    <radialGradient id="background" cx="34%" cy="22%" r="92%">
+      <stop offset="0" stop-color="#29234a"/>
+      <stop offset=".52" stop-color="#111426"/>
+      <stop offset="1" stop-color="#080b14"/>
+    </radialGradient>
+    <linearGradient id="orbit" x1=".08" y1=".12" x2=".92" y2=".88">
+      <stop offset="0" stop-color="#67e9df"/>
+      <stop offset=".42" stop-color="#9e8cff"/>
+      <stop offset="1" stop-color="#f07ec1"/>
+    </linearGradient>
+    <radialGradient id="core" cx=".36" cy=".28" r=".72">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset=".18" stop-color="#d9d1ff"/>
+      <stop offset=".62" stop-color="#9378ff"/>
+      <stop offset="1" stop-color="#5840b7"/>
+    </radialGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="24" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="rounded">
+      <rect width="1024" height="1024" rx="224"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#rounded)">
+    <rect width="1024" height="1024" fill="url(#background)"/>
+    <circle cx="512" cy="512" r="360" fill="#8b78ff" opacity=".055"/>
+    <circle cx="512" cy="512" r="268" fill="#67e9df" opacity=".035"/>
+
+    <g fill="none" stroke="url(#orbit)" stroke-linecap="round">
+      <ellipse cx="512" cy="512" rx="350" ry="156" stroke-width="34" transform="rotate(-18 512 512)" opacity=".96"/>
+      <ellipse cx="512" cy="512" rx="350" ry="156" stroke-width="30" transform="rotate(102 512 512)" opacity=".82"/>
+      <ellipse cx="512" cy="512" rx="350" ry="156" stroke-width="24" transform="rotate(222 512 512)" opacity=".62"/>
+    </g>
+
+    <g filter="url(#glow)">
+      <circle cx="512" cy="512" r="124" fill="#8f76ff" opacity=".28"/>
+      <circle cx="512" cy="512" r="82" fill="url(#core)"/>
+    </g>
+
+    <g fill="#f4f1ff">
+      <circle cx="268" cy="329" r="24"/>
+      <circle cx="746" cy="335" r="20"/>
+      <circle cx="750" cy="690" r="25"/>
+      <circle cx="283" cy="704" r="18"/>
+    </g>
+    <g fill="#6fe7de">
+      <circle cx="499" cy="174" r="16"/>
+      <circle cx="858" cy="532" r="14"/>
+    </g>
+  </g>
+</svg>

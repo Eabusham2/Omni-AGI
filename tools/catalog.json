@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "tools": [
+    {
+      "id": "windows.files",
+      "label": "Windows files",
+      "description": "List, read, and write absolute paths. Auto reads are contained to the brain-local directory; paths outside it and all writes require one-action approval unless Full Authority is enabled.",
+      "defaultGrant": "ask",
+      "actions": {
+        "list": {
+          "input": { "path": "string" },
+          "output": { "entries": "array" }
+        },
+        "read": {
+          "input": { "path": "string", "maxBytes": "number?" },
+          "output": { "content": "string", "sha256": "string" }
+        },
+        "write": {
+          "input": { "path": "string", "content": "string", "expectedSha256": "string?" },
+          "output": { "sha256": "string", "bytes": "number" }
+        }
+      }
+    },
+    {
+      "id": "windows.powershell",
+      "label": "PowerShell",
+      "description": "Run a PowerShell command with an explicit working directory and timeout.",
+      "defaultGrant": "ask",
+      "actions": {
+        "run": {
+          "input": { "command": "string", "cwd": "string", "timeoutMs": "number?" },
+          "output": { "exitCode": "number", "stdout": "string", "stderr": "string" }
+        }
+      }
+    },
+    {
+      "id": "code.execute",
+      "label": "Code runner",
+      "description": "Run a saved program using a configured local toolchain.",
+      "defaultGrant": "ask",
+      "actions": {
+        "run": {
+          "input": {
+            "language": "string",
+            "entryPath": "string",
+            "arguments": "string[]?",
+            "timeoutMs": "number?"
+          },
+          "output": { "exitCode": "number", "stdout": "string", "stderr": "string" }
+        }
+      }
+    },
+    {
+      "id": "web.search",
+      "label": "Web search",
+      "description": "Search through a configured SearxNG-compatible endpoint.",
+      "defaultGrant": "ask",
+      "actions": {
+        "search": {
+          "input": { "query": "string", "limit": "number?" },
+          "output": { "results": "array" }
+        }
+      }
+    },
+    {
+      "id": "web.fetch",
+      "label": "Web fetch",
+      "description": "Fetch a public HTTPS resource with bounded bytes and redirects.",
+      "defaultGrant": "ask",
+      "actions": {
+        "fetch": {
+          "input": { "url": "string", "maxBytes": "number?" },
+          "output": { "status": "number", "contentType": "string", "content": "string" }
+        }
+      }
+    },
+    {
+      "id": "browser.automation",
+      "label": "Browser automation",
+      "description": "Fetch a public page through SSRF checks, render a script-disabled local snapshot, extract visible text and links, and save a screenshot.",
+      "defaultGrant": "off",
+      "actions": {
+        "task": {
+          "input": { "url": "string", "timeoutMs": "number?" },
+          "output": { "status": "number", "title": "string", "text": "string", "links": "array", "artifactPath": "string" }
+        }
+      }
+    },
+    {
+      "id": "modality.imagine",
+      "label": "Imagination",
+      "description": "Generate image, audio, or video from the current internal idea vector.",
+      "defaultGrant": "auto",
+      "actions": {
+        "generate": {
+          "input": { "modality": "image|audio|video", "settings": "object?" },
+          "output": { "artifactPath": "string", "traceId": "string" }
+        }
+      }
+    },
+    {
+      "id": "agent.fork",
+      "label": "Subagent fork",
+      "description": "Create up to four isolated cognitive branches, run the objective once in each copied neural state, and return inspectable merge candidates.",
+      "defaultGrant": "ask",
+      "actions": {
+        "start": {
+          "input": { "objective": "string", "workers": "number?", "budget": "number?" },
+          "output": { "jobId": "string", "forkIds": "string[]" }
+        }
+      }
+    },
+    {
+      "id": "source.self-modify",
+      "label": "Source evolution",
+      "description": "Fork the source workspace, edit it, run required checks, and produce a promotion candidate.",
+      "defaultGrant": "off",
+      "actions": {
+        "propose": {
+          "input": { "objective": "string", "tests": "string[]?" },
+          "output": { "worktree": "string", "diff": "string", "checks": "array" }
+        },
+        "diff": {
+          "input": { "worktree": "string" },
+          "output": { "status": "string", "diff": "string", "sha256": "string" }
+        },
+        "test": {
+          "input": { "worktree": "string", "tests": "typecheck|unit|build[]?", "timeoutMs": "number?" },
+          "output": { "passed": "boolean", "diffSha256": "string", "checks": "array" }
+        },
+        "promote": {
+          "input": { "worktree": "string", "expectedDiffSha256": "string" },
+          "output": { "promoted": "boolean", "commit": "string", "diffSha256": "string" }
+        }
+      }
+    }
+  ]
+}

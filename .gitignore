@@ -1,0 +1,13 @@
+node_modules/
+out/
+release/
+.vite/
+coverage/
+test-results/
+playwright-report/
+.runtime/
+.engine-build/
+engine-dist/
+*.omni
+*.log
+.DS_Store

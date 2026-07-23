@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-07-23T00:00:00Z",
+  "entries": [
+    {
+      "id": "recipe-whole-brain-micro",
+      "name": "Whole Brain · Micro",
+      "description": "A tiny all-module recipe for CPU learning and architecture experiments.",
+      "kind": "recipe",
+      "sourceUrl": "catalog/recipes/whole-brain-micro.json",
+      "license": "PolyForm-Noncommercial-1.0.0"
+    },
+    {
+      "id": "recipe-plastic-synapse-lab",
+      "name": "Plastic Synapse Lab",
+      "description": "A language-light neuromorphic recipe focused on LIF, STDP, and structural growth.",
+      "kind": "recipe",
+      "sourceUrl": "catalog/recipes/plastic-synapse-lab.json",
+      "license": "PolyForm-Noncommercial-1.0.0"
+    },
+    {
+      "id": "dataset-wikimedia",
+      "name": "Wikimedia XML Dumps",
+      "description": "User-selected Wikimedia project dumps for large-scale text pretraining. Attribution and share-alike obligations are shown before import.",
+      "kind": "dataset",
+      "sourceUrl": "https://dumps.wikimedia.org/",
+      "license": "CC BY-SA 4.0 / GFDL; varies by project"
+    },
+    {
+      "id": "dataset-gutenberg",
+      "name": "Project Gutenberg",
+      "description": "Public-domain and licensed books. Availability and copyright status vary by country and item.",
+      "kind": "dataset",
+      "sourceUrl": "https://www.gutenberg.org/",
+      "license": "Per-item; inspect before training"
+    }
+  ]
+}
