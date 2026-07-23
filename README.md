@@ -17,6 +17,7 @@ The project combines a tiny trainable ternary language cortex, spiking/STDP asso
 - Parameter-only, human-consolidation, and total-recall memory recipes.
 - A single persistent identity/chat per build with origin, snapshots, forks, and export.
 - Tiny trainable image, audio, and video baselines that share the brain's idea space.
+- Validated declarative build recipes and modality-only safe-tensor packs.
 - Structured tool capabilities encoded through the VSA idea channel without adding tool-schema prose to the chat prompt.
 - Direct chat tool calls, exact one-use approvals, cancellation, and visible operational audit records.
 - Isolated source-evolution worktrees and active copy-on-write subagent brain forks.
@@ -72,7 +73,7 @@ Create a packaged ARM64 shell:
 npm run package:win:arm64
 ```
 
-The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging is configured for NSIS and ZIP, but clean Windows 11 x64/ARM64 artifact and installation verification remain release gates.
+The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging produces NSIS and ZIP artifacts for x64 and ARM64. The Windows workflow verifies both packaged worker layouts; its x64 leg also drives the installed application through build, chat, navigation, trace export, imagination, download, and full restart. A real ARM64 desktop launch remains a separate hardware gate because the hosted packaging runner is x64.
 
 ## Repository map
 
@@ -81,6 +82,7 @@ The app uses Electron's Windows 11 Mica background where supported and falls bac
 - `engine/` — custom PyTorch brain, multimodal packs, and JSON-lines worker.
 - `docs/ARCHITECTURE.md` — implemented neural, tool, agent, and persistence paths.
 - `docs/OMNI_FORMAT.md` — strict version-1 `.omni` container contract and privacy boundary.
+- `docs/CATALOG_FORMATS.md` — non-executable recipe and `.omnipack` contracts.
 - `BitNet-main/`, `snntorch-master/`, `ncps-master/` — attributed upstream research snapshots.
 - `RESEARCH.md` — paper/repository-to-feature ledger.
 

@@ -446,6 +446,13 @@ export interface ModalityPackManifest {
     version: string;
     modalities: ModalityKind[];
   };
+  compatibility: {
+    dModel: number;
+    modalityChannels: number;
+    imageSize: number;
+    audioSamples: number;
+    videoFrames: number;
+  };
   licenseLedger: {
     license: string;
     provenanceUrl?: string;

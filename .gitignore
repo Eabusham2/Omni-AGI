@@ -3,6 +3,8 @@ out/
 release/
 .vite/
 coverage/
+test-results/
+playwright-report/
 .runtime/
 .engine-build/
 engine-dist/

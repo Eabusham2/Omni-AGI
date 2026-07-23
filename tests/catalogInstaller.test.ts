@@ -55,6 +55,13 @@ function packFixture(
       version: "1.0.0",
       modalities: [modality]
     },
+    compatibility: {
+      dModel: 64,
+      modalityChannels: 16,
+      imageSize: 16,
+      audioSamples: 256,
+      videoFrames: 4
+    },
     licenseLedger: {
       license: "MIT",
       provenanceUrl: "https://example.com/model-card"
@@ -188,7 +195,9 @@ describe("declarative catalog installers", () => {
     ).toThrow(/unsupported entry|directory is invalid/i);
 
     const fixture = packFixture("image");
-    fixture[fixture.indexOf(Buffer.from("Tiny fixture"))] ^= 1;
+    const markerIndex = fixture.indexOf(Buffer.from("Tiny fixture"));
+    expect(markerIndex).toBeGreaterThanOrEqual(0);
+    fixture[markerIndex] = (fixture[markerIndex] ?? 0) ^ 1;
     expect(() => validateModalityPack(fixture)).toThrow();
 
     const badTensor = modalityTensors("audio");
@@ -199,6 +208,13 @@ describe("declarative catalog installers", () => {
       architecture: "OmniCortex",
       architectureSchemaVersion: 1,
       pack: { id: "wrong", name: "Wrong", version: "1", modalities: ["image"] },
+      compatibility: {
+        dModel: 64,
+        modalityChannels: 16,
+        imageSize: 16,
+        audioSamples: 256,
+        videoFrames: 4
+      },
       licenseLedger: { license: "MIT" },
       files: {
         "model-card.md": { sha256: sha256(modelCard), bytes: modelCard.byteLength },

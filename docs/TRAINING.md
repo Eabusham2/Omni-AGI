@@ -12,12 +12,12 @@ Profiles change scale, not the meaning of a module:
 
 | Profile | Typical machine | Text scale | Media baseline | Training strategy |
 | --- | --- | --- | --- | --- |
-| Micro | 4–8 GB RAM, CPU | Architecture/smoke scale | Tiny images, short low-rate audio, tiny clips | Small batches, aggressive checkpointing |
-| Personal | 16 GB RAM | Small research model | Moderate latent sizes | Gradient accumulation and disk-backed data |
-| GPU | NVIDIA/DirectML-capable PC | User-selected | Larger packs | Mixed precision |
-| Workstation | Multi-GPU or remote worker | Scalable | Scalable | Distributed data/model parallelism |
+| Micro | 4–8 GB RAM, CPU | Architecture/smoke scale | Tiny images, short low-rate audio, tiny clips | Batch 1, eight-step accumulation, activation checkpointing |
+| Personal | About 16 GB RAM | Small research model | Moderate latent sizes | Batch 2, four-step accumulation, activation checkpointing |
+| GPU | NVIDIA/DirectML-capable PC | Larger local research model | Larger packs | Batch 8, two-step accumulation, activation checkpointing |
+| Workstation | High-memory local host | Largest bundled baseline | Larger packs | Batch 16, direct block execution |
 
-A large model that cannot fit active state is not made feasible merely by waiting. The builder selects a smaller compatible model or a stronger worker.
+A large model that cannot fit active state is not made feasible merely by waiting. The builder selects a smaller compatible model. Replay and stability tensors remain CPU-resident between operations and are durably offloaded to safe-tensor checkpoints; only the active micro-batch moves to the selected CPU, CUDA, or DirectML device. The current release reports distributed capability but does not claim a multi-node trainer.
 
 ## Experience lifecycle
 
@@ -38,6 +38,15 @@ Human Consolidation uses Encode and scheduled Consolidate. Synapses Only erases 
   conservatively restores the complete prior checkpoint before reading tensors.
 - Reservoir or latent replay reduces catastrophic forgetting.
 - Stable, frequently used synapses have lower plasticity.
+- Persistent squared-gradient importance and slow anchors add an EWC-like
+  stability penalty to language, dialogue, consolidation, and modality
+  updates.
+- Background corpus training forms padded physical micro-batches and performs
+  the profile's configured number of gradient-accumulation passes before one
+  clipped optimizer step.
+- Micro, Personal, and GPU profiles checkpoint decoder-block activations during
+  training. Replay remains on CPU until used, and all durable checkpoints are
+  non-executable safe tensors.
 - Optimizer internals and data cursors are not persisted. The checkpoint format
   deliberately avoids pickle, so an interrupted slow job restarts rather than
   resuming at an exact optimizer step.
@@ -50,7 +59,7 @@ These mechanisms reduce forgetting; they cannot guarantee perfect retention.
 
 ## Conversation learning
 
-The current conversation is ordinary model input and bounded working memory. After the turn:
+The current human turn is ordinary model input. Long-term memory is not pasted beside it. Parameter-only mode conditions activations with learned semantic state; working-memory mode additionally blends bounded recency-weighted recurrent vectors without adding earlier message tokens. After the turn:
 
 - human text is eligible for self-supervised learning;
 - generated text receives a lower default replay weight to limit self-amplifying errors;
@@ -60,4 +69,6 @@ The current conversation is ordinary model input and bounded working memory. Aft
 
 ## Web and dataset training
 
-Catalog and crawl jobs always record URLs, hashes, timestamps, and declared licensing. They stream into shards rather than loading an entire corpus into RAM. The training engine does not execute code found in a dataset or repository unless the separate code tool is explicitly granted authority.
+Catalog and crawl jobs record URLs, hashes, timestamps, quarantine state, and declared licensing. Bounded files and pages are processed incrementally instead of concatenating an entire crawl into one prompt or in-memory corpus. The training engine does not execute code found in a dataset or repository unless the separate code tool is explicitly granted authority.
+
+Declarative build recipes may select a blank or compatible starter origin, architecture recipe, hardware tier, memory policy, modalities, and initial tool grant. A recipe cannot contain commands. Modality packs carry only a model card, manifest, checksum ledger, and safe tensors; installation is namespace-, shape-, architecture-, and license-validated twice. See [CATALOG_FORMATS.md](CATALOG_FORMATS.md).

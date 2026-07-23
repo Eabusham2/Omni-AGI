@@ -29,6 +29,7 @@ class OmniConfig:
     origin_kind: str = "blank"
     train_batch_size: int = 2
     gradient_accumulation: int = 2
+    gradient_checkpointing: bool = False
 
     ternary_weights: bool = True
     spiking_dynamics: bool = True
@@ -131,6 +132,8 @@ class OmniConfig:
             raise ValueError("video_frames must be at least 2")
         if self.working_memory_slots < 1 or self.parallel_thoughts < 1:
             raise ValueError("memory slots and parallel thoughts must be positive")
+        if self.train_batch_size < 1 or self.gradient_accumulation < 1:
+            raise ValueError("training batch size and accumulation must be positive")
         if self.short_term_half_life_minutes <= 0:
             raise ValueError("short-term half-life must be positive")
         if self.slow_stability_strength < 0:
@@ -172,6 +175,7 @@ class OmniConfig:
                 "channels": 8,
                 "batch": 1,
                 "accumulation": 8,
+                "checkpointing": True,
             },
             "personal": {
                 "dimensions": 64,
@@ -183,6 +187,7 @@ class OmniConfig:
                 "channels": 16,
                 "batch": 2,
                 "accumulation": 4,
+                "checkpointing": True,
             },
             "gpu": {
                 "dimensions": 96,
@@ -194,6 +199,7 @@ class OmniConfig:
                 "channels": 24,
                 "batch": 8,
                 "accumulation": 2,
+                "checkpointing": True,
             },
             "workstation": {
                 "dimensions": 128,
@@ -205,6 +211,7 @@ class OmniConfig:
                 "channels": 32,
                 "batch": 16,
                 "accumulation": 1,
+                "checkpointing": False,
             },
         }
         if tier not in profiles:
@@ -228,6 +235,7 @@ class OmniConfig:
             "origin_kind": str(raw.get("origin_kind", raw.get("origin", "blank"))),
             "train_batch_size": int(profile["batch"]),
             "gradient_accumulation": int(profile["accumulation"]),
+            "gradient_checkpointing": bool(profile["checkpointing"]),
             "image_size": int(profile["image"]),
             "audio_samples": int(profile["audio"]),
             "video_frames": int(profile["frames"]),
@@ -315,6 +323,7 @@ class OmniConfig:
             "hardware_tier": "micro",
             "train_batch_size": 1,
             "gradient_accumulation": 8,
+            "gradient_checkpointing": True,
         }
         values.update(overrides)
         config = cls(**values)

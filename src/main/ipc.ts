@@ -128,11 +128,11 @@ async function hardwareProfile(): Promise<HardwareProfile> {
     !description.includes("software");
   const gib = totalMemoryBytes / 1024 ** 3;
   const recommendedTier =
-    gib >= 48 || logicalCpus >= 24
+    gib >= 48 || (gib >= 32 && logicalCpus >= 24)
       ? "workstation"
       : gpuAvailable && gib >= 12
         ? "gpu"
-        : gib >= 12
+        : gib >= 16
           ? "personal"
           : "micro";
   const recommendations = {

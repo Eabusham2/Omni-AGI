@@ -651,6 +651,8 @@ class AdaptiveBrain:
                 "contextTokens": self.config.max_seq_len,
                 "trainBatchSize": self.config.train_batch_size,
                 "gradientAccumulation": self.config.gradient_accumulation,
+                "gradientCheckpointing": self.config.gradient_checkpointing,
+                "replayOffload": "cpu-with-durable-safetensors",
                 "imageSize": self.config.image_size,
                 "audioSamples": self.config.audio_samples,
                 "videoFrames": self.config.video_frames,
@@ -666,6 +668,7 @@ class AdaptiveBrain:
                 "onlineLearning": self.config.online_learning,
                 "consolidation": self.config.consolidation_enabled,
                 "metaplasticity": self.config.metaplasticity,
+                "gradientCheckpointing": self.config.gradient_checkpointing,
             },
             "enabled_modalities": [
                 name
@@ -958,6 +961,66 @@ class AdaptiveBrain:
         if commit_stability:
             self._commit_slow_anchors(rate=0.08)
         return {"loss": sum(losses) / len(losses)}
+
+    def _experience_batch_loss(
+        self,
+        texts: Sequence[str],
+        vsa_vectors: Sequence[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute one padded micro-batch without stepping the optimizer."""
+
+        encoded = [
+            self.tokenizer.tensor(
+                text,
+                self.device,
+                max_length=self.config.max_seq_len,
+                add_bos=True,
+                add_eos=True,
+            )[0]
+            for text in texts
+        ]
+        width = max(int(ids.shape[0]) for ids in encoded)
+        ids = torch.full(
+            (len(encoded), width),
+            self.tokenizer.pad_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for index, values in enumerate(encoded):
+            ids[index, : values.shape[0]] = values
+        idea = torch.cat(
+            [self._idea_model_vector(vector) for vector in vsa_vectors],
+            dim=0,
+        )
+        reconstructed = self.idea_adapter(
+            idea + torch.randn_like(idea) * 0.06
+        )
+        idea_loss = F.mse_loss(reconstructed, idea.detach())
+        liquid_state = self.liquid_state.detach().expand(
+            idea.shape[0], -1
+        )
+        temporal, _ = self.liquid(
+            idea, state=liquid_state, elapsed=1.0
+        )
+        temporal_loss = F.mse_loss(temporal, idea.detach())
+        language = self.decoder(
+            ids, memory_bias=reconstructed, labels=ids
+        )["loss"]
+        stability_loss = self._stability_penalty()
+        loss = (
+            language
+            + 0.2 * idea_loss
+            + 0.05 * temporal_loss
+            + stability_loss
+        )
+        if not bool(torch.isfinite(loss)):
+            raise RuntimeError("non-finite batch training loss")
+        return loss, {
+            "loss": float(loss.detach().item()),
+            "language_loss": float(language.detach().item()),
+            "idea_loss": float(idea_loss.detach().item()),
+            "stability_loss": float(stability_loss.detach().item()),
+        }
 
     def _maybe_grow(self, novelty: float, prototype: torch.Tensor) -> bool:
         if self.config.growth_policy == "fixed":
@@ -1607,7 +1670,6 @@ class AdaptiveBrain:
                         else "Recurrent working-memory injection is disabled."
                     ),
                     "value": (
-                        "%d active vectors" % len(self.working_memory)
                         "%d active vectors" % working_memory_used
                         if working_model is not None
                         else "parameter-only mode"
@@ -1762,25 +1824,64 @@ class AdaptiveBrain:
         losses: List[float] = []
         total = epochs * len(samples)
         completed = 0
+        optimizer_steps = 0
+        optimizer = (
+            self._new_optimizer(learning_rate)
+            if learning_rate is not None
+            else self._optimizer
+        )
+        physical_batch = max(1, int(self.config.train_batch_size))
+        accumulation = max(1, int(self.config.gradient_accumulation))
+        effective_batch = physical_batch * accumulation
         candidate_id, candidate_dir = self._begin_candidate("slow-training")
         promoted = False
         rejection = ""
         try:
+            self.decoder.train()
+            self.memory_bridge.train()
+            self.idea_adapter.train()
+            self.liquid.train()
             for _ in range(epochs):
-                for sample in samples:
-                    vector = self.memory.vector_for_text(sample)
-                    result = self._optimize_experience(
-                        sample,
-                        vector,
-                        steps=1,
-                        learning_rate=learning_rate,
-                        commit_stability=False,
+                for group_start in range(0, len(samples), effective_batch):
+                    group = samples[group_start : group_start + effective_batch]
+                    micro_batches = [
+                        group[index : index + physical_batch]
+                        for index in range(0, len(group), physical_batch)
+                    ]
+                    optimizer.zero_grad(set_to_none=True)
+                    for micro_batch in micro_batches:
+                        vectors = [
+                            self.memory.vector_for_text(sample)
+                            for sample in micro_batch
+                        ]
+                        loss, measurements = self._experience_batch_loss(
+                            micro_batch, vectors
+                        )
+                        (loss / float(len(micro_batches))).backward()
+                        losses.append(measurements["loss"])
+                        for vector in vectors:
+                            self._append_replay(
+                                self._idea_model_vector(vector)
+                            )
+                        completed += len(micro_batch)
+                        if progress is not None:
+                            progress(
+                                completed / float(total),
+                                "Training candidate",
+                            )
+                    self._accumulate_slow_importance()
+                    parameters = [
+                        parameter
+                        for group_record in optimizer.param_groups
+                        for parameter in group_record["params"]
+                        if parameter.grad is not None
+                    ]
+                    torch.nn.utils.clip_grad_norm_(
+                        parameters, self.config.grad_clip
                     )
-                    losses.append(float(result["loss"]))
-                    self._append_replay(self._idea_model_vector(vector))
-                    completed += 1
-                    if progress is not None:
-                        progress(completed / float(total), "Training candidate")
+                    optimizer.step()
+                    optimizer_steps += 1
+                    self.counters["training_steps"] += 1
             final_losses = [
                 self._evaluate_experience(
                     sample, self.memory.vector_for_text(sample)
@@ -1842,6 +1943,9 @@ class AdaptiveBrain:
                 "epochs": epochs,
                 "samples": len(samples),
                 "steps": completed,
+                "optimizerSteps": optimizer_steps,
+                "physicalBatchSize": physical_batch,
+                "gradientAccumulation": accumulation,
                 "meanLoss": sum(losses) / len(losses),
                 "baselineLoss": baseline_loss,
                 "finalLoss": final_loss,
@@ -1857,6 +1961,9 @@ class AdaptiveBrain:
             "epochs": epochs,
             "samples": len(samples),
             "steps": completed,
+            "optimizerSteps": optimizer_steps,
+            "physicalBatchSize": physical_batch,
+            "gradientAccumulation": accumulation,
             "meanLoss": sum(losses) / len(losses),
             "baselineLoss": baseline_loss,
             "finalLoss": final_loss,
@@ -2271,21 +2378,26 @@ class AdaptiveBrain:
                     )
         else:
             try:
-                import imageio.v3 as imageio
+                import imageio.v2 as imageio
                 try:
-                    decoded_frames = imageio.imiter(path, plugin="FFMPEG")
-                    for frame in decoded_frames:
-                        frames.append(
-                            np.asarray(
-                                Image.fromarray(frame).convert("RGB").resize(
-                                    (
-                                        self.config.image_size,
-                                        self.config.image_size,
-                                    )
-                                ),
-                                dtype="float32",
-                            ).copy()
-                        )
+                    decoded_frames = imageio.get_reader(path, format="FFMPEG")
+                    try:
+                        for frame in decoded_frames:
+                            frames.append(
+                                np.asarray(
+                                    Image.fromarray(frame).convert("RGB").resize(
+                                        (
+                                            self.config.image_size,
+                                            self.config.image_size,
+                                        )
+                                    ),
+                                    dtype="float32",
+                                ).copy()
+                            )
+                    finally:
+                        close = getattr(decoded_frames, "close", None)
+                        if callable(close):
+                            close()
                 except (OSError, ValueError, RuntimeError):
                     decoded = imageio.imread(path)
                     if decoded.ndim == 3:

@@ -134,14 +134,17 @@ export class EngineSupervisor extends EventEmitter {
     const packagedExecutable = this.options.resourcesPath
       ? join(this.options.resourcesPath, "engine-runtime", "omni-engine.exe")
       : undefined;
+    const packagedRequired = process.env.OMNI_PACKAGED_ENGINE_REQUIRED === "1";
     const candidates: Array<{ candidate: PythonCandidate; direct: boolean }> = [];
-    if (configured && worker) {
-      candidates.push({ candidate: { command: configured, prefix: [] }, direct: false });
-    }
+    // A packaged build must exercise its self-contained, non-pickle worker first.
+    // Source-Python candidates remain a development/recovery fallback.
     if (packagedExecutable && existsSync(packagedExecutable)) {
       candidates.push({ candidate: { command: packagedExecutable, prefix: [] }, direct: true });
     }
-    if (worker) {
+    if (!packagedRequired && configured && worker) {
+      candidates.push({ candidate: { command: configured, prefix: [] }, direct: false });
+    }
+    if (!packagedRequired && worker) {
       candidates.push(
         ...pythonCandidates({ ...this.options, pythonCommand: undefined })
           .filter((candidate) => candidate.command !== configured)
@@ -150,7 +153,9 @@ export class EngineSupervisor extends EventEmitter {
     }
     if (candidates.length === 0) {
       this.lastError =
-        "No packaged engine or engine/worker.py source was found; the deterministic local fallback is active.";
+        packagedRequired
+          ? "The required packaged OmniCortex engine was not found; the deterministic local fallback is active."
+          : "No packaged engine or engine/worker.py source was found; the deterministic local fallback is active.";
       return false;
     }
     for (const launch of candidates) {

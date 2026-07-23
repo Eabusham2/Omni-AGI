@@ -15,6 +15,8 @@ An `.omni` file is a non-executable ZIP container for OmniCortex state. The curr
 
 The schema-version value above is illustrative of the current build constant; import requires an exact match with that build. The importer never loads pickle objects and never executes repository code or setup scripts from a bundle.
 
+This format is for a complete identity. Build recipes and modality-only weights deliberately use smaller, separate contracts documented in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
+
 ## Required entries
 
 Every version-1 bundle contains both a selected payload and an immutable-origin payload:

@@ -16,7 +16,6 @@ $Scratch = Join-Path ([System.IO.Path]::GetTempPath()) (
 )
 $ZipRoot = Join-Path $Scratch "zip"
 $InstallRoot = Join-Path $Scratch "installed"
-$ProfileRoot = Join-Path $Scratch "profile"
 [System.IO.Directory]::CreateDirectory($Scratch) | Out-Null
 
 function Get-OneArtifact {
@@ -78,18 +77,27 @@ try {
   }
 
   $AppLaunched = $false
+  $DesktopE2E = $false
   if ($Arch -eq "x64") {
-    [System.IO.Directory]::CreateDirectory($ProfileRoot) | Out-Null
-    $App = Start-Process `
-      -FilePath $AppExecutables[0].FullName `
-      -ArgumentList @("--disable-gpu", "--user-data-dir=$ProfileRoot") `
-      -PassThru
-    Start-Sleep -Seconds 8
-    if ($App.HasExited) {
-      throw "Installed x64 desktop app exited during startup with code $($App.ExitCode)."
+    $PreviousExecutable = $env:OMNI_E2E_EXECUTABLE
+    try {
+      $env:OMNI_E2E_EXECUTABLE = $AppExecutables[0].FullName
+      Push-Location $RepoRoot
+      try {
+        & npm.cmd run test:ui:built
+        if ($LASTEXITCODE -ne 0) {
+          throw "Installed x64 desktop end-to-end test failed with exit code $LASTEXITCODE."
+        }
+      }
+      finally {
+        Pop-Location
+      }
+      $AppLaunched = $true
+      $DesktopE2E = $true
     }
-    $AppLaunched = $true
-    & taskkill.exe /PID $App.Id /T /F | Out-Null
+    finally {
+      $env:OMNI_E2E_EXECUTABLE = $PreviousExecutable
+    }
   }
 
   $EvidencePath = Join-Path $ReleaseRoot "windows-package-smoke-$Arch.json"
@@ -113,6 +121,10 @@ try {
       packagedWorker = $InstalledWorkers[0].FullName.Substring($InstallRoot.Length)
       rpcSmoke = $InstalledSmoke | ConvertFrom-Json
       desktopLaunch = $AppLaunched
+      desktopEndToEnd = $DesktopE2E
+      desktopRestart = $DesktopE2E
+      accessibilityNavigation = $DesktopE2E
+      modalityGeneration = $DesktopE2E
       desktopLaunchSkippedReason = $LaunchSkipReason
     }
   } | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 $EvidencePath

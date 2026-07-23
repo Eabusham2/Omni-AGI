@@ -163,7 +163,6 @@ class ReleaseGateTests(unittest.TestCase):
             fps=4,
             codec="libx264",
             pix_fmt_in="rgb24",
-            output_params=["-pix_fmt", "yuv420p"],
         )
         writer.send(None)
         try:

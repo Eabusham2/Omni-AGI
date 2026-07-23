@@ -9,6 +9,7 @@ This file preserves the requested scope. A checked item has current inspectable 
 - [x] Effective ternary weights are exactly `-1`, `0`, or `+1`.
 - [x] New input produces persistent parameter/synapse mutations.
 - [x] Slow self-supervised weights can consolidate without RLHF.
+- [x] Hardware-scaled physical batches, gradient accumulation, and decoder activation checkpointing change the real slow-training path.
 - [x] Fast STDP updates have tested potentiation and depression.
 - [x] CfC and LTC-like liquid state are implemented and persistent.
 - [x] VSA ideas bind, bundle, connect, and recall approximately.
@@ -37,8 +38,9 @@ Evidence: `engine/tests/test_model.py`, `engine/tests/test_brain.py`, `engine/te
 
 - [x] Text, Markdown, JSON, source, folder, and PDF ingestion paths exist; real PDF extraction is tested.
 - [x] Image understanding and generation execute real model paths.
-- [x] Audio input and generation execute real model paths for PCM WAV.
-- [x] Video input and generation execute real model paths for the tested animated-GIF path.
+- [x] Audio input and generation execute real model paths for PCM WAV, tested FLAC, and common soundfile/FFmpeg-backed formats.
+- [x] Video input and generation execute real model paths for animated GIF/WebP and tested FFmpeg-backed MP4.
+- [x] Text, image, audio, and video miniature fixtures decrease loss, reload safe tensors, and reproduce identical seeded output.
 - [x] Uploading data can change model weights rather than only appending context.
 - [x] Dataset catalog, quarantined web-corpus mode, and source provenance are visible.
 - [x] Low-end hardware profiles retain every modality at reduced scale.
@@ -49,17 +51,18 @@ Evidence: `engine/tests/test_memory_modalities.py`, `engine/tests/test_brain.py`
 
 ## Windows application
 
-- [ ] Windows 11 Build and Run modes are complete and accessible. The renderer builds, but Windows keyboard/screen-reader/manual evidence has not been recorded.
-- [ ] Brain Library, Build wizard, one-chat workspace, Data Studio, Brain Map, Trace, Journal, Tools, Agents, and Catalog are usable. The surfaces exist; a packaged-app end-to-end smoke pass is still required.
+- [ ] Windows 11 Build and Run modes are complete and accessible. A Playwright fixture checks keyboard focus, roles, and accessible navigation names; a green Windows run is still required.
+- [ ] Brain Library, Build wizard, one-chat workspace, Data Studio, Brain Map, Trace, Journal, Tools, Agents, Catalog, and Imagination are usable. The full built-app fixture passes on the development host; a packaged Windows pass is still required.
 - [ ] x64 Windows package builds in clean CI. NSIS and ZIP are configured; a successful workflow artifact is still required.
 - [ ] ARM64 Windows package builds in clean CI. NSIS and ZIP are configured; a successful workflow artifact is still required.
 - [ ] A clean installation can provision or include its Python/PyTorch worker. CI now configures direct, ZIP, and silent-NSIS JSON-RPC worker smoke checks, but a green Windows artifact is still required.
-- [ ] State survives a full packaged-app restart and interrupted training. A killed JSON-RPC worker and an interrupted promotion both reload the complete stable safe-tensor checkpoint and quarantine the candidate; the packaged desktop restart scenario remains unverified.
+- [ ] State survives a full packaged-app restart and interrupted training. A killed JSON-RPC worker and an interrupted promotion both reload the complete stable safe-tensor checkpoint and quarantine the candidate. The Windows x64 package smoke now runs create/chat/imagine/close/relaunch/persistence against the installed executable, but the gate remains open until CI evidence is green.
 
 Configured evidence: `.github/workflows/windows.yml`,
 `scripts/smoke-engine.ps1`, `scripts/smoke-windows-package.ps1`, and
-`engine/tests/test_interrupted_recovery.py`. CI configuration is not counted as
-a successful Windows run until its uploaded evidence exists.
+`tests/e2e/electron.spec.ts`, and `engine/tests/test_interrupted_recovery.py`.
+CI configuration is not counted as a successful Windows run until its uploaded
+evidence exists.
 
 ## Tools, agents, and sharing
 
@@ -72,9 +75,9 @@ a successful Windows run until its uploaded evidence exists.
 - [x] Active subagent turns use isolated copy-on-write brain forks and cannot mutate the parent directly; merge remains explicit and overlay-based.
 - [x] `.omni` import/export enforces architecture/schema, checksum, exact-byte, safe-tensor, secret-redaction-policy, and license-ledger contracts.
 - [x] Referenced-local `.omni` exports use verified content-addressed local tensor objects and fail on an installation that lacks them.
-- [x] GitHub/catalog imports declarative `.omni` packs without auto-executing repository code.
+- [x] GitHub/catalog URLs import complete `.omni` bundles, strict recipe JSON, and namespace-limited `.omnipack` safe tensors without auto-executing repository code.
 
-Evidence: `engine/tests/test_tool_schemas.py`, `tests/projectIntegrity.test.ts`, `tests/brainRepository.test.ts`, `tests/toolExecutor.test.ts`, `tests/toolWorkflows.test.ts`, `src/main/toolExecutor.ts`, and `src/main/brainService.ts`.
+Evidence: `engine/tests/test_tool_schemas.py`, `engine/tests/test_brain.py`, `tests/projectIntegrity.test.ts`, `tests/brainRepository.test.ts`, `tests/catalogInstaller.test.ts`, `tests/toolExecutor.test.ts`, `tests/toolWorkflows.test.ts`, `src/main/catalogInstaller.ts`, `src/main/toolExecutor.ts`, and `src/main/brainService.ts`.
 
 ## Accuracy, provenance, and licensing
 

@@ -44,9 +44,9 @@ The renderer has no direct Node.js, filesystem, process, or credential access. E
 
 `Automatic` hardware selection is resolved once in Electron before brain creation. The current profiler considers logical CPU count, system memory, and Electron GPU status:
 
-- Workstation at 48 GiB RAM or 24 logical CPUs;
+- Workstation at 48 GiB RAM, or at least 32 GiB plus 24 logical CPUs;
 - GPU at 12 GiB RAM plus an available GPU process;
-- Personal at 12 GiB RAM;
+- Personal at 16 GiB RAM;
 - Micro otherwise.
 
 That selection scales transformer width/layers, sequence length, media dimensions and duration, batch size, gradient accumulation, and related limits. A GPU or Workstation worker prefers CUDA, then an installed usable DirectML path, then CPU. This is build-time selection, not a claim of continuous runtime re-profiling.
@@ -94,9 +94,11 @@ Only participating `BitLinear` projections are ternary during the forward pass. 
 
 The spiking router stores recurrent weights, pre/post traces, stability, use counts, membrane state, and spike counts in `plasticity.safetensors`. A presynaptic spike followed by a postsynaptic spike potentiates the connection; reversed timing depresses it. Metaplastic stability reduces repeated updates, while consolidation decays weakly used structures.
 
-The VSA memory stores concept and idea metadata in engine JSON and their hypervectors in safe tensors. Concepts and typed co-occurrence relations grow up to configured capacities; low-value entries are reused or evicted when those capacities are reached.
+The VSA memory stores concept and idea metadata in engine JSON and their hypervectors in safe tensors. Fixed and elastic builds use their configured capacities and reuse or evict low-value entries at pressure. An unbounded build doubles pressured concept/idea/relation capacities while disk and RAM reserves permit, records every expansion, and pauses with the measured resource reason before exhaustion.
 
-Novelty can add small residual decoder experts. `fixed` disables expert growth, `elastic` observes `max_experts`, and `unbounded` removes that model-count limit but still pauses before crossing runtime disk or memory reserves. Growth does not resize the live transformer's dense base tensors.
+Novelty can add small residual decoder experts. `fixed` disables expert growth, `elastic` observes `max_experts`, and `unbounded` removes that model-count limit but still pauses before crossing runtime disk or memory reserves. Expert growth is live and sparse; the next atomic save persists the new structure. Growth does not resize the live transformer's dense base tensors.
+
+Slow parameters have a second metaplastic protection path. Squared gradients update persistent importance tensors, and an EWC-like penalty resists movement away from persistent anchors. Successful online steps move anchors gradually; promoted training or consolidation candidates commit them. Rejected or interrupted candidates restore weights, anchors, and importance together.
 
 ## Memory recipes
 
@@ -106,7 +108,7 @@ Novelty can add small residual decoder experts. `fixed` disables expert growth, 
 | Total Recall | Optional local retention | Yes | Yes | Yes | Neural/vector conditioning |
 | Synapses Only | No | Yes, without source text | Yes | Yes | Neural/vector conditioning |
 
-Total Recall's retained text is available for explicit source-selected training and private archival export. The current worker does not silently retrieve that text into chat prompts. `memoryInjection` is persisted and displayed, but the Python worker currently keeps both selectable values on the same vector-conditioned generation path.
+Total Recall's retained text is available for explicit source-selected training and private archival export. The worker never silently retrieves it into chat prompts. In `parameter-only` mode, generation receives learned parameters, semantic/VSA recall, fast weights, and liquid state. In `working-memory` mode it additionally blends a bounded, recency-weighted recurrent activity vector. Both paths leave the input token sequence unchanged; the trace reports the selected channel, vector count, and token digest.
 
 Working-memory slots, short-term half-life, replay threshold, forgetting rate, and consolidation rate are configurable. They improve control over retention; they do not guarantee exact recall.
 
@@ -115,11 +117,11 @@ Working-memory slots, short-term half-life, replay threshold, forgetting rate, a
 All current packs share the configured idea dimension. A blank build initializes them randomly; a compatible materialized starter may supply trained pack weights:
 
 - a compact convolutional vision encoder;
-- a VQ-style image autoencoder with an idea-conditioned convolutional denoiser;
-- a two-stage residual-vector-quantized audio codec and generator;
-- a compressed 3D spatial/temporal video autoencoder and generator.
+- a VQ image autoencoder with a ternary, idea/time-conditioned latent transformer denoiser;
+- a two-stage residual-vector-quantized audio codec with a ternary latent-token generator;
+- a compressed video autoencoder with factorized spatial/temporal evolution and a CfC-like liquid temporal gate.
 
-The fixtures train and backpropagate through all packs. Image input supports Pillow-compatible images, audio input currently supports PCM WAV, and video input supports animated GIF/WebP plus formats decodable by the installed `imageio` backend. Generated artifacts are PNG, WAV, and animated PNG. These are tiny functional baselines, not DiT, EnCodec, or Latte quality claims.
+Fixtures prove that every pack can overfit a miniature example, save as safe tensors, reload, and generate byte-identical seeded output. Image input supports Pillow-compatible images. Audio accepts PCM WAV directly, formats supported by libsndfile such as FLAC/OGG, and FFmpeg-decoded MP3/M4A/AAC where available. Video accepts animated GIF/WebP and FFmpeg-backed MP4/WebM/MOV. Generated artifacts are PNG, WAV, and animated PNG. These are tiny functional baselines inspired by DiT, EnCodec, and Latte, not quality-equivalent reproductions.
 
 ## Persistence and lineage
 
@@ -171,9 +173,9 @@ Forks receive independent application state and neural metadata. Immutable tenso
 
 ## `.omni` boundary
 
-`.omni` is the only supported portable checkpoint container. It carries both the selected current/origin payload and the immutable origin payload, with JSON state, safe tensors, a model card, lineage, and SHA-256 records. The exact version-1 contract and privacy limitations are documented in [OMNI_FORMAT.md](OMNI_FORMAT.md).
+`.omni` is the only supported portable whole-brain checkpoint container. It carries both the selected current/origin payload and the immutable origin payload, with JSON state, safe tensors, a model card, lineage, and SHA-256 records. The exact version-1 contract and privacy limitations are documented in [OMNI_FORMAT.md](OMNI_FORMAT.md). Declarative builder recipes and modality-only `.omnipack` files have separate non-executable contracts in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
 
-Downloaded bundles are treated as data. The importer validates ZIP paths, size limits, duplicate names, encryption/symlink flags, executable extensions, checksums, exact manifest byte lengths, the `OmniCortex` architecture name and current schema version, materialized engine format, secret-redaction declaration, source license ledger, and safe-tensor headers. It never loads pickle data or runs repository setup scripts.
+Downloaded bundles are treated as data. The importer validates ZIP paths, size limits, duplicate names, encryption/symlink flags, executable extensions, checksums, exact manifest byte lengths, the `OmniCortex` architecture name and current schema version, materialized engine format, secret-redaction declaration, source license ledger, and safe-tensor headers. Recipes reject unknown fields and contain no command field. Modality packs are revalidated by both Electron and the neural worker and may replace only declared `modalities.<kind>.*` tensors with exact compatible shapes and finite values. No path loads pickle data or runs repository setup scripts.
 
 Current, origin, and private-archive exports carry materialized tensor bytes. A `referenced-local` export replaces those tensor entries with valid placeholder safe tensors and records the real tensor hashes; import succeeds only when the same local repository still has every referenced object. It is a storage convenience, not a shareable checkpoint.
 
@@ -193,6 +195,6 @@ An `agent.fork` action creates one to four copy-on-write brain forks and runs on
 
 ## Windows packaging
 
-GitHub Actions is configured to test on `windows-latest`, build and exercise the PyInstaller worker over JSON-RPC, and ask electron-builder for NSIS and ZIP artifacts for x64 and ARM64. Each matrix leg expands the ZIP, silently installs the NSIS artifact into a clean temporary directory, and runs the packaged worker from both layouts. The x64 leg also verifies that the installed desktop process remains running through startup; the ARM64 Electron executable cannot run on the hosted x64 runner. Each successful leg emits a JSON evidence file with artifact hashes and runtime versions. The workflow forwards `WINDOWS_CSC_LINK` and `WINDOWS_CSC_KEY_PASSWORD` into electron-builder's signing variables. Artifacts are unsigned when those repository secrets are absent; “signed-ready” is not a claim that a particular artifact is signed.
+GitHub Actions is configured to test on `windows-latest`, build and exercise the PyInstaller worker over JSON-RPC, and ask electron-builder for NSIS and ZIP artifacts for x64 and ARM64. Each matrix leg expands the ZIP, silently installs the NSIS artifact into a clean temporary directory, and runs the packaged worker from both layouts. The x64 leg points Playwright at the installed executable and requires the packaged worker while it builds a brain, chats, navigates every primary surface by accessible name, exports a trace, generates and downloads an image, closes the app, relaunches it, and verifies persisted identity and chat. The ARM64 Electron executable cannot run on the hosted x64 runner. Each successful leg emits a JSON evidence file with artifact hashes and runtime versions. The workflow forwards `WINDOWS_CSC_LINK` and `WINDOWS_CSC_KEY_PASSWORD` into electron-builder's signing variables. Artifacts are unsigned when those repository secrets are absent; “signed-ready” is not a claim that a particular artifact is signed.
 
 The x64 package contains an x64 Electron shell and x64 PyInstaller worker. The current ARM64 package targets the ARM64 Electron shell but includes the same x64 worker built on the hosted x64 runner, relying on Windows 11 ARM64 x64 emulation. These are configured checks, not evidence of a green run by themselves. A native ARM64 PyTorch/PyInstaller worker and an actual Windows 11 ARM64 desktop launch remain open release gates.

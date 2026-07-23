@@ -548,6 +548,7 @@ export function validateModalityPack(
       "architecture",
       "architectureSchemaVersion",
       "pack",
+      "compatibility",
       "licenseLedger",
       "files"
     ],
@@ -579,6 +580,31 @@ export function validateModalityPack(
   if (modalities.length !== value.pack.modalities.length) {
     throw new Error("The modality pack repeats a modality.");
   }
+  if (!isRecord(value.compatibility)) {
+    throw new Error("The modality pack compatibility record is required.");
+  }
+  assertOnlyKeys(
+    value.compatibility,
+    ["dModel", "modalityChannels", "imageSize", "audioSamples", "videoFrames"],
+    "Modality pack compatibility"
+  );
+  const compatibility = {
+    dModel: integerValue(value.compatibility.dModel, "Pack dModel", 8, 65_536),
+    modalityChannels: integerValue(
+      value.compatibility.modalityChannels,
+      "Pack modalityChannels",
+      1,
+      16_384
+    ),
+    imageSize: integerValue(value.compatibility.imageSize, "Pack imageSize", 8, 16_384),
+    audioSamples: integerValue(
+      value.compatibility.audioSamples,
+      "Pack audioSamples",
+      16,
+      16_777_216
+    ),
+    videoFrames: integerValue(value.compatibility.videoFrames, "Pack videoFrames", 2, 65_536)
+  };
   if (!isRecord(value.licenseLedger)) throw new Error("The pack license ledger is required.");
   assertOnlyKeys(
     value.licenseLedger,
@@ -617,6 +643,7 @@ export function validateModalityPack(
       architecture: "OmniCortex",
       architectureSchemaVersion: BRAIN_SCHEMA_VERSION,
       pack: { id, name, version, modalities },
+      compatibility,
       licenseLedger: { license, provenanceUrl, sourceUrl },
       files: {
         "model-card.md": {

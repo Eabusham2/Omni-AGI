@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import OmniConfig
 
@@ -252,7 +253,15 @@ class OmniDecoder(nn.Module):
             hidden = hidden + torch.tanh(self.memory_strength) * projected
 
         for block in self.blocks:
-            hidden = block(hidden)
+            if self.training and self.config.gradient_checkpointing:
+                hidden = checkpoint(
+                    block,
+                    hidden,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                hidden = block(hidden)
         hidden, routing = self._apply_experts(hidden)
         hidden = self.final_norm(hidden)
         logits = self.language_head(hidden)

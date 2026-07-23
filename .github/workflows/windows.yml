@@ -39,6 +39,7 @@ jobs:
         run: |
           npm run test:node
           npm run build
+          npm run test:ui:built
 
       - name: Build self-contained brain worker
         run: npm run build:engine:win

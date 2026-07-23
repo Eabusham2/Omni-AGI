@@ -99,7 +99,7 @@ class AdaptiveBrainTests(unittest.TestCase):
                 next(brain.decoder.parameters()).add_(100.0)
             raise RuntimeError("deliberate candidate failure")
 
-        brain._optimize_experience = explode
+        brain._experience_batch_loss = explode
         with self.assertRaisesRegex(RuntimeError, "deliberate"):
             brain.train(texts=["candidate rollback fixture"], epochs=1)
         self.assertEqual(before, brain.parameter_checksum())
@@ -200,6 +200,33 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertEqual(config.liquid_mode, "ltc")
         self.assertEqual(config.working_memory_slots, 7)
         self.assertEqual(config.parallel_thoughts, 2)
+        self.assertEqual(config.train_batch_size, 8)
+        self.assertEqual(config.gradient_accumulation, 2)
+        self.assertTrue(config.gradient_checkpointing)
+
+    def test_slow_training_uses_profile_batch_and_gradient_accumulation(self):
+        brain = self.make_brain(
+            train_batch_size=2,
+            gradient_accumulation=2,
+            gradient_checkpointing=True,
+        )
+        result = brain.train(
+            texts=[
+                "alpha learns amber",
+                "beta learns blue",
+                "gamma learns green",
+                "delta learns violet",
+            ],
+            epochs=1,
+        )
+        self.assertEqual(result["steps"], 4)
+        self.assertEqual(result["optimizerSteps"], 1)
+        self.assertEqual(result["physicalBatchSize"], 2)
+        self.assertEqual(result["gradientAccumulation"], 2)
+        self.assertTrue(
+            brain.runtime_card()["scale"]["gradientCheckpointing"]
+        )
+        brain.events.close()
 
     def test_working_memory_is_internal_bounded_and_persistent(self):
         parameter_config = OmniConfig.micro(
