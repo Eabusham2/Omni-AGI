@@ -18,8 +18,8 @@
     "test:ui:built": "playwright test --config playwright.config.ts",
     "test:watch": "vitest",
     "build:engine:win": "powershell -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
-    "package:win": "npm run build && npm run build:engine:win && electron-builder --win nsis zip --x64 --publish never",
-    "package:win:arm64": "npm run build && npm run build:engine:win && electron-builder --win nsis zip --arm64 --publish never"
+    "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Arch x64",
+    "package:win:arm64": "powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Arch arm64"
   },
   "dependencies": {
     "fflate": "^0.8.2",

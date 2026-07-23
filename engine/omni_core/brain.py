@@ -11,6 +11,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import time
 import uuid
 import wave
@@ -2378,45 +2379,53 @@ class AdaptiveBrain:
                     )
         else:
             try:
-                import imageio.v2 as imageio
-                try:
-                    decoded_frames = imageio.get_reader(path, format="FFMPEG")
-                    try:
-                        for frame in decoded_frames:
+                import imageio_ffmpeg
+
+                executable = imageio_ffmpeg.get_ffmpeg_exe()
+                with tempfile.TemporaryDirectory(
+                    prefix="omni-video-decode-"
+                ) as temporary:
+                    output_pattern = str(
+                        Path(temporary) / "frame-%06d.png"
+                    )
+                    subprocess.run(
+                        [
+                            executable,
+                            "-v",
+                            "error",
+                            "-i",
+                            str(Path(path).resolve()),
+                            "-frames:v",
+                            str(max(16, self.config.video_frames * 8)),
+                            output_pattern,
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=120,
+                    )
+                    for frame_path in sorted(Path(temporary).glob("frame-*.png")):
+                        with Image.open(frame_path) as opened_frame:
+                            frame = opened_frame.convert("RGB").resize(
+                                (
+                                    self.config.image_size,
+                                    self.config.image_size,
+                                )
+                            )
                             frames.append(
                                 np.asarray(
-                                    Image.fromarray(frame).convert("RGB").resize(
-                                        (
-                                            self.config.image_size,
-                                            self.config.image_size,
-                                        )
-                                    ),
+                                    frame,
                                     dtype="float32",
                                 ).copy()
                             )
-                    finally:
-                        close = getattr(decoded_frames, "close", None)
-                        if callable(close):
-                            close()
-                except (OSError, ValueError, RuntimeError):
-                    decoded = imageio.imread(path)
-                    if decoded.ndim == 3:
-                        decoded = decoded[None, ...]
-                    for frame in decoded:
-                        frames.append(
-                            np.asarray(
-                                Image.fromarray(frame).convert("RGB").resize(
-                                    (
-                                        self.config.image_size,
-                                        self.config.image_size,
-                                    )
-                                ),
-                                dtype="float32",
-                            ).copy()
-                        )
-            except (ImportError, OSError, ValueError) as error:
+            except (
+                ImportError,
+                OSError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as error:
                 raise RuntimeError(
-                    "MP4/WebM/MOV video needs imageio-ffmpeg; GIF works with Pillow"
+                    "MP4/WebM/MOV video needs the bundled FFmpeg decoder; GIF works with Pillow"
                 ) from error
         if not frames:
             raise ValueError("video contained no decodable frames")

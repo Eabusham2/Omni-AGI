@@ -61,19 +61,19 @@ npm run test:python:portable
 npm run dev
 ```
 
-Create a packaged x64 build:
+Create a packaged x64 build on x64 Windows:
 
 ```powershell
 npm run package:win
 ```
 
-Create a packaged ARM64 shell:
+Create a native ARM64 build on ARM64 Windows:
 
 ```powershell
 npm run package:win:arm64
 ```
 
-The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging produces NSIS and ZIP artifacts for x64 and ARM64. The Windows workflow verifies both packaged worker layouts; its x64 leg also drives the installed application through build, chat, navigation, trace export, imagination, download, and full restart. A real ARM64 desktop launch remains a separate hardware gate because the hosted packaging runner is x64.
+The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging produces NSIS and ZIP artifacts for x64 and ARM64. The Windows workflow uses matching native x64 and ARM64 Windows 11 runners, verifies both packaged worker layouts, and drives each installed application through build, chat, navigation, trace export, imagination, download, and full restart.
 
 ## Repository map
 

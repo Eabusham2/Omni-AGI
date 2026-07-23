@@ -9,22 +9,28 @@ on:
 
 jobs:
   test-and-package:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+          architecture: ${{ matrix.arch }}
           cache: npm
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+          architecture: ${{ matrix.arch }}
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -35,11 +41,14 @@ jobs:
       - name: Test brain
         run: npm run test:python:portable
 
-      - name: Test and build desktop app
-        run: |
-          npm run test:node
-          npm run build
-          npm run test:ui:built
+      - name: Test desktop app
+        run: npm run test:node
+
+      - name: Build desktop app
+        run: npm run build
+
+      - name: Test built desktop UI
+        run: npm run test:ui:built
 
       - name: Build self-contained brain worker
         run: npm run build:engine:win
@@ -65,7 +74,7 @@ jobs:
             -ReleaseRoot ./release
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: omni-agi-studio-windows-${{ matrix.arch }}
           if-no-files-found: error

@@ -78,7 +78,8 @@ try {
 
   $AppLaunched = $false
   $DesktopE2E = $false
-  if ($Arch -eq "x64") {
+  $HostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+  if ($Arch -eq $HostArch) {
     $PreviousExecutable = $env:OMNI_E2E_EXECUTABLE
     try {
       $env:OMNI_E2E_EXECUTABLE = $AppExecutables[0].FullName
@@ -86,7 +87,7 @@ try {
       try {
         & npm.cmd run test:ui:built
         if ($LASTEXITCODE -ne 0) {
-          throw "Installed x64 desktop end-to-end test failed with exit code $LASTEXITCODE."
+          throw "Installed $Arch desktop end-to-end test failed with exit code $LASTEXITCODE."
         }
       }
       finally {
@@ -104,7 +105,7 @@ try {
   $LaunchSkipReason = if ($AppLaunched) {
     ""
   } else {
-    "ARM64 Electron executable cannot run on the hosted x64 Windows runner."
+    "Package architecture $Arch does not match runner architecture $HostArch."
   }
   @{
     architecture = $Arch

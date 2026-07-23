@@ -110,8 +110,12 @@ describe("project integrity", () => {
       build: { win: { target: string[] } };
     }>("package.json");
 
-    expect(workflow).toContain("runs-on: windows-latest");
-    expect(workflow).toContain("arch: [x64, arm64]");
+    expect(workflow).toContain('runs-on: ${{ matrix.runner }}');
+    expect(workflow).toContain("arch: x64");
+    expect(workflow).toContain("runner: windows-latest");
+    expect(workflow).toContain("arch: arm64");
+    expect(workflow).toContain("runner: windows-11-arm");
+    expect(workflow).toContain('architecture: ${{ matrix.arch }}');
     expect(workflow).toContain("npm run test:python:portable");
     expect(workflow).toContain("npm run build:engine:win");
     expect(workflow).toContain("smoke-engine.ps1");
@@ -132,8 +136,8 @@ describe("project integrity", () => {
     expect(read("scripts/smoke-windows-package.ps1")).toContain(
       '"Omni AGI Studio.exe"'
     );
-    expect(packageDocument.scripts["package:win"]).toContain("--x64");
-    expect(packageDocument.scripts["package:win:arm64"]).toContain("--arm64");
+    expect(packageDocument.scripts["package:win"]).toContain("-Arch x64");
+    expect(packageDocument.scripts["package:win:arm64"]).toContain("-Arch arm64");
     expect(packageDocument.build.win.target).toEqual(expect.arrayContaining(["nsis", "zip"]));
   });
 });

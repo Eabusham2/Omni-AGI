@@ -975,7 +975,10 @@ export class ToolExecutor {
       if (names.some((name) => !allowed.has(name))) {
         throw new Error("Evolution tests may be typecheck, unit, or build.");
       }
-      const executable = process.platform === "win32" ? "npm.cmd" : "npm";
+      const executable =
+        process.platform === "win32"
+          ? (process.env.ComSpec?.trim() || "cmd.exe")
+          : "npm";
       const commands: Record<string, string[]> = {
         typecheck: ["run", "typecheck"],
         unit: ["test"],
@@ -983,9 +986,13 @@ export class ToolExecutor {
       };
       const checks = [];
       for (const name of names) {
+        const commandArgs =
+          process.platform === "win32"
+            ? ["/d", "/c", "npm.cmd", ...commands[name]!]
+            : commands[name]!;
         const result = await runEvolutionProcess(
           executable,
-          commands[name]!,
+          commandArgs,
           worktree,
           boundedTimeout(args.timeoutMs, 600_000)
         );
