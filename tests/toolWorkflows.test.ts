@@ -136,6 +136,8 @@ describe("ToolExecutor complete workflows", () => {
       writeFile(runningBinary, "running image remains unchanged\n")
     ]);
     await run("git", ["init"], sourceRepository);
+    await run("git", ["config", "core.autocrlf", "false"], sourceRepository);
+    await run("git", ["config", "core.eol", "lf"], sourceRepository);
     await run("git", ["config", "user.name", "Workflow Test"], sourceRepository);
     await run(
       "git",

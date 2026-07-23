@@ -9,8 +9,8 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $HostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
 if ($HostArch -ne $Arch) {
   throw (
-    "A native $Arch package requires a $Arch Windows host so Electron and the " +
-    "PyTorch/PyInstaller worker have the same architecture. Current host: $HostArch."
+    "A native $Arch Electron package requires a $Arch Windows host. " +
+    "The worker follows the architecture of the selected Python runtime. Current host: $HostArch."
   )
 }
 

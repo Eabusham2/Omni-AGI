@@ -54,9 +54,9 @@ Evidence: `engine/tests/test_memory_modalities.py`, `engine/tests/test_brain.py`
 - [ ] Windows 11 Build and Run modes are complete and accessible. A Playwright fixture checks keyboard focus, roles, and accessible navigation names; a green Windows run is still required.
 - [ ] Brain Library, Build wizard, one-chat workspace, Data Studio, Brain Map, Trace, Journal, Tools, Agents, Catalog, and Imagination are usable. The full built-app fixture passes on the development host; a packaged Windows pass is still required.
 - [ ] x64 Windows package builds in clean CI. NSIS and ZIP are configured; a successful workflow artifact is still required.
-- [ ] ARM64 Windows package builds in clean native CI. The workflow now targets `windows-11-arm` and builds a matching Python/PyTorch/PyInstaller worker plus Electron shell; a successful artifact is still required.
+- [ ] ARM64 Windows package builds in clean native CI. The workflow targets `windows-11-arm`, builds a native ARM64 Electron shell, and includes an x64 PyTorch/PyInstaller worker for Windows 11 emulation because no stable native PyTorch Windows ARM64 wheel is available; a successful installed-app artifact is still required.
 - [ ] A clean installation can provision or include its Python/PyTorch worker. CI now configures direct, ZIP, and silent-NSIS JSON-RPC worker smoke checks, but a green Windows artifact is still required.
-- [ ] State survives a full packaged-app restart and interrupted training. A killed JSON-RPC worker and an interrupted promotion both reload the complete stable safe-tensor checkpoint and quarantine the candidate. The Windows x64 package smoke now runs create/chat/imagine/close/relaunch/persistence against the installed executable, but the gate remains open until CI evidence is green.
+- [ ] State survives a full packaged-app restart and interrupted training. A killed JSON-RPC worker and an interrupted promotion both reload the complete stable safe-tensor checkpoint and quarantine the candidate. Each native Windows package smoke runs create/chat/imagine/close/relaunch/persistence against the installed executable, but the gate remains open until CI evidence is green.
 
 Configured evidence: `.github/workflows/windows.yml`,
 `scripts/smoke-engine.ps1`, `scripts/smoke-windows-package.ps1`, and

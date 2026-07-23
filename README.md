@@ -67,13 +67,13 @@ Create a packaged x64 build on x64 Windows:
 npm run package:win
 ```
 
-Create a native ARM64 build on ARM64 Windows:
+Create an ARM64 desktop build on ARM64 Windows:
 
 ```powershell
 npm run package:win:arm64
 ```
 
-The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging produces NSIS and ZIP artifacts for x64 and ARM64. The Windows workflow uses matching native x64 and ARM64 Windows 11 runners, verifies both packaged worker layouts, and drives each installed application through build, chat, navigation, trace export, imagination, download, and full restart.
+The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging produces NSIS and ZIP artifacts for x64 and ARM64. The Windows workflow uses native x64 and ARM64 Windows 11 runners, verifies both packaged worker layouts, and drives each installed application through build, chat, navigation, trace export, imagination, download, and full restart. The ARM64 package has a native ARM64 Electron shell and an x64 PyTorch/PyInstaller worker that runs through Windows 11 x64 emulation, because stable PyTorch Windows ARM64 wheels are not currently available.
 
 ## Repository map
 
@@ -81,6 +81,7 @@ The app uses Electron's Windows 11 Mica background where supported and falls bac
 - `src/main/` and `src/preload/` — isolated desktop lifecycle, IPC, tools, and brain supervision.
 - `engine/` — custom PyTorch brain, multimodal packs, and JSON-lines worker.
 - `docs/ARCHITECTURE.md` — implemented neural, tool, agent, and persistence paths.
+- `docs/COMPLETION_AUDIT.md` — requirement-to-code map and verified release gates.
 - `docs/OMNI_FORMAT.md` — strict version-1 `.omni` container contract and privacy boundary.
 - `docs/CATALOG_FORMATS.md` — non-executable recipe and `.omnipack` contracts.
 - `BitNet-main/`, `snntorch-master/`, `ncps-master/` — attributed upstream research snapshots.

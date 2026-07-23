@@ -222,6 +222,19 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
     await page.getByRole("button", { name: "Build a new brain" }).click();
     await expect(page.getByRole("heading", { name: "Build a brain" })).toBeVisible();
     await expect(page.locator(".recipe-card")).toHaveCount(6);
+    await page
+      .getByRole("button", { name: /Senses & tools Give it ways to perceive and act/ })
+      .click();
+    const audioCard = page.getByRole("button", {
+      name: /Audio Hear, encode, and imagine sound/
+    });
+    const videoCard = page.getByRole("button", {
+      name: /Video Learn temporal scenes/
+    });
+    await audioCard.click();
+    await videoCard.click();
+    await expect(audioCard).toHaveClass(/is-selected/);
+    await expect(videoCard).toHaveClass(/is-selected/);
     await page.getByRole("button", { name: /Review Create the immutable origin/ }).click();
     await page.getByPlaceholder("Name this mind").fill("E2E Cortex");
     await page.getByRole("button", { name: "Create E2E Cortex" }).click();
@@ -241,6 +254,36 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
     await expect(page.locator(".message--brain")).toHaveCount(1, {
       timeout: 60_000
     });
+
+    await composer.fill("/imagine image direct chat memory");
+    await page.getByLabel("Send message").click();
+    await expect(
+      page.getByText(/modality\.imagine\.generate completed and its visible result/)
+    ).toBeVisible({ timeout: 60_000 });
+    await expect
+      .poll(() =>
+        page.evaluate(async () => {
+          const api = (
+            window as unknown as {
+              omni: {
+                train: {
+                  list(): Promise<Array<{ kind: string; state: string }>>;
+                };
+              };
+            }
+          ).omni;
+          return (await api.train.list()).find((job) => job.kind === "image")
+            ?.state;
+        })
+      )
+      .toBe("complete");
+
+    await composer.fill("/agent Explore one isolated cobalt-memory association.");
+    await page.getByLabel("Send message").click();
+    await page.getByRole("button", { name: "Approve exact action" }).click();
+    await expect(
+      page.getByText(/agent\.fork\.start completed and its visible result/)
+    ).toBeVisible({ timeout: 90_000 });
 
     const surfaces = [
       ["Data & training", "Data & training"],
@@ -303,6 +346,52 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
         )
       )
       .toMatch(/\.png$/);
+
+    await page.getByRole("button", { name: "Audio", exact: true }).click();
+    await page.getByRole("button", { name: "Imagine audio" }).click();
+    await expect(page.locator("audio")).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByLabel("Download output")).toBeEnabled();
+    await page.getByLabel("Download output").click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                __omniDownloads: Array<{ download: string }>;
+              }
+            ).__omniDownloads[2]?.download
+        )
+      )
+      .toMatch(/\.wav$/);
+
+    await page.getByRole("button", { name: "Video", exact: true }).click();
+    await page.getByRole("button", { name: "Imagine video" }).click();
+    await expect(page.getByAltText("Locally generated video artifact")).toBeVisible({
+      timeout: 60_000
+    });
+    await expect(page.getByLabel("Download output")).toBeEnabled();
+    await page.getByLabel("Download output").click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                __omniDownloads: Array<{ download: string }>;
+              }
+            ).__omniDownloads[3]?.download
+        )
+      )
+      .toMatch(/\.png$/);
+
+    await page.getByRole("button", { name: "Forks & agents" }).click();
+    await page.getByRole("button", { name: "Review merge" }).first().click();
+    await expect(page.getByText(/MERGE PREVIEW · NO WEIGHTS CHANGED YET/)).toBeVisible();
+    await page.getByRole("button", { name: "Merge reviewed overlay" }).click();
+    await expect(page.getByText(/Merged \d+ ideas/)).toBeVisible({
+      timeout: 60_000
+    });
 
     for (const label of [
       "Conversation",

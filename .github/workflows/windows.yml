@@ -16,21 +16,30 @@ jobs:
         include:
           - arch: x64
             runner: windows-latest
+            node_arch: x64
+            python_arch: x64
+            worker_arch: x64
           - arch: arm64
             runner: windows-11-arm
+            node_arch: arm64
+            # PyTorch does not publish stable Windows ARM64 wheels. The app
+            # shell remains native ARM64 while its x64 worker runs through the
+            # Windows 11 x64-emulation layer.
+            python_arch: x64
+            worker_arch: x64
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-          architecture: ${{ matrix.arch }}
+          architecture: ${{ matrix.node_arch }}
           cache: npm
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-          architecture: ${{ matrix.arch }}
+          architecture: ${{ matrix.python_arch }}
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -71,6 +80,7 @@ jobs:
         run: |
           ./scripts/smoke-windows-package.ps1 `
             -Arch "${{ matrix.arch }}" `
+            -ExpectedWorkerArch "${{ matrix.worker_arch }}" `
             -ReleaseRoot ./release
 
       - name: Upload Windows artifacts

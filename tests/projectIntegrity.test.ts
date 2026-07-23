@@ -115,7 +115,11 @@ describe("project integrity", () => {
     expect(workflow).toContain("runner: windows-latest");
     expect(workflow).toContain("arch: arm64");
     expect(workflow).toContain("runner: windows-11-arm");
-    expect(workflow).toContain('architecture: ${{ matrix.arch }}');
+    expect(workflow).toContain("node_arch: arm64");
+    expect(workflow).toContain("python_arch: x64");
+    expect(workflow).toContain("worker_arch: x64");
+    expect(workflow).toContain('architecture: ${{ matrix.node_arch }}');
+    expect(workflow).toContain('architecture: ${{ matrix.python_arch }}');
     expect(workflow).toContain("npm run test:python:portable");
     expect(workflow).toContain("npm run build:engine:win");
     expect(workflow).toContain("smoke-engine.ps1");
@@ -135,6 +139,9 @@ describe("project integrity", () => {
     );
     expect(read("scripts/smoke-windows-package.ps1")).toContain(
       '"Omni AGI Studio.exe"'
+    );
+    expect(read("scripts/smoke-windows-package.ps1")).toContain(
+      "Get-PeArchitecture"
     );
     expect(packageDocument.scripts["package:win"]).toContain("-Arch x64");
     expect(packageDocument.scripts["package:win:arm64"]).toContain("-Arch arm64");

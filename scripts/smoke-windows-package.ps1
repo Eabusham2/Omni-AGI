@@ -2,6 +2,9 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet("x64", "arm64")]
   [string]$Arch,
+  [Parameter(Mandatory = $true)]
+  [ValidateSet("x64", "arm64")]
+  [string]$ExpectedWorkerArch,
   [string]$ReleaseRoot = ""
 )
 
@@ -35,6 +38,35 @@ function Get-OneArtifact {
   return $Matches[0]
 }
 
+function Get-PeArchitecture {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+  $Stream = [System.IO.File]::OpenRead($Path)
+  $Reader = [System.IO.BinaryReader]::new($Stream)
+  try {
+    if ($Reader.ReadUInt16() -ne 0x5A4D) {
+      throw "$Path is not a PE executable."
+    }
+    $Stream.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null
+    $PeOffset = $Reader.ReadInt32()
+    $Stream.Seek($PeOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+    if ($Reader.ReadUInt32() -ne 0x00004550) {
+      throw "$Path has an invalid PE signature."
+    }
+    $Machine = $Reader.ReadUInt16()
+    switch ($Machine) {
+      0x8664 { return "x64" }
+      0xAA64 { return "arm64" }
+      default { throw ("Unsupported PE machine 0x{0:X4} in {1}." -f $Machine, $Path) }
+    }
+  }
+  finally {
+    $Reader.Dispose()
+  }
+}
+
 try {
   $Zip = Get-OneArtifact -Extension "zip"
   $Installer = Get-OneArtifact -Extension "exe"
@@ -45,6 +77,10 @@ try {
   )
   if ($ZipWorkers.Count -ne 1) {
     throw "ZIP package must contain exactly one resources/engine-runtime/omni-engine.exe."
+  }
+  $ZipWorkerArch = Get-PeArchitecture -Path $ZipWorkers[0].FullName
+  if ($ZipWorkerArch -ne $ExpectedWorkerArch) {
+    throw "ZIP worker architecture $ZipWorkerArch does not match expected $ExpectedWorkerArch."
   }
   $ZipSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $ZipWorkers[0].FullName `
@@ -65,15 +101,24 @@ try {
   if ($InstalledWorkers.Count -ne 1) {
     throw "Installed package must contain exactly one resources/engine-runtime/omni-engine.exe."
   }
+  $InstalledWorkerArch = Get-PeArchitecture -Path $InstalledWorkers[0].FullName
+  if ($InstalledWorkerArch -ne $ExpectedWorkerArch) {
+    throw "Installed worker architecture $InstalledWorkerArch does not match expected $ExpectedWorkerArch."
+  }
   $InstalledSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $InstalledWorkers[0].FullName `
-    -BrainRoot (Join-Path $Scratch "installed-brain")
+    -BrainRoot (Join-Path $Scratch "installed-brain") `
+    -Comprehensive
 
   $AppExecutables = @(
     Get-ChildItem -Path $InstallRoot -File -Filter "Omni AGI Studio.exe"
   )
   if ($AppExecutables.Count -ne 1) {
     throw "Installed package is missing Omni AGI Studio.exe."
+  }
+  $AppArch = Get-PeArchitecture -Path $AppExecutables[0].FullName
+  if ($AppArch -ne $Arch) {
+    throw "Installed app architecture $AppArch does not match package architecture $Arch."
   }
 
   $AppLaunched = $false
@@ -113,6 +158,7 @@ try {
       name = $Zip.Name
       sha256 = (Get-FileHash -Algorithm SHA256 $Zip.FullName).Hash.ToLowerInvariant()
       packagedWorker = $ZipWorkers[0].FullName.Substring($ZipRoot.Length)
+      packagedWorkerArchitecture = $ZipWorkerArch
       rpcSmoke = $ZipSmoke | ConvertFrom-Json
     }
     nsis = @{
@@ -120,6 +166,8 @@ try {
       sha256 = (Get-FileHash -Algorithm SHA256 $Installer.FullName).Hash.ToLowerInvariant()
       silentInstall = $true
       packagedWorker = $InstalledWorkers[0].FullName.Substring($InstallRoot.Length)
+      packagedWorkerArchitecture = $InstalledWorkerArch
+      desktopArchitecture = $AppArch
       rpcSmoke = $InstalledSmoke | ConvertFrom-Json
       desktopLaunch = $AppLaunched
       desktopEndToEnd = $DesktopE2E

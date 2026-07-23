@@ -3163,6 +3163,7 @@ function ImaginationWorkspace({ brain, onToast }: { brain: BrainDocument; onToas
   const [installedPacks, setInstalledPacks] = useState<InstalledModalityPack[]>([]);
   const [packUrl, setPackUrl] = useState("");
   const [packBusy, setPackBusy] = useState(false);
+  const settledJobs = useRef(new Set<string>());
   const demo = !window.omni;
 
   const reloadPacks = async () => {
@@ -3175,12 +3176,15 @@ function ImaginationWorkspace({ brain, onToast }: { brain: BrainDocument; onToas
   }, [brain.id]);
 
   useEffect(() => {
-    if (!window.omni) return;
-    return window.omni.train.onEvent(({ job: eventJob }) => {
-      if (eventJob.id !== job?.id) return;
+    const trackedId = job?.id;
+    if (!window.omni || !trackedId) return;
+    const applyJob = (eventJob: RuntimeJob) => {
+      if (eventJob.id !== trackedId) return;
       setJob(eventJob);
       if (["complete", "failed", "cancelled"].includes(eventJob.state)) {
         setGenerating(false);
+        if (settledJobs.current.has(eventJob.id)) return;
+        settledJobs.current.add(eventJob.id);
         if (eventJob.state === "complete") {
           setVariation((current) => current + 1);
           onToast("Local modality artifact completed.");
@@ -3188,8 +3192,21 @@ function ImaginationWorkspace({ brain, onToast }: { brain: BrainDocument; onToas
           onToast(eventJob.error);
         }
       }
+    };
+    const unsubscribe = window.omni.train.onEvent(({ job: eventJob }) => {
+      applyJob(eventJob);
     });
-  }, [job?.id, onToast]);
+    // A tiny local pack can finish before React commits the new job id and
+    // installs the event subscription. The durable job list closes that race.
+    void window.omni.train
+      .list(brain.id)
+      .then((jobs) => {
+        const current = jobs.find((candidate) => candidate.id === trackedId);
+        if (current) applyJob(current);
+      })
+      .catch(() => undefined);
+    return unsubscribe;
+  }, [brain.id, job?.id, onToast]);
 
   const generate = async () => {
     setGenerating(true);
