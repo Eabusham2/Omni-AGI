@@ -1,0 +1,11 @@
+node_modules/
+out/
+release/
+.vite/
+coverage/
+.runtime/
+.engine-build/
+engine-dist/
+*.omni
+*.log
+.DS_Store

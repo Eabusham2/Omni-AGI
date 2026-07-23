@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "plastic-synapse-lab",
+  "name": "Plastic Synapse Lab",
+  "description": "A research-first spiking associative system that can be studied without a fluent language cortex.",
+  "origin": "blank",
+  "hardwareProfile": "micro",
+  "architecture": {
+    "preset": "neuromorphic",
+    "text": {
+      "vocabularySize": 259,
+      "contextLength": 64,
+      "dimension": 32,
+      "layers": 1,
+      "heads": 2,
+      "ternary": true
+    },
+    "spiking": {
+      "enabled": true,
+      "neurons": 512,
+      "stdp": true,
+      "metaplasticity": true,
+      "structuralGrowth": "elastic"
+    },
+    "liquid": {
+      "enabled": false
+    },
+    "ideas": {
+      "enabled": true,
+      "hypervectorDimensions": 1024
+    },
+    "modalities": {
+      "vision": false,
+      "imageGeneration": false,
+      "audio": false,
+      "video": false
+    }
+  },
+  "memoryRecipe": "synapses-only",
+  "toolPermission": "off"
+}

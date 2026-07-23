@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "whole-brain-micro",
+  "name": "Whole Brain · Micro",
+  "description": "The complete OmniCortex pathway at smoke-test scale.",
+  "origin": "blank",
+  "hardwareProfile": "micro",
+  "architecture": {
+    "preset": "whole-brain",
+    "text": {
+      "vocabularySize": 259,
+      "contextLength": 128,
+      "dimension": 64,
+      "layers": 2,
+      "heads": 4,
+      "ternary": true
+    },
+    "spiking": {
+      "enabled": true,
+      "neurons": 128,
+      "stdp": true,
+      "metaplasticity": true
+    },
+    "liquid": {
+      "enabled": true,
+      "kind": "cfc",
+      "units": 32
+    },
+    "ideas": {
+      "enabled": true,
+      "hypervectorDimensions": 512
+    },
+    "modalities": {
+      "vision": true,
+      "imageGeneration": true,
+      "audio": true,
+      "video": true
+    }
+  },
+  "memoryRecipe": "human-consolidation",
+  "toolPermission": "ask"
+}
