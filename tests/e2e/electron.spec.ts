@@ -177,8 +177,8 @@ async function launchInstalled(
             )
             .catch(() => undefined);
         }
-        const exitedCleanly = await waitForExit(child, 30_000);
         await browser?.close().catch(() => undefined);
+        const exitedCleanly = await waitForExit(child, 30_000);
         if (!exitedCleanly) await terminateProcessTree(child);
       }
     };
@@ -422,6 +422,11 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
     await expect(page.getByText("hello evolving cortex")).toBeVisible();
   } finally {
     await application?.close().catch(() => undefined);
-    await rm(dataDirectory, { recursive: true, force: true });
+    await rm(dataDirectory, {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 250
+    });
   }
 });

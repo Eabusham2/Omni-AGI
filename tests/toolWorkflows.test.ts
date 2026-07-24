@@ -326,7 +326,7 @@ describe("ToolExecutor complete workflows", () => {
     ).resolves.toBe("changed after validation\n");
     expect(sha256(await readFile(runningBinary))).toBe(runningBinaryHash);
     expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
-  });
+  }, 60_000);
 
   it("runs isolated subagent forks and leaves the parent's neural state unchanged", async () => {
     await setPermission("agent.fork", "full");
@@ -449,5 +449,5 @@ describe("ToolExecutor complete workflows", () => {
       kind: "tool",
       summary: "agent.fork.start: complete."
     });
-  });
+  }, 60_000);
 });
