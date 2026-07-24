@@ -54,7 +54,7 @@ The following local gates passed on the development host after a clean
 | `npm audit` | 0 known vulnerabilities |
 | Whitespace/error-marker audit | Passed |
 | Native Windows x64 package | Passed again in run 30066558290; ZIP and NSIS uploaded with a comprehensive installed-app smoke record |
-| Native Windows ARM64 package | All build/worker/package paths passed in run 30066558290; installed desktop remains unproven after NSIS omitted the top-level app executable. A direct-ZIP attempt was too slow in run 30067949274; the focused 7z staging repair awaits proof |
+| Native Windows ARM64 package | All build/worker/package paths passed through run 30069924407; installed desktop remains unproven after the 7z archive omitted its top-level app executable. The current installer embeds that verified unpacked executable separately and is intentionally not rerun |
 
 The Windows release workflow uses two matching GitHub-hosted runners:
 
@@ -94,13 +94,18 @@ executable.
 Run [30067949274](https://github.com/Eabusham2/Omni-AGI/actions/runs/30067949274)
 then proved that routing the full package through NSIS ZIP extraction made the
 final package smoke pathologically slow on both architectures; it was
-cancelled after more than twenty minutes in that step. Packaging now restores
-the previously fast 7z path and uses a custom NSIS `customInstall` macro to
-copy only a missing top-level executable from the still-materialized
-`$PLUGINSDIR\7z-out` staging tree. The smoke verifier reports each major
-phase and checks the executable immediately after installation and again
-after worker exercise. ARM64 remains the sole unproven release item until
-that focused repair completes natively.
+cancelled after more than twenty minutes in that step.
+
+Run [30069924407](https://github.com/Eabusham2/Omni-AGI/actions/runs/30069924407)
+restored the fast 7z path and proved the staging archive itself did not contain
+the native executable. The final `customInstall` macro therefore embeds a
+second copy directly from electron-builder's verified
+`release/win-arm64-unpacked` directory and writes it only when normal
+extraction omitted it. The
+x64 companion installed its app and worker and reached a live CDP WebSocket,
+but Playwright's handshake stalled for 120 seconds; CI now gives that isolated
+end-to-end test one fresh-process retry. Per user direction these final two
+fixes are not rerun, so ARM64 remains the sole unproven release item.
 
 The x64 package uses an x64 shell and worker. The ARM64 package uses a native
 ARM64 shell with an x64 PyTorch worker under Windows 11 emulation because a

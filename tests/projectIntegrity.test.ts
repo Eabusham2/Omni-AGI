@@ -177,10 +177,13 @@ describe("project integrity", () => {
     const installerInclude = read("build/installer.nsh");
     expect(installerInclude).toContain("!macro customInstall");
     expect(installerInclude).toContain(
-      '$PLUGINSDIR\\7z-out\\${APP_EXECUTABLE_FILENAME}'
+      'File /oname="${APP_EXECUTABLE_FILENAME}"'
     );
     expect(installerInclude).toContain(
-      '${IfNot} ${FileExists} "$INSTDIR\\${APP_EXECUTABLE_FILENAME}"'
+      '"${PROJECT_DIR}\\release\\win-arm64-unpacked\\${APP_EXECUTABLE_FILENAME}"'
+    );
+    expect(read("playwright.config.ts")).toContain(
+      "retries: process.env.CI ? 1 : 0"
     );
   });
 });
