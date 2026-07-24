@@ -453,7 +453,12 @@ export class ToolExecutor {
       case "web.search":
         return this.search(invocation.action, invocation.arguments, signal);
       case "modality.imagine":
-        return this.imagine(invocation.brainId, invocation.action, invocation.arguments);
+        return this.imagine(
+          invocation.brainId,
+          invocation.action,
+          invocation.arguments,
+          signal
+        );
       case "agent.fork":
         return this.agent(
           invocation.brainId,
@@ -746,17 +751,18 @@ export class ToolExecutor {
     }
   }
 
-  private imagine(
+  private async imagine(
     brainId: string,
     action: string,
-    args: Record<string, unknown>
-  ): unknown {
+    args: Record<string, unknown>,
+    signal: AbortSignal
+  ): Promise<unknown> {
     if (action !== "generate") throw new Error("Unknown imagination action.");
     const modality = argumentString(args, "modality", 16);
     if (!["image", "audio", "video"].includes(modality)) {
       throw new Error("Imagination modality must be image, audio, or video.");
     }
-    return this.jobs.generate({
+    const job = this.jobs.generate({
       brainId,
       modality: modality as "image" | "audio" | "video",
       conceptIds: Array.isArray(args.conceptIds)
@@ -767,6 +773,33 @@ export class ToolExecutor {
           ? (args.settings as Record<string, string | number | boolean>)
           : undefined
     });
+    const finished = await this.jobs.wait(
+      job.id,
+      signal,
+      boundedTimeout(args.timeoutMs, 600_000)
+    );
+    if (finished.state === "failed") {
+      throw new Error(finished.error || `${modality} generation failed.`);
+    }
+    if (finished.state === "cancelled") throw toolCancellationError();
+    if (finished.state !== "complete") {
+      throw new Error(`${modality} generation ended in an unexpected state.`);
+    }
+    const output =
+      typeof finished.output === "object" && finished.output !== null
+        ? (finished.output as Record<string, unknown>)
+        : { value: finished.output };
+    return {
+      ...output,
+      jobId: finished.id,
+      state: finished.state,
+      artifactPath:
+        typeof output.artifactPath === "string"
+          ? output.artifactPath
+          : typeof output.path === "string"
+            ? output.path
+            : undefined
+    };
   }
 
   private async agent(

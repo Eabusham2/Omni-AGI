@@ -277,6 +277,15 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
         })
       )
       .toBe("complete");
+    await expect(page.locator(".message--human").last()).toContainText(
+      '"artifactPath"'
+    );
+    await expect(page.locator(".message--human").last()).toContainText(
+      '"state": "complete"'
+    );
+    await expect(page.locator(".message--human").last()).not.toContainText(
+      '"state": "running"'
+    );
 
     await composer.fill("/agent Explore one isolated cobalt-memory association.");
     await page.getByLabel("Send message").click();
@@ -367,7 +376,7 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
 
     await page.getByRole("button", { name: "Video", exact: true }).click();
     await page.getByRole("button", { name: "Imagine video" }).click();
-    await expect(page.getByAltText("Locally generated video artifact")).toBeVisible({
+    await expect(page.getByLabel("Locally generated video artifact")).toBeVisible({
       timeout: 60_000
     });
     await expect(page.getByLabel("Download output")).toBeEnabled();
@@ -383,7 +392,7 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
             ).__omniDownloads[3]?.download
         )
       )
-      .toMatch(/\.png$/);
+      .toMatch(/\.mp4$/);
 
     await page.getByRole("button", { name: "Forks & agents" }).click();
     await page.getByRole("button", { name: "Review merge" }).first().click();

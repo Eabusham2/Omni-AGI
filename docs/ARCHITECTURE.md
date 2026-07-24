@@ -117,11 +117,11 @@ Working-memory slots, short-term half-life, replay threshold, forgetting rate, a
 All current packs share the configured idea dimension. A blank build initializes them randomly; a compatible materialized starter may supply trained pack weights:
 
 - a compact convolutional vision encoder;
-- a VQ image autoencoder with a ternary, idea/time-conditioned latent transformer denoiser;
+- a VQ image autoencoder with a ternary, idea/time-conditioned latent transformer trained against an explicit latent noise-prediction objective;
 - a two-stage residual-vector-quantized audio codec with a ternary latent-token generator;
-- a compressed video autoencoder with factorized spatial/temporal evolution and a CfC-like liquid temporal gate.
+- a compressed video autoencoder with factorized spatial/temporal latent denoising, an explicit noise-prediction objective, and a CfC-like liquid temporal gate.
 
-Fixtures prove that every pack can overfit a miniature example, save as safe tensors, reload, and generate byte-identical seeded output. Image input supports Pillow-compatible images. Audio accepts PCM WAV directly, formats supported by libsndfile such as FLAC/OGG, and FFmpeg-decoded MP3/M4A/AAC where available. Video accepts animated GIF/WebP and FFmpeg-backed MP4/WebM/MOV. Generated artifacts are PNG, WAV, and animated PNG. These are tiny functional baselines inspired by DiT, EnCodec, and Latte, not quality-equivalent reproductions.
+Fixtures prove that every pack can overfit a miniature example, save as safe tensors, reload, and generate byte-identical seeded output. Image input supports Pillow-compatible images. Audio accepts PCM WAV directly, formats supported by libsndfile such as FLAC/OGG, and FFmpeg-decoded MP3/M4A/AAC where available. Video accepts animated GIF/WebP and FFmpeg-backed MP4/WebM/MOV. Generated artifacts are PNG, WAV, and H.264 MP4; animated PNG remains a fallback when the bundled FFmpeg encoder cannot run. These are tiny functional baselines inspired by DiT, EnCodec, and Latte, not quality-equivalent reproductions.
 
 ## Persistence and lineage
 
@@ -181,7 +181,7 @@ Current, origin, and private-archive exports carry materialized tensor bytes. A 
 
 ## Tools and agents
 
-Tool schemas are structured VSA model inputs; grant enforcement stays in Electron. They describe capability, not persona or behavior, and create no additional language prompt tokens. The model may emit one `<omni-tool>` JSON request, while users can call the same path directly with `/tool <tool.id> <action> {JSON}`, `/imagine image|audio|video`, or `/agent <objective>`. Tool results are displayed and returned to the brain as a visible structured experience. Recursive model-produced calls are capped at four actions for a turn.
+Tool schemas are structured VSA model inputs; grant enforcement stays in Electron. They describe capability, not persona or behavior, and create no additional language prompt tokens. The model may emit one `<omni-tool>` JSON request, while users can call the same path directly with `/tool <tool.id> <action> {JSON}`, `/imagine image|audio|video`, or `/agent <objective>`. Tool results are displayed and returned to the brain as a visible structured experience. Long-running imagination calls remain cancellable and do not report completion or enter experience until the neural job produces its final artifact metadata. Recursive model-produced calls are capped at four actions for a turn.
 
 `Off` rejects execution. `Ask` issues a five-minute, single-use approval token bound to the exact brain ID, tool ID, action, and SHA-256 digest of the serialized JSON arguments. `Auto` executes its safe subset but still asks for writes and other risky operations; its file reads are confined by real-path checks to the selected brain directory. `Full Authority` executes a valid invocation without an approval token. All levels append permission, invocation, result, cancellation, and failure stages to the same operational trace used by the brain. Arguments are represented by names and digests rather than copied file contents. Active processes, fetches, browser loads, and modality jobs have cancellation paths; a cancelled worker job is interrupted and late results are ignored.
 

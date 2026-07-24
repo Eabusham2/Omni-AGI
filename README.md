@@ -16,7 +16,7 @@ The project combines a tiny trainable ternary language cortex, spiking/STDP asso
 - Immediate fast-weight learning plus slower checkpointed consolidation.
 - Parameter-only, human-consolidation, and total-recall memory recipes.
 - A single persistent identity/chat per build with origin, snapshots, forks, and export.
-- Tiny trainable image, audio, and video baselines that share the brain's idea space.
+- Tiny trainable image, audio, and video baselines that share the brain's idea space, including latent denoising and local MP4 imagination output.
 - Validated declarative build recipes and modality-only safe-tensor packs.
 - Structured tool capabilities encoded through the VSA idea channel without adding tool-schema prose to the chat prompt.
 - Direct chat tool calls, exact one-use approvals, cancellation, and visible operational audit records.

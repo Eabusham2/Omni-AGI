@@ -57,6 +57,7 @@ class MemoryAndModalityTests(unittest.TestCase):
         image = torch.randn(1, 3, config.image_size, config.image_size).clamp(-1, 1)
         image_result = hub.image(image, idea)
         self.assertEqual(tuple(image_result["reconstruction"].shape), tuple(image.shape))
+        self.assertGreater(float(image_result["diffusion_loss"].item()), 0.0)
 
         audio = torch.randn(1, 1, config.audio_samples).clamp(-1, 1)
         audio_result = hub.audio(audio, idea)
@@ -71,6 +72,7 @@ class MemoryAndModalityTests(unittest.TestCase):
         ).clamp(-1, 1)
         video_result = hub.video(video, idea)
         self.assertEqual(tuple(video_result["reconstruction"].shape), tuple(video.shape))
+        self.assertGreater(float(video_result["diffusion_loss"].item()), 0.0)
 
         loss = (
             image_result["loss"] + audio_result["loss"] + video_result["loss"]

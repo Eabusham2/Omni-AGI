@@ -2805,6 +2805,61 @@ class AdaptiveBrain:
         return b"".join(output)
 
     @staticmethod
+    def _mp4_bytes(video: torch.Tensor, fps: int = 8) -> bytes:
+        """Encode a generated tensor into a browser-viewable H.264 MP4."""
+
+        try:
+            import imageio_ffmpeg
+        except ImportError as error:
+            raise RuntimeError("MP4 output requires the bundled FFmpeg runtime") from error
+        value = video.detach().cpu().float()
+        if value.ndim == 5:
+            value = value[0]
+        if value.ndim != 4 or value.shape[0] != 3:
+            raise ValueError("video output must have shape [3, frames, height, width]")
+        value = ((value.clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
+        frames = value.permute(1, 2, 3, 0).contiguous()
+        height, width = int(frames.shape[1]), int(frames.shape[2])
+        frame_rate = max(1, min(60, int(fps)))
+        with tempfile.TemporaryDirectory(prefix="omni-video-output-") as temporary:
+            output = Path(temporary) / "generated.mp4"
+            subprocess.run(
+                [
+                    imageio_ffmpeg.get_ffmpeg_exe(),
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-s:v",
+                    "%dx%d" % (width, height),
+                    "-r",
+                    str(frame_rate),
+                    "-i",
+                    "-",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    str(output),
+                ],
+                input=frames.numpy().tobytes(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=120,
+            )
+            encoded = output.read_bytes()
+        if len(encoded) < 12 or encoded[4:8] != b"ftyp":
+            raise RuntimeError("FFmpeg did not produce a valid MP4 container")
+        return encoded
+
+    @staticmethod
     def _wav_bytes(waveform: torch.Tensor, sample_rate: int = 16000) -> bytes:
         value = waveform.detach().cpu().float().reshape(-1).clamp(-1, 1)
         samples = array.array("h", (value * 32767.0).to(torch.int16).tolist())
@@ -2944,13 +2999,23 @@ class AdaptiveBrain:
                 artifact.write_bytes(artifact_bytes)
                 mime_type = "audio/wav"
             elif modality == "video":
-                artifact = artifact_dir / (artifact_id + ".png")
-                artifact_bytes = self._apng_bytes(
-                    output,
-                    fps=int(_finite_number((settings or {}).get("fps"), 8)),
-                )
+                fps = int(_finite_number((settings or {}).get("fps"), 8))
+                container_fallback = ""
+                try:
+                    artifact_bytes = self._mp4_bytes(output, fps=fps)
+                    artifact = artifact_dir / (artifact_id + ".mp4")
+                    mime_type = "video/mp4"
+                except (
+                    ImportError,
+                    OSError,
+                    RuntimeError,
+                    subprocess.SubprocessError,
+                ) as error:
+                    artifact_bytes = self._apng_bytes(output, fps=fps)
+                    artifact = artifact_dir / (artifact_id + ".png")
+                    mime_type = "image/apng"
+                    container_fallback = str(error)
                 artifact.write_bytes(artifact_bytes)
-                mime_type = "image/apng"
             else:
                 raise ValueError("modality must be image, audio, video, or vision")
             result = {
@@ -2968,6 +3033,8 @@ class AdaptiveBrain:
                     "on the disclosed pack and local modality training."
                 ),
             }
+            if modality == "video":
+                result["containerFallback"] = container_fallback
             if len(artifact_bytes) <= 8 * 1024 * 1024:
                 result["dataUrl"] = (
                     "data:%s;base64,%s"

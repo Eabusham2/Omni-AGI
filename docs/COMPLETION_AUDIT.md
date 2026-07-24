@@ -29,11 +29,11 @@ implementation boundaries are recorded in [../RESEARCH.md](../RESEARCH.md).
 | Fuzzy behavior and traceability | Seeded exploration noise, uncertainty-driven branches, voluntary bounded pondering, activation/mutation traces, and model self-reports labeled as non-authoritative | `engine/omni_core/brain.py`; `engine/tests/test_release_gates.py` |
 | No RLHF or hidden behavioral persona | No reward/preference model or behavioral system prompt in the training/generation path; role boundaries are non-text tokens | `engine/tests/test_model.py`; `tests/projectIntegrity.test.ts`; `docs/MODEL_CARD.md` |
 | One identity and continuous chat | One durable chat per brain, immutable origin, snapshots, origin restore, fork lineage, and restart persistence | `src/main/brainRepository.ts`; `tests/brainRepository.test.ts`; `tests/e2e/electron.spec.ts` |
-| Direct tools from chat | `/tool`, `/imagine`, and `/agent` plus bounded model-produced `<omni-tool>` calls use the same permission-checked, cancellable, traced executor | `src/renderer/src/App.tsx`; `src/main/toolExecutor.ts`; `tests/toolExecutor.test.ts` |
-| Windows files, PowerShell, code, web, browser, and media tools | Structured protocols with Off, Ask, Auto, and Full Authority; exact one-use approvals; visible execution records | `tools/protocols.json`; `src/main/toolExecutor.ts`; `tests/toolExecutor.test.ts` |
+| Direct tools from chat | `/tool`, `/imagine`, and `/agent` plus bounded model-produced `<omni-tool>` calls use the same permission-checked, cancellable, traced executor; imagination waits for final artifact metadata before returning experience | `src/renderer/src/App.tsx`; `src/main/toolExecutor.ts`; `tests/toolExecutor.test.ts`; `tests/e2e/electron.spec.ts` |
+| Windows files, PowerShell, code, web, browser, and media tools | Structured protocols with Off, Ask, Auto, and Full Authority; exact one-use approvals; visible execution records | `tools/catalog.json`; `src/main/toolExecutor.ts`; `tests/toolExecutor.test.ts` |
 | Tool knowledge inside the brain without prompt prose | Enabled schemas are encoded as bounded deterministic VSA capability vectors and add no prompt tokens | `engine/omni_core/tool_schemas.py`; `engine/tests/test_tool_schemas.py` |
 | PDF/code/document learning | PDF, text, Markdown, JSON, source, folders, images, audio, and video flow through provenance-aware ingestion and selected Encode/Consolidate/Pretrain/Archive policies | `src/main/brainService.ts`; `engine/omni_core/brain.py`; `engine/tests/test_release_gates.py` |
-| Vision and imagination | Trainable compact vision encoder, VQ image model with ternary latent transformer, RVQ audio model, and factorized liquid-gated video model | `engine/omni_core/modalities.py`; `engine/tests/test_memory_modalities.py` |
+| Vision and imagination | Trainable compact vision encoder, VQ image model with ternary latent noise prediction, RVQ audio model, factorized liquid-gated video denoising, and local MP4 output | `engine/omni_core/modalities.py`; `engine/omni_core/brain.py`; `engine/tests/test_memory_modalities.py`; `engine/tests/test_brain.py` |
 | Forked subagents and reviewed merging | Copy-on-write brain forks execute isolated turns; merge previews bind exact overlay/file hashes and never average full dense models | `src/main/brainService.ts`; `src/main/toolExecutor.ts`; `tests/toolWorkflows.test.ts` |
 | Self-modification | Authorized Git worktree proposal, diff, allowlisted test/build, exact-diff validation, tamper rejection, and optional merge promotion | `src/main/toolExecutor.ts`; `tests/toolWorkflows.test.ts` |
 | Download, copy, share, and restore | Strict non-executable `.omni` current/origin/private/referenced exports, content-addressed tensors, safe import, and separate declarative recipe/pack formats | `src/main/brainRepository.ts`; `src/main/catalogInstaller.ts`; `docs/OMNI_FORMAT.md`; `docs/CATALOG_FORMATS.md` |
@@ -47,7 +47,7 @@ The following local gates passed on the development host after a clean
 | Gate | Result |
 | --- | --- |
 | Python neural/integration suite | 43 of 43 passed |
-| Node/Electron unit and workflow suite | 43 of 43 passed |
+| Node/Electron unit and workflow suite | 44 of 44 passed |
 | TypeScript checks and production Electron build | Passed |
 | Real built Electron UI test | Passed, including build, chat, neural worker health, all primary surfaces, trace export, image generation/download, close, relaunch, identity persistence, and chat persistence |
 | Python bytecode compilation | Passed |

@@ -37,9 +37,9 @@ Evidence: `engine/tests/test_model.py`, `engine/tests/test_brain.py`, `engine/te
 ## Inputs, imagination, and learning
 
 - [x] Text, Markdown, JSON, source, folder, and PDF ingestion paths exist; real PDF extraction is tested.
-- [x] Image understanding and generation execute real model paths.
+- [x] Image understanding and generation execute real model paths, including latent noise-prediction training and iterative ternary-transformer denoising.
 - [x] Audio input and generation execute real model paths for PCM WAV, tested FLAC, and common soundfile/FFmpeg-backed formats.
-- [x] Video input and generation execute real model paths for animated GIF/WebP and tested FFmpeg-backed MP4.
+- [x] Video input and generation execute real model paths for animated GIF/WebP and tested FFmpeg-backed MP4, with factorized latent noise prediction, liquid temporal gating, iterative denoising, and generated H.264 MP4 output.
 - [x] Text, image, audio, and video miniature fixtures decrease loss, reload safe tensors, and reproduce identical seeded output.
 - [x] Uploading data can change model weights rather than only appending context.
 - [x] Dataset catalog, quarantined web-corpus mode, and source provenance are visible.
@@ -72,7 +72,7 @@ Implementation and fixture sources: `.github/workflows/windows.yml`,
 
 - [x] Off, Ask, Auto, and Full Authority grants are enforced by the Electron executor.
 - [x] Files, PowerShell, code, web, browser, and media tools have structured protocols.
-- [x] Users can invoke tools directly from chat, and bounded model-produced calls use the same visible, permission-checked execution path.
+- [x] Users can invoke tools directly from chat, and bounded model-produced calls use the same visible, permission-checked execution path. Long-running imagination calls wait for the final artifact before their result is learned into chat experience.
 - [x] Ask approvals are one-use, expiring, and bound to the exact brain, tool, action, and serialized-argument digest; execution and worker jobs have tested cancellation paths.
 - [x] Browser execution produces a guarded, isolated, sanitized inert HTML/text/link/PNG snapshot without exposing remote active content or an interactive signed-in browser. A native Electron retry on the development host after full restart verified HTTP status/title/text, an absolute HTTPS link, visible chat feedback, and a real artifact PNG; Windows packaging remains a separate open gate.
 - [x] Source self-modification uses an authorized isolated Git worktree with diff inventory, allowlisted build/test, exact-diff validation, tamper rejection, and optional promotion.
@@ -88,6 +88,7 @@ Evidence: `engine/tests/test_tool_schemas.py`, `engine/tests/test_brain.py`, `te
 - [x] UI does not claim proven AGI, consciousness, human equivalence, or perfect parametric recall.
 - [x] Every currently identified research-derived module has a source and license-boundary ledger.
 - [x] Vendored MIT and Apache license texts are configured to ship in the package.
+- [x] The pinned imageio-ffmpeg wrapper and its separately licensed GPL FFmpeg executable are disclosed in the packaged third-party notice, including exact source and redistribution-obligation links.
 - [x] Original code uses PolyForm Noncommercial plus separate commercial licensing.
 - [x] Imported model/dataset licenses remain separate and visible through catalog labels and the required `.omni` per-source provenance/license ledger; undeclared rights remain explicitly undeclared.
 

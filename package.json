@@ -89,6 +89,14 @@
       {
         "from": "ncps-master/LICENSE",
         "to": "licenses/NCPS-Apache-2.0.txt"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "licenses/THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "licenses/imageio-ffmpeg-BSD-2-Clause.txt",
+        "to": "licenses/imageio-ffmpeg-BSD-2-Clause.txt"
       }
     ],
     "win": {

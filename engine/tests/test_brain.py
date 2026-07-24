@@ -165,10 +165,16 @@ class AdaptiveBrainTests(unittest.TestCase):
         video = brain.generate_modality("video", prompt="moving light", seed=3)
         self.assertEqual(Path(image["path"]).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
         self.assertEqual(Path(audio["path"]).read_bytes()[:4], b"RIFF")
-        self.assertEqual(Path(video["path"]).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
         self.assertTrue(image["dataUrl"].startswith("data:image/png;base64,"))
         self.assertTrue(audio["dataUrl"].startswith("data:audio/wav;base64,"))
-        self.assertTrue(video["dataUrl"].startswith("data:image/apng;base64,"))
+        if video["mimeType"] == "video/mp4":
+            self.assertEqual(Path(video["path"]).read_bytes()[4:8], b"ftyp")
+            self.assertTrue(video["dataUrl"].startswith("data:video/mp4;base64,"))
+            self.assertEqual(video["containerFallback"], "")
+        else:
+            self.assertEqual(Path(video["path"]).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertTrue(video["dataUrl"].startswith("data:image/apng;base64,"))
+            self.assertTrue(video["containerFallback"])
         brain.events.close()
 
     def test_snapshot_and_append_only_event_log(self):

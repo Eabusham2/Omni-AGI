@@ -24,7 +24,6 @@ import {
 import {
   DEFAULT_CONFIG,
   type BrainDocument,
-  type RuntimeJob,
   type ToolPermissionLevel
 } from "../src/shared/types";
 
@@ -287,25 +286,66 @@ describe("ToolExecutor release gates", () => {
     executor = new ToolExecutor(service, jobs);
     await setPermission("modality.imagine", "auto");
 
+    const pendingExecution = executor.execute({
+      brainId: brain.id,
+      toolId: "modality.imagine",
+      action: "generate",
+      arguments: { modality: "image", conceptIds: ["concept-1"] }
+    });
+    await vi.waitFor(() => {
+      expect(jobs.list(brain.id)).toEqual([
+        expect.objectContaining({ kind: "image", state: "running" })
+      ]);
+    });
+
+    expect(executor.cancel(brain.id)).toBe(1);
+    const execution = await pendingExecution;
+    expect(execution.state).toBe("failed");
+    expect(execution.error).toMatch(/cancelled/i);
+    expect(engine.interruptAndRestart).toHaveBeenCalledOnce();
+
+    finishWorker?.({ artifactPath: join(temporaryRoot, "late.png") });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(jobs.list(brain.id)[0]?.state).toBe("cancelled");
+  });
+
+  it("waits for imagination and returns the completed artifact to chat tools", async () => {
+    const artifactPath = join(temporaryRoot, "finished.png");
+    const engine = Object.assign(new EventEmitter(), {
+      request: vi.fn(async () => ({
+        path: artifactPath,
+        mimeType: "image/png",
+        seed: 41,
+        dataUrl: "data:image/png;base64,fixture"
+      })),
+      tryRequest: vi.fn(async () => undefined),
+      interruptAndRestart: vi.fn(async () => true)
+    }) as unknown as EngineSupervisor;
+    const jobs = new RuntimeJobManager(service, engine);
+    executor = new ToolExecutor(service, jobs);
+    await setPermission("modality.imagine", "auto");
+
     const execution = await executor.execute({
       brainId: brain.id,
       toolId: "modality.imagine",
       action: "generate",
       arguments: { modality: "image", conceptIds: ["concept-1"] }
     });
+
     expect(execution.state).toBe("complete");
-    const generated = execution.output as RuntimeJob;
-    expect(generated.state).toBe("running");
-
-    const cancelled = await jobs.cancel(generated.id);
-    expect(cancelled.state).toBe("cancelled");
-    expect(engine.interruptAndRestart).toHaveBeenCalledOnce();
-
-    finishWorker?.({ artifactPath: join(temporaryRoot, "late.png") });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(jobs.list(brain.id).find((job) => job.id === generated.id)?.state).toBe(
-      "cancelled"
-    );
+    expect(execution.output).toMatchObject({
+      state: "complete",
+      artifactPath,
+      path: artifactPath,
+      mimeType: "image/png",
+      seed: 41,
+      dataUrl: "data:image/png;base64,fixture",
+      jobId: expect.stringMatching(/^[a-f0-9-]{36}$/i)
+    });
+    expect(jobs.list(brain.id)[0]).toMatchObject({
+      state: "complete",
+      output: { path: artifactPath, mimeType: "image/png", seed: 41 }
+    });
   });
 
   it("does not run fallback consolidation after cancelling neural training", async () => {

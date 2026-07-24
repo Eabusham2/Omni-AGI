@@ -220,16 +220,30 @@ class TinyImageImagination(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         latent = self.encoder(images)
         quantized, commitment = self.quantizer(latent)
+        timestep = 0.55
+        alpha = 1.0 - timestep * 0.72
+        noise = torch.randn_like(quantized)
+        noisy = alpha**0.5 * quantized + (1.0 - alpha) ** 0.5 * noise
+        predicted_noise = self.denoiser(noisy, idea, timestep=timestep)
+        diffusion_loss = F.mse_loss(predicted_noise, noise)
+        denoised = (
+            noisy - (1.0 - alpha) ** 0.5 * predicted_noise
+        ) / max(alpha**0.5, 1e-4)
         conditioned = (
-            quantized
+            0.8 * quantized
+            + 0.2 * denoised
             + self.idea_projection(idea)[:, :, None, None]
-            + 0.1 * self.denoiser(quantized, idea, timestep=0.0)
         )
         reconstructed = self.decoder(conditioned)
         return {
             "reconstruction": reconstructed,
             "commitment_loss": commitment,
-            "loss": F.mse_loss(reconstructed, images) + 0.1 * commitment,
+            "diffusion_loss": diffusion_loss,
+            "loss": (
+                F.mse_loss(reconstructed, images)
+                + 0.1 * commitment
+                + 0.05 * diffusion_loss
+            ),
         }
 
     def generate(
@@ -415,30 +429,47 @@ class TinyVideoImagination(nn.Module):
         self, video: torch.Tensor, idea: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         latent = self.encoder(video)
-        conditioned = latent + 0.1 * self._condition(idea)
-        reconstructed = self.decoder(self._evolve(conditioned))
+        condition = self._condition(idea)
+        timestep = 0.6
+        alpha = 1.0 - timestep * 0.7
+        noise = torch.randn_like(latent)
+        noisy = alpha**0.5 * latent + (1.0 - alpha) ** 0.5 * noise
+        predicted_noise = self._evolve(noisy + 0.1 * condition)
+        diffusion_loss = F.mse_loss(predicted_noise, noise)
+        denoised = (
+            noisy - (1.0 - alpha) ** 0.5 * predicted_noise
+        ) / max(alpha**0.5, 1e-4)
+        reconstructed = self.decoder(
+            0.8 * latent + 0.2 * denoised + 0.05 * condition
+        )
         embedding = F.normalize(
             self.encoder_projection(latent.mean(dim=(2, 3, 4))), dim=-1
         )
         return {
             "reconstruction": reconstructed,
             "embedding": embedding,
-            "loss": F.mse_loss(reconstructed, video),
+            "diffusion_loss": diffusion_loss,
+            "loss": F.mse_loss(reconstructed, video) + 0.05 * diffusion_loss,
         }
 
     def generate(
         self, idea: torch.Tensor, generator: torch.Generator, steps: int = 3
     ) -> torch.Tensor:
-        latent = self._condition(idea)
-        noise = torch.randn(
-            latent.shape,
+        condition = self._condition(idea)
+        latent = torch.randn(
+            condition.shape,
             generator=generator,
-            device=latent.device,
-            dtype=latent.dtype,
+            device=condition.device,
+            dtype=condition.dtype,
         )
-        latent = latent + 0.25 * noise
-        for _ in range(max(1, steps)):
-            latent = 0.75 * latent + 0.25 * self._evolve(latent)
+        total_steps = max(1, steps)
+        for index in range(total_steps):
+            timestep = 1.0 - index / float(total_steps)
+            predicted_noise = self._evolve(
+                latent + (0.05 + 0.1 * timestep) * condition
+            )
+            rate = 0.32 / float(index + 1)
+            latent = latent - rate * predicted_noise + 0.08 * condition
         return self.decoder(latent).clamp(-1.0, 1.0)
 
 

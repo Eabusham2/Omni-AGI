@@ -93,8 +93,19 @@
       "defaultGrant": "auto",
       "actions": {
         "generate": {
-          "input": { "modality": "image|audio|video", "settings": "object?" },
-          "output": { "artifactPath": "string", "traceId": "string" }
+          "input": {
+            "modality": "image|audio|video",
+            "conceptIds": "string[]?",
+            "settings": "object?",
+            "timeoutMs": "number?"
+          },
+          "output": {
+            "jobId": "string",
+            "state": "complete",
+            "artifactPath": "string",
+            "mimeType": "string",
+            "seed": "number"
+          }
         }
       }
     },

@@ -1623,6 +1623,68 @@ export class RuntimeJobManager extends EventEmitter {
       .map((job) => ({ ...job }));
   }
 
+  async wait(
+    jobId: string,
+    signal?: AbortSignal,
+    timeoutMs = 600_000
+  ): Promise<RuntimeJob> {
+    const terminal = new Set<RuntimeJob["state"]>([
+      "complete",
+      "failed",
+      "cancelled"
+    ]);
+    const current = this.jobs.get(jobId);
+    if (!current) throw new Error("The runtime job was not found.");
+    if (terminal.has(current.state)) return { ...current };
+    if (signal?.aborted) {
+      await this.cancel(jobId);
+      throw new Error("Runtime job was cancelled.");
+    }
+
+    return new Promise<RuntimeJob>((resolveJob, rejectJob) => {
+      let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.off("event", onEvent);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const finish = (
+        result: { job: RuntimeJob } | { error: Error }
+      ): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if ("error" in result) rejectJob(result.error);
+        else resolveJob({ ...result.job });
+      };
+      const onEvent = ({ job }: RuntimeJobEvent): void => {
+        if (job.id === jobId && terminal.has(job.state)) finish({ job });
+      };
+      const cancelAndReject = (message: string): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        void this.cancel(jobId)
+          .catch(() => undefined)
+          .finally(() => rejectJob(new Error(message)));
+      };
+      const onAbort = (): void => cancelAndReject("Runtime job was cancelled.");
+      const timer = setTimeout(
+        () => cancelAndReject("Runtime job timed out."),
+        Math.max(1_000, Math.min(3_600_000, Math.round(timeoutMs)))
+      );
+
+      this.on("event", onEvent);
+      signal?.addEventListener("abort", onAbort, { once: true });
+
+      // The job can finish between the first state check and listener setup.
+      const afterSubscription = this.jobs.get(jobId);
+      if (afterSubscription && terminal.has(afterSubscription.state)) {
+        finish({ job: afterSubscription });
+      }
+    });
+  }
+
   startTraining(request: StartTrainingRequest): RuntimeJob {
     const job = this.createJob(request.brainId, "training", "Training slow neural parameters");
     void this.run(job, async () => {

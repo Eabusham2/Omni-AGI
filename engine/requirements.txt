@@ -5,7 +5,7 @@ numpy>=1.24,<3
 Pillow>=10,<13
 pypdf>=4,<7
 imageio>=2.34,<3
-imageio-ffmpeg>=0.5,<1
+imageio-ffmpeg==0.6.0
 soundfile>=0.12,<1
 
 # Optional on supported Windows GPU systems:

@@ -35,17 +35,35 @@ describe("project integrity", () => {
   });
 
   it("ships the noncommercial terms separately from commercial permission", () => {
-    const packageDocument = readJson<{ license: string }>("package.json");
+    const packageDocument = readJson<{
+      license: string;
+      build: { extraResources: Array<{ from: string; to: string }> };
+    }>("package.json");
     const noncommercial = read("LICENSE.md");
     const commercial = read("COMMERCIAL_LICENSE.md");
+    const notices = read("THIRD_PARTY_NOTICES.md");
 
     expect(packageDocument.license).toBe("SEE LICENSE IN LICENSE.md");
     expect(noncommercial).toContain("PolyForm Noncommercial License 1.0.0");
     expect(noncommercial).toContain("Noncommercial Purpose");
     expect(commercial).toContain("Commercial and for-profit use");
-    expect(read("THIRD_PARTY_NOTICES.md")).toContain("BitNet");
-    expect(read("THIRD_PARTY_NOTICES.md")).toContain("snnTorch");
-    expect(read("THIRD_PARTY_NOTICES.md")).toContain("NCPS");
+    expect(notices).toContain("BitNet");
+    expect(notices).toContain("snnTorch");
+    expect(notices).toContain("NCPS");
+    expect(notices).toContain("imageio-ffmpeg");
+    expect(notices).toContain("GPL-2.0-or-later");
+    expect(notices).toContain("corresponding-source");
+    expect(read("licenses/imageio-ffmpeg-BSD-2-Clause.txt")).toContain(
+      "Copyright (c) 2019-2025, imageio"
+    );
+    expect(packageDocument.build.extraResources).toContainEqual({
+      from: "THIRD_PARTY_NOTICES.md",
+      to: "licenses/THIRD_PARTY_NOTICES.md"
+    });
+    expect(packageDocument.build.extraResources).toContainEqual({
+      from: "licenses/imageio-ffmpeg-BSD-2-Clause.txt",
+      to: "licenses/imageio-ffmpeg-BSD-2-Clause.txt"
+    });
   });
 
   it("requires provenance and license labels for every catalog entry", () => {

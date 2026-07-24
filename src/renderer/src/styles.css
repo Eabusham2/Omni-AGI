@@ -5146,7 +5146,8 @@ textarea:focus-visible,
   border-radius: 50%;
 }
 
-.generated-media-image {
+.generated-media-image,
+.generated-media-video {
   position: absolute;
   width: 100%;
   height: 100%;
