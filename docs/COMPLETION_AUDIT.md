@@ -53,8 +53,8 @@ The following local gates passed on the development host after a clean
 | Python bytecode compilation | Passed |
 | `npm audit` | 0 known vulnerabilities |
 | Whitespace/error-marker audit | Passed |
-| Native Windows x64 package | Passed in run 30063378852; ZIP and NSIS uploaded with a comprehensive installed-app smoke record |
-| Native Windows ARM64 package | Package and worker paths executed in run 30064377772; installed desktop gate remains unproven after a verifier lookup failure |
+| Native Windows x64 package | Passed again in run 30066558290; ZIP and NSIS uploaded with a comprehensive installed-app smoke record |
+| Native Windows ARM64 package | All build/worker/package paths passed in run 30066558290; installed desktop remains unproven after NSIS omitted the top-level app executable, with a direct-ZIP extraction fix intentionally not rerun |
 
 The Windows release workflow uses two matching GitHub-hosted runners:
 
@@ -78,10 +78,22 @@ made its CDP endpoint and WebSocket available but exceeded Playwright's
 30-second connection handshake. The ARM64 package passed the ZIP worker and
 the comprehensive silently-installed worker exercise, then the verifier
 searched only the installation root for the desktop executable. The source
-now gives the CDP handshake 120 seconds and resolves the installed executable
-from its worker application root with a recursive exact-name fallback. These
-two verifier changes are implemented but were not rerun, so ARM64 remains an
-open evidence gate rather than being inferred green.
+then gave the CDP handshake 120 seconds and resolved the installed executable
+from its worker application root with a recursive exact-name fallback. Run
+30066558290 exercised both changes: x64 passed, while ARM64 exposed a separate
+NSIS extraction defect rather than another lookup failure.
+
+Run [30066558290](https://github.com/Eabusham2/Omni-AGI/actions/runs/30066558290)
+fully passed and uploaded the x64 release. On native ARM64 it passed both
+source suites, the production and built-UI gates, the self-contained worker,
+package creation, ZIP worker, silent NSIS installation, and the comprehensive
+installed-worker neural exercise. The installed resources tree was complete,
+but the NSIS 7z staging/copy path omitted only the top-level native Electron
+executable. Packaging now sets `nsis.useZip` so NSIS extracts directly into
+the install directory, and the smoke verifier checks the executable
+immediately after installation and again after worker exercise. Per user
+direction this final packaging fix was not rerun, so ARM64 remains the sole
+unproven release item.
 
 The x64 package uses an x64 shell and worker. The ARM64 package uses a native
 ARM64 shell with an x64 PyTorch worker under Windows 11 emulation because a

@@ -92,6 +92,46 @@ function Remove-TreeWithRetry {
   }
 }
 
+function Get-InstalledAppExecutable {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$InstallRoot,
+    [Parameter(Mandatory = $true)]
+    [string]$WorkerPath
+  )
+  # The worker is at <app>/resources/engine-runtime/omni-engine.exe.
+  $WorkerAppRoot = Split-Path -Parent (
+    Split-Path -Parent (
+      Split-Path -Parent $WorkerPath
+    )
+  )
+  $Expected = Join-Path $WorkerAppRoot "Omni AGI Studio.exe"
+  $Matches = if (Test-Path -LiteralPath $Expected -PathType Leaf) {
+    @((Get-Item -LiteralPath $Expected -Force))
+  } else {
+    @(
+      Get-ChildItem `
+        -LiteralPath $InstallRoot `
+        -Recurse `
+        -Force `
+        -File `
+        -Filter "Omni AGI Studio.exe"
+    )
+  }
+  if ($Matches.Count -ne 1) {
+    $InstalledExecutables = @(
+      Get-ChildItem -LiteralPath $InstallRoot -Recurse -Force -File -Filter "*.exe" |
+        ForEach-Object { $_.FullName.Substring($InstallRoot.Length) }
+    )
+    throw (
+      "Installed package must contain exactly one Omni AGI Studio.exe; found " +
+      "$($Matches.Count). Installed executables: " +
+      ($InstalledExecutables -join ", ")
+    )
+  }
+  return $Matches[0]
+}
+
 try {
   $Zip = Get-OneArtifact -Extension "zip"
   $Installer = Get-OneArtifact -Extension "exe"
@@ -130,41 +170,23 @@ try {
   if ($InstalledWorkerArch -ne $ExpectedWorkerArch) {
     throw "Installed worker architecture $InstalledWorkerArch does not match expected $ExpectedWorkerArch."
   }
+  # Resolve the desktop binary immediately after installation. This separates
+  # extraction failures from anything exercised by the neural worker smoke.
+  $AppExecutable = Get-InstalledAppExecutable `
+    -InstallRoot $InstallRoot `
+    -WorkerPath $InstalledWorkers[0].FullName
+  $AppArch = Get-PeArchitecture -Path $AppExecutable.FullName
+  if ($AppArch -ne $Arch) {
+    throw "Installed app architecture $AppArch does not match package architecture $Arch."
+  }
+
   $InstalledSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $InstalledWorkers[0].FullName `
     -BrainRoot (Join-Path $Scratch "installed-brain") `
     -Comprehensive
 
-  # NSIS can place the application one directory below the requested /D root
-  # on native ARM64 hosts. Resolve the executable from the installed worker's
-  # application root first, then fall back to a recursive exact-name search.
-  $WorkerAppRoot = Split-Path -Parent (
-    Split-Path -Parent (
-      Split-Path -Parent $InstalledWorkers[0].FullName
-    )
-  )
-  $ExpectedAppExecutable = Join-Path $WorkerAppRoot "Omni AGI Studio.exe"
-  $AppExecutables = if (Test-Path -LiteralPath $ExpectedAppExecutable -PathType Leaf) {
-    @((Get-Item -LiteralPath $ExpectedAppExecutable))
-  } else {
-    @(
-      Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter "Omni AGI Studio.exe"
-    )
-  }
-  if ($AppExecutables.Count -ne 1) {
-    $InstalledExecutables = @(
-      Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter "*.exe" |
-        ForEach-Object { $_.FullName.Substring($InstallRoot.Length) }
-    )
-    throw (
-      "Installed package must contain exactly one Omni AGI Studio.exe; found " +
-      "$($AppExecutables.Count). Installed executables: " +
-      ($InstalledExecutables -join ", ")
-    )
-  }
-  $AppArch = Get-PeArchitecture -Path $AppExecutables[0].FullName
-  if ($AppArch -ne $Arch) {
-    throw "Installed app architecture $AppArch does not match package architecture $Arch."
+  if (-not (Test-Path -LiteralPath $AppExecutable.FullName -PathType Leaf)) {
+    throw "Installed desktop executable disappeared during the worker smoke."
   }
 
   $AppLaunched = $false
@@ -173,7 +195,7 @@ try {
   if ($Arch -eq $HostArch) {
     $PreviousExecutable = $env:OMNI_E2E_EXECUTABLE
     try {
-      $env:OMNI_E2E_EXECUTABLE = $AppExecutables[0].FullName
+      $env:OMNI_E2E_EXECUTABLE = $AppExecutable.FullName
       Push-Location $RepoRoot
       try {
         & npm.cmd run test:ui:built

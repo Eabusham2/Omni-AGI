@@ -125,7 +125,7 @@ describe("project integrity", () => {
     const workflow = read(".github/workflows/windows.yml");
     const packageDocument = readJson<{
       scripts: Record<string, string>;
-      build: { win: { target: string[] } };
+      build: { win: { target: string[] }; nsis: { useZip: boolean } };
     }>("package.json");
 
     expect(workflow).toContain('runs-on: ${{ matrix.runner }}');
@@ -159,7 +159,10 @@ describe("project integrity", () => {
       '"Omni AGI Studio.exe"'
     );
     expect(read("scripts/smoke-windows-package.ps1")).toContain(
-      'Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter "Omni AGI Studio.exe"'
+      "Get-InstalledAppExecutable"
+    );
+    expect(read("scripts/smoke-windows-package.ps1")).toContain(
+      "Installed desktop executable disappeared during the worker smoke."
     );
     expect(read("scripts/smoke-windows-package.ps1")).toContain(
       "Get-PeArchitecture"
@@ -170,5 +173,6 @@ describe("project integrity", () => {
     expect(packageDocument.scripts["package:win"]).toContain("-Arch x64");
     expect(packageDocument.scripts["package:win:arm64"]).toContain("-Arch arm64");
     expect(packageDocument.build.win.target).toEqual(expect.arrayContaining(["nsis", "zip"]));
+    expect(packageDocument.build.nsis.useZip).toBe(true);
   });
 });
