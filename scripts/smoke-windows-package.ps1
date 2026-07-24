@@ -67,6 +67,31 @@ function Get-PeArchitecture {
   }
 }
 
+function Remove-TreeWithRetry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+    [int]$Attempts = 60
+  )
+  for ($Attempt = 1; $Attempt -le $Attempts; $Attempt++) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+      return
+    }
+    try {
+      Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+      return
+    }
+    catch {
+      if ($Attempt -eq $Attempts) {
+        throw
+      }
+      # Windows can briefly retain mapped PyInstaller extensions while an
+      # emulated worker finishes process teardown.
+      Start-Sleep -Milliseconds 1000
+    }
+  }
+}
+
 try {
   $Zip = Get-OneArtifact -Extension "zip"
   $Installer = Get-OneArtifact -Extension "exe"
@@ -181,6 +206,6 @@ try {
 }
 finally {
   if (Test-Path $Scratch) {
-    Remove-Item -Recurse -Force $Scratch
+    Remove-TreeWithRetry -Path $Scratch
   }
 }

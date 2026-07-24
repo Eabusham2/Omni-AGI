@@ -143,6 +143,9 @@ describe("project integrity", () => {
     expect(read("scripts/smoke-windows-package.ps1")).toContain(
       "Get-PeArchitecture"
     );
+    expect(read("scripts/smoke-windows-package.ps1")).toContain(
+      "Remove-TreeWithRetry"
+    );
     expect(packageDocument.scripts["package:win"]).toContain("-Arch x64");
     expect(packageDocument.scripts["package:win:arm64"]).toContain("-Arch arm64");
     expect(packageDocument.build.win.target).toEqual(expect.arrayContaining(["nsis", "zip"]));
