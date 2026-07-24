@@ -135,6 +135,7 @@ function Get-InstalledAppExecutable {
 try {
   $Zip = Get-OneArtifact -Extension "zip"
   $Installer = Get-OneArtifact -Extension "exe"
+  Write-Host "Package smoke [$Arch]: expanding ZIP artifact."
   Expand-Archive -LiteralPath $Zip.FullName -DestinationPath $ZipRoot
   $ZipWorkers = @(
     Get-ChildItem -Path $ZipRoot -Recurse -File -Filter "omni-engine.exe" |
@@ -151,6 +152,7 @@ try {
     -Executable $ZipWorkers[0].FullName `
     -BrainRoot (Join-Path $Scratch "zip-brain")
 
+  Write-Host "Package smoke [$Arch]: silently installing NSIS artifact."
   $Install = Start-Process `
     -FilePath $Installer.FullName `
     -ArgumentList @("/S", "/D=$InstallRoot") `
@@ -180,6 +182,7 @@ try {
     throw "Installed app architecture $AppArch does not match package architecture $Arch."
   }
 
+  Write-Host "Package smoke [$Arch]: exercising installed neural worker."
   $InstalledSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $InstalledWorkers[0].FullName `
     -BrainRoot (Join-Path $Scratch "installed-brain") `
@@ -195,6 +198,7 @@ try {
   if ($Arch -eq $HostArch) {
     $PreviousExecutable = $env:OMNI_E2E_EXECUTABLE
     try {
+      Write-Host "Package smoke [$Arch]: exercising installed desktop and restart."
       $env:OMNI_E2E_EXECUTABLE = $AppExecutable.FullName
       Push-Location $RepoRoot
       try {
@@ -248,6 +252,7 @@ try {
   Write-Host "Windows package smoke evidence: $EvidencePath"
 }
 finally {
+  Write-Host "Package smoke [$Arch]: cleaning temporary package state."
   if (Test-Path $Scratch) {
     Remove-TreeWithRetry -Path $Scratch
   }

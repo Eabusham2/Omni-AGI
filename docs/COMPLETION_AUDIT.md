@@ -54,7 +54,7 @@ The following local gates passed on the development host after a clean
 | `npm audit` | 0 known vulnerabilities |
 | Whitespace/error-marker audit | Passed |
 | Native Windows x64 package | Passed again in run 30066558290; ZIP and NSIS uploaded with a comprehensive installed-app smoke record |
-| Native Windows ARM64 package | All build/worker/package paths passed in run 30066558290; installed desktop remains unproven after NSIS omitted the top-level app executable, with a direct-ZIP extraction fix intentionally not rerun |
+| Native Windows ARM64 package | All build/worker/package paths passed in run 30066558290; installed desktop remains unproven after NSIS omitted the top-level app executable. A direct-ZIP attempt was too slow in run 30067949274; the focused 7z staging repair awaits proof |
 
 The Windows release workflow uses two matching GitHub-hosted runners:
 
@@ -89,11 +89,18 @@ source suites, the production and built-UI gates, the self-contained worker,
 package creation, ZIP worker, silent NSIS installation, and the comprehensive
 installed-worker neural exercise. The installed resources tree was complete,
 but the NSIS 7z staging/copy path omitted only the top-level native Electron
-executable. Packaging now sets `nsis.useZip` so NSIS extracts directly into
-the install directory, and the smoke verifier checks the executable
-immediately after installation and again after worker exercise. Per user
-direction this final packaging fix was not rerun, so ARM64 remains the sole
-unproven release item.
+executable.
+
+Run [30067949274](https://github.com/Eabusham2/Omni-AGI/actions/runs/30067949274)
+then proved that routing the full package through NSIS ZIP extraction made the
+final package smoke pathologically slow on both architectures; it was
+cancelled after more than twenty minutes in that step. Packaging now restores
+the previously fast 7z path and uses a custom NSIS `customInstall` macro to
+copy only a missing top-level executable from the still-materialized
+`$PLUGINSDIR\7z-out` staging tree. The smoke verifier reports each major
+phase and checks the executable immediately after installation and again
+after worker exercise. ARM64 remains the sole unproven release item until
+that focused repair completes natively.
 
 The x64 package uses an x64 shell and worker. The ARM64 package uses a native
 ARM64 shell with an x64 PyTorch worker under Windows 11 emulation because a

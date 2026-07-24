@@ -173,6 +173,14 @@ describe("project integrity", () => {
     expect(packageDocument.scripts["package:win"]).toContain("-Arch x64");
     expect(packageDocument.scripts["package:win:arm64"]).toContain("-Arch arm64");
     expect(packageDocument.build.win.target).toEqual(expect.arrayContaining(["nsis", "zip"]));
-    expect(packageDocument.build.nsis.useZip).toBe(true);
+    expect(packageDocument.build.nsis.useZip).toBe(false);
+    const installerInclude = read("build/installer.nsh");
+    expect(installerInclude).toContain("!macro customInstall");
+    expect(installerInclude).toContain(
+      '$PLUGINSDIR\\7z-out\\${APP_EXECUTABLE_FILENAME}'
+    );
+    expect(installerInclude).toContain(
+      '${IfNot} ${FileExists} "$INSTDIR\\${APP_EXECUTABLE_FILENAME}"'
+    );
   });
 });
