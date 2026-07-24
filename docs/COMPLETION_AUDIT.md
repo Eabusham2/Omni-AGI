@@ -53,22 +53,40 @@ The following local gates passed on the development host after a clean
 | Python bytecode compilation | Passed |
 | `npm audit` | 0 known vulnerabilities |
 | Whitespace/error-marker audit | Passed |
+| Native Windows x64 package | Passed in run 30063378852; ZIP and NSIS uploaded with a comprehensive installed-app smoke record |
+| Native Windows ARM64 package | Package and worker paths executed in run 30064377772; installed desktop gate remains unproven after a verifier lookup failure |
 
-The Windows release gate is complete only when both native-host matrix legs
-pass on their matching GitHub-hosted runners:
+The Windows release workflow uses two matching GitHub-hosted runners:
 
 - x64 on `windows-latest`;
 - ARM64 on `windows-11-arm`.
 
-Each leg must run the neural and desktop suites, produce NSIS and ZIP
-artifacts, smoke the worker from both layouts, silently install the app, drive
-the installed UI over CDP, close/relaunch it, and upload a
-`windows-package-smoke-<arch>.json` evidence record containing artifact
-hashes. The x64 package uses an x64 shell and worker. The ARM64 package uses a
-native ARM64 shell with an x64 PyTorch worker under Windows 11 emulation,
-because no stable native PyTorch Windows ARM64 wheel is available. A
-configured workflow or an unexecuted cross-build is not counted as successful
-evidence.
+Run [30063378852](https://github.com/Eabusham2/Omni-AGI/actions/runs/30063378852)
+produced the current successful x64 release record. Its installed NSIS app
+passed accessibility navigation, direct chat/tool/subagent paths, image,
+audio, and video generation, slow/fast parameter mutation, real PDF
+ingestion, safe-tensor and SQLite persistence, and full close/relaunch state
+recovery. The uploaded ZIP SHA-256 is
+`c9935bd703bb8fda9aa7835e5eec13dfe1a2cf15e9f4fc7b6c5de94b6e6fc761`;
+the NSIS SHA-256 is
+`a8218ac9dc2e15be636a61bb68a3008f93a6e8013a199204b2e7e5d80e5f541c`.
+
+Run [30064377772](https://github.com/Eabusham2/Omni-AGI/actions/runs/30064377772)
+completed both architecture source suites, builds, built-UI tests,
+self-contained workers, and Windows package builds. The x64 installed app
+made its CDP endpoint and WebSocket available but exceeded Playwright's
+30-second connection handshake. The ARM64 package passed the ZIP worker and
+the comprehensive silently-installed worker exercise, then the verifier
+searched only the installation root for the desktop executable. The source
+now gives the CDP handshake 120 seconds and resolves the installed executable
+from its worker application root with a recursive exact-name fallback. These
+two verifier changes are implemented but were not rerun, so ARM64 remains an
+open evidence gate rather than being inferred green.
+
+The x64 package uses an x64 shell and worker. The ARM64 package uses a native
+ARM64 shell with an x64 PyTorch worker under Windows 11 emulation because a
+stable native PyTorch Windows ARM64 wheel is not available. A configured
+workflow or an unexecuted fix is never counted here as successful evidence.
 
 ## Deliberate limits
 

@@ -135,11 +135,32 @@ try {
     -BrainRoot (Join-Path $Scratch "installed-brain") `
     -Comprehensive
 
-  $AppExecutables = @(
-    Get-ChildItem -Path $InstallRoot -File -Filter "Omni AGI Studio.exe"
+  # NSIS can place the application one directory below the requested /D root
+  # on native ARM64 hosts. Resolve the executable from the installed worker's
+  # application root first, then fall back to a recursive exact-name search.
+  $WorkerAppRoot = Split-Path -Parent (
+    Split-Path -Parent (
+      Split-Path -Parent $InstalledWorkers[0].FullName
+    )
   )
+  $ExpectedAppExecutable = Join-Path $WorkerAppRoot "Omni AGI Studio.exe"
+  $AppExecutables = if (Test-Path -LiteralPath $ExpectedAppExecutable -PathType Leaf) {
+    @((Get-Item -LiteralPath $ExpectedAppExecutable))
+  } else {
+    @(
+      Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter "Omni AGI Studio.exe"
+    )
+  }
   if ($AppExecutables.Count -ne 1) {
-    throw "Installed package is missing Omni AGI Studio.exe."
+    $InstalledExecutables = @(
+      Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter "*.exe" |
+        ForEach-Object { $_.FullName.Substring($InstallRoot.Length) }
+    )
+    throw (
+      "Installed package must contain exactly one Omni AGI Studio.exe; found " +
+      "$($AppExecutables.Count). Installed executables: " +
+      ($InstalledExecutables -join ", ")
+    )
   }
   $AppArch = Get-PeArchitecture -Path $AppExecutables[0].FullName
   if ($AppArch -ne $Arch) {

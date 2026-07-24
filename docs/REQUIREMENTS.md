@@ -1,6 +1,6 @@
 # Completion evidence matrix
 
-This file preserves the requested scope. A checked item has current inspectable implementation evidence and, where practical, an automated fixture. A checked research item is not a claim of model quality. Windows packaging and clean-install items remain unchecked until a green Windows Actions run and a Windows 11 smoke test produce artifacts and logs.
+This file preserves the requested scope. A checked item has current inspectable implementation evidence and, where practical, an automated fixture. A checked research item is not a claim of model quality. Windows items are checked only where a native Windows Actions run produced direct logs or an uploaded smoke record; an implemented but unexecuted CI fix is not counted as release evidence.
 
 ## Custom adaptive brain
 
@@ -51,18 +51,22 @@ Evidence: `engine/tests/test_memory_modalities.py`, `engine/tests/test_brain.py`
 
 ## Windows application
 
-- [ ] Windows 11 Build and Run modes are complete and accessible. A Playwright fixture checks keyboard focus, roles, and accessible navigation names; a green Windows run is still required.
-- [ ] Brain Library, Build wizard, one-chat workspace, Data Studio, Brain Map, Trace, Journal, Tools, Agents, Catalog, and Imagination are usable. The full built-app fixture passes on the development host; a packaged Windows pass is still required.
-- [ ] x64 Windows package builds in clean CI. NSIS and ZIP are configured; a successful workflow artifact is still required.
-- [ ] ARM64 Windows package builds in clean native CI. The workflow targets `windows-11-arm`, builds a native ARM64 Electron shell, and includes an x64 PyTorch/PyInstaller worker for Windows 11 emulation because no stable native PyTorch Windows ARM64 wheel is available; a successful installed-app artifact is still required.
-- [ ] A clean installation can provision or include its Python/PyTorch worker. CI now configures direct, ZIP, and silent-NSIS JSON-RPC worker smoke checks, but a green Windows artifact is still required.
-- [ ] State survives a full packaged-app restart and interrupted training. A killed JSON-RPC worker and an interrupted promotion both reload the complete stable safe-tensor checkpoint and quarantine the candidate. Each native Windows package smoke runs create/chat/imagine/close/relaunch/persistence against the installed executable, but the gate remains open until CI evidence is green.
+- [x] Windows 11 Build and Run modes are complete and accessible. The installed x64 Playwright pass exercised keyboard focus, roles, and named navigation.
+- [x] Brain Library, Build wizard, one-chat workspace, Data Studio, Brain Map, Trace, Journal, Tools, Agents, Catalog, and Imagination are usable in the packaged Windows app.
+- [x] x64 Windows package builds in clean CI. The native-host job uploaded both NSIS and ZIP artifacts plus a checksum-bearing smoke record.
+- [ ] ARM64 Windows package builds in clean native CI. The workflow builds a native ARM64 Electron shell with an x64 PyTorch/PyInstaller worker for Windows 11 emulation. Native ARM runs have built the package and exercised both packaged workers; the latest run exposed a top-level-only installed-executable lookup, which is fixed but intentionally not represented as green evidence before another run.
+- [x] A clean installation includes its Python/PyTorch worker. The uploaded x64 record proves direct, ZIP, and silent-NSIS worker execution with safe-tensor and SQLite persistence.
+- [x] State survives a full packaged-app restart and interrupted training. The installed x64 UI record proves create/chat/imagine/close/relaunch persistence; killed-worker and interrupted-promotion fixtures prove recovery and candidate quarantine.
 
-Configured evidence: `.github/workflows/windows.yml`,
-`scripts/smoke-engine.ps1`, `scripts/smoke-windows-package.ps1`, and
-`tests/e2e/electron.spec.ts`, and `engine/tests/test_interrupted_recovery.py`.
-CI configuration is not counted as a successful Windows run until its uploaded
-evidence exists.
+Executed evidence:
+
+- [Windows run 30063378852](https://github.com/Eabusham2/Omni-AGI/actions/runs/30063378852), x64 job: green. Uploaded ZIP SHA-256 `c9935bd703bb8fda9aa7835e5eec13dfe1a2cf15e9f4fc7b6c5de94b6e6fc761`; NSIS SHA-256 `a8218ac9dc2e15be636a61bb68a3008f93a6e8013a199204b2e7e5d80e5f541c`.
+- [Windows run 30064377772](https://github.com/Eabusham2/Omni-AGI/actions/runs/30064377772): both source suites, production builds, built-UI tests, self-contained workers, and Windows packages completed. The x64 leg then timed out during a 30-second CDP handshake; the ARM64 leg exercised the ZIP and installed worker before failing a non-recursive desktop-executable lookup. The corresponding timeout and lookup fixes are present in `tests/e2e/electron.spec.ts` and `scripts/smoke-windows-package.ps1` but have not been rerun.
+
+Implementation and fixture sources: `.github/workflows/windows.yml`,
+`scripts/smoke-engine.ps1`, `scripts/smoke-windows-package.ps1`,
+`tests/e2e/electron.spec.ts`, and
+`engine/tests/test_interrupted_recovery.py`.
 
 ## Tools, agents, and sharing
 

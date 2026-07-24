@@ -141,6 +141,9 @@ describe("project integrity", () => {
       '"Omni AGI Studio.exe"'
     );
     expect(read("scripts/smoke-windows-package.ps1")).toContain(
+      'Get-ChildItem -LiteralPath $InstallRoot -Recurse -File -Filter "Omni AGI Studio.exe"'
+    );
+    expect(read("scripts/smoke-windows-package.ps1")).toContain(
       "Get-PeArchitecture"
     );
     expect(read("scripts/smoke-windows-package.ps1")).toContain(

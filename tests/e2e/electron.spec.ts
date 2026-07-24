@@ -158,7 +158,7 @@ async function launchInstalled(
   let browser: Browser | undefined;
   try {
     await waitForCdp(endpoint, child, () => output);
-    browser = await chromium.connectOverCDP(endpoint);
+    browser = await chromium.connectOverCDP(endpoint, { timeout: 120_000 });
     const page = await waitForPage(browser);
     let closed = false;
     return {
