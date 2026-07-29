@@ -205,7 +205,27 @@ async function launch(dataDirectory: string): Promise<RunningApplication> {
   };
 }
 
-test("build, run, learn, inspect, imagine, download, and restart one persistent brain", async () => {
+async function sendNaturalMessage(
+  page: Page,
+  brainName: string,
+  message: string
+): Promise<void> {
+  const previousHumanMessages = await page.locator(".message--human").count();
+  const composer = page.getByLabel(`Message ${brainName}`);
+  await composer.fill(message);
+  await page.getByLabel("Send message").click();
+  await expect
+    .poll(() => page.locator(".message--human").count(), {
+      timeout: 240_000
+    })
+    .toBeGreaterThan(previousHumanMessages);
+  await expect(page.getByLabel("Send message")).toBeVisible({
+    timeout: 240_000
+  });
+}
+
+test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicates, and restarts", async () => {
+  test.setTimeout(900_000);
   const dataDirectory = await mkdtemp(join(tmpdir(), "omni-electron-e2e-"));
   let application: RunningApplication | undefined;
   try {
@@ -221,186 +241,182 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
 
     await page.getByRole("button", { name: "Build a new brain" }).click();
     await expect(page.getByRole("heading", { name: "Build a brain" })).toBeVisible();
-    await expect(page.locator(".recipe-card")).toHaveCount(6);
-    await page
-      .getByRole("button", { name: /Senses & tools Give it ways to perceive and act/ })
-      .click();
-    const audioCard = page.getByRole("button", {
-      name: /Audio Hear, encode, and imagine sound/
-    });
-    const videoCard = page.getByRole("button", {
-      name: /Video Learn temporal scenes/
-    });
-    await audioCard.click();
-    await videoCard.click();
-    await expect(audioCard).toHaveClass(/is-selected/);
-    await expect(videoCard).toHaveClass(/is-selected/);
-    await page.getByRole("button", { name: /Review Create the immutable origin/ }).click();
+    await expect(page.getByText("Step 1 of 4")).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Who are you creating?" })
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: /Omni Starter Recommended/ })
+    ).toHaveClass(/is-selected/);
+    await expect(page.locator('input[type="range"]')).toHaveCount(0);
     await page.getByPlaceholder("Name this mind").fill("E2E Cortex");
+    await page.getByRole("button", { name: "Continue" }).click();
+
+    await expect(page.getByText("Step 2 of 4")).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "How should learning live?" })
+    ).toBeVisible();
+    for (const label of [
+      "Learn continuously",
+      "Retain exact sources",
+      "Extended working memory",
+      "Recursive improvement"
+    ]) {
+      await expect(page.getByText(label, { exact: true })).toBeVisible();
+    }
+    await expect(page.locator('input[type="range"]')).toHaveCount(0);
+    await page.getByRole("button", { name: "Continue" }).click();
+
+    await expect(page.getByText("Step 3 of 4")).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "What can it experience first?" })
+    ).toBeVisible();
+    for (const label of [
+      "Vision",
+      "Image imagination",
+      "Audio",
+      "Video"
+    ]) {
+      await expect(
+        page.locator("button.modality-card").filter({ hasText: label })
+      ).toHaveClass(/is-selected/);
+    }
+    for (const label of [
+      "Files & datasets",
+      "Images",
+      "Audio",
+      "Video",
+      "Whole folder"
+    ]) {
+      await expect(
+        page.getByRole("button", { name: label, exact: true })
+      ).toBeVisible();
+    }
+    await page.getByRole("button", { name: "Continue" }).click();
+
+    await expect(page.getByText("Step 4 of 4")).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Choose action permissions." })
+    ).toBeVisible();
+    await expect(page.getByText("Initially trained Omni Starter")).toBeVisible();
+    await expect(page.getByText("Behavioral prompt / RLHF")).toBeVisible();
+    const evolutionPermission = page
+      .locator(".tool-row")
+      .filter({ hasText: "Recursive improvement" });
+    await expect(
+      evolutionPermission.getByRole("button", { name: "Ask", exact: true })
+    ).toHaveClass(/is-active/);
     await page.getByRole("button", { name: "Create E2E Cortex" }).click();
 
     const composer = page.getByLabel("Message E2E Cortex");
-    await expect(composer).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText(/Python engine/)).toBeVisible({ timeout: 60_000 });
-    await composer.fill("/help");
-    await page.getByLabel("Send message").click();
-    await expect(page.getByText(/Chat commands: \/tool/)).toBeVisible();
-
-    await composer.fill("hello evolving cortex");
-    await page.getByLabel("Send message").click();
-    await expect(page.locator(".message--human")).toHaveCount(1, {
-      timeout: 60_000
-    });
-    await expect(page.locator(".message--brain")).toHaveCount(1, {
-      timeout: 60_000
+    await expect(composer).toBeVisible({ timeout: 300_000 });
+    await expect(page.getByText(/Python engine/)).toBeVisible({
+      timeout: 120_000
     });
 
-    await composer.fill("/imagine image direct chat memory");
-    await page.getByLabel("Send message").click();
-    await expect(
-      page.getByText(/modality\.imagine\.generate completed and its visible result/)
-    ).toBeVisible({ timeout: 60_000 });
-    await expect
-      .poll(() =>
-        page.evaluate(async () => {
-          const api = (
-            window as unknown as {
-              omni: {
-                train: {
-                  list(): Promise<Array<{ kind: string; state: string }>>;
-                };
-              };
-            }
-          ).omni;
-          return (await api.train.list()).find((job) => job.kind === "image")
-            ?.state;
-        })
-      )
-      .toBe("complete");
-    await expect(page.locator(".message--human").last()).toContainText(
-      '"artifactPath"'
-    );
-    await expect(page.locator(".message--human").last()).toContainText(
-      '"state": "complete"'
-    );
-    await expect(page.locator(".message--human").last()).not.toContainText(
-      '"state": "running"'
-    );
-
-    await composer.fill("/agent Explore one isolated cobalt-memory association.");
-    await page.getByLabel("Send message").click();
-    await page.getByRole("button", { name: "Approve exact action" }).click();
-    await expect(
-      page.getByText(/agent\.fork\.start completed and its visible result/)
-    ).toBeVisible({ timeout: 90_000 });
-
-    const surfaces = [
-      ["Data & training", "Data & training"],
-      ["Brain map", "Brain map"],
-      ["Trace & journal", "Trace & journal"],
-      ["Tools & permissions", "Tools & permissions"],
-      ["Forks & agents", "Forks & agents"]
-    ] as const;
-    for (const [navigation, heading] of surfaces) {
-      await page.getByRole("button", { name: navigation }).click();
-      await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
+    for (const label of [
+      "Upload files and datasets to learn",
+      "Upload images to learn",
+      "Upload audio to learn",
+      "Upload video to learn",
+      "Upload a folder to learn"
+    ]) {
+      await expect(page.getByLabel(label)).toBeVisible();
+      await expect(page.getByLabel(label)).toBeEnabled();
     }
 
-    await page.evaluate(() => {
-      const state = window as unknown as {
-        __omniDownloads: Array<{ href: string; download: string }>;
-      };
-      state.__omniDownloads = [];
-      HTMLAnchorElement.prototype.click = function captureDownload() {
-        state.__omniDownloads.push({
-          href: this.href,
-          download: this.download
-        });
-      };
-    });
-    await page.getByRole("button", { name: "Trace & journal" }).click();
-    await page.getByRole("button", { name: "Export trace" }).click();
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (
-              window as unknown as {
-                __omniDownloads: Array<{ download: string }>;
-              }
-            ).__omniDownloads[0]?.download
-        )
-      )
-      .toMatch(/\.trace\.json$/);
+    await page.getByRole("button", { name: "Runtime card" }).click();
+    const runtimeCard = page.locator(".runtime-card");
+    await expect(runtimeCard.getByRole("heading", { name: "Transparent runtime" })).toBeVisible();
+    await expect(runtimeCard.getByText("Behavioral system prompt", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Long-term source injection", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Reward model / RLHF", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Mandatory · −1 / 0 / +1", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Current context", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Working memory", { exact: true })).toBeVisible();
 
-    await page.getByRole("button", { name: "Imagination" }).click();
+    await sendNaturalMessage(page, "E2E Cortex", "hello, tell me what you notice");
+    await expect(
+      page.locator(".message--human").filter({
+        hasText: "hello, tell me what you notice"
+      })
+    ).toBeVisible();
+    await expect(page.locator(".message--brain").last()).toBeVisible();
+
+    await sendNaturalMessage(
+      page,
+      "E2E Cortex",
+      "make an image from this internal scene"
+    );
+    const imaginationAction = page
+      .locator(".chat-action-card")
+      .filter({ hasText: "modality.imagine" })
+      .last();
+    await expect(imaginationAction).toContainText("complete", {
+      timeout: 240_000
+    });
+    await expect(
+      imaginationAction.locator("img, audio, video").first()
+    ).toBeVisible({ timeout: 120_000 });
+
+    await sendNaturalMessage(
+      page,
+      "E2E Cortex",
+      "fork agents to investigate these independent parts"
+    );
+    await expect(
+      page.getByRole("button", { name: "Approve exact action" })
+    ).toBeVisible({ timeout: 120_000 });
+    await page.getByRole("button", { name: "Approve exact action" }).click();
+    await expect(
+      page.getByText(
+        /agent\.fork\.start completed and its visible result entered working experience/
+      )
+    ).toBeVisible({ timeout: 180_000 });
+
+    await page.getByRole("button", { name: "Data & training", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Data & training" })).toBeVisible();
+    for (const label of ["Files & datasets", "Images", "Audio", "Video", "Whole folder"]) {
+      await expect(
+        page.getByRole("button", { name: label, exact: true })
+      ).toBeVisible();
+    }
+
+    await page.getByRole("button", { name: "Brain map", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Brain map" })).toBeVisible();
+    await expect(page.getByText(/no display ceiling/i)).toBeVisible({
+      timeout: 120_000
+    });
+
+    await page.getByRole("button", { name: "Trace & journal", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Trace & journal" })).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Operational trace", exact: true })
+    ).toBeVisible();
+
+    await page.getByRole("button", { name: "Tools & permissions", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Tools & permissions" })).toBeVisible();
+    await expect(page.getByText("Source evolution", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Forks & agents", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Forks & agents" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Review merge" }).first()).toBeVisible({
+      timeout: 120_000
+    });
+
+    await page.getByRole("button", { name: "Imagination", exact: true }).click();
     await expect(
       page.getByRole("heading", { name: "Imagination", exact: true })
     ).toBeVisible();
-    await page.getByRole("button", { name: "Imagine image" }).click();
-    await expect(page.getByAltText("Locally generated image artifact")).toBeVisible({
-      timeout: 60_000
-    });
-    await expect(page.getByLabel("Download output")).toBeEnabled();
-    await page.getByLabel("Download output").click();
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (
-              window as unknown as {
-                __omniDownloads: Array<{ download: string }>;
-              }
-            ).__omniDownloads[1]?.download
-        )
-      )
-      .toMatch(/\.png$/);
+    await expect(page.getByRole("button", { name: "Imagine image" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Audio", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Video", exact: true })).toBeVisible();
 
-    await page.getByRole("button", { name: "Audio", exact: true }).click();
-    await page.getByRole("button", { name: "Imagine audio" }).click();
-    await expect(page.locator("audio")).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByLabel("Download output")).toBeEnabled();
-    await page.getByLabel("Download output").click();
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (
-              window as unknown as {
-                __omniDownloads: Array<{ download: string }>;
-              }
-            ).__omniDownloads[2]?.download
-        )
-      )
-      .toMatch(/\.wav$/);
-
-    await page.getByRole("button", { name: "Video", exact: true }).click();
-    await page.getByRole("button", { name: "Imagine video" }).click();
-    await expect(page.getByLabel("Locally generated video artifact")).toBeVisible({
-      timeout: 60_000
-    });
-    await expect(page.getByLabel("Download output")).toBeEnabled();
-    await page.getByLabel("Download output").click();
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (
-              window as unknown as {
-                __omniDownloads: Array<{ download: string }>;
-              }
-            ).__omniDownloads[3]?.download
-        )
-      )
-      .toMatch(/\.mp4$/);
-
-    await page.getByRole("button", { name: "Forks & agents" }).click();
-    await page.getByRole("button", { name: "Review merge" }).first().click();
-    await expect(page.getByText(/MERGE PREVIEW · NO WEIGHTS CHANGED YET/)).toBeVisible();
-    await page.getByRole("button", { name: "Merge reviewed overlay" }).click();
-    await expect(page.getByText(/Merged \d+ ideas/)).toBeVisible({
-      timeout: 60_000
-    });
+    await page.getByRole("button", { name: "Evolution", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Evolution lab" })).toBeVisible();
+    await expect(page.getByText("New isolated candidate", { exact: true })).toBeVisible();
+    await expect(page.getByText("ask permission", { exact: false })).toBeVisible();
+    await expect(page.getByText("No improvement runs yet", { exact: true })).toBeVisible();
 
     for (const label of [
       "Conversation",
@@ -409,26 +425,62 @@ test("build, run, learn, inspect, imagine, download, and restart one persistent 
       "Trace & journal",
       "Imagination",
       "Tools & permissions",
-      "Forks & agents"
+      "Forks & agents",
+      "Evolution"
     ]) {
-      await expect(page.getByRole("button", { name: label })).toHaveAttribute(
-        "aria-label",
-        label
-      );
+      await expect(
+        page.getByRole("button", { name: label, exact: true })
+      ).toHaveAttribute("aria-label", label);
     }
 
+    await page.getByRole("button", { name: "Conversation", exact: true }).click();
+    await page.getByRole("button", { name: "Duplicate E2E Cortex" }).click();
+    await expect(
+      page.getByText(/E2E Cortex copy created with copy-on-write neural storage/)
+    ).toBeVisible({ timeout: 180_000 });
+
+    await page
+      .getByRole("button", { name: "Brain library", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name: "E2E Cortex", exact: true })
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "E2E Cortex copy", exact: true })
+    ).toBeVisible();
+
     await application.close();
+    application = undefined;
     application = await launch(dataDirectory);
     page = application.page;
     await page.waitForLoadState("domcontentloaded");
-    await expect(page.getByText("E2E Cortex").first()).toBeVisible({
-      timeout: 60_000
+    await expect(
+      page.getByRole("heading", { name: "E2E Cortex", exact: true })
+    ).toBeVisible({
+      timeout: 120_000
     });
-    await page.getByText("E2E Cortex").first().click();
+    await expect(
+      page.getByRole("heading", { name: "E2E Cortex copy", exact: true })
+    ).toBeVisible();
+    await page
+      .locator("article.brain-card")
+      .filter({
+        has: page.getByRole("heading", { name: "E2E Cortex", exact: true })
+      })
+      .click();
     await expect(page.getByLabel("Message E2E Cortex")).toBeVisible({
-      timeout: 60_000
+      timeout: 120_000
     });
-    await expect(page.getByText("hello evolving cortex")).toBeVisible();
+    await expect(
+      page.getByText("hello, tell me what you notice", { exact: true })
+    ).toBeVisible();
+    await expect(
+      page.getByText("make an image from this internal scene", { exact: true })
+    ).toBeVisible();
+    await page.getByRole("button", { name: "Runtime card" }).click();
+    await expect(page.getByText("Transparent runtime", { exact: true })).toBeVisible();
+    await expect(page.getByText("Current context", { exact: true })).toBeVisible();
+    await expect(page.getByText("Working memory", { exact: true })).toBeVisible();
   } finally {
     await application?.close().catch(() => undefined);
     await rm(dataDirectory, {

@@ -96,7 +96,8 @@ try {
   if (
     health?.ready !== true ||
     health?.worker !== "python" ||
-    health?.protocolVersion !== 1
+    health?.protocolVersion !== 1 ||
+    typeof health?.operatingSystem !== "string"
   ) {
     throw new Error("Packaged worker returned an invalid health response.");
   }
@@ -167,6 +168,7 @@ try {
         pythonVersion: health.pythonVersion,
         torchVersion: health.torchVersion,
         platform: health.platform,
+        operatingSystem: health.operatingSystem,
         persistedBrain: true,
         safeTensorCheckpoint: true,
         sqliteEventLog: true

@@ -271,6 +271,16 @@ def _allow_local_remote_urls() -> bool:
     return os.environ.get("OMNI_ALLOW_LOCAL_URLS", "").strip() == "1"
 
 
+def _is_loopback_url(raw_url: str) -> bool:
+    hostname = (urllib.parse.urlsplit(raw_url).hostname or "").rstrip(".").lower()
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
 def _validate_remote_url(raw_url: str) -> str:
     """Validate a remote data URL before every request and redirect.
 
@@ -381,7 +391,13 @@ def _download_remote_shard(
         },
         method="GET",
     )
-    opener = urllib.request.build_opener(_ValidatedRedirectHandler())
+    handlers: List[Any] = [_ValidatedRedirectHandler()]
+    if _allow_local_remote_urls() and _is_loopback_url(fetch_url):
+        # Explicitly allowed local dataset servers must not be intercepted by
+        # a machine- or CI-level HTTP proxy. Ordinary global HTTPS downloads
+        # keep urllib's normal proxy discovery.
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
     timeout = max(
         1.0,
         float(os.environ.get("OMNI_DATASET_HTTP_TIMEOUT_SECONDS", "30")),

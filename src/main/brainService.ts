@@ -3007,7 +3007,7 @@ export class BrainService {
     return {
       runtime: brain.config.runtime,
       ready: health.ready,
-      label: health.worker === "python" ? "Omni neural worker" : "Adaptive core fallback",
+      label: health.worker === "python" ? "Omni neural worker" : "Neural worker unavailable",
       detail: health.detail
     };
   }

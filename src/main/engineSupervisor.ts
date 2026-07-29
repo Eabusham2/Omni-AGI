@@ -152,7 +152,8 @@ export class EngineSupervisor extends EventEmitter {
     const packagedRequired = process.env.OMNI_PACKAGED_ENGINE_REQUIRED === "1";
     const candidates: Array<{ candidate: PythonCandidate; direct: boolean }> = [];
     // A packaged build must exercise its self-contained, non-pickle worker first.
-    // Source-Python candidates remain a development/recovery fallback.
+    // A source-Python worker is a development/recovery launch form of the
+    // same authoritative OmniCortex engine, never an alternate brain.
     if (packagedExecutable && existsSync(packagedExecutable)) {
       candidates.push({ candidate: { command: packagedExecutable, prefix: [] }, direct: true });
     }
@@ -169,8 +170,8 @@ export class EngineSupervisor extends EventEmitter {
     if (candidates.length === 0) {
       this.lastError =
         packagedRequired
-          ? "The required packaged OmniCortex engine was not found; the deterministic local fallback is active."
-          : "No packaged engine or engine/worker.py source was found; the deterministic local fallback is active.";
+          ? "The required packaged OmniCortex engine was not found."
+          : "No packaged engine or engine/worker.py source was found.";
       return false;
     }
     for (const launch of candidates) {
@@ -468,10 +469,14 @@ export class EngineSupervisor extends EventEmitter {
     }
     const stderr = this.recentStderr.at(-1);
     return {
-      ready: true,
-      worker: "fallback",
+      ready: false,
+      worker: "unavailable",
       protocolVersion: PROTOCOL_VERSION,
-      detail: [this.lastError, stderr, "The TypeScript adaptive core remains available."]
+      detail: [
+        this.lastError,
+        stderr,
+        "The authoritative OmniCortex neural worker is unavailable; no alternate memory model will be substituted."
+      ]
         .filter(Boolean)
         .join(" ")
     };

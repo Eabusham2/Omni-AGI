@@ -31,7 +31,7 @@ export interface BrainConfig {
   recursiveImprovement: boolean;
   idleCognition: boolean;
 
-  /** Resolved workspace capacity for inspection and degraded-mode operation. */
+  /** Hardware-resolved transient neural-workspace capacity. */
   workingMemorySlots: number;
   /** Resolved slow-training rate; it is not a personality or motivation dial. */
   learningRate: number;
@@ -762,7 +762,7 @@ export interface AgentMergeFilePreview {
 
 export interface EngineHealth {
   ready: boolean;
-  worker: "python" | "fallback";
+  worker: "python" | "unavailable";
   protocolVersion: number;
   detail: string;
   pid?: number;
@@ -980,6 +980,24 @@ export interface PromotionRecord {
   rolledBackAt?: string;
 }
 
+/**
+ * A compare-and-write source mutation for an isolated evolution worktree.
+ * Existing files require their exact SHA-256; null means the path must not
+ * exist. This channel never interprets generated response prose.
+ */
+export interface EvolutionSourceEdit {
+  path: string;
+  content: string;
+  expectedSha256: string | null;
+}
+
+export interface EvolutionSourceEditLineage {
+  path: string;
+  expectedSha256: string | null;
+  resultSha256: string;
+  bytes: number;
+}
+
 export interface EvolutionCandidate {
   id: string;
   runId: string;
@@ -994,6 +1012,10 @@ export interface EvolutionCandidate {
   updatedAt: string;
   evaluations: EvolutionEvaluation[];
   promotion?: PromotionRecord;
+  sourceEditLineage?: EvolutionSourceEditLineage[];
+  authoredChangedPaths?: string[];
+  authoredDiffSha256?: string;
+  authoredBytes?: number;
   error?: string;
 }
 
@@ -1029,6 +1051,11 @@ export interface EvolutionStartRequest {
   latentReplay?: boolean;
   objectives?: string[];
   provenance?: Record<string, unknown>;
+  /**
+   * Typed source candidate authoring. Edits are applied only inside the new
+   * isolated worktree, before it becomes externally visible.
+   */
+  sourceEdits?: EvolutionSourceEdit[];
   architectureChange?: {
     /** Stable v1's only load-compatible architecture mutation. */
     mutation: "grow-experts";

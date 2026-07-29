@@ -1120,9 +1120,7 @@ function WorkspaceShell({
         if (active) {
           setHealth(
             result.ready
-              ? result.worker === "python"
-                ? `Python engine${result.pid ? ` · PID ${result.pid}` : ""}`
-                : "Built-in fallback engine"
+              ? `Python engine${result.pid ? ` · PID ${result.pid}` : ""}`
               : result.detail
           );
         }
@@ -3999,7 +3997,7 @@ const protocolMeta: Record<string, { label: string; icon: IconName; action: stri
   "code.execute": { label: "Code runner", icon: "code", action: "run", args: { language: "python", entryPath: "C:\\path\\to\\script.py", arguments: [] } },
   "web.fetch": { label: "Web fetch", icon: "download", action: "fetch", args: { url: "https://example.com", maxBytes: 1000000 } },
   "web.search": { label: "Web search", icon: "search", action: "search", args: { query: "neuromorphic computing", limit: 5 } },
-  "browser.automation": { label: "Browser snapshot", icon: "expand", action: "task", args: { url: "https://example.com" } },
+  "browser.automation": { label: "Browser task", icon: "expand", action: "task", args: { url: "https://example.com" } },
   "modality.imagine": { label: "Imagination", icon: "sparkles", action: "generate", args: { modality: "image", conceptIds: [] } },
   "agent.fork": { label: "Subagent fork", icon: "agents", action: "start", args: { objective: "Explore this question independently." } },
   "source.self-modify": { label: "Source evolution", icon: "code", action: "propose", args: {} }

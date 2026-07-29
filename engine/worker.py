@@ -225,6 +225,7 @@ class Worker:
             "pythonVersion": platform.python_version(),
             "torchVersion": torch.__version__,
             "platform": platform.platform(),
+            "operatingSystem": sys.platform,
             "capabilities": {
                 "cpu": True,
                 "cuda": cuda,

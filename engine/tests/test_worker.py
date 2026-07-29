@@ -87,6 +87,7 @@ class WorkerProtocolTests(unittest.TestCase):
         health = request("health", "health", {})
         self.assertTrue(health["ready"])
         self.assertIn("directml", health["capabilities"])
+        self.assertEqual(health["operatingSystem"], sys.platform)
 
         with tempfile.TemporaryDirectory(prefix="omni-worker-test-") as folder:
             config = {

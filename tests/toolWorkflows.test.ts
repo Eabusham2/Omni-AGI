@@ -167,13 +167,36 @@ describe("ToolExecutor complete workflows", () => {
       parentCommit: string;
       evaluatorSha256: string;
       benchmarkDomains: string[];
+      sourceEditLineage: Array<{
+        path: string;
+        expectedSha256: string | null;
+        resultSha256: string;
+        bytes: number;
+      }>;
+      authoredChangedPaths: string[];
+      authoredDiffSha256: string;
+      authoredBytes: number;
       checks: Array<{ name: string; passed: boolean }>;
     }>(
       await executor.execute({
         brainId: brain.id,
         toolId: "source.self-modify",
         action: "propose",
-        arguments: { objective: "Add a candidate capability without replacing the app." }
+        arguments: {
+          objective: "Add a candidate capability without replacing the app.",
+          sourceEdits: [
+            {
+              path: "source.txt",
+              content: "candidate source\n",
+              expectedSha256: sha256("original source\n")
+            },
+            {
+              path: "new-capability.txt",
+              content: "untracked version one\n",
+              expectedSha256: null
+            }
+          ]
+        }
       })
     );
     expect(proposal.worktree).toMatch(
@@ -187,18 +210,38 @@ describe("ToolExecutor complete workflows", () => {
     );
     expect(proposal.checks).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: "isolated-worktree", passed: true })
+        expect.objectContaining({ name: "isolated-worktree", passed: true }),
+        expect.objectContaining({ name: "typed-source-authoring", passed: true })
       ])
+    );
+    expect(proposal.sourceEditLineage).toEqual([
+      {
+        path: "new-capability.txt",
+        expectedSha256: null,
+        resultSha256: sha256("untracked version one\n"),
+        bytes: Buffer.byteLength("untracked version one\n")
+      },
+      {
+        path: "source.txt",
+        expectedSha256: sha256("original source\n"),
+        resultSha256: sha256("candidate source\n"),
+        bytes: Buffer.byteLength("candidate source\n")
+      }
+    ]);
+    expect(proposal.authoredChangedPaths).toEqual([
+      "new-capability.txt",
+      "source.txt"
+    ]);
+    expect(proposal.authoredDiffSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(proposal.authoredBytes).toBe(
+      Buffer.byteLength("untracked version one\n") +
+        Buffer.byteLength("candidate source\n")
     );
     await expect(readFile(proposal.taskFile, "utf8")).resolves.toContain(
       "Add a candidate capability"
     );
     expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
 
-    await Promise.all([
-      writeFile(join(proposal.worktree, "source.txt"), "candidate source\n"),
-      writeFile(join(proposal.worktree, "new-capability.txt"), "untracked version one\n")
-    ]);
     const firstDiff = completeOutput<{
       diff: string;
       untracked: Array<{ path: string; sha256: string; bytes: number }>;
@@ -445,6 +488,212 @@ describe("ToolExecutor complete workflows", () => {
       readFile(join(sourceRepository, "new-capability.txt"), "utf8")
     ).rejects.toMatchObject({ code: "ENOENT" });
     expect(sha256(await readFile(runningBinary))).toBe(runningBinaryHash);
+    expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
+  }, 60_000);
+
+  it("rejects unsafe or stale typed edits and never promotes an empty source candidate", async () => {
+    const sourceRepository = join(temporaryRoot, "bounded-source");
+    const evolutionRoot = join(temporaryRoot, "bounded-candidates");
+    await Promise.all([
+      mkdir(join(sourceRepository, "src"), { recursive: true }),
+      mkdir(join(sourceRepository, "tests"), { recursive: true })
+    ]);
+    await Promise.all([
+      writeFile(
+        join(sourceRepository, "package.json"),
+        JSON.stringify({
+          name: "omni-bounded-evolution-fixture",
+          private: true,
+          scripts: {
+            test: "node -e \"process.stdout.write('bounded evaluator passed')\""
+          }
+        })
+      ),
+      writeFile(
+        join(sourceRepository, "src", "measured.ts"),
+        "export const measured = 1;\n"
+      ),
+      writeFile(
+        join(sourceRepository, "tests", "immutable-evaluator.test.js"),
+        "export const immutableEvaluator = true;\n"
+      )
+    ]);
+    await run("git", ["init"], sourceRepository);
+    await run("git", ["config", "core.autocrlf", "false"], sourceRepository);
+    await run("git", ["config", "core.eol", "lf"], sourceRepository);
+    await run("git", ["config", "user.name", "Bounded Workflow Test"], sourceRepository);
+    await run(
+      "git",
+      ["config", "user.email", "bounded-workflow@local.invalid"],
+      sourceRepository
+    );
+    await run("git", ["add", "-A"], sourceRepository);
+    await run("git", ["commit", "-m", "Initial bounded fixture"], sourceRepository);
+
+    process.env.OMNI_SOURCE_REPOSITORY = sourceRepository;
+    process.env.OMNI_EVOLUTION_ROOT = evolutionRoot;
+    await setPermission("source.self-modify", "ask");
+    const executor = executorFor();
+    const propose = (sourceEdits: unknown) =>
+      executor.execute({
+        brainId: brain.id,
+        toolId: "source.self-modify",
+        action: "propose",
+        arguments: {
+          objective: "Author one bounded measured maintenance candidate.",
+          sourceEdits
+        }
+      });
+
+    await expect(
+      propose([
+        {
+          path: "../outside.ts",
+          content: "export const escaped = true;\n",
+          expectedSha256: null
+        }
+      ])
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/traverse|relative|portable/i)
+    });
+    await expect(
+      propose([
+        {
+          path: "package.json",
+          content: "{\"scripts\":{\"postinstall\":\"arbitrary setup\"}}\n",
+          expectedSha256: sha256(
+            JSON.stringify({
+              name: "omni-bounded-evolution-fixture",
+              private: true,
+              scripts: {
+                test: "node -e \"process.stdout.write('bounded evaluator passed')\""
+              }
+            })
+          )
+        }
+      ])
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/package installation|execution manifests/i)
+    });
+    await expect(
+      propose([
+        {
+          path: "release/running-binary.txt",
+          content: "running image replacement\n",
+          expectedSha256: null
+        }
+      ])
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/build, release, script, or control directories/i)
+    });
+    await expect(
+      propose([
+        {
+          path: "tests/immutable-evaluator.test.js",
+          content: "export const immutableEvaluator = false;\n",
+          expectedSha256: sha256("export const immutableEvaluator = true;\n")
+        }
+      ])
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/immutable evaluator/i)
+    });
+    await expect(
+      propose([
+        {
+          path: "src/measured.ts",
+          content: "export const measured = 2;\n",
+          expectedSha256: "0".repeat(64)
+        }
+      ])
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/checksum does not match/i)
+    });
+    await expect(
+      propose([
+        {
+          path: "src/too-large.ts",
+          content: "x".repeat(8 * 1024 * 1024 + 1),
+          expectedSha256: null
+        }
+      ])
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/exceed.*byte proposal limit/i)
+    });
+    await expect(
+      readFile(join(temporaryRoot, "outside.ts"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      readFile(join(sourceRepository, "src", "measured.ts"), "utf8")
+    ).resolves.toBe("export const measured = 1;\n");
+    await expect(
+      readFile(
+        join(sourceRepository, "tests", "immutable-evaluator.test.js"),
+        "utf8"
+      )
+    ).resolves.toBe("export const immutableEvaluator = true;\n");
+
+    const empty = completeOutput<{
+      worktree: string;
+      evaluatorSha256: string;
+      authoredChangedPaths: string[];
+      checks: Array<{ name: string; passed: boolean }>;
+    }>(await propose([]));
+    expect(empty.authoredChangedPaths).toEqual([]);
+    expect(empty.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "typed-source-authoring", passed: false })
+      ])
+    );
+    const evaluated = completeOutput<{
+      passed: boolean;
+      diffSha256: string;
+      checks: Array<{ name: string; passed: boolean }>;
+    }>(
+      await executor.execute({
+        brainId: brain.id,
+        toolId: "source.self-modify",
+        action: "test",
+        arguments: {
+          worktree: empty.worktree,
+          tests: ["unit"],
+          expectedEvaluatorSha256: empty.evaluatorSha256,
+          timeoutMs: 30_000
+        }
+      })
+    );
+    expect(evaluated.passed).toBe(false);
+    expect(evaluated.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "candidate-change", passed: false })
+      ])
+    );
+    const promotionInvocation = {
+      brainId: brain.id,
+      toolId: "source.self-modify",
+      action: "promote",
+      arguments: {
+        worktree: empty.worktree,
+        expectedDiffSha256: evaluated.diffSha256,
+        expectedEvaluatorSha256: empty.evaluatorSha256
+      }
+    };
+    const challenge = await executor.execute(promotionInvocation);
+    expect(challenge.state).toBe("approval-required");
+    await expect(
+      executor.execute({
+        ...promotionInvocation,
+        approvalToken: challenge.approvalToken
+      })
+    ).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/empty source candidate cannot be promoted/i)
+    });
     expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
   }, 60_000);
 

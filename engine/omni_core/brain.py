@@ -746,6 +746,28 @@ class AdaptiveBrain:
     def load(
         cls, storage_path: Path, expected_brain_id: Optional[str] = None
     ) -> "AdaptiveBrain":
+        constructed: List["AdaptiveBrain"] = []
+        try:
+            return cls._load_impl(
+                storage_path,
+                expected_brain_id=expected_brain_id,
+                constructed=constructed,
+            )
+        except BaseException:
+            # A failed integrity or compatibility check must not leave the
+            # SQLite event journal open. Windows will otherwise refuse to
+            # clean up, replace, or restore the containing brain directory.
+            if constructed:
+                constructed[0].events.close()
+            raise
+
+    @classmethod
+    def _load_impl(
+        cls,
+        storage_path: Path,
+        expected_brain_id: Optional[str] = None,
+        constructed: Optional[List["AdaptiveBrain"]] = None,
+    ) -> "AdaptiveBrain":
         engine_path = Path(storage_path).resolve() / "engine"
         recovered_candidates = cls._recover_interrupted_candidates(engine_path)
         metadata = read_json(engine_path / "brain.json")
@@ -760,6 +782,8 @@ class AdaptiveBrain:
             raise ValueError("brain id does not match the requested storage path")
         config = OmniConfig.from_dict(metadata["config"])
         brain = cls(brain_id, storage_path, config)
+        if constructed is not None:
+            constructed.append(brain)
         for _ in range(int(metadata.get("expert_count", 0))):
             brain.decoder.grow_expert()
         core = load_tensors(engine_path / "core.safetensors", device="cpu")

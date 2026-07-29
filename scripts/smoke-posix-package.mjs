@@ -338,9 +338,9 @@ const workerSmoke = await run(
   { capture: true, cwd: resolve(".") }
 );
 const workerEvidence = JSON.parse(workerSmoke.stdout);
-if (workerEvidence.platform !== expectedPlatform) {
+if (workerEvidence.operatingSystem !== expectedPlatform) {
   throw new Error(
-    `Archived worker reported ${String(workerEvidence.platform)} instead of ${expectedPlatform}.`
+    `Archived worker reported ${String(workerEvidence.operatingSystem)} instead of ${expectedPlatform}.`
   );
 }
 

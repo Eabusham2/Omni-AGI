@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { isUtf8 } from "node:buffer";
 import {
   lstat,
   mkdir,
@@ -11,7 +12,15 @@ import {
   unlink,
   writeFile
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve
+} from "node:path";
 import type {
   ToolExecutionResult,
   ToolInvocation,
@@ -37,6 +46,55 @@ import {
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_PROCESS_OUTPUT = 2 * 1024 * 1024;
 const MAX_WEB_BYTES = 8 * 1024 * 1024;
+const MAX_SOURCE_EDIT_TOTAL_BYTES = 8 * 1024 * 1024;
+const MAX_SOURCE_EDIT_COUNT = 256;
+
+const SOURCE_TEXT_EXTENSIONS = new Set([
+  ".c",
+  ".cc",
+  ".cpp",
+  ".css",
+  ".go",
+  ".h",
+  ".hpp",
+  ".html",
+  ".java",
+  ".js",
+  ".json",
+  ".jsx",
+  ".kt",
+  ".md",
+  ".mjs",
+  ".mts",
+  ".py",
+  ".rs",
+  ".scss",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".yaml",
+  ".yml"
+]);
+
+const SOURCE_EDIT_PROTECTED_NAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock"
+]);
+
+const SOURCE_EDIT_PROTECTED_SEGMENTS = new Set([
+  ".git",
+  ".github",
+  ".openai",
+  "build",
+  "dist",
+  "node_modules",
+  "out",
+  "release",
+  "scripts"
+]);
 
 interface Approval {
   brainId: string;
@@ -55,7 +113,24 @@ interface EvolutionProposalRecord {
   evaluatorSha256: string;
   baselineTestPaths: string[];
   packageScripts: Record<string, string>;
+  sourceEditLineage: SourceEditLineageRecord[];
+  authoredChangedPaths: string[];
+  authoredDiffSha256: string;
+  authoredBytes: number;
   createdAt: string;
+}
+
+interface SourceEditRequest {
+  path: string;
+  content: string;
+  expectedSha256: string | null;
+}
+
+interface SourceEditLineageRecord {
+  path: string;
+  expectedSha256: string | null;
+  resultSha256: string;
+  bytes: number;
 }
 
 function sha256(contents: Buffer | string): string {
@@ -82,6 +157,92 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
   const temporary = `${path}.${randomUUID()}.omni-next`;
   await writeFile(temporary, contents, { encoding: "utf8", flag: "wx", mode: 0o600 });
   await rename(temporary, path);
+}
+
+function normalizeSourceEditPath(value: unknown): string {
+  if (typeof value !== "string" || !value || value !== value.trim()) {
+    throw new Error("Each source edit path must be a non-empty relative path.");
+  }
+  if (
+    value.length > 1_024 ||
+    value.includes("\\") ||
+    value.startsWith("/") ||
+    /^[a-z]:/i.test(value) ||
+    /[\0-\x1f\x7f:]/.test(value)
+  ) {
+    throw new Error("Source edit paths must use safe portable relative syntax.");
+  }
+  const segments = value.split("/");
+  if (
+    segments.some(
+      (segment) =>
+        !segment ||
+        segment === "." ||
+        segment === ".." ||
+        segment.endsWith(" ") ||
+        segment.endsWith(".")
+    )
+  ) {
+    throw new Error("Source edit paths may not traverse or contain ambiguous segments.");
+  }
+  const lowerSegments = segments.map((segment) => segment.toLocaleLowerCase());
+  if (lowerSegments.some((segment) => SOURCE_EDIT_PROTECTED_SEGMENTS.has(segment))) {
+    throw new Error("Source edits may not target build, release, script, or control directories.");
+  }
+  const name = lowerSegments.at(-1)!;
+  if (SOURCE_EDIT_PROTECTED_NAMES.has(name)) {
+    throw new Error("Source edits may not rewrite package installation or execution manifests.");
+  }
+  if (!SOURCE_TEXT_EXTENSIONS.has(extname(name))) {
+    throw new Error("Source evolution accepts UTF-8 source and documentation text files only.");
+  }
+  return segments.join("/");
+}
+
+function sourceEditRequests(value: unknown): SourceEditRequest[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("sourceEdits must be an array.");
+  if (value.length > MAX_SOURCE_EDIT_COUNT) {
+    throw new Error(`A source proposal may author at most ${MAX_SOURCE_EDIT_COUNT} files.`);
+  }
+  const edits: SourceEditRequest[] = [];
+  const paths = new Set<string>();
+  let totalBytes = 0;
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Every source edit must be a typed object.");
+    }
+    const record = entry as Record<string, unknown>;
+    const path = normalizeSourceEditPath(record.path);
+    const portableIdentity = path.toLocaleLowerCase();
+    if (paths.has(portableIdentity)) {
+      throw new Error(`Source edit path is duplicated: ${path}`);
+    }
+    paths.add(portableIdentity);
+    if (typeof record.content !== "string" || record.content.includes("\0")) {
+      throw new Error("Source edit content must be UTF-8 text without NUL bytes.");
+    }
+    const expectedSha256 =
+      record.expectedSha256 === null
+        ? null
+        : typeof record.expectedSha256 === "string" &&
+            /^[a-f0-9]{64}$/i.test(record.expectedSha256)
+          ? record.expectedSha256.toLocaleLowerCase()
+          : undefined;
+    if (expectedSha256 === undefined) {
+      throw new Error(
+        "Every source edit requires expectedSha256, or null when the file must be absent."
+      );
+    }
+    totalBytes += Buffer.byteLength(record.content, "utf8");
+    if (totalBytes > MAX_SOURCE_EDIT_TOTAL_BYTES) {
+      throw new Error(
+        `Typed source edits exceed the ${MAX_SOURCE_EDIT_TOTAL_BYTES} byte proposal limit.`
+      );
+    }
+    edits.push({ path, content: record.content, expectedSha256 });
+  }
+  return edits;
 }
 
 function boundedTimeout(value: unknown, fallback = 60_000): number {
@@ -1158,12 +1319,51 @@ export class ToolExecutor {
         !Array.isArray(value.baselineTestPaths) ? "baseline-tests" : undefined,
         typeof value.packageScripts !== "object" || value.packageScripts === null
           ? "scripts"
+          : undefined,
+        !Array.isArray(value.sourceEditLineage) ? "source-edit-lineage" : undefined,
+        !Array.isArray(value.authoredChangedPaths) ? "authored-paths" : undefined,
+        !/^[a-f0-9]{64}$/i.test(value.authoredDiffSha256 ?? "")
+          ? "authored-diff"
+          : undefined,
+        !Number.isSafeInteger(value.authoredBytes) || (value.authoredBytes ?? -1) < 0
+          ? "authored-bytes"
           : undefined
       ].filter((entry): entry is string => Boolean(entry));
       if (invalid.length) {
         throw new Error(`The external evolution proposal record is invalid (${invalid.join(", ")}).`);
       }
-      return value as EvolutionProposalRecord;
+      const proposal = value as EvolutionProposalRecord;
+      const invalidLineage = proposal.sourceEditLineage.some(
+        (entry) =>
+          typeof entry !== "object" ||
+          entry === null ||
+          normalizeSourceEditPath(entry.path) !== entry.path ||
+          !(
+            entry.expectedSha256 === null ||
+            /^[a-f0-9]{64}$/i.test(entry.expectedSha256)
+          ) ||
+          !/^[a-f0-9]{64}$/i.test(entry.resultSha256) ||
+          !Number.isSafeInteger(entry.bytes) ||
+          entry.bytes < 0
+      );
+      const lineagePaths = proposal.sourceEditLineage
+        .map((entry) => entry.path)
+        .sort();
+      const authoredPaths = [...proposal.authoredChangedPaths].sort();
+      if (
+        invalidLineage ||
+        proposal.authoredChangedPaths.some(
+          (path) =>
+            typeof path !== "string" ||
+            normalizeSourceEditPath(path) !== path
+        ) ||
+        JSON.stringify(lineagePaths) !== JSON.stringify(authoredPaths) ||
+        proposal.sourceEditLineage.reduce((total, entry) => total + entry.bytes, 0) !==
+          proposal.authoredBytes
+      ) {
+        throw new Error("The external evolution proposal source-edit lineage is invalid.");
+      }
+      return proposal;
     };
     const resolveCandidate = async (): Promise<string> => {
       const requested = absolutePath(argumentString(args, "worktree", 32_000));
@@ -1281,6 +1481,163 @@ export class ToolExecutor {
       };
     };
 
+    const applySourceEdits = async (
+      worktree: string,
+      baselineTestPaths: ReadonlySet<string>,
+      edits: SourceEditRequest[]
+    ): Promise<SourceEditLineageRecord[]> => {
+      const root = await realpath(worktree);
+      const inspectTarget = async (
+        edit: SourceEditRequest
+      ): Promise<{
+        target: string;
+        exists: boolean;
+        mode: number;
+        currentSha256: string | null;
+      }> => {
+        if (isProtectedEvolutionPath(edit.path, baselineTestPaths)) {
+          throw new Error(`Source edit targets an immutable evaluator file: ${edit.path}`);
+        }
+        const target = resolve(root, ...edit.path.split("/"));
+        const fromRoot = relative(root, target);
+        if (!fromRoot || fromRoot.startsWith("..") || isAbsolute(fromRoot)) {
+          throw new Error("Source edit path escaped the isolated worktree.");
+        }
+        let cursor = root;
+        for (const segment of edit.path.split("/").slice(0, -1)) {
+          cursor = join(cursor, segment);
+          try {
+            const info = await lstat(cursor);
+            if (info.isSymbolicLink()) {
+              throw new Error(`Source edit parent is a symbolic link: ${edit.path}`);
+            }
+            if (!info.isDirectory()) {
+              throw new Error(`Source edit parent is not a directory: ${edit.path}`);
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+            throw error;
+          }
+        }
+        try {
+          const info = await lstat(target);
+          if (info.isSymbolicLink()) {
+            throw new Error(`Source edits may not replace symbolic links: ${edit.path}`);
+          }
+          if (!info.isFile()) {
+            throw new Error(`Source edit target is not a regular file: ${edit.path}`);
+          }
+          if (info.size > MAX_SOURCE_EDIT_TOTAL_BYTES) {
+            throw new Error(
+              `Existing source file exceeds the ${MAX_SOURCE_EDIT_TOTAL_BYTES} byte authoring limit.`
+            );
+          }
+          const current = await readFile(target);
+          if (!isUtf8(current) || current.includes(0)) {
+            throw new Error(`Source edit target is not valid UTF-8 text: ${edit.path}`);
+          }
+          return {
+            target,
+            exists: true,
+            mode: info.mode & 0o777,
+            currentSha256: sha256(current)
+          };
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          return {
+            target,
+            exists: false,
+            mode: 0o600,
+            currentSha256: null
+          };
+        }
+      };
+
+      const assertExpectedState = (
+        edit: SourceEditRequest,
+        inspected: Awaited<ReturnType<typeof inspectTarget>>
+      ): void => {
+        if (edit.expectedSha256 === null) {
+          if (inspected.exists) {
+            throw new Error(
+              `Source edit expected a new file but the path already exists: ${edit.path}`
+            );
+          }
+          return;
+        }
+        if (!inspected.exists) {
+          throw new Error(
+            `Source edit expected an existing file but the path is absent: ${edit.path}`
+          );
+        }
+        if (inspected.currentSha256 !== edit.expectedSha256) {
+          throw new Error(`Source edit checksum does not match current content: ${edit.path}`);
+        }
+      };
+
+      const prepared: Array<{
+        edit: SourceEditRequest;
+        target: string;
+        temporary: string;
+      }> = [];
+      try {
+        for (const edit of edits) {
+          assertToolActive(signal);
+          const inspected = await inspectTarget(edit);
+          assertExpectedState(edit, inspected);
+          await mkdir(dirname(inspected.target), { recursive: true });
+          const realParent = await realpath(dirname(inspected.target));
+          const parentFromRoot = relative(root, realParent);
+          if (parentFromRoot.startsWith("..") || isAbsolute(parentFromRoot)) {
+            throw new Error("Source edit parent escaped the isolated worktree.");
+          }
+          const temporary = join(
+            realParent,
+            `.${basename(inspected.target)}.${randomUUID()}.omni-source-next`
+          );
+          await writeFile(temporary, edit.content, {
+            encoding: "utf8",
+            flag: "wx",
+            mode: inspected.mode || 0o600
+          });
+          prepared.push({ edit, target: inspected.target, temporary });
+        }
+
+        // Recheck every compare-and-write precondition after all temporary
+        // files exist. The worktree is discarded if any check or rename fails,
+        // so no partially authored candidate is ever returned to a caller.
+        for (const entry of prepared) {
+          assertToolActive(signal);
+          assertExpectedState(entry.edit, await inspectTarget(entry.edit));
+        }
+        for (const entry of prepared) {
+          assertToolActive(signal);
+          assertExpectedState(entry.edit, await inspectTarget(entry.edit));
+          await rename(entry.temporary, entry.target);
+        }
+
+        const lineage: SourceEditLineageRecord[] = [];
+        for (const edit of edits) {
+          const target = resolve(root, ...edit.path.split("/"));
+          const contents = await readFile(target);
+          if (!isUtf8(contents) || contents.includes(0)) {
+            throw new Error(`Authored source is not valid UTF-8 text: ${edit.path}`);
+          }
+          lineage.push({
+            path: edit.path,
+            expectedSha256: edit.expectedSha256,
+            resultSha256: sha256(contents),
+            bytes: contents.byteLength
+          });
+        }
+        return lineage.sort((left, right) => left.path.localeCompare(right.path));
+      } finally {
+        await Promise.all(
+          prepared.map((entry) => unlink(entry.temporary).catch(() => undefined))
+        );
+      }
+    };
+
     const verifyEvaluatorBoundary = async (
       worktree: string,
       proposal: EvolutionProposalRecord,
@@ -1320,6 +1677,7 @@ export class ToolExecutor {
 
     if (action === "propose") {
       const objective = argumentString(args, "objective", 20_000);
+      const sourceEdits = sourceEditRequests(args.sourceEdits);
       const [parentCommitResult, baselineTestsResult, packageScripts] = await Promise.all([
         runEvolutionProcess(
           "git",
@@ -1367,46 +1725,100 @@ export class ToolExecutor {
       );
       if (created.exitCode !== 0) throw new Error(`Git worktree creation failed: ${created.stderr}`);
       const taskFile = join(evolutionRoot, `${identifier}.task.md`);
-      await atomicWrite(
-        taskFile,
-        `# OmniCortex source-evolution candidate\n\n${objective}\n\n` +
-          "Edits belong in the isolated worktree. Run diff and test before requesting promotion.\n"
-      );
-      const externalProposal: EvolutionProposalRecord = {
-        schemaVersion: 1,
-        worktree,
-        branch,
-        parentCommit,
-        evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
-        evaluatorSha256,
-        baselineTestPaths,
-        packageScripts,
-        createdAt: new Date().toISOString()
-      };
-      await atomicWrite(proposalPath(worktree), JSON.stringify(externalProposal, null, 2));
-      return {
-        worktree,
-        branch,
-        taskFile,
-        parentCommit,
-        evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
-        evaluatorSha256,
-        benchmarkDomains: EVOLUTION_BENCHMARK_DOMAINS,
-        protectedPaths: EVOLUTION_PROTECTED_PATHS,
-        diff: "",
-        checks: [
-          {
-            name: "isolated-worktree",
-            passed: true,
-            detail: "No running application files were overwritten."
-          },
-          {
-            name: "promotion",
-            passed: false,
-            detail: "Promotion requires a passing test action and a separate exact approval."
-          }
-        ]
-      };
+      try {
+        const sourceEditLineage = await applySourceEdits(
+          worktree,
+          new Set(baselineTestPaths),
+          sourceEdits
+        );
+        const authored = await diffSnapshot(worktree, parentCommit);
+        const requestedPaths = sourceEdits.map((edit) => edit.path).sort();
+        if (
+          JSON.stringify(authored.changedPaths) !== JSON.stringify(requestedPaths)
+        ) {
+          throw new Error(
+            "Typed source authoring changed paths outside its declared edit set."
+          );
+        }
+        const authoredBytes = sourceEditLineage.reduce(
+          (total, entry) => total + entry.bytes,
+          0
+        );
+        await atomicWrite(
+          taskFile,
+          `# OmniCortex source-evolution candidate\n\n${objective}\n\n` +
+            `${sourceEditLineage.length} typed source edit(s) were authored in this isolated worktree. ` +
+            "Run diff and test before requesting promotion.\n"
+        );
+        const externalProposal: EvolutionProposalRecord = {
+          schemaVersion: 1,
+          worktree,
+          branch,
+          parentCommit,
+          evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
+          evaluatorSha256,
+          baselineTestPaths,
+          packageScripts,
+          sourceEditLineage,
+          authoredChangedPaths: authored.changedPaths,
+          authoredDiffSha256: authored.sha256,
+          authoredBytes,
+          createdAt: new Date().toISOString()
+        };
+        await atomicWrite(proposalPath(worktree), JSON.stringify(externalProposal, null, 2));
+        return {
+          worktree,
+          branch,
+          taskFile,
+          parentCommit,
+          evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
+          evaluatorSha256,
+          benchmarkDomains: EVOLUTION_BENCHMARK_DOMAINS,
+          protectedPaths: EVOLUTION_PROTECTED_PATHS,
+          sourceEditLineage,
+          authoredChangedPaths: authored.changedPaths,
+          authoredDiffSha256: authored.sha256,
+          authoredBytes,
+          diff: authored.diff,
+          checks: [
+            {
+              name: "isolated-worktree",
+              passed: true,
+              detail: "No running application files were overwritten."
+            },
+            {
+              name: "typed-source-authoring",
+              passed: sourceEditLineage.length > 0,
+              detail: sourceEditLineage.length
+                ? `${sourceEditLineage.length} compare-and-write text edit(s) were applied.`
+                : "No typed source edits were provided; an empty candidate cannot be promoted."
+            },
+            {
+              name: "promotion",
+              passed: false,
+              detail: "Promotion requires a non-empty diff, passing tests, and exact authorization."
+            }
+          ]
+        };
+      } catch (error) {
+        await Promise.all([
+          unlink(taskFile).catch(() => undefined),
+          unlink(proposalPath(worktree)).catch(() => undefined)
+        ]);
+        await runProcess(
+          "git",
+          ["-C", repository, "worktree", "remove", "--force", worktree],
+          repository,
+          60_000
+        ).catch(() => undefined);
+        await runProcess(
+          "git",
+          ["-C", repository, "branch", "-D", branch],
+          repository,
+          30_000
+        ).catch(() => undefined);
+        throw error;
+      }
     }
 
     if (action === "diff") {
@@ -1514,6 +1926,21 @@ export class ToolExecutor {
         truncated: diffCheck.truncated
       });
       const snapshot = await diffSnapshot(worktree, proposal.parentCommit);
+      checks.push({
+        name: "candidate-change",
+        passed: snapshot.changedPaths.length > 0,
+        exitCode: snapshot.changedPaths.length > 0 ? 0 : 1,
+        durationMs: 0,
+        stdout:
+          snapshot.changedPaths.length > 0
+            ? `${snapshot.changedPaths.length} source path(s) changed.`
+            : "",
+        stderr:
+          snapshot.changedPaths.length > 0
+            ? ""
+            : "An empty source candidate cannot pass evaluation or be promoted.",
+        truncated: false
+      });
       const passed = checks.every((check) => check.passed);
       const baselineDurationMs = baselineChecks.reduce(
         (total, check) => total + check.durationMs,
@@ -1597,6 +2024,9 @@ export class ToolExecutor {
         throw new Error("expectedDiffSha256 must be a SHA-256 digest from source.self-modify.test.");
       }
       const snapshot = await diffSnapshot(worktree, proposal.parentCommit);
+      if (snapshot.changedPaths.length === 0) {
+        throw new Error("An empty source candidate cannot be promoted.");
+      }
       if (snapshot.sha256 !== expected) {
         throw new Error("Evolution candidate changed after validation; test it again.");
       }

@@ -32,10 +32,10 @@ interface LearningDelta {
 }
 
 /**
- * The TypeScript core is a degraded-mode continuity path, not a second
- * configurable personality system. These constants mirror mandatory v1
- * substrate mechanics; organic variability and branching are derived below
- * from live state instead of persisted user controls.
+ * Legacy deterministic mechanics retained only for isolated unit fixtures.
+ * Production neural creation, learning, recall, and chat are owned by the
+ * authoritative Python OmniCortex worker; only recordNeuralChat below is used
+ * to persist its presentation state.
  */
 const FALLBACK_DYNAMICS = Object.freeze({
   membraneLeak: 0.82,

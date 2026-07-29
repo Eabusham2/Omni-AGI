@@ -7,6 +7,8 @@ import type {
   EvolutionEvaluation,
   EvolutionRollbackRequest,
   EvolutionRun,
+  EvolutionSourceEdit,
+  EvolutionSourceEditLineage,
   EvolutionStartRequest,
   PromotionRecord,
   ToolPermissionLevel,
@@ -298,6 +300,83 @@ function cleanStringArray(value: unknown, label: string): string[] | undefined {
     .filter(Boolean);
 }
 
+function cleanSourceEdits(value: unknown): EvolutionSourceEdit[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error("sourceEdits must be an array.");
+  }
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Every source edit must be a typed object.");
+    }
+    const edit = entry as Record<string, unknown>;
+    if (
+      typeof edit.path !== "string" ||
+      !edit.path.trim() ||
+      edit.path.includes("\0")
+    ) {
+      throw new Error("Every source edit requires a non-empty relative path.");
+    }
+    if (typeof edit.content !== "string" || edit.content.includes("\0")) {
+      throw new Error("Source edit content must be UTF-8 text without NUL bytes.");
+    }
+    if (
+      edit.expectedSha256 !== null &&
+      !(
+        typeof edit.expectedSha256 === "string" &&
+        /^[a-f0-9]{64}$/i.test(edit.expectedSha256)
+      )
+    ) {
+      throw new Error(
+        "Every source edit requires an expected SHA-256 or null when creating a file."
+      );
+    }
+    return {
+      path: edit.path.trim(),
+      content: edit.content,
+      expectedSha256:
+        typeof edit.expectedSha256 === "string"
+          ? edit.expectedSha256.toLocaleLowerCase()
+          : null
+    };
+  });
+}
+
+function outputSourceEditLineage(
+  output: Record<string, unknown>
+): EvolutionSourceEditLineage[] {
+  if (!Array.isArray(output.sourceEditLineage)) return [];
+  return output.sourceEditLineage
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        typeof entry === "object" && entry !== null && !Array.isArray(entry)
+    )
+    .flatMap((entry) => {
+      const path = typeof entry.path === "string" ? entry.path : "";
+      const expectedSha256 =
+        entry.expectedSha256 === null
+          ? null
+          : typeof entry.expectedSha256 === "string" &&
+              /^[a-f0-9]{64}$/i.test(entry.expectedSha256)
+            ? entry.expectedSha256.toLocaleLowerCase()
+            : undefined;
+      const resultSha256 =
+        typeof entry.resultSha256 === "string" &&
+        /^[a-f0-9]{64}$/i.test(entry.resultSha256)
+          ? entry.resultSha256.toLocaleLowerCase()
+          : "";
+      const bytes =
+        typeof entry.bytes === "number" &&
+        Number.isSafeInteger(entry.bytes) &&
+        entry.bytes >= 0
+          ? entry.bytes
+          : -1;
+      return path && expectedSha256 !== undefined && resultSha256 && bytes >= 0
+        ? [{ path, expectedSha256, resultSha256, bytes }]
+        : [];
+    });
+}
+
 function workerState(status: string | undefined): EvolutionCandidateRecord["state"] | undefined {
   switch (status) {
     case "training":
@@ -331,8 +410,10 @@ export class EvolutionController {
   /**
    * Source evolution keeps its external immutable Git evaluator. Neural and
    * data learning use the worker's transactional safe-tensor overlay manager.
-   * Architecture mutation remains unavailable until stable shape migration
-   * and side-by-side restart are implemented.
+   * Architecture evolution is deliberately narrower than arbitrary tensor
+   * reshaping: it may add resource-checked, load-compatible zero-residual
+   * ternary experts, while incompatible width/depth/router/modality shape
+   * mutations remain rejected.
    */
   candidateRoutes(): EvolutionCandidateRoute[] {
     return [
@@ -653,6 +734,9 @@ export class EvolutionController {
     allowAutomaticPromotion: boolean
   ): Promise<EvolutionRunRecord> {
     const kind = request.candidateKind ?? "source";
+    if (kind !== "source" && request.sourceEdits !== undefined) {
+      throw new Error("sourceEdits are valid only for isolated source candidates.");
+    }
     return kind === "source"
       ? this.startSource(request, allowAutomaticPromotion)
       : this.startWorker(request, kind, allowAutomaticPromotion);
@@ -663,6 +747,7 @@ export class EvolutionController {
     allowAutomaticPromotion: boolean
   ): Promise<EvolutionRunRecord> {
     const objective = cleanObjective(request.objective);
+    const sourceEdits = cleanSourceEdits(request.sourceEdits);
     const detectedLimitations = await this.detectLimitations(request.brainId);
     const ids = { run: randomUUID(), candidate: randomUUID() };
     const now = new Date().toISOString();
@@ -744,7 +829,8 @@ export class EvolutionController {
           objective,
           hypothesis: initial.hypothesis,
           limitationEvidence: initial.limitations,
-          evaluatorPolicySha256: EVOLUTION_POLICY_SHA256
+          evaluatorPolicySha256: EVOLUTION_POLICY_SHA256,
+          ...(sourceEdits === undefined ? {} : { sourceEdits })
         }
       });
     } catch (error) {
@@ -792,18 +878,36 @@ export class EvolutionController {
         candidate.evaluatorVersion = evaluatorVersion;
       }
       candidate.benchmarkDomains = outputStringArray(output, "benchmarkDomains");
+      candidate.sourceEditLineage = outputSourceEditLineage(output);
+      candidate.authoredChangedPaths = outputStringArray(output, "authoredChangedPaths");
+      candidate.authoredDiffSha256 = outputString(output, "authoredDiffSha256");
+      candidate.authoredBytes = finiteNumber(output.authoredBytes);
       candidate.promotionPolicy = sourcePolicy;
       candidate.promotionApprovalRequired = sourcePolicy !== "full";
+      const expectedEditPaths = [...new Set((sourceEdits ?? []).map((edit) => edit.path))].sort();
+      const authoredLineagePaths = [
+        ...new Set((candidate.sourceEditLineage ?? []).map((edit) => edit.path))
+      ].sort();
+      const typedAuthoringInvalid =
+        expectedEditPaths.length > 0 &&
+        (
+          JSON.stringify(authoredLineagePaths) !== JSON.stringify(expectedEditPaths) ||
+          JSON.stringify(candidate.authoredChangedPaths) !== JSON.stringify(expectedEditPaths) ||
+          !isSha256(candidate.authoredDiffSha256) ||
+          candidate.authoredBytes === undefined ||
+          candidate.authoredBytes < 0
+        );
       if (
         !candidate.worktree ||
         !candidate.branch ||
         !isCommit(candidate.proposalParentCommit) ||
         !isSha256(candidate.evaluatorSha256) ||
         candidate.evaluatorVersion !== EVOLUTION_EVALUATOR_VERSION ||
-        candidate.benchmarkDomains.length === 0
+        candidate.benchmarkDomains.length === 0 ||
+        typedAuthoringInvalid
       ) {
         const error =
-          "The isolated evolution proposal did not return a verifiable worktree, parent, and immutable evaluator identity.";
+          "The isolated evolution proposal did not return verifiable worktree, evaluator, and typed source-edit lineage.";
         run.state = "failed";
         run.error = error;
         candidate.state = "failed";
@@ -1257,6 +1361,7 @@ export class EvolutionController {
     const parentCommit = outputString(testOutput, "parentCommit");
     const benchmarkDomains = outputStringArray(testOutput, "benchmarkDomains");
     const regressions = outputStringArray(testOutput, "regressions");
+    const resources = outputResources(testOutput);
     const requiredChecks = new Set<string>(evaluationTests);
     requiredChecks.add("diff-check");
     const checksComplete =
@@ -1278,6 +1383,9 @@ export class EvolutionController {
         ? "Candidate parent changed between proposal and evaluation."
         : undefined,
       !isSha256(diffSha256) ? "Evaluation did not return a valid diff hash." : undefined,
+      resources.changedPaths === undefined || resources.changedPaths < 1
+        ? "An empty source candidate cannot be promoted."
+        : undefined,
       !checksComplete ? "Required checks were missing or failed." : undefined,
       regressions.length ? `Detected regressions: ${regressions.join(", ")}.` : undefined
     ].filter((reason): reason is string => Boolean(reason));
@@ -1294,7 +1402,7 @@ export class EvolutionController {
       checks,
       baselineChecks,
       regressions,
-      resources: outputResources(testOutput),
+      resources,
       rejectionReason: rejectionReasons.join(" ")
     };
     await this.mutateArchive(request.brainId, (archive) => {

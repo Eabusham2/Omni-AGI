@@ -1,5 +1,10 @@
 # Neural chat streaming contract
 
+Omni's worker API is stable protocol version **1** (the product's `1.0`
+contract). Its wire envelope uses JSON-RPC **2.0**, because ordered progress
+and cancellation events rely on standard notifications. “Protocol 1.0” in the
+product plan refers to the Omni API version, not a JSON-RPC 1.0 envelope.
+
 The desktop sends a unique `streamId` in every `chat` JSON-RPC request. While
 that request is active, the worker may emit JSON-RPC notifications using the
 existing `event` method:

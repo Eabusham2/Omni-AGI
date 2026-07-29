@@ -38,7 +38,7 @@ local OmniCortex Python/PyTorch worker
   - reads user-selected ingestion paths passed by Electron
 ```
 
-The renderer has no direct Node.js, filesystem, process, or credential access. Electron denies unhandled web permissions and sends validated work to the local worker. If the worker cannot start, the app exposes a deterministic TypeScript research fallback; the fallback is not presented as equivalent to the PyTorch engine.
+The renderer has no direct Node.js, filesystem, process, or credential access. Electron denies unhandled web permissions and sends validated work to the local worker. Stable v1 does not substitute a second TypeScript “brain” when the authoritative PyTorch worker is unavailable; neural creation, chat, training, and inspection fail visibly until that worker recovers.
 
 ## Build initialization and hardware selection
 
@@ -173,7 +173,7 @@ brains/
         core.safetensors
         plasticity.safetensors
     artifacts/
-      browser/                       guarded browser snapshot PNGs
+      browser/                       guarded browser-task screenshots and evidence
     engine/
       brain.json                     current neural metadata
       core.safetensors               decoder, liquid, adapters, modalities
@@ -213,15 +213,15 @@ objects, so it is a storage convenience, not a shareable checkpoint.
 
 ## Tools and agents
 
-Tool schemas are structured VSA model inputs; grant enforcement stays in Electron. They describe capability, not persona or behavior, and create no additional language prompt tokens. The model may emit one `<omni-tool>` JSON request, while users can call the same path directly with `/tool <tool.id> <action> {JSON}`, `/imagine image|audio|video`, or `/agent <objective>`. Tool results are displayed and returned to the brain as a visible structured experience. Long-running imagination calls remain cancellable and do not report completion or enter experience until the neural job produces its final artifact metadata. Recursive model-produced calls are capped at four actions for a turn.
+Tool schemas are structured VSA model inputs; grant enforcement stays in Electron. They describe capability, not persona or behavior, and create no additional language-prompt tokens. A learned action head selects among `talk`, `tool`, `imagine`, `agent`, `ponder`, `learn`, `evolve`, and `stop`. Its dedicated typed worker channel materializes enabled tool IDs, actions, and validated arguments; response prose, slash commands, and tagged text are ignored. Tool results are displayed and returned as visible structured experience. Long-running imagination calls stream previews, remain cancellable, and enter experience only after final artifact metadata is available.
 
 `Off` rejects execution. `Ask` issues a five-minute, single-use approval token bound to the exact brain ID, tool ID, action, and SHA-256 digest of the serialized JSON arguments. `Auto` executes its safe subset but still asks for writes and other risky operations; its file reads are confined by real-path checks to the selected brain directory. `Full Authority` executes a valid invocation without an approval token. All levels append permission, invocation, result, cancellation, and failure stages to the same operational trace used by the brain. Arguments are represented by names and digests rather than copied file contents. Active processes, fetches, browser loads, and modality jobs have cancellation paths; a cancelled worker job is interrupted and late results are ignored.
 
-The browser executor is a real but deliberately constrained snapshot provider. It performs guarded fetches with private-network and redirect checks, sanitizes bounded remote markup into an inert local document, and loads that document in a hidden sandboxed Electron window with an ephemeral partition. Remote scripts and active content are blocked; only the app's fixed extraction routine executes. Navigation and popups remain blocked. The executor returns bounded title/text/link data and writes a PNG under the brain's artifact directory. It does not operate signed-in sessions or provide general interactive browser automation.
+The browser executor runs a sandboxed persistent partition scoped to one brain. Public-network validation is applied to page, redirect, websocket, and subresource destinations; browser permission requests, downloads, popups, private-network targets, and non-web navigation are denied. Typed steps can navigate, click, type, press keys, wait for selectors, extract bounded DOM data, and capture screenshots. A permission-approved visible session can retain sign-in cookies without exposing renderer filesystem or Node access.
 
-Files, PowerShell, code execution, guarded web fetch/search, modality generation, browser snapshots, brain agents, and source evolution have local executors.
+Files, PowerShell, code execution, guarded web fetch/search, browser automation, modality generation, brain agents, and source evolution have local executors.
 
-Source evolution requires an explicitly authorized Git clone. `propose` creates a separate branch/worktree and an out-of-tree task record. Edits are made inside that candidate through separately permissioned file/code tools. `diff` validates the worktree boundary and inventories tracked changes plus bounded untracked-file hashes. `test` runs only the allowlisted typecheck, unit-test, and build commands plus `git diff --check`, recording validation against the exact diff digest. `promote` requires that digest, a matching passing validation, and a clean target clone before committing and merging the candidate branch. The running binary is never replaced or restarted mid-execution.
+Source evolution requires an explicitly authorized Git clone. `propose` creates a separate branch/worktree and applies only declared typed UTF-8 compare-and-write edits whose existing-file SHA-256 (or new-file absence) still matches. It publishes the candidate only after all paths and temporary files pass traversal, symlink, protected-evaluator, setup-script, binary, size, and stale-input checks; the lineage records every before/after hash and the complete authored diff hash. `diff` validates the worktree boundary and inventories tracked changes plus bounded untracked-file hashes. `test` runs only the allowlisted typecheck, unit-test, and build commands plus `git diff --check`, recording validation against the exact diff digest. Empty candidates cannot pass. `promote` requires that digest, a matching passing validation, and a clean target clone before committing and merging the candidate branch. Generated response prose is never interpreted as source code. The running binary is never replaced or restarted mid-execution.
 
 An `agent.fork` action creates one to four copy-on-write brain forks and runs one objective turn in each isolated identity. The parent receives result summaries but no neural mutation. Merge remains a separate, previewed user action that copies novel ideas, relations, deduplicated evidence metadata, retained source blobs allowed by the target memory recipe, branch-local artifacts, replay examples, and related overlays. `Synapses Only` targets receive evidence provenance but no raw source text or source blob. Whole-model weights are never averaged. The current executor runs these bounded fork turns sequentially, so this is not a claim of an open-ended parallel autonomous society.
 

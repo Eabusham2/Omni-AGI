@@ -168,7 +168,7 @@ class DatasetStreamingTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(len(records), 7)
+        self.assertEqual(len(records), 7, coverage.errors)
         self.assertEqual(coverage.processed_records, 7)
         self.assertEqual(coverage.rejected_records, 0)
         self.assertTrue(records[0].name.startswith(remote_url))

@@ -5,6 +5,7 @@ import type {
   ChatResult,
   ChatStreamEvent,
   EvolutionRun,
+  EvolutionSourceEdit,
   EvolutionStartRequest,
   IdleCycleResult,
   ModalityPreview,
@@ -71,6 +72,36 @@ function actionFingerprint(action: StructuredAction): string {
     action.action,
     action.arguments
   ]);
+}
+
+function typedSourceEdits(value: unknown): EvolutionSourceEdit[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error("A source evolution action's sourceEdits must be an array.");
+  }
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Every source edit must be a typed object.");
+    }
+    const edit = entry as Record<string, unknown>;
+    if (
+      typeof edit.path !== "string" ||
+      typeof edit.content !== "string" ||
+      !(
+        edit.expectedSha256 === null ||
+        typeof edit.expectedSha256 === "string"
+      )
+    ) {
+      throw new Error(
+        "Every source edit requires path, content, and expectedSha256 (or null for a new file)."
+      );
+    }
+    return {
+      path: edit.path,
+      content: edit.content,
+      expectedSha256: edit.expectedSha256
+    };
+  });
 }
 
 function eventFor(brainId: string, action: StructuredAction): ActionEvent {
@@ -176,6 +207,7 @@ export class ChatActionController extends EventEmitter {
           ? value
           : undefined;
       const addExperts = action.arguments.addExperts;
+      const sourceEdits = typedSourceEdits(action.arguments.sourceEdits);
       const run = await this.evolution.start({
         brainId: event.brainId,
         objective,
@@ -196,6 +228,7 @@ export class ChatActionController extends EventEmitter {
             ? action.arguments.latentReplay
             : undefined,
         objectives: stringArray(action.arguments.objectives),
+        ...(sourceEdits === undefined ? {} : { sourceEdits }),
         architectureChange:
           candidateKind === "architecture"
             ? {

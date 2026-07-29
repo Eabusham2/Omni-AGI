@@ -40,9 +40,9 @@ gates.
 | Web learning | A brain-local SQLite frontier supports same-site continuous crawling, bounded parallel fetches, persistent resume, deduplication, pacing/backoff, robots controls, external-link opt-in, quarantine, cancellation, provenance, and linked image/audio/video learning | `src/main/dataIngestion.ts`; `src/main/brainService.ts`; `tests/dataIngestion.test.ts` |
 | Uploads in all user surfaces | Build, Data Studio, and Run/chat expose native selectors for general files and datasets, images, audio, video, and folders. Run also accepts drag-and-drop and displays a neural-learning receipt | `src/shared/uploadSupport.ts`; `src/main/ipc.ts`; `src/preload/index.ts`; `src/renderer/src/App.tsx`; `tests/uploadSupport.test.ts` |
 | Multimodal learning and imagination | Compact trainable vision, VQ/image diffusion, RVQ/audio, and liquid-gated factorized video baselines share the idea space. Ingestion trains the matching packs; generation can start from active assemblies | `engine/omni_core/modalities.py`; `engine/omni_core/brain.py`; `engine/tests/test_memory_modalities.py`; `engine/tests/test_release_gates.py` |
-| Natural typed actions | A learned neural action head scores `talk`, `tool`, `imagine`, `agent`, `ponder`, `learn`, `evolve`, or `stop`. Only the dedicated typed action channel is executable; response prose, slash commands, and tagged text are ignored. Generic neural tool ID/argument materialization is provisional pending its final bridge test | `engine/omni_core/model.py`; `engine/omni_core/brain.py`; `src/main/actionProtocol.ts`; `src/main/chatActionController.ts`; `tests/actionProtocol.test.ts` |
+| Natural typed actions | A learned neural action head scores `talk`, `tool`, `imagine`, `agent`, `ponder`, `learn`, `evolve`, or `stop`. Only the dedicated typed action channel is executable; response prose, slash commands, and tagged text are ignored. Enabled generic tool IDs/actions are ranked through neural/VSA evidence and required arguments must be explicit | `engine/omni_core/model.py`; `engine/omni_core/brain.py`; `src/main/actionProtocol.ts`; `src/main/chatActionController.ts`; `tests/actionProtocol.test.ts`; `engine/tests/test_tool_schemas.py` |
 | Real-time imagination | Image, audio, and video generators publish ordered intermediate media previews while a chat turn remains active. Final artifacts and visible tool results re-enter the continuous experience only after completion | `engine/omni_core/modalities.py`; `engine/omni_core/brain.py`; `engine/worker.py`; `src/main/chatActionController.ts`; `tests/actionProtocol.test.ts`; `engine/tests/test_worker.py` |
-| Tools directly in chat | The chat controller accepts permission-checked file, PowerShell, code, web, guarded browser, imagination, agent, and source-evolution typed actions with visible cards and cancellation. Imagination, agent, and evolution have an end-to-end neural materializer; the generic neural tool bridge is still a provisional current-revision integration | `tools/catalog.json`; `engine/omni_core/brain.py`; `src/main/toolExecutor.ts`; `src/main/chatActionController.ts`; `engine/tests/test_tool_schemas.py`; `tests/toolExecutor.test.ts` |
+| Tools directly in chat | The chat controller accepts permission-checked file, PowerShell, code, web, interactive browser, imagination, agent, and source-evolution typed actions with visible cards and cancellation. The neural materializer selects only enabled schemas and emits file/code/search/fetch/browser arguments only when required values are explicit | `tools/catalog.json`; `engine/omni_core/brain.py`; `src/main/toolExecutor.ts`; `src/main/chatActionController.ts`; `engine/tests/test_tool_schemas.py`; `tests/toolExecutor.test.ts` |
 | Agents and identity forks | Each build has one continuous identity and chat. Duplicate and fork create copy-on-write neural identities; reviewed merges import assemblies, evidence, artifacts, files, and replay examples without averaging whole identities | `src/main/brainRepository.ts`; `src/main/brainService.ts`; `src/renderer/src/App.tsx`; `tests/brainRepository.test.ts`; `tests/brainService.test.ts`; `tests/toolWorkflows.test.ts` |
 | Recursive improvement | Neural and data candidates autonomously train in isolated safe-tensor overlays with immutable capability, retention, integrity, ternary, and resource checks, plus promotion lineage and rollback. Source candidates get an isolated Git worktree and evaluator, but the source proposal does not itself edit code | `src/main/evolutionController.ts`; `engine/omni_core/evolution.py`; `engine/worker.py`; `tests/evolutionController.test.ts`; `engine/tests/test_neural_evolution.py` |
 | Storage, export, and sharing | Stable `.omni` bundles include checksum-bound current/origin state and packed ternary generations without executable pickle. Portable and content-addressed local-reference exports, explicit beta rejection/deletion, catalog recipes, and modality packs are implemented | `src/main/brainRepository.ts`; `src/main/catalogInstaller.ts`; `engine/omni_core/ternary_packing.py`; `tests/brainRepository.test.ts`; `tests/catalogInstaller.test.ts` |
@@ -67,12 +67,12 @@ or prior beta Actions runs do not prove the present source tree.
 | Signing and notarization | Conditional on repository credentials; no signed or notarized artifact is claimed |
 | `main`, `v1.0.0`, GitHub Release, and only-branch cleanup | Not complete at this audit point |
 | Public Omni Starter checkpoint, dataset ledger, and external loss curves | Not published; the bundled starter is only the small local project-authored baseline |
-| Generic file/web/code/browser action materialization from the learned neural `tool` class | Provisional integration; must pass a real worker-to-executor fixture before it is counted complete |
-| Evolution candidate review, approval, and rollback controls in the Run renderer | Not present at this audit point; preload/IPC/controller APIs exist, but the renderer does not call them |
-| Pressure/convergence-governed generation branching and spreading activation with no implementation-defined step count | Partial: user-facing controls and fixed top-k recall are removed, but chat still uses tier branch budgets and spreading activation still has a four-hop loop |
+| Generic file/web/code/browser action materialization from the learned neural `tool` class | Implemented and covered by worker-level explicit-argument/off-schema fixtures in `engine/tests/test_tool_schemas.py` |
+| Evolution candidate review, approval, and rollback controls in the Run renderer | Implemented in `EvolutionWorkspace` with lineage/evaluation display, start/stop, Ask review, recursive reassessment, and exact rollback |
+| Pressure/convergence-governed generation branching and spreading activation with no implementation-defined step count | Implemented: neural-energy settling, score convergence, workspace pressure, and host reserves replace tier branch budgets; spreading activation has no hop counter |
 | Full-Authority source improvement installs a side-by-side rebuilt desktop binary and restarts into it | Not implemented: verified source diffs can be promoted to Git, but the running packaged binary is not replaced or restarted |
-| Source evolution autonomously writes its proposed code change | Not implemented: the proposal creates an isolated worktree and task record; another explicitly authorized editor must make the candidate diff |
-| Idle cognition can initiate a spontaneous conversational question/message | Not implemented: idle cycles rehearse and can propose typed external actions, but they do not append a `talk` message to the chat |
+| Typed source candidate authoring | Implemented: the dedicated action channel can supply exact compare-and-write UTF-8 edits. `propose` applies them atomically only inside the isolated worktree, records before/after hashes and the authored diff, and rejects traversal, links, protected paths, stale inputs, binary/setup changes, oversized edits, and empty candidates |
+| Idle cognition can initiate a spontaneous conversational question/message | Implemented: a confident idle `talk` choice decodes from recurrent state without a prompt, persists in the continuous chat, and emits a visible organic action event |
 
 ## Important engineering limits
 
@@ -90,14 +90,13 @@ or prior beta Actions runs do not prove the present source tree.
 - Source evolution promotes a verified Git change. It does not currently build
   and install a replacement desktop binary or restart the running app into that
   binary.
-- Source evolution creates and guards an isolated Git worktree, but the
-  proposal action does not itself author a code diff. Autonomous recursive
-  source editing is therefore incomplete even though neural/data candidate
-  training is real.
-- Generation branch count is currently bounded by a hardware-tier budget, and
-  spreading activation currently uses a four-hop propagation loop. These are
-  internal implementation ceilings even though neither is exposed as a user
-  personality control.
+- Source evolution has a safe typed authoring channel, but the bundled starter
+  is not claimed to reliably discover arbitrary source locations or synthesize
+  generally intelligent patches. It must produce exact paths, contents, and
+  parent hashes through that channel; generated prose is never executed.
+- Generation candidates settle from neural energy, score convergence,
+  working-memory scale, and host reserves. Recurrent spreading schedules only
+  materially stronger damped signals and has no hop counter.
 - Dataset traversal can prove that each valid manifested record was visited;
   it cannot prove that a small model understood or perfectly remembered every
   record.
@@ -108,9 +107,10 @@ or prior beta Actions runs do not prove the present source tree.
 - Common image, audio, and video formats are supported through installed local
   decoders. “All forms” cannot be guaranteed for corrupt, encrypted,
   proprietary, DRM-protected, or decoder-unsupported media.
-- The guarded browser protocol renders a script-disabled public-page snapshot
-  and returns text, links, and a screenshot. It is not interactive signed-in
-  browser automation.
+- Interactive browser tasks use a sandboxed persistent per-brain partition and
+  typed navigation/click/type/key/wait/extract/screenshot steps. Private
+  networks, browser permissions, downloads, popups, and non-web navigation are
+  denied; Full Authority does not remove those host boundaries.
 - Exact source recall requires Total Recall. Human Consolidation and Synapses
   Only are intentionally lossy.
 - Operational traces expose seeds, activations, routes, action events, and

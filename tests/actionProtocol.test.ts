@@ -461,6 +461,44 @@ describe("structured chat actions", () => {
       state: "complete",
       evolutionRunId: "run-1"
     });
+
+    const typedEdits = [
+      {
+        path: "src/measured-maintenance.ts",
+        content: "export const measuredMaintenance = true;\n",
+        expectedSha256: null
+      }
+    ];
+    const sourceEvolve = { start: vi.fn().mockResolvedValue(run) };
+    const sourceController = new ChatActionController(
+      {
+        chat: vi
+          .fn()
+          .mockResolvedValueOnce(chatResult("Authoring an isolated source candidate.", [{
+            kind: "evolve",
+            source: "brain",
+            toolId: "source.self-modify",
+            action: "propose",
+            arguments: {
+              objective: "record measured maintenance",
+              candidateKind: "source",
+              sourceEdits: typedEdits
+            }
+          }]))
+          .mockResolvedValueOnce(chatResult("The typed candidate was recorded."))
+      },
+      tools,
+      sourceEvolve
+    );
+    await sourceController.send("brain-2", "Record the measured maintenance patch");
+    expect(sourceEvolve.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        brainId: "brain-2",
+        objective: "record measured maintenance",
+        candidateKind: "source",
+        sourceEdits: typedEdits
+      })
+    );
   });
 
   it("routes organic idle actions through the same permission and audit events", async () => {

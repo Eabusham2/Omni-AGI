@@ -28,10 +28,10 @@ line-by-line user-request audit.
 | LIF spiking and causal/anti-causal STDP with metaplasticity | Implemented | `engine/omni_core/spiking.py`; `engine/tests/test_dynamics.py` |
 | CfC default temporal controller and experimental LTC path | Implemented | `engine/omni_core/liquid.py`; `engine/tests/test_dynamics.py` |
 | VSA/HDC bind, bundle, permutation, approximate recall, and recurrent spreading activation | Implemented | `engine/omni_core/vsa.py`; `engine/tests/test_memory_modalities.py` |
-| Spreading activation continues solely until convergence, interference, workspace pressure, or resource pressure | Partial | Fixed top-k recall is gone, but `NeuralSubstrate.recall_vector()` still has a four-hop propagation loop |
+| Spreading activation continues solely until convergence, interference, workspace pressure, or resource pressure | Implemented | `NeuralSubstrate.recall_vector()` has no hop counter; damped recurrent changes settle against an adaptive workspace-pressure floor. `engine/tests/test_memory_modalities.py` proves activation beyond four hops |
 | Dynamic sparse growth without a product-defined neuron, assembly, synapse, or expert count | Implemented | `engine/omni_core/vsa.py`; `engine/omni_core/brain.py`; `engine/tests/test_brain.py`; `engine/tests/test_release_gates.py` |
 | Graceful growth pause before the configured RAM/disk reserve | Implemented | `engine/omni_core/vsa.py`; `engine/omni_core/brain.py`; `tests/dataIngestion.test.ts` |
-| Dense base architecture can reshape itself while running | Partial | Sparse structures and experts grow, but live dense tensor shapes remain fixed; architecture candidates are explicitly unavailable in stable v1 |
+| Dense base architecture can reshape itself while running | Partial | Safe architecture candidates can add load-compatible, initially zero-residual ternary experts with exact rollback. Arbitrary width/depth/router/modality tensor-shape migration remains intentionally rejected |
 
 ## Working memory, organic dynamics, and trace
 
@@ -43,9 +43,9 @@ line-by-line user-request audit.
 | Hardware-sized context with only an Extended working memory checkbox in basic Build | Implemented | `engine/omni_core/config.py`; `src/renderer/src/App.tsx`; `engine/tests/test_config.py` |
 | Long-term source prose is not silently appended to the generation prompt | Implemented | `engine/omni_core/brain.py`; `engine/tests/test_brain.py`; `engine/tests/test_tool_schemas.py` |
 | Curiosity, pondering, branch count, and fuzziness emerge from measured internal state instead of sliders | Implemented | `engine/omni_core/brain.py`; `engine/omni_core/config.py`; `src/renderer/src/App.tsx`; `engine/tests/test_brain.py`; `tests/projectIntegrity.test.ts` |
-| Branch/ponder computation has no fixed implementation-defined thought count | Partial | The user cannot set it, but chat currently uses hardware-tier branch budgets |
+| Branch/ponder computation has no fixed implementation-defined thought count | Implemented | Chat has no tier branch ceiling or user control; computation settles from measured score convergence, organic neural energy, working-memory scale, and disk/RAM reserve pressure |
 | Prompt-free idle cognition can rehearse and propose typed actions | Implemented | `engine/omni_core/brain.py`; `src/main/idleCognitionScheduler.ts`; `engine/tests/test_brain.py`; `tests/idleCognitionScheduler.test.ts`; `tests/neuralFeedbackIdle.test.ts` |
-| Idle cognition can spontaneously ask the user something in the continuous chat | Not implemented | The current idle scheduler does not materialize a `talk` action as a new chat message |
+| Idle cognition can spontaneously ask the user something in the continuous chat | Implemented | A confident prompt-free `talk` choice decodes from active recurrent state using only language-boundary tokens, persists to the continuous chat, and publishes a visible organic action event. `engine/tests/test_brain.py`; `tests/neuralFeedbackIdle.test.ts` |
 | Trace records seeds, activations, recurrence, routes, mutations, and external actions | Implemented | `engine/omni_core/brain.py`; `src/main/chatActionController.ts`; `tests/actionProtocol.test.ts` |
 | Trace is a guaranteed faithful chain-of-thought explanation | Not claimed | The product records operational evidence and labels generated explanations as self-report |
 
@@ -104,17 +104,18 @@ line-by-line user-request audit.
 | Action, progress, preview, result, approval, cancellation, and failure cards appear directly in chat for received typed actions | Implemented | `src/main/chatActionController.ts`; `src/renderer/src/App.tsx`; `tests/actionProtocol.test.ts`; `tests/toolExecutor.test.ts` |
 | Tool capabilities enter through bounded learned schema embeddings and add no behavioral prompt text | Implemented | `engine/omni_core/brain.py`; `engine/tests/test_tool_schemas.py` |
 | Files, PowerShell, code, web search/fetch, guarded browser, imagination, agent, and source-evolution protocols | Implemented | `tools/catalog.json`; `src/main/toolExecutor.ts`; `tests/toolExecutor.test.ts`; `tests/toolWorkflows.test.ts` |
-| Interactive browser automation with navigation, clicks, typing, and signed-in sessions | Partial | `browser.automation` intentionally produces a guarded script-disabled snapshot with text, links, and a screenshot |
-| Learned generic `tool` choice materializes a valid enabled tool ID, action, and typed arguments end to end | Partial | The executor and typed channel exist; the final neural generic-tool bridge and its real worker fixture are provisional |
+| Interactive browser automation with navigation, clicks, typing, and signed-in sessions | Implemented | `browser.automation` uses a persistent per-brain sandbox and typed navigate/click/type/press/wait/extract/screenshot steps while validating all public-network requests and denying downloads, popups, browser permissions, and private-network targets |
+| Learned generic `tool` choice materializes a valid enabled tool ID, action, and typed arguments end to end | Implemented | The neural tool head ranks only enabled schema/action pairs and materializes explicit file, code, search, fetch, and browser arguments without parsing response prose or guessing missing required values. `engine/tests/test_tool_schemas.py` |
 | Off, Ask, Auto, and Full grants are enforced outside candidate-writable neural state | Implemented | `src/main/toolExecutor.ts`; `src/main/evolutionController.ts`; `tests/toolExecutor.test.ts`; `tests/evolutionController.test.ts` |
 | Subagent forks have isolated neural state and reviewed overlay merges | Implemented | `src/main/brainService.ts`; `src/main/toolExecutor.ts`; `tests/brainService.test.ts`; `tests/toolWorkflows.test.ts` |
 | Source evolution creates/tests an isolated Git worktree with diff-bound promotion and rollback | Implemented | `src/main/toolExecutor.ts`; `src/main/evolutionController.ts`; `tests/toolWorkflows.test.ts`; `tests/evolutionController.test.ts` |
-| A source-evolution proposal autonomously authors the candidate code diff | Not implemented | `source.self-modify.propose` creates the worktree, task record, and evaluator; a separate authorized editor must make changes |
+| A typed source-evolution proposal authors its declared candidate diff | Implemented | Exact path/content/parent-hash edits are applied atomically inside the new worktree and archived with before/after and diff hashes. Traversal, links, protected evaluators, package/setup scripts, binaries, stale hashes, oversized edits, and empty candidates fail closed. `src/main/toolExecutor.ts`; `src/main/evolutionController.ts`; `tests/toolWorkflows.test.ts`; `tests/actionProtocol.test.ts` |
+| The bundled starter reliably discovers and synthesizes arbitrary source-code improvements without source evidence | Not claimed | The safe authoring mechanism accepts only an exact typed edit; it does not pretend that a small local model has general coding intelligence, and generated prose is never executed |
 | Full Authority builds, installs, and restarts into a promoted source/binary candidate | Not implemented | Source promotion records a verified Git change; it does not replace the running packaged binary |
 | Neural and data evolution use isolated safe-tensor candidates and immutable evaluation | Implemented | `src/main/evolutionController.ts`; `engine/omni_core/evolution.py`; `engine/tests/test_neural_evolution.py`; `tests/evolutionController.test.ts` |
 | Recursive generations can reassess the improvement process after promotion | Implemented | `src/main/evolutionController.ts`; `tests/evolutionController.test.ts` |
-| Run UI lists evolution candidates and exposes review, approve, stop, and rollback | Partial | Stable preload/IPC/controller APIs exist, but the current renderer has no `window.omni.evolution` integration |
-| Arbitrary architecture/tensor-shape self-rewrite in stable v1 | Not implemented | The controller fails closed because safe state migration is not implemented |
+| Run UI lists evolution candidates and exposes review, approve, stop, and rollback | Implemented | `src/renderer/src/EvolutionWorkspace.tsx`; `src/renderer/src/evolutionView.ts`; `tests/evolutionRenderer.test.ts` |
+| Arbitrary architecture/tensor-shape self-rewrite in stable v1 | Not implemented | Resource-checked residual-expert growth is implemented, but arbitrary incompatible shape migration still fails closed because safe state migration is not available |
 | “Unaligned” action without host permissions | Not implemented by design | No behavioral alignment objective is trained, but external side effects still require the build’s explicit grant |
 
 ## Identity, storage, sharing, and stable interfaces
@@ -141,7 +142,7 @@ line-by-line user-request audit.
 | Basic flow uses checkboxes and permission segments, not behavior sliders or neural caps | Implemented | `src/renderer/src/App.tsx`; `src/shared/types.ts`; `tests/projectIntegrity.test.ts` |
 | Initial resources are removable from the build without deleting the originals | Implemented | `src/main/ipc.ts`; `src/renderer/src/App.tsx`; `tests/uploadSupport.test.ts` |
 | Run keeps chat, uploads, live actions, Data Studio, substrate map, trace, journal, tools, agents, imagination, duplicate, import, and export together | Implemented | `src/renderer/src/App.tsx`; `tests/uploadSupport.test.ts`; `tests/stableBrainInspection.test.ts` |
-| Run exposes the full evolution-candidate lifecycle rather than only starting a chat evolution action | Partial | Controller/preload APIs exist; candidate list/approve/rollback controls are still absent from `src/renderer/src/App.tsx` |
+| Run exposes the full evolution-candidate lifecycle rather than only starting a chat evolution action | Implemented | The Evolution workspace lists lineage/evaluations and exposes start, stop, Ask review/promotion, recursive reassessment, and exact rollback through the stable preload API |
 | Brain Map is cursor-paged and multiresolution rather than a fixed small mirror | Implemented | `engine/omni_core/brain.py`; `src/main/brainService.ts`; `src/renderer/src/App.tsx`; `tests/stableBrainInspection.test.ts` |
 | Runtime card exposes working context/workspace and confirms no hidden prompt or raw long-term text injection | Implemented | `engine/omni_core/brain.py`; `src/renderer/src/App.tsx`; `tests/stableBrainInspection.test.ts` |
 

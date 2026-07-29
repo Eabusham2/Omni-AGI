@@ -227,6 +227,128 @@ describe("EvolutionController", () => {
     expect((await reloaded.listCandidates(brain.id, run.id))[0]?.state).toBe("stopped");
   });
 
+  it("forwards typed source edits and archives their authored hash lineage", async () => {
+    const sourceEdits = [
+      {
+        path: "src/cache-policy.ts",
+        content: "export const cachePolicy = \"measured\";\n",
+        expectedSha256: "d".repeat(64)
+      },
+      {
+        path: "src/new-maintenance.ts",
+        content: "export const maintenance = true;\n",
+        expectedSha256: null
+      }
+    ];
+    const sourceEditLineage = sourceEdits.map((edit) => ({
+      path: edit.path,
+      expectedSha256: edit.expectedSha256,
+      resultSha256: edit.path.includes("new-") ? "1".repeat(64) : "2".repeat(64),
+      bytes: Buffer.byteLength(edit.content)
+    }));
+    const execute = vi.fn(async (invocation: ToolInvocation) =>
+      execution(invocation, "complete", {
+        ...proposalOutput(
+          join(temporaryRoot, "typed-worktree"),
+          "omni-evolution/typed"
+        ),
+        sourceEditLineage,
+        authoredChangedPaths: sourceEdits.map((edit) => edit.path).sort(),
+        authoredDiffSha256: DIFF_SHA256,
+        authoredBytes: sourceEditLineage.reduce(
+          (total, edit) => total + edit.bytes,
+          0
+        )
+      })
+    );
+    const controller = new EvolutionController(repository, {
+      execute,
+      cancel: vi.fn(() => 0)
+    });
+
+    const run = await controller.start({
+      brainId: brain.id,
+      objective: "Apply a bounded measured cache maintenance patch",
+      candidateKind: "source",
+      sourceEdits
+    });
+
+    expect(execute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolId: "source.self-modify",
+        action: "propose",
+        arguments: expect.objectContaining({ sourceEdits })
+      })
+    );
+    expect((await controller.listCandidates(brain.id, run.id))[0]).toMatchObject({
+      state: "experimenting",
+      sourceEditLineage,
+      authoredChangedPaths: sourceEdits.map((edit) => edit.path).sort(),
+      authoredDiffSha256: DIFF_SHA256,
+      authoredBytes: sourceEditLineage.reduce(
+        (total, edit) => total + edit.bytes,
+        0
+      )
+    });
+  });
+
+  it("rejects an evaluator result that claims an empty source candidate passed", async () => {
+    const execute = vi.fn(async (invocation: ToolInvocation) => {
+      if (invocation.action === "propose") {
+        return execution(
+          invocation,
+          "complete",
+          proposalOutput(
+            join(temporaryRoot, "empty-worktree"),
+            "omni-evolution/empty"
+          )
+        );
+      }
+      if (invocation.action === "test") {
+        return execution(invocation, "complete", {
+          ...passingEvaluationOutput(["typecheck", "unit", "build"]),
+          resources: {
+            baselineDurationMs: 3,
+            candidateDurationMs: 3,
+            durationDeltaMs: 0,
+            changedBytes: 0,
+            changedPaths: 0,
+            untrackedBytes: 0
+          }
+        });
+      }
+      return execution(
+        invocation,
+        "failed",
+        undefined,
+        undefined,
+        "Promotion must never execute for an empty source candidate."
+      );
+    });
+    const controller = new EvolutionController(repository, {
+      execute,
+      cancel: vi.fn(() => 0)
+    });
+    const run = await controller.start({
+      brainId: brain.id,
+      objective: "Do not promote an empty source fork"
+    });
+    const candidate = (await controller.listCandidates(brain.id, run.id))[0]!;
+
+    const rejected = await controller.approve({
+      brainId: brain.id,
+      candidateId: candidate.id
+    });
+
+    expect(rejected).toMatchObject({
+      state: "rejected",
+      error: expect.stringMatching(/empty source candidate cannot be promoted/i)
+    });
+    expect(execute.mock.calls.some(([invocation]) => invocation.action === "promote")).toBe(
+      false
+    );
+  });
+
   it("bridges neural candidate proposal, list, evaluation, promotion, and rollback through dotted worker RPCs", async () => {
     await setEvolutionPermission("ask");
     let status = "ready";

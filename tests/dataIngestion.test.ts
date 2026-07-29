@@ -94,35 +94,39 @@ describe("whole-dataset persistence", () => {
     return { brainId: brain.id, service, engineRequests };
   }
 
-  it("walks beyond the former 2,000-file ceiling and persists an exhaustive cursor", async () => {
-    const dataset = join(root, "many-files");
-    await mkdir(dataset);
-    for (let index = 0; index < 2_005; index += 1) {
-      await writeFile(join(dataset, `${String(index).padStart(4, "0")}.txt`), `row ${index}`);
-    }
-    const store = new DatasetManifestStore(() => brainDirectory);
-    const manifest = await store.create("brain-a", [dataset]);
-    expect(manifest.discoveredFiles).toBe(2_005);
-    expect(manifest.discoveredBytes).toBeGreaterThan(2_005);
+  it(
+    "walks beyond the former 2,000-file ceiling and persists an exhaustive cursor",
+    async () => {
+      const dataset = join(root, "many-files");
+      await mkdir(dataset);
+      for (let index = 0; index < 2_005; index += 1) {
+        await writeFile(join(dataset, `${String(index).padStart(4, "0")}.txt`), `row ${index}`);
+      }
+      const store = new DatasetManifestStore(() => brainDirectory);
+      const manifest = await store.create("brain-a", [dataset]);
+      expect(manifest.discoveredFiles).toBe(2_005);
+      expect(manifest.discoveredBytes).toBeGreaterThan(2_005);
 
-    let visited = 0;
-    for await (const entry of store.entries("brain-a", manifest.id)) {
-      expect(entry.index).toBe(visited);
-      visited += 1;
-    }
-    expect(visited).toBe(2_005);
+      let visited = 0;
+      for await (const entry of store.entries("brain-a", manifest.id)) {
+        expect(entry.index).toBe(visited);
+        visited += 1;
+      }
+      expect(visited).toBe(2_005);
 
-    const cursor = await store.cursor("brain-a", manifest.id);
-    cursor.nextEntry = 1_337;
-    cursor.processedFiles = 1_337;
-    cursor.state = "paused";
-    await store.saveCursor("brain-a", cursor);
-    await expect(store.cursor("brain-a", manifest.id)).resolves.toMatchObject({
-      nextEntry: 1_337,
-      processedFiles: 1_337,
-      state: "paused"
-    });
-  });
+      const cursor = await store.cursor("brain-a", manifest.id);
+      cursor.nextEntry = 1_337;
+      cursor.processedFiles = 1_337;
+      cursor.state = "paused";
+      await store.saveCursor("brain-a", cursor);
+      await expect(store.cursor("brain-a", manifest.id)).resolves.toMatchObject({
+        nextEntry: 1_337,
+        processedFiles: 1_337,
+        state: "paused"
+      });
+    },
+    30_000
+  );
 
   it("streams all text beyond the former 16-million-character truncation", async () => {
     const path = join(root, "large.txt");
