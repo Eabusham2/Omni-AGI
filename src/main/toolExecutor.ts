@@ -15,14 +15,24 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import type {
   ToolExecutionResult,
   ToolInvocation,
+  RuntimeJob,
   ToolPermissionLevel
 } from "../shared/types";
 import {
+  assertSafeRemoteUrl,
   readResponseBounded,
   safeFetch,
   type BrainService,
   type RuntimeJobManager
 } from "./brainService";
+import {
+  EVOLUTION_BENCHMARK_DOMAINS,
+  EVOLUTION_EVALUATOR_VERSION,
+  EVOLUTION_POLICY_SHA256,
+  EVOLUTION_PROTECTED_PATHS,
+  EVOLUTION_TEST_NAMES,
+  isProtectedEvolutionPath
+} from "./evolutionPolicy";
 
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_PROCESS_OUTPUT = 2 * 1024 * 1024;
@@ -34,6 +44,18 @@ interface Approval {
   action: string;
   argumentSha256: string;
   expiresAt: number;
+}
+
+interface EvolutionProposalRecord {
+  schemaVersion: 1;
+  worktree: string;
+  branch: string;
+  parentCommit: string;
+  evaluatorVersion: number;
+  evaluatorSha256: string;
+  baselineTestPaths: string[];
+  packageScripts: Record<string, string>;
+  createdAt: string;
 }
 
 function sha256(contents: Buffer | string): string {
@@ -75,7 +97,7 @@ function riskyInvocation(toolId: string, action: string): boolean {
     toolId === "code.execute" ||
     toolId === "browser.automation" ||
     toolId === "agent.fork" ||
-    toolId === "source.self-modify"
+    (toolId === "source.self-modify" && ["promote", "rollback"].includes(action))
   );
 }
 
@@ -85,6 +107,24 @@ function toolCancellationError(): Error {
 
 function assertToolActive(signal: AbortSignal): void {
   if (signal.aborted) throw toolCancellationError();
+}
+
+function toolDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  const duration = Math.max(0, Math.min(30_000, Math.round(milliseconds)));
+  assertToolActive(signal);
+  return new Promise((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(finish, duration);
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      rejectDelay(toolCancellationError());
+    };
+    function finish(): void {
+      signal.removeEventListener("abort", abort);
+      resolveDelay();
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function terminateProcessTree(
@@ -331,7 +371,10 @@ export class ToolExecutor {
     private readonly jobs: RuntimeJobManager
   ) {}
 
-  async execute(invocation: ToolInvocation): Promise<ToolExecutionResult> {
+  async execute(
+    invocation: ToolInvocation,
+    onProgress?: (job: RuntimeJob) => void
+  ): Promise<ToolExecutionResult> {
     const id = randomUUID();
     const startedAt = new Date().toISOString();
     const base: ToolExecutionResult = {
@@ -348,8 +391,11 @@ export class ToolExecutor {
         permission === "auto" &&
         invocation.toolId === "windows.files" &&
         !(await this.insideAutomaticFileScope(invocation.brainId, invocation.arguments));
+      const autonomousEvolutionExperiment =
+        invocation.toolId === "source.self-modify" &&
+        ["propose", "diff", "test"].includes(invocation.action);
       const needsApproval =
-        permission === "ask" ||
+        (permission === "ask" && !autonomousEvolutionExperiment) ||
         (permission === "auto" &&
           (riskyInvocation(invocation.toolId, invocation.action) || outsideAutomaticFileScope));
       if (needsApproval && !this.consumeApproval(invocation)) {
@@ -367,7 +413,7 @@ export class ToolExecutor {
       this.activeExecutions.set(id, { brainId: invocation.brainId, controller });
       let output: unknown;
       try {
-        output = await this.dispatch(invocation, controller.signal);
+        output = await this.dispatch(invocation, controller.signal, onProgress);
       } catch (error) {
         if (controller.signal.aborted) throw toolCancellationError();
         throw error;
@@ -440,7 +486,11 @@ export class ToolExecutor {
     }
   }
 
-  private async dispatch(invocation: ToolInvocation, signal: AbortSignal): Promise<unknown> {
+  private async dispatch(
+    invocation: ToolInvocation,
+    signal: AbortSignal,
+    onProgress?: (job: RuntimeJob) => void
+  ): Promise<unknown> {
     switch (invocation.toolId) {
       case "windows.files":
         return this.files(invocation.action, invocation.arguments);
@@ -457,7 +507,8 @@ export class ToolExecutor {
           invocation.brainId,
           invocation.action,
           invocation.arguments,
-          signal
+          signal,
+          onProgress
         );
       case "agent.fork":
         return this.agent(
@@ -656,35 +707,25 @@ export class ToolExecutor {
       throw new Error("Browser automation supports task or open.");
     }
     const requested = new URL(argumentString(args, "url", 16_000));
-    const response = await safeFetch(requested, {
-      signal: AbortSignal.any([
-        signal,
-        AbortSignal.timeout(boundedTimeout(args.timeoutMs, 120_000))
-      ]),
-      headers: { Accept: "text/html, text/plain;q=0.9" }
-    });
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!contentType.includes("text/html") && !contentType.includes("text/plain")) {
-      throw new Error("Browser snapshots support HTML or plain-text pages.");
-    }
-    const contents = await readResponseBounded(response, 4 * 1024 * 1024);
-    assertToolActive(signal);
-    const source = contentType.includes("text/html")
-      ? contents.toString("utf8")
-      : `<pre>${contents
-          .toString("utf8")
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;")}</pre>`;
-    const inert = buildInertBrowserDocument(source, response.url || requested.href);
+    await assertSafeRemoteUrl(requested);
+    const steps = Array.isArray(args.steps)
+      ? args.steps
+          .filter(
+            (value): value is Record<string, unknown> =>
+              typeof value === "object" && value !== null && !Array.isArray(value)
+          )
+          .slice(0, 200)
+      : [];
     const { BrowserWindow } = await import("electron");
     const browser = new BrowserWindow({
-      show: false,
+      show: args.visible === true,
       width: 1280,
       height: 900,
       backgroundColor: "#ffffff",
       webPreferences: {
-        partition: `omni-browser-${randomUUID()}`,
+        // Persistent per-brain cookies/storage allow a user-approved browser
+        // task to continue inside an existing signed-in session.
+        partition: `persist:omni-browser-${sha256(brainId).slice(0, 20)}`,
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,
@@ -694,35 +735,222 @@ export class ToolExecutor {
     });
     const requestSession = browser.webContents.session;
     requestSession.webRequest.onBeforeRequest((details, callback) => {
-      callback({
-        cancel:
-          !details.url.startsWith("data:") &&
-          details.url !== "about:blank"
-      });
+      let url: URL;
+      try {
+        url = new URL(details.url);
+      } catch {
+        callback({ cancel: true });
+        return;
+      }
+      if (["data:", "blob:", "about:"].includes(url.protocol)) {
+        callback({ cancel: false });
+        return;
+      }
+      const validation =
+        url.protocol === "wss:"
+          ? new URL(`https://${url.host}${url.pathname}${url.search}`)
+          : url;
+      void assertSafeRemoteUrl(validation).then(
+        () => callback({ cancel: false }),
+        () => callback({ cancel: true })
+      );
     });
+    requestSession.setPermissionRequestHandler((_contents, _permission, callback) => {
+      callback(false);
+    });
+    const preventDownload = (
+      _event: Electron.Event,
+      item: Electron.DownloadItem
+    ): void => item.cancel();
+    requestSession.on("will-download", preventDownload);
     browser.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-    browser.webContents.on("will-navigate", (event) => event.preventDefault());
+    browser.webContents.on("will-navigate", (event, destination) => {
+      try {
+        const target = new URL(destination);
+        if (!["https:", "http:"].includes(target.protocol)) event.preventDefault();
+      } catch {
+        event.preventDefault();
+      }
+    });
     const abort = (): void => {
       if (!browser.isDestroyed()) browser.destroy();
     };
     signal.addEventListener("abort", abort, { once: true });
-    try {
-      assertToolActive(signal);
-      await browser.loadURL(
-        `data:text/html;base64,${Buffer.from(inert.document).toString("base64")}`
-      );
-      assertToolActive(signal);
-      const page = (await browser.webContents.executeJavaScript(
+    const waitForLoading = async (maximum = 30_000): Promise<void> => {
+      const deadline = Date.now() + Math.max(1_000, Math.min(30_000, maximum));
+      while (!browser.isDestroyed() && browser.webContents.isLoading()) {
+        assertToolActive(signal);
+        if (Date.now() >= deadline) {
+          throw new Error("Browser navigation did not settle before its timeout.");
+        }
+        await toolDelay(50, signal);
+      }
+    };
+    const selector = (step: Record<string, unknown>): string =>
+      argumentString(step, "selector", 2_000);
+    const pageSnapshot = async (): Promise<{
+      title: string;
+      text: string;
+      links: Array<{ label: string; href: string }>;
+    }> =>
+      browser.webContents.executeJavaScript(
         `(() => ({
           title: document.title.slice(0, 1000),
           text: (document.body?.innerText || "").slice(0, 200000),
           links: Array.from(document.querySelectorAll("a[href]")).slice(0, 500).map((item) => ({
             label: (item.textContent || "").trim().slice(0, 500),
-            href: item.getAttribute("href") || ""
+            href: item.href.slice(0, 16000)
           }))
         }))()`,
         true
-      )) as { title?: string; text?: string; links?: Array<{ label: string; href: string }> };
+      ) as Promise<{
+        title: string;
+        text: string;
+        links: Array<{ label: string; href: string }>;
+      }>;
+    try {
+      assertToolActive(signal);
+      await browser.loadURL(requested.href);
+      assertToolActive(signal);
+      const stepResults: unknown[] = [];
+      for (const [index, step] of steps.entries()) {
+        assertToolActive(signal);
+        const kind = argumentString(step, "kind", 32).toLocaleLowerCase();
+        if (kind === "navigate") {
+          const destination = new URL(argumentString(step, "url", 16_000));
+          await assertSafeRemoteUrl(destination);
+          await browser.loadURL(destination.href);
+          stepResults.push({ index, kind, finalUrl: browser.webContents.getURL() });
+          continue;
+        }
+        if (kind === "click") {
+          const query = selector(step);
+          const clicked = await browser.webContents.executeJavaScript(
+            `((query) => {
+              const node = document.querySelector(query);
+              if (!(node instanceof HTMLElement)) return false;
+              node.scrollIntoView({block: "center", inline: "center"});
+              node.click();
+              return true;
+            })(${JSON.stringify(query)})`,
+            true
+          );
+          if (clicked !== true) throw new Error(`Browser step ${index} could not find its selector.`);
+          await waitForLoading(
+            typeof step.timeoutMs === "number" ? step.timeoutMs : 30_000
+          );
+          stepResults.push({ index, kind, selector: query });
+          continue;
+        }
+        if (kind === "type") {
+          const query = selector(step);
+          const value = argumentString(step, "value", 100_000);
+          const typed = await browser.webContents.executeJavaScript(
+            `((input) => {
+              const node = document.querySelector(input.selector);
+              if (!(node instanceof HTMLInputElement) &&
+                  !(node instanceof HTMLTextAreaElement) &&
+                  !(node instanceof HTMLElement && node.isContentEditable)) return false;
+              node.focus();
+              if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+                if (input.clear) node.value = "";
+                node.value += input.value;
+              } else {
+                if (input.clear) node.textContent = "";
+                node.textContent = (node.textContent || "") + input.value;
+              }
+              node.dispatchEvent(new InputEvent("input", {bubbles: true, inputType: "insertText", data: input.value}));
+              node.dispatchEvent(new Event("change", {bubbles: true}));
+              return true;
+            })(${JSON.stringify({
+              selector: query,
+              value,
+              clear: step.clear !== false
+            })})`,
+            true
+          );
+          if (typed !== true) throw new Error(`Browser step ${index} could not type into its selector.`);
+          stepResults.push({
+            index,
+            kind,
+            selector: query,
+            characters: value.length,
+            sensitive: step.sensitive === true
+          });
+          continue;
+        }
+        if (kind === "press") {
+          const key = argumentString(step, "key", 64);
+          browser.webContents.sendInputEvent({ type: "keyDown", keyCode: key });
+          browser.webContents.sendInputEvent({ type: "keyUp", keyCode: key });
+          await waitForLoading(
+            typeof step.timeoutMs === "number" ? step.timeoutMs : 30_000
+          );
+          stepResults.push({ index, kind, key });
+          continue;
+        }
+        if (kind === "wait") {
+          const waitSelector =
+            typeof step.selector === "string" && step.selector.trim()
+              ? selector(step)
+              : "";
+          const timeout = boundedTimeout(step.timeoutMs, 30_000);
+          if (waitSelector) {
+            const deadline = Date.now() + Math.min(30_000, timeout);
+            let found = false;
+            while (!found && Date.now() < deadline) {
+              found =
+                (await browser.webContents.executeJavaScript(
+                  `document.querySelector(${JSON.stringify(waitSelector)}) !== null`,
+                  true
+                )) === true;
+              if (!found) await toolDelay(100, signal);
+            }
+            if (!found) throw new Error(`Browser step ${index} timed out waiting for its selector.`);
+          } else {
+            const milliseconds =
+              typeof step.milliseconds === "number"
+                ? step.milliseconds
+                : 500;
+            await toolDelay(milliseconds, signal);
+          }
+          stepResults.push({ index, kind, selector: waitSelector || undefined });
+          continue;
+        }
+        if (kind === "extract") {
+          const query =
+            typeof step.selector === "string" && step.selector.trim()
+              ? selector(step)
+              : "body";
+          const extracted = await browser.webContents.executeJavaScript(
+            `((query) => Array.from(document.querySelectorAll(query)).slice(0, 1000).map((node) => ({
+              text: (node.textContent || "").trim().slice(0, 20000),
+              href: node instanceof HTMLAnchorElement ? node.href.slice(0, 16000) : undefined,
+              value: node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement
+                ? node.value.slice(0, 20000)
+                : undefined
+            })))(${JSON.stringify(query)})`,
+            true
+          );
+          stepResults.push({ index, kind, selector: query, values: extracted });
+          continue;
+        }
+        if (kind === "screenshot") {
+          const image = await browser.webContents.capturePage();
+          const artifactDirectory = join(
+            this.service.repository.brainDirectory(brainId),
+            "artifacts",
+            "browser"
+          );
+          await mkdir(artifactDirectory, { recursive: true });
+          const path = join(artifactDirectory, `${randomUUID()}.png`);
+          await writeFile(path, image.toPNG(), { flag: "wx", mode: 0o600 });
+          stepResults.push({ index, kind, artifactPath: path });
+          continue;
+        }
+        throw new Error(`Unknown browser step kind at index ${index}.`);
+      }
+      const page = await pageSnapshot();
       assertToolActive(signal);
       const artifactDirectory = join(
         this.service.repository.brainDirectory(brainId),
@@ -734,19 +962,21 @@ export class ToolExecutor {
       const screenshot = await browser.webContents.capturePage();
       await writeFile(artifactPath, screenshot.toPNG(), { flag: "wx", mode: 0o600 });
       return {
-        status: response.status,
-        finalUrl: response.url,
-        title: page.title ?? "",
-        text: page.text ?? "",
-        links: page.links ?? [],
+        finalUrl: browser.webContents.getURL(),
+        title: page.title,
+        text: page.text,
+        links: page.links,
+        steps: stepResults,
         artifactPath,
-        mode: "script-disabled-snapshot",
+        mode: "interactive-persistent-session",
+        sessionPersistent: true,
         note:
-          "The public page was fetched with private-network and redirect checks, then rendered locally with scripts and live navigation disabled."
+          "Public-network validation applies to every request. Actions, navigation, and the persistent per-brain signed-in session remain permission-gated and audited."
       };
     } finally {
       signal.removeEventListener("abort", abort);
       requestSession.webRequest.onBeforeRequest(null);
+      requestSession.removeListener("will-download", preventDownload);
       if (!browser.isDestroyed()) browser.destroy();
     }
   }
@@ -755,7 +985,8 @@ export class ToolExecutor {
     brainId: string,
     action: string,
     args: Record<string, unknown>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    onProgress?: (job: RuntimeJob) => void
   ): Promise<unknown> {
     if (action !== "generate") throw new Error("Unknown imagination action.");
     const modality = argumentString(args, "modality", 16);
@@ -765,19 +996,30 @@ export class ToolExecutor {
     const job = this.jobs.generate({
       brainId,
       modality: modality as "image" | "audio" | "video",
+      prompt: typeof args.prompt === "string" ? args.prompt.slice(0, 1_000_000) : undefined,
       conceptIds: Array.isArray(args.conceptIds)
-        ? args.conceptIds.filter((value): value is string => typeof value === "string").slice(0, 128)
+        ? args.conceptIds.filter((value): value is string => typeof value === "string")
         : undefined,
       settings:
         typeof args.settings === "object" && args.settings !== null
           ? (args.settings as Record<string, string | number | boolean>)
           : undefined
     });
-    const finished = await this.jobs.wait(
-      job.id,
-      signal,
-      boundedTimeout(args.timeoutMs, 600_000)
-    );
+    onProgress?.(job);
+    const progressListener = ({ job: update }: { job: RuntimeJob }): void => {
+      if (update.id === job.id) onProgress?.(update);
+    };
+    this.jobs.on("event", progressListener);
+    let finished: RuntimeJob;
+    try {
+      finished = await this.jobs.wait(
+        job.id,
+        signal,
+        boundedTimeout(args.timeoutMs, 600_000)
+      );
+    } finally {
+      this.jobs.off("event", progressListener);
+    }
     if (finished.state === "failed") {
       throw new Error(finished.error || `${modality} generation failed.`);
     }
@@ -883,6 +1125,46 @@ export class ToolExecutor {
     );
     if (probe.exitCode !== 0) throw new Error(`Configured source is not a Git clone: ${probe.stderr}`);
 
+    const proposalPath = (worktree: string): string =>
+      join(evolutionRoot, `${basename(worktree)}.proposal.json`);
+    const readPackageScripts = async (
+      root: string
+    ): Promise<Record<string, string>> => {
+      const value = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
+        scripts?: unknown;
+      };
+      if (typeof value.scripts !== "object" || value.scripts === null) return {};
+      return Object.fromEntries(
+        EVOLUTION_TEST_NAMES.map((name) => {
+          const script = (value.scripts as Record<string, unknown>)[name];
+          return [name, typeof script === "string" ? script : ""];
+        })
+      );
+    };
+    const readProposal = async (worktree: string): Promise<EvolutionProposalRecord> => {
+      const value = JSON.parse(await readFile(proposalPath(worktree), "utf8")) as
+        Partial<EvolutionProposalRecord>;
+      const recordedWorktree =
+        typeof value.worktree === "string"
+          ? await realpath(value.worktree).catch(() => "")
+          : "";
+      const invalid = [
+        value.schemaVersion !== 1 ? "schema" : undefined,
+        resolve(recordedWorktree) !== resolve(worktree) ? "worktree" : undefined,
+        typeof value.branch !== "string" ? "branch" : undefined,
+        !/^[a-f0-9]{40,64}$/i.test(value.parentCommit ?? "") ? "parent" : undefined,
+        value.evaluatorVersion !== EVOLUTION_EVALUATOR_VERSION ? "version" : undefined,
+        !/^[a-f0-9]{64}$/i.test(value.evaluatorSha256 ?? "") ? "evaluator" : undefined,
+        !Array.isArray(value.baselineTestPaths) ? "baseline-tests" : undefined,
+        typeof value.packageScripts !== "object" || value.packageScripts === null
+          ? "scripts"
+          : undefined
+      ].filter((entry): entry is string => Boolean(entry));
+      if (invalid.length) {
+        throw new Error(`The external evolution proposal record is invalid (${invalid.join(", ")}).`);
+      }
+      return value as EvolutionProposalRecord;
+    };
     const resolveCandidate = async (): Promise<string> => {
       const requested = absolutePath(argumentString(args, "worktree", 32_000));
       const [root, candidate] = await Promise.all([realpath(evolutionRoot), realpath(requested)]);
@@ -900,24 +1182,43 @@ export class ToolExecutor {
       if (top.exitCode !== 0 || resolve(top.stdout.trim()) !== resolve(candidate)) {
         throw new Error("The selected evolution candidate is not an isolated Git worktree.");
       }
+      await readProposal(candidate);
       return candidate;
     };
 
     const diffSnapshot = async (
-      worktree: string
+      worktree: string,
+      parentCommit: string
     ): Promise<{
       status: string;
       diff: string;
       untracked: Array<{ path: string; sha256: string; bytes: number }>;
+      changedPaths: string[];
+      changedBytes: number;
       sha256: string;
     }> => {
-      const [status, diff, untrackedList] = await Promise.all([
+      const [status, diff, changedList, untrackedList] = await Promise.all([
         runEvolutionProcess("git", ["-C", worktree, "status", "--short"], worktree, 30_000),
         runEvolutionProcess(
           "git",
-          ["-C", worktree, "diff", "--no-ext-diff", "--binary", "HEAD"],
+          ["-C", worktree, "diff", "--no-ext-diff", "--no-renames", "--binary", parentCommit],
           worktree,
           60_000
+        ),
+        runEvolutionProcess(
+          "git",
+          [
+            "-C",
+            worktree,
+            "diff",
+            "--no-ext-diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            parentCommit
+          ],
+          worktree,
+          30_000
         ),
         runEvolutionProcess(
           "git",
@@ -926,9 +1227,16 @@ export class ToolExecutor {
           30_000
         )
       ]);
-      if (status.exitCode !== 0 || diff.exitCode !== 0 || untrackedList.exitCode !== 0) {
+      if (
+        status.exitCode !== 0 ||
+        diff.exitCode !== 0 ||
+        changedList.exitCode !== 0 ||
+        untrackedList.exitCode !== 0
+      ) {
         throw new Error(
-          `Could not inspect evolution candidate: ${status.stderr || diff.stderr || untrackedList.stderr}`
+          `Could not inspect evolution candidate: ${
+            status.stderr || diff.stderr || changedList.stderr || untrackedList.stderr
+          }`
         );
       }
       const untracked = [];
@@ -951,12 +1259,103 @@ export class ToolExecutor {
         const contents = await readFile(path);
         untracked.push({ path: rawPath, sha256: sha256(contents), bytes: contents.byteLength });
       }
-      const material = `${status.stdout}\n${diff.stdout}\n${JSON.stringify(untracked)}`;
-      return { status: status.stdout, diff: diff.stdout, untracked, sha256: sha256(material) };
+      const changedPaths = [
+        ...new Set([
+          ...changedList.stdout.split("\0").filter(Boolean),
+          ...untracked.map((entry) => entry.path)
+        ])
+      ].sort();
+      const changedBytes =
+        Buffer.byteLength(diff.stdout) +
+        untracked.reduce((total, entry) => total + entry.bytes, 0);
+      const material =
+        `${parentCommit}\n${status.stdout}\n${diff.stdout}\n` +
+        `${JSON.stringify(untracked)}\n${JSON.stringify(changedPaths)}`;
+      return {
+        status: status.stdout,
+        diff: diff.stdout,
+        untracked,
+        changedPaths,
+        changedBytes,
+        sha256: sha256(material)
+      };
+    };
+
+    const verifyEvaluatorBoundary = async (
+      worktree: string,
+      proposal: EvolutionProposalRecord,
+      expectedEvaluatorSha256?: unknown
+    ): Promise<void> => {
+      if (
+        typeof expectedEvaluatorSha256 === "string" &&
+        expectedEvaluatorSha256.toLocaleLowerCase() !==
+          proposal.evaluatorSha256.toLocaleLowerCase()
+      ) {
+        throw new Error("The candidate evaluator hash does not match its immutable proposal.");
+      }
+      const ancestry = await runEvolutionProcess(
+        "git",
+        ["-C", worktree, "merge-base", "--is-ancestor", proposal.parentCommit, "HEAD"],
+        worktree,
+        30_000
+      );
+      if (ancestry.exitCode !== 0) {
+        throw new Error("The candidate no longer descends from its recorded parent commit.");
+      }
+      const currentScripts = await readPackageScripts(worktree);
+      if (JSON.stringify(currentScripts) !== JSON.stringify(proposal.packageScripts)) {
+        throw new Error("Evolution candidates may not rewrite benchmark package scripts.");
+      }
+      const snapshot = await diffSnapshot(worktree, proposal.parentCommit);
+      const baselineTests = new Set(proposal.baselineTestPaths);
+      const protectedChanges = snapshot.changedPaths.filter((path) =>
+        isProtectedEvolutionPath(path, baselineTests)
+      );
+      if (protectedChanges.length) {
+        throw new Error(
+          `Evolution candidates may not modify immutable evaluator files: ${protectedChanges.join(", ")}`
+        );
+      }
     };
 
     if (action === "propose") {
       const objective = argumentString(args, "objective", 20_000);
+      const [parentCommitResult, baselineTestsResult, packageScripts] = await Promise.all([
+        runEvolutionProcess(
+          "git",
+          ["-C", repository, "rev-parse", "HEAD"],
+          repository,
+          30_000
+        ),
+        runEvolutionProcess(
+          "git",
+          ["-C", repository, "ls-tree", "-r", "--name-only", "HEAD", "--", "tests"],
+          repository,
+          30_000
+        ),
+        readPackageScripts(repository)
+      ]);
+      if (parentCommitResult.exitCode !== 0 || baselineTestsResult.exitCode !== 0) {
+        throw new Error(
+          `Could not anchor the evolution evaluator: ${
+            parentCommitResult.stderr || baselineTestsResult.stderr
+          }`
+        );
+      }
+      const parentCommit = parentCommitResult.stdout.trim().toLocaleLowerCase();
+      const baselineTestPaths = baselineTestsResult.stdout
+        .split(/\r?\n/)
+        .map((path) => path.trim())
+        .filter(Boolean)
+        .sort();
+      const evaluatorSha256 = sha256(
+        [
+          EVOLUTION_POLICY_SHA256,
+          parentCommit,
+          JSON.stringify(baselineTestPaths),
+          JSON.stringify(packageScripts)
+        ].join("\n")
+      );
       const identifier = randomUUID().slice(0, 12);
       const branch = `omni-evolution/${identifier}`;
       const worktree = join(evolutionRoot, identifier);
@@ -973,10 +1372,27 @@ export class ToolExecutor {
         `# OmniCortex source-evolution candidate\n\n${objective}\n\n` +
           "Edits belong in the isolated worktree. Run diff and test before requesting promotion.\n"
       );
+      const externalProposal: EvolutionProposalRecord = {
+        schemaVersion: 1,
+        worktree,
+        branch,
+        parentCommit,
+        evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
+        evaluatorSha256,
+        baselineTestPaths,
+        packageScripts,
+        createdAt: new Date().toISOString()
+      };
+      await atomicWrite(proposalPath(worktree), JSON.stringify(externalProposal, null, 2));
       return {
         worktree,
         branch,
         taskFile,
+        parentCommit,
+        evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
+        evaluatorSha256,
+        benchmarkDomains: EVOLUTION_BENCHMARK_DOMAINS,
+        protectedPaths: EVOLUTION_PROTECTED_PATHS,
         diff: "",
         checks: [
           {
@@ -995,16 +1411,24 @@ export class ToolExecutor {
 
     if (action === "diff") {
       const worktree = await resolveCandidate();
-      return { worktree, ...(await diffSnapshot(worktree)) };
+      const proposal = await readProposal(worktree);
+      return {
+        worktree,
+        parentCommit: proposal.parentCommit,
+        evaluatorSha256: proposal.evaluatorSha256,
+        ...(await diffSnapshot(worktree, proposal.parentCommit))
+      };
     }
 
     if (action === "test") {
       const worktree = await resolveCandidate();
+      const proposal = await readProposal(worktree);
+      await verifyEvaluatorBoundary(worktree, proposal, args.expectedEvaluatorSha256);
       const requested = Array.isArray(args.tests)
         ? args.tests.filter((value): value is string => typeof value === "string").slice(0, 3)
         : [];
       const names = requested.length ? requested : ["typecheck", "unit", "build"];
-      const allowed = new Set(["typecheck", "unit", "build"]);
+      const allowed = new Set<string>(EVOLUTION_TEST_NAMES);
       if (names.some((name) => !allowed.has(name))) {
         throw new Error("Evolution tests may be typecheck, unit, or build.");
       }
@@ -1017,12 +1441,46 @@ export class ToolExecutor {
         unit: ["test"],
         build: ["run", "build"]
       };
-      const checks = [];
+      const checks: Array<{
+        name: string;
+        passed: boolean;
+        exitCode: number;
+        durationMs: number;
+        stdout: string;
+        stderr: string;
+        truncated: boolean;
+      }> = [];
+      const baselineChecks: Array<{
+        name: string;
+        passed: boolean;
+        exitCode: number;
+        durationMs: number;
+        stdout: string;
+        stderr: string;
+        truncated: boolean;
+      }> = [];
       for (const name of names) {
         const commandArgs =
           process.platform === "win32"
             ? ["/d", "/c", "npm.cmd", ...commands[name]!]
             : commands[name]!;
+        const baselineStartedAt = Date.now();
+        const baseline = await runEvolutionProcess(
+          executable,
+          commandArgs,
+          repository,
+          boundedTimeout(args.timeoutMs, 600_000)
+        );
+        baselineChecks.push({
+          name,
+          passed: baseline.exitCode === 0,
+          exitCode: baseline.exitCode,
+          durationMs: Date.now() - baselineStartedAt,
+          stdout: baseline.stdout,
+          stderr: baseline.stderr,
+          truncated: baseline.truncated
+        });
+        const candidateStartedAt = Date.now();
         const result = await runEvolutionProcess(
           executable,
           commandArgs,
@@ -1033,6 +1491,7 @@ export class ToolExecutor {
           name,
           passed: result.exitCode === 0,
           exitCode: result.exitCode,
+          durationMs: Date.now() - candidateStartedAt,
           stdout: result.stdout,
           stderr: result.stderr,
           truncated: result.truncated
@@ -1049,25 +1508,62 @@ export class ToolExecutor {
         name: "diff-check",
         passed: diffCheck.exitCode === 0,
         exitCode: diffCheck.exitCode,
+        durationMs: 0,
         stdout: diffCheck.stdout,
         stderr: diffCheck.stderr,
         truncated: diffCheck.truncated
       });
-      const snapshot = await diffSnapshot(worktree);
+      const snapshot = await diffSnapshot(worktree, proposal.parentCommit);
       const passed = checks.every((check) => check.passed);
+      const baselineDurationMs = baselineChecks.reduce(
+        (total, check) => total + check.durationMs,
+        0
+      );
+      const candidateDurationMs = checks.reduce(
+        (total, check) => total + check.durationMs,
+        0
+      );
+      const regressions = checks
+        .filter((check) => {
+          const baseline = baselineChecks.find((entry) => entry.name === check.name);
+          return Boolean(baseline?.passed && !check.passed);
+        })
+        .map((check) => check.name);
+      const resources = {
+        baselineDurationMs,
+        candidateDurationMs,
+        durationDeltaMs: candidateDurationMs - baselineDurationMs,
+        changedBytes: snapshot.changedBytes,
+        changedPaths: snapshot.changedPaths.length,
+        untrackedBytes: snapshot.untracked.reduce((total, entry) => total + entry.bytes, 0)
+      };
       const validationPath = join(evolutionRoot, `${basename(worktree)}.validation.json`);
       await writeFile(
         validationPath,
         JSON.stringify(
           {
             worktree,
+            parentCommit: proposal.parentCommit,
+            evaluatorVersion: proposal.evaluatorVersion,
+            evaluatorSha256: proposal.evaluatorSha256,
             diffSha256: snapshot.sha256,
             passed,
+            boundaryPassed: true,
             checks: checks.map(({ name, passed: checkPassed, exitCode }) => ({
               name,
               passed: checkPassed,
               exitCode
             })),
+            baselineChecks: baselineChecks.map(
+              ({ name, passed: checkPassed, exitCode, durationMs }) => ({
+                name,
+                passed: checkPassed,
+                exitCode,
+                durationMs
+              })
+            ),
+            regressions,
+            resources,
             createdAt: new Date().toISOString()
           },
           null,
@@ -1075,28 +1571,50 @@ export class ToolExecutor {
         ),
         { encoding: "utf8", mode: 0o600 }
       );
-      return { worktree, passed, diffSha256: snapshot.sha256, validationPath, checks };
+      return {
+        worktree,
+        parentCommit: proposal.parentCommit,
+        evaluatorVersion: proposal.evaluatorVersion,
+        evaluatorSha256: proposal.evaluatorSha256,
+        benchmarkDomains: EVOLUTION_BENCHMARK_DOMAINS,
+        boundaryPassed: true,
+        passed,
+        diffSha256: snapshot.sha256,
+        validationPath,
+        checks,
+        baselineChecks,
+        regressions,
+        resources
+      };
     }
 
     if (action === "promote") {
       const worktree = await resolveCandidate();
+      const proposal = await readProposal(worktree);
+      await verifyEvaluatorBoundary(worktree, proposal, args.expectedEvaluatorSha256);
       const expected = argumentString(args, "expectedDiffSha256", 64).toLocaleLowerCase();
       if (!/^[a-f0-9]{64}$/.test(expected)) {
         throw new Error("expectedDiffSha256 must be a SHA-256 digest from source.self-modify.test.");
       }
-      const snapshot = await diffSnapshot(worktree);
+      const snapshot = await diffSnapshot(worktree, proposal.parentCommit);
       if (snapshot.sha256 !== expected) {
         throw new Error("Evolution candidate changed after validation; test it again.");
       }
       const validationPath = join(evolutionRoot, `${basename(worktree)}.validation.json`);
       const validation = JSON.parse(await readFile(validationPath, "utf8")) as {
         worktree?: string;
+        parentCommit?: string;
+        evaluatorSha256?: string;
         diffSha256?: string;
         passed?: boolean;
+        boundaryPassed?: boolean;
       };
       if (
         validation.passed !== true ||
+        validation.boundaryPassed !== true ||
         validation.diffSha256 !== expected ||
+        validation.parentCommit !== proposal.parentCommit ||
+        validation.evaluatorSha256 !== proposal.evaluatorSha256 ||
         resolve(validation.worktree ?? "") !== resolve(worktree)
       ) {
         throw new Error("Evolution candidate has no matching passing validation record.");
@@ -1109,6 +1627,21 @@ export class ToolExecutor {
       );
       if (repositoryStatus.exitCode !== 0 || repositoryStatus.stdout.trim()) {
         throw new Error("Authorized source repository must be clean before promotion.");
+      }
+      const parentCommit = await runEvolutionProcess(
+        "git",
+        ["-C", repository, "rev-parse", "HEAD"],
+        repository,
+        30_000
+      );
+      if (parentCommit.exitCode !== 0) {
+        throw new Error(`Could not resolve the promotion parent: ${parentCommit.stderr}`);
+      }
+      if (
+        parentCommit.stdout.trim().toLocaleLowerCase() !==
+        proposal.parentCommit.toLocaleLowerCase()
+      ) {
+        throw new Error("Authorized source changed after the candidate was forked; rebase and retest it.");
       }
       await unlink(join(worktree, "OMNI_EVOLUTION_TASK.md")).catch(() => undefined);
       const added = await runEvolutionProcess(
@@ -1173,12 +1706,109 @@ export class ToolExecutor {
         await runProcess("git", ["-C", repository, "merge", "--abort"], repository, 30_000);
         throw new Error(`Candidate promotion failed and was aborted: ${merged.stderr}`);
       }
+      const promotionCommit = await runEvolutionProcess(
+        "git",
+        ["-C", repository, "rev-parse", "HEAD"],
+        repository,
+        30_000
+      );
+      if (promotionCommit.exitCode !== 0) {
+        throw new Error(`Could not resolve the promotion commit: ${promotionCommit.stderr}`);
+      }
       return {
         worktree,
         promoted: true,
-        commit: commit.stdout.trim(),
+        commit: promotionCommit.stdout.trim(),
+        candidateCommit: commit.stdout.trim(),
+        parentCommit: parentCommit.stdout.trim(),
         diffSha256: expected,
+        evaluatorSha256: proposal.evaluatorSha256,
         note: "Source was merged; the running binary was not overwritten or restarted."
+      };
+    }
+
+    if (action === "rollback") {
+      const expectedCommit = argumentString(args, "expectedCommit", 64).toLocaleLowerCase();
+      const parentCommit = argumentString(args, "parentCommit", 64).toLocaleLowerCase();
+      if (
+        !/^[a-f0-9]{40,64}$/.test(expectedCommit) ||
+        !/^[a-f0-9]{40,64}$/.test(parentCommit)
+      ) {
+        throw new Error("Rollback requires exact promotion and parent commit hashes.");
+      }
+      const [repositoryStatus, head, firstParent] = await Promise.all([
+        runEvolutionProcess(
+          "git",
+          ["-C", repository, "status", "--porcelain"],
+          repository,
+          30_000
+        ),
+        runEvolutionProcess(
+          "git",
+          ["-C", repository, "rev-parse", "HEAD"],
+          repository,
+          30_000
+        ),
+        runEvolutionProcess(
+          "git",
+          ["-C", repository, "rev-parse", `${expectedCommit}^1`],
+          repository,
+          30_000
+        )
+      ]);
+      if (repositoryStatus.exitCode !== 0 || repositoryStatus.stdout.trim()) {
+        throw new Error("Authorized source repository must be clean before rollback.");
+      }
+      if (head.exitCode !== 0 || head.stdout.trim().toLocaleLowerCase() !== expectedCommit) {
+        throw new Error("Rollback only applies when the exact promoted commit is current.");
+      }
+      if (
+        firstParent.exitCode !== 0 ||
+        firstParent.stdout.trim().toLocaleLowerCase() !== parentCommit
+      ) {
+        throw new Error("Rollback lineage does not match the archived promotion.");
+      }
+      const reverted = await runEvolutionProcess(
+        "git",
+        [
+          "-C",
+          repository,
+          "-c",
+          "user.name=OmniCortex Evolution",
+          "-c",
+          "user.email=omni-evolution@local.invalid",
+          "revert",
+          "--no-edit",
+          "-m",
+          "1",
+          expectedCommit
+        ],
+        repository,
+        120_000
+      );
+      if (reverted.exitCode !== 0) {
+        await runProcess(
+          "git",
+          ["-C", repository, "revert", "--abort"],
+          repository,
+          30_000
+        ).catch(() => undefined);
+        throw new Error(`Evolution rollback failed and was aborted: ${reverted.stderr}`);
+      }
+      const rollbackCommit = await runEvolutionProcess(
+        "git",
+        ["-C", repository, "rev-parse", "HEAD"],
+        repository,
+        30_000
+      );
+      if (rollbackCommit.exitCode !== 0) {
+        throw new Error(`Could not resolve the rollback commit: ${rollbackCommit.stderr}`);
+      }
+      return {
+        rolledBack: true,
+        revertedCommit: expectedCommit,
+        rollbackCommit: rollbackCommit.stdout.trim(),
+        note: "Promotion was reverted with an auditable commit; history was not rewritten."
       };
     }
 

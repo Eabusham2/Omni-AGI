@@ -7,6 +7,8 @@ pypdf>=4,<7
 imageio>=2.34,<3
 imageio-ffmpeg==0.6.0
 soundfile>=0.12,<1
+pyarrow>=14,<23
+ijson>=3.3,<4
 
 # Optional on supported Windows GPU systems:
 # torch-directml>=0.2.5

@@ -93,7 +93,9 @@ class StructuredToolSchemaTests(unittest.TestCase):
             trace["available_tool_actions"]["windows.files"],
             ["list", "read"],
         )
-        self.assertEqual(trace["tool_schema_channel"], "vsa-internal")
+        self.assertEqual(
+            trace["tool_schema_channel"], "substrate-capability-embedding"
+        )
         self.assertEqual(
             result["runtimeCard"]["available_tool_ids"],
             trace["available_tool_ids"],
@@ -176,6 +178,90 @@ class StructuredToolSchemaTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "at most 100"):
             brain.chat("hello", tool_schemas=oversized)
+        brain.events.close()
+
+    def test_learned_tool_head_materializes_typed_standard_actions(self):
+        brain = self.make_brain("materialized")
+        logits = torch.tensor(
+            [[-8.0, 12.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0]]
+        )
+        scores, actions = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "web.search",
+                    "actions": ["search"],
+                    "grant": "ask",
+                },
+                {
+                    "id": "windows.files",
+                    "actions": ["read", "write"],
+                    "grant": "auto",
+                },
+            ],
+            input_text="Search the web for liquid neural networks",
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertGreater(scores["tool"], 0.99)
+        self.assertEqual(
+            actions,
+            [
+                {
+                    "kind": "tool",
+                    "toolId": "web.search",
+                    "action": "search",
+                    "arguments": {
+                        "assemblyIds": [],
+                        "organic": True,
+                        "query": "liquid neural networks",
+                    },
+                    "confidence": scores["tool"],
+                }
+            ],
+        )
+        brain.events.close()
+
+    def test_tool_materialization_never_guesses_required_arguments(self):
+        brain = self.make_brain("no-guesses")
+        logits = torch.tensor(
+            [[-8.0, 12.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0]]
+        )
+        _, actions = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "windows.files",
+                    "actions": ["write"],
+                    "grant": "auto",
+                }
+            ],
+            input_text="Write /tmp/omni.txt",
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertEqual(actions, [])
+        brain.events.close()
+
+    def test_off_tool_schema_cannot_participate_in_action_selection(self):
+        brain = self.make_brain("off-schema")
+        logits = torch.tensor(
+            [[-8.0, 12.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0]]
+        )
+        _, actions = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "web.search",
+                    "actions": ["search"],
+                    "grant": "off",
+                }
+            ],
+            input_text="Search the web for ternary kernels",
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertEqual(actions, [])
         brain.events.close()
 
 

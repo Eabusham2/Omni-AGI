@@ -9,7 +9,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BrainService } from "../src/main/brainService";
+import {
+  BrainService,
+  normalizeModalityPreview
+} from "../src/main/brainService";
 import { BrainRepository } from "../src/main/brainRepository";
 import type { EngineSupervisor } from "../src/main/engineSupervisor";
 import {
@@ -30,10 +33,42 @@ function sha256(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+describe("streaming media preview validation", () => {
+  it("accepts bounded media previews and rejects executable or mismatched data URLs", () => {
+    expect(normalizeModalityPreview({
+      revision: 3,
+      progress: 1.7,
+      statusLabel: "Decoding\0 now",
+      mimeType: "image/png",
+      dataUrl: "data:image/png;base64,cHJldmlldw==",
+      artifactPath: "artifacts/\0preview.png"
+    })).toEqual({
+      revision: 3,
+      progress: 1,
+      statusLabel: "Decoding now",
+      mimeType: "image/png",
+      dataUrl: "data:image/png;base64,cHJldmlldw==",
+      path: undefined,
+      artifactPath: "artifacts/preview.png"
+    });
+    expect(normalizeModalityPreview({
+      revision: 4,
+      mimeType: "image/png",
+      dataUrl: "javascript:alert(1)"
+    })).toBeUndefined();
+    expect(normalizeModalityPreview({
+      revision: 5,
+      mimeType: "video/mp4",
+      dataUrl: "data:image/png;base64,cHJldmlldw=="
+    })).toBeUndefined();
+  });
+});
+
 describe("BrainService starter checkpoints", () => {
   let temporaryRoot: string;
   let repository: BrainRepository;
   let tryRequest: ReturnType<typeof vi.fn>;
+  let request: ReturnType<typeof vi.fn>;
   let service: BrainService;
 
   beforeEach(async () => {
@@ -41,9 +76,18 @@ describe("BrainService starter checkpoints", () => {
     repository = new BrainRepository(join(temporaryRoot, "brains"));
     await repository.initialize();
     tryRequest = vi.fn(async () => undefined);
+    request = vi.fn(async () => ({
+      runtimeCard: {
+        origin_kind: "starter",
+        pretrained: true,
+        hidden_behavioral_prompt: false,
+        reward_model: false,
+        rlhf: false
+      }
+    }));
     service = new BrainService(
       repository,
-      { tryRequest } as unknown as EngineSupervisor
+      { tryRequest, request } as unknown as EngineSupervisor
     );
   });
 
@@ -57,12 +101,34 @@ describe("BrainService starter checkpoints", () => {
     return repository.create(config);
   }
 
+  it("builds the bundled trained starter when no catalog URL is supplied", async () => {
+    const built = await service.create({
+      origin: "starter",
+      starterUrl: "",
+      hardwareTier: "micro",
+      modalities: ["vision", "image", "audio", "video"],
+      config: { ...DEFAULT_CONFIG, name: "Bundled starter" }
+    });
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(
+      "create",
+      expect.objectContaining({
+        brainId: built.id,
+        origin: "starter",
+        hardwareTier: "micro",
+        modalities: ["vision", "image", "audio", "video"],
+        storagePath: repository.brainDirectory(built.id)
+      }),
+      300_000
+    );
+    expect(tryRequest).not.toHaveBeenCalled();
+  });
+
   it("loads and shape-safely updates a materialized starter without randomizing it", async () => {
     const imported = await importedBrain({
       ...DEFAULT_CONFIG,
-      name: "Pretrained checkpoint",
-      initialNeuronBudget: 4_096,
-      noise: 0.04
+      name: "Pretrained checkpoint"
     });
     const engineDirectory = join(repository.brainDirectory(imported.id), "engine");
     const core = emptySafetensors("pretrained-core");
@@ -74,6 +140,7 @@ describe("BrainService starter checkpoints", () => {
         JSON.stringify({
           schema_version: 1,
           format: "omni-cortex-engine",
+          release_format: "stable-1.0",
           brain_id: imported.id,
           name: imported.name,
           config: {
@@ -96,19 +163,21 @@ describe("BrainService starter checkpoints", () => {
       config: {
         ...DEFAULT_CONFIG,
         name: "Adapted checkpoint",
+        workingMemorySlots: 48,
+        // Simulate a pre-v1 caller. Stable normalization must discard these
+        // beta behavior and architecture controls.
         initialNeuronBudget: 98_304,
-        noise: 0.23,
-        workingMemorySlots: 48
-      }
+        noise: 0.23
+      } as BrainConfig & { initialNeuronBudget: number; noise: number }
     });
 
     expect(built.id).toBe(imported.id);
     expect(built.config).toMatchObject({
       name: "Adapted checkpoint",
-      initialNeuronBudget: 98_304,
-      noise: 0.23,
       workingMemorySlots: 48
     });
+    expect(built.config).not.toHaveProperty("initialNeuronBudget");
+    expect(built.config).not.toHaveProperty("noise");
     expect(tryRequest.mock.calls.map(([method]) => method)).toEqual([
       "unload",
       "load",

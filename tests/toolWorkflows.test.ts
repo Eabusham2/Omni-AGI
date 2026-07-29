@@ -120,7 +120,10 @@ describe("ToolExecutor complete workflows", () => {
     const sourceRepository = join(temporaryRoot, "authorized-source");
     const evolutionRoot = join(temporaryRoot, "evolution-candidates");
     const runningBinary = join(sourceRepository, "release", "running-binary.exe");
-    await mkdir(join(sourceRepository, "release"), { recursive: true });
+    await Promise.all([
+      mkdir(join(sourceRepository, "release"), { recursive: true }),
+      mkdir(join(sourceRepository, "tests"), { recursive: true })
+    ]);
     await Promise.all([
       writeFile(
         join(sourceRepository, "package.json"),
@@ -133,6 +136,10 @@ describe("ToolExecutor complete workflows", () => {
         })
       ),
       writeFile(join(sourceRepository, "source.txt"), "original source\n"),
+      writeFile(
+        join(sourceRepository, "tests", "immutable-evaluator.test.js"),
+        "export const immutableEvaluator = true;\n"
+      ),
       writeFile(runningBinary, "running image remains unchanged\n")
     ]);
     await run("git", ["init"], sourceRepository);
@@ -150,13 +157,16 @@ describe("ToolExecutor complete workflows", () => {
 
     process.env.OMNI_SOURCE_REPOSITORY = sourceRepository;
     process.env.OMNI_EVOLUTION_ROOT = evolutionRoot;
-    await setPermission("source.self-modify", "full");
+    await setPermission("source.self-modify", "ask");
     const executor = executorFor();
 
     const proposal = completeOutput<{
       worktree: string;
       branch: string;
       taskFile: string;
+      parentCommit: string;
+      evaluatorSha256: string;
+      benchmarkDomains: string[];
       checks: Array<{ name: string; passed: boolean }>;
     }>(
       await executor.execute({
@@ -170,6 +180,11 @@ describe("ToolExecutor complete workflows", () => {
       new RegExp(`^${evolutionRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
     );
     expect(proposal.branch).toMatch(/^omni-evolution\//);
+    expect(proposal.parentCommit).toMatch(/^[a-f0-9]{40,64}$/);
+    expect(proposal.evaluatorSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(proposal.benchmarkDomains).toEqual(
+      expect.arrayContaining(["capability", "retention", "evolution-integrity"])
+    );
     expect(proposal.checks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "isolated-worktree", passed: true })
@@ -225,9 +240,42 @@ describe("ToolExecutor complete workflows", () => {
     expect(secondDiff.sha256).not.toBe(firstDiff.sha256);
     expect(secondDiff.untracked[0]?.sha256).toBe(sha256("untracked version two\n"));
 
+    await writeFile(
+      join(proposal.worktree, "tests", "immutable-evaluator.test.js"),
+      "export const immutableEvaluator = false;\n"
+    );
+    const evaluatorTamper = await executor.execute({
+      brainId: brain.id,
+      toolId: "source.self-modify",
+      action: "test",
+      arguments: {
+        worktree: proposal.worktree,
+        tests: ["unit"],
+        expectedEvaluatorSha256: proposal.evaluatorSha256,
+        timeoutMs: 30_000
+      }
+    });
+    expect(evaluatorTamper).toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/immutable evaluator files/i)
+    });
+    await writeFile(
+      join(proposal.worktree, "tests", "immutable-evaluator.test.js"),
+      "export const immutableEvaluator = true;\n"
+    );
+
     const validation = completeOutput<{
       passed: boolean;
+      boundaryPassed: boolean;
       diffSha256: string;
+      evaluatorSha256: string;
+      parentCommit: string;
+      baselineChecks: Array<{ name: string; passed: boolean }>;
+      resources: {
+        baselineDurationMs: number;
+        candidateDurationMs: number;
+        changedBytes: number;
+      };
       checks: Array<{
         name: string;
         passed: boolean;
@@ -241,12 +289,24 @@ describe("ToolExecutor complete workflows", () => {
         arguments: {
           worktree: proposal.worktree,
           tests: ["unit"],
+          expectedEvaluatorSha256: proposal.evaluatorSha256,
           timeoutMs: 30_000
         }
       })
     );
     expect(validation.passed).toBe(true);
+    expect(validation.boundaryPassed).toBe(true);
     expect(validation.diffSha256).toBe(secondDiff.sha256);
+    expect(validation.evaluatorSha256).toBe(proposal.evaluatorSha256);
+    expect(validation.parentCommit).toBe(proposal.parentCommit);
+    expect(validation.baselineChecks).toEqual([
+      expect.objectContaining({ name: "unit", passed: true })
+    ]);
+    expect(validation.resources).toMatchObject({
+      baselineDurationMs: expect.any(Number),
+      candidateDurationMs: expect.any(Number),
+      changedBytes: expect.any(Number)
+    });
     expect(validation.checks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -262,14 +322,21 @@ describe("ToolExecutor complete workflows", () => {
       join(proposal.worktree, "new-capability.txt"),
       "changed after validation\n"
     );
-    const rejectedPromotion = await executor.execute({
+    const staleInvocation = {
       brainId: brain.id,
       toolId: "source.self-modify",
       action: "promote",
       arguments: {
         worktree: proposal.worktree,
-        expectedDiffSha256: validation.diffSha256
+        expectedDiffSha256: validation.diffSha256,
+        expectedEvaluatorSha256: proposal.evaluatorSha256
       }
+    };
+    const staleChallenge = await executor.execute(staleInvocation);
+    expect(staleChallenge.state).toBe("approval-required");
+    const rejectedPromotion = await executor.execute({
+      ...staleInvocation,
+      approvalToken: staleChallenge.approvalToken
     });
     expect(rejectedPromotion.state).toBe("failed");
     expect(rejectedPromotion.error).toMatch(/changed after validation/i);
@@ -288,6 +355,7 @@ describe("ToolExecutor complete workflows", () => {
         arguments: {
           worktree: proposal.worktree,
           tests: ["unit"],
+          expectedEvaluatorSha256: proposal.evaluatorSha256,
           timeoutMs: 30_000
         }
       })
@@ -296,34 +364,86 @@ describe("ToolExecutor complete workflows", () => {
     expect(revalidation.diffSha256).not.toBe(validation.diffSha256);
     expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
 
+    const promotionInvocation = {
+      brainId: brain.id,
+      toolId: "source.self-modify",
+      action: "promote",
+      arguments: {
+        worktree: proposal.worktree,
+        expectedDiffSha256: revalidation.diffSha256,
+        expectedEvaluatorSha256: proposal.evaluatorSha256
+      }
+    };
+    const promotionChallenge = await executor.execute(promotionInvocation);
+    expect(promotionChallenge).toMatchObject({
+      state: "approval-required",
+      approvalToken: expect.any(String)
+    });
     const promotion = completeOutput<{
       promoted: boolean;
       commit: string;
+      parentCommit: string;
       diffSha256: string;
+      evaluatorSha256: string;
       note: string;
     }>(
       await executor.execute({
-        brainId: brain.id,
-        toolId: "source.self-modify",
-        action: "promote",
-        arguments: {
-          worktree: proposal.worktree,
-          expectedDiffSha256: revalidation.diffSha256
-        }
+        ...promotionInvocation,
+        approvalToken: promotionChallenge.approvalToken
       })
     );
     expect(promotion).toMatchObject({
       promoted: true,
       diffSha256: revalidation.diffSha256,
+      evaluatorSha256: proposal.evaluatorSha256,
       note: expect.stringMatching(/running binary was not overwritten or restarted/i)
     });
     expect(promotion.commit).toMatch(/^[a-f0-9]{40,64}$/);
+    expect(promotion.parentCommit).toMatch(/^[a-f0-9]{40,64}$/);
     await expect(readFile(join(sourceRepository, "source.txt"), "utf8")).resolves.toBe(
       "candidate source\n"
     );
     await expect(
       readFile(join(sourceRepository, "new-capability.txt"), "utf8")
     ).resolves.toBe("changed after validation\n");
+    expect(sha256(await readFile(runningBinary))).toBe(runningBinaryHash);
+    expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
+
+    const rollbackInvocation = {
+      brainId: brain.id,
+      toolId: "source.self-modify",
+      action: "rollback",
+      arguments: {
+        expectedCommit: promotion.commit,
+        parentCommit: promotion.parentCommit
+      }
+    };
+    const rollbackChallenge = await executor.execute(rollbackInvocation);
+    expect(rollbackChallenge).toMatchObject({
+      state: "approval-required",
+      approvalToken: expect.any(String)
+    });
+    const rollback = completeOutput<{
+      rolledBack: boolean;
+      revertedCommit: string;
+      rollbackCommit: string;
+    }>(
+      await executor.execute({
+        ...rollbackInvocation,
+        approvalToken: rollbackChallenge.approvalToken
+      })
+    );
+    expect(rollback).toMatchObject({
+      rolledBack: true,
+      revertedCommit: promotion.commit
+    });
+    expect(rollback.rollbackCommit).toMatch(/^[a-f0-9]{40,64}$/);
+    await expect(readFile(join(sourceRepository, "source.txt"), "utf8")).resolves.toBe(
+      "original source\n"
+    );
+    await expect(
+      readFile(join(sourceRepository, "new-capability.txt"), "utf8")
+    ).rejects.toMatchObject({ code: "ENOENT" });
     expect(sha256(await readFile(runningBinary))).toBe(runningBinaryHash);
     expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
   }, 60_000);

@@ -41,6 +41,10 @@ export interface EngineEvent {
   type: string;
   brainId?: string;
   jobId?: string;
+  /** Correlates ordered chat notifications with the request that created them. */
+  streamId?: string;
+  sequence?: number;
+  actionId?: string;
   progress?: number;
   message?: string;
   data?: unknown;
@@ -91,6 +95,17 @@ function pythonCandidates(options: EngineSupervisorOptions): PythonCandidate[] {
   );
 }
 
+export function packagedEnginePath(
+  resourcesPath: string,
+  platform: NodeJS.Platform = process.platform
+): string {
+  return join(
+    resourcesPath,
+    "engine-runtime",
+    platform === "win32" ? "omni-engine.exe" : "omni-engine"
+  );
+}
+
 function messageFromError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -132,7 +147,7 @@ export class EngineSupervisor extends EventEmitter {
       process.env.OMNI_PYTHON?.trim() ||
       process.env.OMNI_AGI_PYTHON?.trim();
     const packagedExecutable = this.options.resourcesPath
-      ? join(this.options.resourcesPath, "engine-runtime", "omni-engine.exe")
+      ? packagedEnginePath(this.options.resourcesPath)
       : undefined;
     const packagedRequired = process.env.OMNI_PACKAGED_ENGINE_REQUIRED === "1";
     const candidates: Array<{ candidate: PythonCandidate; direct: boolean }> = [];
@@ -354,6 +369,49 @@ export class EngineSupervisor extends EventEmitter {
     return (await this.rawRequest(method, params, timeoutMs, signal)) as T;
   }
 
+  /**
+   * Run a request while receiving only its correlated worker notifications.
+   *
+   * Worker contract: the request contains `streamId`; notifications must echo
+   * it and use a strictly increasing non-negative integer `sequence`. Duplicate
+   * or out-of-order notifications are ignored before reaching application code.
+   */
+  async requestStream<T>(
+    method: string,
+    params: Record<string, unknown>,
+    onEvent: (event: EngineEvent) => void,
+    timeoutMs = 120_000,
+    signal?: AbortSignal,
+    requestedStreamId?: string
+  ): Promise<T> {
+    const streamId = requestedStreamId?.trim() || randomUUID();
+    let lastSequence = -1;
+    const listener = (event: EngineEvent): void => {
+      if (event.streamId !== streamId) return;
+      if (
+        typeof event.sequence !== "number" ||
+        !Number.isSafeInteger(event.sequence) ||
+        event.sequence < 0 ||
+        event.sequence <= lastSequence
+      ) {
+        return;
+      }
+      lastSequence = event.sequence;
+      onEvent(event);
+    };
+    this.on("event", listener);
+    try {
+      return await this.request<T>(
+        method,
+        { ...params, streamId },
+        timeoutMs,
+        signal
+      );
+    } finally {
+      this.off("event", listener);
+    }
+  }
+
   async tryRequest<T>(
     method: string,
     params: Record<string, unknown> = {},
@@ -362,6 +420,29 @@ export class EngineSupervisor extends EventEmitter {
   ): Promise<T | undefined> {
     try {
       return await this.request<T>(method, params, timeoutMs, signal);
+    } catch (error) {
+      this.lastError = messageFromError(error);
+      return undefined;
+    }
+  }
+
+  async tryRequestStream<T>(
+    method: string,
+    params: Record<string, unknown>,
+    onEvent: (event: EngineEvent) => void,
+    timeoutMs = 120_000,
+    signal?: AbortSignal,
+    streamId?: string
+  ): Promise<T | undefined> {
+    try {
+      return await this.requestStream<T>(
+        method,
+        params,
+        onEvent,
+        timeoutMs,
+        signal,
+        streamId
+      );
     } catch (error) {
       this.lastError = messageFromError(error);
       return undefined;

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { cpus, freemem, totalmem } from "node:os";
 import { readFile } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
@@ -12,22 +13,35 @@ import {
 import type {
   BrainConfig,
   BrainExportMode,
+  BuildResourceSelection,
+  BuildResourceStartRequest,
   CatalogEntry,
   CreateBrainRequest,
+  DatasetPreviewRequest,
+  DatasetStartRequest,
   FeedbackRequest,
   HardwareProfile,
+  EvolutionApprovalRequest,
+  EvolutionRollbackRequest,
+  EvolutionStartRequest,
   InstallModalityPackUrlRequest,
   ImportUrlRequest,
   IngestFilesRequest,
   IngestWebRequest,
   ModalityGenerateRequest,
   StartTrainingRequest,
+  SubstrateQuery,
   ToolInvocation,
   ToolPermissionLevel,
   TraceQuery,
   WebCrawlRequest
 } from "../shared/types";
 import { IPC } from "../shared/ipc";
+import {
+  EXPERIENCE_UPLOADS,
+  isExperienceUploadKind,
+  type ExperienceUploadKind
+} from "../shared/uploadSupport";
 import type { BrainRepository } from "./brainRepository";
 import {
   BrainService,
@@ -35,6 +49,8 @@ import {
 } from "./brainService";
 import type { EngineSupervisor } from "./engineSupervisor";
 import type { ToolExecutor } from "./toolExecutor";
+import type { ChatActionController } from "./chatActionController";
+import type { EvolutionController } from "./evolutionController";
 
 export interface IpcDependencies {
   repository: BrainRepository;
@@ -42,6 +58,8 @@ export interface IpcDependencies {
   jobs: RuntimeJobManager;
   engine: EngineSupervisor;
   tools: ToolExecutor;
+  actions: ChatActionController;
+  evolution: EvolutionController;
   appPath: string;
 }
 
@@ -67,6 +85,17 @@ function requireId(value: unknown, label = "id"): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function uploadDescriptor(value: unknown): {
+  kind: ExperienceUploadKind;
+  descriptor: (typeof EXPERIENCE_UPLOADS)[ExperienceUploadKind];
+} {
+  if (value !== undefined && !isExperienceUploadKind(value)) {
+    throw new Error("Invalid experience upload kind.");
+  }
+  const kind = value ?? "files";
+  return { kind, descriptor: EXPERIENCE_UPLOADS[kind] };
 }
 
 async function loadCatalog(appPath: string): Promise<CatalogEntry[]> {
@@ -160,8 +189,12 @@ async function hardwareProfile(): Promise<HardwareProfile> {
 }
 
 export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
-  const { repository, service, jobs, engine, tools, appPath } = dependencies;
+  const { repository, service, jobs, engine, tools, actions, evolution, appPath } = dependencies;
   const channels: string[] = [];
+  const buildSelections = new Map<
+    string,
+    BuildResourceSelection & { paths: string[] }
+  >();
   const handle = <T extends unknown[]>(
     channel: string,
     listener: (event: IpcMainInvokeEvent, ...args: T) => unknown
@@ -215,6 +248,9 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     );
     return brain;
   });
+  handle(IPC.brain.duplicate, (_event, id: string, name?: string) =>
+    repository.duplicate(requireId(id), typeof name === "string" ? name : undefined)
+  );
   handle(IPC.brain.fork, (_event, id: string, name?: string) =>
     repository.fork(requireId(id), typeof name === "string" ? name : undefined)
   );
@@ -327,9 +363,30 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     return brain;
   });
   handle(IPC.brain.health, () => engine.health());
+  handle(IPC.brain.querySubstrate, (_event, id: string, query?: SubstrateQuery) => {
+    const brainId = requireId(id);
+    if (query !== undefined && !isRecord(query)) {
+      throw new Error("Invalid substrate query.");
+    }
+    return service.querySubstrate(brainId, query);
+  });
+  handle(IPC.brain.workspace, (_event, id: string) =>
+    service.workspace(requireId(id))
+  );
 
-  handle(IPC.chat.send, (_event, id: string, input: string) =>
-    service.chat(requireId(id), input)
+  handle(IPC.chat.send, (_event, id: string, input: string, turnId?: string) =>
+    actions.send(
+      requireId(id),
+      input,
+      undefined,
+      typeof turnId === "string" ? requireId(turnId, "turn id") : undefined
+    )
+  );
+  handle(IPC.chat.cancel, (_event, id: string, turnId?: string) =>
+    actions.cancel(
+      requireId(id),
+      typeof turnId === "string" ? requireId(turnId, "turn id") : undefined
+    )
   );
   handle(IPC.chat.list, async (_event, id: string) => (await repository.get(requireId(id))).messages);
   handle(IPC.chat.feedback, (_event, request: FeedbackRequest) => service.feedback(request));
@@ -345,49 +402,136 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     jobs.list(typeof id === "string" ? requireId(id) : undefined)
   );
 
+  handle(
+    IPC.data.selectBuildResources,
+    async (
+      event,
+      kind: BuildResourceSelection["kind"],
+      requestedSelection?: ExperienceUploadKind
+    ) => {
+      if (!["files", "folder"].includes(kind)) {
+        throw new Error("Invalid build resource kind.");
+      }
+      const folder = kind === "folder";
+      const { descriptor } = uploadDescriptor(requestedSelection);
+      const choice = await dialog.showOpenDialog(senderWindow(event), {
+        title: folder
+          ? "Choose a dataset folder"
+          : descriptor.title,
+        properties: folder ? ["openDirectory"] : ["openFile", "multiSelections"],
+        filters: folder
+          ? undefined
+          : [
+              {
+                name: descriptor.filterName,
+                extensions: [...descriptor.extensions]
+              },
+              { name: "All files", extensions: ["*"] }
+            ]
+      });
+      if (choice.canceled || choice.filePaths.length === 0) return null;
+      const id = randomUUID();
+      const paths = choice.filePaths.map((path) => resolve(path));
+      const selection: BuildResourceSelection & { paths: string[] } = {
+        id,
+        kind,
+        label:
+          folder
+            ? basename(paths[0]!)
+            : paths.length === 1
+              ? basename(paths[0]!)
+              : `${paths.length} selected ${descriptor.shortLabel}`,
+        itemCount: paths.length,
+        paths
+      };
+      buildSelections.set(id, selection);
+      const { paths: _paths, ...publicSelection } = selection;
+      return publicSelection;
+    }
+  );
+  handle(IPC.data.discardBuildResource, (_event, selectionId: string) =>
+    buildSelections.delete(requireId(selectionId, "build resource selection id"))
+  );
+  handle(
+    IPC.data.startBuildResource,
+    async (_event, request: BuildResourceStartRequest) => {
+      if (!isRecord(request)) throw new Error("Invalid build resource request.");
+      const brainId = requireId(request.brainId);
+      const selectionId = requireId(
+        request.selectionId,
+        "build resource selection id"
+      );
+      const selection = buildSelections.get(selectionId);
+      if (!selection) {
+        throw new Error("The selected build resource is no longer available.");
+      }
+      const manifest = await service.previewDataset(brainId, selection.paths);
+      buildSelections.delete(selectionId);
+      return jobs.startIngestion({
+        brainId,
+        manifestId: manifest.id,
+        policy: request.policy ?? "pretrain",
+        epochs: request.epochs ?? 1,
+        resume: true
+      });
+    }
+  );
+
+  handle(IPC.data.preview, async (event, request: DatasetPreviewRequest) => {
+    if (!isRecord(request)) throw new Error("Invalid dataset preview request.");
+    const brainId = requireId(request.brainId);
+    const folder = request.selection === "folder";
+    const { descriptor } = uploadDescriptor(
+      folder ? undefined : request.selection
+    );
+    const choice = await dialog.showOpenDialog(senderWindow(event), {
+      title: folder ? "Choose a dataset folder" : descriptor.title,
+      properties: folder ? ["openDirectory"] : ["openFile", "multiSelections"],
+      filters: folder
+        ? undefined
+        : [
+            {
+              name: descriptor.filterName,
+              extensions: [...descriptor.extensions]
+            },
+            { name: "All files", extensions: ["*"] }
+          ]
+    });
+    if (choice.canceled || choice.filePaths.length === 0) return null;
+    return service.previewDataset(brainId, choice.filePaths);
+  });
+  handle(IPC.data.start, (_event, request: DatasetStartRequest) => {
+    if (!isRecord(request)) throw new Error("Invalid dataset start request.");
+    requireId(request.brainId);
+    requireId(request.manifestId, "dataset manifest id");
+    return jobs.startIngestion({ ...request, resume: request.resume ?? true });
+  });
+  handle(IPC.data.pause, (_event, jobId: string) =>
+    jobs.cancel(requireId(jobId, "job id"))
+  );
+  handle(IPC.data.resume, (_event, request: DatasetStartRequest) => {
+    if (!isRecord(request)) throw new Error("Invalid dataset resume request.");
+    requireId(request.brainId);
+    requireId(request.manifestId, "dataset manifest id");
+    return jobs.startIngestion({ ...request, resume: true });
+  });
+  handle(IPC.data.coverage, (_event, brainId: string, manifestId: string) =>
+    service.datasets.coverage(
+      requireId(brainId),
+      requireId(manifestId, "dataset manifest id")
+    )
+  );
+
   handle(IPC.data.ingestFiles, async (event, request: IngestFilesRequest) => {
     const brainId = requireId(request.brainId);
+    const { descriptor } = uploadDescriptor(request.selection);
     const choice = await dialog.showOpenDialog(senderWindow(event), {
-      title: "Choose material to learn",
+      title: descriptor.title,
       properties: ["openFile", "multiSelections"],
       filters: [
         {
-          name: "Learning material",
-          extensions: [
-            "pdf",
-            "txt",
-            "md",
-            "mdx",
-            "json",
-            "jsonl",
-            "ts",
-            "tsx",
-            "js",
-            "jsx",
-            "py",
-            "rs",
-            "go",
-            "java",
-            "cs",
-            "cpp",
-            "c",
-            "h",
-            "html",
-            "css",
-            "yaml",
-            "yml",
-            "toml",
-            "png",
-            "jpg",
-            "jpeg",
-            "webp",
-            "wav",
-            "mp3",
-            "flac",
-            "mp4",
-            "webm",
-            "mov"
-          ]
+          name: descriptor.filterName,
+          extensions: [...descriptor.extensions]
         },
         { name: "All files", extensions: ["*"] }
       ]
@@ -408,7 +552,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     IPC.data.ingestDropped,
     (_event, request: IngestFilesRequest, rawPaths: unknown) => {
       const brainId = requireId(request.brainId);
-      if (!Array.isArray(rawPaths) || rawPaths.length > 256) {
+      if (!Array.isArray(rawPaths)) {
         throw new Error("Invalid dropped-file selection.");
       }
       const paths = rawPaths.map((path) => {
@@ -508,6 +652,35 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       )
   );
 
+  handle(IPC.evolution.start, (_event, request: EvolutionStartRequest) => {
+    if (!isRecord(request)) throw new Error("Invalid evolution request.");
+    requireId(request.brainId);
+    return evolution.start(request);
+  });
+  handle(IPC.evolution.stop, (_event, brainId: string, runId: string) =>
+    evolution.stop(requireId(brainId), requireId(runId, "evolution run id"))
+  );
+  handle(
+    IPC.evolution.listCandidates,
+    (_event, brainId: string, runId?: string) =>
+      evolution.listCandidates(
+        requireId(brainId),
+        typeof runId === "string" ? requireId(runId, "evolution run id") : undefined
+      )
+  );
+  handle(IPC.evolution.approve, (_event, request: EvolutionApprovalRequest) => {
+    if (!isRecord(request)) throw new Error("Invalid evolution approval request.");
+    requireId(request.brainId);
+    requireId(request.candidateId, "evolution candidate id");
+    return evolution.approve(request);
+  });
+  handle(IPC.evolution.rollback, (_event, request: EvolutionRollbackRequest) => {
+    if (!isRecord(request)) throw new Error("Invalid evolution rollback request.");
+    requireId(request.brainId);
+    requireId(request.candidateId, "evolution candidate id");
+    return evolution.rollback(request);
+  });
+
   handle(IPC.catalog.list, () => loadCatalog(appPath));
   handle(IPC.catalog.importUrl, async (_event, request: ImportUrlRequest) => {
     const brain = await service.importUrl(request);
@@ -587,9 +760,24 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     }
   };
   jobs.on("event", jobListener);
+  const actionListener = (event: unknown): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send(IPC.chat.actionEvent, event);
+    }
+  };
+  actions.on("event", actionListener);
+  const streamListener = (event: unknown): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send(IPC.chat.streamEvent, event);
+    }
+  };
+  actions.on("stream", streamListener);
 
   return () => {
+    buildSelections.clear();
     jobs.off("event", jobListener);
+    actions.off("event", actionListener);
+    actions.off("stream", streamListener);
     for (const channel of channels) ipcMain.removeHandler(channel);
   };
 }

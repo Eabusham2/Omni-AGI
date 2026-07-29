@@ -1,0 +1,88 @@
+name: macOS
+
+on:
+  push:
+    branches: ["main", "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            node_arch: x64
+            python_arch: x64
+            torch_version: 2.2.2
+            numpy_constraint: numpy<2
+          - arch: arm64
+            runner: macos-15
+            node_arch: arm64
+            python_arch: arm64
+            torch_version: 2.10.0
+            numpy_constraint: numpy<3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          architecture: ${{ matrix.node_arch }}
+          cache: npm
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+          cache-dependency-path: engine/requirements.txt
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Verify stable release metadata
+        run: npm run verify:release
+
+      - name: Install CPU brain runtime
+        run: |
+          python -m pip install "${{ matrix.numpy_constraint }}" "torch==${{ matrix.torch_version }}"
+          python -m pip install -r engine/requirements.txt
+
+      - name: Test brain
+        run: npm run test:python:portable
+
+      - name: Test desktop app
+        run: npm run test:node
+
+      - name: Package native macOS application
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run package:mac:${{ matrix.arch }}
+
+      - name: Smoke packaged worker and desktop
+        env:
+          OMNI_EXPECT_SIGNED: "0"
+          OMNI_EXPECT_NOTARIZED: "0"
+        run: >-
+          node scripts/smoke-posix-package.mjs
+          --platform mac
+          --arch ${{ matrix.arch }}
+          --release-root release
+          --desktop-e2e
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-agi-studio-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            release/*-macOS-${{ matrix.arch }}.dmg
+            release/*-macOS-${{ matrix.arch }}.zip
+            release/mac-package-smoke-${{ matrix.arch }}.json

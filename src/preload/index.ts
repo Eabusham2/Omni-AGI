@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { OmniApi, RuntimeJobEvent } from "../shared/types";
+import type {
+  ActionEvent,
+  ChatStreamEvent,
+  OmniApi,
+  RuntimeJobEvent
+} from "../shared/types";
 import { IPC } from "../shared/ipc";
 
 const invoke = <T>(channel: string, ...args: unknown[]): Promise<T> =>
@@ -22,6 +27,7 @@ const api: OmniApi = {
     get: (id) => invoke(IPC.brain.get, id),
     create: (request) => invoke(IPC.brain.create, request),
     update: (id, config) => invoke(IPC.brain.update, id, config),
+    duplicate: (id, name) => invoke(IPC.brain.duplicate, id, name),
     fork: (id, name) => invoke(IPC.brain.fork, id, name),
     remove: (id) => invoke(IPC.brain.remove, id),
     snapshot: (id, label) => invoke(IPC.brain.snapshot, id, label),
@@ -36,12 +42,27 @@ const api: OmniApi = {
       ipcRenderer.on(IPC.brain.imported, wrapped);
       return () => ipcRenderer.removeListener(IPC.brain.imported, wrapped);
     },
-    health: (id) => invoke(IPC.brain.health, id)
+    health: (id) => invoke(IPC.brain.health, id),
+    querySubstrate: (id, query) => invoke(IPC.brain.querySubstrate, id, query),
+    workspace: (id) => invoke(IPC.brain.workspace, id)
   },
   chat: {
-    send: (id, input) => invoke(IPC.chat.send, id, input),
+    send: (id, input, turnId) => invoke(IPC.chat.send, id, input, turnId),
+    cancel: (id, turnId) => invoke(IPC.chat.cancel, id, turnId),
     list: (id) => invoke(IPC.chat.list, id),
-    feedback: (request) => invoke(IPC.chat.feedback, request)
+    feedback: (request) => invoke(IPC.chat.feedback, request),
+    onAction: (listener) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, value: ActionEvent): void =>
+        listener(value);
+      ipcRenderer.on(IPC.chat.actionEvent, wrapped);
+      return () => ipcRenderer.removeListener(IPC.chat.actionEvent, wrapped);
+    },
+    onStream: (listener) => {
+      const wrapped = (_event: Electron.IpcRendererEvent, value: ChatStreamEvent): void =>
+        listener(value);
+      ipcRenderer.on(IPC.chat.streamEvent, wrapped);
+      return () => ipcRenderer.removeListener(IPC.chat.streamEvent, wrapped);
+    }
   },
   train: {
     start: (request) => invoke(IPC.train.start, request),
@@ -56,11 +77,21 @@ const api: OmniApi = {
     }
   },
   data: {
+    selectBuildResources: (kind, selection) =>
+      invoke(IPC.data.selectBuildResources, kind, selection),
+    discardBuildResource: (selectionId) =>
+      invoke(IPC.data.discardBuildResource, selectionId),
+    startBuildResource: (request) => invoke(IPC.data.startBuildResource, request),
+    preview: (request) => invoke(IPC.data.preview, request),
+    start: (request) => invoke(IPC.data.start, request),
+    pause: (jobId) => invoke(IPC.data.pause, jobId),
+    resume: (request) => invoke(IPC.data.resume, request),
+    coverage: (brainId, manifestId) =>
+      invoke(IPC.data.coverage, brainId, manifestId),
     ingestFiles: (request) => invoke(IPC.data.ingestFiles, request),
     ingestFolder: (request) => invoke(IPC.data.ingestFolder, request),
     ingestDropped: (request, files) => {
       const paths = files
-        .slice(0, 256)
         .map((file) => {
           try {
             return webUtils.getPathForFile(file as File);
@@ -96,6 +127,14 @@ const api: OmniApi = {
       invoke(IPC.agent.previewMerge, sourceBrainId, targetBrainId),
     merge: (sourceBrainId, targetBrainId, reviewToken) =>
       invoke(IPC.agent.merge, sourceBrainId, targetBrainId, reviewToken)
+  },
+  evolution: {
+    start: (request) => invoke(IPC.evolution.start, request),
+    stop: (brainId, runId) => invoke(IPC.evolution.stop, brainId, runId),
+    listCandidates: (brainId, runId) =>
+      invoke(IPC.evolution.listCandidates, brainId, runId),
+    approve: (request) => invoke(IPC.evolution.approve, request),
+    rollback: (request) => invoke(IPC.evolution.rollback, request)
   },
   catalog: {
     list: () => invoke(IPC.catalog.list),

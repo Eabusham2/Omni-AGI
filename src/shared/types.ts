@@ -9,55 +9,36 @@ export type ArchitecturePreset =
   | "custom";
 
 export type InferenceRuntime = "adaptive-core";
-export type MemoryInjectionMode = "parameter-only" | "working-memory";
 export type MemoryRecipe = "human-consolidation" | "total-recall" | "synapses-only";
-export type GrowthPolicy = "fixed" | "elastic" | "unbounded";
 export type TraceDetail = "summary" | "standard" | "research";
 
+/**
+ * Stable v1 user choices.
+ *
+ * Neural shape, mandatory ternary/spiking/liquid/VSA capabilities, plasticity
+ * constants, organic drive state, and structural growth belong to the engine's
+ * hardware-derived architecture manifest. They are deliberately not
+ * behavioral controls in this public or persisted configuration.
+ */
 export interface BrainConfig {
   name: string;
   preset: ArchitecturePreset;
   runtime: InferenceRuntime;
   description: string;
 
-  ternaryWeights: boolean;
-  spikingDynamics: boolean;
-  stdpPlasticity: boolean;
-  liquidDynamics: boolean;
-  liquidMode: "cfc" | "ltc";
-  vectorSymbolicMemory: boolean;
   onlineLearning: boolean;
-  consolidation: boolean;
-  metaplasticity: boolean;
+  extendedWorkingMemory: boolean;
+  recursiveImprovement: boolean;
+  idleCognition: boolean;
 
+  /** Resolved workspace capacity for inspection and degraded-mode operation. */
   workingMemorySlots: number;
-  shortTermHalfLifeMinutes: number;
-  longTermThreshold: number;
-  initialNeuronBudget: number;
-  growthPolicy: GrowthPolicy;
-  maxConcepts: number;
-  maxSynapses: number;
-
+  /** Resolved slow-training rate; it is not a personality or motivation dial. */
   learningRate: number;
-  noise: number;
-  firingThreshold: number;
-  membraneLeak: number;
-  stdpWindow: number;
-  consolidationRate: number;
-  forgettingRate: number;
-
-  noveltyDrive: number;
-  coherenceDrive: number;
-  curiosityDrive: number;
-  parallelThoughts: number;
   traceDetail: TraceDetail;
 
-  storeAtomicIdeas: boolean;
   retainSourceText: boolean;
-  learnFromOwnMessages: boolean;
-  memoryInjection: MemoryInjectionMode;
-  memoryRecipe?: MemoryRecipe;
-
+  memoryRecipe: MemoryRecipe;
 }
 
 export interface BrainLineage {
@@ -176,6 +157,12 @@ export interface TrainingSource {
     | "markdown"
     | "code"
     | "json"
+    | "csv"
+    | "parquet"
+    | "arrow"
+    | "archive"
+    | "sqlite"
+    | "dataset"
     | "image"
     | "audio"
     | "video"
@@ -210,6 +197,11 @@ export interface BrainMetrics {
 
 export interface BrainDocument {
   schemaVersion: number;
+  /**
+   * Stable v1 storage discriminator. Beta documents intentionally do not have
+   * this marker and are never normalized or loaded as stable brains.
+   */
+  releaseFormat?: "stable-1.0";
   id: string;
   name: string;
   createdAt: string;
@@ -245,6 +237,140 @@ export interface BrainSummary {
   generation: number;
 }
 
+export type SubstrateEntity =
+  | "overview"
+  | "neurons"
+  | "assemblies"
+  | "synapses";
+
+export interface SubstrateQuery {
+  /**
+   * Overview and low zoom levels return aggregate clusters. The other entity
+   * kinds expose the same unbounded substrate through cursor-based pages.
+   */
+  entity?: SubstrateEntity;
+  cursor?: string;
+  pageSize?: number;
+  region?: string;
+  search?: string;
+  zoom?: number;
+}
+
+export interface SubstrateNeuron {
+  id: string;
+  label: string;
+  region: string;
+  activation: number;
+  importance: number;
+  uncertainty: number;
+  exposures: number;
+  createdAt?: string;
+  lastActivatedAt?: string;
+  aliases: string[];
+}
+
+export interface SubstrateAssembly {
+  id: string;
+  label: string;
+  region: "assembly";
+  neuronIds: string[];
+  childAssemblyIds: string[];
+  kind: string;
+  source: string;
+  confidence: number;
+  importance: number;
+  rehearsals: number;
+  createdAt?: string;
+  lastRecalledAt?: string;
+  sourceLabel?: string;
+  retainsSourceText: boolean;
+}
+
+export interface SubstrateSynapse {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  kind: string;
+  effectiveWeight: -1 | 0 | 1;
+  latentWeight: number;
+  eligibility: number;
+  plasticity: number;
+  stability: number;
+  uses: number;
+  lastUpdatedAt?: string;
+}
+
+export interface SubstrateCluster {
+  id: string;
+  label: string;
+  kind: "region" | "activation-band" | "pathway";
+  region?: string;
+  sourceRegion?: string;
+  targetRegion?: string;
+  count: number;
+  activeCount: number;
+  meanActivation: number;
+  maxActivation: number;
+  effectiveWeights: {
+    negative: number;
+    zero: number;
+    positive: number;
+  };
+}
+
+export interface SubstratePage {
+  brainId: string;
+  queriedAt: string;
+  entity: SubstrateEntity;
+  zoom: number;
+  totals: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+  };
+  matched: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  clusters: SubstrateCluster[];
+  neurons: SubstrateNeuron[];
+  assemblies: SubstrateAssembly[];
+  synapses: SubstrateSynapse[];
+}
+
+export interface WorkspaceSnapshot {
+  brainId: string;
+  queriedAt: string;
+  contextWindow: {
+    capacityTokens: number;
+    tokenCount: number;
+    tokenHash: string;
+    sensorySlots: number;
+    extended: boolean;
+    updatedAt: string;
+  };
+  latentWorkspace: {
+    capacity: number;
+    occupancy: number;
+    items: Array<{
+      id?: string;
+      kind?: string;
+      salience: number;
+      rehearsals: number;
+      enteredAt?: string;
+      lastActiveAt?: string;
+    }>;
+    evictions: number;
+    rehearsals: number;
+  };
+  liquidState: {
+    dimensions: number;
+    mean: number;
+    norm: number;
+  };
+  hiddenBehavioralPrompt: boolean;
+  rawLongTermTextInjected: boolean;
+}
+
 export interface RecallResult {
   idea: Idea;
   score: number;
@@ -257,12 +383,16 @@ export interface ChatResult {
   humanMessage: ChatMessage;
   brainMessage: ChatMessage;
   trace: ThoughtTrace;
+  proposedActions?: StructuredAction[];
+  actionEvents?: ActionEvent[];
 }
 
 export interface IngestResult {
   brain: BrainDocument;
   source: TrainingSource;
   warnings: string[];
+  manifestId?: string;
+  coverage?: TrainingCoverage;
 }
 
 export interface RuntimeHealth {
@@ -309,9 +439,116 @@ export type BrainExportMode = "current" | "origin" | "private-archive" | "refere
 
 export type DataIngestionPolicy = "encode" | "consolidate" | "pretrain" | "archive";
 
+export type DatasetFormat =
+  | "text"
+  | "pdf"
+  | "epub"
+  | "office"
+  | "csv"
+  | "tsv"
+  | "json"
+  | "jsonl"
+  | "parquet"
+  | "arrow"
+  | "sqlite"
+  | "archive"
+  | "webdataset"
+  | "huggingface"
+  | "image"
+  | "audio"
+  | "video"
+  | "unknown";
+
+export interface DatasetManifestEntry {
+  index: number;
+  path: string;
+  relativePath: string;
+  format: DatasetFormat;
+  bytes: number;
+}
+
+export interface DatasetManifest {
+  schemaVersion: 1;
+  id: string;
+  brainId: string;
+  createdAt: string;
+  updatedAt: string;
+  roots: string[];
+  entryFile: string;
+  discoveredFiles: number;
+  discoveredBytes: number;
+  manifestHash: string;
+}
+
+export interface DatasetCursor {
+  schemaVersion: 1;
+  manifestId: string;
+  currentEpoch?: number;
+  requestedEpochs?: number;
+  nextEntry: number;
+  nextRecord: number;
+  processedFiles: number;
+  processedRecords: number;
+  processedBytes: number;
+  state: "ready" | "running" | "paused" | "complete" | "failed";
+  updatedAt: string;
+}
+
+export interface TrainingCoverageError {
+  source: string;
+  message: string;
+}
+
+export interface TrainingCoverage {
+  schemaVersion: 1;
+  manifestId: string;
+  requestedEpochs?: number;
+  completedEpochs?: number;
+  discoveredFiles: number;
+  processedFiles: number;
+  rejectedFiles: number;
+  discoveredRecords: number;
+  processedRecords: number;
+  rejectedRecords: number;
+  discoveredBytes: number;
+  processedBytes: number;
+  shards: number;
+  modalityCounts: Partial<Record<DatasetFormat, number>>;
+  errors: TrainingCoverageError[];
+  errorLog?: string;
+  complete: boolean;
+  updatedAt: string;
+}
+
 export interface IngestFilesRequest {
   brainId: string;
   policy?: DataIngestionPolicy;
+  selection?: import("./uploadSupport").ExperienceUploadKind;
+}
+
+export interface DatasetPreviewRequest
+  extends Omit<IngestFilesRequest, "selection"> {
+  selection?:
+    | "folder"
+    | import("./uploadSupport").ExperienceUploadKind;
+}
+
+export interface DatasetStartRequest extends IngestFilesRequest {
+  manifestId: string;
+  epochs?: number;
+  resume?: boolean;
+}
+
+export interface BuildResourceSelection {
+  id: string;
+  kind: "files" | "folder";
+  label: string;
+  itemCount: number;
+}
+
+export interface BuildResourceStartRequest extends IngestFilesRequest {
+  selectionId: string;
+  epochs?: number;
 }
 
 export interface IngestWebRequest {
@@ -322,18 +559,26 @@ export interface IngestWebRequest {
 }
 
 export interface WebCrawlRequest extends IngestWebRequest {
+  crawlId?: string;
   maxPages?: number;
   maxDepth?: number;
   sameOrigin?: boolean;
+  followExternalLinks?: boolean;
   respectRobots?: boolean;
+  concurrency?: number;
+  resume?: boolean;
 }
 
 export interface WebCrawlResult {
+  crawlId: string;
   startUrl: string;
   visited: number;
   skipped: number;
   results: IngestResult[];
   warnings: string[];
+  frontierRemaining: number;
+  stopped: boolean;
+  coverage: TrainingCoverage;
 }
 
 export type ToolPermissionLevel = "off" | "ask" | "auto" | "full";
@@ -348,7 +593,13 @@ export interface ToolPermissionRecord {
 export interface JournalEntry {
   id: string;
   createdAt: string;
-  kind: "learning" | "consolidation" | "tool" | "fork" | "system";
+  kind:
+    | "learning"
+    | "consolidation"
+    | "tool"
+    | "fork"
+    | "reflection"
+    | "system";
   summary: string;
   detail?: string;
 }
@@ -376,6 +627,8 @@ export interface RuntimeJob {
   updatedAt: string;
   error?: string;
   output?: unknown;
+  /** A bounded, non-authoritative preview emitted while media is decoding. */
+  preview?: ModalityPreview;
 }
 
 export interface RuntimeJobEvent {
@@ -554,6 +807,247 @@ export interface ToolExecutionResult {
   approvalToken?: string;
 }
 
+export type ActionKind =
+  | "talk"
+  | "tool"
+  | "imagine"
+  | "agent"
+  | "ponder"
+  | "learn"
+  | "evolve"
+  | "stop";
+
+export type ActionSource = "human" | "brain" | "organic";
+
+/**
+ * A model-facing action channel. Tool capability schemas enter the neural
+ * runtime as structured vectors; this value is never a behavioral prompt.
+ */
+export interface StructuredAction {
+  kind: ActionKind;
+  source: ActionSource;
+  toolId?: string;
+  action?: string;
+  arguments: Record<string, unknown>;
+  confidence?: number;
+}
+
+export interface ActionEvent {
+  id: string;
+  brainId: string;
+  action: StructuredAction;
+  state:
+    | "proposed"
+    | "running"
+    | "approval-required"
+    | "complete"
+    | "failed"
+    | "stopped";
+  createdAt: string;
+  updatedAt: string;
+  /** Live local-runtime progress for long imagination/tool actions. */
+  progress?: number;
+  statusLabel?: string;
+  runtimeJobId?: string;
+  execution?: ToolExecutionResult;
+  evolutionRunId?: string;
+  /** Latest safe progressive preview for an imagination action. */
+  preview?: ModalityPreview;
+  error?: string;
+}
+
+/**
+ * Progressive media is display-only until the corresponding action completes.
+ * The main process validates and bounds every field before it crosses preload.
+ */
+export interface ModalityPreview {
+  revision: number;
+  progress?: number;
+  statusLabel?: string;
+  mimeType?: string;
+  dataUrl?: string;
+  path?: string;
+  artifactPath?: string;
+}
+
+interface ChatStreamEventBase {
+  id: string;
+  brainId: string;
+  turnId: string;
+  sequence: number;
+  createdAt: string;
+}
+
+export interface ChatTokenStreamEvent extends ChatStreamEventBase {
+  type: "chat-token";
+  delta: string;
+}
+
+export interface ChatActionStreamEvent extends ChatStreamEventBase {
+  type: "chat-action";
+  actionEvent: ActionEvent;
+}
+
+export interface ChatModalityPreviewStreamEvent extends ChatStreamEventBase {
+  type: "modality-preview";
+  actionId: string;
+  preview: ModalityPreview;
+}
+
+export interface ChatStateStreamEvent extends ChatStreamEventBase {
+  type: "chat-state";
+  state: "started" | "complete" | "cancelled" | "failed";
+  error?: string;
+}
+
+/**
+ * One typed, ordered renderer stream. No response prose, tags, or hidden
+ * instructions are parsed to manufacture an action.
+ */
+export type ChatStreamEvent =
+  | ChatTokenStreamEvent
+  | ChatActionStreamEvent
+  | ChatModalityPreviewStreamEvent
+  | ChatStateStreamEvent;
+
+export interface IdleCognitionTrace {
+  id: string;
+  createdAt: string;
+  mode: "ponder" | "imagine" | "rehearse";
+  seed: number;
+  promptTokenCount: 0;
+  hiddenBehavioralPrompt: false;
+  activeAssemblyIds: string[];
+  organicState: Record<string, number>;
+  liquidControls: Record<string, number>;
+  stdpUpdate: number;
+  spikeRate: number;
+  rehearsal: {
+    loss: number;
+    reconstructionLoss: number;
+    temporalLoss: number;
+    stabilityLoss: number;
+  };
+  parameterChecksumBefore: string;
+  parameterChecksumAfter: string;
+  parameterDeltaNorm: number;
+  actionPolicyScores: Record<ActionKind, number>;
+  proposedActionKinds: ActionKind[];
+  note: string;
+}
+
+export interface IdleCycleResult {
+  brainId: string;
+  ran: boolean;
+  reason?: "idle-cognition-disabled" | "cooldown" | "no-learned-assemblies";
+  retryAfterSeconds?: number;
+  trace?: IdleCognitionTrace;
+  actions: StructuredAction[];
+  actionEvents?: ActionEvent[];
+  metrics?: Record<string, unknown>;
+  runtimeCard?: Record<string, unknown>;
+}
+
+export type EvolutionRunState =
+  | "experimenting"
+  | "awaiting-review"
+  | "promoted"
+  | "rejected"
+  | "stopped"
+  | "failed"
+  | "rolled-back";
+
+export interface EvolutionEvaluation {
+  id: string;
+  createdAt: string;
+  passed: boolean;
+  diffSha256?: string;
+  checks: Array<{
+    name: string;
+    passed: boolean;
+    exitCode?: number;
+  }>;
+}
+
+export interface PromotionRecord {
+  id: string;
+  candidateId: string;
+  createdAt: string;
+  commit: string;
+  parentCommit: string;
+  diffSha256: string;
+  rollbackCommit?: string;
+  rolledBackAt?: string;
+}
+
+export interface EvolutionCandidate {
+  id: string;
+  runId: string;
+  brainId: string;
+  parentCandidateId?: string;
+  generation: number;
+  objective: string;
+  state: EvolutionRunState;
+  branch?: string;
+  worktree?: string;
+  createdAt: string;
+  updatedAt: string;
+  evaluations: EvolutionEvaluation[];
+  promotion?: PromotionRecord;
+  error?: string;
+}
+
+export interface EvolutionRun {
+  id: string;
+  brainId: string;
+  objective: string;
+  state: EvolutionRunState;
+  recursive: boolean;
+  generation: number;
+  candidateIds: string[];
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
+export interface EvolutionStartRequest {
+  brainId: string;
+  objective: string;
+  recursive?: boolean;
+  parentCandidateId?: string;
+  /**
+   * Source remains the compatibility default. Neural and data candidates use
+   * isolated, worker-owned safe-tensor overlays. Stable v1 intentionally
+   * rejects architecture candidates because tensor-shape migration is not
+   * implemented.
+   */
+  candidateKind?: "source" | "neural" | "data" | "substrate" | "architecture";
+  texts?: string[];
+  sourceIds?: string[];
+  epochs?: number;
+  learningRate?: number;
+  latentReplay?: boolean;
+  objectives?: string[];
+  provenance?: Record<string, unknown>;
+  architectureChange?: {
+    /** Stable v1's only load-compatible architecture mutation. */
+    mutation: "grow-experts";
+    addExperts?: number;
+  };
+}
+
+export interface EvolutionApprovalRequest {
+  brainId: string;
+  candidateId: string;
+  tests?: Array<"typecheck" | "unit" | "build">;
+  timeoutMs?: number;
+}
+
+export interface EvolutionRollbackRequest {
+  brainId: string;
+  candidateId: string;
+}
+
 export interface OmniApi {
   window: {
     minimize(): Promise<void>;
@@ -569,6 +1063,7 @@ export interface OmniApi {
     get(id: string): Promise<BrainDocument>;
     create(request: CreateBrainRequest): Promise<BrainDocument>;
     update(id: string, config: BrainConfig): Promise<BrainDocument>;
+    duplicate(id: string, name?: string): Promise<BrainDocument>;
     fork(id: string, name?: string): Promise<BrainDocument>;
     remove(id: string): Promise<boolean>;
     snapshot(id: string, label?: string): Promise<BrainSnapshotSummary>;
@@ -578,11 +1073,16 @@ export interface OmniApi {
     importFile(): Promise<BrainDocument | null>;
     onImported(listener: (brain: BrainDocument) => void): () => void;
     health(id?: string): Promise<EngineHealth>;
+    querySubstrate(id: string, query?: SubstrateQuery): Promise<SubstratePage>;
+    workspace(id: string): Promise<WorkspaceSnapshot>;
   };
   chat: {
-    send(id: string, input: string): Promise<ChatResult>;
+    send(id: string, input: string, turnId?: string): Promise<ChatResult>;
+    cancel(id: string, turnId?: string): Promise<number>;
     list(id: string): Promise<ChatMessage[]>;
     feedback(request: FeedbackRequest): Promise<BrainDocument>;
+    onAction(listener: (event: ActionEvent) => void): () => void;
+    onStream(listener: (event: ChatStreamEvent) => void): () => void;
   };
   train: {
     start(request: StartTrainingRequest): Promise<RuntimeJob>;
@@ -592,6 +1092,17 @@ export interface OmniApi {
     onEvent(listener: (event: RuntimeJobEvent) => void): () => void;
   };
   data: {
+    selectBuildResources(
+      kind: BuildResourceSelection["kind"],
+      selection?: import("./uploadSupport").ExperienceUploadKind
+    ): Promise<BuildResourceSelection | null>;
+    discardBuildResource(selectionId: string): Promise<boolean>;
+    startBuildResource(request: BuildResourceStartRequest): Promise<RuntimeJob>;
+    preview(request: DatasetPreviewRequest): Promise<DatasetManifest | null>;
+    start(request: DatasetStartRequest): Promise<RuntimeJob>;
+    pause(jobId: string): Promise<RuntimeJob>;
+    resume(request: DatasetStartRequest): Promise<RuntimeJob>;
+    coverage(brainId: string, manifestId: string): Promise<TrainingCoverage>;
     ingestFiles(request: IngestFilesRequest): Promise<IngestResult[]>;
     ingestFolder(request: IngestFilesRequest): Promise<IngestResult[]>;
     ingestDropped(request: IngestFilesRequest, files: unknown[]): Promise<IngestResult[]>;
@@ -627,6 +1138,13 @@ export interface OmniApi {
       targetBrainId: string,
       reviewToken: string
     ): Promise<BrainDocument>;
+  };
+  evolution: {
+    start(request: EvolutionStartRequest): Promise<EvolutionRun>;
+    stop(brainId: string, runId: string): Promise<EvolutionRun>;
+    listCandidates(brainId: string, runId?: string): Promise<EvolutionCandidate[]>;
+    approve(request: EvolutionApprovalRequest): Promise<EvolutionCandidate>;
+    rollback(request: EvolutionRollbackRequest): Promise<EvolutionCandidate>;
   };
   catalog: {
     list(): Promise<CatalogEntry[]>;
@@ -675,90 +1193,33 @@ export const DEFAULT_CONFIG: BrainConfig = {
   name: "New mind",
   preset: "whole-brain",
   runtime: "adaptive-core",
-  description: "A persistent local mind that grows an associative concept graph as it learns.",
+  description: "A persistent adaptive OmniCortex identity with a unified neural substrate.",
 
-  ternaryWeights: true,
-  spikingDynamics: true,
-  stdpPlasticity: true,
-  liquidDynamics: true,
-  liquidMode: "cfc",
-  vectorSymbolicMemory: true,
   onlineLearning: true,
-  consolidation: true,
-  metaplasticity: true,
+  extendedWorkingMemory: false,
+  recursiveImprovement: true,
+  idleCognition: true,
 
   workingMemorySlots: 24,
-  shortTermHalfLifeMinutes: 45,
-  longTermThreshold: 0.62,
-  initialNeuronBudget: 2048,
-  growthPolicy: "elastic",
-  maxConcepts: 100_000,
-  maxSynapses: 1_000_000,
-
   learningRate: 0.14,
-  noise: 0.08,
-  firingThreshold: 0.56,
-  membraneLeak: 0.82,
-  stdpWindow: 8,
-  consolidationRate: 0.06,
-  forgettingRate: 0.002,
-
-  noveltyDrive: 0.72,
-  coherenceDrive: 0.88,
-  curiosityDrive: 0.58,
-  parallelThoughts: 3,
   traceDetail: "standard",
 
-  storeAtomicIdeas: true,
   retainSourceText: false,
-  learnFromOwnMessages: true,
-  memoryInjection: "parameter-only",
-  memoryRecipe: "human-consolidation",
-
+  memoryRecipe: "human-consolidation"
 };
 
-export const PRESET_CONFIGS: Record<ArchitecturePreset, Partial<BrainConfig>> = {
-  "whole-brain": {},
-  ternary: {
-    spikingDynamics: false,
-    stdpPlasticity: false,
-    liquidDynamics: false,
-    vectorSymbolicMemory: true,
-    noise: 0.03,
-    description: "A compact associative network with effective weights constrained to −1, 0, or +1."
-  },
-  neuromorphic: {
-    ternaryWeights: false,
-    spikingDynamics: true,
-    stdpPlasticity: true,
-    liquidDynamics: false,
-    vectorSymbolicMemory: false,
-    firingThreshold: 0.5,
-    noise: 0.11,
-    description: "Leaky integrate-and-fire dynamics with local spike-timing plasticity."
-  },
-  liquid: {
-    ternaryWeights: false,
-    spikingDynamics: false,
-    stdpPlasticity: false,
-    liquidDynamics: true,
-    vectorSymbolicMemory: false,
-    memoryInjection: "working-memory",
-    description: "Continuous recurrent state with input-dependent time constants."
-  },
-  symbolic: {
-    ternaryWeights: true,
-    spikingDynamics: false,
-    stdpPlasticity: false,
-    liquidDynamics: false,
-    vectorSymbolicMemory: true,
-    noise: 0.02,
-    parallelThoughts: 1,
-    description: "Idea-first memory using compositional hypervectors and an inspectable concept graph."
-  },
-  custom: {
-    description: "A fully configurable cortex recipe."
-  }
+const PRESET_DESCRIPTIONS: Record<ArchitecturePreset, string> = {
+  "whole-brain": DEFAULT_CONFIG.description,
+  ternary:
+    "A unified OmniCortex identity imported from the historical Ternary Cortex recipe.",
+  neuromorphic:
+    "A unified OmniCortex identity imported from the historical Neuromorphic Lab recipe.",
+  liquid:
+    "A unified OmniCortex identity imported from the historical Liquid Cortex recipe.",
+  symbolic:
+    "A unified OmniCortex identity imported from the historical VSA Idea Brain recipe.",
+  custom:
+    "A unified OmniCortex identity imported from a declarative architecture recipe."
 };
 
 export function createPresetConfig(
@@ -767,7 +1228,7 @@ export function createPresetConfig(
 ): BrainConfig {
   return {
     ...DEFAULT_CONFIG,
-    ...PRESET_CONFIGS[preset],
+    description: PRESET_DESCRIPTIONS[preset],
     name,
     preset
   };

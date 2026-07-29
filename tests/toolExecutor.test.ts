@@ -354,7 +354,8 @@ describe("ToolExecutor release gates", () => {
       finishTraining = resolve;
     });
     const engine = Object.assign(new EventEmitter(), {
-      tryRequest: vi.fn(() => trainingResult),
+      request: vi.fn(() => trainingResult),
+      tryRequest: vi.fn(async () => ({ cancelled: true })),
       interruptAndRestart: vi.fn(async () => true)
     }) as unknown as EngineSupervisor;
     const consolidate = vi.fn(async () => repository.get(brain.id));
@@ -365,7 +366,7 @@ describe("ToolExecutor release gates", () => {
     const jobs = new RuntimeJobManager(trainingService, engine);
 
     const training = jobs.startTraining({ brainId: brain.id, epochs: 2 });
-    await vi.waitFor(() => expect(engine.tryRequest).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(engine.request).toHaveBeenCalledOnce());
     const cancelled = await jobs.cancel(training.id);
     expect(cancelled.state).toBe("cancelled");
 

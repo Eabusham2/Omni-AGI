@@ -8,6 +8,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -32,10 +33,13 @@ const MAX_UNCOMPRESSED_BUNDLE_BYTES = 1024 * 1024 * 1024;
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const BUNDLE_FORMAT = "omni-brain";
 const BUNDLE_VERSION = 1;
+const STABLE_RELEASE_FORMAT = "stable-1.0";
+const BETA_REVIEW_FILE = ".stable-v1-beta-review.json";
 
 interface OmniManifest {
   format: typeof BUNDLE_FORMAT;
   formatVersion: number;
+  releaseFormat: typeof STABLE_RELEASE_FORMAT;
   architecture: "OmniCortex";
   architectureSchemaVersion: number;
   exportedAt: string;
@@ -49,6 +53,18 @@ interface OmniManifest {
   memoryRecipe: string;
   rawEpisodesPresent: boolean;
   quantization: "ternary-effective";
+  packedTernary?: {
+    format: "omni-packed-ternary";
+    formatVersion: 1;
+    currentManifestSha256: string;
+    originManifestSha256: string;
+    currentTensorCount: number;
+    originTensorCount: number;
+    references?: {
+      current: Record<string, string>;
+      origin: Record<string, string>;
+    };
+  };
   secretRedaction: {
     version: 1;
     replacements: number;
@@ -69,6 +85,19 @@ interface OmniManifest {
     originPlasticity: string;
   };
   files: Record<string, { sha256: string; bytes: number }>;
+}
+
+interface PackedTernaryDirectory {
+  manifestSha256: string;
+  tensorCount: number;
+  files: Record<string, Uint8Array>;
+}
+
+export interface ManagedBetaBrain {
+  id: string;
+  name: string;
+  path: string;
+  reason: "beta-document" | "beta-engine" | "invalid-document";
 }
 
 export const DEFAULT_TOOL_PERMISSIONS: ToolPermissionRecord[] = [
@@ -321,6 +350,11 @@ function portableEngineState(
     throw new Error("The Python engine metadata is invalid.");
   }
   if (!isRecord(state)) throw new Error("The Python engine metadata is invalid.");
+  if (state.release_format !== STABLE_RELEASE_FORMAT) {
+    throw new Error(
+      "Incompatible OmniCortex beta engine; stable v1 bundles require stable neural state."
+    );
+  }
   if (!includePrivateSources && Array.isArray(state.training_sources)) {
     state.training_sources = state.training_sources.map((source) => {
       if (!isRecord(source)) return source;
@@ -366,33 +400,22 @@ function normalizeConfig(value: unknown): BrainConfig {
   ) {
     merged.preset = "whole-brain";
   }
-  if (!["fixed", "elastic", "unbounded"].includes(merged.growthPolicy)) {
-    merged.growthPolicy = "elastic";
-  }
   if (!["summary", "standard", "research"].includes(merged.traceDetail)) {
     merged.traceDetail = "standard";
   }
-  if (!["parameter-only", "working-memory"].includes(merged.memoryInjection)) {
-    merged.memoryInjection = "parameter-only";
-  }
   if (
-    merged.memoryRecipe &&
-    !["human-consolidation", "total-recall", "synapses-only"].includes(merged.memoryRecipe)
+    !["human-consolidation", "total-recall", "synapses-only"].includes(
+      merged.memoryRecipe
+    )
   ) {
     merged.memoryRecipe = "human-consolidation";
   }
   for (const key of [
-    "ternaryWeights",
-    "spikingDynamics",
-    "stdpPlasticity",
-    "liquidDynamics",
-    "vectorSymbolicMemory",
     "onlineLearning",
-    "consolidation",
-    "metaplasticity",
-    "storeAtomicIdeas",
-    "retainSourceText",
-    "learnFromOwnMessages"
+    "extendedWorkingMemory",
+    "recursiveImprovement",
+    "idleCognition",
+    "retainSourceText"
   ] as const) {
     if (typeof merged[key] !== "boolean") merged[key] = DEFAULT_CONFIG[key];
   }
@@ -407,85 +430,19 @@ function normalizeConfig(value: unknown): BrainConfig {
   merged.workingMemorySlots = Math.round(
     boundNumber(merged.workingMemorySlots, DEFAULT_CONFIG.workingMemorySlots, 1, 4_096)
   );
-  merged.shortTermHalfLifeMinutes = Math.round(
-    boundNumber(
-      merged.shortTermHalfLifeMinutes,
-      DEFAULT_CONFIG.shortTermHalfLifeMinutes,
-      1,
-      525_600
-    )
-  );
-  merged.longTermThreshold = boundNumber(
-    merged.longTermThreshold,
-    DEFAULT_CONFIG.longTermThreshold,
-    0,
-    1
-  );
-  merged.initialNeuronBudget = Math.round(
-    boundNumber(
-      merged.initialNeuronBudget,
-      DEFAULT_CONFIG.initialNeuronBudget,
-      16,
-      100_000_000
-    )
-  );
-  merged.maxConcepts = Math.round(
-    boundNumber(merged.maxConcepts, DEFAULT_CONFIG.maxConcepts, 16, 100_000_000)
-  );
-  merged.maxSynapses = Math.round(
-    boundNumber(merged.maxSynapses, DEFAULT_CONFIG.maxSynapses, 16, 1_000_000_000)
-  );
   merged.learningRate = boundNumber(merged.learningRate, DEFAULT_CONFIG.learningRate, 0, 1);
-  merged.noise = boundNumber(merged.noise, DEFAULT_CONFIG.noise, 0, 1);
-  merged.firingThreshold = boundNumber(
-    merged.firingThreshold,
-    DEFAULT_CONFIG.firingThreshold,
-    0.01,
-    1
-  );
-  merged.liquidMode = merged.liquidMode === "ltc" ? "ltc" : "cfc";
-  merged.membraneLeak = boundNumber(merged.membraneLeak, DEFAULT_CONFIG.membraneLeak, 0, 1);
-  merged.stdpWindow = Math.round(
-    boundNumber(merged.stdpWindow, DEFAULT_CONFIG.stdpWindow, 1, 100_000)
-  );
-  merged.consolidationRate = boundNumber(
-    merged.consolidationRate,
-    DEFAULT_CONFIG.consolidationRate,
-    0,
-    1
-  );
-  merged.forgettingRate = boundNumber(
-    merged.forgettingRate,
-    DEFAULT_CONFIG.forgettingRate,
-    0,
-    0.5
-  );
-  merged.noveltyDrive = boundNumber(
-    merged.noveltyDrive,
-    DEFAULT_CONFIG.noveltyDrive,
-    0,
-    1
-  );
-  merged.coherenceDrive = boundNumber(
-    merged.coherenceDrive,
-    DEFAULT_CONFIG.coherenceDrive,
-    0,
-    1
-  );
-  merged.curiosityDrive = boundNumber(
-    merged.curiosityDrive,
-    DEFAULT_CONFIG.curiosityDrive,
-    0,
-    1
-  );
-  merged.parallelThoughts = Math.round(
-    boundNumber(merged.parallelThoughts, DEFAULT_CONFIG.parallelThoughts, 1, 64)
-  );
+  if (merged.memoryRecipe === "synapses-only") merged.retainSourceText = false;
+  if (merged.memoryRecipe === "total-recall") merged.retainSourceText = true;
   return merged;
 }
 
 function normalizeBrain(value: unknown): BrainDocument {
   if (!isRecord(value)) throw new Error("The bundle does not contain a brain document.");
+  if (value.releaseFormat !== STABLE_RELEASE_FORMAT) {
+    throw new Error(
+      "Incompatible Omni AGI Studio beta brain; create or import a stable v1 brain."
+    );
+  }
   const id = requireSafeId(String(value.id ?? ""));
   const now = new Date().toISOString();
   const lineageValue = isRecord(value.lineage) ? value.lineage : {};
@@ -494,6 +451,7 @@ function normalizeBrain(value: unknown): BrainDocument {
 
   const brain: BrainDocument = {
     schemaVersion: BRAIN_SCHEMA_VERSION,
+    releaseFormat: STABLE_RELEASE_FORMAT,
     id,
     name: typeof value.name === "string" ? value.name.trim().slice(0, 120) || "Imported mind" : "Imported mind",
     createdAt: typeof value.createdAt === "string" ? value.createdAt : now,
@@ -619,6 +577,212 @@ async function atomicWrite(path: string, contents: string | Buffer): Promise<voi
   }
 }
 
+function verifyPackedTernaryFiles(
+  files: Record<string, Uint8Array>,
+  label: string
+): PackedTernaryDirectory {
+  const manifestBytes = Buffer.from(files["manifest.json"] ?? []);
+  const checksumBytes = Buffer.from(files["manifest.sha256"] ?? []);
+  const expectedManifestHash = checksumBytes.toString("ascii").trim();
+  if (
+    !/^[a-f0-9]{64}$/.test(expectedManifestHash) ||
+    sha256(manifestBytes) !== expectedManifestHash
+  ) {
+    throw new Error(`${label} packed ternary manifest checksum failed.`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(manifestBytes.toString("utf8"));
+  } catch {
+    throw new Error(`${label} packed ternary manifest is invalid.`);
+  }
+  if (
+    !isRecord(parsed) ||
+    parsed.format !== "omni-packed-ternary" ||
+    parsed.formatVersion !== 1 ||
+    parsed.architecture !== "OmniCortex" ||
+    !isRecord(parsed.encoding) ||
+    parsed.encoding.bitsPerValue !== 2 ||
+    parsed.encoding.byteOrder !== "four-values-lsb-first" ||
+    parsed.encoding.reservedCode !== 3 ||
+    parsed.encoding.paddingValue !== 0 ||
+    !isRecord(parsed.encoding.codes) ||
+    parsed.encoding.codes["-1"] !== 0 ||
+    parsed.encoding.codes["0"] !== 1 ||
+    parsed.encoding.codes["+1"] !== 2 ||
+    !isRecord(parsed.coverage) ||
+    parsed.coverage.complete !== true ||
+    !Array.isArray(parsed.coverage.eligibleTensorNames) ||
+    !Array.isArray(parsed.tensors) ||
+    !Array.isArray(parsed.shards) ||
+    typeof parsed.contentSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(parsed.contentSha256)
+  ) {
+    throw new Error(`${label} packed ternary manifest is incompatible.`);
+  }
+  const expectedNames = parsed.coverage.eligibleTensorNames;
+  if (
+    expectedNames.some((name) => typeof name !== "string" || name.length === 0) ||
+    new Set(expectedNames).size !== expectedNames.length ||
+    parsed.coverage.eligibleTensorCount !== expectedNames.length ||
+    parsed.tensors.length !== expectedNames.length
+  ) {
+    throw new Error(`${label} packed ternary coverage contract is invalid.`);
+  }
+  const shardFiles = new Set<string>();
+  const shardPayloads = new Map<string, Buffer>();
+  for (const descriptor of parsed.shards) {
+    if (
+      !isRecord(descriptor) ||
+      typeof descriptor.file !== "string" ||
+      !/^ternary-[0-9]{5,}-[a-f0-9]{16}\.bin$/.test(descriptor.file) ||
+      typeof descriptor.byteLength !== "number" ||
+      !Number.isSafeInteger(descriptor.byteLength) ||
+      descriptor.byteLength < 0 ||
+      typeof descriptor.sha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(descriptor.sha256) ||
+      shardFiles.has(descriptor.file)
+    ) {
+      throw new Error(`${label} packed ternary shard table is invalid.`);
+    }
+    const payload = Buffer.from(files[descriptor.file] ?? []);
+    if (
+      payload.byteLength !== descriptor.byteLength ||
+      sha256(payload) !== descriptor.sha256
+    ) {
+      throw new Error(`${label} packed ternary shard checksum failed.`);
+    }
+    shardFiles.add(descriptor.file);
+    shardPayloads.set(descriptor.file, payload);
+  }
+  const tensorNames = new Set<string>();
+  const referencedShards = new Set<string>();
+  for (const tensor of parsed.tensors) {
+    if (
+      !isRecord(tensor) ||
+      typeof tensor.name !== "string" ||
+      typeof tensor.shard !== "string" ||
+      !shardFiles.has(tensor.shard) ||
+      tensorNames.has(tensor.name) ||
+      referencedShards.has(tensor.shard) ||
+      !["projection", "dynamic-synapse"].includes(String(tensor.kind)) ||
+      tensor.dtype !== "int8" ||
+      !Array.isArray(tensor.shape) ||
+      tensor.shape.some(
+        (dimension) =>
+          typeof dimension !== "number" ||
+          !Number.isSafeInteger(dimension) ||
+          dimension < 0
+      ) ||
+      typeof tensor.numel !== "number" ||
+      !Number.isSafeInteger(tensor.numel) ||
+      tensor.numel < 0 ||
+      tensor.byteOffset !== 0 ||
+      typeof tensor.byteLength !== "number" ||
+      !Number.isSafeInteger(tensor.byteLength) ||
+      tensor.byteLength < 0 ||
+      typeof tensor.scale !== "number" ||
+      !Number.isFinite(tensor.scale) ||
+      tensor.scale <= 0 ||
+      typeof tensor.sourceDtype !== "string" ||
+      typeof tensor.packedSha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(tensor.packedSha256) ||
+      typeof tensor.tensorSha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(tensor.tensorSha256)
+    ) {
+      throw new Error(`${label} packed ternary tensor table is invalid.`);
+    }
+    const shapeProduct = tensor.shape.reduce(
+      (total, dimension) => total * (dimension as number),
+      1
+    );
+    const payload = shardPayloads.get(tensor.shard);
+    const expectedByteLength = Math.ceil(tensor.numel / 4);
+    if (
+      !Number.isSafeInteger(shapeProduct) ||
+      shapeProduct !== tensor.numel ||
+      !payload ||
+      payload.byteLength !== expectedByteLength ||
+      tensor.byteLength !== expectedByteLength ||
+      tensor.packedSha256 !== sha256(payload)
+    ) {
+      throw new Error(`${label} packed ternary tensor shape or length is invalid.`);
+    }
+    const decoded = Buffer.alloc(tensor.numel);
+    for (let index = 0; index < payload.byteLength * 4; index += 1) {
+      const code = (payload[index >> 2]! >> ((index & 3) * 2)) & 0x03;
+      if (index >= tensor.numel) {
+        if (code !== 1) {
+          throw new Error(`${label} packed ternary padding is non-canonical.`);
+        }
+        continue;
+      }
+      if (code === 3) {
+        throw new Error(`${label} packed ternary data uses the reserved code.`);
+      }
+      decoded[index] = code === 0 ? 0xff : code === 1 ? 0 : 1;
+    }
+    const tensorDigest = sha256(
+      Buffer.concat([
+        Buffer.from(
+          JSON.stringify({ dtype: "int8", shape: tensor.shape }),
+          "utf8"
+        ),
+        Buffer.from([0]),
+        decoded
+      ])
+    );
+    if (tensorDigest !== tensor.tensorSha256) {
+      throw new Error(`${label} packed ternary decoded tensor checksum failed.`);
+    }
+    tensorNames.add(tensor.name);
+    referencedShards.add(tensor.shard);
+  }
+  if (
+    tensorNames.size !== expectedNames.length ||
+    expectedNames.some((name) => !tensorNames.has(name)) ||
+    referencedShards.size !== shardFiles.size
+  ) {
+    throw new Error(`${label} packed ternary coverage is incomplete.`);
+  }
+  const allowedFiles = new Set(["manifest.json", "manifest.sha256", ...shardFiles]);
+  if (Object.keys(files).some((name) => !allowedFiles.has(name))) {
+    throw new Error(`${label} packed ternary directory contains an unlisted file.`);
+  }
+  return {
+    manifestSha256: expectedManifestHash,
+    tensorCount: expectedNames.length,
+    files
+  };
+}
+
+async function readPackedTernaryDirectory(
+  directory: string,
+  label: string
+): Promise<PackedTernaryDirectory> {
+  const directoryEntries = await readdir(directory, { withFileTypes: true });
+  if (directoryEntries.some((entry) => !entry.isFile())) {
+    throw new Error(`${label} packed ternary directory contains a non-file entry.`);
+  }
+  const files: Record<string, Uint8Array> = {};
+  for (const entry of directoryEntries) {
+    files[entry.name] = new Uint8Array(await readFile(join(directory, entry.name)));
+  }
+  return verifyPackedTernaryFiles(files, label);
+}
+
+function packedTernaryFilesFromBundle(
+  files: Record<string, Uint8Array>,
+  scope: "current" | "origin"
+): Record<string, Uint8Array> {
+  const prefix = `packed/${scope}/`;
+  return Object.fromEntries(
+    Object.entries(files)
+      .filter(([path]) => path.startsWith(prefix))
+      .map(([path, contents]) => [path.slice(prefix.length), contents])
+  );
+}
+
 export function resolveBrainDataRoot(
   userDataPath: string,
   override = process.env.OMNI_AGI_DATA_DIR
@@ -646,6 +810,142 @@ export class BrainRepository {
       mkdir(join(this.root, ".trash"), { recursive: true }),
       mkdir(join(this.root, ".blobs"), { recursive: true })
     ]);
+  }
+
+  async betaReviewComplete(): Promise<boolean> {
+    try {
+      const value = JSON.parse(
+        await readFile(join(this.root, BETA_REVIEW_FILE), "utf8")
+      ) as unknown;
+      return (
+        isRecord(value) &&
+        value.releaseFormat === STABLE_RELEASE_FORMAT &&
+        typeof value.reviewedAt === "string"
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      return false;
+    }
+  }
+
+  async enumerateManagedBetaBrains(): Promise<ManagedBetaBrain[]> {
+    await this.initialize();
+    const entries = await readdir(this.root, { withFileTypes: true });
+    const candidates: ManagedBetaBrain[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !SAFE_ID.test(entry.name)) continue;
+      const directory = join(this.root, entry.name);
+      const documentPath = join(directory, "brain.json");
+      if (!(await pathExists(documentPath))) continue;
+      let document: Record<string, unknown> | undefined;
+      try {
+        const parsed = JSON.parse(await readFile(documentPath, "utf8")) as unknown;
+        document = isRecord(parsed) ? parsed : undefined;
+      } catch {
+        document = undefined;
+      }
+      const name =
+        typeof document?.name === "string" && document.name.trim()
+          ? document.name.trim().slice(0, 120)
+          : entry.name;
+      if (!document) {
+        candidates.push({
+          id: entry.name,
+          name,
+          path: directory,
+          reason: "invalid-document"
+        });
+        continue;
+      }
+      if (document.releaseFormat !== STABLE_RELEASE_FORMAT) {
+        candidates.push({
+          id: entry.name,
+          name,
+          path: directory,
+          reason: "beta-document"
+        });
+        continue;
+      }
+      const enginePath = join(directory, "engine", "brain.json");
+      if (!(await pathExists(enginePath))) continue;
+      try {
+        const engineState = JSON.parse(await readFile(enginePath, "utf8")) as unknown;
+        if (
+          !isRecord(engineState) ||
+          engineState.release_format !== STABLE_RELEASE_FORMAT
+        ) {
+          candidates.push({
+            id: entry.name,
+            name,
+            path: directory,
+            reason: "beta-engine"
+          });
+        }
+      } catch {
+        candidates.push({
+          id: entry.name,
+          name,
+          path: directory,
+          reason: "beta-engine"
+        });
+      }
+    }
+    return candidates.sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  async deleteManagedBetaBrains(
+    ids: string[],
+    explicitlyConfirmed: boolean
+  ): Promise<string[]> {
+    if (!explicitlyConfirmed) {
+      throw new Error("Permanent beta deletion requires explicit confirmation.");
+    }
+    const requested = [...new Set(ids.map((id) => requireSafeId(id)))];
+    const candidates = new Map(
+      (await this.enumerateManagedBetaBrains()).map((candidate) => [
+        candidate.id,
+        candidate
+      ])
+    );
+    const rootPath = await realpath(this.root);
+    const deleted: string[] = [];
+    for (const id of requested) {
+      const candidate = candidates.get(id);
+      if (!candidate) {
+        throw new Error(`Managed beta brain "${id}" is no longer eligible for deletion.`);
+      }
+      const targetPath = await realpath(candidate.path);
+      if (dirname(targetPath) !== rootPath || basename(targetPath) !== id) {
+        throw new Error("Managed beta deletion escaped the app data root.");
+      }
+      const info = await stat(targetPath);
+      if (!info.isDirectory()) {
+        throw new Error(`Managed beta brain "${id}" is not a directory.`);
+      }
+      await rm(targetPath, { recursive: true, force: false });
+      deleted.push(id);
+    }
+    return deleted;
+  }
+
+  async completeBetaReview(
+    disposition: "kept" | "deleted" | "none",
+    ids: string[]
+  ): Promise<void> {
+    await this.initialize();
+    await atomicWrite(
+      join(this.root, BETA_REVIEW_FILE),
+      JSON.stringify(
+        {
+          releaseFormat: STABLE_RELEASE_FORMAT,
+          reviewedAt: new Date().toISOString(),
+          disposition,
+          managedBrainIds: [...new Set(ids.map((id) => requireSafeId(id)))]
+        },
+        null,
+        2
+      )
+    );
   }
 
   async storeBlob(contents: Buffer): Promise<string> {
@@ -737,6 +1037,35 @@ export class BrainRepository {
     }
   }
 
+  private async copyPackedTernaryDirectory(
+    source: string,
+    destination: string
+  ): Promise<PackedTernaryDirectory | undefined> {
+    if (!(await pathExists(join(source, "manifest.json")))) return undefined;
+    const packed = await readPackedTernaryDirectory(source, "Source");
+    const temporary = `${destination}.${randomUUID()}.next`;
+    const backup = `${destination}.${randomUUID()}.bak`;
+    await mkdir(temporary, { recursive: true });
+    try {
+      for (const [name, contents] of Object.entries(packed.files)) {
+        const hash = await this.storeBlob(Buffer.from(contents));
+        await this.linkBlobTo(hash, join(temporary, name));
+      }
+      if (await pathExists(destination)) await rename(destination, backup);
+      try {
+        await rename(temporary, destination);
+        await rm(backup, { recursive: true, force: true });
+      } catch (error) {
+        if (await pathExists(backup)) await rename(backup, destination);
+        throw error;
+      }
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+    await readPackedTernaryDirectory(destination, "Copied");
+    return packed;
+  }
+
   private async cloneEngineState(
     sourceBrainId: string,
     targetBrainId: string,
@@ -773,6 +1102,17 @@ export class BrainRepository {
       atomicWrite(join(targetEngine, "brain.json"), JSON.stringify(metadata, null, 2)),
       atomicWrite(join(targetOrigin, "brain.json"), JSON.stringify(metadata, null, 2))
     ]);
+    const packedSource = join(sourceEngine, "packed-ternary");
+    await Promise.all([
+      this.copyPackedTernaryDirectory(
+        packedSource,
+        join(targetEngine, "packed-ternary")
+      ),
+      this.copyPackedTernaryDirectory(
+        packedSource,
+        join(targetOrigin, "packed-ternary")
+      )
+    ]);
   }
 
   brainDirectory(id: string): string {
@@ -790,6 +1130,7 @@ export class BrainRepository {
     const normalizedConfig = normalizeConfig(config);
     const brain: BrainDocument = {
       schemaVersion: BRAIN_SCHEMA_VERSION,
+      releaseFormat: STABLE_RELEASE_FORMAT,
       id,
       name: normalizedConfig.name,
       createdAt: now,
@@ -892,11 +1233,25 @@ export class BrainRepository {
   }
 
   async fork(id: string, name?: string): Promise<BrainDocument> {
+    return this.copyOnWriteClone(id, name, "fork");
+  }
+
+  async duplicate(id: string, name?: string): Promise<BrainDocument> {
+    return this.copyOnWriteClone(id, name, "duplicate");
+  }
+
+  private async copyOnWriteClone(
+    id: string,
+    name: string | undefined,
+    operation: "fork" | "duplicate"
+  ): Promise<BrainDocument> {
     const source = await this.get(id);
     const fork = clone(source);
     const now = new Date().toISOString();
     fork.id = randomUUID();
-    fork.name = name?.trim().slice(0, 120) || `${source.name} fork`;
+    fork.name =
+      name?.trim().slice(0, 120) ||
+      `${source.name}${operation === "duplicate" ? " copy" : " fork"}`;
     fork.config.name = fork.name;
     fork.createdAt = now;
     fork.updatedAt = now;
@@ -911,8 +1266,15 @@ export class BrainRepository {
         id: randomUUID(),
         createdAt: now,
         kind: "fork",
-        summary: `Forked from ${source.name}.`,
-        detail: source.id
+        summary:
+          operation === "duplicate"
+            ? `Duplicated from ${source.name} with copy-on-write neural storage.`
+            : `Forked from ${source.name}.`,
+        detail: JSON.stringify({
+          sourceBrainId: source.id,
+          operation,
+          copyOnWrite: true
+        })
       }
     ];
     fork.originChecksum = undefined;
@@ -957,6 +1319,11 @@ export class BrainRepository {
         await this.linkBlobTo(hash, join(engineSnapshot, name));
         hashes.push(hash);
       }
+      const packed = await this.copyPackedTernaryDirectory(
+        join(engineSource, "packed-ternary"),
+        join(engineSnapshot, "packed-ternary")
+      );
+      if (packed) hashes.push(packed.manifestSha256);
       engineChecksum = sha256(hashes.join(":"));
     }
     const summary: BrainSnapshotSummary = {
@@ -1033,6 +1400,13 @@ export class BrainRepository {
         const sourcePath = join(engineSnapshot, name);
         if (await pathExists(sourcePath)) hashes.push(sha256(await readFile(sourcePath)));
       }
+      if (await pathExists(join(engineSnapshot, "packed-ternary", "manifest.json"))) {
+        const packed = await readPackedTernaryDirectory(
+          join(engineSnapshot, "packed-ternary"),
+          "Snapshot"
+        );
+        hashes.push(packed.manifestSha256);
+      }
       if (summary.engineChecksum && sha256(hashes.join(":")) !== summary.engineChecksum) {
         throw new Error("Neural snapshot checksum validation failed.");
       }
@@ -1048,6 +1422,10 @@ export class BrainRepository {
         const hash = await this.storeFileAsBlob(sourcePath);
         await this.linkBlobTo(hash, join(targetEngine, name));
       }
+      await this.copyPackedTernaryDirectory(
+        join(engineSnapshot, "packed-ternary"),
+        join(targetEngine, "packed-ternary")
+      );
     }
     return saved;
   }
@@ -1088,6 +1466,11 @@ export class BrainRepository {
       mode === "origin" ? join(directory, "engine", "origin") : join(directory, "engine");
     const engineStatePath = join(engineDirectory, "brain.json");
     const engineMaterialized = await pathExists(engineStatePath);
+    const selectedPackedPath = join(engineDirectory, "packed-ternary");
+    const selectedPacked =
+      engineMaterialized && (await pathExists(join(selectedPackedPath, "manifest.json")))
+        ? await readPackedTernaryDirectory(selectedPackedPath, "Current")
+        : undefined;
     const engineState = engineMaterialized
       ? portableEngineState(
           await readFile(engineStatePath),
@@ -1105,6 +1488,11 @@ export class BrainRepository {
             2
           )
         );
+    if (engineMaterialized && !selectedPacked) {
+      throw new Error(
+        "Materialized OmniCortex state is missing its verified packed ternary inference shards."
+      );
+    }
     const corePath = join(engineDirectory, "core.safetensors");
     const plasticityPath = join(engineDirectory, "plasticity.safetensors");
     const core = (await pathExists(corePath))
@@ -1126,6 +1514,11 @@ export class BrainRepository {
       "tensors/core.safetensors": core,
       "tensors/plastic.safetensors": plasticity
     };
+    if (selectedPacked) {
+      for (const [name, contents] of Object.entries(selectedPacked.files)) {
+        entries[`packed/current/${name}`] = contents;
+      }
+    }
     let originBrain = normalizeBrain(
       JSON.parse(await readFile(join(directory, "origin.json"), "utf8"))
     );
@@ -1172,6 +1565,19 @@ export class BrainRepository {
     const immutablePlastic = (await pathExists(immutablePlasticPath))
       ? new Uint8Array(await readFile(immutablePlasticPath))
       : plasticity;
+    const immutablePackedPath = join(immutableEngine, "packed-ternary");
+    const immutablePacked =
+      engineMaterialized &&
+      (await pathExists(join(immutablePackedPath, "manifest.json")))
+        ? await readPackedTernaryDirectory(immutablePackedPath, "Origin")
+        : mode === "origin"
+          ? selectedPacked
+          : undefined;
+    if (engineMaterialized && !immutablePacked) {
+      throw new Error(
+        "Materialized OmniCortex state is missing its immutable-origin packed ternary shards."
+      );
+    }
     const references =
       mode === "referenced"
         ? {
@@ -1199,6 +1605,32 @@ export class BrainRepository {
     entries["origin/tensors/plastic.safetensors"] = references
       ? validEmptySafetensors(`Local content reference ${references.originPlasticity}`)
       : immutablePlastic;
+    if (immutablePacked) {
+      for (const [name, contents] of Object.entries(immutablePacked.files)) {
+        entries[`packed/origin/${name}`] = contents;
+      }
+    }
+    let packedReferences:
+      | {
+          current: Record<string, string>;
+          origin: Record<string, string>;
+        }
+      | undefined;
+    if (references && selectedPacked && immutablePacked) {
+      packedReferences = { current: {}, origin: {} };
+      for (const [scope, packed] of [
+        ["current", selectedPacked],
+        ["origin", immutablePacked]
+      ] as const) {
+        for (const [name, contents] of Object.entries(packed.files)) {
+          const hash = await this.storeBlob(Buffer.from(contents));
+          packedReferences[scope][name] = hash;
+          entries[`packed/${scope}/${name}`] = strToU8(
+            `Local content reference ${hash}\n`
+          );
+        }
+      }
+    }
     for (const source of mode === "private-archive" ? portableBrain.trainingSources : []) {
       if (!source.blobHash || entries[`blobs/${source.blobHash}`]) continue;
       const blob = await this.getBlob(source.blobHash);
@@ -1228,6 +1660,7 @@ export class BrainRepository {
     const manifest: OmniManifest = {
       format: BUNDLE_FORMAT,
       formatVersion: BUNDLE_VERSION,
+      releaseFormat: STABLE_RELEASE_FORMAT,
       architecture: "OmniCortex",
       architectureSchemaVersion: portableBrain.schemaVersion,
       exportedAt: new Date().toISOString(),
@@ -1248,6 +1681,18 @@ export class BrainRepository {
       memoryRecipe: portableBrain.config.memoryRecipe ?? "human-consolidation",
       rawEpisodesPresent: portableBrain.trainingSources.some((source) => source.rawTextRetained),
       quantization: "ternary-effective",
+      packedTernary:
+        selectedPacked && immutablePacked
+          ? {
+              format: "omni-packed-ternary",
+              formatVersion: 1,
+              currentManifestSha256: selectedPacked.manifestSha256,
+              originManifestSha256: immutablePacked.manifestSha256,
+              currentTensorCount: selectedPacked.tensorCount,
+              originTensorCount: immutablePacked.tensorCount,
+              references: packedReferences
+            }
+          : undefined,
       secretRedaction: {
         version: 1,
         replacements: redactions.replacements
@@ -1333,9 +1778,12 @@ export class BrainRepository {
     if (
       !isRecord(manifestValue) ||
       manifestValue.format !== BUNDLE_FORMAT ||
-      manifestValue.formatVersion !== BUNDLE_VERSION
+      manifestValue.formatVersion !== BUNDLE_VERSION ||
+      manifestValue.releaseFormat !== STABLE_RELEASE_FORMAT
     ) {
-      throw new Error("Unsupported .omni bundle format or version.");
+      throw new Error(
+        "Unsupported or beta .omni bundle; stable Omni AGI Studio v1 format is required."
+      );
     }
     if (
       manifestValue.architecture !== "OmniCortex" ||
@@ -1346,6 +1794,92 @@ export class BrainRepository {
       )
     ) {
       throw new Error("The .omni bundle targets an incompatible architecture schema.");
+    }
+    const declaredEngineMaterialized = manifestValue.engineMaterialized === true;
+    let packedDeclaration: OmniManifest["packedTernary"];
+    if (manifestValue.packedTernary !== undefined) {
+      const packed = manifestValue.packedTernary;
+      if (
+        !isRecord(packed) ||
+        packed.format !== "omni-packed-ternary" ||
+        packed.formatVersion !== 1 ||
+        typeof packed.currentManifestSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(packed.currentManifestSha256) ||
+        typeof packed.originManifestSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(packed.originManifestSha256) ||
+        typeof packed.currentTensorCount !== "number" ||
+        !Number.isSafeInteger(packed.currentTensorCount) ||
+        packed.currentTensorCount < 1 ||
+        typeof packed.originTensorCount !== "number" ||
+        !Number.isSafeInteger(packed.originTensorCount) ||
+        packed.originTensorCount < 1
+      ) {
+        throw new Error("The .omni bundle has an invalid packed ternary declaration.");
+      }
+      let packedReferenceDeclaration:
+        | {
+            current: Record<string, string>;
+            origin: Record<string, string>;
+          }
+        | undefined;
+      if (packed.references !== undefined) {
+        if (
+          !isRecord(packed.references) ||
+          !isRecord(packed.references.current) ||
+          !isRecord(packed.references.origin)
+        ) {
+          throw new Error("The packed ternary local references are invalid.");
+        }
+        const normalizeReferences = (
+          value: Record<string, unknown>
+        ): Record<string, string> => {
+          const result: Record<string, string> = {};
+          for (const [name, hash] of Object.entries(value)) {
+            if (
+              !["manifest.json", "manifest.sha256"].includes(name) &&
+              !/^ternary-[0-9]{5,}-[a-f0-9]{16}\.bin$/.test(name)
+            ) {
+              throw new Error("A packed ternary local reference has an unsafe name.");
+            }
+            if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash)) {
+              throw new Error("A packed ternary local reference has an invalid hash.");
+            }
+            result[name] = hash;
+          }
+          return result;
+        };
+        packedReferenceDeclaration = {
+          current: normalizeReferences(packed.references.current),
+          origin: normalizeReferences(packed.references.origin)
+        };
+      }
+      packedDeclaration = {
+        format: "omni-packed-ternary",
+        formatVersion: 1,
+        currentManifestSha256: packed.currentManifestSha256,
+        originManifestSha256: packed.originManifestSha256,
+        currentTensorCount: packed.currentTensorCount,
+        originTensorCount: packed.originTensorCount,
+        references: packedReferenceDeclaration
+      };
+    }
+    if (declaredEngineMaterialized && !packedDeclaration) {
+      throw new Error(
+        "A materialized stable v1 brain must contain packed ternary inference shards."
+      );
+    }
+    if (
+      packedDeclaration?.references &&
+      manifestValue.mode !== "referenced-local"
+    ) {
+      throw new Error("Portable bundles may not contain packed ternary local references.");
+    }
+    if (
+      manifestValue.mode === "referenced-local" &&
+      declaredEngineMaterialized &&
+      !packedDeclaration?.references
+    ) {
+      throw new Error("The local referenced bundle has no packed ternary references.");
     }
     if (
       !isRecord(manifestValue.secretRedaction) ||
@@ -1431,6 +1965,56 @@ export class BrainRepository {
     } else if (manifestValue.references !== undefined) {
       throw new Error("Portable bundles may not contain local tensor references.");
     }
+    if (packedDeclaration?.references) {
+      for (const scope of ["current", "origin"] as const) {
+        const referencesForScope: Record<string, string> =
+          packedDeclaration.references[scope];
+        for (const [name, hash] of Object.entries(referencesForScope) as Array<
+          [string, string]
+        >) {
+          const path = `packed/${scope}/${name}`;
+          if (!files[path]) {
+            throw new Error(`The local referenced bundle is missing ${path}.`);
+          }
+          try {
+            files[path] = new Uint8Array(await this.getBlob(hash));
+          } catch {
+            throw new Error(
+              `Local packed ternary reference ${hash.slice(0, 12)}… is unavailable on this installation.`
+            );
+          }
+        }
+      }
+    }
+    let verifiedPackedCurrent: PackedTernaryDirectory | undefined;
+    let verifiedPackedOrigin: PackedTernaryDirectory | undefined;
+    const bundledCurrentPack = packedTernaryFilesFromBundle(files, "current");
+    const bundledOriginPack = packedTernaryFilesFromBundle(files, "origin");
+    if (packedDeclaration) {
+      verifiedPackedCurrent = verifyPackedTernaryFiles(
+        bundledCurrentPack,
+        "Current bundle"
+      );
+      verifiedPackedOrigin = verifyPackedTernaryFiles(
+        bundledOriginPack,
+        "Origin bundle"
+      );
+      if (
+        verifiedPackedCurrent.manifestSha256 !==
+          packedDeclaration.currentManifestSha256 ||
+        verifiedPackedOrigin.manifestSha256 !==
+          packedDeclaration.originManifestSha256 ||
+        verifiedPackedCurrent.tensorCount !== packedDeclaration.currentTensorCount ||
+        verifiedPackedOrigin.tensorCount !== packedDeclaration.originTensorCount
+      ) {
+        throw new Error("Packed ternary bundle metadata does not match its manifest.");
+      }
+    } else if (
+      Object.keys(bundledCurrentPack).length > 0 ||
+      Object.keys(bundledOriginPack).length > 0
+    ) {
+      throw new Error("The .omni bundle contains undeclared packed ternary data.");
+    }
     assertSafeTensors(files["tensors/core.safetensors"] as Uint8Array, "core.safetensors");
     assertSafeTensors(files["tensors/plastic.safetensors"] as Uint8Array, "plastic.safetensors");
     assertSafeTensors(
@@ -1472,9 +2056,14 @@ export class BrainRepository {
       engineMaterialized &&
       (!isRecord(engineValue) ||
         engineValue.format !== "omni-cortex-engine" ||
-        engineValue.schema_version !== 1)
+        engineValue.schema_version !== 1 ||
+        engineValue.release_format !== STABLE_RELEASE_FORMAT ||
+        !isRecord(originEngineValue) ||
+        originEngineValue.format !== "omni-cortex-engine" ||
+        originEngineValue.schema_version !== 1 ||
+        originEngineValue.release_format !== STABLE_RELEASE_FORMAT)
     ) {
-      throw new Error("Materialized engine state is invalid.");
+      throw new Error("Materialized engine state is invalid or belongs to the beta format.");
     }
     if (isRecord(engineValue)) engineValue.brain_id = imported.id;
     if (isRecord(originEngineValue)) originEngineValue.brain_id = imported.id;
@@ -1550,6 +2139,18 @@ export class BrainRepository {
         )
       ]);
     }
+    if (engineMaterialized && verifiedPackedCurrent) {
+      const packedDirectory = join(directory, "engine", "packed-ternary");
+      await mkdir(packedDirectory, { recursive: true });
+      for (const [name, contents] of Object.entries(verifiedPackedCurrent.files)) {
+        const referenceHash = packedDeclaration?.references?.current[name];
+        if (referenceHash) {
+          await this.linkBlobTo(referenceHash, join(packedDirectory, name));
+        } else {
+          await atomicWrite(join(packedDirectory, name), Buffer.from(contents));
+        }
+      }
+    }
     if (isRecord(originEngineValue) && originEngineValue.format === "omni-cortex-engine") {
       if (resolvedReferences) {
         await Promise.all([
@@ -1580,6 +2181,27 @@ export class BrainRepository {
           Buffer.from(files["origin/tensors/plastic.safetensors"] as Uint8Array)
         )
       ]);
+    }
+    if (
+      isRecord(originEngineValue) &&
+      originEngineValue.format === "omni-cortex-engine" &&
+      verifiedPackedOrigin
+    ) {
+      const packedDirectory = join(
+        directory,
+        "engine",
+        "origin",
+        "packed-ternary"
+      );
+      await mkdir(packedDirectory, { recursive: true });
+      for (const [name, contents] of Object.entries(verifiedPackedOrigin.files)) {
+        const referenceHash = packedDeclaration?.references?.origin[name];
+        if (referenceHash) {
+          await this.linkBlobTo(referenceHash, join(packedDirectory, name));
+        } else {
+          await atomicWrite(join(packedDirectory, name), Buffer.from(contents));
+        }
+      }
     }
     for (const [path, contents] of Object.entries(files)) {
       if (!path.startsWith("blobs/")) continue;

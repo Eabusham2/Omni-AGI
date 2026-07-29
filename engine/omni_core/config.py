@@ -4,6 +4,36 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict
 
 
+# Stable v1 no longer exposes these beta builder controls.  The dataclass
+# fields remain temporarily so legacy internal fixtures and explicitly loaded
+# architecture dictionaries can still be interpreted, but new engine metadata
+# must not make them look like supported BrainConfig or architecture-manifest
+# knobs.  Mandatory substrate features are enforced by AdaptiveBrain.
+_DEPRECATED_BETA_CONTROL_FIELDS = frozenset(
+    {
+        "ternary_weights",
+        "spiking_dynamics",
+        "stdp_plasticity",
+        "liquid_dynamics",
+        "vector_symbolic_memory",
+        "consolidation_enabled",
+        "metaplasticity",
+        "noise",
+        "memory_injection",
+        "learn_from_own_messages",
+        "max_concepts",
+        "max_ideas",
+        "max_synapses",
+        "novelty_drive",
+        "coherence_drive",
+        "curiosity_drive",
+        "parallel_thoughts",
+        "growth_policy",
+        "max_experts",
+    }
+)
+
+
 @dataclass
 class OmniConfig:
     """Serializable architecture and learning configuration.
@@ -66,9 +96,12 @@ class OmniConfig:
     liquid_mode: str = "cfc"
     liquid_steps: int = 3
     memory_recipe: str = "human-consolidation"
-    memory_injection: str = "parameter-only"
+    memory_injection: str = "working-memory"
     learn_from_own_messages: bool = True
     retain_source_text: bool = False
+    extended_working_memory: bool = False
+    recursive_improvement: bool = True
+    idle_cognition: bool = True
     max_concepts: int = 50000
     max_ideas: int = 10000
     replay_capacity: int = 2048
@@ -83,7 +116,7 @@ class OmniConfig:
     curiosity_drive: float = 0.58
     parallel_thoughts: int = 3
 
-    growth_policy: str = "elastic"
+    growth_policy: str = "unbounded"
     max_experts: int = 8
     growth_novelty_threshold: float = 0.92
     growth_patience: int = 3
@@ -142,7 +175,11 @@ class OmniConfig:
             raise ValueError("slow_importance_decay must be in [0, 1)")
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if key not in _DEPRECATED_BETA_CONTROL_FIELDS
+        }
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "OmniConfig":
@@ -155,20 +192,20 @@ class OmniConfig:
     def from_external(cls, raw: Dict[str, Any]) -> "OmniConfig":
         """Translate the desktop app's camelCase builder config.
 
-        UI neuron budgets describe conceptual capacity, not a dense recurrent
-        matrix.  The physical LIF population therefore scales sublinearly and
-        remains bounded by the selected local hardware profile.
+        Stable v1 ignores beta personality sliders and cardinality ceilings.
+        Hardware profiling determines the physical recurrent population and
+        working workspace; structural assemblies remain resource-governed.
         """
 
         if any(key in raw for key in ("d_model", "n_layers", "vsa_dim")):
             return cls.from_dict(raw)
-        neuron_budget = max(64, int(raw.get("initialNeuronBudget", 2048)))
         tier = str(raw.get("hardwareTier", "personal"))
         profiles = {
             "micro": {
                 "dimensions": 32,
                 "layers": 1,
                 "sequence": 64,
+                "router": 24,
                 "image": 8,
                 "audio": 64,
                 "frames": 2,
@@ -181,6 +218,7 @@ class OmniConfig:
                 "dimensions": 64,
                 "layers": 2,
                 "sequence": 128,
+                "router": 64,
                 "image": 16,
                 "audio": 256,
                 "frames": 4,
@@ -193,6 +231,7 @@ class OmniConfig:
                 "dimensions": 96,
                 "layers": 4,
                 "sequence": 256,
+                "router": 96,
                 "image": 32,
                 "audio": 512,
                 "frames": 6,
@@ -205,6 +244,7 @@ class OmniConfig:
                 "dimensions": 128,
                 "layers": 6,
                 "sequence": 512,
+                "router": 128,
                 "image": 32,
                 "audio": 1024,
                 "frames": 8,
@@ -219,8 +259,19 @@ class OmniConfig:
         profile = profiles[tier]
         dimensions = int(profile["dimensions"])
         heads = 4 if dimensions <= 64 else 8
-        physical_neurons = max(24, min(128, int(neuron_budget ** 0.5 * 1.4)))
+        physical_neurons = int(profile["router"])
         external_rate = float(raw.get("learningRate", 0.14))
+        extended_working = bool(raw.get("extendedWorkingMemory", False))
+        context_tokens = int(profile["sequence"]) * (
+            2 if extended_working else 1
+        )
+        workspace_slots = max(
+            16,
+            min(
+                512,
+                dimensions * (2 if extended_working else 1),
+            ),
+        )
         values: Dict[str, Any] = {
             "name": str(raw.get("name", "New OmniCortex")),
             "d_model": dimensions,
@@ -228,7 +279,7 @@ class OmniConfig:
             "n_heads": heads,
             "n_layers": int(profile["layers"]),
             "d_ff": dimensions * 3,
-            "max_seq_len": int(profile["sequence"]),
+            "max_seq_len": context_tokens,
             "router_neurons": physical_neurons,
             "vsa_dim": max(128, dimensions * 4),
             "hardware_tier": tier,
@@ -240,17 +291,15 @@ class OmniConfig:
             "audio_samples": int(profile["audio"]),
             "video_frames": int(profile["frames"]),
             "modality_channels": int(profile["channels"]),
-            "ternary_weights": bool(raw.get("ternaryWeights", True)),
-            "spiking_dynamics": bool(raw.get("spikingDynamics", True)),
-            "stdp_plasticity": bool(raw.get("stdpPlasticity", True)),
-            "liquid_dynamics": bool(raw.get("liquidDynamics", True)),
+            "ternary_weights": True,
+            "spiking_dynamics": True,
+            "stdp_plasticity": True,
+            "liquid_dynamics": True,
             "liquid_mode": str(raw.get("liquidMode", "cfc")),
-            "vector_symbolic_memory": bool(
-                raw.get("vectorSymbolicMemory", True)
-            ),
+            "vector_symbolic_memory": True,
             "online_learning": bool(raw.get("onlineLearning", True)),
-            "consolidation_enabled": bool(raw.get("consolidation", True)),
-            "metaplasticity": bool(raw.get("metaplasticity", True)),
+            "consolidation_enabled": True,
+            "metaplasticity": True,
             "vision_enabled": bool(raw.get("vision_enabled", True)),
             "image_enabled": bool(raw.get("image_enabled", True)),
             "audio_enabled": bool(raw.get("audio_enabled", True)),
@@ -262,39 +311,19 @@ class OmniConfig:
             "slow_importance_decay": max(
                 0.0, min(0.9999, float(raw.get("slowImportanceDecay", 0.97)))
             ),
-            "noise": max(0.0, min(1.0, float(raw.get("noise", 0.08)))),
-            "firing_threshold": max(
-                0.05, min(2.0, float(raw.get("firingThreshold", 0.55)))
-            ),
-            "membrane_leak": max(
-                0.0, min(0.999, float(raw.get("membraneLeak", 0.88)))
-            ),
-            "stdp_tau_pre": max(1.0, float(raw.get("stdpWindow", 8))),
-            "stdp_tau_post": max(1.0, float(raw.get("stdpWindow", 8))),
             "memory_recipe": str(
                 raw.get("memoryRecipe", "human-consolidation")
             ),
-            "memory_injection": str(
-                raw.get("memoryInjection", "parameter-only")
-            ),
-            "learn_from_own_messages": bool(
-                raw.get("learnFromOwnMessages", True)
-            ),
+            "memory_injection": "working-memory",
+            "learn_from_own_messages": True,
             "retain_source_text": bool(raw.get("retainSourceText", False)),
-            "max_concepts": int(raw.get("maxConcepts", 50000)),
-            "max_synapses": int(raw.get("maxSynapses", 1000000)),
-            "growth_policy": str(raw.get("growthPolicy", "elastic")),
-            "working_memory_slots": int(raw.get("workingMemorySlots", 24)),
-            "short_term_half_life_minutes": float(
-                raw.get("shortTermHalfLifeMinutes", 45)
+            "extended_working_memory": extended_working,
+            "recursive_improvement": bool(
+                raw.get("recursiveImprovement", True)
             ),
-            "long_term_threshold": float(raw.get("longTermThreshold", 0.62)),
-            "forgetting_rate": float(raw.get("forgettingRate", 0.002)),
-            "consolidation_rate": float(raw.get("consolidationRate", 0.06)),
-            "novelty_drive": float(raw.get("noveltyDrive", 0.72)),
-            "coherence_drive": float(raw.get("coherenceDrive", 0.88)),
-            "curiosity_drive": float(raw.get("curiosityDrive", 0.58)),
-            "parallel_thoughts": int(raw.get("parallelThoughts", 3)),
+            "idle_cognition": bool(raw.get("idleCognition", True)),
+            "growth_policy": "unbounded",
+            "working_memory_slots": workspace_slots,
             "device": str(raw.get("device", "cpu")),
         }
         if values["memory_recipe"] == "human":

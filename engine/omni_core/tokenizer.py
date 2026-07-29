@@ -1,6 +1,6 @@
 """A deterministic UTF-8 byte tokenizer with no external model files."""
 
-from typing import Iterable, List
+from typing import Iterable, Iterator, List
 
 import torch
 
@@ -76,3 +76,56 @@ class ByteTokenizer:
             dtype=torch.long,
             device=device,
         )
+
+    def windows(
+        self,
+        text: str,
+        max_length: int,
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> Iterator[List[int]]:
+        """Yield every UTF-8 byte in bounded model windows without truncation."""
+
+        special = int(add_bos) + int(add_eos)
+        payload_size = int(max_length) - special
+        if payload_size < 1:
+            raise ValueError("max_length is too small for tokenizer specials")
+        payload = [
+            int(value) + self.byte_offset for value in text.encode("utf-8")
+        ]
+        if not payload:
+            values: List[int] = []
+            if add_bos:
+                values.append(self.bos_id)
+            if add_eos:
+                values.append(self.eos_id)
+            yield values
+            return
+        for offset in range(0, len(payload), payload_size):
+            values = []
+            if add_bos:
+                values.append(self.bos_id)
+            values.extend(payload[offset : offset + payload_size])
+            if add_eos:
+                values.append(self.eos_id)
+            yield values
+
+    def window_tensors(
+        self,
+        text: str,
+        device: torch.device,
+        max_length: int,
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> Iterator[torch.Tensor]:
+        for values in self.windows(
+            text,
+            max_length=max_length,
+            add_bos=add_bos,
+            add_eos=add_eos,
+        ):
+            yield torch.tensor(
+                [values],
+                dtype=torch.long,
+                device=device,
+            )

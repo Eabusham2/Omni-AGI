@@ -51,7 +51,16 @@ The renderer has no direct Node.js, filesystem, process, or credential access. E
 
 That selection scales transformer width/layers, sequence length, media dimensions and duration, batch size, gradient accumulation, and related limits. A GPU or Workstation worker prefers CUDA, then an installed usable DirectML path, then CPU. This is build-time selection, not a claim of continuous runtime re-profiling.
 
-Blank creation records random engine state as the immutable origin. A starter build must import a materialized, compatible `.omni`; it loads the imported tensors and applies shape-safe configuration updates without invoking random creation over them. Optional initial pretraining runs only after the immutable origin exists. It mutates the current state with user-selected local data, so “starter knowledge” means imported or explicitly trained knowledge rather than a hidden bundled model.
+Blank creation records random engine state as the immutable origin. A starter
+build can load a materialized, compatible `.omni`; it applies only shape-safe
+configuration updates and never randomizes the imported tensors. When no
+starter URL is supplied, the worker instead materializes the small,
+project-authored Omni Starter locally by training the same OmniCortex
+architecture on its published seed corpus and action trajectories, then
+records that trained state as the immutable origin. This bundled baseline is
+auditable and initially trained, but it is not a frontier checkpoint.
+Optional user-selected initial training runs only after the immutable origin
+exists and mutates the current copy.
 
 ## Per-turn data flow
 
@@ -88,15 +97,27 @@ The current engine uses a deliberately small decoder-only transformer so CPU fix
 - shared idea-space conditioning;
 - next-symbol prediction.
 
-Only participating `BitLinear` projections are ternary during the forward pass. Embeddings, activations, convolutional packs, optimizer state, liquid state, and plastic traces are not 1.58-bit. A configuration can disable ternary forwarding and use dense floating-point projections.
+Every eligible `BitLinear`, ternary convolution, and recurrent STDP projection
+is ternary during the forward pass. Embeddings, activations, optimizer state,
+liquid state, plastic traces, and floating learning masters are not 1.58-bit.
+Stable v1 exposes no dense-forward toggle, and its packed inference shards must
+cover every eligible projection and dynamic synapse.
 
 ## Plastic and growable state
 
 The spiking router stores recurrent weights, pre/post traces, stability, use counts, membrane state, and spike counts in `plasticity.safetensors`. A presynaptic spike followed by a postsynaptic spike potentiates the connection; reversed timing depresses it. Metaplastic stability reduces repeated updates, while consolidation decays weakly used structures.
 
-The VSA memory stores concept and idea metadata in engine JSON and their hypervectors in safe tensors. Fixed and elastic builds use their configured capacities and reuse or evict low-value entries at pressure. An unbounded build doubles pressured concept/idea/relation capacities while disk and RAM reserves permit, records every expansion, and pauses with the measured resource reason before exhaustion.
+The neural substrate stores distributed neurons, assemblies, and their
+effective ternary synapses as authoritative memory. Concept and idea labels are
+inspection views derived from that state; their hypervectors live in safe
+tensors. Stable v1 has no configured neuron, assembly, synapse, idea, concept,
+or expert cardinality ceiling. Host RAM and disk reserve checks gate
+allocation, record measured pauses, and allow later growth to resume.
 
-Novelty can add small residual decoder experts. `fixed` disables expert growth, `elastic` observes `max_experts`, and `unbounded` removes that model-count limit but still pauses before crossing runtime disk or memory reserves. Expert growth is live and sparse; the next atomic save persists the new structure. Growth does not resize the live transformer's dense base tensors.
+Sustained novelty can add small residual decoder experts under the same
+resource guard. Expert growth is live and sparse; the next atomic save persists
+the new structure. Growth does not resize the live transformer's dense base
+tensors.
 
 Slow parameters have a second metaplastic protection path. Squared gradients update persistent importance tensors, and an EWC-like penalty resists movement away from persistent anchors. Successful online steps move anchors gradually; promoted training or consolidation candidates commit them. Rejected or interrupted candidates restore weights, anchors, and importance together.
 
@@ -157,11 +178,16 @@ brains/
       brain.json                     current neural metadata
       core.safetensors               decoder, liquid, adapters, modalities
       plasticity.safetensors         SNN, VSA vectors, replay, liquid activity
+      packed-ternary/
+        manifest.json                exact eligible-forward coverage
+        manifest.sha256              canonical-manifest checksum
+        ternary-*.bin                four exact 2-bit values per byte
       events.sqlite3                 append-only operational event log
       origin/
         brain.json
         core.safetensors
         plasticity.safetensors
+        packed-ternary/              immutable-origin exact ternary shards
       candidates/<candidate-id>/
       snapshots/<snapshot-id>/
       artifacts/
@@ -177,7 +203,13 @@ Forks receive independent application state and neural metadata. Immutable tenso
 
 Downloaded bundles are treated as data. The importer validates ZIP paths, size limits, duplicate names, encryption/symlink flags, executable extensions, checksums, exact manifest byte lengths, the `OmniCortex` architecture name and current schema version, materialized engine format, secret-redaction declaration, source license ledger, and safe-tensor headers. Recipes reject unknown fields and contain no command field. Modality packs are revalidated by both Electron and the neural worker and may replace only declared `modalities.<kind>.*` tensors with exact compatible shapes and finite values. No path loads pickle data or runs repository setup scripts.
 
-Current, origin, and private-archive exports carry materialized tensor bytes. A `referenced-local` export replaces those tensor entries with valid placeholder safe tensors and records the real tensor hashes; import succeeds only when the same local repository still has every referenced object. It is a storage convenience, not a shareable checkpoint.
+Current, origin, and private-archive exports carry materialized current and
+immutable-origin safe tensors plus both exact packed-ternary trees. A
+`referenced-local` export replaces safe tensors with valid placeholders and
+packed files with local-reference markers, recording every real object hash.
+Import resolves every object before verifying safe-tensor headers and packed
+coverage. It succeeds only when the local repository still has all referenced
+objects, so it is a storage convenience, not a shareable checkpoint.
 
 ## Tools and agents
 
@@ -193,8 +225,29 @@ Source evolution requires an explicitly authorized Git clone. `propose` creates 
 
 An `agent.fork` action creates one to four copy-on-write brain forks and runs one objective turn in each isolated identity. The parent receives result summaries but no neural mutation. Merge remains a separate, previewed user action that copies novel ideas, relations, deduplicated evidence metadata, retained source blobs allowed by the target memory recipe, branch-local artifacts, replay examples, and related overlays. `Synapses Only` targets receive evidence provenance but no raw source text or source blob. Whole-model weights are never averaged. The current executor runs these bounded fork turns sequentially, so this is not a claim of an open-ended parallel autonomous society.
 
-## Windows packaging
+## Cross-platform packaging
 
 GitHub Actions uses native `windows-latest` x64 and `windows-11-arm` ARM64 runners. Each runner installs a native Node runtime, runs the full neural/unit/UI suites, builds the PyInstaller worker, and asks electron-builder for matching NSIS and ZIP artifacts. Each matrix leg expands the ZIP, silently installs the NSIS artifact into a clean temporary directory, and runs the packaged worker from both layouts. Playwright then points at the installed executable and requires the packaged worker while it builds a brain, chats, invokes tools and subagents directly in chat, navigates every primary surface by accessible name, exports a trace, generates and downloads image, audio, and video artifacts, closes the app, relaunches it, and verifies persisted identity and chat. Each successful leg emits a JSON evidence file with artifact hashes and runtime versions. The workflow forwards `WINDOWS_CSC_LINK` and `WINDOWS_CSC_KEY_PASSWORD` into electron-builder's signing variables. Artifacts are unsigned when those repository secrets are absent; “signed-ready” is not a claim that a particular artifact is signed.
 
 The x64 package contains an x64 Electron shell and x64 PyInstaller worker. The ARM64 package contains a native ARM64 Electron shell and an x64 PyTorch/PyInstaller worker that Windows 11 runs through its x64 emulation layer. This split is explicit because PyTorch does not currently publish a stable Windows ARM64 wheel; it is not represented as a native ARM64 neural runtime. The package is still built, installed, launched, restarted, and exercised on a native ARM64 runner. Workflow configuration is not treated as release evidence until both native-host jobs finish green and upload their smoke records.
+
+macOS packages are built natively on Intel and Apple Silicon runners as DMG
+and ZIP artifacts. Linux packages are built natively on x64 and ARM64 runners
+as AppImage, DEB, and tar.gz artifacts. Their PyInstaller workers live at
+`resources/engine-runtime/omni-engine`; Windows uses
+`resources/engine-runtime/omni-engine.exe`. The supervisor selects the
+platform-specific executable and package smoke rejects a shell or worker whose
+machine architecture does not match the matrix leg.
+
+The macOS and Linux workflows run the neural and Node suites, package the
+desktop, create and reload a safe-tensor/SQLite brain through the embedded
+worker, and drive the packaged application through the Playwright restart
+scenario. Artifact hashes and runtime evidence are uploaded per architecture.
+Configured workflow coverage becomes release evidence only after the matching
+native-host job completes successfully.
+
+Tags do not bypass these gates. The stable-release workflow accepts only the
+exact `v<package.version>` tag when its commit is contained in `main`, rebuilds
+all six native package legs, validates every expected file and smoke record,
+writes `SHA256SUMS.txt` plus `RELEASE-MANIFEST.json`, and only then publishes
+the GitHub release.

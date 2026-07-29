@@ -10,7 +10,7 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core.config import OmniConfig
-from omni_core.model import BitLinear, OmniDecoder
+from omni_core.model import BitConv2d, BitConvTranspose2d, BitLinear, OmniDecoder
 from omni_core.tokenizer import ByteTokenizer
 
 
@@ -28,12 +28,36 @@ class TernaryDecoderTests(unittest.TestCase):
         self.assertIsNotNone(layer.weight.grad)
         self.assertGreater(float(layer.weight.grad.abs().sum()), 0.0)
 
-    def test_dense_recipe_bypasses_ternary_forward(self):
+    def test_dense_flag_cannot_bypass_mandatory_ternary_forward(self):
         layer = BitLinear(3, 2)
         layer.ternary = False
         inputs = torch.randn(2, 3)
-        expected = torch.nn.functional.linear(inputs, layer.weight, layer.bias)
+        scale = layer.weight.detach().abs().mean().clamp_min(1e-6)
+        effective = layer.effective_weight().to(inputs.dtype) * scale
+        expected = torch.nn.functional.linear(inputs, effective, layer.bias)
         self.assertTrue(torch.allclose(layer(inputs), expected))
+        self.assertFalse(
+            torch.allclose(
+                layer(inputs),
+                torch.nn.functional.linear(inputs, layer.weight, layer.bias),
+            )
+        )
+
+    def test_modality_convolutions_use_exact_ternary_forward_weights(self):
+        inputs = torch.randn(1, 3, 8, 8, requires_grad=True)
+        encoder = BitConv2d(3, 4, 3, padding=1)
+        decoder = BitConvTranspose2d(4, 3, 3, padding=1)
+        encoded = encoder(inputs)
+        output = decoder(encoded)
+        output.square().mean().backward()
+        for module in (encoder, decoder):
+            self.assertTrue(
+                set(module.effective_weight().reshape(-1).tolist()).issubset(
+                    {-1, 0, 1}
+                )
+            )
+            self.assertIsNotNone(module.weight.grad)
+            self.assertGreater(float(module.weight.grad.abs().sum()), 0.0)
 
     def test_attention_is_causal_and_finite(self):
         config = OmniConfig.micro(dropout=0.0, parallel_thoughts=1)
@@ -107,6 +131,22 @@ class TernaryDecoderTests(unittest.TestCase):
         self.assertIn(tokenizer.human_id, ids)
         self.assertIn(tokenizer.brain_id, ids)
         self.assertEqual(tokenizer.decode(ids), "humanbrain")
+
+    def test_training_windows_cover_every_utf8_byte_without_truncation(self):
+        tokenizer = ByteTokenizer()
+        text = ("whole document 🧠 " * 40) + "tail-sentinel"
+        windows = list(tokenizer.windows(text, max_length=24))
+        payload = [
+            token
+            for window in windows
+            for token in window
+            if tokenizer.byte_offset <= token < tokenizer.human_id
+        ]
+        self.assertGreater(len(windows), 1)
+        self.assertEqual(
+            bytes(token - tokenizer.byte_offset for token in payload),
+            text.encode("utf-8"),
+        )
 
 
 if __name__ == "__main__":

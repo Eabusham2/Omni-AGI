@@ -126,16 +126,14 @@ function integerValue(
 
 function recipeMemory(
   value: unknown
-): Pick<BrainConfig, "memoryRecipe" | "retainSourceText" | "memoryInjection" | "consolidation"> {
+): Pick<BrainConfig, "memoryRecipe" | "retainSourceText"> {
   if (!["human-consolidation", "total-recall", "synapses-only"].includes(String(value))) {
     throw new Error("Recipe memoryRecipe is invalid.");
   }
   const memoryRecipe = value as BrainConfig["memoryRecipe"];
   return {
     memoryRecipe,
-    retainSourceText: memoryRecipe === "total-recall",
-    memoryInjection: memoryRecipe === "total-recall" ? "working-memory" : "parameter-only",
-    consolidation: memoryRecipe !== "total-recall"
+    retainSourceText: memoryRecipe === "total-recall"
   };
 }
 
@@ -217,10 +215,6 @@ export function validateBuildRecipe(
     throw new Error("Recipe architecture preset is invalid.");
   }
   const preset = architecture.preset as ArchitecturePreset;
-  let config: BrainConfig = {
-    ...createPresetConfig(preset, name),
-    description
-  };
 
   if (architecture.text !== undefined) {
     if (!isRecord(architecture.text)) throw new Error("Recipe text settings must be an object.");
@@ -246,10 +240,9 @@ export function validateBuildRecipe(
     if (architecture.text.heads !== undefined) {
       integerValue(architecture.text.heads, "heads", 1, 1_024);
     }
-    config = {
-      ...config,
-      ternaryWeights: booleanValue(architecture.text, "ternary", config.ternaryWeights)
-    };
+    if (architecture.text.ternary !== undefined) {
+      booleanValue(architecture.text, "ternary", true);
+    }
   }
 
   if (architecture.spiking !== undefined) {
@@ -261,26 +254,18 @@ export function validateBuildRecipe(
       ["enabled", "neurons", "stdp", "metaplasticity", "structuralGrowth"],
       "Recipe spiking settings"
     );
-    const neurons =
-      architecture.spiking.neurons === undefined
-        ? config.initialNeuronBudget
-        : integerValue(architecture.spiking.neurons, "spiking neurons", 16, 100_000_000);
+    if (architecture.spiking.neurons !== undefined) {
+      integerValue(architecture.spiking.neurons, "spiking neurons", 16, 100_000_000);
+    }
+    for (const key of ["enabled", "stdp", "metaplasticity"] as const) {
+      if (architecture.spiking[key] !== undefined) {
+        booleanValue(architecture.spiking, key, true);
+      }
+    }
     const growth = architecture.spiking.structuralGrowth;
     if (growth !== undefined && !["fixed", "elastic", "unbounded"].includes(String(growth))) {
       throw new Error("Recipe structuralGrowth is invalid.");
     }
-    config = {
-      ...config,
-      spikingDynamics: booleanValue(architecture.spiking, "enabled", config.spikingDynamics),
-      stdpPlasticity: booleanValue(architecture.spiking, "stdp", config.stdpPlasticity),
-      metaplasticity: booleanValue(
-        architecture.spiking,
-        "metaplasticity",
-        config.metaplasticity
-      ),
-      initialNeuronBudget: neurons,
-      growthPolicy: (growth as BrainConfig["growthPolicy"] | undefined) ?? config.growthPolicy
-    };
   }
 
   if (architecture.liquid !== undefined) {
@@ -295,12 +280,9 @@ export function validateBuildRecipe(
     if (architecture.liquid.units !== undefined) {
       integerValue(architecture.liquid.units, "liquid units", 1, 1_000_000);
     }
-    config = {
-      ...config,
-      liquidDynamics: booleanValue(architecture.liquid, "enabled", config.liquidDynamics),
-      liquidMode:
-        (architecture.liquid.kind as BrainConfig["liquidMode"] | undefined) ?? config.liquidMode
-    };
+    if (architecture.liquid.enabled !== undefined) {
+      booleanValue(architecture.liquid, "enabled", true);
+    }
   }
 
   if (architecture.ideas !== undefined) {
@@ -318,17 +300,16 @@ export function validateBuildRecipe(
         1_048_576
       );
     }
-    config = {
-      ...config,
-      vectorSymbolicMemory: booleanValue(
-        architecture.ideas,
-        "enabled",
-        config.vectorSymbolicMemory
-      )
-    };
+    if (architecture.ideas.enabled !== undefined) {
+      booleanValue(architecture.ideas, "enabled", true);
+    }
   }
 
-  config = { ...config, ...recipeMemory(document.memoryRecipe) };
+  const config: BrainConfig = {
+    ...createPresetConfig(preset, name),
+    description,
+    ...recipeMemory(document.memoryRecipe)
+  };
   const modalities = recipeModalities(architecture.modalities);
   const origin = document.origin;
   if (!["blank", "starter"].includes(String(origin))) throw new Error("Recipe origin is invalid.");

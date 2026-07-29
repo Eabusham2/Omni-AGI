@@ -3,9 +3,11 @@ name: Windows
 on:
   push:
     branches: ["main", "codex/**"]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test-and-package:
@@ -19,6 +21,7 @@ jobs:
             node_arch: x64
             python_arch: x64
             worker_arch: x64
+            package_script: package:win
           - arch: arm64
             runner: windows-11-arm
             node_arch: arm64
@@ -27,25 +30,33 @@ jobs:
             # Windows 11 x64-emulation layer.
             python_arch: x64
             worker_arch: x64
+            package_script: package:win:arm64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           architecture: ${{ matrix.node_arch }}
           cache: npm
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
           architecture: ${{ matrix.python_arch }}
+          cache: pip
+          cache-dependency-path: engine/requirements.txt
 
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Verify stable release metadata
+        run: npm run verify:release
+
       - name: Install CPU brain runtime
-        run: python -m pip install -r engine/requirements.txt
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0+cpu"
+          python -m pip install -r engine/requirements.txt
 
       - name: Test brain
         run: npm run test:python:portable
@@ -71,11 +82,14 @@ jobs:
 
       - name: Package signed-ready Windows installer and archive
         env:
-          CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
-        run: npx electron-builder --win nsis zip --${{ matrix.arch }} --publish never
+          WIN_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Arch "${{ matrix.arch }}" -SkipBuild
 
       - name: Smoke ZIP, silent NSIS install, and installed worker
+        env:
+          OMNI_EXPECT_SIGNED: ${{ secrets.WINDOWS_CSC_LINK != '' && '1' || '0' }}
         shell: pwsh
         run: |
           ./scripts/smoke-windows-package.ps1 `
@@ -84,11 +98,11 @@ jobs:
             -ReleaseRoot ./release
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omni-agi-studio-windows-${{ matrix.arch }}
           if-no-files-found: error
           path: |
-            release/*.exe
-            release/*.zip
-            release/windows-package-smoke-*.json
+            release/*-Windows-${{ matrix.arch }}.exe
+            release/*-Windows-${{ matrix.arch }}.zip
+            release/windows-package-smoke-${{ matrix.arch }}.json

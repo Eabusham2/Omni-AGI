@@ -1,20 +1,37 @@
 # Third-party notices
 
-Omni AGI Studio is an original research implementation informed by the projects and papers below. Third-party source directories already present in this repository retain their original licenses; the project-level PolyForm license does not replace those terms.
+Omni AGI Studio is an original research implementation informed by the projects and papers below. The implementation does not vendor or execute these upstream source trees. Their preserved license texts ship in `licenses/`; the project-level PolyForm license does not replace any third-party terms.
 
-## Bundled source snapshots
+## Research source licenses
 
-| Component | Location | License | Use in Omni |
+| Component | Upstream | Preserved license | Use in Omni |
 | --- | --- | --- | --- |
-| Microsoft BitNet | `BitNet-main/` | MIT | Research reference for ternary inference and quantization. The uploaded snapshot is missing its `llama.cpp` submodule and is not executed by the custom engine. |
-| snnTorch | `snntorch-master/` | MIT | Research reference for spiking neuron dynamics and spike encoding. |
-| Neural Circuit Policies (NCPS) | `ncps-master/` | Apache-2.0 | Research reference for CfC/LTC cells and sparse circuit wiring. |
+| Microsoft BitNet | <https://github.com/microsoft/BitNet> | `licenses/BitNet-MIT.txt` | Research reference for ternary inference and quantization; Omni uses its own implementation. |
+| snnTorch | <https://github.com/jeshraghian/snntorch> | `licenses/snnTorch-MIT.txt` | Research reference for spiking neuron dynamics and spike encoding; Omni uses its own tested STDP implementation. |
+| Neural Circuit Policies (NCPS) | <https://github.com/mlech26l/ncps> | `licenses/NCPS-Apache-2.0.txt` | Research reference for CfC/LTC cells and sparse circuit wiring; Omni uses its own implementation. |
 
 The full license texts ship with packaged applications under `resources/licenses/`.
 
 ## Runtime dependencies
 
 Electron, React, Vite, TypeScript, Python, PyTorch, NumPy, safetensors, and PDF parsing dependencies retain their respective upstream licenses. Exact dependency versions are recorded in `package-lock.json` and `engine/requirements.txt`.
+
+### Apache Arrow / PyArrow
+
+Streaming Parquet and Arrow IPC ingestion uses PyArrow, the Python bindings for
+Apache Arrow, under the Apache License 2.0. Omni does not bundle Arrow datasets
+or assign licenses to user-provided data.
+
+- Project and source: <https://arrow.apache.org/>
+- License: <https://github.com/apache/arrow/blob/main/LICENSE.txt>
+
+### ijson
+
+Large JSON arrays and maps are traversed incrementally with ijson under its
+BSD-3-Clause license.
+
+- Project: <https://github.com/ICRAR/ijson>
+- License: <https://github.com/ICRAR/ijson/blob/master/LICENSE.txt>
 
 ### imageio-ffmpeg and FFmpeg
 

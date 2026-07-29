@@ -13,6 +13,7 @@ export const IPC = {
     get: "omni:brain:get",
     create: "omni:brain:create",
     update: "omni:brain:update",
+    duplicate: "omni:brain:duplicate",
     fork: "omni:brain:fork",
     remove: "omni:brain:remove",
     snapshot: "omni:brain:snapshot",
@@ -21,12 +22,17 @@ export const IPC = {
     export: "omni:brain:export",
     importFile: "omni:brain:import-file",
     imported: "omni:brain:imported",
-    health: "omni:brain:health"
+    health: "omni:brain:health",
+    querySubstrate: "omni:brain:query-substrate",
+    workspace: "omni:brain:workspace"
   },
   chat: {
     send: "omni:chat:send",
+    cancel: "omni:chat:cancel",
     list: "omni:chat:list",
-    feedback: "omni:chat:feedback"
+    feedback: "omni:chat:feedback",
+    actionEvent: "omni:chat:action-event",
+    streamEvent: "omni:chat:stream-event"
   },
   train: {
     start: "omni:train:start",
@@ -36,6 +42,14 @@ export const IPC = {
     event: "omni:train:event"
   },
   data: {
+    selectBuildResources: "omni:data:select-build-resources",
+    discardBuildResource: "omni:data:discard-build-resource",
+    startBuildResource: "omni:data:start-build-resource",
+    preview: "omni:data:preview",
+    start: "omni:data:start",
+    pause: "omni:data:pause",
+    resume: "omni:data:resume",
+    coverage: "omni:data:coverage",
     ingestFiles: "omni:data:ingest-files",
     ingestFolder: "omni:data:ingest-folder",
     ingestDropped: "omni:data:ingest-dropped",
@@ -61,6 +75,13 @@ export const IPC = {
     fork: "omni:agent:fork",
     previewMerge: "omni:agent:preview-merge",
     merge: "omni:agent:merge"
+  },
+  evolution: {
+    start: "omni:evolution:start",
+    stop: "omni:evolution:stop",
+    listCandidates: "omni:evolution:list-candidates",
+    approve: "omni:evolution:approve",
+    rollback: "omni:evolution:rollback"
   },
   catalog: {
     list: "omni:catalog:list",

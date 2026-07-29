@@ -44,10 +44,55 @@ class MemoryAndModalityTests(unittest.TestCase):
         self.assertNotIn("source_text", memory.ideas[0])
         self.assertIn(learned["idea_id"], memory.idea_vectors)
 
-    def test_relation_capacity_is_enforced(self):
+    def test_relation_growth_ignores_legacy_cardinality_limit(self):
         memory = ConceptMemory(64, max_relations=2)
         memory.learn("alpha beta gamma delta epsilon")
-        self.assertLessEqual(len(memory.relations), 2)
+        self.assertGreater(len(memory.relations), 2)
+        self.assertIsNone(memory.metadata()["cardinality_limit"])
+
+    def test_spreading_activation_is_not_limited_to_four_hops(self):
+        memory = ConceptMemory(16, seed=9)
+        for index in range(7):
+            assembly_id = "assembly-%d" % index
+            vector = torch.zeros(16)
+            vector[index] = 1.0
+            memory.assemblies.append(
+                {
+                    "id": assembly_id,
+                    "neuron_ids": [],
+                    "importance": 0.5,
+                    "rehearsals": 1,
+                }
+            )
+            memory.assembly_vectors[assembly_id] = vector
+            memory.neurons[assembly_id] = {
+                "id": assembly_id,
+                "label": assembly_id,
+                "region": "assembly",
+                "activation": 0.0,
+                "importance": 0.5,
+                "uncertainty": 0.5,
+                "exposures": 1,
+                "last_activated_at": 0.0,
+            }
+            if index:
+                source = "assembly-%d" % (index - 1)
+                synapse_id = "%s>%s:test" % (source, assembly_id)
+                memory.synapses[synapse_id] = {
+                    "id": synapse_id,
+                    "source_id": source,
+                    "target_id": assembly_id,
+                    "effective_weight": 1,
+                    "latent_weight": 1.0,
+                }
+
+        _, recalled = memory.recall_vector(
+            memory.assembly_vectors["assembly-0"],
+            workspace_slots=16,
+        )
+        recalled_ids = {item["assembly_id"] for item in recalled}
+        self.assertIn("assembly-6", recalled_ids)
+        self.assertGreater(memory._last_recall_rounds, 4)
 
     def test_all_modality_baselines_forward_generate_and_backpropagate(self):
         config = OmniConfig.micro()
@@ -98,9 +143,20 @@ class MemoryAndModalityTests(unittest.TestCase):
                 ),
             ),
         ):
-            generated = hub.generate(kind, idea, seed=1)
+            previews = []
+            generated = hub.generate(
+                kind,
+                idea,
+                seed=1,
+                preview_callback=lambda progress, value: previews.append(
+                    (progress, tuple(value.shape))
+                ),
+            )
             self.assertEqual(tuple(generated.shape), expected)
             self.assertTrue(torch.isfinite(generated).all())
+            self.assertGreaterEqual(len(previews), 3)
+            self.assertEqual(previews[-1][0], 1.0)
+            self.assertTrue(all(shape == expected for _progress, shape in previews))
 
     def test_each_modality_overfits_a_fixture_and_safe_reload_is_exact(self):
         config = OmniConfig.micro(learning_rate=0.01)

@@ -1,9 +1,10 @@
 {
   "name": "omni-agi-studio",
-  "version": "0.1.0",
-  "description": "A Windows 11 studio for building persistent, adaptive OmniCortex research models.",
+  "version": "1.0.0",
+  "description": "A cross-platform studio for building persistent, adaptive OmniCortex research models.",
   "main": "out/main/index.js",
   "author": "Omni-AGI contributors",
+  "homepage": "https://github.com/Eabusham2/Omni-AGI",
   "license": "SEE LICENSE IN LICENSE.md",
   "type": "module",
   "scripts": {
@@ -18,8 +19,15 @@
     "test:ui:built": "playwright test --config playwright.config.ts",
     "test:watch": "vitest",
     "build:engine:win": "powershell -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
+    "build:engine:mac": "bash scripts/build-engine-posix.sh mac",
+    "build:engine:linux": "bash scripts/build-engine-posix.sh linux",
     "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Arch x64",
-    "package:win:arm64": "powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Arch arm64"
+    "package:win:arm64": "powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Arch arm64",
+    "package:mac:x64": "bash scripts/package-posix.sh mac x64",
+    "package:mac:arm64": "bash scripts/package-posix.sh mac arm64",
+    "package:linux:x64": "bash scripts/package-posix.sh linux x64",
+    "package:linux:arm64": "bash scripts/package-posix.sh linux arm64",
+    "verify:release": "node scripts/verify-release.mjs"
   },
   "dependencies": {
     "fflate": "^0.8.2",
@@ -79,15 +87,15 @@
         "to": "engine-runtime"
       },
       {
-        "from": "BitNet-main/LICENSE",
+        "from": "licenses/BitNet-MIT.txt",
         "to": "licenses/BitNet-MIT.txt"
       },
       {
-        "from": "snntorch-master/LICENSE",
+        "from": "licenses/snnTorch-MIT.txt",
         "to": "licenses/snnTorch-MIT.txt"
       },
       {
-        "from": "ncps-master/LICENSE",
+        "from": "licenses/NCPS-Apache-2.0.txt",
         "to": "licenses/NCPS-Apache-2.0.txt"
       },
       {
@@ -107,6 +115,43 @@
       ],
       "artifactName": "${productName}-${version}-Windows-${arch}.${ext}"
     },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-macOS-${arch}.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "notarize": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "sign": false
+    },
+    "linux": {
+      "category": "Science",
+      "target": [
+        "AppImage",
+        "deb",
+        "tar.gz"
+      ],
+      "artifactName": "${productName}-${version}-Linux-${arch}.${ext}",
+      "executableName": "omni-agi-studio",
+      "synopsis": "Persistent adaptive OmniCortex research studio",
+      "maintainer": "Omni-AGI contributors",
+      "vendor": "Omni-AGI contributors"
+    },
+    "fileAssociations": [
+      {
+        "ext": "omni",
+        "name": "Omni brain bundle",
+        "description": "Portable OmniCortex brain bundle",
+        "role": "Editor"
+      }
+    ],
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,

@@ -122,11 +122,30 @@ class ReleaseGateTests(unittest.TestCase):
             duration=40,
             loop=0,
         )
+        observed = []
+        hook = brain.modalities.video.register_forward_pre_hook(
+            lambda _module, inputs: observed.append(
+                inputs[0].detach().cpu().clone()
+            )
+        )
         before = brain.parameter_checksum()
-        result = brain.ingest(path=str(gif), kind="video", policy="encode")
+        try:
+            result = brain.ingest(path=str(gif), kind="video", policy="encode")
+        finally:
+            hook.remove()
         self.assertTrue(result["source"]["modality_trained"])
         self.assertFalse(result["warnings"])
         self.assertNotEqual(before, result["parameterChecksumAfter"])
+        self.assertEqual(result["mediaCoverage"]["processedFrames"], 3)
+        self.assertEqual(result["mediaCoverage"]["windows"], 2)
+        self.assertEqual(result["mediaCoverage"]["tailFrames"], 1)
+        self.assertTrue(result["mediaCoverage"]["complete"])
+        self.assertEqual(len(observed), 4)
+        # The third (blue) frame is the one-frame tail and is padded only
+        # after being admitted to the final training window.
+        tail_window = observed[-1]
+        self.assertTrue(torch.equal(tail_window[:, :, 0], tail_window[:, :, 1]))
+        self.assertGreater(float(tail_window[:, 2].mean()), 0.7)
         brain.events.close()
 
     @unittest.skipUnless(
@@ -166,7 +185,9 @@ class ReleaseGateTests(unittest.TestCase):
         )
         writer.send(None)
         try:
-            for index in range(4):
+            # The old decoder stopped at max(16, video_frames * 8). Seventeen
+            # frames guard full traversal beyond that historical ceiling.
+            for index in range(17):
                 frame = np.zeros((16, 16, 3), dtype="uint8")
                 frame[:, :, index % 3] = 220
                 frame[index : index + 4, :, :] = 80
@@ -177,6 +198,9 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertTrue(result["source"]["modality_trained"])
         self.assertFalse(result["warnings"])
         self.assertGreater(brain.modality_training["video"], 0)
+        self.assertEqual(result["mediaCoverage"]["processedFrames"], 17)
+        self.assertEqual(result["mediaCoverage"]["windows"], 9)
+        self.assertEqual(result["mediaCoverage"]["tailFrames"], 1)
         brain.events.close()
 
     def test_memory_recipes_have_distinct_source_retention(self):

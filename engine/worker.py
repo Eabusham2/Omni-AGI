@@ -5,6 +5,7 @@ Stdout is protocol-only.  Diagnostics and tracebacks go to stderr so Electron
 can safely parse one JSON response/notification per line.
 """
 
+import base64
 import json
 import os
 import platform
@@ -23,6 +24,7 @@ if str(WORKER_DIR) not in sys.path:
 import torch
 
 from omni_core import AdaptiveBrain, OmniConfig, __version__
+from omni_core.evolution import NeuralEvolutionManager
 
 
 PROTOCOL_VERSION = 1
@@ -55,11 +57,29 @@ class Worker:
             "list": self.list_brains,
             "state": self.state,
             "export_state": self.state,
+            "query_substrate": self.query_substrate,
+            "workspace": self.workspace,
+            "feedback": self.feedback,
+            "idle_cycle": self.idle_cycle,
             "chat": self.chat,
             "train": self.train,
             "ingest": self.ingest,
             "consolidate": self.consolidate,
             "generate_modality": self.generate_modality,
+            "evolution.propose": self.evolution_propose,
+            "evolution.evaluate": self.evolution_evaluate,
+            "evolution.list": self.evolution_list,
+            "evolution.promote": self.evolution_promote,
+            "evolution.reject": self.evolution_reject,
+            "evolution.rollback": self.evolution_rollback,
+            # Aliases for transports that reserve dotted method names.
+            "evolution_propose": self.evolution_propose,
+            "evolution_evaluate": self.evolution_evaluate,
+            "evolution_list": self.evolution_list,
+            "evolution_promote": self.evolution_promote,
+            "evolution_reject": self.evolution_reject,
+            "evolution_rollback": self.evolution_rollback,
+            "export_ternary": self.export_ternary,
             "snapshot": self.snapshot,
             "trace": self.trace,
             "events": self.events,
@@ -93,6 +113,9 @@ class Worker:
         event_type: str,
         brain_id: str = "",
         job_id: str = "",
+        stream_id: str = "",
+        sequence: Optional[int] = None,
+        action_id: str = "",
         progress: Optional[float] = None,
         message: str = "",
         data: Any = None,
@@ -102,6 +125,12 @@ class Worker:
             params["brainId"] = brain_id
         if job_id:
             params["jobId"] = job_id
+        if stream_id:
+            params["streamId"] = stream_id
+        if sequence is not None:
+            params["sequence"] = max(0, int(sequence))
+        if action_id:
+            params["actionId"] = action_id
         if progress is not None:
             params["progress"] = max(0.0, min(float(progress), 1.0))
         if message:
@@ -222,7 +251,11 @@ class Worker:
             "brain-created",
             brain_id=brain_id,
             progress=1.0,
-            message="Randomly initialized OmniCortex brain created.",
+            message=(
+                "Bundled trained Omni Starter created."
+                if config.origin_kind == "starter"
+                else "Blank randomly initialized OmniCortex brain created."
+            ),
         )
         return brain.summary()
 
@@ -284,7 +317,10 @@ class Worker:
                 temporary = engine / (filename + ".restore.tmp")
                 shutil.copy2(str(source), str(temporary))
                 os.replace(str(temporary), str(engine / filename))
-        return self.reload(params, request_id)
+        restored = self.reload(params, request_id)
+        brain = self.brains[brain_id]
+        brain.export_packed_ternary()
+        return {**restored, "packedTernary": brain.packed_ternary_manifest}
 
     def update_config(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -351,6 +387,65 @@ class Worker:
         del request_id
         brain = self._get(params)
         return brain.state(include_events=int(params.get("eventLimit", 20)))
+
+    def query_substrate(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        brain = self._get(params)
+        query = params.get("query", {})
+        if not isinstance(query, dict):
+            raise RpcFault(-32602, "params.query must be an object")
+        try:
+            return brain.query_substrate(query)
+        except (TypeError, ValueError) as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def workspace(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        return self._get(params).workspace_snapshot()
+
+    def feedback(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        text = params.get("text")
+        direction = params.get("direction")
+        if not isinstance(text, str):
+            raise RpcFault(-32602, "params.text must be a string")
+        if direction not in {"up", "down"}:
+            raise RpcFault(-32602, "params.direction must be up or down")
+        try:
+            return self._get(params).feedback(
+                text,
+                str(direction),
+                trace_id=str(params.get("traceId", "")),
+                message_id=str(params.get("messageId", "")),
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def idle_cycle(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        try:
+            schemas = AdaptiveBrain._normalize_tool_schemas(
+                params.get("toolSchemas", [])
+            )
+            minimum_idle = _number(params.get("minimumIdleSeconds", 45.0))
+            if minimum_idle < 0 or minimum_idle > 86_400:
+                raise ValueError(
+                    "minimumIdleSeconds must be between 0 and 86400"
+                )
+            return self._get(params).idle_cycle(
+                tool_schemas=schemas,
+                minimum_idle_seconds=minimum_idle,
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def _job(
         self,
@@ -420,6 +515,40 @@ class Worker:
             )
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
+        stream_id = str(params.get("streamId", "")).strip()
+        if stream_id and (
+            len(stream_id) > 128
+            or "\x00" in stream_id
+            or any(character in "\r\n" for character in stream_id)
+        ):
+            raise RpcFault(-32602, "params.streamId is invalid")
+        sequence = 0
+
+        def stream(kind: str, payload: Dict[str, Any]) -> None:
+            nonlocal sequence
+            if not stream_id:
+                return
+            if kind == "token":
+                self.notify(
+                    "chat-token",
+                    brain_id=brain.brain_id,
+                    stream_id=stream_id,
+                    sequence=sequence,
+                    data={"delta": str(payload.get("delta", ""))},
+                )
+            elif kind == "action":
+                self.notify(
+                    "chat-action",
+                    brain_id=brain.brain_id,
+                    stream_id=stream_id,
+                    sequence=sequence,
+                    action_id=str(payload.get("actionId", "")),
+                    data={"action": payload.get("action")},
+                )
+            else:
+                raise RuntimeError("unsupported neural chat stream event")
+            sequence += 1
+
         result = brain.chat(
             value,
             max_new_tokens=int(params.get("maxNewTokens", 48)),
@@ -429,6 +558,7 @@ class Worker:
                 else None
             ),
             tool_schemas=tool_schemas,
+            stream_callback=stream if stream_id else None,
         )
         self.notify(
             "brain-mutated",
@@ -465,17 +595,52 @@ class Worker:
 
     def ingest(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain, job_id, progress = self._job(params, request_id, "ingestion")
-        result = brain.ingest(
-            path=str(params["path"]) if params.get("path") else None,
-            text=str(params["text"]) if params.get("text") is not None else None,
-            name=str(params.get("name", "")),
-            kind=str(params.get("kind", "")),
-            policy=str(params.get("policy", "encode")),
-            expected_hash=str(
-                params.get("contentHash", params.get("expectedSha256", ""))
-            ),
-            progress=progress,
-        )
+        try:
+            result = brain.ingest(
+                path=str(params["path"]) if params.get("path") else None,
+                text=(
+                    str(params["text"])
+                    if params.get("text") is not None
+                    else None
+                ),
+                name=str(params.get("name", "")),
+                kind=str(params.get("kind", "")),
+                policy=str(params.get("policy", "encode")),
+                expected_hash=str(
+                    params.get(
+                        "contentHash", params.get("expectedSha256", "")
+                    )
+                ),
+                allow_replay=bool(params.get("allowReplay", False)),
+                epoch=int(params.get("epoch", 0)),
+                progress=progress,
+            )
+        except Exception:
+            # Ingestion mutates fast weights and assemblies as records stream,
+            # but the durable cursor is committed only after the whole worker
+            # call succeeds. Drop that in-memory object and reload the last
+            # atomic checkpoint so retrying the same manifest record cannot
+            # inherit a partial application.
+            brain_id = brain.brain_id
+            storage = brain.storage_path
+            previous = self.brains.pop(brain_id, None)
+            if previous is not None:
+                previous.events.close()
+            restored = AdaptiveBrain.load(
+                storage, expected_brain_id=brain_id
+            )
+            self.brains[brain_id] = restored
+            self.notify(
+                "ingestion-rolled-back",
+                brain_id=brain_id,
+                job_id=job_id,
+                progress=0.0,
+                message=(
+                    "Partial ingestion was discarded; the last atomic "
+                    "checkpoint was restored."
+                ),
+            )
+            raise
         self._job_complete(brain, job_id, "ingestion", result)
         return result
 
@@ -497,6 +662,42 @@ class Worker:
             params, request_id, "modality-generation"
         )
         progress(0.2, "Activating internal idea vectors")
+        preview_revision = 0
+
+        def preview(
+            generation_progress: float,
+            mime_type: str,
+            payload: bytes,
+        ) -> None:
+            nonlocal preview_revision
+            bounded_progress = 0.2 + 0.75 * max(
+                0.0, min(float(generation_progress), 1.0)
+            )
+            preview_value: Dict[str, Any] = {
+                "revision": preview_revision,
+                "progress": bounded_progress,
+                "statusLabel": "Decoding the current neural latent",
+                "mimeType": mime_type,
+            }
+            if len(payload) <= 12 * 1024 * 1024:
+                preview_value["dataUrl"] = (
+                    "data:%s;base64,%s"
+                    % (
+                        mime_type,
+                        base64.b64encode(payload).decode("ascii"),
+                    )
+                )
+            self.notify(
+                "modality-preview",
+                brain_id=brain.brain_id,
+                job_id=job_id,
+                sequence=preview_revision,
+                progress=bounded_progress,
+                message="Decoding the current neural latent",
+                data={"preview": preview_value},
+            )
+            preview_revision += 1
+
         result = brain.generate_modality(
             modality=str(params.get("modality", "")),
             prompt=str(params.get("prompt", "")),
@@ -508,9 +709,152 @@ class Worker:
                 else {}
             ),
             seed=int(params["seed"]) if params.get("seed") is not None else None,
+            preview_callback=preview,
         )
         self._job_complete(brain, job_id, "modality-generation", result)
         return result
+
+    def evolution_propose(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        brain, job_id, progress = self._job(
+            params, request_id, "neural-evolution-proposal"
+        )
+        texts = params.get("texts")
+        if texts is None and isinstance(params.get("text"), str):
+            texts = [params["text"]]
+        if texts is not None and not (
+            isinstance(texts, list)
+            and all(isinstance(value, str) for value in texts)
+        ):
+            raise RpcFault(-32602, "params.texts must be a string array")
+        source_ids = params.get("sourceIds")
+        if source_ids is not None and not (
+            isinstance(source_ids, list)
+            and all(isinstance(value, str) for value in source_ids)
+        ):
+            raise RpcFault(-32602, "params.sourceIds must be a string array")
+        objectives = params.get("objectives")
+        if objectives is not None and not (
+            isinstance(objectives, list)
+            and all(isinstance(value, str) for value in objectives)
+        ):
+            raise RpcFault(-32602, "params.objectives must be a string array")
+        provenance = params.get("provenance")
+        if provenance is not None and not isinstance(provenance, dict):
+            raise RpcFault(-32602, "params.provenance must be an object")
+        architecture = params.get("architectureChange")
+        if architecture is not None and not isinstance(architecture, dict):
+            raise RpcFault(
+                -32602, "params.architectureChange must be an object"
+            )
+        try:
+            result = NeuralEvolutionManager(brain).propose(
+                texts=texts,
+                source_ids=source_ids,
+                epochs=int(params.get("epochs", params.get("steps", 1))),
+                learning_rate=(
+                    _number(params.get("learningRate"))
+                    if params.get("learningRate") is not None
+                    else None
+                ),
+                latent_replay=bool(params.get("latentReplay", False)),
+                objectives=objectives,
+                provenance=provenance,
+                architecture_change=architecture,
+                progress=progress,
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+        self._job_complete(brain, job_id, "neural-evolution-proposal", result)
+        return result
+
+    def evolution_evaluate(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        candidate_id = str(params.get("candidateId", ""))
+        if not candidate_id:
+            raise RpcFault(-32602, "params.candidateId is required")
+        try:
+            return NeuralEvolutionManager(self._get(params)).evaluate(
+                candidate_id
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def evolution_list(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        return NeuralEvolutionManager(self._get(params)).list()
+
+    def evolution_promote(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        candidate_id = str(params.get("candidateId", ""))
+        if not candidate_id:
+            raise RpcFault(-32602, "params.candidateId is required")
+        brain = self._get(params)
+        try:
+            result = NeuralEvolutionManager(brain).promote(candidate_id)
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+        previous = self.brains.pop(brain.brain_id, None)
+        if previous is not None:
+            previous.events.close()
+        reloaded = AdaptiveBrain.load(
+            brain.storage_path, expected_brain_id=brain.brain_id
+        )
+        self.brains[brain.brain_id] = reloaded
+        result["runtimeCard"] = reloaded.runtime_card()
+        return result
+
+    def evolution_reject(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        candidate_id = str(params.get("candidateId", ""))
+        if not candidate_id:
+            raise RpcFault(-32602, "params.candidateId is required")
+        try:
+            return NeuralEvolutionManager(self._get(params)).reject(
+                candidate_id, str(params.get("reason", ""))
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def evolution_rollback(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        candidate_id = str(params.get("candidateId", ""))
+        if not candidate_id:
+            raise RpcFault(-32602, "params.candidateId is required")
+        brain = self._get(params)
+        try:
+            result = NeuralEvolutionManager(brain).rollback(
+                candidate_id, force=bool(params.get("force", False))
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+        previous = self.brains.pop(brain.brain_id, None)
+        if previous is not None:
+            previous.events.close()
+        reloaded = AdaptiveBrain.load(
+            brain.storage_path, expected_brain_id=brain.brain_id
+        )
+        self.brains[brain.brain_id] = reloaded
+        result["runtimeCard"] = reloaded.runtime_card()
+        return result
+
+    def export_ternary(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        brain = self._get(params)
+        return brain.export_packed_ternary()
 
     def snapshot(
         self, params: Dict[str, Any], request_id: Optional[str]

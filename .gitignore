@@ -8,6 +8,9 @@ playwright-report/
 .runtime/
 .engine-build/
 engine-dist/
+__pycache__/
+*.py[cod]
+.codex/
 *.omni
 *.log
 .DS_Store

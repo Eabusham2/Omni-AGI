@@ -47,9 +47,10 @@ Human Consolidation uses Encode and scheduled Consolidate. Synapses Only erases 
 - Micro, Personal, and GPU profiles checkpoint decoder-block activations during
   training. Replay remains on CPU until used, and all durable checkpoints are
   non-executable safe tensors.
-- Optimizer internals and data cursors are not persisted. The checkpoint format
-  deliberately avoids pickle, so an interrupted slow job restarts rather than
-  resuming at an exact optimizer step.
+- Optimizer internals are not persisted because the checkpoint format avoids
+  pickle. Dataset manifests, per-file cursors, coverage, and crawler frontiers
+  are persisted separately, so an interrupted corpus job resumes at its next
+  atomic file without skipping a committed file.
 - Interrupted training candidates are marked `interrupted` and quarantined on
   the next load; a killed-worker integration fixture verifies that stable model
   parameters and counters survive.
@@ -69,6 +70,21 @@ The current human turn is ordinary model input. Long-term memory is not pasted b
 
 ## Web and dataset training
 
-Catalog and crawl jobs record URLs, hashes, timestamps, quarantine state, and declared licensing. Bounded files and pages are processed incrementally instead of concatenating an entire crawl into one prompt or in-memory corpus. The training engine does not execute code found in a dataset or repository unless the separate code tool is explicitly granted authority.
+Catalog and crawl jobs record URLs, hashes, timestamps, quarantine state, and
+declared licensing. Dataset traversal has no product-defined file, byte, row,
+or chunk ceiling: it writes a deterministic manifest, streams every regular
+file, and records processed/rejected coverage. Supported readers include
+PDF/text/source, CSV/TSV, JSON/JSONL, Parquet, Arrow IPC, SQLite, ZIP/TAR and
+WebDataset shards, EPUB/Office archives, and local Hugging Face-style
+`data_files` manifests. PyArrow handles columnar batches without loading an
+entire table.
+
+The web crawler uses a brain-local SQLite frontier. It follows the same site by
+default, fetches concurrently, obeys `robots.txt` by default, and continues
+until stopped, an optional page/depth condition is reached, or its frontier is
+empty. Resume requeues in-flight pages and retains visited URLs, failures, and
+provenance. Neither datasets nor crawls are concatenated into a prompt or
+in-memory corpus. The training engine does not execute code found in a dataset
+or repository unless the separate code tool is explicitly granted authority.
 
 Declarative build recipes may select a blank or compatible starter origin, architecture recipe, hardware tier, memory policy, modalities, and initial tool grant. A recipe cannot contain commands. Modality packs carry only a model card, manifest, checksum ledger, and safe tensors; installation is namespace-, shape-, architecture-, and license-validated twice. See [CATALOG_FORMATS.md](CATALOG_FORMATS.md).

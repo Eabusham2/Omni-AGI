@@ -5,14 +5,22 @@ the complete learning/generation paths without pretending to provide the
 quality of a large pretrained image, audio, or video model.
 """
 
-from typing import Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from .config import OmniConfig
-from .model import BitLinear
+from .model import (
+    BitConv1d,
+    BitConv2d,
+    BitConv3d,
+    BitConvTranspose1d,
+    BitConvTranspose2d,
+    BitConvTranspose3d,
+    BitLinear,
+)
 
 
 class VectorQuantizer(nn.Module):
@@ -47,9 +55,9 @@ class TinyVisionEncoder(nn.Module):
     def __init__(self, shared_dim: int, channels: int = 16):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, channels, 3, stride=2, padding=1),
+            BitConv2d(3, channels, 3, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(channels, channels * 2, 3, stride=2, padding=1),
+            BitConv2d(channels, channels * 2, 3, stride=2, padding=1),
             nn.SiLU(),
             nn.AdaptiveAvgPool2d(1),
         )
@@ -197,15 +205,15 @@ class TinyImageImagination(nn.Module):
         self.channels = channels
         self.latent_size = image_size // 4
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, channels, 4, stride=2, padding=1),
+            BitConv2d(3, channels, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, 4, stride=2, padding=1),
+            BitConv2d(channels, channels, 4, stride=2, padding=1),
         )
         self.quantizer = VectorQuantizer(32, channels)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(channels, channels, 4, stride=2, padding=1),
+            BitConvTranspose2d(channels, channels, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.ConvTranspose2d(channels, 3, 4, stride=2, padding=1),
+            BitConvTranspose2d(channels, 3, 4, stride=2, padding=1),
             nn.Tanh(),
         )
         self.idea_projection = BitLinear(shared_dim, channels, bias=True)
@@ -247,7 +255,13 @@ class TinyImageImagination(nn.Module):
         }
 
     def generate(
-        self, idea: torch.Tensor, generator: torch.Generator, steps: int = 4
+        self,
+        idea: torch.Tensor,
+        generator: torch.Generator,
+        steps: int = 4,
+        preview_callback: Optional[
+            Callable[[float, torch.Tensor], None]
+        ] = None,
     ) -> torch.Tensor:
         latent = torch.randn(
             idea.shape[0],
@@ -268,6 +282,11 @@ class TinyImageImagination(nn.Module):
             )
             latent = latent - rate * prediction
             latent = 0.9 * latent + 0.1 * condition
+            if preview_callback is not None:
+                preview_callback(
+                    float(index + 1) / float(max(1, steps)),
+                    self.decoder(latent).clamp(-1.0, 1.0),
+                )
         return self.decoder(latent).clamp(-1.0, 1.0)
 
 
@@ -280,16 +299,16 @@ class TinyAudioCodec(nn.Module):
         self.channels = channels
         self.latent_samples = samples // 4
         self.encoder = nn.Sequential(
-            nn.Conv1d(1, channels, 4, stride=2, padding=1),
+            BitConv1d(1, channels, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv1d(channels, channels, 4, stride=2, padding=1),
+            BitConv1d(channels, channels, 4, stride=2, padding=1),
         )
         self.quantizer_a = VectorQuantizer(32, channels)
         self.quantizer_b = VectorQuantizer(16, channels)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose1d(channels, channels, 4, stride=2, padding=1),
+            BitConvTranspose1d(channels, channels, 4, stride=2, padding=1),
             nn.SiLU(),
-            nn.ConvTranspose1d(channels, 1, 4, stride=2, padding=1),
+            BitConvTranspose1d(channels, 1, 4, stride=2, padding=1),
             nn.Tanh(),
         )
         self.idea_projection = BitLinear(
@@ -326,7 +345,12 @@ class TinyAudioCodec(nn.Module):
         }
 
     def generate(
-        self, idea: torch.Tensor, generator: torch.Generator
+        self,
+        idea: torch.Tensor,
+        generator: torch.Generator,
+        preview_callback: Optional[
+            Callable[[float, torch.Tensor], None]
+        ] = None,
     ) -> torch.Tensor:
         latent = self.idea_projection(idea).view(
             idea.shape[0], self.channels, self.latent_samples
@@ -343,6 +367,11 @@ class TinyAudioCodec(nn.Module):
                 latent, idea, timestep=1.0 - index / 3.0
             )
             latent = 0.8 * latent + 0.2 * predicted
+            if preview_callback is not None:
+                preview_callback(
+                    float(index + 1) / 3.0,
+                    self.decoder(latent).squeeze(1),
+                )
         return self.decoder(latent).squeeze(1)
 
 
@@ -364,18 +393,18 @@ class TinyVideoImagination(nn.Module):
         latent_elements = channels * frames * self.latent_size * self.latent_size
         self.idea_projection = BitLinear(shared_dim, latent_elements, bias=True)
         self.temporal = nn.Sequential(
-            nn.Conv3d(channels, channels, (3, 1, 1), padding=(1, 0, 0)),
+            BitConv3d(channels, channels, (3, 1, 1), padding=(1, 0, 0)),
             nn.SiLU(),
-            nn.Conv3d(channels, channels, (3, 1, 1), padding=(1, 0, 0)),
+            BitConv3d(channels, channels, (3, 1, 1), padding=(1, 0, 0)),
         )
         self.spatial = nn.Sequential(
-            nn.Conv3d(channels, channels, (1, 3, 3), padding=(0, 1, 1)),
+            BitConv3d(channels, channels, (1, 3, 3), padding=(0, 1, 1)),
             nn.SiLU(),
-            nn.Conv3d(channels, channels, (1, 3, 3), padding=(0, 1, 1)),
+            BitConv3d(channels, channels, (1, 3, 3), padding=(0, 1, 1)),
         )
         self.liquid_gate = LiquidTemporalGate(channels)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(
+            BitConvTranspose3d(
                 channels,
                 channels,
                 (1, 4, 4),
@@ -383,7 +412,7 @@ class TinyVideoImagination(nn.Module):
                 padding=(0, 1, 1),
             ),
             nn.SiLU(),
-            nn.ConvTranspose3d(
+            BitConvTranspose3d(
                 channels,
                 3,
                 (1, 4, 4),
@@ -393,7 +422,7 @@ class TinyVideoImagination(nn.Module):
             nn.Tanh(),
         )
         self.encoder = nn.Sequential(
-            nn.Conv3d(
+            BitConv3d(
                 3,
                 channels,
                 (1, 4, 4),
@@ -401,7 +430,7 @@ class TinyVideoImagination(nn.Module):
                 padding=(0, 1, 1),
             ),
             nn.SiLU(),
-            nn.Conv3d(
+            BitConv3d(
                 channels,
                 channels,
                 (1, 4, 4),
@@ -453,7 +482,13 @@ class TinyVideoImagination(nn.Module):
         }
 
     def generate(
-        self, idea: torch.Tensor, generator: torch.Generator, steps: int = 3
+        self,
+        idea: torch.Tensor,
+        generator: torch.Generator,
+        steps: int = 3,
+        preview_callback: Optional[
+            Callable[[float, torch.Tensor], None]
+        ] = None,
     ) -> torch.Tensor:
         condition = self._condition(idea)
         latent = torch.randn(
@@ -470,6 +505,11 @@ class TinyVideoImagination(nn.Module):
             )
             rate = 0.32 / float(index + 1)
             latent = latent - rate * predicted_noise + 0.08 * condition
+            if preview_callback is not None:
+                preview_callback(
+                    float(index + 1) / float(total_steps),
+                    self.decoder(latent).clamp(-1.0, 1.0),
+                )
         return self.decoder(latent).clamp(-1.0, 1.0)
 
 
@@ -496,15 +536,27 @@ class ModalityHub(nn.Module):
 
     @torch.no_grad()
     def generate(
-        self, modality: str, idea: torch.Tensor, seed: int = 0
+        self,
+        modality: str,
+        idea: torch.Tensor,
+        seed: int = 0,
+        preview_callback: Optional[
+            Callable[[float, torch.Tensor], None]
+        ] = None,
     ) -> torch.Tensor:
         self.eval()
         generator = torch.Generator(device=idea.device)
         generator.manual_seed(int(seed))
         if modality == "image":
-            return self.image.generate(idea, generator)
+            return self.image.generate(
+                idea, generator, preview_callback=preview_callback
+            )
         if modality == "audio":
-            return self.audio.generate(idea, generator)
+            return self.audio.generate(
+                idea, generator, preview_callback=preview_callback
+            )
         if modality == "video":
-            return self.video.generate(idea, generator)
+            return self.video.generate(
+                idea, generator, preview_callback=preview_callback
+            )
         raise ValueError("modality must be image, audio, or video")

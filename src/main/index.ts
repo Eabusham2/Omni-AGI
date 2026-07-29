@@ -1,12 +1,15 @@
 import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, session } from "electron";
+import { app, BrowserWindow, dialog, session } from "electron";
 import { IPC } from "../shared/ipc";
 import { BrainRepository, resolveBrainDataRoot } from "./brainRepository";
 import { BrainService, RuntimeJobManager } from "./brainService";
 import { EngineSupervisor } from "./engineSupervisor";
 import { registerIpcHandlers } from "./ipc";
 import { ToolExecutor } from "./toolExecutor";
+import { ChatActionController } from "./chatActionController";
+import { EvolutionController } from "./evolutionController";
+import { IdleCognitionScheduler } from "./idleCognitionScheduler";
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const developmentRendererUrl = process.env.ELECTRON_RENDERER_URL;
@@ -14,6 +17,7 @@ let mainWindow: BrowserWindow | undefined;
 let disposeIpc: (() => void) | undefined;
 let engine: EngineSupervisor | undefined;
 let brainRepository: BrainRepository | undefined;
+let idleCognition: IdleCognitionScheduler | undefined;
 let quitAfterCleanup = false;
 const pendingImports: string[] = [];
 
@@ -108,6 +112,66 @@ function installSecurityPolicy(): void {
   });
 }
 
+async function reviewManagedBetaBrains(repository: BrainRepository): Promise<void> {
+  if (await repository.betaReviewComplete()) return;
+  const candidates = await repository.enumerateManagedBetaBrains();
+  if (candidates.length === 0) {
+    await repository.completeBetaReview("none", []);
+    return;
+  }
+  const visible = candidates.slice(0, 20);
+  const directoryList = visible
+    .map((candidate) => `• ${candidate.name}\n  ${candidate.path}`)
+    .join("\n");
+  const hidden =
+    candidates.length > visible.length
+      ? `\n• …and ${candidates.length - visible.length} more app-managed beta directories.`
+      : "";
+  const decision = await dialog.showMessageBox({
+    type: "warning",
+    title: "Stable v1 found incompatible beta brains",
+    message: `${candidates.length} app-managed beta brain${candidates.length === 1 ? "" : "s"} cannot be opened by stable v1.`,
+    detail:
+      "Keep them on disk, or permanently delete only the exact directories shown below. Omni AGI Studio does not search for or delete external .omni files.\n\n" +
+      directoryList +
+      hidden,
+    buttons: ["Keep beta data", "Permanently delete beta data…"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true
+  });
+  if (decision.response !== 1) {
+    await repository.completeBetaReview(
+      "kept",
+      candidates.map((candidate) => candidate.id)
+    );
+    return;
+  }
+  const confirmation = await dialog.showMessageBox({
+    type: "warning",
+    title: "Permanently delete beta brains?",
+    message: "This cannot be undone.",
+    detail:
+      `Delete ${candidates.length} exact app-managed beta director${candidates.length === 1 ? "y" : "ies"} and all neural checkpoints stored inside? External files are not touched.`,
+    buttons: ["Cancel", "Delete permanently"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true
+  });
+  if (confirmation.response !== 1) {
+    await repository.completeBetaReview(
+      "kept",
+      candidates.map((candidate) => candidate.id)
+    );
+    return;
+  }
+  const deleted = await repository.deleteManagedBetaBrains(
+    candidates.map((candidate) => candidate.id),
+    true
+  );
+  await repository.completeBetaReview("deleted", deleted);
+}
+
 async function createWindow(): Promise<BrowserWindow> {
   const window = new BrowserWindow({
     width: 1480,
@@ -175,6 +239,7 @@ async function bootstrap(): Promise<void> {
   const repository = new BrainRepository(resolveBrainDataRoot(app.getPath("userData")));
   brainRepository = repository;
   await repository.initialize();
+  await reviewManagedBetaBrains(repository);
   engine = new EngineSupervisor({
     appPath,
     resourcesPath: process.resourcesPath
@@ -182,16 +247,26 @@ async function bootstrap(): Promise<void> {
   const service = new BrainService(repository, engine);
   const jobs = new RuntimeJobManager(service, engine);
   const tools = new ToolExecutor(service, jobs);
+  const evolution = new EvolutionController(repository, tools, engine);
+  const actions = new ChatActionController(service, tools, evolution);
+  idleCognition = new IdleCognitionScheduler(repository, actions, {
+    intervalMs: 60_000,
+    minimumIdleSeconds: 45,
+    onError: (error) => console.error("Idle cognition cycle failed:", error)
+  });
   disposeIpc = registerIpcHandlers({
     repository,
     service,
     jobs,
     engine,
     tools,
+    actions,
+    evolution,
     appPath
   });
   mainWindow = await createWindow();
   void engine.start();
+  idleCognition.start();
   const startupImports = [...pendingImports.splice(0), ...queuedOmniPaths(process.argv)];
   if (startupImports.length > 0) await importQueuedBundles(startupImports);
 }
@@ -231,6 +306,7 @@ if (!hasSingleInstanceLock) {
     if (quitAfterCleanup) return;
     event.preventDefault();
     quitAfterCleanup = true;
+    idleCognition?.stop();
     disposeIpc?.();
     void (engine?.stop() ?? Promise.resolve()).finally(() => app.quit());
   });

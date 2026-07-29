@@ -77,12 +77,12 @@
     {
       "id": "browser.automation",
       "label": "Browser automation",
-      "description": "Fetch a public page through SSRF checks, render a script-disabled local snapshot, extract visible text and links, and save a screenshot.",
+      "description": "Operate public pages through a persistent per-brain browser session with validated navigation, clicking, typing, key presses, waits, extraction, screenshots, and visible audit events.",
       "defaultGrant": "off",
       "actions": {
         "task": {
-          "input": { "url": "string", "timeoutMs": "number?" },
-          "output": { "status": "number", "title": "string", "text": "string", "links": "array", "artifactPath": "string" }
+          "input": { "url": "string", "steps": "BrowserStep[]?", "visible": "boolean?", "timeoutMs": "number?" },
+          "output": { "finalUrl": "string", "title": "string", "text": "string", "links": "array", "steps": "array", "artifactPath": "string", "sessionPersistent": "boolean" }
         }
       }
     },
@@ -141,7 +141,17 @@
         },
         "promote": {
           "input": { "worktree": "string", "expectedDiffSha256": "string" },
-          "output": { "promoted": "boolean", "commit": "string", "diffSha256": "string" }
+          "output": {
+            "promoted": "boolean",
+            "commit": "string",
+            "candidateCommit": "string",
+            "parentCommit": "string",
+            "diffSha256": "string"
+          }
+        },
+        "rollback": {
+          "input": { "expectedCommit": "string", "parentCommit": "string" },
+          "output": { "rolledBack": "boolean", "rollbackCommit": "string" }
         }
       }
     }

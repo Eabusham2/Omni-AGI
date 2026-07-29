@@ -1,6 +1,6 @@
 # Omni AGI Studio
 
-Omni AGI Studio is a Windows 11 desktop research environment for building persistent, continuously adapting **OmniCortex** models. A brain may start from recorded random weights or a strictly validated compatible Omni checkpoint, then optionally pretrain on user-selected local data before its first conversation. It is not a wrapper around a hosted language model.
+Omni AGI Studio v1 is a Windows, macOS, and Linux desktop research environment for building persistent, continuously adapting **OmniCortex** models. A brain may start from recorded random weights or a strictly validated compatible Omni checkpoint, then optionally pretrain on user-selected local data before its first conversation. It is not a wrapper around a hosted language model.
 
 The project combines a tiny trainable ternary language cortex, spiking/STDP associative plasticity, liquid temporal state, vector-symbolic idea memory, structural growth, multimodal research packs, one continuous chat, traceable mutations, and portable forks.
 
@@ -46,7 +46,7 @@ A blank origin is intentionally primitive. A compatible starter imports its lear
 
 Run is one continuous local chat. `/tool`, `/imagine`, and `/agent` invoke the same permission-checked executor available to model-produced `<omni-tool>` requests. Tool results are shown in the chat and returned as visible structured experience. A generated call chain is limited to four actions per turn.
 
-## Windows 11 development
+## Desktop development
 
 Prerequisites:
 
@@ -61,35 +61,44 @@ npm run test:python:portable
 npm run dev
 ```
 
-Create a packaged x64 build on x64 Windows:
+Create a package on a native host matching the requested architecture:
 
 ```powershell
+# Windows x64
 npm run package:win
-```
-
-Create an ARM64 desktop build on ARM64 Windows:
-
-```powershell
+# Windows ARM64
 npm run package:win:arm64
 ```
 
-The app uses Electron's Windows 11 Mica background where supported and falls back to the same Fluent-inspired CSS surfaces elsewhere. Packaging produces NSIS and ZIP artifacts for x64 and ARM64. The Windows workflow uses native x64 and ARM64 Windows 11 runners, verifies both packaged worker layouts, and drives each installed application through build, chat, navigation, trace export, imagination, download, and full restart. The ARM64 package has a native ARM64 Electron shell and an x64 PyTorch/PyInstaller worker that runs through Windows 11 x64 emulation, because stable PyTorch Windows ARM64 wheels are not currently available.
+```bash
+# macOS
+npm run package:mac:x64
+npm run package:mac:arm64
+
+# Linux
+npm run package:linux:x64
+npm run package:linux:arm64
+```
+
+Windows produces NSIS and ZIP files, macOS produces DMG and ZIP files, and Linux produces AppImage, DEB, and tar.gz files. Each package embeds a self-contained PyInstaller worker built on the matching OS and architecture. The Windows ARM64 shell intentionally carries an x64 worker for Windows 11 emulation because stable PyTorch Windows ARM64 wheels are not available.
+
+The app uses Windows 11 Mica where supported and the same Fluent-inspired surfaces on other systems. Native-host workflows run source tests, package the worker and desktop, verify architecture, exercise the packaged worker, launch the packaged desktop through Playwright, restart it, and upload checksum-bearing evidence. See [docs/RELEASE.md](docs/RELEASE.md) for the stable release contract.
 
 ## Repository map
 
-- `src/renderer/` — Windows 11 Build and Run interface.
+- `src/renderer/` — cross-platform Build and Run interface.
 - `src/main/` and `src/preload/` — isolated desktop lifecycle, IPC, tools, and brain supervision.
 - `engine/` — custom PyTorch brain, multimodal packs, and JSON-lines worker.
 - `docs/ARCHITECTURE.md` — implemented neural, tool, agent, and persistence paths.
 - `docs/COMPLETION_AUDIT.md` — requirement-to-code map and verified release gates.
 - `docs/OMNI_FORMAT.md` — strict version-1 `.omni` container contract and privacy boundary.
 - `docs/CATALOG_FORMATS.md` — non-executable recipe and `.omnipack` contracts.
-- `BitNet-main/`, `snntorch-master/`, `ncps-master/` — attributed upstream research snapshots.
+- `licenses/` — preserved third-party license texts for the upstream research sources; source snapshots are intentionally not vendored.
 - `RESEARCH.md` — paper/repository-to-feature ledger.
 
 ## Privacy and authority
 
-Brains live below `%LOCALAPPDATA%\OmniAGI\brains` by default. Network access is only used by enabled catalog, crawler, or web tools. Tool grants are stored separately from neural state and can be Off, Ask, Auto, or Full Authority. Ask approvals are short-lived, single-use, and bound to the exact brain, tool, action, and argument digest. Auto still asks for risky operations. Full Authority is intentionally powerful; every action remains visible in the operational trace, and running actions can be cancelled.
+Brains live below `%LOCALAPPDATA%\OmniAGI\brains` on Windows and the Electron application-data directory on macOS and Linux by default. Network access is only used by enabled catalog, crawler, or web tools. Tool grants are stored separately from neural state and can be Off, Ask, Auto, or Full Authority. Ask approvals are short-lived, single-use, and bound to the exact brain, tool, action, and argument digest. Auto still asks for risky operations. Full Authority is intentionally powerful; every action remains visible in the operational trace, and running actions can be cancelled.
 
 The browser tool is a real, isolated snapshot: it performs guarded fetching, sanitizes remote markup into an inert local document, runs only the app's fixed extraction routine, extracts bounded text and links, and saves a PNG. It is not a signed-in or interactive browser controller. Source evolution uses an authorized Git clone and a separate worktree for proposal, diff, allowlisted build/test, exact-diff validation, and optional promotion; it never overwrites the running binary.
 

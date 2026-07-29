@@ -35,6 +35,82 @@ function digest(value: Uint8Array | Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+    .join(",")}}`;
+}
+
+async function writePackedTernaryFixture(directory: string): Promise<void> {
+  const shard = Buffer.from([0b01010101]);
+  const shardHash = digest(shard);
+  const tensorHash = digest(
+    Buffer.concat([
+      Buffer.from(canonicalJson({ dtype: "int8", shape: [1] })),
+      Buffer.from([0]),
+      Buffer.from([0])
+    ])
+  );
+  const manifestBody = {
+    format: "omni-packed-ternary",
+    formatVersion: 1,
+    architecture: "OmniCortex",
+    encoding: {
+      bitsPerValue: 2,
+      byteOrder: "four-values-lsb-first",
+      codes: { "-1": 0, "0": 1, "+1": 2 },
+      reservedCode: 3,
+      paddingValue: 0
+    },
+    coverage: {
+      eligibleTensorCount: 1,
+      eligibleTensorNames: ["fixture.projection.weight"],
+      complete: true
+    },
+    tensors: [
+      {
+        name: "fixture.projection.weight",
+        kind: "projection",
+        shape: [1],
+        dtype: "int8",
+        sourceDtype: "float32",
+        scale: 1,
+        numel: 1,
+        shard: `ternary-00000-${shardHash.slice(0, 16)}.bin`,
+        byteOffset: 0,
+        byteLength: shard.byteLength,
+        packedSha256: shardHash,
+        tensorSha256: tensorHash
+      }
+    ],
+    shards: [
+      {
+        file: `ternary-00000-${shardHash.slice(0, 16)}.bin`,
+        byteLength: shard.byteLength,
+        sha256: shardHash
+      }
+    ],
+    metadata: { fixture: true }
+  };
+  const manifest = {
+    ...manifestBody,
+    contentSha256: digest(canonicalJson(manifestBody))
+  };
+  const manifestBytes = Buffer.from(canonicalJson(manifest));
+  await mkdir(directory, { recursive: true });
+  await Promise.all([
+    writeFile(join(directory, "manifest.json"), manifestBytes),
+    writeFile(join(directory, "manifest.sha256"), `${digest(manifestBytes)}\n`),
+    writeFile(
+      join(directory, `ternary-00000-${shardHash.slice(0, 16)}.bin`),
+      shard
+    )
+  ]);
+}
+
 describe("BrainRepository lifecycle", () => {
   let temporaryRoot: string;
   let repository: BrainRepository;
@@ -49,6 +125,42 @@ describe("BrainRepository lifecycle", () => {
     await rm(temporaryRoot, { recursive: true, force: true });
   });
 
+  it("persists only stable v1 choices and discards beta behavior controls", async () => {
+    const legacyInput = {
+      ...DEFAULT_CONFIG,
+      name: "Unconfigured mind",
+      curiosityDrive: 1,
+      noveltyDrive: 0,
+      noise: 0.99,
+      parallelThoughts: 64,
+      maxConcepts: 16,
+      maxSynapses: 16,
+      growthPolicy: "fixed",
+      ternaryWeights: false
+    } as typeof DEFAULT_CONFIG & Record<string, unknown>;
+    const brain = await repository.create(legacyInput);
+    const stored = JSON.parse(
+      await readFile(join(repository.brainDirectory(brain.id), "brain.json"), "utf8")
+    ) as { config: Record<string, unknown> };
+
+    expect(brain.config).toEqual({
+      ...DEFAULT_CONFIG,
+      name: "Unconfigured mind"
+    });
+    for (const key of [
+      "curiosityDrive",
+      "noveltyDrive",
+      "noise",
+      "parallelThoughts",
+      "maxConcepts",
+      "maxSynapses",
+      "growthPolicy",
+      "ternaryWeights"
+    ]) {
+      expect(stored.config).not.toHaveProperty(key);
+    }
+  });
+
   it("creates an immutable origin and copy-on-write neural fork", async () => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Ada" });
     const engine = join(repository.brainDirectory(brain.id), "engine");
@@ -58,6 +170,7 @@ describe("BrainRepository lifecycle", () => {
       JSON.stringify({
         schema_version: 1,
         format: "omni-cortex-engine",
+        release_format: "stable-1.0",
         brain_id: brain.id,
         name: brain.name,
         config: {},
@@ -83,6 +196,151 @@ describe("BrainRepository lifecycle", () => {
     ).resolves.toBeInstanceOf(Buffer);
   });
 
+  it("duplicates every brain as an independent copy-on-write identity", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Original" });
+    const engine = join(repository.brainDirectory(brain.id), "engine");
+    await mkdir(engine, { recursive: true });
+    await writeFile(
+      join(engine, "brain.json"),
+      JSON.stringify({
+        schema_version: 1,
+        format: "omni-cortex-engine",
+        release_format: "stable-1.0",
+        brain_id: brain.id,
+        name: brain.name,
+        config: {}
+      })
+    );
+    await Promise.all([
+      writeFile(join(engine, "core.safetensors"), emptySafetensors()),
+      writeFile(join(engine, "plasticity.safetensors"), emptySafetensors())
+    ]);
+    await writePackedTernaryFixture(join(engine, "packed-ternary"));
+
+    const duplicate = await repository.duplicate(brain.id);
+    const metadata = JSON.parse(
+      await readFile(
+        join(repository.brainDirectory(duplicate.id), "engine", "brain.json"),
+        "utf8"
+      )
+    ) as { brain_id: string };
+
+    expect(duplicate).toMatchObject({
+      name: "Original copy",
+      lineage: {
+        parentId: brain.id,
+        rootId: brain.id,
+        generation: 1
+      }
+    });
+    expect(metadata.brain_id).toBe(duplicate.id);
+    expect(duplicate.journal?.at(-1)?.summary).toMatch(
+      /Duplicated.*copy-on-write/i
+    );
+    await expect(repository.get(brain.id)).resolves.toMatchObject({
+      id: brain.id,
+      name: "Original"
+    });
+    await Promise.all([
+      expect(
+        readFile(
+          join(
+            repository.brainDirectory(duplicate.id),
+            "engine",
+            "packed-ternary",
+            "manifest.json"
+          )
+        )
+      ).resolves.toBeInstanceOf(Buffer),
+      expect(
+        readFile(
+          join(
+            repository.brainDirectory(duplicate.id),
+            "engine",
+            "origin",
+            "packed-ternary",
+            "manifest.json"
+          )
+        )
+      ).resolves.toBeInstanceOf(Buffer)
+    ]);
+  });
+
+  it("enumerates only app-managed beta directories and deletes them only after confirmation", async () => {
+    const stable = await repository.create({ ...DEFAULT_CONFIG, name: "Stable mind" });
+    const betaId = "managed-beta";
+    const betaDirectory = repository.brainDirectory(betaId);
+    await mkdir(betaDirectory, { recursive: true });
+    await writeFile(
+      join(betaDirectory, "brain.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        id: betaId,
+        name: "Old beta mind"
+      })
+    );
+    const externalBundle = join(temporaryRoot, "external-beta.omni");
+    await writeFile(externalBundle, "external beta file");
+
+    const candidates = await repository.enumerateManagedBetaBrains();
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        id: betaId,
+        name: "Old beta mind",
+        path: betaDirectory,
+        reason: "beta-document"
+      })
+    ]);
+    await expect(
+      repository.deleteManagedBetaBrains([betaId], false)
+    ).rejects.toThrow(/explicit confirmation/i);
+    await expect(readFile(join(betaDirectory, "brain.json"), "utf8")).resolves.toContain(
+      "Old beta mind"
+    );
+
+    await expect(
+      repository.deleteManagedBetaBrains([betaId], true)
+    ).resolves.toEqual([betaId]);
+    await expect(stat(betaDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(repository.get(stable.id)).resolves.toMatchObject({ id: stable.id });
+    await expect(readFile(externalBundle, "utf8")).resolves.toBe("external beta file");
+
+    expect(await repository.betaReviewComplete()).toBe(false);
+    await repository.completeBetaReview("deleted", [betaId]);
+    expect(await repository.betaReviewComplete()).toBe(true);
+  });
+
+  it("rejects beta local documents and beta materialized engine exports", async () => {
+    const betaId = "beta-local";
+    const betaDirectory = repository.brainDirectory(betaId);
+    await mkdir(betaDirectory, { recursive: true });
+    await writeFile(
+      join(betaDirectory, "brain.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        id: betaId,
+        name: "Beta local",
+        config: DEFAULT_CONFIG
+      })
+    );
+    await expect(repository.get(betaId)).rejects.toThrow(/beta brain/i);
+
+    const stable = await repository.create({ ...DEFAULT_CONFIG, name: "Stable shell" });
+    const engine = join(repository.brainDirectory(stable.id), "engine");
+    await mkdir(engine, { recursive: true });
+    await writeFile(
+      join(engine, "brain.json"),
+      JSON.stringify({
+        schema_version: 1,
+        format: "omni-cortex-engine",
+        brain_id: stable.id
+      })
+    );
+    await expect(
+      repository.exportBundle(stable.id, join(temporaryRoot, "beta-engine.omni"))
+    ).rejects.toThrow(/beta engine/i);
+  });
+
   it("snapshots and restores both inspectable and neural state", async () => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Snapshot mind" });
     const engine = join(repository.brainDirectory(brain.id), "engine");
@@ -92,6 +350,7 @@ describe("BrainRepository lifecycle", () => {
       JSON.stringify({
         schema_version: 1,
         format: "omni-cortex-engine",
+        release_format: "stable-1.0",
         brain_id: brain.id,
         marker: "before"
       })
@@ -100,6 +359,10 @@ describe("BrainRepository lifecycle", () => {
       writeFile(join(engine, "core.safetensors"), emptySafetensors()),
       writeFile(join(engine, "plasticity.safetensors"), emptySafetensors())
     ]);
+    await writePackedTernaryFixture(join(engine, "packed-ternary"));
+    const packedBefore = await readFile(
+      join(engine, "packed-ternary", "manifest.json")
+    );
     const snapshot = await repository.snapshot(brain.id, "before mutation");
 
     const mutated = await repository.get(brain.id);
@@ -111,10 +374,12 @@ describe("BrainRepository lifecycle", () => {
       JSON.stringify({
         schema_version: 1,
         format: "omni-cortex-engine",
+        release_format: "stable-1.0",
         brain_id: brain.id,
         marker: "after"
       })
     );
+    await writeFile(join(engine, "packed-ternary", "manifest.json"), "{}");
 
     const restored = await repository.restoreSnapshot(brain.id, snapshot.id);
     const engineState = JSON.parse(await readFile(join(engine, "brain.json"), "utf8")) as {
@@ -123,6 +388,9 @@ describe("BrainRepository lifecycle", () => {
     expect(restored.name).toBe("Snapshot mind");
     expect(engineState.marker).toBe("before");
     expect(snapshot.engineChecksum).toMatch(/^[a-f0-9]{64}$/);
+    await expect(
+      readFile(join(engine, "packed-ternary", "manifest.json"))
+    ).resolves.toEqual(packedBefore);
   });
 
   it("round-trips a checksum-verified ZIP and omits private sources by default", async () => {
@@ -132,6 +400,7 @@ describe("BrainRepository lifecycle", () => {
     const engineState = {
       schema_version: 1,
       format: "omni-cortex-engine",
+      release_format: "stable-1.0",
       brain_id: brain.id,
       name: brain.name,
       config: { name: brain.name },
@@ -145,6 +414,10 @@ describe("BrainRepository lifecycle", () => {
       writeFile(join(engine, "origin", "brain.json"), JSON.stringify(engineState)),
       writeFile(join(engine, "origin", "core.safetensors"), emptySafetensors()),
       writeFile(join(engine, "origin", "plasticity.safetensors"), emptySafetensors())
+    ]);
+    await Promise.all([
+      writePackedTernaryFixture(join(engine, "packed-ternary")),
+      writePackedTernaryFixture(join(engine, "origin", "packed-ternary"))
     ]);
     const sourceBytes = Buffer.from("private source material");
     const copiedCredential = `sk-${"a".repeat(32)}`;
@@ -192,6 +465,8 @@ describe("BrainRepository lifecycle", () => {
         "state/brain.json",
         "state/engine.json",
         "tensors/core.safetensors",
+        "packed/current/manifest.json",
+        "packed/origin/manifest.json",
         "origin/state/brain.json"
       ])
     );
@@ -208,7 +483,13 @@ describe("BrainRepository lifecycle", () => {
     };
     expect(manifest).toMatchObject({
       architecture: "OmniCortex",
-      architectureSchemaVersion: 1
+      architectureSchemaVersion: 1,
+      packedTernary: {
+        format: "omni-packed-ternary",
+        formatVersion: 1,
+        currentTensorCount: 1,
+        originTensorCount: 1
+      }
     });
     expect(manifest.secretRedaction.replacements).toBeGreaterThan(0);
     expect(manifest.licenseLedger.application).toContain("PolyForm");
@@ -228,6 +509,16 @@ describe("BrainRepository lifecycle", () => {
       await readFile(join(repository.brainDirectory(imported.id), "engine", "brain.json"), "utf8")
     ) as { brain_id: string };
     expect(importedEngine.brain_id).toBe(imported.id);
+    await expect(
+      readFile(
+        join(
+          repository.brainDirectory(imported.id),
+          "engine",
+          "packed-ternary",
+          "manifest.json"
+        )
+      )
+    ).resolves.toBeInstanceOf(Buffer);
 
     const privatePath = join(temporaryRoot, "private.omni");
     await repository.exportBundle(brain.id, privatePath, "private-archive");
@@ -267,6 +558,32 @@ describe("BrainRepository lifecycle", () => {
     );
   });
 
+  it("rejects a checksum-valid beta bundle without the stable release discriminator", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Stable bundle" });
+    const portablePath = join(temporaryRoot, "stable.omni");
+    await repository.exportBundle(brain.id, portablePath, "current");
+    const entries = unzipSync(new Uint8Array(await readFile(portablePath)));
+    const manifest = JSON.parse(strFromU8(entries["manifest.json"]!)) as Record<
+      string,
+      unknown
+    >;
+    delete manifest.releaseFormat;
+    entries["manifest.json"] = Buffer.from(JSON.stringify(manifest, null, 2));
+    entries["checksums.sha256"] = Buffer.from(
+      Object.entries(entries)
+        .filter(([path]) => path !== "checksums.sha256")
+        .map(([path, contents]) => `${digest(contents)}  ${path}`)
+        .sort()
+        .join("\n") + "\n"
+    );
+    await expect(
+      repository.importBundleBuffer(
+        Buffer.from(zipSync(entries)),
+        "old-beta.omni"
+      )
+    ).rejects.toThrow(/beta .omni bundle/i);
+  });
+
   it("refuses a private source archive when retained text appears to contain a credential", async () => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Private mind" });
     const secretBytes = Buffer.from(`api_key=sk-${"b".repeat(36)}`);
@@ -300,6 +617,7 @@ describe("BrainRepository lifecycle", () => {
     const engineState = {
       schema_version: 1,
       format: "omni-cortex-engine",
+      release_format: "stable-1.0",
       brain_id: brain.id,
       name: brain.name,
       config: {},
@@ -315,6 +633,10 @@ describe("BrainRepository lifecycle", () => {
       writeFile(join(engine, "origin", "brain.json"), JSON.stringify(engineState)),
       writeFile(join(engine, "origin", "core.safetensors"), core),
       writeFile(join(engine, "origin", "plasticity.safetensors"), plastic)
+    ]);
+    await Promise.all([
+      writePackedTernaryFixture(join(engine, "packed-ternary")),
+      writePackedTernaryFixture(join(engine, "origin", "packed-ternary"))
     ]);
 
     const portablePath = join(temporaryRoot, "full.omni");

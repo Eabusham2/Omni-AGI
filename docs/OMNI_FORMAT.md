@@ -35,9 +35,29 @@ origin/tensors/core.safetensors
 origin/tensors/plastic.safetensors
 ```
 
+When `engineMaterialized` is true, both exact inference payloads are also
+required:
+
+```text
+packed/current/manifest.json
+packed/current/manifest.sha256
+packed/current/ternary-<index>-<digest>.bin
+packed/origin/manifest.json
+packed/origin/manifest.sha256
+packed/origin/ternary-<index>-<digest>.bin
+```
+
 `state/brain.json` is inspectable Electron state: configuration, lineage, messages, traces, journal, concept/synapse summaries, and sanitized or archived source metadata. `state/engine.json` is Python-worker metadata. Core safe tensors contain slow neural and modality parameters; plastic safe tensors contain SNN state, VSA vectors, replay tensors, liquid activity, and other mutable recurrent state.
 
-Private archives may add `blobs/<sha256>` source objects. Referenced-local bundles keep all required paths but replace their four tensor entries with valid placeholder safe tensors; the manifest points to the real content-addressed tensor hashes held by the originating local repository.
+Each `packed/**` directory is a complete `omni-packed-ternary` inference
+package. Its manifest enumerates every eligible neural projection plus the
+dynamically grown substrate synapses, records each shape and per-tensor scale,
+and requires complete coverage. The binary shards use deterministic two-bit
+codes, least-significant pair first: `00 = -1`, `01 = 0`, `10 = +1`; `11` is
+reserved and rejected. Unused pairs must use canonical zero padding (`01`).
+`manifest.sha256` authenticates the exact canonical manifest bytes.
+
+Private archives may add `blobs/<sha256>` source objects. Referenced-local bundles keep all required paths but replace their four safe-tensor entries with valid placeholder safe tensors and every packed-ternary entry with a local-reference marker. The manifest points to the real content-addressed objects held by the originating local repository.
 
 ## Manifest contract
 
@@ -47,10 +67,13 @@ The manifest records and validates:
 - export timestamp, brain ID, display name, and lineage;
 - one declared export mode;
 - materialized-engine status, memory recipe, raw-episode status, and `ternary-effective` quantization;
+- the current and immutable-origin packed-ternary manifest hashes, tensor
+  counts, and—only for referenced-local mode—per-file object references;
 - secret-redaction policy version and replacement count;
 - an application-license declaration and normalized per-source provenance/license ledger;
 - SHA-256 and exact byte length for every payload entry except `manifest.json` and `checksums.sha256`;
-- for referenced-local mode, the SHA-256 object IDs for current and origin core/plasticity tensors.
+- for referenced-local mode, the SHA-256 object IDs for current and origin
+  core/plasticity tensors and every current/origin packed-ternary file.
 
 Every source record must make its redistribution status visible. A source without declared licensing is labeled `Undeclared; verify before redistribution`; absence of a declaration is not converted into permission.
 
@@ -69,6 +92,10 @@ Before materializing a brain, the importer:
 - requires the exact supported architecture, schema, export mode, redaction policy, and license-ledger shape;
 - parses every required JSON document;
 - validates all four final safe-tensor headers and data offsets without deserializing code, after resolving local references when applicable;
+- requires both complete packed-ternary packages for every materialized stable
+  brain, rejects undeclared or extra pack files, and validates manifest,
+  shard, packed-payload, decoded-tensor, reserved-code, canonical-padding, and
+  eligible-projection coverage checksums before materializing the brain;
 - verifies content-addressed object names against their bytes;
 - resolves referenced tensors only from the destination repository's local object store and then validates the resolved safe tensors.
 
@@ -83,7 +110,14 @@ If an imported brain ID already exists, the importer assigns a new ID and advanc
 | `private-archive` | `private-archive` | Current state plus retained source blobs after confirmation | Self-contained and sensitive |
 | `referenced` | `referenced-local` | Sanitized current state with local tensor references | Same repository only |
 
-Every mode includes an `origin/**` payload. In a referenced-local bundle the exporter emits valid safe-tensor placeholders until import resolves the four declared hashes. Export first stores the real tensor bytes in the repository `.blobs` store. A different installation without those exact objects rejects the import, so referenced-local files must not be advertised as portable or shareable checkpoints.
+Every mode includes an `origin/**` payload and both `packed/current/**` and
+`packed/origin/**` when the neural engine is materialized. In a
+referenced-local bundle the exporter emits valid safe-tensor placeholders and
+packed-file reference markers until import resolves every declared hash.
+Export first stores the real tensor and packed bytes in the repository
+`.blobs` store. A different installation without those exact objects rejects
+the import, so referenced-local files must not be advertised as portable or
+shareable checkpoints.
 
 ## Privacy and secret-redaction boundary
 

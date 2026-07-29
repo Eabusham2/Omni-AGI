@@ -9,6 +9,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ExpectedSigningText = if ($env:OMNI_EXPECT_SIGNED) {
+  $env:OMNI_EXPECT_SIGNED.Trim()
+} else {
+  "0"
+}
+if ($ExpectedSigningText -notin @("0", "1")) {
+  throw "OMNI_EXPECT_SIGNED must be 0 or 1."
+}
+$ExpectedSigned = $ExpectedSigningText -eq "1"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ReleaseRoot) {
   $ReleaseRoot = Join-Path $RepoRoot "release"
@@ -64,6 +73,33 @@ function Get-PeArchitecture {
   }
   finally {
     $Reader.Dispose()
+  }
+}
+
+function Get-SignatureRecord {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+  $Signature = Get-AuthenticodeSignature -LiteralPath $Path
+  return @{
+    status = $Signature.Status.ToString()
+    valid = $Signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid
+    signerSubject = if ($null -ne $Signature.SignerCertificate) {
+      $Signature.SignerCertificate.Subject
+    } else {
+      ""
+    }
+    signerThumbprint = if ($null -ne $Signature.SignerCertificate) {
+      $Signature.SignerCertificate.Thumbprint
+    } else {
+      ""
+    }
+    timestampSubject = if ($null -ne $Signature.TimeStamperCertificate) {
+      $Signature.TimeStamperCertificate.Subject
+    } else {
+      ""
+    }
   }
 }
 
@@ -148,6 +184,16 @@ try {
   if ($ZipWorkerArch -ne $ExpectedWorkerArch) {
     throw "ZIP worker architecture $ZipWorkerArch does not match expected $ExpectedWorkerArch."
   }
+  $ZipApps = @(
+    Get-ChildItem -Path $ZipRoot -Recurse -Force -File -Filter "Omni AGI Studio.exe"
+  )
+  if ($ZipApps.Count -ne 1) {
+    throw "ZIP package must contain exactly one Omni AGI Studio.exe."
+  }
+  $ZipAppArch = Get-PeArchitecture -Path $ZipApps[0].FullName
+  if ($ZipAppArch -ne $Arch) {
+    throw "ZIP desktop architecture $ZipAppArch does not match package architecture $Arch."
+  }
   $ZipSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $ZipWorkers[0].FullName `
     -BrainRoot (Join-Path $Scratch "zip-brain")
@@ -180,6 +226,31 @@ try {
   $AppArch = Get-PeArchitecture -Path $AppExecutable.FullName
   if ($AppArch -ne $Arch) {
     throw "Installed app architecture $AppArch does not match package architecture $Arch."
+  }
+  $InstallerSignature = Get-SignatureRecord -Path $Installer.FullName
+  $ZipAppSignature = Get-SignatureRecord -Path $ZipApps[0].FullName
+  $InstalledAppSignature = Get-SignatureRecord -Path $AppExecutable.FullName
+  $SignatureRecords = @(
+    $InstallerSignature,
+    $ZipAppSignature,
+    $InstalledAppSignature
+  )
+  $ValidSignatureCount = @(
+    $SignatureRecords | Where-Object { $_.valid -eq $true }
+  ).Count
+  $InvalidSignatureCount = @(
+    $SignatureRecords |
+      Where-Object { $_.status -notin @("Valid", "NotSigned") }
+  ).Count
+  $FullySigned = $ValidSignatureCount -eq $SignatureRecords.Count
+  if ($InvalidSignatureCount -gt 0) {
+    throw "One or more Windows artifacts has an invalid Authenticode signature."
+  }
+  if ($ValidSignatureCount -gt 0 -and -not $FullySigned) {
+    throw "Windows package signing is inconsistent across installer and desktop binaries."
+  }
+  if ($ExpectedSigned -and -not $FullySigned) {
+    throw "Signing credentials were configured, but the Windows package is not fully signed."
   }
 
   Write-Host "Package smoke [$Arch]: exercising installed neural worker."
@@ -231,6 +302,8 @@ try {
       sha256 = (Get-FileHash -Algorithm SHA256 $Zip.FullName).Hash.ToLowerInvariant()
       packagedWorker = $ZipWorkers[0].FullName.Substring($ZipRoot.Length)
       packagedWorkerArchitecture = $ZipWorkerArch
+      desktopArchitecture = $ZipAppArch
+      desktopSignature = $ZipAppSignature
       rpcSmoke = $ZipSmoke | ConvertFrom-Json
     }
     nsis = @{
@@ -240,6 +313,8 @@ try {
       packagedWorker = $InstalledWorkers[0].FullName.Substring($InstallRoot.Length)
       packagedWorkerArchitecture = $InstalledWorkerArch
       desktopArchitecture = $AppArch
+      installerSignature = $InstallerSignature
+      desktopSignature = $InstalledAppSignature
       rpcSmoke = $InstalledSmoke | ConvertFrom-Json
       desktopLaunch = $AppLaunched
       desktopEndToEnd = $DesktopE2E
@@ -247,6 +322,15 @@ try {
       accessibilityNavigation = $DesktopE2E
       modalityGeneration = $DesktopE2E
       desktopLaunchSkippedReason = $LaunchSkipReason
+    }
+    signing = @{
+      expectedSigned = $ExpectedSigned
+      fullySigned = $FullySigned
+      state = if ($FullySigned) {
+        "signed"
+      } else {
+        "unsigned-signed-ready"
+      }
     }
   } | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 $EvidencePath
   Write-Host "Windows package smoke evidence: $EvidencePath"

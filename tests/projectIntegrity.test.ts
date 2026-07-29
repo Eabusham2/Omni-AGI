@@ -121,6 +121,48 @@ describe("project integrity", () => {
     }
   });
 
+  it("keeps stable Build raw, removable, and locally starter-first", () => {
+    const renderer = read("src/renderer/src/App.tsx");
+    const preload = read("src/preload/index.ts");
+    const ipc = read("src/main/ipc.ts");
+    const repository = read("src/main/brainRepository.ts");
+
+    expect(renderer).not.toContain('type="range"');
+    expect(renderer).not.toContain("Internal freedom");
+    expect(renderer).not.toContain("curiosityDrive");
+    expect(renderer).toContain('imagination: "auto"');
+    expect(renderer).toContain("Remove only changes this build list");
+    expect(renderer).toContain("window.omni?.data.discardBuildResource");
+    expect(renderer).toContain("window.omni.brain.duplicate");
+    expect(renderer).not.toContain("const first = starters[0]");
+    expect(preload).toContain("selectBuildResources");
+    expect(preload).toContain("startBuildResource");
+    expect(ipc).toContain("buildSelections.delete");
+    expect(repository).toContain("copy-on-write neural storage");
+  });
+
+  it("exposes ordered mid-turn neural streaming without prose action parsing", () => {
+    const types = read("src/shared/types.ts");
+    const channels = read("src/shared/ipc.ts");
+    const preload = read("src/preload/index.ts");
+    const ipc = read("src/main/ipc.ts");
+    const controller = read("src/main/chatActionController.ts");
+    const protocol = read("docs/STREAMING_PROTOCOL.md");
+
+    expect(types).toContain('type: "chat-token"');
+    expect(types).toContain('type: "modality-preview"');
+    expect(types).toContain("onStream(listener:");
+    expect(channels).toContain('streamEvent: "omni:chat:stream-event"');
+    expect(channels).toContain('cancel: "omni:chat:cancel"');
+    expect(preload).toContain("onStream: (listener)");
+    expect(preload).toContain("IPC.chat.streamEvent");
+    expect(ipc).toContain('actions.on("stream", streamListener)');
+    expect(controller).not.toContain("parseHumanAction");
+    expect(controller).not.toContain("parseModelActions");
+    expect(protocol).toContain("monotonically increasing");
+    expect(protocol).toContain("never parsed into actions");
+  });
+
   it("keeps both Windows architectures in continuous packaging coverage", () => {
     const workflow = read(".github/workflows/windows.yml");
     const packageDocument = readJson<{
@@ -142,7 +184,9 @@ describe("project integrity", () => {
     expect(workflow).toContain("npm run build:engine:win");
     expect(workflow).toContain("smoke-engine.ps1");
     expect(workflow).toContain("smoke-windows-package.ps1");
-    expect(workflow).toContain("windows-package-smoke-*.json");
+    expect(workflow).toContain(
+      "windows-package-smoke-${{ matrix.arch }}.json"
+    );
     expect(read("scripts/smoke-engine.ps1")).toContain(
       'Invoke-WorkerRpc -Id "health" -Method "health"'
     );
@@ -184,6 +228,71 @@ describe("project integrity", () => {
     );
     expect(read("playwright.config.ts")).toContain(
       "retries: process.env.CI ? 1 : 0"
+    );
+  });
+
+  it("defines the stable v1 release across Windows, macOS, and Linux", () => {
+    const packageDocument = readJson<{
+      version: string;
+      description: string;
+      scripts: Record<string, string>;
+      build: {
+        mac: { target: string[]; artifactName: string };
+        linux: { target: string[]; artifactName: string };
+      };
+    }>("package.json");
+    const packageLock = readJson<{
+      version: string;
+      packages: Record<string, { version: string }>;
+    }>("package-lock.json");
+    const macos = read(".github/workflows/macos.yml");
+    const linux = read(".github/workflows/linux.yml");
+    const release = read(".github/workflows/release.yml");
+
+    expect(packageDocument.version).toBe("1.0.0");
+    expect(packageLock.version).toBe(packageDocument.version);
+    expect(packageLock.packages[""]?.version).toBe(packageDocument.version);
+    expect(packageDocument.description).toContain("cross-platform");
+    expect(packageDocument.build.mac.target).toEqual(
+      expect.arrayContaining(["dmg", "zip"])
+    );
+    expect(packageDocument.build.linux.target).toEqual(
+      expect.arrayContaining(["AppImage", "deb", "tar.gz"])
+    );
+    expect(packageDocument.build.mac.artifactName).toContain("macOS-${arch}");
+    expect(packageDocument.build.linux.artifactName).toContain("Linux-${arch}");
+    for (const script of [
+      "package:mac:x64",
+      "package:mac:arm64",
+      "package:linux:x64",
+      "package:linux:arm64",
+      "verify:release"
+    ]) {
+      expect(packageDocument.scripts[script]).toBeTypeOf("string");
+    }
+
+    expect(macos).toContain("runner: macos-15-intel");
+    expect(macos).toContain("runner: macos-15");
+    expect(macos).toContain("package:mac:${{ matrix.arch }}");
+    expect(macos).toContain("--desktop-e2e");
+    expect(linux).toContain("runner: ubuntu-24.04");
+    expect(linux).toContain("runner: ubuntu-24.04-arm");
+    expect(linux).toContain("package:linux:${{ matrix.arch }}");
+    expect(read("scripts/smoke-posix-package.mjs")).toContain("xvfb-run");
+    expect(release).toContain('tags: ["v*.*.*"]');
+    expect(release).toContain("git merge-base --is-ancestor HEAD origin/main");
+    expect(release).toContain("verify-release-artifacts.mjs");
+    expect(read("scripts/verify-release-artifacts.mjs")).toContain(
+      "SHA256SUMS.txt"
+    );
+    expect(read("scripts/build-engine-posix.sh")).toContain(
+      "--collect-all torch"
+    );
+    expect(read("scripts/package-posix.sh")).toContain(
+      "requires a matching host"
+    );
+    expect(read("scripts/verify-release.mjs")).toContain(
+      "requestedTag === expectedTag"
     );
   });
 });

@@ -8,8 +8,11 @@ plugins, post-install hooks, or repository setup scripts.
 
 A version-1 recipe is a UTF-8 JSON object no larger than 1 MiB. Unknown fields,
 invalid ranges, non-HTTPS remote URLs, and undeclared starter URLs are rejected.
-The desktop validates the document before applying it to the Build wizard; the
-user can still review every resolved setting before creating a brain.
+The desktop validates the document before applying it to the Build wizard.
+Stable v1 treats historical architecture fields as compatibility metadata:
+hardware profiling resolves tensor shapes, and the mandatory ternary,
+spiking/STDP, liquid, VSA, organic-drive, and resource-governed growth systems
+cannot be turned into personality or capability switches by a recipe.
 
 ```json
 {
@@ -70,9 +73,13 @@ Allowed values are:
 - `toolPermission`: `off`, `ask`, `auto`, or `full`; the selected initial level
   is expanded across the known tool protocols and remains visible in Build.
 
-Shape fields are range-validated for forward compatibility. The selected
-hardware profile owns the final tensor shapes in format version 1; a recipe
-does not allocate arbitrary shapes or execute code.
+Architecture and shape fields are range/type-validated for compatibility and
+provenance, but are not copied into the public or persisted `BrainConfig`. The
+selected hardware profile owns final tensor shapes; neural constants and live
+organic-drive state live in the engine architecture/runtime manifests. A
+recipe therefore cannot allocate arbitrary shapes, impose neuron/synapse
+ceilings, set curiosity/noise/parallel-thought behavior, disable mandatory
+ternary paths, or execute code.
 
 Recipes may be bundled in `catalog/recipes`, opened from a local file, or
 downloaded from HTTPS. A catalog entry can pin its SHA-256 digest. Remote

@@ -47,4 +47,11 @@ if (-not (Test-Path $Executable)) {
   throw "Engine packaging completed without producing $Executable"
 }
 
+# Retain only the distributable. The PyInstaller analysis cache is
+# reproducible and can otherwise exhaust the 14 GB native runner while
+# electron-builder creates both NSIS and ZIP outputs.
+if (Test-Path $WorkRoot) {
+  Remove-Item -Recurse -Force $WorkRoot
+}
+
 Write-Host "Packaged OmniCortex worker: $Executable"

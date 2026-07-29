@@ -77,6 +77,7 @@ class STDPSynapses(nn.Module):
         self.a_minus = float(a_minus)
         self.metaplasticity_rate = float(metaplasticity_rate)
         self.weight_limit = float(weight_limit)
+        self.ternary = True
         self.register_buffer("weights", torch.zeros(post_neurons, pre_neurons))
         self.register_buffer("stability", torch.zeros(post_neurons, pre_neurons))
         self.register_buffer("pre_trace", torch.zeros(pre_neurons))
@@ -87,6 +88,20 @@ class STDPSynapses(nn.Module):
     def reset_activity(self) -> None:
         self.pre_trace.zero_()
         self.post_trace.zero_()
+
+    def effective_weight(self) -> torch.Tensor:
+        """Return the exact ternary synapses used by recurrent computation."""
+
+        threshold = max(1e-6, self.weight_limit * 0.25)
+        return torch.where(
+            self.weights >= threshold,
+            torch.ones_like(self.weights, dtype=torch.int8),
+            torch.where(
+                self.weights <= -threshold,
+                -torch.ones_like(self.weights, dtype=torch.int8),
+                torch.zeros_like(self.weights, dtype=torch.int8),
+            ),
+        )
 
     def step(
         self, pre_spikes: torch.Tensor, post_spikes: torch.Tensor
@@ -184,7 +199,10 @@ class AssociativeSpikingRouter(nn.Module):
         total_spikes = torch.zeros_like(projected)
         total_update = 0.0
         for _ in range(max(1, int(steps))):
-            recurrent = torch.mv(self.synapses.weights, previous.detach())
+            recurrent = torch.mv(
+                self.synapses.effective_weight().to(previous),
+                previous.detach(),
+            )
             current = projected + 0.35 * recurrent
             spikes, _ = self.population.step(
                 current, threshold_offset=threshold_offset
@@ -205,6 +223,53 @@ class AssociativeSpikingRouter(nn.Module):
             "spikes": float(total_spikes.detach().sum().item()),
             "stdp_update": total_update,
             "mean_stability": float(self.synapses.stability.mean().item()),
-            "active_synapses": float(self.synapses.weights.ne(0).sum().item()),
+            "active_synapses": float(
+                self.synapses.effective_weight().ne(0).sum().item()
+            ),
         }
         return routed, metrics
+
+    @torch.no_grad()
+    def apply_feedback(
+        self, idea: torch.Tensor, direction: int
+    ) -> Dict[str, float]:
+        """Apply causal or anti-causal local timing to the active assembly.
+
+        This is direct synaptic plasticity, not a scalar reward model. Positive
+        feedback replays presynaptic activity before its associated
+        postsynaptic activity; negative feedback reverses that timing so the
+        same pair-based STDP rule depresses the association.
+        """
+
+        if direction not in {-1, 1}:
+            raise ValueError("feedback direction must be -1 or +1")
+        if idea.ndim == 1:
+            idea = idea.unsqueeze(0)
+        if idea.shape != (1, self.idea_dim):
+            raise ValueError("feedback expects one idea vector")
+        projected = torch.sigmoid(self.input_projection(idea))[0]
+        threshold = projected.mean()
+        pre = (projected >= threshold).to(projected)
+        # A deterministic permutation creates associative pre/post pairs while
+        # avoiding a self-connection-only update.
+        post = torch.roll(pre, shifts=1)
+        silence = torch.zeros_like(pre)
+        self.synapses.reset_activity()
+        before = self.synapses.weights.detach().clone()
+        if direction > 0:
+            self.synapses.step(pre, silence)
+            first_delta = self.synapses.step(silence, post)
+        else:
+            self.synapses.step(silence, post)
+            first_delta = self.synapses.step(pre, silence)
+        changed = self.synapses.weights.detach() - before
+        return {
+            "stdp_update": float(changed.abs().sum().item()),
+            "signed_update": float(changed.sum().item()),
+            "timing_signal": float(first_delta.abs().sum().item()),
+            "active_pairs": float(changed.ne(0).sum().item()),
+            "mean_stability": float(self.synapses.stability.mean().item()),
+            "plasticity_events": float(
+                self.synapses.plasticity_events.item()
+            ),
+        }

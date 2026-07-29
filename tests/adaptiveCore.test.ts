@@ -19,7 +19,7 @@ function blankBrain(): BrainDocument {
     createdAt: now,
     updatedAt: now,
     lineage: { rootId: "test-brain", generation: 0 },
-    config: { ...DEFAULT_CONFIG, name: "Test brain", noise: 0 },
+    config: { ...DEFAULT_CONFIG, name: "Test brain" },
     concepts: {},
     synapses: {},
     ideas: [],
@@ -87,4 +87,3 @@ describe("degraded adaptive core", () => {
     expect(JSON.stringify(brain)).not.toContain("reward_model");
   });
 });
-

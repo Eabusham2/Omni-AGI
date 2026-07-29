@@ -118,14 +118,12 @@ describe("declarative catalog installers", () => {
       modalities: ["vision", "image", "audio", "video"],
       config: {
         preset: "whole-brain",
-        ternaryWeights: true,
-        spikingDynamics: true,
-        stdpPlasticity: true,
-        liquidDynamics: true,
-        vectorSymbolicMemory: true,
         memoryRecipe: "human-consolidation"
       }
     });
+    expect(micro.config).not.toHaveProperty("ternaryWeights");
+    expect(micro.config).not.toHaveProperty("noise");
+    expect(micro.config).not.toHaveProperty("maxSynapses");
     expect(micro.toolPermissions.every((entry) => entry.level === "ask")).toBe(true);
 
     const plastic = validateBuildRecipe(
@@ -133,11 +131,11 @@ describe("declarative catalog installers", () => {
     );
     expect(plastic.config).toMatchObject({
       preset: "neuromorphic",
-      initialNeuronBudget: 512,
-      growthPolicy: "elastic",
       memoryRecipe: "synapses-only",
       retainSourceText: false
     });
+    expect(plastic.config).not.toHaveProperty("initialNeuronBudget");
+    expect(plastic.config).not.toHaveProperty("growthPolicy");
     expect(plastic.modalities).toEqual([]);
   });
 

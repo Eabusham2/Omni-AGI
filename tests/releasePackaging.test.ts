@@ -1,0 +1,187 @@
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+const repository = resolve(".");
+const packageDocument = JSON.parse(
+  readFileSync(join(repository, "package.json"), "utf8")
+) as {
+  version: string;
+  build: { productName: string };
+};
+const temporaryDirectories: string[] = [];
+
+function hash(bytes: Buffer | string): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function workerSmoke(comprehensive = false): Record<string, unknown> {
+  return {
+    engineVersion: "1.0.0",
+    protocolVersion: 1,
+    persistedBrain: true,
+    safeTensorCheckpoint: true,
+    sqliteEventLog: true,
+    comprehensive,
+    ...(comprehensive
+      ? {
+          trainingLossDecreased: true,
+          pdfIngested: true,
+          chatParameterMutation: true,
+          generatedModalities: ["image", "audio", "video"]
+        }
+      : {})
+  };
+}
+
+function writeReleaseFixture(): string {
+  const directory = mkdtempSync(join(tmpdir(), "omni-release-verifier-"));
+  temporaryDirectories.push(directory);
+  const product = packageDocument.build.productName;
+  const version = packageDocument.version;
+  const artifact = (name: string): { name: string; bytes: number; sha256: string } => {
+    const bytes = Buffer.from(`fixture:${name}`);
+    writeFileSync(join(directory, name), bytes);
+    return { name, bytes: bytes.length, sha256: hash(bytes) };
+  };
+
+  for (const arch of ["x64", "arm64"] as const) {
+    const windowsExe = artifact(`${product}-${version}-Windows-${arch}.exe`);
+    const windowsZip = artifact(`${product}-${version}-Windows-${arch}.zip`);
+    const macDmg = artifact(`${product}-${version}-macOS-${arch}.dmg`);
+    const macZip = artifact(`${product}-${version}-macOS-${arch}.zip`);
+    const linuxAppImage = artifact(`${product}-${version}-Linux-${arch}.AppImage`);
+    const linuxDeb = artifact(`${product}-${version}-Linux-${arch}.deb`);
+    const linuxTar = artifact(`${product}-${version}-Linux-${arch}.tar.gz`);
+
+    writeFileSync(
+      join(directory, `windows-package-smoke-${arch}.json`),
+      JSON.stringify({
+        architecture: arch,
+        zip: {
+          ...windowsZip,
+          packagedWorkerArchitecture: "x64",
+          desktopArchitecture: arch,
+          desktopSignature: { valid: false },
+          rpcSmoke: workerSmoke()
+        },
+        nsis: {
+          ...windowsExe,
+          packagedWorkerArchitecture: "x64",
+          desktopArchitecture: arch,
+          silentInstall: true,
+          desktopEndToEnd: true,
+          desktopRestart: true,
+          accessibilityNavigation: true,
+          modalityGeneration: true,
+          installerSignature: { valid: false },
+          desktopSignature: { valid: false },
+          rpcSmoke: workerSmoke(true)
+        },
+        signing: {
+          expectedSigned: false,
+          fullySigned: false,
+          state: "unsigned-signed-ready"
+        }
+      })
+    );
+    writeFileSync(
+      join(directory, `mac-package-smoke-${arch}.json`),
+      JSON.stringify({
+        architecture: arch,
+        platform: "mac",
+        artifacts: [macDmg, macZip],
+        desktopEndToEnd: true,
+        formatValidation: {
+          dmg: { verified: true },
+          zip: { extracted: true }
+        },
+        workerSmoke: workerSmoke(),
+        signing: {
+          expectedSigned: false,
+          expectedNotarized: false,
+          signatureValid: false,
+          certificateSigned: false,
+          notarized: false,
+          state: "unsigned-signed-ready"
+        }
+      })
+    );
+    writeFileSync(
+      join(directory, `linux-package-smoke-${arch}.json`),
+      JSON.stringify({
+        architecture: arch,
+        platform: "linux",
+        artifacts: [linuxAppImage, linuxDeb, linuxTar],
+        desktopEndToEnd: true,
+        formatValidation: {
+          "tar.gz": { extracted: true },
+          deb: {
+            extracted: true,
+            architecture: arch === "arm64" ? "arm64" : "amd64"
+          },
+          AppImage: { extracted: true }
+        },
+        workerSmoke: workerSmoke(),
+        signing: {
+          expectedSigned: false,
+          expectedNotarized: false,
+          state: "not-applicable"
+        }
+      })
+    );
+  }
+  return directory;
+}
+
+function verify(directory: string): string {
+  const result = spawnSync(
+    process.execPath,
+    [join(repository, "scripts/verify-release-artifacts.mjs"), "--directory", directory],
+    { cwd: repository, encoding: "utf8" }
+  );
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || `Verifier exited ${String(result.status)}.`);
+  }
+  return result.stdout;
+}
+
+afterEach(() => {
+  while (temporaryDirectories.length > 0) {
+    rmSync(temporaryDirectories.pop() as string, { recursive: true, force: true });
+  }
+});
+
+describe("stable release artifact gate", () => {
+  it("accepts one complete hash-bound cross-platform artifact set", () => {
+    const directory = writeReleaseFixture();
+    expect(verify(directory)).toContain("Verified 20 release files");
+    const manifest = JSON.parse(
+      readFileSync(join(directory, "RELEASE-MANIFEST.json"), "utf8")
+    ) as { artifactCount: number; platformStatus: Record<string, unknown> };
+    expect(manifest.artifactCount).toBe(20);
+    expect(manifest.platformStatus).toHaveProperty("windows.arm64.workerArchitecture", "x64");
+    expect(readFileSync(join(directory, "SHA256SUMS.txt"), "utf8").trim().split("\n")).toHaveLength(
+      20
+    );
+  });
+
+  it("rejects an extra file that the publisher would otherwise upload", () => {
+    const directory = writeReleaseFixture();
+    writeFileSync(join(directory, "unverified.bin"), "not reviewed");
+    expect(() => verify(directory)).toThrow(/unverified files: unverified\.bin/);
+  });
+
+  it("rejects a package changed after its smoke record was produced", () => {
+    const directory = writeReleaseFixture();
+    const target = join(
+      directory,
+      `${packageDocument.build.productName}-${packageDocument.version}-Linux-arm64.AppImage`
+    );
+    writeFileSync(target, "tampered");
+    expect(() => verify(directory)).toThrow(/hash does not match/);
+  });
+});

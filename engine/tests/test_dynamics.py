@@ -51,6 +51,22 @@ class SpikingAndLiquidTests(unittest.TestCase):
         ).abs().item()
         self.assertLess(second, first)
 
+    def test_stdp_forward_synapses_are_exact_ternary_with_float_learning_state(self):
+        synapses = STDPSynapses(3, 2)
+        synapses.weights.copy_(
+            torch.tensor(
+                [[-0.8, -0.1, 0.0], [0.2, 0.3, 0.9]],
+                dtype=torch.float32,
+            )
+        )
+        effective = synapses.effective_weight()
+        self.assertEqual(effective.dtype, torch.int8)
+        self.assertEqual(
+            set(effective.reshape(-1).tolist()),
+            {-1, 0, 1},
+        )
+        self.assertEqual(synapses.weights.dtype, torch.float32)
+
     def test_cfc_and_ltc_are_trainable_and_stable(self):
         inputs = torch.randn(3, 8, requires_grad=True)
         for cell in (CfCCell(8, 8), LTCCell(8, 8, solver_steps=4)):
