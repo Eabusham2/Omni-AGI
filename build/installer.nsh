@@ -8,7 +8,7 @@
   !ifdef APP_ARM64
     ${IfNot} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
       SetOutPath "$INSTDIR"
-      File /oname="${APP_EXECUTABLE_FILENAME}" "${PROJECT_DIR}\release\win-arm64-unpacked\${APP_EXECUTABLE_FILENAME}"
+      File "${PROJECT_DIR}\release\win-arm64-unpacked\${APP_EXECUTABLE_FILENAME}"
     ${EndIf}
   !endif
 !macroend

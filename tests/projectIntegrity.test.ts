@@ -265,12 +265,11 @@ describe("project integrity", () => {
     expect(packageDocument.build.nsis.useZip).toBe(false);
     const installerInclude = read("build/installer.nsh");
     expect(installerInclude).toContain("!macro customInstall");
+    expect(installerInclude).toContain("!ifdef APP_ARM64");
     expect(installerInclude).toContain(
-      'File /oname="${APP_EXECUTABLE_FILENAME}"'
+      'File "${PROJECT_DIR}\\release\\win-arm64-unpacked\\${APP_EXECUTABLE_FILENAME}"'
     );
-    expect(installerInclude).toContain(
-      '"${PROJECT_DIR}\\release\\win-arm64-unpacked\\${APP_EXECUTABLE_FILENAME}"'
-    );
+    expect(installerInclude).not.toMatch(/File\s+\/oname=/);
     expect(read("playwright.config.ts")).toContain(
       "retries: process.env.CI ? 1 : 0"
     );
