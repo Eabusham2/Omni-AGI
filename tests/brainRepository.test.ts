@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { strFromU8, unzipSync, zipSync } from "fflate";
@@ -245,6 +245,35 @@ describe("BrainRepository lifecycle", () => {
     ]) {
       expect(stored.config).not.toHaveProperty(key);
     }
+  });
+
+  it("idempotently promotes concurrent immutable blobs and rejects a corrupt winner", async () => {
+    const source = join(temporaryRoot, "shared-tensor.safetensors");
+    const contents = byteTensorSafetensors(64 * 1024);
+    const expected = digest(contents);
+    await writeFile(source, contents);
+
+    const promoted = await Promise.all(
+      Array.from({ length: 24 }, () => repository.storeFileAsBlob(source))
+    );
+
+    expect(new Set(promoted)).toEqual(new Set([expected]));
+    await expect(repository.getBlob(expected)).resolves.toEqual(contents);
+    expect((await readdir(join(repository.root, ".blobs"))).sort()).toEqual([
+      expected
+    ]);
+
+    const corrupt = Buffer.from("corrupt blob winner");
+    await writeFile(join(repository.root, ".blobs", expected), corrupt);
+    await expect(repository.storeFileAsBlob(source)).rejects.toThrow(
+      /blob checksum failed/i
+    );
+    await expect(readFile(join(repository.root, ".blobs", expected))).resolves.toEqual(
+      corrupt
+    );
+    expect((await readdir(join(repository.root, ".blobs"))).sort()).toEqual([
+      expected
+    ]);
   });
 
   it("preserves an imported checkpoint workspace above the former product cap", async () => {
@@ -697,6 +726,10 @@ describe("BrainRepository lifecycle", () => {
     ).resolves.toBe(canonicalJson(substratePointer));
 
     const visibleBeforeFailure = (await repository.list()).map((item) => item.id).sort();
+    const directoriesBeforeFailure = (await readdir(repository.root, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .map((entry) => entry.name)
+      .sort();
     const storeFailure = vi
       .spyOn(repository, "storeFileAsBlob")
       .mockRejectedValueOnce(new Error("simulated streamed install failure"));
@@ -710,6 +743,12 @@ describe("BrainRepository lifecycle", () => {
     expect((await repository.list()).map((item) => item.id).sort()).toEqual(
       visibleBeforeFailure
     );
+    expect(
+      (await readdir(repository.root, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name)
+        .sort()
+    ).toEqual(directoriesBeforeFailure);
 
     const privatePath = join(temporaryRoot, "private.omni");
     await repository.exportBundle(brain.id, privatePath, "private-archive");

@@ -104,14 +104,15 @@ async function sendNaturalMessage(
     .locator(".message--human")
     .getByText(message, { exact: true });
   const errorToast = page.locator(".toast");
-  await Promise.race([
-    persistedMessage.waitFor({ state: "visible", timeout: 240_000 }),
-    errorToast.waitFor({ state: "visible", timeout: 240_000 }).then(async () => {
-      throw new Error(
-        `Chat failed before persistence: ${(await errorToast.textContent())?.trim() ?? "unknown error"}`
-      );
-    })
-  ]);
+  await expect(persistedMessage.or(errorToast).first()).toBeVisible({
+    timeout: 240_000
+  });
+  if (await errorToast.isVisible().catch(() => false)) {
+    throw new Error(
+      `Chat failed before persistence: ${(await errorToast.textContent())?.trim() ?? "unknown error"}`
+    );
+  }
+  await expect(persistedMessage).toBeVisible();
   await expect(page.getByLabel("Send message")).toBeVisible({
     timeout: 240_000
   });

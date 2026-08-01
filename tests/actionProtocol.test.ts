@@ -335,20 +335,21 @@ describe("structured chat actions", () => {
       undefined,
       "turn-story"
     );
-    await vi.waitFor(() => expect(tools.execute).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(turnStream).toContain("modality-preview"));
     expect(calls).toBe(1);
+    expect(tools.execute).not.toHaveBeenCalled();
     expect(turnStream.slice(0, 3)).toEqual([
       "chat-state",
       "chat-token",
       "chat-action"
     ]);
-    expect(turnStream).toContain("modality-preview");
     finishInitial(chatResult("The scene became motion in my workspace."));
+    await vi.waitFor(() => expect(tools.execute).toHaveBeenCalledOnce());
     const result = await pending;
 
     expect(streamed).toEqual([
       { state: "proposed", progress: undefined, label: undefined },
-      { state: "running", progress: undefined, label: undefined },
+      { state: "running", progress: 0.08, label: "A first temporal sketch" },
       { state: "running", progress: 0.08, label: "A first temporal sketch" },
       { state: "running", progress: 0.18, label: "Forming temporal latents" },
       { state: "running", progress: 0.72, label: "Decoding frames and sound" },
@@ -362,6 +363,102 @@ describe("structured chat actions", () => {
       preview: { revision: 1 },
       execution
     });
+  });
+
+  it("commits the original turn before a tool audit can save its document", async () => {
+    const proposed = {
+      kind: "imagine" as const,
+      source: "brain" as const,
+      toolId: "modality.imagine",
+      action: "generate",
+      arguments: { modality: "image", conceptIds: ["persisted-scene"] }
+    };
+    let releaseInitial!: () => void;
+    const initialGate = new Promise<void>((resolve) => {
+      releaseInitial = resolve;
+    });
+    let markInitialCommitted!: () => void;
+    const initialCommitted = new Promise<void>((resolve) => {
+      markInitialCommitted = resolve;
+    });
+    let persistedMessages: string[] = [];
+    let calls = 0;
+    const service = {
+      chat: vi.fn(async (
+        _brainId: string,
+        input: string,
+        _signal?: AbortSignal,
+        onStream?: (event: {
+          type: "chat-action";
+          sequence: number;
+          actionId: string;
+          action: typeof proposed;
+        }) => void
+      ) => {
+        calls += 1;
+        if (calls === 1) {
+          const documentBeforeChat = [...persistedMessages];
+          onStream?.({
+            type: "chat-action",
+            sequence: 0,
+            actionId: "33333333333333333333333333333333",
+            action: proposed
+          });
+          await initialGate;
+          persistedMessages = [...documentBeforeChat, input];
+          markInitialCommitted();
+          return chatResult("I committed the scene before its tool audit.");
+        }
+        persistedMessages = [...persistedMessages, input];
+        return chatResult("The audited artifact entered working experience.");
+      })
+    };
+    const execution: ToolExecutionResult = {
+      id: "audited-image",
+      toolId: "modality.imagine",
+      action: "generate",
+      state: "complete",
+      startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      output: { artifactPath: "persisted-scene.png" }
+    };
+    const tools = {
+      execute: vi.fn(async () => {
+        // Model ToolExecutor.audit's former read/modify/write race: an eager
+        // execution captures a stale document, waits for chat commit, and can
+        // then overwrite the original turn with only its audit entry.
+        const documentBeforeAudit = [...persistedMessages];
+        await initialCommitted;
+        persistedMessages = [...documentBeforeAudit, "tool-audit"];
+        return execution;
+      }),
+      cancel: vi.fn(() => 0)
+    };
+    const controller = new ChatActionController(service, tools, { start: vi.fn() });
+    const states: string[] = [];
+    controller.on("event", (event) => states.push(event.state));
+
+    const pending = controller.send(
+      "brain-persistence",
+      "make an image from this internal scene"
+    );
+    await vi.waitFor(() => expect(states).toContain("proposed"));
+    expect(tools.execute).not.toHaveBeenCalled();
+
+    releaseInitial();
+    const result = await pending;
+
+    expect(tools.execute).toHaveBeenCalledOnce();
+    expect(persistedMessages[0]).toBe(
+      "make an image from this internal scene"
+    );
+    expect(persistedMessages).toContain("tool-audit");
+    expect(persistedMessages.at(-1)).toContain(
+      "[Visible structured action result]"
+    );
+    expect(result.actionEvents).toEqual([
+      expect.objectContaining({ state: "complete", execution })
+    ]);
   });
 
   it("keeps a typed worker action authoritative without a human regex fallback", async () => {

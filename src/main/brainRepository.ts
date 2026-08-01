@@ -963,6 +963,76 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+const TRANSIENT_FILESYSTEM_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "ENOTEMPTY",
+  "EPERM"
+]);
+const BLOB_PROMOTION_RETRY_CODES = new Set([
+  ...TRANSIENT_FILESYSTEM_CODES,
+  "EEXIST"
+]);
+
+function filesystemErrorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+async function retryFilesystemOperation<T>(
+  operation: () => Promise<T>,
+  retryCodes: ReadonlySet<string> = TRANSIENT_FILESYSTEM_CODES,
+  attempts = 8
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const retryable = retryCodes.has(filesystemErrorCode(error) ?? "");
+      if (!retryable || attempt + 1 >= attempts) throw error;
+      await new Promise<void>((resolveDelay) => {
+        setTimeout(resolveDelay, Math.min(250, 25 * (attempt + 1)));
+      });
+    }
+  }
+}
+
+async function removeFileWithRetry(path: string): Promise<void> {
+  await retryFilesystemOperation(() => rm(path, { force: true }));
+}
+
+async function removeTreeWithRetry(path: string): Promise<void> {
+  await retryFilesystemOperation(() =>
+    rm(path, {
+      recursive: true,
+      force: true,
+      maxRetries: 4,
+      retryDelay: 50
+    })
+  );
+}
+
+async function verifiedExistingBlob(path: string, expectedHash: string): Promise<boolean> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    if (filesystemErrorCode(error) === "ENOENT") return false;
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink() || (await fileSha256(path)) !== expectedHash) {
+    throw new Error("Content-addressed blob checksum failed.");
+  }
+  return true;
+}
+
+async function awaitAllOrThrow(operations: readonly Promise<unknown>[]): Promise<void> {
+  const settled = await Promise.allSettled(operations);
+  const failed = settled.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected"
+  );
+  if (failed) throw failed.reason;
+}
+
 async function atomicWrite(path: string, contents: string | Buffer): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.next`;
@@ -1412,18 +1482,22 @@ export class BrainRepository {
       await copyFile(path, temporary);
       const hash = await fileSha256(temporary);
       const destination = join(this.root, ".blobs", hash);
-      if (await pathExists(destination)) await rm(temporary, { force: true });
-      else {
+      await retryFilesystemOperation(async () => {
+        // Concurrent copy-on-write operations often promote the same immutable
+        // tensor. Windows reports that collision as EPERM rather than EEXIST,
+        // so only accept it after validating the winner's type and digest.
+        if (await verifiedExistingBlob(destination, hash)) return;
         try {
           await rename(temporary, destination);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          await rm(temporary, { force: true });
+          if (await verifiedExistingBlob(destination, hash)) return;
+          throw error;
         }
-      }
+      }, BLOB_PROMOTION_RETRY_CODES);
+      await removeFileWithRetry(temporary);
       return hash;
     } catch (error) {
-      await rm(temporary, { force: true });
+      await removeFileWithRetry(temporary);
       throw error;
     }
   }
@@ -1550,7 +1624,7 @@ export class BrainRepository {
     if (isRecord(metadata.config)) metadata.config.name = targetName;
     const targetEngine = join(this.brainDirectory(targetBrainId), "engine");
     const targetOrigin = join(targetEngine, "origin");
-    await Promise.all([
+    await awaitAllOrThrow([
       mkdir(targetEngine, { recursive: true }),
       mkdir(targetOrigin, { recursive: true })
     ]);
@@ -1562,7 +1636,7 @@ export class BrainRepository {
       const sourcePath = join(sourceEngine, sourceName);
       if (!(await pathExists(sourcePath))) continue;
       const hash = await this.storeFileAsBlob(sourcePath);
-      await Promise.all([
+      await awaitAllOrThrow([
         this.linkBlobTo(hash, join(targetEngine, targetNameValue)),
         this.linkBlobTo(hash, join(targetOrigin, targetNameValue))
       ]);
@@ -1589,7 +1663,7 @@ export class BrainRepository {
     );
     if (failedMaterialization) throw failedMaterialization.reason;
     // Metadata is the commit record and therefore moves last.
-    await Promise.all([
+    await awaitAllOrThrow([
       atomicWrite(join(targetEngine, "brain.json"), JSON.stringify(metadata, null, 2)),
       atomicWrite(join(targetOrigin, "brain.json"), JSON.stringify(metadata, null, 2))
     ]);
@@ -1771,7 +1845,7 @@ export class BrainRepository {
       await this.cloneEngineState(source.id, fork.id, fork.name);
       return clone(fork);
     } catch (error) {
-      await rm(directory, { recursive: true, force: true });
+      await removeTreeWithRetry(directory);
       throw error;
     }
   }
@@ -2419,7 +2493,7 @@ export class BrainRepository {
     try {
       return await this.importExtractedBundle(extracted, basename(path));
     } finally {
-      await rm(extracted.root, { recursive: true, force: true });
+      await removeTreeWithRetry(extracted.root);
     }
   }
 
@@ -2436,10 +2510,10 @@ export class BrainRepository {
       try {
         return await this.importExtractedBundle(extracted, sourceLabel);
       } finally {
-        await rm(extracted.root, { recursive: true, force: true });
+        await removeTreeWithRetry(extracted.root);
       }
     } finally {
-      await rm(temporary, { recursive: true, force: true });
+      await removeTreeWithRetry(temporary);
     }
   }
 
@@ -2885,14 +2959,14 @@ export class BrainRepository {
       }
     };
     try {
-      await Promise.all([
+      await awaitAllOrThrow([
         mkdir(join(directory, "snapshots"), { recursive: true }),
         mkdir(join(directory, "engine"), { recursive: true })
       ]);
       await atomicWrite(this.documentPath(imported.id), JSON.stringify(imported, null, 2));
       if (engineMaterialized) {
         if (resolvedReferences) {
-          await Promise.all([
+          await awaitAllOrThrow([
             this.linkBlobTo(
               resolvedReferences.currentCore,
               join(directory, "engine", "core.safetensors")
@@ -2903,7 +2977,7 @@ export class BrainRepository {
             )
           ]);
         } else {
-          await Promise.all([
+          await awaitAllOrThrow([
             materializeFile(
               tensorPaths["tensors/core.safetensors"]!,
               join(directory, "engine", "core.safetensors")
@@ -2942,7 +3016,7 @@ export class BrainRepository {
       }
       if (isRecord(originEngineValue) && originEngineValue.format === "omni-cortex-engine") {
         if (resolvedReferences) {
-          await Promise.all([
+          await awaitAllOrThrow([
             this.linkBlobTo(
               resolvedReferences.originCore,
               join(directory, "engine", "origin", "core.safetensors")
@@ -2953,7 +3027,7 @@ export class BrainRepository {
             )
           ]);
         } else {
-          await Promise.all([
+          await awaitAllOrThrow([
             materializeFile(
               tensorPaths["origin/tensors/core.safetensors"]!,
               join(directory, "engine", "origin", "core.safetensors")
@@ -3014,7 +3088,7 @@ export class BrainRepository {
       });
       return clone(imported);
     } catch (error) {
-      await rm(directory, { recursive: true, force: true });
+      await removeTreeWithRetry(directory);
       throw error;
     }
   }

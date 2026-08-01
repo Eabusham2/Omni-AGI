@@ -391,7 +391,7 @@ export class ChatActionController extends EventEmitter {
     const events: ActionEvent[] = [];
     const workerActions = new Map<string, ActionEvent>();
     const previewRevisions = new Map<string, number>();
-    const executions: Array<Promise<ActionOutcome>> = [];
+    const executions: Array<() => Promise<ActionOutcome>> = [];
     let latestImagination: ActionEvent | undefined;
 
     const updateAction = (event: ActionEvent): void => {
@@ -426,7 +426,7 @@ export class ChatActionController extends EventEmitter {
       if (workerActionId) workerActions.set(workerActionId, event);
       if (action.kind === "imagine") latestImagination = event;
       this.publishAction(turn, event);
-      const execution = (async (): Promise<ActionOutcome> => {
+      const execute = async (): Promise<ActionOutcome> => {
         let output: unknown;
         try {
           controller.signal.throwIfAborted();
@@ -438,8 +438,8 @@ export class ChatActionController extends EventEmitter {
         }
         this.publishAction(turn, event);
         return { event, output };
-      })();
-      executions.push(execution);
+      };
+      executions.push(execute);
       return event;
     };
     const consumeNeuralStream = (neural: NeuralChatStreamEvent): void => {
@@ -464,6 +464,11 @@ export class ChatActionController extends EventEmitter {
       if (neural.preview.statusLabel) {
         action.statusLabel = neural.preview.statusLabel;
       }
+      // Auto/Full inline imagination is already decoding in the worker when
+      // it publishes a preview. The trusted tool claim remains deferred until
+      // the neural turn commits, but the visible state should still reflect
+      // that real worker-side activity.
+      if (action.state === "proposed") action.state = "running";
       action.updatedAt = new Date().toISOString();
       updateAction(action);
     };
@@ -479,12 +484,13 @@ export class ChatActionController extends EventEmitter {
       );
       for (const action of result.proposedActions ?? []) queueAction(action);
 
-      // Every action starts as soon as its typed event arrives. Results are
-      // integrated sequentially only after the initial neural response has
-      // committed, avoiding concurrent mutation of one persistent identity.
+      // Typed events and worker-side inline previews publish immediately, but
+      // trusted tool execution/auditing starts only after the neural response
+      // commits. This prevents two whole-brain persistence paths from racing
+      // and losing the original turn while preserving real-time imagination.
       for (let index = 0; index < executions.length; index += 1) {
         controller.signal.throwIfAborted();
-        const { event, output } = await executions[index]!;
+        const { event, output } = await executions[index]!();
         if (event.state !== "complete") continue;
         if (["talk", "ponder", "learn"].includes(event.action.kind)) continue;
         result = await this.service.chat(
