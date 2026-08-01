@@ -93,8 +93,5 @@ export const IPC = {
     installModalityPackFile: "omni:catalog:install-modality-pack-file",
     listModalityPacks: "omni:catalog:list-modality-packs",
     hardwareProfile: "omni:catalog:hardware-profile"
-  },
-  legacy: {
-    runtimeHealth: "omni:legacy:runtime-health"
   }
 } as const;

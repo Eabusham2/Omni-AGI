@@ -12,6 +12,11 @@ in `main`; release jobs deliberately reject tags cut from another branch.
 | macOS | Intel x64, Apple Silicon ARM64 | DMG, ZIP | native |
 | Linux | x64, ARM64 | AppImage, DEB, tar.gz | native |
 
+Electron Builder uses target-native x64 suffixes on Linux: `x86_64` for
+AppImage, `amd64` for DEB, and `x64` for tar.gz. The package smoke, upload
+patterns, and release verifier share one naming helper so these are not
+mistaken for missing artifacts.
+
 Each native-host job runs the Python and Node suites, builds the Electron
 application and PyInstaller brain worker, verifies their machine
 architectures, creates and reloads a safe-tensor/SQLite brain through the

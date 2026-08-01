@@ -381,13 +381,12 @@ class OmniDecoder(nn.Module):
         config.validate()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        workspace_slots = max(
-            4,
-            min(
-                32,
-                config.working_memory_slots // 4,
-            ),
-        )
+        # Distillation latents scale with the hardware-resolved recurrent
+        # workspace. The old fixed 32-latent ceiling made higher tiers claim
+        # more working memory without giving whole-input integration more
+        # capacity. Extended memory can expand this population; physical tier
+        # selection remains the resource guard.
+        workspace_slots = max(8, config.working_memory_slots // 4)
         self.global_workspace = GlobalWorkspace(
             config.d_model,
             slots=workspace_slots,

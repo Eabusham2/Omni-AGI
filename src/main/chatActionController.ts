@@ -33,6 +33,7 @@ export interface ActionToolExecutor {
     onProgress?: (job: RuntimeJob) => void
   ): Promise<ToolExecutionResult>;
   cancel(brainId: string): number;
+  hasPendingOrActive?(brainId: string): boolean;
 }
 
 export interface ActionEvolutionController {
@@ -66,12 +67,46 @@ function serializableToolExperience(action: StructuredAction, output: unknown): 
 }
 
 function actionFingerprint(action: StructuredAction): string {
+  // Assembly/concept identifiers are transient neural routing evidence. They
+  // can legitimately change after an artifact is fed back into the same turn,
+  // but that must not make an otherwise identical action recur forever. Keep
+  // explicit human/model intent in the convergence key while ignoring those
+  // volatile internal handles for imagination.
+  if (action.kind === "imagine" || action.toolId === "modality.imagine") {
+    const modality =
+      typeof action.arguments.modality === "string"
+        ? action.arguments.modality.trim().toLocaleLowerCase()
+        : "";
+    const prompt =
+      typeof action.arguments.prompt === "string"
+        ? action.arguments.prompt.replace(/\s+/g, " ").trim()
+        : "";
+    const inputPath =
+      typeof action.arguments.inputPath === "string"
+        ? action.arguments.inputPath.trim()
+        : "";
+    return JSON.stringify([
+      action.kind,
+      action.toolId,
+      action.action,
+      modality,
+      prompt,
+      inputPath
+    ]);
+  }
   return JSON.stringify([
     action.kind,
     action.toolId,
     action.action,
     action.arguments
   ]);
+}
+
+function neuralActionCorrelation(value?: string): string | undefined {
+  const normalized = value?.trim().toLocaleLowerCase();
+  return normalized && /^[a-f0-9]{32}$/.test(normalized)
+    ? normalized
+    : undefined;
 }
 
 function typedSourceEdits(value: unknown): EvolutionSourceEdit[] | undefined {
@@ -104,11 +139,16 @@ function typedSourceEdits(value: unknown): EvolutionSourceEdit[] | undefined {
   });
 }
 
-function eventFor(brainId: string, action: StructuredAction): ActionEvent {
+function eventFor(
+  brainId: string,
+  action: StructuredAction,
+  neuralActionId?: string
+): ActionEvent {
   const now = new Date().toISOString();
   return {
     id: randomUUID(),
     brainId,
+    ...(neuralActionId ? { neuralActionId } : {}),
     action,
     state: "proposed",
     createdAt: now,
@@ -137,6 +177,14 @@ export class ChatActionController extends EventEmitter {
     private readonly evolution: ActionEvolutionController
   ) {
     super();
+  }
+
+  isBusy(brainId: string): boolean {
+    return (
+      [...this.activeTurns.values()].some(
+        (turn) => turn.brainId === brainId && !turn.controller.signal.aborted
+      ) || this.tools.hasPendingOrActive?.(brainId) === true
+    );
   }
 
   private publish(event: ActionEvent): void {
@@ -181,7 +229,19 @@ export class ChatActionController extends EventEmitter {
       event.updatedAt = new Date().toISOString();
       return { stopped: true };
     }
-    if (["talk", "ponder", "learn"].includes(action.kind)) {
+    if (action.kind === "ponder") {
+      if (!this.service.idleCycle) {
+        throw new Error("The neural worker does not expose internal cognition.");
+      }
+      // A learned ponder action is an actual second recurrent computation,
+      // not a decorative completed card. The worker performs prompt-free
+      // liquid/LIF settling, rehearsal and any resulting plastic update.
+      const cognition = await this.service.idleCycle(event.brainId, 0);
+      event.state = "complete";
+      event.updatedAt = new Date().toISOString();
+      return { internal: true, kind: action.kind, cognition };
+    }
+    if (["talk", "learn"].includes(action.kind)) {
       event.state = "complete";
       event.updatedAt = new Date().toISOString();
       return { internal: true, kind: action.kind };
@@ -193,7 +253,7 @@ export class ChatActionController extends EventEmitter {
           : "";
       if (!objective) throw new Error("An evolution action requires an objective.");
       const requestedKind = action.arguments.candidateKind;
-      const candidateKind =
+      const requestedCandidateKind =
         requestedKind === "source" ||
         requestedKind === "neural" ||
         requestedKind === "data" ||
@@ -208,13 +268,41 @@ export class ChatActionController extends EventEmitter {
           : undefined;
       const addExperts = action.arguments.addExperts;
       const sourceEdits = typedSourceEdits(action.arguments.sourceEdits);
+      const hasTypedSourceEdits = Boolean(sourceEdits?.length);
+      // Source changes are the one evolution route that must never be
+      // synthesized from an objective alone. Without exact typed edits, use a
+      // worker-owned neural overlay; a learned/organic action can therefore
+      // improve itself without creating an empty Git candidate that is
+      // guaranteed to fail evaluation.
+      let candidateKind: NonNullable<EvolutionStartRequest["candidateKind"]> =
+        hasTypedSourceEdits
+          ? "source"
+          : requestedCandidateKind === "source" || requestedCandidateKind === undefined
+            ? "substrate"
+            : requestedCandidateKind;
+      const texts = stringArray(action.arguments.texts);
+      const sourceIds = stringArray(action.arguments.sourceIds);
+      if (
+        candidateKind === "data" &&
+        !texts?.length &&
+        !sourceIds?.length &&
+        action.arguments.latentReplay !== true
+      ) {
+        candidateKind = "substrate";
+      }
+      const latentReplay =
+        typeof action.arguments.latentReplay === "boolean"
+          ? action.arguments.latentReplay
+          : candidateKind === "neural" || candidateKind === "substrate"
+            ? true
+            : undefined;
       const run = await this.evolution.start({
         brainId: event.brainId,
         objective,
         recursive: action.arguments.recursive !== false,
         candidateKind,
-        texts: stringArray(action.arguments.texts),
-        sourceIds: stringArray(action.arguments.sourceIds),
+        texts,
+        sourceIds,
         epochs:
           typeof action.arguments.epochs === "number"
             ? action.arguments.epochs
@@ -223,12 +311,9 @@ export class ChatActionController extends EventEmitter {
           typeof action.arguments.learningRate === "number"
             ? action.arguments.learningRate
             : undefined,
-        latentReplay:
-          typeof action.arguments.latentReplay === "boolean"
-            ? action.arguments.latentReplay
-            : undefined,
+        latentReplay,
         objectives: stringArray(action.arguments.objectives),
-        ...(sourceEdits === undefined ? {} : { sourceEdits }),
+        ...(hasTypedSourceEdits ? { sourceEdits } : {}),
         architectureChange:
           candidateKind === "architecture"
             ? {
@@ -247,14 +332,19 @@ export class ChatActionController extends EventEmitter {
     if (!action.toolId || !action.action) {
       throw new Error("The structured action is missing its tool protocol.");
     }
+    const imagination =
+      action.kind === "imagine" || action.toolId === "modality.imagine";
     const invocation = {
       brainId: event.brainId,
       toolId: action.toolId,
       action: action.action,
-      arguments: action.arguments
+      arguments:
+        imagination && event.neuralActionId
+          ? { ...action.arguments, neuralActionId: event.neuralActionId }
+          : action.arguments
     };
     const execution =
-      action.kind === "imagine" || action.toolId === "modality.imagine"
+      imagination
         ? await this.tools.execute(invocation, (job) => {
             event.runtimeJobId = job.id;
             event.progress = Math.max(0, Math.min(1, job.progress));
@@ -327,7 +417,11 @@ export class ChatActionController extends EventEmitter {
         return workerActionId ? workerActions.get(workerActionId) : undefined;
       }
       seen.add(fingerprint);
-      const event = eventFor(brainId, action);
+      const event = eventFor(
+        brainId,
+        action,
+        neuralActionCorrelation(workerActionId)
+      );
       events.push(event);
       if (workerActionId) workerActions.set(workerActionId, event);
       if (action.kind === "imagine") latestImagination = event;

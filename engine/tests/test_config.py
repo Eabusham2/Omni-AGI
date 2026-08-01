@@ -42,22 +42,12 @@ class StableConfigTests(unittest.TestCase):
         torch.set_num_threads(1)
 
     def test_stable_payload_hides_retired_beta_controls_but_loads_legacy_dicts(self):
-        legacy = OmniConfig.micro(
-            ternary_weights=False,
-            noise=0.99,
-            curiosity_drive=0.01,
-            parallel_thoughts=11,
-            max_concepts=7,
-            max_ideas=8,
-            max_synapses=9,
-            growth_policy="elastic",
-            max_experts=2,
-        )
+        legacy = OmniConfig.micro(ternary_weights=False)
         payload = legacy.to_dict()
         self.assertTrue(RETIRED_BETA_FIELDS.isdisjoint(payload))
         self.assertEqual(payload["hardware_tier"], "micro")
         self.assertEqual(payload["router_neurons"], 24)
-        self.assertEqual(payload["working_memory_slots"], 24)
+        self.assertEqual(payload["working_memory_slots"], 128)
 
         # The compatibility parser still accepts internal/legacy architecture
         # dictionaries. New saves deliberately normalize away those controls.
@@ -73,10 +63,10 @@ class StableConfigTests(unittest.TestCase):
             }
         )
         self.assertFalse(loaded.ternary_weights)
-        self.assertEqual(loaded.noise, 0.7)
-        self.assertEqual(loaded.parallel_thoughts, 5)
-        self.assertEqual(loaded.max_concepts, 13)
-        self.assertEqual(loaded.growth_policy, "elastic")
+        self.assertFalse(hasattr(loaded, "noise"))
+        self.assertFalse(hasattr(loaded, "parallel_thoughts"))
+        self.assertFalse(hasattr(loaded, "max_concepts"))
+        self.assertFalse(hasattr(loaded, "growth_policy"))
 
     def test_external_population_is_hardware_derived_and_beta_sliders_are_ignored(self):
         retired_values = {
@@ -121,13 +111,9 @@ class StableConfigTests(unittest.TestCase):
                 )
                 self.assertEqual(low.router_neurons, expected)
                 self.assertEqual(high.router_neurons, expected)
-                self.assertEqual(high.noise, OmniConfig().noise)
-                self.assertEqual(
-                    high.curiosity_drive, OmniConfig().curiosity_drive
-                )
-                self.assertEqual(
-                    high.parallel_thoughts, OmniConfig().parallel_thoughts
-                )
+                self.assertFalse(hasattr(high, "noise"))
+                self.assertFalse(hasattr(high, "curiosity_drive"))
+                self.assertFalse(hasattr(high, "parallel_thoughts"))
                 self.assertTrue(high.consolidation_enabled)
                 self.assertTrue(high.metaplasticity)
                 self.assertTrue(high.learn_from_own_messages)
@@ -145,14 +131,7 @@ class StableConfigTests(unittest.TestCase):
             brain = AdaptiveBrain.create(
                 "stable-config-brain",
                 root,
-                OmniConfig.micro(
-                    noise=0.91,
-                    curiosity_drive=0.11,
-                    parallel_thoughts=7,
-                    max_concepts=3,
-                    max_ideas=4,
-                    max_synapses=5,
-                ),
+                OmniConfig.micro(),
             )
             brain.events.close()
             metadata = json.loads(

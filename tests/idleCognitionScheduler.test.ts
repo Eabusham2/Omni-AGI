@@ -60,4 +60,20 @@ describe("IdleCognitionScheduler", () => {
     release({ brainId: "active", ran: false, reason: "cooldown", actions: [] });
     await expect(first).resolves.toMatchObject({ reason: "cooldown" });
   });
+
+  it("does not create repeated organic actions while approval or execution is pending", async () => {
+    const repository = {
+      list: vi.fn().mockResolvedValue([summary("active")]),
+      get: vi.fn().mockResolvedValue(brain("active", true))
+    };
+    const actions = {
+      idle: vi.fn(),
+      isBusy: vi.fn().mockReturnValue(true)
+    };
+    const scheduler = new IdleCognitionScheduler(repository, actions);
+
+    await expect(scheduler.tick()).resolves.toBeUndefined();
+    expect(actions.isBusy).toHaveBeenCalledWith("active");
+    expect(actions.idle).not.toHaveBeenCalled();
+  });
 });

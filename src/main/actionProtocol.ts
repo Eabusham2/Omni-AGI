@@ -61,7 +61,11 @@ function naturalToolAction(
     source,
     toolId: "source.self-modify",
     action: "propose",
-    arguments: argumentsValue
+    arguments: {
+      candidateKind: "substrate",
+      latentReplay: true,
+      ...argumentsValue
+    }
   };
 }
 

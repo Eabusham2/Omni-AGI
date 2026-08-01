@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CrawlFrontierStore,
   DatasetManifestStore,
+  detectDatasetFormat,
   streamUtf8Text
 } from "../src/main/dataIngestion";
 import { BrainRepository } from "../src/main/brainRepository";
@@ -93,6 +94,15 @@ describe("whole-dataset persistence", () => {
     } as unknown as EngineSupervisor);
     return { brainId: brain.id, service, engineRequests };
   }
+
+  it("classifies every stable Office, OpenDocument, and compressed upload format", () => {
+    for (const extension of ["docx", "pptx", "xlsx", "odt", "ods", "odp"]) {
+      expect(detectDatasetFormat(`fixture.${extension}`)).toBe("office");
+    }
+    for (const extension of ["gz", "bz2", "xz"]) {
+      expect(detectDatasetFormat(`corpus.txt.${extension}`)).toBe("archive");
+    }
+  });
 
   it(
     "walks beyond the former 2,000-file ceiling and persists an exhaustive cursor",
@@ -183,6 +193,31 @@ describe("whole-dataset persistence", () => {
     });
   });
 
+  it("persists the neural worker's animated-GIF video reroute", async () => {
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "GIF routing" });
+    const path = join(root, "motion.gif");
+    await writeFile(path, Buffer.from("GIF89a-temporal-fixture"));
+    const service = new BrainService(repository, {
+      request: async () => ({
+        source: {
+          kind: "video",
+          learned_ideas: 1,
+          learned_concepts: 2,
+          plasticity_events: 3
+        }
+      })
+    } as unknown as EngineSupervisor);
+
+    const [result] = await service.ingestPaths(brain.id, [path]);
+    expect(result?.source).toMatchObject({
+      kind: "video",
+      name: "motion.gif"
+    });
+    expect((await repository.get(brain.id)).trainingSources[0]?.kind).toBe("video");
+  });
+
   it("keeps the cursor on an uncommitted file when neural training pauses", async () => {
     const repository = new BrainRepository(join(root, "brains"));
     await repository.initialize();
@@ -206,6 +241,54 @@ describe("whole-dataset persistence", () => {
       complete: false
     });
 
+    const store = new DatasetManifestStore((id) => repository.brainDirectory(id));
+    await expect(store.cursor(brain.id, manifest.id)).resolves.toMatchObject({
+      nextEntry: 0,
+      processedFiles: 0,
+      state: "paused"
+    });
+  });
+
+  it("pauses before persistence when worker traversal totals are incomplete", async () => {
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Honest coverage" });
+    const path = join(root, "partial.jsonl");
+    await writeFile(path, '{"first":true}\n{"second":true}\n');
+    const service = new BrainService(repository, {
+      request: async () => ({
+        source: {
+          learned_ideas: 1,
+          learned_concepts: 1,
+          plasticity_events: 1
+        },
+        coverage: {
+          discoveredFiles: 1,
+          completedFiles: 1,
+          discoveredRecords: 2,
+          processedRecords: 1,
+          rejectedRecords: 0,
+          processedBytes: 15,
+          shards: 0,
+          modalityCounts: { jsonl: 1 },
+          errors: []
+        }
+      })
+    } as unknown as EngineSupervisor);
+    const manifest = await service.previewDataset(brain.id, [path]);
+
+    const run = await service.ingestManifest(brain.id, manifest.id);
+
+    expect(run.paused).toBe(true);
+    expect(run.coverage).toMatchObject({
+      processedFiles: 0,
+      rejectedFiles: 0,
+      discoveredRecords: 0,
+      processedRecords: 0,
+      rejectedRecords: 0,
+      complete: false
+    });
+    expect((await repository.get(brain.id)).trainingSources).toEqual([]);
     const store = new DatasetManifestStore((id) => repository.brainDirectory(id));
     await expect(store.cursor(brain.id, manifest.id)).resolves.toMatchObject({
       nextEntry: 0,
@@ -308,7 +391,7 @@ describe("whole-dataset persistence", () => {
       2
     );
     expect(calls).toHaveLength(2);
-    expect(calls.map((params) => params.allowReplay)).toEqual([false, true]);
+    expect(calls.map((params) => params.allowReplay)).toEqual([true, true]);
     expect(calls.map((params) => params.epoch)).toEqual([0, 1]);
     expect(run.coverage).toMatchObject({
       requestedEpochs: 2,
@@ -318,6 +401,45 @@ describe("whole-dataset persistence", () => {
       complete: true
     });
     expect(run.results).toHaveLength(2);
+  });
+
+  it("replays a prelearned source in an explicit manifest but deduplicates one-off uploads", async () => {
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Replay semantics" });
+    const path = join(root, "prelearned.txt");
+    await writeFile(path, "explicit whole-dataset traversal must revisit this source");
+    const calls: Array<Record<string, unknown>> = [];
+    const service = new BrainService(repository, {
+      request: async (_method: string, params: Record<string, unknown>) => {
+        calls.push(params);
+        return {
+          source: {
+            learned_ideas: 1,
+            learned_concepts: 2,
+            plasticity_events: 3
+          }
+        };
+      }
+    } as unknown as EngineSupervisor);
+
+    const firstUpload = await service.ingestPaths(brain.id, [path]);
+    const duplicateUpload = await service.ingestPaths(brain.id, [path]);
+    expect(firstUpload).toHaveLength(1);
+    expect(duplicateUpload[0]!.warnings.join(" ")).toMatch(/already encoded/i);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ allowReplay: false, epoch: 0 });
+
+    const manifest = await service.previewDataset(brain.id, [path]);
+    const explicitRun = await service.ingestManifest(brain.id, manifest.id);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toMatchObject({ allowReplay: true, epoch: 0 });
+    expect(explicitRun.coverage).toMatchObject({
+      processedFiles: 1,
+      rejectedFiles: 0,
+      complete: true
+    });
+    expect((await repository.get(brain.id)).trainingSources).toHaveLength(1);
   });
 
   it("persists an unbounded crawl frontier in SQLite and resumes in-flight pages", async () => {
@@ -443,7 +565,9 @@ describe("whole-dataset persistence", () => {
 
   it("paces same-domain requests and retries throttled pages with backoff", async () => {
     process.env.OMNI_ALLOW_LOCAL_URLS = "1";
-    process.env.OMNI_CRAWL_MIN_DELAY_MS = "20";
+    // Keep a comfortable wall-clock margin for heavily loaded CI runners
+    // while still proving requests are serialized and paced per domain.
+    process.env.OMNI_CRAWL_MIN_DELAY_MS = "50";
     process.env.OMNI_CRAWL_BACKOFF_BASE_MS = "30";
     const requestTimes: number[] = [];
     let throttledHits = 0;
@@ -478,7 +602,7 @@ describe("whole-dataset persistence", () => {
     expect(throttledHits).toBe(2);
     expect(requestTimes).toHaveLength(4);
     for (let index = 1; index < requestTimes.length; index += 1) {
-      expect(requestTimes[index]! - requestTimes[index - 1]!).toBeGreaterThanOrEqual(12);
+      expect(requestTimes[index]! - requestTimes[index - 1]!).toBeGreaterThanOrEqual(25);
     }
   });
 
@@ -532,6 +656,10 @@ describe("whole-dataset persistence", () => {
     expect(result).toMatchObject({
       visited: 5,
       skipped: 0,
+      resultCount: 5,
+      resultsTruncated: false,
+      warningCount: 0,
+      warningsTruncated: false,
       coverage: {
         complete: true,
         modalityCounts: { text: 1, image: 2, audio: 1, video: 1 }
@@ -579,6 +707,70 @@ describe("whole-dataset persistence", () => {
           blobHash: expect.stringMatching(/^[a-f0-9]{64}$/)
         })
       ])
+    );
+  });
+
+  it("keeps crawl diagnostics bounded while receipts preserve exact resumed coverage", async () => {
+    process.env.OMNI_ALLOW_LOCAL_URLS = "1";
+    process.env.OMNI_CRAWL_MIN_DELAY_MS = "1";
+    const origin = await listen((request, response) => {
+      response.setHeader("content-type", request.url === "/" ? "text/html" : "text/plain");
+      if (request.url === "/") {
+        response.end(
+          Array.from(
+            { length: 47 },
+            (_, index) => `<a href="/page-${index + 1}">page ${index + 1}</a>`
+          ).join("")
+        );
+        return;
+      }
+      response.end(`unique learned page ${request.url}`);
+    });
+    const { brainId, service } = await crawlerService("Bounded crawl receipts");
+
+    const first = await service.crawlWeb({
+      brainId,
+      url: `${origin}/`,
+      maxPages: 8,
+      maxDepth: 1,
+      concurrency: 8,
+      respectRobots: false,
+      quarantine: false
+    });
+    expect(first).toMatchObject({
+      visited: 8,
+      resultCount: 8,
+      resultsTruncated: false,
+      frontierRemaining: 40,
+      coverage: { modalityCounts: { text: 8 } }
+    });
+
+    const resumed = await service.crawlWeb({
+      brainId,
+      url: `${origin}/`,
+      crawlId: first.crawlId,
+      maxPages: 48,
+      maxDepth: 1,
+      concurrency: 8,
+      respectRobots: false,
+      quarantine: false,
+      resume: true
+    });
+    expect(resumed).toMatchObject({
+      visited: 48,
+      resultCount: 48,
+      resultsTruncated: true,
+      frontierRemaining: 0,
+      coverage: {
+        processedFiles: 48,
+        processedRecords: 48,
+        modalityCounts: { text: 48 },
+        complete: true
+      }
+    });
+    expect(resumed.results).toHaveLength(32);
+    expect(resumed.resultLog).toBe(
+      join("datasets", "crawls", `${resumed.crawlId}.sqlite3`)
     );
   });
 

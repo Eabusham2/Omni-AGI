@@ -2,9 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
   access,
+  cp,
   copyFile,
   link,
+  lstat,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   readdir,
@@ -14,8 +17,9 @@ import {
   stat,
   writeFile
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
+import { strToU8 } from "fflate";
 import {
   BRAIN_SCHEMA_VERSION,
   DEFAULT_CONFIG,
@@ -27,12 +31,20 @@ import {
   type BrainSummary,
   type ToolPermissionRecord
 } from "../shared/types";
+import {
+  assertSafeArchivePath,
+  extractStreamingZip,
+  streamFileSha256,
+  writeStreamingZip,
+  type ExtractedZipArchive,
+  type StreamingZipSource
+} from "./streamingZip";
 
-const MAX_BUNDLE_BYTES = 512 * 1024 * 1024;
-const MAX_UNCOMPRESSED_BUNDLE_BYTES = 1024 * 1024 * 1024;
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const BUNDLE_FORMAT = "omni-brain";
 const BUNDLE_VERSION = 1;
+/** Must remain identical to engine/omni_core/vsa.py's store format. */
+export const SUBSTRATE_STORE_FORMAT = "omni-substrate-shards";
 const STABLE_RELEASE_FORMAT = "stable-1.0";
 const BETA_REVIEW_FILE = ".stable-v1-beta-review.json";
 
@@ -87,10 +99,10 @@ interface OmniManifest {
   files: Record<string, { sha256: string; bytes: number }>;
 }
 
-interface PackedTernaryDirectory {
+interface StreamingPackedTernaryDirectory {
   manifestSha256: string;
   tensorCount: number;
-  files: Record<string, Uint8Array>;
+  files: Map<string, string>;
 }
 
 export interface ManagedBetaBrain {
@@ -154,6 +166,38 @@ function redactSecretText(value: string, counter: RedactionCounter): string {
     });
   }
   return redacted;
+}
+
+async function assertFileContainsNoPortableSecrets(
+  path: string,
+  label: string
+): Promise<void> {
+  const probe = await open(path, "r");
+  try {
+    const sample = Buffer.alloc(256 * 1024);
+    const { bytesRead } = await probe.read(sample, 0, sample.byteLength, 0);
+    const text = sample.subarray(0, bytesRead).toString("utf8");
+    const binaryRatio =
+      text.length === 0
+        ? 0
+        : ((text.match(/\uFFFD/g)?.length ?? 0) + (text.match(/\0/g)?.length ?? 0)) /
+          text.length;
+    if (binaryRatio >= 0.01) return;
+  } finally {
+    await probe.close();
+  }
+  let overlap = "";
+  for await (const chunk of createReadStream(path, { encoding: "utf8" })) {
+    const combined = overlap + chunk;
+    const counter: RedactionCounter = { replacements: 0 };
+    redactSecretText(combined, counter);
+    if (counter.replacements > 0) {
+      throw new Error(
+        `${label} appears to contain credentials. Remove or sanitize it before a private archive export.`
+      );
+    }
+    overlap = combined.slice(-4096);
+  }
 }
 
 function redactPortableValue(
@@ -230,68 +274,6 @@ function assertAllowedBundlePath(path: string): void {
   }
 }
 
-interface ZipDirectoryEntry {
-  name: string;
-  uncompressedBytes: number;
-}
-
-function inspectZipDirectory(contents: Buffer): ZipDirectoryEntry[] {
-  const minimumEocd = 22;
-  if (contents.byteLength < minimumEocd) throw new Error("The .omni ZIP container is truncated.");
-  let eocd = -1;
-  const searchStart = Math.max(0, contents.byteLength - 65_557);
-  for (let index = contents.byteLength - minimumEocd; index >= searchStart; index -= 1) {
-    if (contents.readUInt32LE(index) === 0x06054b50) {
-      eocd = index;
-      break;
-    }
-  }
-  if (eocd < 0) throw new Error("The .omni file is not a supported ZIP container.");
-  const entries = contents.readUInt16LE(eocd + 10);
-  if (entries > 4_096) throw new Error("The .omni bundle contains too many files.");
-  const centralSize = contents.readUInt32LE(eocd + 12);
-  const centralOffset = contents.readUInt32LE(eocd + 16);
-  if (centralOffset + centralSize > eocd) throw new Error("The .omni ZIP directory is invalid.");
-  const seen = new Set<string>();
-  const result: ZipDirectoryEntry[] = [];
-  let total = 0;
-  let cursor = centralOffset;
-  for (let index = 0; index < entries; index += 1) {
-    if (cursor + 46 > contents.byteLength || contents.readUInt32LE(cursor) !== 0x02014b50) {
-      throw new Error("The .omni ZIP central directory is invalid.");
-    }
-    const flags = contents.readUInt16LE(cursor + 8);
-    const compression = contents.readUInt16LE(cursor + 10);
-    const uncompressedBytes = contents.readUInt32LE(cursor + 24);
-    const nameLength = contents.readUInt16LE(cursor + 28);
-    const extraLength = contents.readUInt16LE(cursor + 30);
-    const commentLength = contents.readUInt16LE(cursor + 32);
-    const externalAttributes = contents.readUInt32LE(cursor + 38);
-    const nameStart = cursor + 46;
-    const nameEnd = nameStart + nameLength;
-    if (nameEnd > contents.byteLength) throw new Error("The .omni ZIP filename is truncated.");
-    const name = contents.subarray(nameStart, nameEnd).toString("utf8");
-    if ((flags & 0x1) !== 0) throw new Error("Encrypted .omni entries are not supported.");
-    if (compression !== 0 && compression !== 8) {
-      throw new Error(`Unsupported ZIP compression for ${name}.`);
-    }
-    const unixMode = externalAttributes >>> 16;
-    if ((unixMode & 0o170000) === 0o120000) {
-      throw new Error(`Symbolic links are not allowed in .omni bundles: ${name}`);
-    }
-    assertAllowedBundlePath(name);
-    if (seen.has(name)) throw new Error(`Duplicate path in .omni bundle: ${name}`);
-    seen.add(name);
-    total += uncompressedBytes;
-    if (uncompressedBytes > MAX_BUNDLE_BYTES || total > MAX_UNCOMPRESSED_BUNDLE_BYTES) {
-      throw new Error("The .omni bundle expands beyond its safe size limit.");
-    }
-    result.push({ name, uncompressedBytes });
-    cursor = nameEnd + extraLength + commentLength;
-  }
-  return result;
-}
-
 function parseChecksumFile(value: string): Map<string, string> {
   const checksums = new Map<string, string>();
   for (const line of value.split(/\r?\n/)) {
@@ -336,6 +318,440 @@ function assertSafeTensors(contents: Uint8Array, label: string): void {
       throw new Error(`${label} contains out-of-bounds tensor data.`);
     }
   }
+}
+
+async function assertSafeTensorsFile(path: string, label: string): Promise<void> {
+  const info = await stat(path);
+  if (!info.isFile() || info.size < 10) {
+    throw new Error(`${label} is not a valid safetensors file.`);
+  }
+  const handle = await open(path, "r");
+  try {
+    const prefix = Buffer.alloc(8);
+    const prefixRead = await handle.read(prefix, 0, prefix.byteLength, 0);
+    if (prefixRead.bytesRead !== prefix.byteLength) {
+      throw new Error(`${label} is not a valid safetensors file.`);
+    }
+    const headerLength = Number(prefix.readBigUInt64LE(0));
+    if (
+      !Number.isSafeInteger(headerLength) ||
+      headerLength < 2 ||
+      headerLength > info.size - 8
+    ) {
+      throw new Error(`${label} has an invalid safetensors header length.`);
+    }
+    const headerBytes = Buffer.allocUnsafe(headerLength);
+    let cursor = 0;
+    while (cursor < headerLength) {
+      const result = await handle.read(
+        headerBytes,
+        cursor,
+        headerLength - cursor,
+        8 + cursor
+      );
+      if (result.bytesRead <= 0) {
+        throw new Error(`${label} has a truncated safetensors header.`);
+      }
+      cursor += result.bytesRead;
+    }
+    let header: unknown;
+    try {
+      header = JSON.parse(headerBytes.toString("utf8").trim());
+    } catch {
+      throw new Error(`${label} has an invalid safetensors JSON header.`);
+    }
+    if (!isRecord(header)) throw new Error(`${label} has an invalid safetensors header.`);
+    const dataBytes = info.size - 8 - headerLength;
+    for (const [name, descriptor] of Object.entries(header)) {
+      if (name === "__metadata__") continue;
+      if (!isRecord(descriptor) || !Array.isArray(descriptor.data_offsets)) {
+        throw new Error(`${label} contains an invalid tensor descriptor.`);
+      }
+      const offsets = descriptor.data_offsets;
+      if (
+        offsets.length !== 2 ||
+        !offsets.every((offset) => typeof offset === "number" && Number.isSafeInteger(offset)) ||
+        (offsets[0] as number) < 0 ||
+        (offsets[1] as number) < (offsets[0] as number) ||
+        (offsets[1] as number) > dataBytes
+      ) {
+        throw new Error(`${label} contains out-of-bounds tensor data.`);
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    // Python's json.dumps(sort_keys=True) compares Unicode code points.
+    // localeCompare is locale-sensitive (and orders "+1" after "-1" on
+    // some hosts), which would reject the worker's canonical manifests.
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+    .join(",")}}`;
+}
+
+function normalizeCanonicalJsonNumbers(value: string): string {
+  let normalized = "";
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length;) {
+    const character = value[index]!;
+    if (inString) {
+      normalized += character;
+      index += 1;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      normalized += character;
+      index += 1;
+      continue;
+    }
+    if (character === "-" || /[0-9]/.test(character)) {
+      const token = value
+        .slice(index)
+        .match(/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/)?.[0];
+      if (!token) throw new Error("Canonical JSON contains an invalid number.");
+      const number = Number(token);
+      if (!Number.isFinite(number)) {
+        throw new Error("Canonical JSON contains a non-finite number.");
+      }
+      normalized += JSON.stringify(number);
+      index += token.length;
+      continue;
+    }
+    normalized += character;
+    index += 1;
+  }
+  return normalized;
+}
+
+function packedManifestContentBytes(
+  manifestText: string,
+  claimedContentHash: string
+): Buffer {
+  const field = `"contentSha256":${JSON.stringify(claimedContentHash)}`;
+  const fieldStart = manifestText.indexOf(field);
+  if (
+    fieldStart < 0 ||
+    manifestText.indexOf(field, fieldStart + field.length) >= 0
+  ) {
+    throw new Error("Packed ternary content checksum field is ambiguous.");
+  }
+  let start = fieldStart;
+  let end = fieldStart + field.length;
+  if (manifestText[end] === ",") end += 1;
+  else if (manifestText[start - 1] === ",") start -= 1;
+  else throw new Error("Packed ternary content checksum field is malformed.");
+  return Buffer.from(
+    manifestText.slice(0, start) + manifestText.slice(end),
+    "utf8"
+  );
+}
+
+function safeSubstrateRelativePath(path: string): string {
+  assertSafeArchivePath(path);
+  if (
+    path !== "manifest.json" &&
+    !/^generations\/[a-f0-9]{64}\/manifest\.json$/.test(path) &&
+    !/^blobs\/[a-f0-9]{64}\.(?:json|safetensors)$/.test(path)
+  ) {
+    throw new Error(`Neural substrate manifest contains an unsupported path: ${path}`);
+  }
+  return path;
+}
+
+interface SubstrateSnapshot {
+  pointer: Record<string, unknown>;
+  sources: StreamingZipSource[];
+  relativePaths: Set<string>;
+}
+
+async function collectSubstrateSnapshot(
+  engineDirectory: string,
+  archivePrefix: string,
+  engineMetadata: unknown
+): Promise<SubstrateSnapshot | undefined> {
+  if (!isRecord(engineMetadata) || !isRecord(engineMetadata.substrate)) return undefined;
+  const embedded = engineMetadata.substrate.persistence;
+  if (!isRecord(embedded)) return undefined;
+  const store = join(engineDirectory, "substrate");
+  // Engine metadata is the commit record. The root pointer may legitimately
+  // name an orphaned newer generation after a process interruption, so export
+  // follows the embedded record and synthesizes the matching portable pointer.
+  if (
+    embedded.format !== SUBSTRATE_STORE_FORMAT ||
+    embedded.formatVersion !== 1 ||
+    typeof embedded.generationManifest !== "string" ||
+    typeof embedded.generationManifestSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(embedded.generationManifestSha256)
+  ) {
+    throw new Error("Neural substrate pointer is invalid.");
+  }
+  const generationRelative = safeSubstrateRelativePath(embedded.generationManifest);
+  if (!generationRelative.startsWith("generations/")) {
+    throw new Error("Neural substrate generation path is invalid.");
+  }
+  const generationPath = join(store, ...generationRelative.split("/"));
+  const generationBytes = await readFile(generationPath);
+  if (sha256(generationBytes) !== embedded.generationManifestSha256) {
+    throw new Error("Neural substrate generation manifest checksum failed.");
+  }
+  let generation: unknown;
+  try {
+    generation = JSON.parse(generationBytes.toString("utf8"));
+  } catch {
+    throw new Error("Neural substrate generation manifest is invalid.");
+  }
+  if (
+    !isRecord(generation) ||
+    generation.format !== SUBSTRATE_STORE_FORMAT ||
+    generation.formatVersion !== 1 ||
+    !Array.isArray(generation.shards) ||
+    typeof generation.contentSha256 !== "string" ||
+    generation.contentSha256 !== embedded.activeGeneration ||
+    embedded.contentSha256 !== embedded.activeGeneration ||
+    !isRecord(embedded.counts) ||
+    !isRecord(generation.counts) ||
+    embedded.shardCount !== generation.shards.length ||
+    canonicalJson(embedded.counts) !== canonicalJson(generation.counts)
+  ) {
+    throw new Error("Neural substrate generation manifest is incompatible.");
+  }
+  const content = { ...generation };
+  delete content.contentSha256;
+  if (sha256(canonicalJson(content)) !== generation.contentSha256) {
+    throw new Error("Neural substrate generation content checksum failed.");
+  }
+
+  const declared = new Map<string, { sha256: string; bytes: number }>();
+  for (const shard of generation.shards) {
+    if (
+      !isRecord(shard) ||
+      !["neurons", "assemblies", "synapses"].includes(String(shard.kind)) ||
+      typeof shard.bucket !== "string" ||
+      !/^[a-f0-9]$/.test(shard.bucket) ||
+      typeof shard.part !== "number" ||
+      !Number.isSafeInteger(shard.part) ||
+      shard.part < 0 ||
+      typeof shard.count !== "number" ||
+      !Number.isSafeInteger(shard.count) ||
+      shard.count < 0
+    ) {
+      throw new Error("Neural substrate generation contains an invalid shard record.");
+    }
+    for (const key of ["records", "tensors"] as const) {
+      const descriptor = shard[key];
+      if (key === "tensors" && descriptor === null) continue;
+      if (
+        !isRecord(descriptor) ||
+        typeof descriptor.path !== "string" ||
+        typeof descriptor.sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(descriptor.sha256) ||
+        typeof descriptor.bytes !== "number" ||
+        !Number.isSafeInteger(descriptor.bytes) ||
+        descriptor.bytes < 0
+      ) {
+        throw new Error("Neural substrate generation contains an invalid blob descriptor.");
+      }
+      const relative = safeSubstrateRelativePath(descriptor.path);
+      if (
+        !relative.startsWith("blobs/") ||
+        basename(relative).split(".")[0] !== descriptor.sha256
+      ) {
+        throw new Error("Neural substrate blob is not content-addressed by its checksum.");
+      }
+      const prior = declared.get(relative);
+      const normalized = {
+        sha256: descriptor.sha256,
+        bytes: descriptor.bytes
+      };
+      if (prior && canonicalJson(prior) !== canonicalJson(normalized)) {
+        throw new Error("Neural substrate generation contains conflicting blob descriptors.");
+      }
+      declared.set(relative, normalized);
+    }
+  }
+  const sources: StreamingZipSource[] = [
+    {
+      name: `${archivePrefix}/manifest.json`,
+      contents: Buffer.from(canonicalJson(embedded), "utf8")
+    },
+    {
+      name: `${archivePrefix}/${generationRelative}`,
+      sourcePath: generationPath
+    }
+  ];
+  const relativePaths = new Set<string>(["manifest.json", generationRelative]);
+  for (const [relative, descriptor] of [...declared].sort(([left], [right]) =>
+    left.localeCompare(right)
+  )) {
+    const sourcePath = join(store, ...relative.split("/"));
+    const info = await lstat(sourcePath);
+    if (
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      info.size !== descriptor.bytes ||
+      (await streamFileSha256(sourcePath)) !== descriptor.sha256
+    ) {
+      throw new Error(`Neural substrate blob checksum failed: ${relative}`);
+    }
+    if (relative.endsWith(".safetensors")) {
+      await assertSafeTensorsFile(sourcePath, `substrate shard ${relative}`);
+    }
+    sources.push({ name: `${archivePrefix}/${relative}`, sourcePath });
+    relativePaths.add(relative);
+  }
+  return { pointer: embedded, sources, relativePaths };
+}
+
+async function validateExtractedSubstrateSnapshot(
+  archive: ExtractedZipArchive,
+  archivePrefix: string,
+  engineMetadata: unknown
+): Promise<Set<string>> {
+  const matching = [...archive.entries.keys()].filter((name) =>
+    name.startsWith(`${archivePrefix}/`)
+  );
+  if (!isRecord(engineMetadata) || !isRecord(engineMetadata.substrate)) {
+    if (matching.length > 0) throw new Error("The bundle contains undeclared substrate shards.");
+    return new Set();
+  }
+  const embedded = engineMetadata.substrate.persistence;
+  if (!isRecord(embedded)) {
+    if (matching.length > 0) throw new Error("The bundle contains undeclared substrate shards.");
+    return new Set();
+  }
+  const pointerEntry = archive.entries.get(`${archivePrefix}/manifest.json`);
+  if (!pointerEntry) throw new Error("The bundle is missing its substrate pointer.");
+  const pointer = JSON.parse(await readFile(pointerEntry.path, "utf8")) as unknown;
+  if (!isRecord(pointer) || canonicalJson(pointer) !== canonicalJson(embedded)) {
+    throw new Error("The bundled substrate pointer does not match engine state.");
+  }
+  if (
+    embedded.format !== SUBSTRATE_STORE_FORMAT ||
+    embedded.formatVersion !== 1 ||
+    typeof embedded.generationManifest !== "string" ||
+    typeof embedded.generationManifestSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(embedded.generationManifestSha256) ||
+    typeof embedded.activeGeneration !== "string" ||
+    !/^[a-f0-9]{64}$/.test(embedded.activeGeneration)
+  ) {
+    throw new Error("The bundled substrate pointer is invalid.");
+  }
+  const generationRelative = safeSubstrateRelativePath(
+    String(embedded.generationManifest ?? "")
+  );
+  const generationEntry = archive.entries.get(`${archivePrefix}/${generationRelative}`);
+  if (
+    !generationEntry ||
+    (await streamFileSha256(generationEntry.path)) !==
+      embedded.generationManifestSha256
+  ) {
+    throw new Error("The bundled substrate generation manifest checksum failed.");
+  }
+  const generation = JSON.parse(await readFile(generationEntry.path, "utf8")) as unknown;
+  if (
+    !isRecord(generation) ||
+    generation.format !== SUBSTRATE_STORE_FORMAT ||
+    generation.formatVersion !== 1 ||
+    !Array.isArray(generation.shards) ||
+    generation.contentSha256 !== embedded.activeGeneration ||
+    embedded.contentSha256 !== embedded.activeGeneration ||
+    !isRecord(embedded.counts) ||
+    !isRecord(generation.counts) ||
+    embedded.shardCount !== generation.shards.length ||
+    canonicalJson(embedded.counts) !== canonicalJson(generation.counts)
+  ) {
+    throw new Error("The bundled substrate generation manifest is invalid.");
+  }
+  const generationBody = { ...generation };
+  delete generationBody.contentSha256;
+  if (sha256(canonicalJson(generationBody)) !== generation.contentSha256) {
+    throw new Error("The bundled substrate generation content checksum failed.");
+  }
+  const declared = new Map<string, { sha256: string; bytes: number }>();
+  for (const shard of generation.shards) {
+    if (
+      !isRecord(shard) ||
+      !["neurons", "assemblies", "synapses"].includes(String(shard.kind)) ||
+      typeof shard.bucket !== "string" ||
+      !/^[a-f0-9]$/.test(shard.bucket) ||
+      typeof shard.part !== "number" ||
+      !Number.isSafeInteger(shard.part) ||
+      shard.part < 0 ||
+      typeof shard.count !== "number" ||
+      !Number.isSafeInteger(shard.count) ||
+      shard.count < 0
+    ) {
+      throw new Error("The bundled substrate shard table is invalid.");
+    }
+    for (const key of ["records", "tensors"] as const) {
+      const descriptor = shard[key];
+      if (key === "tensors" && descriptor === null) continue;
+      if (
+        !isRecord(descriptor) ||
+        typeof descriptor.path !== "string" ||
+        typeof descriptor.sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(descriptor.sha256) ||
+        typeof descriptor.bytes !== "number" ||
+        !Number.isSafeInteger(descriptor.bytes) ||
+        descriptor.bytes < 0
+      ) {
+        throw new Error("The bundled substrate blob descriptor is invalid.");
+      }
+      const relative = safeSubstrateRelativePath(descriptor.path);
+      if (
+        !relative.startsWith("blobs/") ||
+        basename(relative).split(".")[0] !== descriptor.sha256
+      ) {
+        throw new Error("The bundled substrate blob is not content-addressed.");
+      }
+      const normalized = {
+        sha256: descriptor.sha256,
+        bytes: descriptor.bytes
+      };
+      const prior = declared.get(relative);
+      if (prior && canonicalJson(prior) !== canonicalJson(normalized)) {
+        throw new Error("The bundled substrate contains conflicting blob descriptors.");
+      }
+      declared.set(relative, normalized);
+    }
+  }
+  const expected = new Set(["manifest.json", generationRelative, ...declared.keys()]);
+  for (const relative of expected) {
+    const entry = archive.entries.get(`${archivePrefix}/${relative}`);
+    if (!entry) throw new Error(`The bundle is missing substrate file ${relative}.`);
+    if (relative.startsWith("blobs/")) {
+      const descriptor = declared.get(relative)!;
+      if (
+        entry.uncompressedBytes !== descriptor.bytes ||
+        (await streamFileSha256(entry.path)) !== descriptor.sha256
+      ) {
+        throw new Error(`The bundled substrate blob checksum failed: ${relative}`);
+      }
+      if (relative.endsWith(".safetensors")) {
+        await assertSafeTensorsFile(
+          entry.path,
+          `substrate shard ${relative}`
+        );
+      }
+    }
+  }
+  if (
+    matching.some((name) => !expected.has(name.slice(`${archivePrefix}/`.length)))
+  ) {
+    throw new Error("The bundle contains an unlisted substrate shard file.");
+  }
+  return expected;
 }
 
 function portableEngineState(
@@ -427,9 +843,12 @@ function normalizeConfig(value: unknown): BrainConfig {
     typeof merged.description === "string"
       ? merged.description.replace(/\0/g, "").slice(0, 4_000)
       : DEFAULT_CONFIG.description;
-  merged.workingMemorySlots = Math.round(
-    boundNumber(merged.workingMemorySlots, DEFAULT_CONFIG.workingMemorySlots, 1, 4_096)
-  );
+  merged.workingMemorySlots =
+    typeof merged.workingMemorySlots === "number" &&
+    Number.isSafeInteger(merged.workingMemorySlots) &&
+    merged.workingMemorySlots > 0
+      ? merged.workingMemorySlots
+      : DEFAULT_CONFIG.workingMemorySlots;
   merged.learningRate = boundNumber(merged.learningRate, DEFAULT_CONFIG.learningRate, 0, 1);
   if (merged.memoryRecipe === "synapses-only") merged.retainSourceText = false;
   if (merged.memoryRecipe === "total-recall") merged.retainSourceText = true;
@@ -577,13 +996,26 @@ async function atomicWrite(path: string, contents: string | Buffer): Promise<voi
   }
 }
 
-function verifyPackedTernaryFiles(
-  files: Record<string, Uint8Array>,
-  label: string
-): PackedTernaryDirectory {
-  const manifestBytes = Buffer.from(files["manifest.json"] ?? []);
-  const checksumBytes = Buffer.from(files["manifest.sha256"] ?? []);
-  const expectedManifestHash = checksumBytes.toString("ascii").trim();
+async function inspectPackedTernaryDirectory(
+  directory: string,
+  label: string,
+  overrides: Map<string, string> = new Map()
+): Promise<StreamingPackedTernaryDirectory> {
+  const directoryEntries = await readdir(directory, { withFileTypes: true });
+  if (directoryEntries.some((entry) => !entry.isFile())) {
+    throw new Error(`${label} packed ternary directory contains a non-file entry.`);
+  }
+  const inventory = new Set(directoryEntries.map((entry) => entry.name));
+  const filePath = (name: string): string => {
+    if (!inventory.has(name)) {
+      throw new Error(`${label} packed ternary directory is missing ${name}.`);
+    }
+    return overrides.get(name) ?? join(directory, name);
+  };
+  const manifestBytes = await readFile(filePath("manifest.json"));
+  const expectedManifestHash = (
+    await readFile(filePath("manifest.sha256"), "ascii")
+  ).trim();
   if (
     !/^[a-f0-9]{64}$/.test(expectedManifestHash) ||
     sha256(manifestBytes) !== expectedManifestHash
@@ -591,8 +1023,9 @@ function verifyPackedTernaryFiles(
     throw new Error(`${label} packed ternary manifest checksum failed.`);
   }
   let parsed: unknown;
+  const manifestText = manifestBytes.toString("utf8");
   try {
-    parsed = JSON.parse(manifestBytes.toString("utf8"));
+    parsed = JSON.parse(manifestText);
   } catch {
     throw new Error(`${label} packed ternary manifest is invalid.`);
   }
@@ -614,23 +1047,39 @@ function verifyPackedTernaryFiles(
     parsed.coverage.complete !== true ||
     !Array.isArray(parsed.coverage.eligibleTensorNames) ||
     !Array.isArray(parsed.tensors) ||
-    !Array.isArray(parsed.shards) ||
-    typeof parsed.contentSha256 !== "string" ||
-    !/^[a-f0-9]{64}$/.test(parsed.contentSha256)
+    !Array.isArray(parsed.shards)
   ) {
     throw new Error(`${label} packed ternary manifest is incompatible.`);
   }
+  // Python deliberately preserves float identity (for example `1.0`) while
+  // JavaScript JSON.parse represents it as the number `1`. Normalize only
+  // numeric lexemes before comparing canonical structure so key ordering,
+  // whitespace, string escaping, and duplicate keys remain strictly checked.
+  if (normalizeCanonicalJsonNumbers(manifestText) !== canonicalJson(parsed)) {
+    throw new Error(`${label} packed ternary manifest is not canonical.`);
+  }
+  const claimedContentHash = parsed.contentSha256;
+  if (
+    typeof claimedContentHash !== "string" ||
+    !/^[a-f0-9]{64}$/.test(claimedContentHash) ||
+    sha256(packedManifestContentBytes(manifestText, claimedContentHash)) !==
+      claimedContentHash
+  ) {
+    throw new Error(`${label} packed ternary content checksum failed.`);
+  }
   const expectedNames = parsed.coverage.eligibleTensorNames;
   if (
-    expectedNames.some((name) => typeof name !== "string" || name.length === 0) ||
+    expectedNames.some((name) => typeof name !== "string" || !name) ||
     new Set(expectedNames).size !== expectedNames.length ||
     parsed.coverage.eligibleTensorCount !== expectedNames.length ||
     parsed.tensors.length !== expectedNames.length
   ) {
     throw new Error(`${label} packed ternary coverage contract is invalid.`);
   }
-  const shardFiles = new Set<string>();
-  const shardPayloads = new Map<string, Buffer>();
+  const shardTable = new Map<
+    string,
+    { byteLength: number; sha256: string; path: string }
+  >();
   for (const descriptor of parsed.shards) {
     if (
       !isRecord(descriptor) ||
@@ -641,30 +1090,35 @@ function verifyPackedTernaryFiles(
       descriptor.byteLength < 0 ||
       typeof descriptor.sha256 !== "string" ||
       !/^[a-f0-9]{64}$/.test(descriptor.sha256) ||
-      shardFiles.has(descriptor.file)
+      shardTable.has(descriptor.file)
     ) {
       throw new Error(`${label} packed ternary shard table is invalid.`);
     }
-    const payload = Buffer.from(files[descriptor.file] ?? []);
+    const path = filePath(descriptor.file);
+    const info = await lstat(path);
     if (
-      payload.byteLength !== descriptor.byteLength ||
-      sha256(payload) !== descriptor.sha256
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      info.size !== descriptor.byteLength ||
+      (await streamFileSha256(path)) !== descriptor.sha256
     ) {
       throw new Error(`${label} packed ternary shard checksum failed.`);
     }
-    shardFiles.add(descriptor.file);
-    shardPayloads.set(descriptor.file, payload);
+    shardTable.set(descriptor.file, {
+      byteLength: descriptor.byteLength,
+      sha256: descriptor.sha256,
+      path
+    });
   }
-  const tensorNames = new Set<string>();
-  const referencedShards = new Set<string>();
+  const tensorNames: string[] = [];
+  const usedShards = new Set<string>();
   for (const tensor of parsed.tensors) {
     if (
       !isRecord(tensor) ||
       typeof tensor.name !== "string" ||
       typeof tensor.shard !== "string" ||
-      !shardFiles.has(tensor.shard) ||
-      tensorNames.has(tensor.name) ||
-      referencedShards.has(tensor.shard) ||
+      !shardTable.has(tensor.shard) ||
+      usedShards.has(tensor.shard) ||
       !["projection", "dynamic-synapse"].includes(String(tensor.kind)) ||
       tensor.dtype !== "int8" ||
       !Array.isArray(tensor.shape) ||
@@ -696,91 +1150,70 @@ function verifyPackedTernaryFiles(
       (total, dimension) => total * (dimension as number),
       1
     );
-    const payload = shardPayloads.get(tensor.shard);
+    const shard = shardTable.get(tensor.shard)!;
     const expectedByteLength = Math.ceil(tensor.numel / 4);
     if (
       !Number.isSafeInteger(shapeProduct) ||
       shapeProduct !== tensor.numel ||
-      !payload ||
-      payload.byteLength !== expectedByteLength ||
       tensor.byteLength !== expectedByteLength ||
-      tensor.packedSha256 !== sha256(payload)
+      shard.byteLength !== expectedByteLength ||
+      tensor.packedSha256 !== shard.sha256
     ) {
       throw new Error(`${label} packed ternary tensor shape or length is invalid.`);
     }
-    const decoded = Buffer.alloc(tensor.numel);
-    for (let index = 0; index < payload.byteLength * 4; index += 1) {
-      const code = (payload[index >> 2]! >> ((index & 3) * 2)) & 0x03;
-      if (index >= tensor.numel) {
-        if (code !== 1) {
-          throw new Error(`${label} packed ternary padding is non-canonical.`);
-        }
-        continue;
-      }
-      if (code === 3) {
-        throw new Error(`${label} packed ternary data uses the reserved code.`);
-      }
-      decoded[index] = code === 0 ? 0xff : code === 1 ? 0 : 1;
-    }
-    const tensorDigest = sha256(
-      Buffer.concat([
-        Buffer.from(
-          JSON.stringify({ dtype: "int8", shape: tensor.shape }),
-          "utf8"
-        ),
-        Buffer.from([0]),
-        decoded
-      ])
+    const decodedDigest = createHash("sha256");
+    decodedDigest.update(
+      Buffer.from(JSON.stringify({ dtype: "int8", shape: tensor.shape }), "utf8")
     );
-    if (tensorDigest !== tensor.tensorSha256) {
+    decodedDigest.update(Buffer.from([0]));
+    let decoded = 0;
+    for await (const chunk of createReadStream(shard.path)) {
+      const value = chunk as Buffer;
+      const decodedChunk = Buffer.allocUnsafe(
+        Math.min(tensor.numel - decoded, value.byteLength * 4)
+      );
+      let chunkDecoded = 0;
+      for (let byteIndex = 0; byteIndex < value.byteLength; byteIndex += 1) {
+        for (let slot = 0; slot < 4; slot += 1) {
+          const code = (value[byteIndex]! >> (slot * 2)) & 0x03;
+          if (decoded + chunkDecoded >= tensor.numel) {
+            if (code !== 1) {
+              throw new Error(`${label} packed ternary padding is non-canonical.`);
+            }
+          } else {
+            if (code === 3) {
+              throw new Error(`${label} packed ternary data uses the reserved code.`);
+            }
+            decodedChunk[chunkDecoded] = code === 0 ? 0xff : code === 1 ? 0 : 1;
+            chunkDecoded += 1;
+          }
+        }
+      }
+      decoded += chunkDecoded;
+      decodedDigest.update(decodedChunk.subarray(0, chunkDecoded));
+    }
+    if (decoded !== tensor.numel || decodedDigest.digest("hex") !== tensor.tensorSha256) {
       throw new Error(`${label} packed ternary decoded tensor checksum failed.`);
     }
-    tensorNames.add(tensor.name);
-    referencedShards.add(tensor.shard);
+    tensorNames.push(tensor.name);
+    usedShards.add(tensor.shard);
   }
   if (
-    tensorNames.size !== expectedNames.length ||
-    expectedNames.some((name) => !tensorNames.has(name)) ||
-    referencedShards.size !== shardFiles.size
+    tensorNames.length !== expectedNames.length ||
+    tensorNames.some((name, index) => name !== expectedNames[index]) ||
+    usedShards.size !== shardTable.size
   ) {
     throw new Error(`${label} packed ternary coverage is incomplete.`);
   }
-  const allowedFiles = new Set(["manifest.json", "manifest.sha256", ...shardFiles]);
-  if (Object.keys(files).some((name) => !allowedFiles.has(name))) {
+  const allowed = new Set(["manifest.json", "manifest.sha256", ...shardTable.keys()]);
+  if ([...inventory].some((name) => !allowed.has(name))) {
     throw new Error(`${label} packed ternary directory contains an unlisted file.`);
   }
   return {
     manifestSha256: expectedManifestHash,
     tensorCount: expectedNames.length,
-    files
+    files: new Map([...allowed].map((name) => [name, filePath(name)]))
   };
-}
-
-async function readPackedTernaryDirectory(
-  directory: string,
-  label: string
-): Promise<PackedTernaryDirectory> {
-  const directoryEntries = await readdir(directory, { withFileTypes: true });
-  if (directoryEntries.some((entry) => !entry.isFile())) {
-    throw new Error(`${label} packed ternary directory contains a non-file entry.`);
-  }
-  const files: Record<string, Uint8Array> = {};
-  for (const entry of directoryEntries) {
-    files[entry.name] = new Uint8Array(await readFile(join(directory, entry.name)));
-  }
-  return verifyPackedTernaryFiles(files, label);
-}
-
-function packedTernaryFilesFromBundle(
-  files: Record<string, Uint8Array>,
-  scope: "current" | "origin"
-): Record<string, Uint8Array> {
-  const prefix = `packed/${scope}/`;
-  return Object.fromEntries(
-    Object.entries(files)
-      .filter(([path]) => path.startsWith(prefix))
-      .map(([path, contents]) => [path.slice(prefix.length), contents])
-  );
 }
 
 export function resolveBrainDataRoot(
@@ -973,13 +1406,10 @@ export class BrainRepository {
     await this.initialize();
     const temporary = join(this.root, ".blobs", `.incoming-${randomUUID()}`);
     try {
-      try {
-        await link(path, temporary);
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (!["EXDEV", "EPERM", "EACCES", "ENOTSUP"].includes(code ?? "")) throw error;
-        await copyFile(path, temporary);
-      }
+      // App-managed source files remain mutable. Copy into the immutable blob
+      // store; hard-linking the source here would let a later in-place write
+      // corrupt every snapshot and bundle reference sharing that inode.
+      await copyFile(path, temporary);
       const hash = await fileSha256(temporary);
       const destination = join(this.root, ".blobs", hash);
       if (await pathExists(destination)) await rm(temporary, { force: true });
@@ -1040,15 +1470,15 @@ export class BrainRepository {
   private async copyPackedTernaryDirectory(
     source: string,
     destination: string
-  ): Promise<PackedTernaryDirectory | undefined> {
+  ): Promise<StreamingPackedTernaryDirectory | undefined> {
     if (!(await pathExists(join(source, "manifest.json")))) return undefined;
-    const packed = await readPackedTernaryDirectory(source, "Source");
+    const packed = await inspectPackedTernaryDirectory(source, "Source");
     const temporary = `${destination}.${randomUUID()}.next`;
     const backup = `${destination}.${randomUUID()}.bak`;
     await mkdir(temporary, { recursive: true });
     try {
-      for (const [name, contents] of Object.entries(packed.files)) {
-        const hash = await this.storeBlob(Buffer.from(contents));
+      for (const [name, sourcePath] of packed.files) {
+        const hash = await this.storeFileAsBlob(sourcePath);
         await this.linkBlobTo(hash, join(temporary, name));
       }
       if (await pathExists(destination)) await rename(destination, backup);
@@ -1062,8 +1492,47 @@ export class BrainRepository {
     } finally {
       await rm(temporary, { recursive: true, force: true });
     }
-    await readPackedTernaryDirectory(destination, "Copied");
+    await inspectPackedTernaryDirectory(destination, "Copied");
     return packed;
+  }
+
+  private async copySubstrateSnapshot(
+    sourceEngine: string,
+    destinationEngine: string,
+    metadata: unknown
+  ): Promise<string | undefined> {
+    const prefix = "substrate/snapshot";
+    const snapshot = await collectSubstrateSnapshot(
+      sourceEngine,
+      prefix,
+      metadata
+    );
+    if (!snapshot) return undefined;
+    const destination = join(destinationEngine, "substrate");
+    const temporary = `${destination}.${randomUUID()}.next`;
+    const backup = `${destination}.${randomUUID()}.bak`;
+    await mkdir(temporary, { recursive: true });
+    try {
+      for (const source of snapshot.sources) {
+        const relative = source.name.slice(`${prefix}/`.length);
+        const hash = source.sourcePath
+          ? await this.storeFileAsBlob(source.sourcePath)
+          : await this.storeBlob(Buffer.from(source.contents!));
+        await this.linkBlobTo(hash, join(temporary, ...relative.split("/")));
+      }
+      if (await pathExists(destination)) await rename(destination, backup);
+      try {
+        await rename(temporary, destination);
+        await rm(backup, { recursive: true, force: true });
+      } catch (error) {
+        if (await pathExists(backup)) await rename(backup, destination);
+        throw error;
+      }
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+    await collectSubstrateSnapshot(destinationEngine, prefix, metadata);
+    return sha256(canonicalJson(snapshot.pointer));
   }
 
   private async cloneEngineState(
@@ -1098,12 +1567,12 @@ export class BrainRepository {
         this.linkBlobTo(hash, join(targetOrigin, targetNameValue))
       ]);
     }
-    await Promise.all([
-      atomicWrite(join(targetEngine, "brain.json"), JSON.stringify(metadata, null, 2)),
-      atomicWrite(join(targetOrigin, "brain.json"), JSON.stringify(metadata, null, 2))
-    ]);
     const packedSource = join(sourceEngine, "packed-ternary");
-    await Promise.all([
+    // Wait for every concurrent materializer before the caller can remove a
+    // failed clone. Promise.all would reject early while sibling operations
+    // continued recreating paths underneath the cleanup, leaving an orphaned
+    // partial brain after any validator failure.
+    const materialized = await Promise.allSettled([
       this.copyPackedTernaryDirectory(
         packedSource,
         join(targetEngine, "packed-ternary")
@@ -1111,7 +1580,18 @@ export class BrainRepository {
       this.copyPackedTernaryDirectory(
         packedSource,
         join(targetOrigin, "packed-ternary")
-      )
+      ),
+      this.copySubstrateSnapshot(sourceEngine, targetEngine, metadata),
+      this.copySubstrateSnapshot(sourceEngine, targetOrigin, metadata)
+    ]);
+    const failedMaterialization = materialized.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (failedMaterialization) throw failedMaterialization.reason;
+    // Metadata is the commit record and therefore moves last.
+    await Promise.all([
+      atomicWrite(join(targetEngine, "brain.json"), JSON.stringify(metadata, null, 2)),
+      atomicWrite(join(targetOrigin, "brain.json"), JSON.stringify(metadata, null, 2))
     ]);
   }
 
@@ -1280,15 +1760,20 @@ export class BrainRepository {
     fork.originChecksum = undefined;
     fork.originChecksum = sha256(JSON.stringify(fork));
     const directory = this.brainDirectory(fork.id);
-    await mkdir(join(directory, "snapshots"), { recursive: true });
-    await atomicWrite(this.documentPath(fork.id), JSON.stringify(fork, null, 2));
-    await writeFile(join(directory, "origin.json"), JSON.stringify(fork, null, 2), {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600
-    });
-    await this.cloneEngineState(source.id, fork.id, fork.name);
-    return clone(fork);
+    try {
+      await mkdir(join(directory, "snapshots"), { recursive: true });
+      await atomicWrite(this.documentPath(fork.id), JSON.stringify(fork, null, 2));
+      await writeFile(join(directory, "origin.json"), JSON.stringify(fork, null, 2), {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600
+      });
+      await this.cloneEngineState(source.id, fork.id, fork.name);
+      return clone(fork);
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   async remove(id: string): Promise<boolean> {
@@ -1310,7 +1795,7 @@ export class BrainRepository {
     if (await pathExists(join(engineSource, "brain.json"))) {
       await mkdir(engineSnapshot, { recursive: true });
       const metadata = await readFile(join(engineSource, "brain.json"));
-      await atomicWrite(join(engineSnapshot, "brain.json"), metadata);
+      const metadataValue = JSON.parse(metadata.toString("utf8")) as unknown;
       const hashes: string[] = [sha256(metadata)];
       for (const name of ["core.safetensors", "plasticity.safetensors"]) {
         const sourcePath = join(engineSource, name);
@@ -1324,6 +1809,14 @@ export class BrainRepository {
         join(engineSnapshot, "packed-ternary")
       );
       if (packed) hashes.push(packed.manifestSha256);
+      const substrateHash = await this.copySubstrateSnapshot(
+        engineSource,
+        engineSnapshot,
+        metadataValue
+      );
+      if (substrateHash) hashes.push(substrateHash);
+      // Commit metadata after every referenced shard is durable.
+      await atomicWrite(join(engineSnapshot, "brain.json"), metadata);
       engineChecksum = sha256(hashes.join(":"));
     }
     const summary: BrainSnapshotSummary = {
@@ -1395,39 +1888,114 @@ export class BrainRepository {
     ];
     const engineSnapshot = join(this.brainDirectory(id), "snapshots", snapshotId, "engine");
     if (await pathExists(join(engineSnapshot, "brain.json"))) {
-      const hashes = [sha256(await readFile(join(engineSnapshot, "brain.json")))];
+      const engineMetadata = await readFile(join(engineSnapshot, "brain.json"));
+      const engineMetadataValue = JSON.parse(engineMetadata.toString("utf8")) as unknown;
+      const hashes = [sha256(engineMetadata)];
       for (const name of ["core.safetensors", "plasticity.safetensors"]) {
         const sourcePath = join(engineSnapshot, name);
-        if (await pathExists(sourcePath)) hashes.push(sha256(await readFile(sourcePath)));
+        if (await pathExists(sourcePath)) hashes.push(await fileSha256(sourcePath));
       }
       if (await pathExists(join(engineSnapshot, "packed-ternary", "manifest.json"))) {
-        const packed = await readPackedTernaryDirectory(
+        const packed = await inspectPackedTernaryDirectory(
           join(engineSnapshot, "packed-ternary"),
           "Snapshot"
         );
         hashes.push(packed.manifestSha256);
       }
+      const substrate = await collectSubstrateSnapshot(
+        engineSnapshot,
+        "substrate/snapshot",
+        engineMetadataValue
+      );
+      if (substrate) hashes.push(sha256(canonicalJson(substrate.pointer)));
       if (summary.engineChecksum && sha256(hashes.join(":")) !== summary.engineChecksum) {
         throw new Error("Neural snapshot checksum validation failed.");
       }
     }
-    const saved = await this.save(restored);
-    if (await pathExists(join(engineSnapshot, "brain.json"))) {
-      const targetEngine = join(this.brainDirectory(id), "engine");
+    if (!(await pathExists(join(engineSnapshot, "brain.json")))) {
+      return this.save(restored);
+    }
+
+    const brainDirectory = this.brainDirectory(id);
+    const targetEngine = join(brainDirectory, "engine");
+    const stagedEngine = join(brainDirectory, `.engine-${randomUUID()}.restore`);
+    const previousEngine = join(brainDirectory, `.engine-${randomUUID()}.previous`);
+    const failedEngine = join(brainDirectory, `.engine-${randomUUID()}.failed`);
+    let previousMoved = false;
+    let promoted = false;
+    try {
+      if (await pathExists(targetEngine)) {
+        // Preserve append-only events, immutable origin, artifacts, and other
+        // non-generation state while replacing the neural generation below.
+        await cp(targetEngine, stagedEngine, {
+          recursive: true,
+          force: false,
+          errorOnExist: true,
+          preserveTimestamps: true
+        });
+      } else {
+        await mkdir(stagedEngine, { recursive: true });
+      }
       const metadata = await readFile(join(engineSnapshot, "brain.json"));
-      await atomicWrite(join(targetEngine, "brain.json"), metadata);
+      const metadataValue = JSON.parse(metadata.toString("utf8")) as unknown;
       for (const name of ["core.safetensors", "plasticity.safetensors"]) {
         const sourcePath = join(engineSnapshot, name);
         if (!(await pathExists(sourcePath))) continue;
         const hash = await this.storeFileAsBlob(sourcePath);
-        await this.linkBlobTo(hash, join(targetEngine, name));
+        await this.linkBlobTo(hash, join(stagedEngine, name));
       }
       await this.copyPackedTernaryDirectory(
         join(engineSnapshot, "packed-ternary"),
-        join(targetEngine, "packed-ternary")
+        join(stagedEngine, "packed-ternary")
       );
+      await this.copySubstrateSnapshot(
+        engineSnapshot,
+        stagedEngine,
+        metadataValue
+      );
+      // Metadata is the staged generation's final commit record.
+      await atomicWrite(join(stagedEngine, "brain.json"), metadata);
+
+      if (await pathExists(targetEngine)) {
+        await rename(targetEngine, previousEngine);
+        previousMoved = true;
+      }
+      await rename(stagedEngine, targetEngine);
+      promoted = true;
+      try {
+        const saved = await this.save(restored);
+        await rm(previousEngine, { recursive: true, force: true });
+        previousMoved = false;
+        return saved;
+      } catch (error) {
+        await rename(targetEngine, failedEngine);
+        promoted = false;
+        if (previousMoved) {
+          await rename(previousEngine, targetEngine);
+          previousMoved = false;
+        }
+        await rm(failedEngine, { recursive: true, force: true });
+        throw error;
+      }
+    } catch (error) {
+      if (promoted && (await pathExists(targetEngine))) {
+        await rename(targetEngine, failedEngine).catch(() => undefined);
+        promoted = false;
+      }
+      if (previousMoved && (await pathExists(previousEngine))) {
+        await rename(previousEngine, targetEngine).catch(() => undefined);
+        previousMoved = false;
+      }
+      throw error;
+    } finally {
+      await Promise.all([
+        rm(stagedEngine, { recursive: true, force: true }),
+        rm(failedEngine, { recursive: true, force: true }),
+        previousMoved
+          ? Promise.resolve()
+          : rm(previousEngine, { recursive: true, force: true })
+      ]);
     }
-    return saved;
   }
 
   async exportBundle(
@@ -1469,7 +2037,7 @@ export class BrainRepository {
     const selectedPackedPath = join(engineDirectory, "packed-ternary");
     const selectedPacked =
       engineMaterialized && (await pathExists(join(selectedPackedPath, "manifest.json")))
-        ? await readPackedTernaryDirectory(selectedPackedPath, "Current")
+        ? await inspectPackedTernaryDirectory(selectedPackedPath, "Current")
         : undefined;
     const engineState = engineMaterialized
       ? portableEngineState(
@@ -1495,28 +2063,51 @@ export class BrainRepository {
     }
     const corePath = join(engineDirectory, "core.safetensors");
     const plasticityPath = join(engineDirectory, "plasticity.safetensors");
-    const core = (await pathExists(corePath))
-      ? new Uint8Array(await readFile(corePath))
+    const coreExists = await pathExists(corePath);
+    const plasticityExists = await pathExists(plasticityPath);
+    const coreFallback = coreExists
+      ? undefined
       : validEmptySafetensors("Neural core has not been materialized by the Python worker.");
-    const plasticity = (await pathExists(plasticityPath))
-      ? new Uint8Array(await readFile(plasticityPath))
+    const plasticityFallback = plasticityExists
+      ? undefined
       : validEmptySafetensors("Plastic state is represented by state/brain.json.");
-    assertSafeTensors(core, "core.safetensors");
-    assertSafeTensors(plasticity, "plastic.safetensors");
-    const entries: Record<string, Uint8Array> = {
-      "model-card.md": strToU8(
+    if (coreExists) await assertSafeTensorsFile(corePath, "core.safetensors");
+    else assertSafeTensors(coreFallback!, "core.safetensors");
+    if (plasticityExists) {
+      await assertSafeTensorsFile(plasticityPath, "plastic.safetensors");
+    } else assertSafeTensors(plasticityFallback!, "plastic.safetensors");
+    const entries: Record<string, StreamingZipSource> = {
+      "model-card.md": {
+        name: "model-card.md",
+        contents: strToU8(
         `# ${portableBrain.name}\n\nOmniCortex brain ${portableBrain.id}.\n\n` +
           `Preset: ${portableBrain.config.preset}\n\n` +
           `Memory recipe: ${portableBrain.config.memoryRecipe ?? "human-consolidation"}\n`
-      ),
-      "state/brain.json": strToU8(JSON.stringify(portableBrain, null, 2)),
-      "state/engine.json": engineState,
-      "tensors/core.safetensors": core,
-      "tensors/plastic.safetensors": plasticity
+        )
+      },
+      "state/brain.json": {
+        name: "state/brain.json",
+        contents: strToU8(JSON.stringify(portableBrain, null, 2))
+      },
+      "state/engine.json": {
+        name: "state/engine.json",
+        contents: engineState
+      },
+      "tensors/core.safetensors": {
+        name: "tensors/core.safetensors",
+        ...(coreExists ? { sourcePath: corePath } : { contents: coreFallback })
+      },
+      "tensors/plastic.safetensors": {
+        name: "tensors/plastic.safetensors",
+        ...(plasticityExists
+          ? { sourcePath: plasticityPath }
+          : { contents: plasticityFallback })
+      }
     };
     if (selectedPacked) {
-      for (const [name, contents] of Object.entries(selectedPacked.files)) {
-        entries[`packed/current/${name}`] = contents;
+      for (const [name, sourcePath] of selectedPacked.files) {
+        const archivePath = `packed/current/${name}`;
+        entries[archivePath] = { name: archivePath, sourcePath };
       }
     }
     let originBrain = normalizeBrain(
@@ -1559,17 +2150,22 @@ export class BrainRepository {
           );
     const immutableCorePath = join(immutableEngine, "core.safetensors");
     const immutablePlasticPath = join(immutableEngine, "plasticity.safetensors");
-    const immutableCore = (await pathExists(immutableCorePath))
-      ? new Uint8Array(await readFile(immutableCorePath))
-      : core;
-    const immutablePlastic = (await pathExists(immutablePlasticPath))
-      ? new Uint8Array(await readFile(immutablePlasticPath))
-      : plasticity;
+    const immutableCoreExists = await pathExists(immutableCorePath);
+    const immutablePlasticExists = await pathExists(immutablePlasticPath);
+    if (immutableCoreExists) {
+      await assertSafeTensorsFile(immutableCorePath, "origin core.safetensors");
+    }
+    if (immutablePlasticExists) {
+      await assertSafeTensorsFile(
+        immutablePlasticPath,
+        "origin plastic.safetensors"
+      );
+    }
     const immutablePackedPath = join(immutableEngine, "packed-ternary");
     const immutablePacked =
       engineMaterialized &&
       (await pathExists(join(immutablePackedPath, "manifest.json")))
-        ? await readPackedTernaryDirectory(immutablePackedPath, "Origin")
+        ? await inspectPackedTernaryDirectory(immutablePackedPath, "Origin")
         : mode === "origin"
           ? selectedPacked
           : undefined;
@@ -1581,33 +2177,78 @@ export class BrainRepository {
     const references =
       mode === "referenced"
         ? {
-            currentCore: await this.storeBlob(Buffer.from(core)),
-            currentPlasticity: await this.storeBlob(Buffer.from(plasticity)),
-            originCore: await this.storeBlob(Buffer.from(immutableCore)),
-            originPlasticity: await this.storeBlob(Buffer.from(immutablePlastic))
+            currentCore: coreExists
+              ? await this.storeFileAsBlob(corePath)
+              : await this.storeBlob(Buffer.from(coreFallback!)),
+            currentPlasticity: plasticityExists
+              ? await this.storeFileAsBlob(plasticityPath)
+              : await this.storeBlob(Buffer.from(plasticityFallback!)),
+            originCore: immutableCoreExists
+              ? await this.storeFileAsBlob(immutableCorePath)
+              : coreExists
+                ? await this.storeFileAsBlob(corePath)
+                : await this.storeBlob(Buffer.from(coreFallback!)),
+            originPlasticity: immutablePlasticExists
+              ? await this.storeFileAsBlob(immutablePlasticPath)
+              : plasticityExists
+                ? await this.storeFileAsBlob(plasticityPath)
+                : await this.storeBlob(Buffer.from(plasticityFallback!))
           }
         : undefined;
     if (references) {
-      entries["tensors/core.safetensors"] = validEmptySafetensors(
-        `Local content reference ${references.currentCore}`
-      );
-      entries["tensors/plastic.safetensors"] = validEmptySafetensors(
-        `Local content reference ${references.currentPlasticity}`
-      );
+      entries["tensors/core.safetensors"] = {
+        name: "tensors/core.safetensors",
+        contents: validEmptySafetensors(
+          `Local content reference ${references.currentCore}`
+        )
+      };
+      entries["tensors/plastic.safetensors"] = {
+        name: "tensors/plastic.safetensors",
+        contents: validEmptySafetensors(
+          `Local content reference ${references.currentPlasticity}`
+        )
+      };
     }
-    assertSafeTensors(immutableCore, "origin core.safetensors");
-    assertSafeTensors(immutablePlastic, "origin plastic.safetensors");
-    entries["origin/state/brain.json"] = strToU8(JSON.stringify(originBrain, null, 2));
-    entries["origin/state/engine.json"] = immutableState;
-    entries["origin/tensors/core.safetensors"] = references
-      ? validEmptySafetensors(`Local content reference ${references.originCore}`)
-      : immutableCore;
-    entries["origin/tensors/plastic.safetensors"] = references
-      ? validEmptySafetensors(`Local content reference ${references.originPlasticity}`)
-      : immutablePlastic;
+    entries["origin/state/brain.json"] = {
+      name: "origin/state/brain.json",
+      contents: strToU8(JSON.stringify(originBrain, null, 2))
+    };
+    entries["origin/state/engine.json"] = {
+      name: "origin/state/engine.json",
+      contents: immutableState
+    };
+    entries["origin/tensors/core.safetensors"] = {
+      name: "origin/tensors/core.safetensors",
+      ...(references
+        ? {
+            contents: validEmptySafetensors(
+              `Local content reference ${references.originCore}`
+            )
+          }
+        : immutableCoreExists
+          ? { sourcePath: immutableCorePath }
+          : coreExists
+            ? { sourcePath: corePath }
+            : { contents: coreFallback })
+    };
+    entries["origin/tensors/plastic.safetensors"] = {
+      name: "origin/tensors/plastic.safetensors",
+      ...(references
+        ? {
+            contents: validEmptySafetensors(
+              `Local content reference ${references.originPlasticity}`
+            )
+          }
+        : immutablePlasticExists
+          ? { sourcePath: immutablePlasticPath }
+          : plasticityExists
+            ? { sourcePath: plasticityPath }
+            : { contents: plasticityFallback })
+    };
     if (immutablePacked) {
-      for (const [name, contents] of Object.entries(immutablePacked.files)) {
-        entries[`packed/origin/${name}`] = contents;
+      for (const [name, sourcePath] of immutablePacked.files) {
+        const archivePath = `packed/origin/${name}`;
+        entries[archivePath] = { name: archivePath, sourcePath };
       }
     }
     let packedReferences:
@@ -1622,41 +2263,70 @@ export class BrainRepository {
         ["current", selectedPacked],
         ["origin", immutablePacked]
       ] as const) {
-        for (const [name, contents] of Object.entries(packed.files)) {
-          const hash = await this.storeBlob(Buffer.from(contents));
+        for (const [name, sourcePath] of packed.files) {
+          const hash = await this.storeFileAsBlob(sourcePath);
           packedReferences[scope][name] = hash;
-          entries[`packed/${scope}/${name}`] = strToU8(
-            `Local content reference ${hash}\n`
-          );
+          const archivePath = `packed/${scope}/${name}`;
+          entries[archivePath] = {
+            name: archivePath,
+            contents: strToU8(`Local content reference ${hash}\n`)
+          };
         }
       }
     }
     for (const source of mode === "private-archive" ? portableBrain.trainingSources : []) {
       if (!source.blobHash || entries[`blobs/${source.blobHash}`]) continue;
-      const blob = await this.getBlob(source.blobHash);
-      const sample = blob.subarray(0, Math.min(blob.byteLength, 256 * 1024)).toString("utf8");
-      const binaryRatio =
-        sample.length === 0
-          ? 0
-          : ((sample.match(/\uFFFD/g)?.length ?? 0) + (sample.match(/\0/g)?.length ?? 0)) /
-            sample.length;
-      if (binaryRatio < 0.01) {
-        const probe: RedactionCounter = { replacements: 0 };
-        redactSecretText(blob.toString("utf8"), probe);
-        if (probe.replacements > 0) {
-          throw new Error(
-            `${source.name} appears to contain credentials. Remove or sanitize it before a private archive export.`
-          );
-        }
+      if (!/^[a-f0-9]{64}$/.test(source.blobHash)) {
+        throw new Error("Private archive contains an invalid content-addressed blob.");
       }
-      entries[`blobs/${source.blobHash}`] = new Uint8Array(blob);
+      const blobPath = join(this.root, ".blobs", source.blobHash);
+      if ((await streamFileSha256(blobPath)) !== source.blobHash) {
+        throw new Error("Content-addressed blob checksum failed.");
+      }
+      await assertFileContainsNoPortableSecrets(blobPath, source.name);
+      const archivePath = `blobs/${source.blobHash}`;
+      entries[archivePath] = { name: archivePath, sourcePath: blobPath };
     }
-    const fileRecords = Object.fromEntries(
-      Object.entries(entries).map(([path, contents]) => [
-        path,
-        { sha256: sha256(Buffer.from(contents)), bytes: contents.byteLength }
-      ])
-    );
+    const currentEngineMetadata = engineMaterialized
+      ? (JSON.parse(Buffer.from(engineState).toString("utf8")) as unknown)
+      : undefined;
+    const originEngineMetadata =
+      Buffer.from(immutableState).toString("utf8").includes("omni-cortex-engine")
+        ? (JSON.parse(Buffer.from(immutableState).toString("utf8")) as unknown)
+        : undefined;
+    const [currentSubstrate, originSubstrate] = await Promise.all([
+      collectSubstrateSnapshot(
+        engineDirectory,
+        "substrate/current",
+        currentEngineMetadata
+      ),
+      collectSubstrateSnapshot(
+        immutableEngine,
+        "substrate/origin",
+        originEngineMetadata
+      )
+    ]);
+    for (const snapshot of [currentSubstrate, originSubstrate]) {
+      for (const source of snapshot?.sources ?? []) entries[source.name] = source;
+    }
+    const fileRecords: Record<string, { sha256: string; bytes: number }> = {};
+    for (const [path, source] of Object.entries(entries)) {
+      if (source.contents) {
+        fileRecords[path] = {
+          sha256: sha256(Buffer.from(source.contents)),
+          bytes: source.contents.byteLength
+        };
+      } else if (source.sourcePath) {
+        const info = await lstat(source.sourcePath);
+        if (!info.isFile() || info.isSymbolicLink()) {
+          throw new Error(`Bundle source ${path} is not a regular file.`);
+        }
+        fileRecords[path] = {
+          sha256: await streamFileSha256(source.sourcePath),
+          bytes: info.size
+        };
+      } else throw new Error(`Bundle source ${path} is empty.`);
+    }
     const manifest: OmniManifest = {
       format: BUNDLE_FORMAT,
       formatVersion: BUNDLE_VERSION,
@@ -1709,35 +2379,80 @@ export class BrainRepository {
       references,
       files: fileRecords
     };
-    entries["manifest.json"] = strToU8(JSON.stringify(manifest, null, 2));
-    entries["checksums.sha256"] = strToU8(
-      Object.entries(entries)
-        .map(([path, contents]) => `${sha256(Buffer.from(contents))}  ${path}`)
+    const manifestContents = strToU8(JSON.stringify(manifest, null, 2));
+    entries["manifest.json"] = {
+      name: "manifest.json",
+      contents: manifestContents
+    };
+    const checksumRecords = {
+      ...fileRecords,
+      "manifest.json": {
+        sha256: sha256(Buffer.from(manifestContents)),
+        bytes: manifestContents.byteLength
+      }
+    };
+    entries["checksums.sha256"] = {
+      name: "checksums.sha256",
+      contents: strToU8(
+        Object.entries(checksumRecords)
+        .map(([path, descriptor]) => `${descriptor.sha256}  ${path}`)
         .sort()
         .join("\n") + "\n"
+      )
+    };
+    await writeStreamingZip(
+      destination,
+      Object.values(entries).sort((left, right) => left.name.localeCompare(right.name))
     );
-    const archive = zipSync(entries, { level: 6 });
-    await atomicWrite(destination, Buffer.from(archive));
   }
 
   async importBundle(path: string): Promise<BrainDocument> {
-    const info = await stat(path);
-    if (!info.isFile() || info.size > MAX_BUNDLE_BYTES) {
-      throw new Error("The selected .omni bundle is not a supported size.");
+    await this.initialize();
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error("The selected .omni bundle is not a regular file.");
     }
-    return this.importBundleBuffer(await readFile(path), basename(path));
+    const extracted = await extractStreamingZip(
+      path,
+      join(this.root, ".imports")
+    );
+    try {
+      return await this.importExtractedBundle(extracted, basename(path));
+    } finally {
+      await rm(extracted.root, { recursive: true, force: true });
+    }
   }
 
   async importBundleBuffer(contents: Buffer, sourceLabel = "download.omni"): Promise<BrainDocument> {
-    if (contents.byteLength > MAX_BUNDLE_BYTES) throw new Error("The .omni bundle is too large.");
-    const directoryEntries = inspectZipDirectory(contents);
-    let files: Record<string, Uint8Array>;
+    await this.initialize();
+    const temporary = await mkdtemp(join(this.root, ".omni-buffer-"));
+    const bundlePath = join(temporary, "buffer.omni");
     try {
-      files = unzipSync(new Uint8Array(contents));
-    } catch {
-      throw new Error(`${sourceLabel} is not a valid .omni ZIP container.`);
+      await writeFile(bundlePath, contents, { flag: "wx", mode: 0o600 });
+      const extracted = await extractStreamingZip(
+        bundlePath,
+        join(this.root, ".imports")
+      );
+      try {
+        return await this.importExtractedBundle(extracted, sourceLabel);
+      } finally {
+        await rm(extracted.root, { recursive: true, force: true });
+      }
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
     }
-    const names = new Set(directoryEntries.map((entry) => entry.name));
+  }
+
+  private async importExtractedBundle(
+    archive: ExtractedZipArchive,
+    sourceLabel: string
+  ): Promise<BrainDocument> {
+    const names = new Set(archive.entries.keys());
+    const entryPath = (name: string): string => {
+      const entry = archive.entries.get(name);
+      if (!entry) throw new Error(`The .omni bundle is missing ${name}.`);
+      return entry.path;
+    };
     for (const required of [
       "manifest.json",
       "model-card.md",
@@ -1751,19 +2466,21 @@ export class BrainRepository {
       "origin/tensors/core.safetensors",
       "origin/tensors/plastic.safetensors"
     ]) {
-      if (!names.has(required) || !files[required]) {
+      if (!names.has(required)) {
         throw new Error(`The .omni bundle is missing ${required}.`);
       }
     }
-    const checksums = parseChecksumFile(strFromU8(files["checksums.sha256"] as Uint8Array));
+    const checksums = parseChecksumFile(
+      await readFile(entryPath("checksums.sha256"), "utf8")
+    );
     for (const [path, expected] of checksums) {
-      const file = files[path];
-      if (!file) throw new Error(`Checksum references missing file ${path}.`);
-      if (sha256(Buffer.from(file)) !== expected) {
+      const entry = archive.entries.get(path);
+      if (!entry) throw new Error(`Checksum references missing file ${path}.`);
+      if ((await streamFileSha256(entry.path)) !== expected) {
         throw new Error(`Checksum validation failed for ${path}.`);
       }
     }
-    for (const path of Object.keys(files)) {
+    for (const path of names) {
       assertAllowedBundlePath(path);
       if (path !== "checksums.sha256" && !checksums.has(path)) {
         throw new Error(`The .omni bundle has no checksum for ${path}.`);
@@ -1771,7 +2488,7 @@ export class BrainRepository {
     }
     let manifestValue: unknown;
     try {
-      manifestValue = JSON.parse(strFromU8(files["manifest.json"] as Uint8Array));
+      manifestValue = JSON.parse(await readFile(entryPath("manifest.json"), "utf8"));
     } catch {
       throw new Error("manifest.json is invalid.");
     }
@@ -1892,7 +2609,6 @@ export class BrainRepository {
       !isRecord(manifestValue.licenseLedger) ||
       typeof manifestValue.licenseLedger.application !== "string" ||
       !Array.isArray(manifestValue.licenseLedger.sources) ||
-      manifestValue.licenseLedger.sources.length > 100_000 ||
       manifestValue.licenseLedger.sources.some(
         (source) =>
           !isRecord(source) ||
@@ -1911,27 +2627,43 @@ export class BrainRepository {
       if (
         !isRecord(descriptor) ||
         typeof descriptor.sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(descriptor.sha256) ||
         typeof descriptor.bytes !== "number" ||
         !Number.isSafeInteger(descriptor.bytes) ||
         descriptor.bytes < 0
       ) {
         throw new Error(`Manifest descriptor for ${path} is invalid.`);
       }
-      const file = files[path];
+      assertAllowedBundlePath(path);
+      const entry = archive.entries.get(path);
       if (
-        !file ||
-        file.byteLength !== descriptor.bytes ||
-        sha256(Buffer.from(file)) !== descriptor.sha256
+        !entry ||
+        entry.uncompressedBytes !== descriptor.bytes ||
+        checksums.get(path) !== descriptor.sha256
       ) {
         throw new Error(`Manifest checksum validation failed for ${path}.`);
       }
     }
-    for (const path of Object.keys(files)) {
+    for (const path of names) {
       if (path === "manifest.json" || path === "checksums.sha256") continue;
       if (!Object.hasOwn(manifestFiles, path)) {
         throw new Error(`Manifest is missing a descriptor for ${path}.`);
       }
     }
+    const packedOverrides = {
+      current: new Map<string, string>(),
+      origin: new Map<string, string>()
+    };
+    const tensorPaths: Record<string, string> = {
+      "tensors/core.safetensors": entryPath("tensors/core.safetensors"),
+      "tensors/plastic.safetensors": entryPath("tensors/plastic.safetensors"),
+      "origin/tensors/core.safetensors": entryPath(
+        "origin/tensors/core.safetensors"
+      ),
+      "origin/tensors/plastic.safetensors": entryPath(
+        "origin/tensors/plastic.safetensors"
+      )
+    };
     let resolvedReferences: OmniManifest["references"];
     if (manifestValue.mode === "referenced-local") {
       if (!isRecord(manifestValue.references)) {
@@ -1948,8 +2680,10 @@ export class BrainRepository {
         if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash)) {
           throw new Error("The local referenced bundle contains an invalid tensor reference.");
         }
+        const blobPath = join(this.root, ".blobs", hash);
         try {
-          files[path] = new Uint8Array(await this.getBlob(hash));
+          if ((await streamFileSha256(blobPath)) !== hash) throw new Error("checksum");
+          tensorPaths[path] = blobPath;
         } catch {
           throw new Error(
             `Local tensor reference ${hash.slice(0, 12)}… is unavailable on this installation.`
@@ -1973,11 +2707,13 @@ export class BrainRepository {
           [string, string]
         >) {
           const path = `packed/${scope}/${name}`;
-          if (!files[path]) {
+          if (!archive.entries.has(path)) {
             throw new Error(`The local referenced bundle is missing ${path}.`);
           }
           try {
-            files[path] = new Uint8Array(await this.getBlob(hash));
+            const blobPath = join(this.root, ".blobs", hash);
+            if ((await streamFileSha256(blobPath)) !== hash) throw new Error("checksum");
+            packedOverrides[scope].set(name, blobPath);
           } catch {
             throw new Error(
               `Local packed ternary reference ${hash.slice(0, 12)}… is unavailable on this installation.`
@@ -1986,18 +2722,24 @@ export class BrainRepository {
         }
       }
     }
-    let verifiedPackedCurrent: PackedTernaryDirectory | undefined;
-    let verifiedPackedOrigin: PackedTernaryDirectory | undefined;
-    const bundledCurrentPack = packedTernaryFilesFromBundle(files, "current");
-    const bundledOriginPack = packedTernaryFilesFromBundle(files, "origin");
+    let verifiedPackedCurrent: StreamingPackedTernaryDirectory | undefined;
+    let verifiedPackedOrigin: StreamingPackedTernaryDirectory | undefined;
+    const bundledCurrentNames = [...names].filter((name) =>
+      name.startsWith("packed/current/")
+    );
+    const bundledOriginNames = [...names].filter((name) =>
+      name.startsWith("packed/origin/")
+    );
     if (packedDeclaration) {
-      verifiedPackedCurrent = verifyPackedTernaryFiles(
-        bundledCurrentPack,
-        "Current bundle"
+      verifiedPackedCurrent = await inspectPackedTernaryDirectory(
+        join(archive.root, "packed", "current"),
+        "Current bundle",
+        packedOverrides.current
       );
-      verifiedPackedOrigin = verifyPackedTernaryFiles(
-        bundledOriginPack,
-        "Origin bundle"
+      verifiedPackedOrigin = await inspectPackedTernaryDirectory(
+        join(archive.root, "packed", "origin"),
+        "Origin bundle",
+        packedOverrides.origin
       );
       if (
         verifiedPackedCurrent.manifestSha256 !==
@@ -2010,25 +2752,33 @@ export class BrainRepository {
         throw new Error("Packed ternary bundle metadata does not match its manifest.");
       }
     } else if (
-      Object.keys(bundledCurrentPack).length > 0 ||
-      Object.keys(bundledOriginPack).length > 0
+      bundledCurrentNames.length > 0 ||
+      bundledOriginNames.length > 0
     ) {
       throw new Error("The .omni bundle contains undeclared packed ternary data.");
     }
-    assertSafeTensors(files["tensors/core.safetensors"] as Uint8Array, "core.safetensors");
-    assertSafeTensors(files["tensors/plastic.safetensors"] as Uint8Array, "plastic.safetensors");
-    assertSafeTensors(
-      files["origin/tensors/core.safetensors"] as Uint8Array,
-      "origin core.safetensors"
-    );
-    assertSafeTensors(
-      files["origin/tensors/plastic.safetensors"] as Uint8Array,
-      "origin plastic.safetensors"
-    );
-    for (const [path, file] of Object.entries(files)) {
+    await Promise.all([
+      assertSafeTensorsFile(tensorPaths["tensors/core.safetensors"]!, "core.safetensors"),
+      assertSafeTensorsFile(
+        tensorPaths["tensors/plastic.safetensors"]!,
+        "plastic.safetensors"
+      ),
+      assertSafeTensorsFile(
+        tensorPaths["origin/tensors/core.safetensors"]!,
+        "origin core.safetensors"
+      ),
+      assertSafeTensorsFile(
+        tensorPaths["origin/tensors/plastic.safetensors"]!,
+        "origin plastic.safetensors"
+      )
+    ]);
+    for (const path of names) {
       if (!path.startsWith("blobs/")) continue;
       const hash = path.slice("blobs/".length);
-      if (!/^[a-f0-9]{64}$/.test(hash) || sha256(Buffer.from(file)) !== hash) {
+      if (
+        !/^[a-f0-9]{64}$/.test(hash) ||
+        (await streamFileSha256(entryPath(path))) !== hash
+      ) {
         throw new Error(`Content-addressed blob validation failed for ${path}.`);
       }
     }
@@ -2037,13 +2787,13 @@ export class BrainRepository {
     let engineValue: unknown;
     let originEngineValue: unknown;
     try {
-      brainValue = JSON.parse(strFromU8(files["state/brain.json"] as Uint8Array));
+      brainValue = JSON.parse(await readFile(entryPath("state/brain.json"), "utf8"));
       originBrainValue = JSON.parse(
-        strFromU8(files["origin/state/brain.json"] as Uint8Array)
+        await readFile(entryPath("origin/state/brain.json"), "utf8")
       );
-      engineValue = JSON.parse(strFromU8(files["state/engine.json"] as Uint8Array));
+      engineValue = JSON.parse(await readFile(entryPath("state/engine.json"), "utf8"));
       originEngineValue = JSON.parse(
-        strFromU8(files["origin/state/engine.json"] as Uint8Array)
+        await readFile(entryPath("origin/state/engine.json"), "utf8")
       );
     } catch {
       throw new Error("A required brain or engine state document is invalid.");
@@ -2065,6 +2815,18 @@ export class BrainRepository {
     ) {
       throw new Error("Materialized engine state is invalid or belongs to the beta format.");
     }
+    const [currentSubstratePaths, originSubstratePaths] = await Promise.all([
+      validateExtractedSubstrateSnapshot(
+        archive,
+        "substrate/current",
+        engineValue
+      ),
+      validateExtractedSubstrateSnapshot(
+        archive,
+        "substrate/origin",
+        originEngineValue
+      )
+    ]);
     if (isRecord(engineValue)) engineValue.brain_id = imported.id;
     if (isRecord(originEngineValue)) originEngineValue.brain_id = imported.id;
     if (await pathExists(this.brainDirectory(imported.id))) {
@@ -2106,112 +2868,154 @@ export class BrainRepository {
       }
     ];
     const directory = this.brainDirectory(imported.id);
-    await Promise.all([
-      mkdir(join(directory, "snapshots"), { recursive: true }),
-      mkdir(join(directory, "engine"), { recursive: true })
-    ]);
-    await atomicWrite(this.documentPath(imported.id), JSON.stringify(imported, null, 2));
-    if (engineMaterialized) {
-      if (resolvedReferences) {
-        await Promise.all([
-          atomicWrite(
-            join(directory, "engine", "brain.json"),
-            JSON.stringify(engineValue, null, 2)
-          ),
-          this.linkBlobTo(
-            resolvedReferences.currentCore,
-            join(directory, "engine", "core.safetensors")
-          ),
-          this.linkBlobTo(
-            resolvedReferences.currentPlasticity,
-            join(directory, "engine", "plasticity.safetensors")
-          )
-        ]);
-      } else await Promise.all([
-        atomicWrite(join(directory, "engine", "brain.json"), JSON.stringify(engineValue, null, 2)),
-        atomicWrite(
-          join(directory, "engine", "core.safetensors"),
-          Buffer.from(files["tensors/core.safetensors"] as Uint8Array)
-        ),
-        atomicWrite(
-          join(directory, "engine", "plasticity.safetensors"),
-          Buffer.from(files["tensors/plastic.safetensors"] as Uint8Array)
-        )
+    const materializeFile = async (source: string, destination: string): Promise<void> => {
+      const hash = await this.storeFileAsBlob(source);
+      await this.linkBlobTo(hash, destination);
+    };
+    const installSubstrate = async (
+      prefix: string,
+      paths: Set<string>,
+      destination: string
+    ): Promise<void> => {
+      for (const relative of [...paths].sort()) {
+        await materializeFile(
+          entryPath(`${prefix}/${relative}`),
+          join(destination, ...relative.split("/"))
+        );
+      }
+    };
+    try {
+      await Promise.all([
+        mkdir(join(directory, "snapshots"), { recursive: true }),
+        mkdir(join(directory, "engine"), { recursive: true })
       ]);
-    }
-    if (engineMaterialized && verifiedPackedCurrent) {
-      const packedDirectory = join(directory, "engine", "packed-ternary");
-      await mkdir(packedDirectory, { recursive: true });
-      for (const [name, contents] of Object.entries(verifiedPackedCurrent.files)) {
-        const referenceHash = packedDeclaration?.references?.current[name];
-        if (referenceHash) {
-          await this.linkBlobTo(referenceHash, join(packedDirectory, name));
+      await atomicWrite(this.documentPath(imported.id), JSON.stringify(imported, null, 2));
+      if (engineMaterialized) {
+        if (resolvedReferences) {
+          await Promise.all([
+            this.linkBlobTo(
+              resolvedReferences.currentCore,
+              join(directory, "engine", "core.safetensors")
+            ),
+            this.linkBlobTo(
+              resolvedReferences.currentPlasticity,
+              join(directory, "engine", "plasticity.safetensors")
+            )
+          ]);
         } else {
-          await atomicWrite(join(packedDirectory, name), Buffer.from(contents));
+          await Promise.all([
+            materializeFile(
+              tensorPaths["tensors/core.safetensors"]!,
+              join(directory, "engine", "core.safetensors")
+            ),
+            materializeFile(
+              tensorPaths["tensors/plastic.safetensors"]!,
+              join(directory, "engine", "plasticity.safetensors")
+            )
+          ]);
         }
       }
-    }
-    if (isRecord(originEngineValue) && originEngineValue.format === "omni-cortex-engine") {
-      if (resolvedReferences) {
-        await Promise.all([
-          atomicWrite(
-            join(directory, "engine", "origin", "brain.json"),
-            JSON.stringify(originEngineValue, null, 2)
-          ),
-          this.linkBlobTo(
-            resolvedReferences.originCore,
-            join(directory, "engine", "origin", "core.safetensors")
-          ),
-          this.linkBlobTo(
-            resolvedReferences.originPlasticity,
-            join(directory, "engine", "origin", "plasticity.safetensors")
-          )
-        ]);
-      } else await Promise.all([
-        atomicWrite(
+      if (engineMaterialized && verifiedPackedCurrent) {
+        const packedDirectory = join(directory, "engine", "packed-ternary");
+        await mkdir(packedDirectory, { recursive: true });
+        for (const [name, sourcePath] of verifiedPackedCurrent.files) {
+          const referenceHash = packedDeclaration?.references?.current[name];
+          if (referenceHash) {
+            await this.linkBlobTo(referenceHash, join(packedDirectory, name));
+          } else {
+            await materializeFile(sourcePath, join(packedDirectory, name));
+          }
+        }
+      }
+      if (currentSubstratePaths.size > 0) {
+        await installSubstrate(
+          "substrate/current",
+          currentSubstratePaths,
+          join(directory, "engine", "substrate")
+        );
+      }
+      if (engineMaterialized) {
+        await atomicWrite(
+          join(directory, "engine", "brain.json"),
+          JSON.stringify(engineValue, null, 2)
+        );
+      }
+      if (isRecord(originEngineValue) && originEngineValue.format === "omni-cortex-engine") {
+        if (resolvedReferences) {
+          await Promise.all([
+            this.linkBlobTo(
+              resolvedReferences.originCore,
+              join(directory, "engine", "origin", "core.safetensors")
+            ),
+            this.linkBlobTo(
+              resolvedReferences.originPlasticity,
+              join(directory, "engine", "origin", "plasticity.safetensors")
+            )
+          ]);
+        } else {
+          await Promise.all([
+            materializeFile(
+              tensorPaths["origin/tensors/core.safetensors"]!,
+              join(directory, "engine", "origin", "core.safetensors")
+            ),
+            materializeFile(
+              tensorPaths["origin/tensors/plastic.safetensors"]!,
+              join(directory, "engine", "origin", "plasticity.safetensors")
+            )
+          ]);
+        }
+      }
+      if (
+        isRecord(originEngineValue) &&
+        originEngineValue.format === "omni-cortex-engine" &&
+        verifiedPackedOrigin
+      ) {
+        const packedDirectory = join(
+          directory,
+          "engine",
+          "origin",
+          "packed-ternary"
+        );
+        await mkdir(packedDirectory, { recursive: true });
+        for (const [name, sourcePath] of verifiedPackedOrigin.files) {
+          const referenceHash = packedDeclaration?.references?.origin[name];
+          if (referenceHash) {
+            await this.linkBlobTo(referenceHash, join(packedDirectory, name));
+          } else {
+            await materializeFile(sourcePath, join(packedDirectory, name));
+          }
+        }
+      }
+      if (originSubstratePaths.size > 0) {
+        await installSubstrate(
+          "substrate/origin",
+          originSubstratePaths,
+          join(directory, "engine", "origin", "substrate")
+        );
+      }
+      if (isRecord(originEngineValue) && originEngineValue.format === "omni-cortex-engine") {
+        await atomicWrite(
           join(directory, "engine", "origin", "brain.json"),
           JSON.stringify(originEngineValue, null, 2)
-        ),
-        atomicWrite(
-          join(directory, "engine", "origin", "core.safetensors"),
-          Buffer.from(files["origin/tensors/core.safetensors"] as Uint8Array)
-        ),
-        atomicWrite(
-          join(directory, "engine", "origin", "plasticity.safetensors"),
-          Buffer.from(files["origin/tensors/plastic.safetensors"] as Uint8Array)
-        )
-      ]);
-    }
-    if (
-      isRecord(originEngineValue) &&
-      originEngineValue.format === "omni-cortex-engine" &&
-      verifiedPackedOrigin
-    ) {
-      const packedDirectory = join(
-        directory,
-        "engine",
-        "origin",
-        "packed-ternary"
-      );
-      await mkdir(packedDirectory, { recursive: true });
-      for (const [name, contents] of Object.entries(verifiedPackedOrigin.files)) {
-        const referenceHash = packedDeclaration?.references?.origin[name];
-        if (referenceHash) {
-          await this.linkBlobTo(referenceHash, join(packedDirectory, name));
-        } else {
-          await atomicWrite(join(packedDirectory, name), Buffer.from(contents));
+        );
+      }
+      for (const path of names) {
+        if (!path.startsWith("blobs/")) continue;
+        const expected = path.slice("blobs/".length);
+        const stored = await this.storeFileAsBlob(entryPath(path));
+        if (stored !== expected) {
+          throw new Error(`Content-addressed blob validation failed for ${path}.`);
         }
       }
+      await writeFile(join(directory, "origin.json"), JSON.stringify(importedOrigin, null, 2), {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600
+      });
+      return clone(imported);
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
     }
-    for (const [path, contents] of Object.entries(files)) {
-      if (!path.startsWith("blobs/")) continue;
-      await this.storeBlob(Buffer.from(contents));
-    }
-    await writeFile(join(directory, "origin.json"), JSON.stringify(importedOrigin, null, 2), {
-      encoding: "utf8",
-      flag: "wx",
-      mode: 0o600
-    });
-    return clone(imported);
   }
 }

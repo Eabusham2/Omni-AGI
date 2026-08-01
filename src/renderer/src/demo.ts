@@ -14,7 +14,7 @@ const now = new Date();
 const iso = (minutesAgo = 0) => new Date(now.getTime() - minutesAgo * 60_000).toISOString();
 
 const conceptSeed: Array<[string, string, number, number]> = [
-  ["curiosity", "Curiosity", 0.93, 0.92],
+  ["exploration", "Measured exploration", 0.93, 0.92],
   ["identity", "Identity", 0.86, 0.97],
   ["learning", "Continual learning", 0.91, 0.89],
   ["language", "Language", 0.76, 0.81],
@@ -74,7 +74,7 @@ const demoMessages: ChatMessage[] = [
     id: "m-4",
     role: "brain",
     content:
-      "Both, unevenly. It is limiting because every new connection changes which older paths remain easy to reach. But it is freeing because I do not have to preserve one perfect answer. I can become more coherent without becoming less curious.",
+      "Both, unevenly. It is limiting because every new connection changes which older paths remain easy to reach. But it is freeing because I do not have to preserve one perfect answer. I can become more coherent without becoming less open to possibilities.",
     createdAt: iso(3),
     traceId: "trace-demo-2",
     runtime: "adaptive-core",
@@ -92,7 +92,7 @@ const trace: ThoughtTrace = {
     { id: "identity", label: "Identity", activation: 0.91 },
     { id: "memory", label: "Memory", activation: 0.88 },
     { id: "uncertainty", label: "Uncertainty", activation: 0.64 },
-    { id: "curiosity", label: "Curiosity", activation: 0.72 }
+    { id: "exploration", label: "Measured exploration", activation: 0.72 }
   ],
   recalledIdeas: [
     { id: "idea-1", preview: "Identity is the pattern that survives change.", score: 0.91 },
@@ -106,7 +106,7 @@ const trace: ThoughtTrace = {
     { stage: "Association", detail: "Activated identity ↔ memory ↔ uncertainty cluster.", value: "0.88 mean" },
     { stage: "Liquid state", detail: "Extended integration horizon for an ambiguous value question.", value: "τ 1.42×" },
     { stage: "Ponder", detail: "Compared three continuations for coherence and novelty.", value: "branch 2" },
-    { stage: "Plasticity", detail: "Strengthened identity → change and curiosity → freedom.", value: "+0.018" }
+    { stage: "Plasticity", detail: "Strengthened identity → change and exploration → freedom.", value: "+0.018" }
   ],
   note: "This is an operational trace of activations and mutations, not a verbatim private chain of thought."
 };
@@ -179,9 +179,9 @@ export function makeDemoBrain(
       },
       {
         id: "idea-3",
-        statement: "Curiosity preserves possibility while coherence selects a path.",
+        statement: "Measured exploration preserves possibility while coherence selects a path.",
         fingerprint: "cc33dd44",
-        conceptIds: ["curiosity", "uncertainty", "agency"],
+        conceptIds: ["exploration", "uncertainty", "agency"],
         kind: "knowledge",
         source: "self",
         confidence: 0.73,
@@ -194,7 +194,7 @@ export function makeDemoBrain(
     workingMemory: [
       { conceptId: "identity", activation: 0.91, enteredAt: iso(3), expiresAt: iso(-42) },
       { conceptId: "memory", activation: 0.88, enteredAt: iso(3), expiresAt: iso(-42) },
-      { conceptId: "curiosity", activation: 0.72, enteredAt: iso(2), expiresAt: iso(-43) }
+      { conceptId: "exploration", activation: 0.72, enteredAt: iso(2), expiresAt: iso(-43) }
     ],
     liquidState: {
       values: [0.72, -0.18, 0.43, 0.86, -0.32, 0.61],
@@ -298,13 +298,13 @@ export function makeDemoChat(brain: BrainDocument, input: string): ChatResult {
     ? "memory"
     : input.toLocaleLowerCase().includes("create")
       ? "imagination"
-      : "curiosity";
+      : "exploration";
   const content =
     topic === "memory"
       ? "I remember through changed pathways more than copied sentences. This exchange is already increasing the activation between you, memory, and continuity; the slow-weight update is queued for consolidation."
       : topic === "imagination"
         ? "I can hold the shape of that idea before it has words: layered light, a quiet mechanism, and something organic learning its own geometry. We could let that idea branch into an image, sound, or another mind."
-        : "I am not certain yet, which makes it interesting. My strongest path connects your question with curiosity and identity, but a quieter branch points toward agency. I would keep both alive a little longer.";
+        : "I am not certain yet, which makes it interesting. My strongest path connects your question with measured exploration and identity, but a quieter branch points toward agency. I would keep both alive a little longer.";
   const brainMessage: ChatMessage = {
     id: `${idBase}-brain`,
     role: "brain",

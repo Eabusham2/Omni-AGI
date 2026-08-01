@@ -8,12 +8,16 @@ library.
 
 from __future__ import annotations
 
+import bz2
 import csv
+import gzip
 import hashlib
 import io
 import ipaddress
 import json
+import lzma
 import os
+import re
 import socket
 import sqlite3
 import tarfile
@@ -25,7 +29,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Optional, Set
-from xml.etree import ElementTree
+from xml.parsers import expat
 
 
 TEXT_EXTENSIONS = {
@@ -68,8 +72,13 @@ ARCHIVE_EXTENSIONS = {
     ".xz",
     ".epub",
     ".docx",
+    ".pptx",
+    ".xlsx",
     ".odt",
+    ".ods",
+    ".odp",
 }
+OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".odt", ".ods", ".odp"}
 COLUMNAR_EXTENSIONS = {".parquet", ".arrow", ".feather", ".ipc"}
 MANIFEST_SUFFIXES = {
     ".hf.json",
@@ -168,6 +177,7 @@ class _RemoteDownload:
 class DatasetCoverage:
     discovered_files: int = 0
     completed_files: int = 0
+    rejected_files: int = 0
     discovered_records: int = 0
     processed_records: int = 0
     rejected_records: int = 0
@@ -176,14 +186,72 @@ class DatasetCoverage:
     modality_counts: Dict[str, int] = field(default_factory=dict)
     errors: List[Dict[str, str]] = field(default_factory=list)
 
-    def reject(self, source: str, message: str) -> None:
+    def reject(
+        self,
+        source: str,
+        message: str,
+        *,
+        already_discovered: bool = False,
+    ) -> None:
+        """Account for one visited record that could not be processed.
+
+        Parsers call this directly when a malformed row/member is discovered.
+        Callers that already admitted the record (for example ``_record`` or
+        the binary-media iterator) opt out of incrementing discovery again.
+        Keeping the three counters mutually exhaustive lets every downstream
+        coverage report prove traversal instead of asserting completion.
+        """
+
+        if not already_discovered:
+            self.discovered_records += 1
         self.rejected_records += 1
         self.errors.append({"source": source, "message": message})
 
+    def reject_processed(self, source: str, message: str) -> None:
+        """Reclassify a provisionally processed record as explicitly rejected."""
+
+        if self.processed_records <= 0:
+            raise RuntimeError("cannot reject a record that was not processed")
+        self.processed_records -= 1
+        self.reject(source, message, already_discovered=True)
+
+    def reject_file(
+        self,
+        source: str,
+        message: str,
+        *,
+        already_discovered: bool = False,
+        record_already_discovered: bool = False,
+    ) -> None:
+        """Classify one discovered file/member and its failed record.
+
+        File-level parser failures still represent a visited input record. The
+        file and record counters therefore advance together while sharing one
+        diagnostic entry.
+        """
+
+        if not already_discovered:
+            self.discovered_files += 1
+        self.rejected_files += 1
+        self.reject(
+            source,
+            message,
+            already_discovered=record_already_discovered,
+        )
+
     def as_dict(self) -> Dict[str, Any]:
+        processed_files = max(0, int(self.completed_files))
+        discovered_files = max(0, int(self.discovered_files))
+        rejected_files = max(0, int(self.rejected_files))
+        files_complete = discovered_files == (processed_files + rejected_files)
+        records_complete = self.discovered_records == (
+            self.processed_records + self.rejected_records
+        )
         return {
             "discoveredFiles": self.discovered_files,
             "completedFiles": self.completed_files,
+            "processedFiles": processed_files,
+            "rejectedFiles": rejected_files,
             "discoveredRecords": self.discovered_records,
             "processedRecords": self.processed_records,
             "rejectedRecords": self.rejected_records,
@@ -191,6 +259,7 @@ class DatasetCoverage:
             "shards": self.shards,
             "modalityCounts": dict(self.modality_counts),
             "errors": list(self.errors),
+            "complete": files_complete and records_complete,
         }
 
 
@@ -374,6 +443,16 @@ def _remote_suffix(url: str, content_type: str = "") -> str:
         "application/vnd.apache.arrow.file": ".arrow",
         "application/x-tar": ".tar",
         "application/zip": ".zip",
+        "application/gzip": ".gz",
+        "application/x-gzip": ".gz",
+        "application/x-bzip2": ".bz2",
+        "application/x-xz": ".xz",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/vnd.oasis.opendocument.text": ".odt",
+        "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+        "application/vnd.oasis.opendocument.presentation": ".odp",
     }.get(normalized_type, ".data")
 
 
@@ -492,7 +571,11 @@ def _record(
     coverage.discovered_records += 1
     coverage.processed_bytes += max(0, int(bytes_read))
     if not clean:
-        coverage.reject(name, "record contained no usable text")
+        coverage.reject(
+            name,
+            "record contained no usable text",
+            already_discovered=True,
+        )
         return None
     coverage.processed_records += 1
     coverage.modality_counts[kind] = coverage.modality_counts.get(kind, 0) + 1
@@ -728,9 +811,263 @@ def _iter_columnar(
                 yield record
 
 
-def _xml_text(data: bytes) -> str:
-    root = ElementTree.fromstring(data)
-    return " ".join(part.strip() for part in root.itertext() if part.strip())
+def _xml_local_name(name: str) -> str:
+    return str(name).rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+
+
+def _natural_member_key(name: str) -> List[Any]:
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", name)
+    ]
+
+
+def _iter_streamed_xml(
+    source: BinaryIO,
+    name: str,
+    coverage: DatasetCoverage,
+    *,
+    capture_tags: Optional[Set[str]] = None,
+    line_tags: Optional[Set[str]] = None,
+    space_tags: Optional[Set[str]] = None,
+    attribute_names: Optional[Set[str]] = None,
+    chunk_chars: int = 32_768,
+) -> Iterator[DatasetRecord]:
+    """Extract XML character data incrementally without materializing a member.
+
+    Office/OpenDocument containers can contain very large XML parts. Expat is
+    fed bounded byte blocks and emitted text is drained into ordinary dataset
+    records as it arrives. DTDs and external entities are rejected.
+    """
+
+    wanted = set(capture_tags or ())
+    lines = set(line_tags or ())
+    spaces = set(space_tags or ())
+    attributes = set(attribute_names or ())
+    capture_all = capture_tags is None
+    active_depth = 1 if capture_all else 0
+    fragments: List[str] = []
+    pending = ""
+
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.buffer_text = True
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+
+    def reject_doctype(*_args: Any) -> None:
+        raise ValueError("XML document type declarations are not accepted")
+
+    def start_element(raw_name: str, raw_attributes: Dict[str, str]) -> None:
+        nonlocal active_depth
+        local = _xml_local_name(raw_name)
+        if not capture_all and local in wanted:
+            active_depth += 1
+        if active_depth > 0 and local in spaces:
+            fragments.append(" ")
+        if active_depth > 0 and attributes:
+            for key, value in raw_attributes.items():
+                if _xml_local_name(key) in attributes and value:
+                    fragments.extend((str(value), " "))
+
+    def characters(value: str) -> None:
+        if active_depth > 0 and value:
+            fragments.append(value)
+
+    def end_element(raw_name: str) -> None:
+        nonlocal active_depth
+        local = _xml_local_name(raw_name)
+        if not capture_all and local in wanted:
+            active_depth = max(0, active_depth - 1)
+        if local in lines:
+            fragments.append("\n")
+
+    parser.StartDoctypeDeclHandler = reject_doctype
+    parser.ExternalEntityRefHandler = lambda *_args: 0
+    parser.StartElementHandler = start_element
+    parser.CharacterDataHandler = characters
+    parser.EndElementHandler = end_element
+
+    while True:
+        block = source.read(256 * 1024)
+        if not block:
+            break
+        parser.Parse(block, False)
+        if fragments:
+            pending += "".join(fragments)
+            fragments.clear()
+        while len(pending) >= chunk_chars:
+            split_at = pending.rfind("\n", 0, chunk_chars)
+            if split_at <= 0:
+                split_at = chunk_chars
+            piece, pending = pending[:split_at], pending[split_at:]
+            record = _record(
+                piece,
+                name,
+                len(piece.encode("utf-8", errors="replace")),
+                coverage,
+            )
+            if record is not None:
+                yield record
+    parser.Parse(b"", True)
+    if fragments:
+        pending += "".join(fragments)
+    if pending:
+        record = _record(
+            pending,
+            name,
+            len(pending.encode("utf-8", errors="replace")),
+            coverage,
+        )
+        if record is not None:
+            yield record
+
+
+def _office_members(
+    archive: zipfile.ZipFile, suffix: str
+) -> List[zipfile.ZipInfo]:
+    members = [member for member in archive.infolist() if not member.is_dir()]
+
+    def selected(member: zipfile.ZipInfo) -> bool:
+        name = member.filename.replace("\\", "/").lower()
+        if suffix == ".docx":
+            return bool(
+                re.fullmatch(
+                    r"word/(?:document|footnotes|endnotes|comments|header\d+|footer\d+)\.xml",
+                    name,
+                )
+            )
+        if suffix == ".pptx":
+            return bool(
+                re.fullmatch(
+                    r"ppt/(?:slides/slide\d+|notesslides/notesslide\d+)\.xml",
+                    name,
+                )
+            )
+        if suffix == ".xlsx":
+            return name == "xl/sharedstrings.xml" or bool(
+                re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+            )
+        return name == "content.xml"
+
+    chosen = [member for member in members if selected(member)]
+    if suffix == ".xlsx":
+        chosen.sort(
+            key=lambda member: (
+                0 if member.filename.lower() == "xl/sharedstrings.xml" else 1,
+                _natural_member_key(member.filename),
+            )
+        )
+    else:
+        chosen.sort(key=lambda member: _natural_member_key(member.filename))
+    return chosen
+
+
+def _office_xml_options(
+    suffix: str, member_name: str
+) -> Dict[str, Set[str]]:
+    lower_name = member_name.replace("\\", "/").lower()
+    if suffix == ".docx":
+        return {
+            "capture_tags": {"t", "instrText"},
+            "line_tags": {"p", "tr"},
+            "space_tags": {"tab", "br"},
+        }
+    if suffix == ".pptx":
+        return {
+            "capture_tags": {"t"},
+            "line_tags": {"p"},
+            "space_tags": {"br"},
+        }
+    if suffix == ".xlsx":
+        if lower_name == "xl/sharedstrings.xml":
+            return {
+                "capture_tags": {"t"},
+                "line_tags": {"si"},
+                "space_tags": set(),
+            }
+        return {
+            "capture_tags": {"v", "t"},
+            "line_tags": {"c", "row"},
+            "space_tags": set(),
+        }
+    if suffix == ".ods":
+        return {
+            "capture_tags": {"table-cell"},
+            "line_tags": {"table-cell", "table-row"},
+            "space_tags": {"s", "tab", "line-break"},
+            "attribute_names": {
+                "value",
+                "date-value",
+                "time-value",
+                "boolean-value",
+                "string-value",
+            },
+        }
+    return {
+        "capture_tags": {"p", "h"},
+        "line_tags": {"p", "h"},
+        "space_tags": {"s", "tab", "line-break"},
+    }
+
+
+def _iter_office_archive(
+    path: Path, coverage: DatasetCoverage
+) -> Iterator[DatasetRecord]:
+    if not zipfile.is_zipfile(path):
+        raise ValueError("%s is not a valid Office/OpenDocument container" % path.name)
+    coverage.shards += 1
+    with zipfile.ZipFile(path) as archive:
+        members = _office_members(archive, path.suffix.lower())
+        if not members:
+            raise ValueError("office document contains no supported content XML")
+        for member in members:
+            coverage.discovered_files += 1
+            display_name = "%s!%s" % (path.name, member.filename)
+            try:
+                with archive.open(member) as source:
+                    yield from _iter_streamed_xml(
+                        source,
+                        display_name,
+                        coverage,
+                        **_office_xml_options(path.suffix.lower(), member.filename),
+                    )
+                coverage.completed_files += 1
+            except Exception as error:
+                coverage.reject_file(
+                    display_name,
+                    str(error),
+                    already_discovered=True,
+                )
+
+
+def _iter_standalone_compressed(
+    path: Path, coverage: DatasetCoverage
+) -> Iterator[DatasetRecord]:
+    suffix = path.suffix.lower()
+    opener = {
+        ".gz": gzip.open,
+        ".bz2": bz2.open,
+        ".xz": lzma.open,
+    }.get(suffix)
+    if opener is None:
+        raise ValueError("unsupported standalone compression format")
+    inner_name = path.name[: -len(suffix)] or (path.name + ".txt")
+    coverage.discovered_files += 1
+    try:
+        with opener(
+            path, mode="rt", encoding="utf-8", errors="replace", newline=""
+        ) as stream:
+            yield from _iter_text_stream(
+                stream,
+                "%s!%s" % (path.name, inner_name),
+                coverage,
+            )
+        coverage.completed_files += 1
+    except Exception as error:
+        coverage.reject_file(
+            "%s!%s" % (path.name, inner_name),
+            str(error),
+            already_discovered=True,
+        )
 
 
 def _iter_binary_member(
@@ -785,7 +1122,14 @@ def _iter_binary_member(
 
 
 def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]:
+    suffix = path.suffix.lower()
+    if suffix in OFFICE_EXTENSIONS:
+        yield from _iter_office_archive(path, coverage)
+        return
     coverage.shards += 1
+    if suffix in {".gz", ".bz2", ".xz"} and not tarfile.is_tarfile(path):
+        yield from _iter_standalone_compressed(path, coverage)
+        return
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
             for member in archive.infolist():
@@ -796,19 +1140,25 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                 try:
                     with archive.open(member) as source:
                         suffix = member_path.suffix.lower()
-                        if suffix in {".xml", ".xhtml", ".html", ".htm"}:
-                            data = source.read()
-                            text = _xml_text(data) if suffix == ".xml" else data.decode(
-                                "utf-8", errors="replace"
-                            )
-                            record = _record(
-                                text,
+                        if suffix == ".xml":
+                            yield from _iter_streamed_xml(
+                                source,
                                 "%s!%s" % (path.name, member.filename),
-                                len(data),
                                 coverage,
+                                line_tags={"p", "h", "row", "tr"},
                             )
-                            if record is not None:
-                                yield record
+                        elif suffix in {".xhtml", ".html", ".htm"}:
+                            with io.TextIOWrapper(
+                                source,
+                                encoding="utf-8",
+                                errors="replace",
+                                newline="",
+                            ) as text_stream:
+                                yield from _iter_text_stream(
+                                    text_stream,
+                                    "%s!%s" % (path.name, member.filename),
+                                    coverage,
+                                )
                         elif suffix in TEXT_EXTENSIONS or suffix in {
                             ".csv",
                             ".tsv",
@@ -816,14 +1166,14 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                             ".jsonl",
                             ".ndjson",
                         }:
-                            text_stream = io.TextIOWrapper(
+                            with io.TextIOWrapper(
                                 source, encoding="utf-8", errors="replace", newline=""
-                            )
-                            yield from _iter_text_stream(
-                                text_stream,
-                                "%s!%s" % (path.name, member.filename),
-                                coverage,
-                            )
+                            ) as text_stream:
+                                yield from _iter_text_stream(
+                                    text_stream,
+                                    "%s!%s" % (path.name, member.filename),
+                                    coverage,
+                                )
                         elif _media_kind(member_path) is not None:
                             yield from _iter_binary_member(
                                 source,
@@ -833,14 +1183,18 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                                 coverage=coverage,
                             )
                         else:
-                            coverage.reject(
+                            coverage.reject_file(
                                 "%s!%s" % (path.name, member.filename),
                                 "unsupported binary archive member",
+                                already_discovered=True,
                             )
+                            continue
                     coverage.completed_files += 1
                 except Exception as error:
-                    coverage.reject(
-                        "%s!%s" % (path.name, member.filename), str(error)
+                    coverage.reject_file(
+                        "%s!%s" % (path.name, member.filename),
+                        str(error),
+                        already_discovered=True,
                     )
         return
 
@@ -851,8 +1205,10 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
             coverage.discovered_files += 1
             source = archive.extractfile(member)
             if source is None:
-                coverage.reject(
-                    "%s!%s" % (path.name, member.name), "member could not be opened"
+                coverage.reject_file(
+                    "%s!%s" % (path.name, member.name),
+                    "member could not be opened",
+                    already_discovered=True,
                 )
                 continue
             try:
@@ -881,13 +1237,19 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                         coverage=coverage,
                     )
                 else:
-                    coverage.reject(
+                    coverage.reject_file(
                         "%s!%s" % (path.name, member.name),
                         "unsupported binary archive member",
+                        already_discovered=True,
                     )
+                    continue
                 coverage.completed_files += 1
             except Exception as error:
-                coverage.reject("%s!%s" % (path.name, member.name), str(error))
+                coverage.reject_file(
+                    "%s!%s" % (path.name, member.name),
+                    str(error),
+                    already_discovered=True,
+                )
 
 
 def _manifest_key(value: Any) -> str:
@@ -1078,28 +1440,31 @@ def _iter_huggingface_manifest(
                         },
                     )
             except Exception as error:
-                coverage.reject(raw, str(error))
+                coverage.reject_file(raw, str(error))
             continue
 
         candidate = (path.parent / raw).resolve()
         try:
             candidate.relative_to(path.parent.resolve())
         except ValueError:
-            coverage.reject(raw, "manifest path escapes its dataset directory")
+            coverage.reject_file(
+                raw,
+                "manifest path escapes its dataset directory",
+            )
             continue
         if not candidate.exists():
-            coverage.reject(raw, "manifest shard was not found")
+            coverage.reject_file(raw, "manifest shard was not found")
             continue
         if shard.sha256:
             declared = shard.sha256.strip().lower()
             if len(declared) != 64 or any(
                 value not in "0123456789abcdef" for value in declared
             ):
-                coverage.reject(raw, "manifest shard sha256 is invalid")
+                coverage.reject_file(raw, "manifest shard sha256 is invalid")
                 continue
             actual = _sha256_path(candidate)
             if actual != declared:
-                coverage.reject(raw, "manifest shard checksum mismatch")
+                coverage.reject_file(raw, "manifest shard checksum mismatch")
                 continue
         else:
             actual = _sha256_path(candidate)
@@ -1153,16 +1518,17 @@ def iter_dataset_records(
     if target.is_dir():
         for child in sorted(target.iterdir(), key=lambda value: value.name.lower()):
             if child.is_symlink():
-                state.reject(str(child), "symbolic links are not followed")
+                state.reject_file(str(child), "symbolic links are not followed")
                 continue
             yield from iter_dataset_records(child, coverage=state, _seen=seen)
         return
     if not target.is_file():
-        state.reject(str(target), "dataset path is not a regular file")
+        state.reject_file(str(target), "dataset path is not a regular file")
         return
 
     state.discovered_files += 1
     format_name = dataset_format(target, requested_kind)
+    file_rejected = False
     try:
         if format_name == "text":
             yield from _iter_text_path(target, state)
@@ -1205,8 +1571,19 @@ def iter_dataset_records(
             if decoded and decoded.count("\ufffd") / len(decoded) < 0.02:
                 yield from _iter_text_path(target, state)
             else:
-                state.reject(str(target), "unsupported binary dataset format")
+                state.reject_file(
+                    str(target),
+                    "unsupported binary dataset format",
+                    already_discovered=True,
+                )
+                file_rejected = True
     except Exception as error:
-        state.reject(str(target), str(error))
-    finally:
+        if not file_rejected:
+            state.reject_file(
+                str(target),
+                str(error),
+                already_discovered=True,
+            )
+            file_rejected = True
+    if not file_rejected:
         state.completed_files += 1

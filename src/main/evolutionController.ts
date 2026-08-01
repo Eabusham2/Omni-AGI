@@ -104,6 +104,17 @@ export interface EvolutionPromotionRecord extends PromotionRecord {
   reason: string;
   approvalRequired: boolean;
   resources: EvolutionResourceMeasurement;
+  brainSnapshotId?: string;
+  runtimeActivation?: {
+    state: "scheduled" | "deferred";
+    slotId: string;
+    executablePath: string;
+    manifestPath: string;
+    manifestSha256: string;
+    promotionCommit: string;
+    delayMs: number;
+    reason?: string;
+  };
 }
 
 export interface EvolutionCandidateRecord extends EvolutionCandidate {
@@ -266,6 +277,41 @@ function outputResources(output: Record<string, unknown>): EvolutionResourceMeas
     changedBytes: number("changedBytes"),
     changedPaths: number("changedPaths"),
     untrackedBytes: number("untrackedBytes")
+  };
+}
+
+function outputRuntimeActivation(
+  output: Record<string, unknown>
+): EvolutionPromotionRecord["runtimeActivation"] {
+  const value = output.runtimeActivation;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    !["scheduled", "deferred"].includes(String(record.state)) ||
+    typeof record.slotId !== "string" ||
+    typeof record.executablePath !== "string" ||
+    typeof record.manifestPath !== "string" ||
+    typeof record.manifestSha256 !== "string" ||
+    !isSha256(record.manifestSha256) ||
+    typeof record.promotionCommit !== "string" ||
+    !isCommit(record.promotionCommit) ||
+    typeof record.delayMs !== "number" ||
+    !Number.isSafeInteger(record.delayMs) ||
+    record.delayMs < 3_000
+  ) {
+    return undefined;
+  }
+  return {
+    state: record.state as "scheduled" | "deferred",
+    slotId: record.slotId,
+    executablePath: record.executablePath,
+    manifestPath: record.manifestPath,
+    manifestSha256: record.manifestSha256.toLocaleLowerCase(),
+    promotionCommit: record.promotionCommit.toLocaleLowerCase(),
+    delayMs: record.delayMs,
+    reason: typeof record.reason === "string" ? record.reason : undefined
   };
 }
 
@@ -733,12 +779,23 @@ export class EvolutionController {
     request: EvolutionStartRequest,
     allowAutomaticPromotion: boolean
   ): Promise<EvolutionRunRecord> {
-    const kind = request.candidateKind ?? "source";
+    const sourceEdits = cleanSourceEdits(request.sourceEdits);
+    const kind =
+      request.candidateKind ??
+      (sourceEdits?.length ? "source" : "substrate");
+    if (kind === "source" && !sourceEdits?.length) {
+      throw new Error(
+        "A source evolution candidate requires one or more exact typed sourceEdits. Edit-free improvement uses a substrate candidate."
+      );
+    }
     if (kind !== "source" && request.sourceEdits !== undefined) {
       throw new Error("sourceEdits are valid only for isolated source candidates.");
     }
     return kind === "source"
-      ? this.startSource(request, allowAutomaticPromotion)
+      ? this.startSource(
+          { ...request, sourceEdits },
+          allowAutomaticPromotion
+        )
       : this.startWorker(request, kind, allowAutomaticPromotion);
   }
 
@@ -999,7 +1056,13 @@ export class EvolutionController {
       if (parent && !["promoted", "awaiting-review"].includes(parent.state)) {
         throw new Error("Only a reviewed or promoted candidate may parent another generation.");
       }
-      if (parent && parent.candidateKind !== kind) {
+      const sourceToSubstrateReassessment =
+        parent?.candidateKind === "source" && kind === "substrate";
+      if (
+        parent &&
+        parent.candidateKind !== kind &&
+        !sourceToSubstrateReassessment
+      ) {
         throw new Error("A worker evolution lineage cannot change candidate kind.");
       }
       const generation = parent ? parent.generation + 1 : 0;
@@ -1454,14 +1517,24 @@ export class EvolutionController {
       const parentCommit = outputString(promotedOutput, "parentCommit");
       const promotedDiff = outputString(promotedOutput, "diffSha256");
       const promotedEvaluator = outputString(promotedOutput, "evaluatorSha256");
+      const brainSnapshotId = outputString(promotedOutput, "brainSnapshotId");
+      const runtimeActivation = outputRuntimeActivation(promotedOutput);
+      const hasRuntimeActivationOutput =
+        promotedOutput.runtimeActivation !== undefined;
       if (
         !isCommit(commit) ||
         parentCommit !== current.proposalParentCommit ||
         promotedDiff !== evaluation.diffSha256 ||
-        promotedEvaluator !== current.evaluatorSha256
+        promotedEvaluator !== current.evaluatorSha256 ||
+        (hasRuntimeActivationOutput && !runtimeActivation) ||
+        (runtimeActivation &&
+          (
+            runtimeActivation.promotionCommit !== commit ||
+            !brainSnapshotId
+          ))
       ) {
         const error =
-          "The promoted candidate did not return verifiable parent, diff, and evaluator lineage.";
+          "The promoted candidate did not return verifiable source and runtime activation lineage.";
         current.state = "failed";
         current.error = error;
         run.state = "failed";
@@ -1480,7 +1553,9 @@ export class EvolutionController {
           `Passed immutable evaluator ${current.evaluatorSha256} across ` +
           `${evaluation.checks.length} checks with no recorded regression.`,
         approvalRequired: promotionExecution.approvalRequired,
-        resources: evaluation.resources
+        resources: evaluation.resources,
+        brainSnapshotId,
+        runtimeActivation
       };
       current.promotion = promotion;
       current.promotionApprovalRequired = false;

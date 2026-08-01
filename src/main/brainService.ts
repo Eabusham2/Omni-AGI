@@ -4,6 +4,7 @@ import { createReadStream } from "node:fs";
 import {
   lstat,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   readdir,
@@ -14,12 +15,14 @@ import {
   writeFile
 } from "node:fs/promises";
 import { isIP } from "node:net";
+import { availableParallelism } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { EventEmitter } from "node:events";
 import { getHeapStatistics } from "node:v8";
 import type {
   AgentMergeFilePreview,
   AgentMergePreview,
+  AgentMergeSubstratePreview,
   BrainConfig,
   BrainDocument,
   BuildRecipe,
@@ -51,7 +54,7 @@ import type {
   WebCrawlResult,
   WorkspaceSnapshot
 } from "../shared/types";
-import { recordNeuralChat } from "./adaptiveCore";
+import { recordNeuralChat } from "./presentationChat";
 import {
   listInstalledPacks,
   recordInstalledPack,
@@ -78,7 +81,14 @@ const MAX_ROBOTS_BYTES = 2 * 1024 * 1024;
 const CRAWL_DISK_CHECK_INTERVAL = 4 * 1024 * 1024;
 const CRAWL_MEMORY_RESERVE_MINIMUM = 64 * 1024 * 1024;
 const CRAWL_DISK_RESERVE_MINIMUM = 512 * 1024 * 1024;
+const CRAWL_DIAGNOSTIC_WINDOW = 32;
 const CRAWL_USER_AGENT = "OmniAGIStudio/1.0 (+local research crawler)";
+const WORKING_MEMORY_SLOTS_BY_TIER = {
+  micro: 128,
+  personal: 256,
+  gpu: 512,
+  workstation: 1024
+} as const;
 const TOOL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
   "windows.files": ["list", "read", "write"],
   "windows.powershell": ["run"],
@@ -287,6 +297,7 @@ function normalizeChatEngineEvent(
 interface WorkerIngestResult {
   duplicate?: boolean;
   source?: {
+    kind?: string;
     learned_ideas?: number;
     learned_concepts?: number;
     plasticity_events?: number;
@@ -321,6 +332,63 @@ interface WorkerTrainingCoverage extends Partial<TrainingCoverage> {
   completedFiles?: number;
 }
 
+function coverageCount(value: unknown, fallback = 0): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.trunc(value));
+}
+
+function normalizeWorkerTrainingCoverage(
+  raw: WorkerTrainingCoverage,
+  fileBytes: number
+): TrainingCoverage {
+  const discoveredFiles = coverageCount(raw.discoveredFiles, 1);
+  const processedFiles = coverageCount(raw.processedFiles ?? raw.completedFiles);
+  const rejectedFiles = coverageCount(raw.rejectedFiles);
+  const discoveredRecords = coverageCount(raw.discoveredRecords);
+  const processedRecords = coverageCount(raw.processedRecords);
+  const rejectedRecords = coverageCount(raw.rejectedRecords);
+  const classifiedFiles = processedFiles + rejectedFiles;
+  const classifiedRecords = processedRecords + rejectedRecords;
+  const complete =
+    raw.complete !== false &&
+    classifiedFiles === discoveredFiles &&
+    classifiedRecords === discoveredRecords;
+  return {
+    schemaVersion: 1,
+    manifestId: "",
+    discoveredFiles,
+    processedFiles,
+    rejectedFiles,
+    discoveredRecords,
+    processedRecords,
+    rejectedRecords,
+    discoveredBytes: coverageCount(raw.discoveredBytes, fileBytes),
+    processedBytes: coverageCount(raw.processedBytes),
+    shards: coverageCount(raw.shards),
+    modalityCounts: raw.modalityCounts ?? {},
+    errors: raw.errors ?? [],
+    complete,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function hasCompleteTraversal(
+  coverage: Pick<
+    TrainingCoverage,
+    | "discoveredFiles"
+    | "processedFiles"
+    | "rejectedFiles"
+    | "discoveredRecords"
+    | "processedRecords"
+    | "rejectedRecords"
+  >
+): boolean {
+  return (
+    coverage.processedFiles + coverage.rejectedFiles === coverage.discoveredFiles &&
+    coverage.processedRecords + coverage.rejectedRecords === coverage.discoveredRecords
+  );
+}
+
 interface JobRecord extends RuntimeJob {
   cancelled?: boolean;
 }
@@ -336,11 +404,109 @@ interface MergePlan {
   target: BrainDocument;
   evidence: Array<{ fingerprint: string; source: TrainingSource }>;
   files: MergeFileCandidate[];
+  substrate: AgentMergeSubstratePreview;
   preview: AgentMergePreview;
 }
 
 function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function mergeCountRecord(
+  value: unknown,
+  fields: readonly string[]
+): Record<string, number> | undefined {
+  const record = objectRecord(value);
+  if (!record) return undefined;
+  const result: Record<string, number> = {};
+  for (const field of fields) {
+    const count = record[field];
+    if (
+      typeof count !== "number" ||
+      !Number.isSafeInteger(count) ||
+      count < 0
+    ) {
+      return undefined;
+    }
+    result[field] = count;
+  }
+  return result;
+}
+
+function normalizeMergeSubstratePreview(
+  value: unknown,
+  sourceBrainId: string,
+  targetBrainId: string
+): AgentMergeSubstratePreview | undefined {
+  const record = objectRecord(value);
+  if (
+    !record ||
+    record.schemaVersion !== 1 ||
+    record.engineSchemaVersion !== 1 ||
+    record.sourceBrainId !== sourceBrainId ||
+    record.targetBrainId !== targetBrainId ||
+    record.weightsAveraged !== false
+  ) {
+    return undefined;
+  }
+  const shaFields = [
+    "digest",
+    "sourceStateSha256",
+    "targetStateSha256",
+    "sourceParameterSha256",
+    "targetParameterSha256",
+    "sourceConfigSha256",
+    "targetConfigSha256"
+  ] as const;
+  const hashes = Object.fromEntries(
+    shaFields.map((field) => [
+      field,
+      typeof record[field] === "string" &&
+      /^[a-f0-9]{64}$/.test(record[field] as string)
+        ? record[field]
+        : undefined
+    ])
+  ) as Record<(typeof shaFields)[number], string | undefined>;
+  if (shaFields.some((field) => !hashes[field])) return undefined;
+  const countFields = [
+    "neurons",
+    "assemblies",
+    "synapses",
+    "replayExamples"
+  ] as const;
+  const sourceCounts = mergeCountRecord(record.sourceCounts, countFields);
+  const targetCounts = mergeCountRecord(record.targetCounts, countFields);
+  const additions = mergeCountRecord(record.additions, countFields);
+  const duplicates = mergeCountRecord(record.duplicates, countFields);
+  const divergent = mergeCountRecord(
+    record.divergent,
+    ["neurons", "assemblies", "synapses"]
+  );
+  if (!sourceCounts || !targetCounts || !additions || !duplicates || !divergent) {
+    return undefined;
+  }
+  for (const field of countFields) {
+    if (additions[field]! + duplicates[field]! !== sourceCounts[field]) {
+      return undefined;
+    }
+  }
+  return {
+    schemaVersion: 1,
+    engineSchemaVersion: 1,
+    digest: hashes.digest!,
+    sourceStateSha256: hashes.sourceStateSha256!,
+    targetStateSha256: hashes.targetStateSha256!,
+    sourceParameterSha256: hashes.sourceParameterSha256!,
+    targetParameterSha256: hashes.targetParameterSha256!,
+    sourceConfigSha256: hashes.sourceConfigSha256!,
+    targetConfigSha256: hashes.targetConfigSha256!,
+    sourceCounts: sourceCounts as AgentMergeSubstratePreview["sourceCounts"],
+    targetCounts: targetCounts as AgentMergeSubstratePreview["targetCounts"],
+    additions: additions as AgentMergeSubstratePreview["additions"],
+    duplicates: duplicates as AgentMergeSubstratePreview["duplicates"],
+    divergent: divergent as AgentMergeSubstratePreview["divergent"],
+    weightsAveraged: false
+  };
 }
 
 function safeMergeName(value: string): string {
@@ -814,7 +980,8 @@ async function assertDiskReserve(directory: string, incomingBytes = 0): Promise<
 async function streamResponseToFile(
   response: Response,
   path: string,
-  directory: string
+  directory: string,
+  onProgress?: () => void
 ): Promise<number> {
   const declared = Number(response.headers.get("content-length") ?? 0);
   if (Number.isFinite(declared) && declared > 0) {
@@ -842,6 +1009,7 @@ async function streamResponseToFile(
       const { done, value } = await reader.read();
       if (done) break;
       if (!value || value.byteLength === 0) continue;
+      onProgress?.();
       if (total - checkedAt >= CRAWL_DISK_CHECK_INTERVAL) {
         await assertDiskReserve(directory, value.byteLength);
         checkedAt = total;
@@ -1091,8 +1259,20 @@ export class BrainService {
         throw new Error("Invalid initial tool permission level.");
       }
     }
+    const resolvedTier = request.hardwareTier ?? "personal";
+    const resolvedConfig: BrainConfig = {
+      ...request.config,
+      // Neural workspace capacity is an architecture decision derived from
+      // the hardware tier. Numeric values supplied by old/beta callers are
+      // not behavioral controls and cannot shrink a stable-v1 brain.
+      workingMemorySlots:
+        WORKING_MEMORY_SLOTS_BY_TIER[resolvedTier] *
+        (request.config.extendedWorkingMemory ? 2 : 1)
+    };
     let brain: BrainDocument;
-    const starter = request.origin === "starter";
+    // Stable v1 is starter-first at every public entry point. Blank creation
+    // remains available only when a caller explicitly requests it.
+    const starter = (request.origin ?? "starter") === "starter";
     const starterUrl = request.starterUrl?.trim() ?? "";
     const remoteStarter = starter && Boolean(starterUrl);
     if (remoteStarter) {
@@ -1108,10 +1288,21 @@ export class BrainService {
           "The selected starter contains no materialized OmniCortex checkpoint."
         );
       }
-      brain.config = { ...brain.config, ...request.config, runtime: "adaptive-core" };
+      const importedWorkingMemorySlots = brain.config.workingMemorySlots;
+      const importedExtendedWorkingMemory = brain.config.extendedWorkingMemory;
+      brain.config = {
+        ...brain.config,
+        ...resolvedConfig,
+        // Decoder/global-workspace tensor shapes belong to the checkpoint.
+        // A hardware choice may size a newly materialized brain, but it must
+        // never rewrite a compatible imported checkpoint's recorded shape.
+        workingMemorySlots: importedWorkingMemorySlots,
+        extendedWorkingMemory: importedExtendedWorkingMemory,
+        runtime: "adaptive-core"
+      };
       brain.name = brain.config.name;
     } else {
-      brain = await this.repository.create(request.config);
+      brain = await this.repository.create(resolvedConfig);
     }
     if (request.initialToolPermissions) {
       const selected = new Map(
@@ -1264,9 +1455,16 @@ export class BrainService {
     input: string,
     signal?: AbortSignal,
     onStream?: (event: NeuralChatStreamEvent) => void,
-    turnId = randomUUID()
+    turnId = randomUUID(),
+    responseTokenBudget?: number
   ): Promise<ChatResult> {
     signal?.throwIfAborted();
+    if (
+      responseTokenBudget !== undefined &&
+      (!Number.isSafeInteger(responseTokenBudget) || responseTokenBudget < 1)
+    ) {
+      throw new Error("Response token budget must be a positive safe integer.");
+    }
     const brain = await this.repository.get(id);
     const message = cleanMessage(input);
     const toolSchemas = enabledToolSchemas(brain);
@@ -1288,7 +1486,10 @@ export class BrainService {
         input: message,
         toolSchemas,
         config: brain.config,
-        storagePath: this.repository.brainDirectory(id)
+        storagePath: this.repository.brainDirectory(id),
+        ...(responseTokenBudget === undefined
+          ? {}
+          : { maxNewTokens: responseTokenBudget })
       },
       (event) => {
         const normalized = normalizeChatEngineEvent(event, id);
@@ -1537,7 +1738,16 @@ export class BrainService {
   ): Promise<IngestResult[]> {
     await this.repository.get(brainId);
     const manifest = await this.datasets.create(brainId, paths);
-    const run = await this.ingestManifest(brainId, manifest.id, policy);
+    const run = await this.ingestManifest(
+      brainId,
+      manifest.id,
+      policy,
+      () => false,
+      () => undefined,
+      true,
+      undefined,
+      false
+    );
     return run.results;
   }
 
@@ -1553,7 +1763,8 @@ export class BrainService {
     cancelled: () => boolean = () => false,
     progress: (value: number, message: string) => void = () => undefined,
     collectResults = true,
-    requestedEpochs?: number
+    requestedEpochs?: number,
+    replayFirstEpoch = true
   ): Promise<{
     manifest: DatasetManifest;
     coverage: TrainingCoverage;
@@ -1587,7 +1798,7 @@ export class BrainService {
     coverage.discoveredBytes = manifest.discoveredBytes * targetEpochs;
     coverage.complete =
       cursor.currentEpoch >= targetEpochs &&
-      coverage.processedFiles + coverage.rejectedFiles === coverage.discoveredFiles;
+      hasCompleteTraversal(coverage);
     if (cursor.state === "complete" && coverage.complete) {
       return { manifest, coverage, results: [], paused: false };
     }
@@ -1617,8 +1828,17 @@ export class BrainService {
             brainId,
             entry.path,
             policy,
-            cursor.currentEpoch ?? 0
+            cursor.currentEpoch ?? 0,
+            replayFirstEpoch
           );
+          if (result.coverage && !result.coverage.complete) {
+            throw new Error(
+              `Worker traversal incomplete for ${entry.path}: ` +
+                `${result.coverage.processedRecords} processed + ` +
+                `${result.coverage.rejectedRecords} rejected of ` +
+                `${result.coverage.discoveredRecords} discovered records`
+            );
+          }
           result.manifestId = manifestId;
           if (collectResults) results.push(result);
           const workerCoverage = result.coverage;
@@ -1706,7 +1926,7 @@ export class BrainService {
     }
     coverage.complete =
       (cursor.currentEpoch ?? 0) >= targetEpochs &&
-      coverage.processedFiles + coverage.rejectedFiles === coverage.discoveredFiles;
+      hasCompleteTraversal(coverage);
     cursor.state = coverage.complete ? "complete" : "failed";
     await Promise.all([
       this.datasets.saveCursor(brainId, cursor),
@@ -1719,14 +1939,15 @@ export class BrainService {
     brainId: string,
     path: string,
     policy: DataIngestionPolicy,
-    epoch = 0
+    epoch = 0,
+    forceReplay = false
   ): Promise<IngestResult> {
     let brain = await this.repository.get(brainId);
     const fileInfo = await stat(path);
     if (!fileInfo.isFile()) throw new Error(`${path} is not a regular file.`);
     const contentHash = await hashFile(path);
     const duplicate = brain.trainingSources.find((source) => source.contentHash === contentHash);
-    if (duplicate && epoch === 0) {
+    if (duplicate && !forceReplay && epoch === 0) {
       return {
         brain,
         source: duplicate,
@@ -1749,27 +1970,61 @@ export class BrainService {
         kind,
         policy,
         contentHash,
-        allowReplay: epoch > 0,
+        allowReplay: forceReplay || epoch > 0,
         epoch,
         config: brain.config,
         storagePath: this.repository.brainDirectory(brainId)
       },
       86_400_000
     );
+    const rawCoverage = worker?.coverage ?? worker?.source?.coverage;
+    const resultCoverage = rawCoverage
+      ? normalizeWorkerTrainingCoverage(rawCoverage, fileInfo.size)
+      : undefined;
+    if (resultCoverage && !resultCoverage.complete) {
+      throw new Error(
+        `Worker dataset traversal incomplete for ${basename(path)}: ` +
+          `${resultCoverage.processedFiles + resultCoverage.rejectedFiles}/` +
+          `${resultCoverage.discoveredFiles} files and ` +
+          `${resultCoverage.processedRecords + resultCoverage.rejectedRecords}/` +
+          `${resultCoverage.discoveredRecords} records were classified`
+      );
+    }
     warnings.push(...(worker?.warnings ?? []), ...(worker?.source?.warnings ?? []));
+    const effectiveKind =
+      typeof worker?.source?.kind === "string" &&
+      [
+        "pdf",
+        "text",
+        "markdown",
+        "code",
+        "json",
+        "csv",
+        "parquet",
+        "arrow",
+        "archive",
+        "sqlite",
+        "dataset",
+        "image",
+        "audio",
+        "video",
+        "unknown"
+      ].includes(worker.source.kind)
+        ? (worker.source.kind as TrainingSource["kind"])
+        : kind;
     const memoryRecipe = brain.config.memoryRecipe ?? "human-consolidation";
     const preserveBlob =
       memoryRecipe !== "synapses-only" &&
       (policy === "archive" ||
         memoryRecipe === "total-recall" ||
-        kind === "image" ||
-        kind === "audio" ||
-        kind === "video");
+        effectiveKind === "image" ||
+        effectiveKind === "audio" ||
+        effectiveKind === "video");
     const source: TrainingSource = {
       id: duplicate?.id ?? randomUUID(),
       name: basename(path),
       path,
-      kind,
+      kind: effectiveKind,
       bytes: fileInfo.size,
       learnedIdeas:
         worker?.source?.learned_ideas ?? brain.ideas.length - beforeIdeas,
@@ -1804,28 +2059,6 @@ export class BrainService {
       }
     ];
     brain = await this.repository.save(brain);
-    const rawCoverage = worker?.coverage ?? worker?.source?.coverage;
-    const resultCoverage = rawCoverage
-      ? ({
-          schemaVersion: 1,
-          manifestId: "",
-          discoveredFiles: Number(rawCoverage.discoveredFiles ?? 1),
-          processedFiles: Number(
-            rawCoverage.processedFiles ?? rawCoverage.completedFiles ?? 1
-          ),
-          rejectedFiles: Number(rawCoverage.rejectedFiles ?? 0),
-          discoveredRecords: Number(rawCoverage.discoveredRecords ?? 0),
-          processedRecords: Number(rawCoverage.processedRecords ?? 0),
-          rejectedRecords: Number(rawCoverage.rejectedRecords ?? 0),
-          discoveredBytes: Number(rawCoverage.discoveredBytes ?? fileInfo.size),
-          processedBytes: Number(rawCoverage.processedBytes ?? fileInfo.size),
-          shards: Number(rawCoverage.shards ?? 0),
-          modalityCounts: rawCoverage.modalityCounts ?? {},
-          errors: rawCoverage.errors ?? [],
-          complete: true,
-          updatedAt: new Date().toISOString()
-        } satisfies TrainingCoverage)
-      : undefined;
     return { brain, source, warnings, coverage: resultCoverage };
   }
 
@@ -2018,12 +2251,18 @@ export class BrainService {
       },
       86_400_000
     );
+    const effectiveKind =
+      worker?.source?.kind === "image" ||
+      worker?.source?.kind === "audio" ||
+      worker?.source?.kind === "video"
+        ? worker.source.kind
+        : kind;
     const memoryRecipe = brain.config.memoryRecipe ?? "human-consolidation";
     const preserveBlob = memoryRecipe !== "synapses-only";
     const source: TrainingSource = {
       id: randomUUID(),
       name: basename(finalUrl.pathname) || `${finalUrl.hostname}-${kind}`,
-      kind,
+      kind: effectiveKind,
       bytes: fileInfo.size,
       learnedIdeas:
         worker?.source?.learned_ideas ?? brain.ideas.length - before.ideas,
@@ -2052,8 +2291,8 @@ export class BrainService {
         createdAt: source.importedAt,
         kind: "learning",
         summary: quarantined
-          ? `Quarantined crawled ${kind} ${source.name}.`
-          : `Learned crawled ${kind} ${source.name}.`,
+          ? `Quarantined crawled ${effectiveKind} ${source.name}.`
+          : `Learned crawled ${effectiveKind} ${source.name}.`,
         detail:
           `${contentType || "unknown content type"}; ` +
           `${source.learnedIdeas} ideas, ${source.learnedConcepts} concepts, ` +
@@ -2092,8 +2331,20 @@ export class BrainService {
     const sameOrigin =
       request.followExternalLinks === true ? false : (request.sameOrigin ?? true);
     const respectRobots = request.respectRobots ?? true;
-    const concurrency = Math.max(1, Math.min(32, Math.round(request.concurrency ?? 4)));
-    const warnings: string[] = [];
+    const concurrency = Math.max(
+      1,
+      Math.min(
+        32,
+        Math.round(request.concurrency ?? availableParallelism())
+      )
+    );
+    const frontier = await CrawlFrontierStore.create(
+      this.repository.brainDirectory(request.brainId),
+      request.brainId,
+      start.toString(),
+      request.crawlId,
+      request.resume ?? true
+    );
     const scheduler = new DomainRequestScheduler();
     const robotsByOrigin = new Map<string, Promise<string[]>>();
     const rulesFor = async (url: URL): Promise<string[]> => {
@@ -2139,8 +2390,9 @@ export class BrainService {
             );
           }
         } catch (error) {
-          warnings.push(
-            `${url.origin}/robots.txt could not be read: ${
+          frontier.recordWarning(
+            `${url.origin}/robots.txt`,
+            `robots.txt could not be read: ${
               error instanceof Error ? error.message : String(error)
             }`
           );
@@ -2167,20 +2419,13 @@ export class BrainService {
         throw new CrawlPolicyError("robots.txt disallows this path");
       }
     };
-    const frontier = await CrawlFrontierStore.create(
-      this.repository.brainDirectory(request.brainId),
-      request.brainId,
-      start.toString(),
-      request.crawlId,
-      request.resume ?? true
-    );
     const spoolDirectory = join(
       this.repository.brainDirectory(request.brainId),
       "datasets",
       "web-spool"
     );
     await mkdir(spoolDirectory, { recursive: true });
-    const results: IngestResult[] = [];
+    const recentResults: IngestResult[] = [];
     let stopped = false;
     try {
       while (true) {
@@ -2301,7 +2546,7 @@ export class BrainService {
           if ("error" in page) {
             if (page.resourcePaused) {
               stopped = true;
-              warnings.push(page.error);
+              frontier.recordWarning(page.entry.url, page.error);
               await retryAndClean(fetched.slice(index));
               break;
             }
@@ -2340,7 +2585,10 @@ export class BrainService {
                     page.contentType
                   );
                 })();
-            results.push(result);
+            if (recentResults.length >= CRAWL_DIAGNOSTIC_WINDOW) {
+              recentResults.shift();
+            }
+            recentResults.push(result);
             if (
               raw !== undefined &&
               page.entry.depth < maximumDepth &&
@@ -2355,11 +2603,27 @@ export class BrainService {
                   }))
               );
             }
-            frontier.visited(page.entry.url, result.source.bytes);
+            const receiptKind =
+              result.source.kind === "image" ||
+              result.source.kind === "audio" ||
+              result.source.kind === "video"
+                ? result.source.kind
+                : "text";
+            frontier.visited(page.entry.url, result.source.bytes, {
+              sourceId: result.source.id,
+              sourceName: result.source.name,
+              kind: receiptKind,
+              bytes: result.source.bytes,
+              contentHash: result.source.contentHash,
+              learnedIdeas: result.source.learnedIdeas,
+              learnedConcepts: result.source.learnedConcepts,
+              learnedSynapses: result.source.learnedSynapses,
+              warnings: result.warnings
+            });
           } catch (error) {
             if (error instanceof CrawlResourcePause) {
               stopped = true;
-              warnings.push(error.message);
+              frontier.recordWarning(page.entry.url, error.message);
               await retryAndClean(fetched.slice(index));
               break;
             }
@@ -2382,17 +2646,7 @@ export class BrainService {
         if (stopped) break;
       }
       const counts = frontier.counts();
-      warnings.push(...frontier.warnings());
-      const modalityCounts: TrainingCoverage["modalityCounts"] = {};
-      for (const result of results) {
-        const format =
-          result.source.kind === "image" ||
-          result.source.kind === "audio" ||
-          result.source.kind === "video"
-            ? result.source.kind
-            : "text";
-        modalityCounts[format] = (modalityCounts[format] ?? 0) + 1;
-      }
+      const warnings = frontier.warnings(CRAWL_DIAGNOSTIC_WINDOW);
       const coverage: TrainingCoverage = {
         schemaVersion: 1,
         manifestId: frontier.id,
@@ -2405,7 +2659,7 @@ export class BrainService {
         discoveredBytes: counts.processedBytes,
         processedBytes: counts.processedBytes,
         shards: 0,
-        modalityCounts,
+        modalityCounts: counts.modalityCounts,
         errors: warnings.map((message) => ({ source: start.toString(), message })),
         errorLog: join("datasets", "crawls", `${frontier.id}.sqlite3`),
         complete:
@@ -2417,8 +2671,13 @@ export class BrainService {
         startUrl: start.toString(),
         visited: counts.visited,
         skipped: counts.skipped,
-        results,
+        results: recentResults,
+        resultCount: counts.resultCount,
+        resultsTruncated: counts.resultCount > recentResults.length,
+        resultLog: join("datasets", "crawls", `${frontier.id}.sqlite3`),
         warnings,
+        warningCount: counts.warningCount,
+        warningsTruncated: counts.warningCount > warnings.length,
         frontierRemaining: counts.queued,
         stopped,
         coverage
@@ -2429,8 +2688,65 @@ export class BrainService {
   }
 
   async importUrl(request: ImportUrlRequest): Promise<BrainDocument> {
-    const { data, finalUrl } = await this.downloadCatalogArtifact(request);
-    return this.repository.importBundleBuffer(data, basename(finalUrl.pathname) || "catalog.omni");
+    const downloaded = await this.downloadCatalogArtifactToFile(request);
+    try {
+      return await this.repository.importBundle(downloaded.path);
+    } finally {
+      await rm(downloaded.temporaryDirectory, { recursive: true, force: true });
+    }
+  }
+
+  private async downloadCatalogArtifactToFile(
+    request: ImportUrlRequest
+  ): Promise<{ path: string; finalUrl: URL; temporaryDirectory: string }> {
+    const url = new URL(request.url);
+    const expected = request.expectedSha256?.trim().toLocaleLowerCase();
+    if (expected && !/^[a-f0-9]{64}$/.test(expected)) {
+      throw new Error("Expected SHA-256 must be 64 hexadecimal characters.");
+    }
+    await this.repository.initialize();
+    const controller = new AbortController();
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshIdleTimeout = (): void => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => controller.abort(new Error("Catalog download stalled.")),
+        120_000
+      );
+      idleTimer.unref?.();
+    };
+    refreshIdleTimeout();
+    try {
+      const response = await safeFetch(url, {
+        signal: controller.signal,
+        headers: { Accept: "application/octet-stream, application/zip;q=0.9" }
+      });
+      if (!response.ok) throw new Error(`Catalog download failed with HTTP ${response.status}.`);
+      const finalUrl = new URL(response.url);
+      await assertSafeRemoteUrl(finalUrl);
+      const temporaryDirectory = await mkdtemp(
+        join(this.repository.root, ".catalog-download-")
+      );
+      const path = join(temporaryDirectory, "checkpoint.omni");
+      try {
+        await streamResponseToFile(
+          response,
+          path,
+          temporaryDirectory,
+          refreshIdleTimeout
+        );
+        const actual = await hashFile(path);
+        if (expected && actual !== expected) {
+          throw new Error("Catalog bundle checksum verification failed.");
+        }
+        return { path, finalUrl, temporaryDirectory };
+      } catch (error) {
+        await rm(temporaryDirectory, { recursive: true, force: true });
+        throw error;
+      }
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+    }
   }
 
   private async downloadCatalogArtifact(
@@ -2588,6 +2904,25 @@ export class BrainService {
       this.repository.get(sourceBrainId),
       this.repository.get(targetBrainId)
     ]);
+    const substrate = normalizeMergeSubstratePreview(
+      await this.engine.request<unknown>(
+        "preview_overlay",
+        {
+          targetBrainId,
+          targetStoragePath: this.repository.brainDirectory(targetBrainId),
+          sourceBrainId,
+          sourceStoragePath: this.repository.brainDirectory(sourceBrainId)
+        },
+        600_000
+      ),
+      sourceBrainId,
+      targetBrainId
+    );
+    if (!substrate) {
+      throw new Error(
+        "The authoritative neural worker did not return a verifiable fork-overlay preview."
+      );
+    }
     const conflicts: string[] = [];
     if (source.lineage.rootId !== target.lineage.rootId) {
       conflicts.push(
@@ -2607,6 +2942,18 @@ export class BrainService {
     if (changedConcepts > 0 || changedSynapses > 0) {
       conflicts.push(
         `${changedConcepts} existing concepts and ${changedSynapses} existing synapses diverged; the target versions will be preserved.`
+      );
+    }
+    if (
+      substrate.divergent.neurons > 0 ||
+      substrate.divergent.assemblies > 0 ||
+      substrate.divergent.synapses > 0
+    ) {
+      conflicts.push(
+        `${substrate.divergent.neurons} authoritative neurons, ` +
+        `${substrate.divergent.assemblies} assemblies, and ` +
+        `${substrate.divergent.synapses} authoritative synapses diverged; ` +
+        "the target versions will be preserved."
       );
     }
 
@@ -2818,15 +3165,17 @@ export class BrainService {
         .sort(([left], [right]) => left.localeCompare(right)),
       files: publicFiles,
       skippedFiles,
-      conflicts: boundedConflicts
+      conflicts: boundedConflicts,
+      substrate
     };
     const preview: AgentMergePreview = {
       sourceBrainId,
       targetBrainId,
       reviewToken: sha256(JSON.stringify(reviewDescriptor)),
-      newConcepts: newConceptEntries.length,
-      newIdeas: newIdeaEntries.length,
-      newSynapses: newSynapseEntries.length,
+      substrate,
+      newConcepts: substrate.additions.neurons,
+      newIdeas: substrate.additions.assemblies,
+      newSynapses: substrate.additions.synapses,
       newEvidence: evidence.length,
       duplicateEvidence,
       newFiles: files.filter((file) => file.disposition === "copy").length,
@@ -2840,7 +3189,7 @@ export class BrainService {
       note:
         "Merge copies reviewed ideas, evidence, content-addressed files, and neural replay overlays. It never averages complete model weights."
     };
-    return { source, target, evidence, files, preview };
+    return { source, target, evidence, files, substrate, preview };
   }
 
   async previewMerge(sourceBrainId: string, targetBrainId: string): Promise<AgentMergePreview> {
@@ -2890,16 +3239,28 @@ export class BrainService {
       );
     }
 
-    await this.engine.tryRequest(
+    const mergedOverlay = objectRecord(
+      await this.engine.request<unknown>(
       "merge_overlay",
       {
         targetBrainId,
         targetStoragePath: this.repository.brainDirectory(targetBrainId),
         sourceBrainId,
-        sourceStoragePath: this.repository.brainDirectory(sourceBrainId)
+        sourceStoragePath: this.repository.brainDirectory(sourceBrainId),
+        expectedPreviewDigest: plan.substrate.digest
       },
       600_000
+      )
     );
+    if (
+      !mergedOverlay ||
+      mergedOverlay.weightsAveraged !== false ||
+      mergedOverlay.reviewedDigest !== plan.substrate.digest
+    ) {
+      throw new Error(
+        "The authoritative worker did not confirm the exact reviewed overlay digest."
+      );
+    }
 
     const { source, target } = plan;
     for (const [id, concept] of Object.entries(source.concepts)) {
@@ -2959,6 +3320,9 @@ export class BrainService {
           sourceBrainId,
           targetBrainId,
           reviewToken,
+          authoritativeSubstrateDigest: plan.substrate.digest,
+          sourceStateSha256: plan.substrate.sourceStateSha256,
+          targetStateSha256: plan.substrate.targetStateSha256,
           mergedAt,
           strategy: "ideas-evidence-files-replay-overlay",
           wholeModelWeightsAveraged: false,
@@ -2990,6 +3354,7 @@ export class BrainService {
         detail: JSON.stringify({
           sourceBrainId: source.id,
           reviewToken,
+          authoritativeSubstrateDigest: plan.substrate.digest,
           ideas: plan.preview.newIdeas,
           evidence: plan.preview.newEvidence,
           files: plan.preview.newFiles,

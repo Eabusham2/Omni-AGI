@@ -21,6 +21,7 @@ from torch.nn import functional as F
 from .persistence import (
     atomic_save_tensors,
     atomic_write_json,
+    copy_substrate_snapshot,
     load_tensors,
     read_json,
     snapshot_files,
@@ -104,7 +105,28 @@ def _bundle_checksum(engine_path: Path) -> str:
         digest.update(str(tuple(tensor.shape)).encode("ascii"))
         digest.update(str(tensor.dtype).encode("ascii"))
         digest.update(tensor.numpy().tobytes())
+    digest.update(b"substrate:")
+    digest.update(_substrate_content_checksum(engine_path).encode("ascii"))
     return digest.hexdigest()
+
+
+def _substrate_content_checksum(engine_path: Path) -> str:
+    metadata = read_json(engine_path / "brain.json")
+    substrate = metadata.get("substrate", {})
+    if not isinstance(substrate, Mapping):
+        return ""
+    persistence = substrate.get("persistence", {})
+    if not isinstance(persistence, Mapping):
+        # Early internal stable-v1 checkpoints are represented in the
+        # plasticity tensor checksum above.
+        return ""
+    checksum = str(persistence.get("contentSha256", ""))
+    if checksum and (
+        len(checksum) != 64
+        or any(character not in "0123456789abcdef" for character in checksum)
+    ):
+        raise ValueError("substrate content checksum is invalid")
+    return checksum
 
 
 def _architecture_signature(engine_path: Path) -> Dict[str, Any]:
@@ -198,6 +220,15 @@ def _architecture_compatible(
 
 def _tensor_resources(engine_path: Path) -> Dict[str, int]:
     tensors = _bundle_tensors(engine_path)
+    substrate_files = (
+        [
+            path
+            for path in (engine_path / "substrate").rglob("*")
+            if path.is_file()
+        ]
+        if (engine_path / "substrate").is_dir()
+        else []
+    )
     return {
         "tensorCount": len(tensors),
         "elementCount": sum(int(tensor.numel()) for tensor in tensors.values()),
@@ -208,6 +239,11 @@ def _tensor_resources(engine_path: Path) -> Dict[str, int]:
         "checkpointBytes": sum(
             int((engine_path / filename).stat().st_size)
             for filename in ("core.safetensors", "plasticity.safetensors")
+        )
+        + sum(int(path.stat().st_size) for path in substrate_files),
+        "substrateShardFiles": len(substrate_files),
+        "substrateShardBytes": sum(
+            int(path.stat().st_size) for path in substrate_files
         ),
     }
 
@@ -243,6 +279,13 @@ def _diff_checksum(baseline_path: Path, candidate_path: Path) -> Tuple[str, floa
             delta = right.float() - left.float()
             digest.update(delta.contiguous().numpy().tobytes())
             squared_norm += float(delta.pow(2).sum().item())
+    baseline_substrate = _substrate_content_checksum(baseline_path)
+    candidate_substrate = _substrate_content_checksum(candidate_path)
+    digest.update(b"substrate:")
+    digest.update(baseline_substrate.encode("ascii"))
+    digest.update(candidate_substrate.encode("ascii"))
+    if baseline_substrate != candidate_substrate:
+        squared_norm += 1.0
     return digest.hexdigest(), math.sqrt(max(0.0, squared_norm))
 
 
@@ -966,12 +1009,13 @@ class NeuralEvolutionManager:
             rollbackPoint="stable/",
         )
         try:
-            for filename in (
-                "core.safetensors",
-                "plasticity.safetensors",
-                "brain.json",
-            ):
+            for filename in ("core.safetensors", "plasticity.safetensors"):
                 _copy_atomic(model_engine / filename, self.engine_path / filename)
+            copy_substrate_snapshot(model_engine, self.engine_path)
+            _copy_atomic(
+                model_engine / "brain.json",
+                self.engine_path / "brain.json",
+            )
             promoted_checksum = _bundle_checksum(self.engine_path)
             if promoted_checksum != candidate_state_checksum:
                 raise RuntimeError("promoted checkpoint checksum mismatch")

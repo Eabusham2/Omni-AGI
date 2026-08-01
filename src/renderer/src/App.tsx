@@ -784,7 +784,7 @@ function SimpleBuildWizard({
           checked={extras.extendedWorkingMemory}
           onChange={(extendedWorkingMemory) => setExtras((current) => ({ ...current, extendedWorkingMemory }))}
           label="Extended working memory"
-          description="Use more temporary context and latent workspace slots when hardware allows."
+          description="For new Blank and bundled Starter builds, double both recent-token context and recurrent latent assembly slots. Imported checkpoints retain their recorded shape."
         />
         <Toggle
           checked={extras.recursiveImprovement}
@@ -808,7 +808,7 @@ function SimpleBuildWizard({
         <span><Icon name="memory" size={22} /></span>
         <div>
           <strong>Working memory is temporary; learning is structural.</strong>
-          <p>Recent tokens, sensory latents, recurrent liquid state, and active assemblies share a limited workspace. Useful experience consolidates into ternary synapses instead of becoming a hidden prompt.</p>
+          <p>Recent-token context is separate from recurrent latent assembly slots. Sensory latents, liquid state, and active assemblies use the neural workspace; useful experience consolidates into ternary synapses instead of becoming a hidden prompt.</p>
         </div>
       </div>
       <details className="research-diagnostics">
@@ -1237,6 +1237,8 @@ interface ChatToolCommand {
   label: string;
   invocation: Omit<ToolInvocation, "brainId" | "approvalToken">;
   source: "human" | "brain";
+  /** Links a one-action approval back to its original visible action card. */
+  actionEventId?: string;
 }
 
 interface PendingChatTool extends ChatToolCommand {
@@ -1346,7 +1348,7 @@ function ChatActionCard({ event }: { event: ActionEvent }) {
         ) : null}
         {preview && event.state === "running" ? (
           <small className="chat-action-card__preview-label">
-            Live imagination · revision {preview.revision + 1}
+            Progressive imagination · revision {preview.revision + 1}
           </small>
         ) : null}
         {dataUrl && mimeType.startsWith("image/") ? (
@@ -1466,6 +1468,7 @@ function ChatWorkspace({
         setPendingTool({
           label: `${protocol} proposed in chat`,
           source: event.action.source === "human" ? "human" : "brain",
+          actionEventId: event.id,
           invocation: {
             toolId: event.action.toolId,
             action: event.action.action,
@@ -1552,6 +1555,21 @@ function ChatWorkspace({
       return;
     }
     setPendingTool(null);
+    if (command.actionEventId) {
+      setActionEvents((current) =>
+        current.map((event) =>
+          event.id === command.actionEventId
+            ? {
+                ...event,
+                state: execution.state,
+                execution,
+                error: execution.error,
+                updatedAt: execution.finishedAt ?? new Date().toISOString()
+              }
+            : event
+        )
+      );
+    }
     if (execution.state === "failed") {
       setToolStatus(`${command.invocation.toolId}.${command.invocation.action} failed: ${execution.error ?? "unknown error"}`);
       onBrainChange(await window.omni.brain.get(brain.id));
@@ -1612,6 +1630,7 @@ function ChatWorkspace({
               setPendingTool({
                 label: `${protocol} proposed in natural chat`,
                 source: lastAction.action.source === "human" ? "human" : "brain",
+                actionEventId: lastAction.id,
                 invocation: {
                   toolId: lastAction.action.toolId,
                   action: lastAction.action.action,
@@ -1812,6 +1831,39 @@ function ChatWorkspace({
       .sort((a, b) => b.activation - a.activation)
       .filter((concept) => concept.activation > 0)
       .map((concept) => ({ id: concept.id, label: concept.label, activation: concept.activation }));
+  const measuredActivity = recentTrace
+    ? Math.max(
+        0,
+        Math.min(
+          1,
+          recentTrace.activatedConcepts.length
+            ? recentTrace.activatedConcepts.reduce(
+                (sum, concept) => sum + concept.activation,
+                0
+              ) / recentTrace.activatedConcepts.length
+            : (
+                recentTrace.driveScores.curiosity +
+                recentTrace.driveScores.coherence +
+                recentTrace.driveScores.novelty
+              ) / 3
+        )
+      )
+    : null;
+  const pondering = actionEvents.some(
+    (event) =>
+      event.action.kind === "ponder" &&
+      (event.state === "proposed" || event.state === "running")
+  );
+  const actionRunning =
+    toolRunning ||
+    actionEvents.some((event) => event.state === "running");
+  const cortexState = pondering
+    ? "Pondering"
+    : actionRunning
+        ? "Running action"
+        : sending
+          ? "Processing turn"
+          : "Idle / ready";
 
   return (
     <div className="chat-layout">
@@ -1892,7 +1944,7 @@ function ChatWorkspace({
                 <div className="message__meta">
                   <strong>{brain.name}</strong>
                   <span className="pondering-label">
-                    <i /> pondering
+                    <i /> {pondering ? "pondering" : actionRunning ? "acting" : "processing"}
                   </span>
                 </div>
                 {partialText ? (
@@ -1902,7 +1954,13 @@ function ChatWorkspace({
                     <span />
                     <span />
                     <span />
-                    <em>Following a quieter association…</em>
+                    <em>
+                      {pondering
+                        ? "Continuing a recurrent ponder cycle…"
+                        : actionRunning
+                          ? "Running the visible structured action…"
+                          : "Processing the current turn…"}
+                    </em>
                   </div>
                 )}
               </div>
@@ -2016,12 +2074,12 @@ function ChatWorkspace({
         </div>
         {inspectorTab === "state" ? (
           <>
-            <CortexOrb activity={0.82} />
+            <CortexOrb activity={measuredActivity} />
             <div className="cortex-readout">
               <span>
                 <i className="dot-violet" />
                 <small>Current state</small>
-                <strong>{sending ? "Pondering" : "Attentive"}</strong>
+                <strong>{cortexState}</strong>
               </span>
               <span>
                 <small>Liquid τ</small>
@@ -2057,19 +2115,22 @@ function ChatWorkspace({
             </div>
             <div className="workspace-meter">
               <div>
-                <span><Icon name="memory" size={15} /> Working memory</span>
+                <span>
+                  <Icon name="memory" size={15} />
+                  {workspaceSnapshot ? "Recent token context" : "Latent assembly workspace"}
+                </span>
                 <strong>
-                  {workspaceSnapshot?.latentWorkspace.occupancy ?? brain.workingMemory.length}
-                  {" / "}
-                  {workspaceSnapshot?.latentWorkspace.capacity ?? brain.config.workingMemorySlots}
+                  {workspaceSnapshot
+                    ? `${workspaceSnapshot.contextWindow.recentTokenCount ?? 0} / ${workspaceSnapshot.contextWindow.capacityTokens} recent tokens`
+                    : `${brain.workingMemory.length} / ${brain.config.workingMemorySlots} latent items`}
                 </strong>
               </div>
               <i>
-                <b style={{ width: `${Math.min(100, (workspaceSnapshot?.latentWorkspace.capacity ?? brain.config.workingMemorySlots) ? (workspaceSnapshot?.latentWorkspace.occupancy ?? brain.workingMemory.length) / (workspaceSnapshot?.latentWorkspace.capacity ?? brain.config.workingMemorySlots) * 100 : 0)}%` }} />
+                <b style={{ width: `${Math.min(100, (workspaceSnapshot?.contextWindow.capacityTokens ?? brain.config.workingMemorySlots) ? (workspaceSnapshot?.contextWindow.recentTokenCount ?? brain.workingMemory.length) / (workspaceSnapshot?.contextWindow.capacityTokens ?? brain.config.workingMemorySlots) * 100 : 0)}%` }} />
               </i>
               <small>
                 {workspaceSnapshot
-                  ? `${workspaceSnapshot.contextWindow.tokenCount} / ${workspaceSnapshot.contextWindow.capacityTokens} context tokens · ${workspaceSnapshot.latentWorkspace.evictions} evictions`
+                  ? `${workspaceSnapshot.contextWindow.recentTokenCount ?? 0} recent dialogue tokens · ${workspaceSnapshot.contextWindow.evictions ?? 0} token evictions · ${workspaceSnapshot.latentWorkspace.occupancy} / ${workspaceSnapshot.latentWorkspace.capacity} latent slots`
                   : `${brain.liquidState.values.length} recurrent channels · ${brain.counters.consolidationCycles} consolidations`}
               </small>
             </div>
@@ -2153,9 +2214,19 @@ function MessageBubble({
   );
 }
 
-function CortexOrb({ activity }: { activity: number }) {
+function CortexOrb({ activity }: { activity: number | null }) {
+  const measured = activity === null
+    ? null
+    : Math.max(0, Math.min(1, activity));
   return (
-    <div className="cortex-orb" aria-label={`${Math.round(activity * 100)} percent neural activity`}>
+    <div
+      className="cortex-orb"
+      aria-label={
+        measured === null
+          ? "No measured neural activity trace yet"
+          : `${Math.round(measured * 100)} percent neural activity in the latest completed trace`
+      }
+    >
       <svg viewBox="0 0 240 170" role="img" aria-hidden="true">
         <defs>
           <radialGradient id="orbGlow" cx="50%" cy="46%" r="60%">
@@ -2220,7 +2291,9 @@ function CortexOrb({ activity }: { activity: number }) {
       </svg>
       <span className="cortex-orb__caption">
         <i />
-        {Math.round(activity * 100)}% active
+        {measured === null
+          ? "No completed trace"
+          : `${Math.round(measured * 100)}% last measured`}
       </span>
     </div>
   );
@@ -2248,8 +2321,25 @@ function RuntimeCard({ brain, workspace }: { brain: BrainDocument; workspace?: W
     ["Reward model / RLHF", "None"],
     ["Ternary forward paths", "Mandatory · −1 / 0 / +1"],
     ["Runtime", brain.config.runtime],
-    ["Current context", workspace ? `${workspace.contextWindow.tokenCount} / ${workspace.contextWindow.capacityTokens} tokens` : currentTokens],
-    ["Working memory", workspace ? `${workspace.latentWorkspace.occupancy} / ${workspace.latentWorkspace.capacity} slots · ${workspace.latentWorkspace.evictions} evictions` : `${brain.workingMemory.length} / ${brain.config.workingMemorySlots} slots${stableConfig.extendedWorkingMemory ? " · extended" : ""}`],
+    [
+      "Current context",
+      workspace
+        ? `${workspace.contextWindow.tokenCount} / ${workspace.contextWindow.capacityTokens} prompt tokens · ${workspace.contextWindow.recentTokenCount ?? 0} recent · ${workspace.contextWindow.evictions ?? 0} evicted`
+        : currentTokens
+    ],
+    [
+      "Recent context digest",
+      workspace?.contextWindow.recentTokenHash
+        ? workspace.contextWindow.recentTokenHash.slice(0, 16)
+        : "Empty"
+    ],
+    [
+      "Baseline response budget",
+      workspace?.contextWindow.generationBudgetTokens
+        ? `${workspace.contextWindow.generationBudgetTokens} tokens · adjusted per turn from neural state`
+        : "Hardware baseline · adjusted per turn from neural state"
+    ],
+    ["Latent assembly workspace", workspace ? `${workspace.latentWorkspace.occupancy} / ${workspace.latentWorkspace.capacity} slots · ${workspace.latentWorkspace.evictions} evictions` : `${brain.workingMemory.length} / ${brain.config.workingMemorySlots} slots${stableConfig.extendedWorkingMemory ? " · extended" : ""}`],
     ["Liquid recurrent state", workspace ? `${workspace.liquidState.dimensions} dimensions · norm ${workspace.liquidState.norm.toFixed(2)}` : `${brain.liquidState.values.length} channels`],
     ["Consolidation", `${brain.counters.consolidationCycles} completed cycles`],
     ["Recursive improvement", evolutionPermission === "off" || stableConfig.recursiveImprovement === false ? "Off" : `${evolutionPermission} permission`],
@@ -2262,7 +2352,7 @@ function RuntimeCard({ brain, workspace }: { brain: BrainDocument; workspace?: W
         <Icon name="check" size={20} />
       </div>
       <h3>Transparent runtime</h3>
-      <p>Everything outside learned parameters and active neural state is shown here.</p>
+      <p>Key prompt inputs, memory occupancy, tool availability, and runtime policy boundaries are summarized here.</p>
       <dl>
         {rows.map(([label, value]) => (
           <div key={label}>
@@ -2305,7 +2395,6 @@ function DataWorkspace({
   const [crawlUrl, setCrawlUrl] = useState("");
   const [respectRobots, setRespectRobots] = useState(true);
   const [followExternalLinks, setFollowExternalLinks] = useState(false);
-  const [crawlConcurrency, setCrawlConcurrency] = useState(4);
   const [quarantine, setQuarantine] = useState(true);
   const [dragging, setDragging] = useState(false);
 
@@ -2316,6 +2405,26 @@ function DataWorkspace({
     : activeJob
       ? Math.round(Math.max(0, Math.min(1, activeJob.progress)) * 100)
       : 0;
+  const jobOutput = valueRecord(activeJob?.output);
+  const coverageValue = valueRecord(jobOutput?.coverage);
+  const activeCoverage =
+    coverageValue &&
+    typeof coverageValue.discoveredRecords === "number" &&
+    typeof coverageValue.processedRecords === "number" &&
+    typeof coverageValue.rejectedRecords === "number" &&
+    typeof coverageValue.discoveredFiles === "number" &&
+    typeof coverageValue.processedFiles === "number" &&
+    typeof coverageValue.rejectedFiles === "number"
+      ? {
+          discoveredRecords: coverageValue.discoveredRecords,
+          processedRecords: coverageValue.processedRecords,
+          rejectedRecords: coverageValue.rejectedRecords,
+          discoveredFiles: coverageValue.discoveredFiles,
+          processedFiles: coverageValue.processedFiles,
+          rejectedFiles: coverageValue.rejectedFiles,
+          complete: coverageValue.complete === true
+        }
+      : null;
   const synapses = Object.values(brain.synapses);
   const averageStability = synapses.length
     ? synapses.reduce((sum, synapse) => sum + synapse.stability, 0) / synapses.length
@@ -2398,7 +2507,7 @@ function DataWorkspace({
         }
         setDemoProgress(10);
         setLocalIngestStatus(
-          `Queued ${manifest.discoveredFiles} source${manifest.discoveredFiles === 1 ? "" : "s"} for complete neural traversal`
+          `Committed ${manifest.discoveredFiles} source${manifest.discoveredFiles === 1 ? "" : "s"} to a resumable traversal manifest`
         );
         const job = await window.omni.data.start({
           brainId: brain.id,
@@ -2465,8 +2574,7 @@ function DataWorkspace({
         quarantine,
         respectRobots,
         sameOrigin: !followExternalLinks,
-        followExternalLinks,
-        concurrency: crawlConcurrency
+        followExternalLinks
       });
       setActiveJob(job);
       onToast(`${quarantine ? "Quarantined " : ""}continuous crawl started. It will run until stopped or resources pause it.`);
@@ -2579,7 +2687,7 @@ function DataWorkspace({
                     <Icon name="upload" size={25} />
                   </span>
                   <strong>Drop files or folders here</strong>
-                  <p>Documents, datasets, code, images, audio, and video are learned—not merely previewed.</p>
+                  <p>Documents, datasets, code, images, audio, and video are traversed and encoded; rejected records stay visible.</p>
                   <span>Browse all supported material</span>
                 </div>
                 <div className="upload-kind-actions" aria-label="Upload by experience type">
@@ -2630,16 +2738,6 @@ function DataWorkspace({
                   <Toggle checked={respectRobots} onChange={setRespectRobots} label="Respect robots.txt" />
                   <Toggle checked={followExternalLinks} onChange={setFollowExternalLinks} label="Follow external links" />
                   <Toggle checked={quarantine} onChange={setQuarantine} label="Quarantine before learning" />
-                  <label className="crawler-concurrency">
-                    <span>Parallel fetches</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={32}
-                      value={crawlConcurrency}
-                      onChange={(event) => setCrawlConcurrency(Math.max(1, Math.min(32, Number(event.target.value) || 1)))}
-                    />
-                  </label>
                 </div>
                 {!respectRobots ? (
                   <div className="crawler-warning">
@@ -2675,14 +2773,14 @@ function DataWorkspace({
           <div className="surface sources-surface">
             <div className="surface-title">
               <div>
-                <h2>Learned sources</h2>
-                <p>Provenance stays attached to every derived idea.</p>
+                <h2>Encoded source ledger</h2>
+                <p>Provenance and reported neural deltas stay attached to each successfully encoded source.</p>
               </div>
             </div>
             <div className="source-table">
               <div className="source-table__header">
                 <span>Source</span>
-                <span>Learned</span>
+                <span>Neural change</span>
                 <span>Representation</span>
                 <span>Added</span>
                 <span />
@@ -2701,8 +2799,8 @@ function DataWorkspace({
                     </span>
                   </span>
                   <span>
-                    <strong>{source.learnedIdeas} ideas</strong>
-                    <small>{source.learnedSynapses} synapses</small>
+                    <strong>{source.learnedIdeas} assembly deltas</strong>
+                    <small>{source.learnedSynapses} synaptic deltas</small>
                   </span>
                   <span>
                     <i className="representation-pill">
@@ -2759,14 +2857,26 @@ function DataWorkspace({
             </div>
             <div className="training-metrics">
               <span>
-                <small>Loss</small>
-                <strong>{activeJob ? "live" : "—"}</strong>
-                <em>{activeJob ? activeJob.kind : "no run"}</em>
+                <small>Manifest coverage</small>
+                <strong>
+                  {activeCoverage
+                    ? `${activeCoverage.processedRecords + activeCoverage.rejectedRecords} / ${activeCoverage.discoveredRecords}`
+                    : activeJob && (activeJob.kind === "ingestion" || activeJob.kind === "crawl")
+                      ? `${progress}%`
+                      : "—"}
+                </strong>
+                <em>
+                  {activeCoverage
+                    ? `${activeCoverage.processedRecords} encoded · ${activeCoverage.rejectedRecords} rejected · ${activeCoverage.processedFiles + activeCoverage.rejectedFiles}/${activeCoverage.discoveredFiles} file visits${activeCoverage.complete ? " · complete" : " · incomplete/resumable"}`
+                    : activeJob && (activeJob.kind === "ingestion" || activeJob.kind === "crawl")
+                      ? "committed traversal in progress"
+                      : "no manifest run"}
+                </em>
               </span>
               <span>
-                <small>New ideas</small>
+                <small>Assembly deltas</small>
                 <strong>{brain.trainingSources.reduce((sum, source) => sum + source.learnedIdeas, 0) || "—"}</strong>
-                <em>{brain.trainingSources.length} sources</em>
+                <em>{brain.trainingSources.length} encoded sources</em>
               </span>
               <span>
                 <small>Synaptic Δ</small>
@@ -4250,6 +4360,43 @@ function AgentsWorkspace({
         sourceBrainId: sourceId,
         targetBrainId: brain.id,
         reviewToken: "demo-review-token",
+        substrate: {
+          schemaVersion: 1,
+          engineSchemaVersion: 1,
+          digest: "0".repeat(64),
+          sourceStateSha256: "1".repeat(64),
+          targetStateSha256: "2".repeat(64),
+          sourceParameterSha256: "3".repeat(64),
+          targetParameterSha256: "4".repeat(64),
+          sourceConfigSha256: "5".repeat(64),
+          targetConfigSha256: "6".repeat(64),
+          sourceCounts: {
+            neurons: 180,
+            assemblies: 40,
+            synapses: 710,
+            replayExamples: 24
+          },
+          targetCounts: {
+            neurons: 162,
+            assemblies: 36,
+            synapses: 639,
+            replayExamples: 20
+          },
+          additions: {
+            neurons: 18,
+            assemblies: 4,
+            synapses: 71,
+            replayExamples: 4
+          },
+          duplicates: {
+            neurons: 162,
+            assemblies: 36,
+            synapses: 639,
+            replayExamples: 20
+          },
+          divergent: { neurons: 1, assemblies: 1, synapses: 2 },
+          weightsAveraged: false
+        },
         newConcepts: 18,
         newIdeas: 4,
         newSynapses: 71,
@@ -4424,6 +4571,7 @@ function AgentsWorkspace({
                 <span><dt>Ideas</dt><dd>+{preview.newIdeas}</dd></span>
                 <span><dt>Concepts</dt><dd>+{preview.newConcepts}</dd></span>
                 <span><dt>Synapses</dt><dd>+{preview.newSynapses}</dd></span>
+                <span><dt>Replay</dt><dd>+{preview.substrate.additions.replayExamples}</dd></span>
                 <span><dt>Evidence</dt><dd>+{preview.newEvidence}</dd></span>
                 <span><dt>Files</dt><dd>+{preview.newFiles}</dd></span>
                 <span><dt>File bytes</dt><dd>{formatBytes(preview.fileBytes)}</dd></span>
@@ -4432,6 +4580,9 @@ function AgentsWorkspace({
               {preview.conflicts.length ? (
                 <p><Icon name="warning" size={14} /> {preview.conflicts.join(" · ")}</p>
               ) : null}
+              <p>
+                Reviewed neural state <code>{preview.substrate.digest.slice(0, 12)}…</code>
+              </p>
               <Button kind="primary" icon="check" onClick={() => void merge()}>Merge reviewed overlay</Button>
             </div>
           ) : null}

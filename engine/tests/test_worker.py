@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,10 +13,190 @@ ENGINE = Path(__file__).resolve().parents[1]
 if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
-from worker import Worker
+from worker import DeferredEventLog, InlineGeneration, RpcFault, Worker
 
 
 class WorkerProtocolTests(unittest.TestCase):
+    def test_cancelling_inline_job_removes_staged_artifacts(self):
+        worker = Worker()
+        with tempfile.TemporaryDirectory(
+            prefix="omni-inline-cancel-"
+        ) as folder:
+            action_id = "b" * 32
+            staging = (
+                Path(folder)
+                / "engine"
+                / ".inline-imagination"
+                / action_id
+            )
+            artifact = staging / "artifacts" / "partial.png"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"partial")
+            future = Future()
+            future.set_result({"path": str(artifact)})
+            record = InlineGeneration(
+                brain_id="cancel-brain",
+                action_id=action_id,
+                stream_id="cancel-stream",
+                signature="fixture",
+                staging_root=staging,
+                events=DeferredEventLog(),
+                future=future,
+                job_id="cancel-job",
+            )
+            worker._inline_generations[(record.brain_id, action_id)] = record
+
+            result = worker.cancel({"jobId": "cancel-job"}, "cancel")
+
+            self.assertEqual(result["inlineGenerationsCancelled"], 1)
+            self.assertFalse(staging.exists())
+            self.assertFalse(staging.parent.exists())
+            self.assertEqual(worker._inline_generations, {})
+        worker.shutdown({}, "shutdown")
+
+    def test_inline_imagination_never_starts_before_ask_approval(self):
+        worker = Worker()
+        brain = MagicMock()
+        brain.brain_id = "permission-brain"
+
+        def chat_side_effect(*_args, **kwargs):
+            callback = kwargs["stream_callback"]
+            callback(
+                "action",
+                {
+                    "actionId": "a" * 32,
+                    "action": {
+                        "kind": "imagine",
+                        "toolId": "modality.imagine",
+                        "action": "generate",
+                        "arguments": {"modality": "image"},
+                    },
+                },
+            )
+            callback("token", {"delta": "permission retained"})
+            return {"text": "permission retained", "trace": {"id": "trace"}}
+
+        brain.chat.side_effect = chat_side_effect
+        with patch.object(worker, "_get", return_value=brain), patch.object(
+            worker, "_start_inline_generation"
+        ) as start_inline, contextlib.redirect_stdout(io.StringIO()):
+            result = worker.chat(
+                {
+                    "brainId": brain.brain_id,
+                    "input": "Imagine only after approval.",
+                    "streamId": "permission-stream",
+                    "toolSchemas": [
+                        {
+                            "id": "modality.imagine",
+                            "actions": ["generate"],
+                            "grant": "ask",
+                        }
+                    ],
+                },
+                "permission-chat",
+            )
+        self.assertEqual(result["text"], "permission retained")
+        start_inline.assert_not_called()
+        worker.shutdown({}, "shutdown")
+
+    def test_authoritative_overlay_digest_rejects_post_review_mutation(self):
+        worker = Worker()
+        with tempfile.TemporaryDirectory(
+            prefix="omni-worker-overlay-target-"
+        ) as target_folder, tempfile.TemporaryDirectory(
+            prefix="omni-worker-overlay-source-"
+        ) as source_folder:
+            config = {
+                "name": "Overlay fixture",
+                "onlineLearning": False,
+                "learnFromOwnMessages": False,
+                "spikingDynamics": False,
+            }
+            worker.create(
+                {
+                    "brainId": "overlay-target",
+                    "storagePath": target_folder,
+                    "config": config,
+                    "hardwareTier": "micro",
+                },
+                "create-target",
+            )
+            worker.create(
+                {
+                    "brainId": "overlay-source",
+                    "storagePath": source_folder,
+                    "config": config,
+                    "hardwareTier": "micro",
+                },
+                "create-source",
+            )
+            source = worker.brains["overlay-source"]
+            source.learn_experience(
+                "A fork-local causal assembly enters replay.",
+                steps=1,
+                importance=1.0,
+            )
+            source.save()
+            params = {
+                "targetBrainId": "overlay-target",
+                "targetStoragePath": target_folder,
+                "sourceBrainId": "overlay-source",
+                "sourceStoragePath": source_folder,
+            }
+            reviewed = worker.preview_overlay(params, "preview")
+            self.assertRegex(reviewed["digest"], r"^[a-f0-9]{64}$")
+            self.assertGreater(reviewed["additions"]["neurons"], 0)
+            self.assertGreater(reviewed["additions"]["assemblies"], 0)
+            self.assertGreater(reviewed["additions"]["replayExamples"], 0)
+            self.assertFalse(reviewed["weightsAveraged"])
+
+            target = worker.brains["overlay-target"]
+            target.learn_experience(
+                "The target base changed after the operator reviewed it.",
+                steps=1,
+                importance=1.0,
+            )
+            target.save()
+            with self.assertRaisesRegex(RpcFault, "changed after review"):
+                worker.merge_overlay(
+                    {
+                        **params,
+                        "expectedPreviewDigest": reviewed["digest"],
+                    },
+                    "stale-target-merge",
+                )
+
+            reviewed = worker.preview_overlay(params, "preview-after-target")
+            source.learn_experience(
+                "This mutation happened after the operator reviewed the fork.",
+                steps=1,
+                importance=1.0,
+            )
+            source.save()
+            with self.assertRaisesRegex(RpcFault, "changed after review"):
+                worker.merge_overlay(
+                    {
+                        **params,
+                        "expectedPreviewDigest": reviewed["digest"],
+                    },
+                    "stale-merge",
+                )
+
+            refreshed = worker.preview_overlay(params, "preview-again")
+            merged = worker.merge_overlay(
+                {
+                    **params,
+                    "expectedPreviewDigest": refreshed["digest"],
+                },
+                "merge",
+            )
+            self.assertEqual(merged["reviewedDigest"], refreshed["digest"])
+            self.assertGreater(merged["ideas"], 0)
+            self.assertGreater(merged["replayExamples"], 0)
+            self.assertFalse(merged["weightsAveraged"])
+            worker.brains["overlay-target"].events.close()
+            source.events.close()
+
     def test_failed_ingestion_discards_partial_state_and_reloads_checkpoint(self):
         worker = Worker()
         partial = MagicMock()
@@ -191,7 +372,41 @@ class WorkerProtocolTests(unittest.TestCase):
                         },
                     }
                 )
+                # Emulate the protocol loop exactly: dispatch returns first,
+                # then the worker writes the chat response. At least one real
+                # modality decoder preview must already be in the stream.
+                Worker._send(streamed_response)
+                with worker._inline_lock:
+                    inline_action_ids = [
+                        record.action_id
+                        for record in worker._inline_generations.values()
+                        if record.brain_id == "rpc-brain"
+                    ]
+                self.assertEqual(len(inline_action_ids), 1)
+                modality_response = worker.dispatch(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "image-preview",
+                        "method": "generate_modality",
+                        "params": {
+                            "brainId": "rpc-brain",
+                            "storagePath": folder,
+                            "jobId": "image-job",
+                            "neuralActionId": inline_action_ids[0],
+                            "modality": "image",
+                            "conceptIds": ["organic-fixture"],
+                        },
+                    }
+                )
             self.assertNotIn("error", streamed_response)
+            self.assertNotIn("error", modality_response)
+            self.assertTrue(
+                modality_response["result"]["generatedDuringChat"]
+            )
+            self.assertEqual(
+                modality_response["result"]["neuralActionId"],
+                inline_action_ids[0],
+            )
             chatted = streamed_response["result"]
             stream_messages = [
                 json.loads(line)
@@ -231,41 +446,43 @@ class WorkerProtocolTests(unittest.TestCase):
                 chatted["runtimeCard"]["tool_schema_channel"],
                 "substrate-capability-embedding",
             )
-
-            preview_output = io.StringIO()
-            with contextlib.redirect_stdout(preview_output):
-                modality_response = worker.dispatch(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": "image-preview",
-                        "method": "generate_modality",
-                        "params": {
-                            "brainId": "rpc-brain",
-                            "storagePath": folder,
-                            "jobId": "image-job",
-                            "modality": "image",
-                            "conceptIds": ["organic-fixture"],
-                            "seed": 23,
-                        },
-                    }
-                )
-            self.assertNotIn("error", modality_response)
-            preview_events = [
-                message["params"]
-                for message in (
-                    json.loads(line)
-                    for line in preview_output.getvalue().splitlines()
-                    if line.strip()
-                )
+            first_preview_index = next(
+                index
+                for index, message in enumerate(stream_messages)
                 if message.get("method") == "event"
                 and message.get("params", {}).get("type")
                 == "modality-preview"
-            ]
-            self.assertGreaterEqual(len(preview_events), 2)
-            self.assertEqual(
-                [event["sequence"] for event in preview_events],
-                list(range(len(preview_events))),
+                and message.get("params", {}).get("streamId")
+                == "turn-stream"
             )
+            chat_response_index = next(
+                index
+                for index, message in enumerate(stream_messages)
+                if message.get("id") == "chat"
+            )
+            self.assertLess(
+                first_preview_index,
+                chat_response_index,
+                "a real generated preview must arrive before chat RPC completion",
+            )
+            first_preview = stream_messages[first_preview_index]["params"]
+            self.assertEqual(
+                first_preview["actionId"], inline_action_ids[0]
+            )
+            self.assertTrue(
+                first_preview["data"]["preview"]["dataUrl"].startswith(
+                    "data:image/png;base64,"
+                )
+            )
+            preview_events = [
+                message["params"]
+                for message in stream_messages
+                if message.get("method") == "event"
+                and message.get("params", {}).get("type")
+                == "modality-preview"
+                and message.get("params", {}).get("jobId") == "image-job"
+            ]
+            self.assertGreaterEqual(len(preview_events), 1)
             self.assertTrue(
                 all(
                     event["data"]["preview"]["dataUrl"].startswith(
@@ -277,6 +494,27 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(
                 sorted(event["progress"] for event in preview_events),
                 [event["progress"] for event in preview_events],
+            )
+            self.assertEqual(
+                len(list((Path(folder) / "engine" / "artifacts").glob("*.png"))),
+                1,
+                "the typed tool job must claim the inline artifact, not generate twice",
+            )
+            self.assertFalse(
+                (Path(folder) / "engine" / ".inline-imagination").exists()
+            )
+            modality_audit = next(
+                event
+                for event in worker.brains["rpc-brain"].events.recent(20)
+                if event["kind"] == "modality-generation"
+            )
+            self.assertEqual(modality_audit["jobId"], "image-job")
+            self.assertTrue(
+                modality_audit["payload"]["generatedDuringChat"]
+            )
+            self.assertEqual(
+                modality_audit["payload"]["neuralActionId"],
+                inline_action_ids[0],
             )
 
             feedback = request(

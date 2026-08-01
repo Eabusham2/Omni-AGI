@@ -72,7 +72,12 @@ function Invoke-WorkerRpc {
 
 try {
   $Health = Invoke-WorkerRpc -Id "health" -Method "health" -Params @{}
-  if (-not $Health.ready -or $Health.worker -ne "python" -or $Health.protocolVersion -ne 1) {
+  if (
+    -not $Health.ready -or
+    $Health.worker -ne "python" -or
+    $Health.protocolVersion -ne 1 -or
+    $Health.operatingSystem -ne "win32"
+  ) {
     throw "Packaged worker returned an invalid health response."
   }
 
@@ -85,7 +90,6 @@ try {
     config = @{
       name = "Packaged worker smoke"
       hardwareTier = "micro"
-      parallelThoughts = 1
       image_enabled = $EnableModalities
       audio_enabled = $EnableModalities
       video_enabled = $EnableModalities
@@ -244,6 +248,7 @@ try {
     pythonVersion = $Health.pythonVersion
     torchVersion = $Health.torchVersion
     platform = $Health.platform
+    operatingSystem = $Health.operatingSystem
     persistedBrain = $true
     safeTensorCheckpoint = $true
     sqliteEventLog = $true

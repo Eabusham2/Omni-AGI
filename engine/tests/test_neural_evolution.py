@@ -18,6 +18,7 @@ if str(ENGINE) not in sys.path:
 
 from omni_core import AdaptiveBrain, OmniConfig
 from omni_core.evolution import NeuralEvolutionManager, _bundle_checksum
+from omni_core.vsa import ConceptMemory
 from worker import Worker
 
 
@@ -34,7 +35,6 @@ class NeuralEvolutionTests(unittest.TestCase):
             self.root,
             OmniConfig.micro(
                 origin_kind="blank",
-                parallel_thoughts=1,
                 max_seq_len=40,
                 learn_from_own_messages=False,
             ),
@@ -77,6 +77,17 @@ class NeuralEvolutionTests(unittest.TestCase):
         )
         self.assertTrue(load_file(str(candidate / "core.safetensors")))
         self.assertTrue(load_file(str(candidate / "plasticity.safetensors")))
+        candidate_metadata = json.loads(
+            (candidate / "brain.json").read_text("utf-8")
+        )
+        candidate_substrate = ConceptMemory.load_sharded(
+            candidate / "substrate",
+            candidate_metadata["substrate"],
+        )
+        self.assertEqual(
+            len(candidate_substrate.synapses),
+            candidate_metadata["substrate"]["persistence"]["counts"]["synapses"],
+        )
         unsafe = {
             ".ckpt",
             ".joblib",

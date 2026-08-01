@@ -14,6 +14,16 @@ const packageDocument = JSON.parse(
 };
 const temporaryDirectories: string[] = [];
 
+function linuxArtifactArchitecture(
+  architecture: "x64" | "arm64",
+  extension: "AppImage" | "deb" | "tar.gz"
+): string {
+  if (architecture !== "x64") return architecture;
+  if (extension === "AppImage") return "x86_64";
+  if (extension === "deb") return "amd64";
+  return architecture;
+}
+
 function hash(bytes: Buffer | string): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -53,9 +63,15 @@ function writeReleaseFixture(): string {
     const windowsZip = artifact(`${product}-${version}-Windows-${arch}.zip`);
     const macDmg = artifact(`${product}-${version}-macOS-${arch}.dmg`);
     const macZip = artifact(`${product}-${version}-macOS-${arch}.zip`);
-    const linuxAppImage = artifact(`${product}-${version}-Linux-${arch}.AppImage`);
-    const linuxDeb = artifact(`${product}-${version}-Linux-${arch}.deb`);
-    const linuxTar = artifact(`${product}-${version}-Linux-${arch}.tar.gz`);
+    const linuxAppImage = artifact(
+      `${product}-${version}-Linux-${linuxArtifactArchitecture(arch, "AppImage")}.AppImage`
+    );
+    const linuxDeb = artifact(
+      `${product}-${version}-Linux-${linuxArtifactArchitecture(arch, "deb")}.deb`
+    );
+    const linuxTar = artifact(
+      `${product}-${version}-Linux-${linuxArtifactArchitecture(arch, "tar.gz")}.tar.gz`
+    );
 
     writeFileSync(
       join(directory, `windows-package-smoke-${arch}.json`),

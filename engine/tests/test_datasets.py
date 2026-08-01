@@ -1,11 +1,15 @@
+import bz2
+import gzip
 import hashlib
 import json
+import lzma
 import os
 import sqlite3
 import tarfile
 import tempfile
 import threading
 import unittest
+import zipfile
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -95,10 +99,163 @@ class DatasetStreamingTests(unittest.TestCase):
         self.assertTrue(all(len(record.content_sha256) == 64 for record in records[2:]))
         self.assertEqual(coverage.shards, 1)
         self.assertEqual(coverage.discovered_files, 7)
+        self.assertEqual(coverage.completed_files, 6)
+        self.assertEqual(coverage.rejected_files, 1)
         self.assertEqual(coverage.rejected_records, 1)
         self.assertEqual(coverage.modality_counts["image"], 1)
         self.assertEqual(coverage.modality_counts["audio"], 1)
         self.assertEqual(coverage.modality_counts["video"], 1)
+        self.assertTrue(coverage.as_dict()["complete"])
+
+    def test_corrupt_file_and_unsupported_member_complete_as_explicit_rejections(self):
+        corrupt = self.root / "corrupt.tar"
+        corrupt.write_bytes(b"not a tar, zip, or readable archive")
+        corrupt_records, corrupt_coverage = self.records(corrupt)
+        self.assertEqual(corrupt_records, [])
+        self.assertEqual(
+            corrupt_coverage.as_dict(),
+            {
+                "discoveredFiles": 1,
+                "completedFiles": 0,
+                "processedFiles": 0,
+                "rejectedFiles": 1,
+                "discoveredRecords": 1,
+                "processedRecords": 0,
+                "rejectedRecords": 1,
+                "processedBytes": 0,
+                "shards": 1,
+                "modalityCounts": {},
+                "errors": [
+                    {
+                        "source": str(corrupt.resolve()),
+                        "message": corrupt_coverage.errors[0]["message"],
+                    }
+                ],
+                "complete": True,
+            },
+        )
+
+        unsupported_source = self.root / "opaque.bin"
+        unsupported_source.write_bytes(b"\x00\xff\x00\xff")
+        archive_path = self.root / "unsupported-member.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            archive.add(unsupported_source, arcname="opaque.bin")
+        member_records, member_coverage = self.records(archive_path)
+        self.assertEqual(member_records, [])
+        self.assertEqual(member_coverage.discovered_files, 2)
+        self.assertEqual(member_coverage.completed_files, 1)
+        self.assertEqual(member_coverage.rejected_files, 1)
+        self.assertEqual(member_coverage.discovered_records, 1)
+        self.assertEqual(member_coverage.processed_records, 0)
+        self.assertEqual(member_coverage.rejected_records, 1)
+        self.assertTrue(member_coverage.as_dict()["complete"])
+        self.assertIn(
+            "unsupported binary archive member",
+            member_coverage.errors[0]["message"],
+        )
+
+    def test_office_and_opendocument_containers_stream_every_content_part(self):
+        long_docx = "".join(
+            "<w:p><w:r><w:t>docx-row-%d</w:t></w:r></w:p>" % index
+            for index in range(4_000)
+        )
+        fixtures = {
+            ".docx": {
+                "word/document.xml": (
+                    '<w:document xmlns:w="urn:word"><w:body>'
+                    + long_docx
+                    + "<w:p><w:r><w:t>docx-tail-sentinel</w:t></w:r></w:p>"
+                    + "</w:body></w:document>"
+                )
+            },
+            ".pptx": {
+                "ppt/slides/slide1.xml": (
+                    '<p:sld xmlns:p="urn:presentation" xmlns:a="urn:drawing">'
+                    "<a:p><a:r><a:t>pptx-tail-sentinel</a:t></a:r></a:p>"
+                    "</p:sld>"
+                )
+            },
+            ".xlsx": {
+                "xl/sharedStrings.xml": (
+                    '<sst xmlns="urn:spreadsheet"><si><t>xlsx-tail-sentinel</t></si></sst>'
+                ),
+                "xl/worksheets/sheet1.xml": (
+                    '<worksheet xmlns="urn:spreadsheet"><sheetData><row>'
+                    '<c t="s"><v>0</v></c><c><v>42</v></c>'
+                    "</row></sheetData></worksheet>"
+                ),
+            },
+            ".odt": {
+                "content.xml": (
+                    '<office:document-content xmlns:office="urn:office" '
+                    'xmlns:text="urn:text"><office:body><office:text>'
+                    "<text:p>odt-tail-sentinel</text:p>"
+                    "</office:text></office:body></office:document-content>"
+                )
+            },
+            ".ods": {
+                "content.xml": (
+                    '<office:document-content xmlns:office="urn:office" '
+                    'xmlns:text="urn:text" xmlns:table="urn:table">'
+                    "<office:body><office:spreadsheet><table:table><table:table-row>"
+                    '<table:table-cell office:value-type="float" office:value="42">'
+                    "<text:p>ods-tail-sentinel</text:p></table:table-cell>"
+                    "</table:table-row></table:table></office:spreadsheet></office:body>"
+                    "</office:document-content>"
+                )
+            },
+            ".odp": {
+                "content.xml": (
+                    '<office:document-content xmlns:office="urn:office" '
+                    'xmlns:text="urn:text"><office:body><office:presentation>'
+                    "<text:p>odp-tail-sentinel</text:p>"
+                    "</office:presentation></office:body></office:document-content>"
+                )
+            },
+        }
+
+        for suffix, members in fixtures.items():
+            with self.subTest(suffix=suffix):
+                path = self.root / ("fixture" + suffix)
+                with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    for member_name, xml in members.items():
+                        archive.writestr(member_name, xml.encode("utf-8"))
+                    archive.writestr("ignored/binary.bin", b"\x00\xff")
+                records, coverage = self.records(path)
+                combined = "\n".join(record.text for record in records)
+                self.assertIn(suffix[1:] + "-tail-sentinel", combined)
+                self.assertEqual(coverage.rejected_records, 0, coverage.errors)
+                self.assertEqual(coverage.shards, 1)
+                self.assertGreaterEqual(coverage.completed_files, 2)
+                if suffix == ".docx":
+                    self.assertGreater(len(records), 1)
+                    self.assertIn("docx-row-3999", combined)
+                if suffix in {".xlsx", ".ods"}:
+                    self.assertIn("42", combined)
+
+    def test_standalone_gzip_bzip2_and_xz_stream_without_a_byte_cap(self):
+        payload = "\n".join(
+            ["compressed-row-%d" % index for index in range(6_000)]
+            + ["compressed-tail-sentinel"]
+        )
+        for suffix, opener in (
+            (".gz", gzip.open),
+            (".bz2", bz2.open),
+            (".xz", lzma.open),
+        ):
+            with self.subTest(suffix=suffix):
+                path = self.root / ("corpus.txt" + suffix)
+                with opener(path, "wt", encoding="utf-8", newline="") as stream:
+                    stream.write(payload)
+                records, coverage = self.records(path)
+                combined = "\n".join(record.text for record in records)
+                self.assertGreater(len(records), 1)
+                self.assertIn("compressed-row-0", combined)
+                self.assertIn("compressed-row-5999", combined)
+                self.assertIn("compressed-tail-sentinel", combined)
+                self.assertEqual(coverage.rejected_records, 0, coverage.errors)
+                self.assertEqual(coverage.shards, 1)
+                self.assertEqual(coverage.completed_files, 2)
 
     def test_binary_member_local_path_is_leased_until_iterator_advances(self):
         image_bytes = b"\x89PNG\r\n\x1a\nleased-fixture"
@@ -124,7 +281,9 @@ class DatasetStreamingTests(unittest.TestCase):
     def test_remote_manifest_streams_shard_and_records_provenance(self):
         remote_path = self.root / "remote.jsonl"
         body = "\n".join(json.dumps({"index": index}) for index in range(7)) + "\n"
-        remote_path.write_text(body, encoding="utf-8")
+        # Use exact bytes so Windows text-mode newline conversion cannot make
+        # the served shard differ from the manifest checksum.
+        remote_path.write_bytes(body.encode("utf-8"))
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
         class QuietHandler(SimpleHTTPRequestHandler):

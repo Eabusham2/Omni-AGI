@@ -118,6 +118,7 @@ describe("ToolExecutor release gates", () => {
     const challenge = await executor.execute(invocation);
     expect(challenge.state).toBe("approval-required");
     expect(challenge.approvalToken).toMatch(/^[a-f0-9-]{36}$/i);
+    expect(executor.hasPendingOrActive(brain.id)).toBe(true);
 
     const substituted = await executor.execute({
       ...invocation,

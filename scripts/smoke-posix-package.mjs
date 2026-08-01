@@ -4,6 +4,7 @@ import { createReadStream, existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
+import { releaseArtifactName } from "./release-artifact-names.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
@@ -119,12 +120,17 @@ const packageDocument = JSON.parse(
     readFile(resolve("package.json"), "utf8")
   )
 );
-const platformLabel = platform === "mac" ? "macOS" : "Linux";
 const extensions = platform === "mac" ? ["dmg", "zip"] : ["AppImage", "deb", "tar.gz"];
 const files = await walk(releaseRoot);
 const artifacts = [];
 for (const extension of extensions) {
-  const expectedName = `${packageDocument.build.productName}-${packageDocument.version}-${platformLabel}-${arch}.${extension}`;
+  const expectedName = releaseArtifactName({
+    product: packageDocument.build.productName,
+    version: packageDocument.version,
+    platform,
+    architecture: arch,
+    extension
+  });
   const matches = files.filter((path) => basename(path) === expectedName);
   if (matches.length !== 1) {
     throw new Error(`Expected exactly one ${expectedName}; found ${matches.length}.`);

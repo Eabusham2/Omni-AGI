@@ -1,14 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { createServer } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
   _electron as electron,
-  chromium,
   expect,
   test,
-  type Browser,
   type ElectronApplication,
   type Page
 } from "@playwright/test";
@@ -38,153 +34,37 @@ function environment(dataDirectory: string, installed: boolean): Record<string, 
   };
 }
 
-async function reservePort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
-    const server = createServer();
-    server.unref();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close();
-        reject(new Error("Could not reserve a local CDP port."));
-        return;
-      }
-      server.close((error) => {
-        if (error) reject(error);
-        else resolvePort(address.port);
-      });
-    });
-  });
-}
-
-function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-  return new Promise((resolveExit) => {
-    const timer = setTimeout(() => {
-      child.off("exit", onExit);
-      resolveExit(false);
-    }, timeoutMs);
-    const onExit = (): void => {
-      clearTimeout(timer);
-      resolveExit(true);
-    };
-    child.once("exit", onExit);
-  });
-}
-
-async function terminateProcessTree(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === "win32" && child.pid) {
-    await new Promise<void>((resolveTermination) => {
-      const terminator = spawn(
-        "taskkill",
-        ["/PID", String(child.pid), "/T", "/F"],
-        { stdio: "ignore", windowsHide: true }
-      );
-      terminator.once("error", () => resolveTermination());
-      terminator.once("exit", () => resolveTermination());
-    });
-    return;
-  }
-  child.kill("SIGKILL");
-  await waitForExit(child, 5_000);
-}
-
-async function waitForCdp(
-  endpoint: string,
-  child: ChildProcess,
-  diagnostics: () => string
-): Promise<void> {
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(
-        `Packaged app exited before CDP became ready (code ${child.exitCode}, signal ${child.signalCode}).\n${diagnostics()}`
-      );
-    }
-    try {
-      const response = await fetch(`${endpoint}/json/version`);
-      if (response.ok) return;
-    } catch {
-      // The executable can take several seconds to unpack and start on CI.
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
-  }
-  throw new Error(`Timed out waiting for packaged app CDP endpoint.\n${diagnostics()}`);
-}
-
-async function waitForPage(browser: Browser): Promise<Page> {
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    const context = browser.contexts()[0];
-    const page = context
-      ?.pages()
-      .find((candidate) => !candidate.url().startsWith("devtools://"));
-    if (page) return page;
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  }
-  throw new Error("Packaged app connected over CDP but did not create a renderer page.");
-}
-
 async function launchInstalled(
   executablePath: string,
   dataDirectory: string
 ): Promise<RunningApplication> {
-  const port = await reservePort();
-  const endpoint = `http://127.0.0.1:${port}`;
-  const child = spawn(
-    executablePath,
-    [
-      `--remote-debugging-port=${port}`,
-      "--remote-allow-origins=*",
-      `--user-data-dir=${join(dataDirectory, "electron-profile")}`,
-      "--disable-gpu"
-    ],
-    {
+  let application: ElectronApplication | undefined;
+  try {
+    application = await electron.launch({
+      executablePath,
+      args: [
+        `--user-data-dir=${join(dataDirectory, "electron-profile")}`,
+        "--disable-gpu"
+      ],
       cwd: dirname(executablePath),
       env: environment(dataDirectory, true),
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    }
-  );
-  let output = "";
-  const capture = (chunk: Buffer): void => {
-    output = `${output}${chunk.toString()}`.slice(-8_000);
-  };
-  child.stdout?.on("data", capture);
-  child.stderr?.on("data", capture);
-
-  let browser: Browser | undefined;
-  try {
-    await waitForCdp(endpoint, child, () => output);
-    browser = await chromium.connectOverCDP(endpoint, { timeout: 120_000 });
-    const page = await waitForPage(browser);
+      // Portable tar archives cannot preserve root ownership for
+      // chrome-sandbox. This affects only the test launch, not shipped defaults.
+      chromiumSandbox: false,
+      timeout: 180_000
+    });
+    const page = await application.firstWindow({ timeout: 120_000 });
     let closed = false;
     return {
       page,
       close: async () => {
         if (closed) return;
         closed = true;
-        if (!page.isClosed()) {
-          await page
-            .evaluate(() =>
-              (
-                window as unknown as {
-                  omni: { window: { close(): Promise<void> } };
-                }
-              ).omni.window.close()
-            )
-            .catch(() => undefined);
-        }
-        await browser?.close().catch(() => undefined);
-        const exitedCleanly = await waitForExit(child, 30_000);
-        if (!exitedCleanly) await terminateProcessTree(child);
+        await application?.close();
       }
     };
   } catch (error) {
-    await browser?.close().catch(() => undefined);
-    await terminateProcessTree(child);
+    await application?.close().catch(() => undefined);
     throw error;
   }
 }
@@ -210,15 +90,28 @@ async function sendNaturalMessage(
   brainName: string,
   message: string
 ): Promise<void> {
-  const previousHumanMessages = await page.locator(".message--human").count();
   const composer = page.getByLabel(`Message ${brainName}`);
+  const sendButton = page.getByLabel("Send message");
+  const staleToastDismiss = page.getByRole("button", { name: "Dismiss" });
+  if (await staleToastDismiss.isVisible().catch(() => false)) {
+    await staleToastDismiss.click();
+  }
+  await expect(sendButton).toBeVisible({ timeout: 240_000 });
   await composer.fill(message);
-  await page.getByLabel("Send message").click();
-  await expect
-    .poll(() => page.locator(".message--human").count(), {
-      timeout: 240_000
+  await expect(sendButton).toBeEnabled({ timeout: 240_000 });
+  await sendButton.click();
+  const persistedMessage = page
+    .locator(".message--human")
+    .getByText(message, { exact: true });
+  const errorToast = page.locator(".toast");
+  await Promise.race([
+    persistedMessage.waitFor({ state: "visible", timeout: 240_000 }),
+    errorToast.waitFor({ state: "visible", timeout: 240_000 }).then(async () => {
+      throw new Error(
+        `Chat failed before persistence: ${(await errorToast.textContent())?.trim() ?? "unknown error"}`
+      );
     })
-    .toBeGreaterThan(previousHumanMessages);
+  ]);
   await expect(page.getByLabel("Send message")).toBeVisible({
     timeout: 240_000
   });
@@ -333,7 +226,9 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await expect(runtimeCard.getByText("Reward model / RLHF", { exact: true })).toBeVisible();
     await expect(runtimeCard.getByText("Mandatory · −1 / 0 / +1", { exact: true })).toBeVisible();
     await expect(runtimeCard.getByText("Current context", { exact: true })).toBeVisible();
-    await expect(runtimeCard.getByText("Working memory", { exact: true })).toBeVisible();
+    await expect(
+      runtimeCard.getByText("Latent assembly workspace", { exact: true })
+    ).toBeVisible();
 
     await sendNaturalMessage(page, "E2E Cortex", "hello, tell me what you notice");
     await expect(
@@ -367,7 +262,15 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await expect(
       page.getByRole("button", { name: "Approve exact action" })
     ).toBeVisible({ timeout: 120_000 });
+    const agentActions = page
+      .locator(".chat-action-card")
+      .filter({ hasText: "agent.fork" });
+    const approvedAgentAction = agentActions.nth((await agentActions.count()) - 1);
+    await expect(approvedAgentAction).toContainText("approval required");
     await page.getByRole("button", { name: "Approve exact action" }).click();
+    await expect(approvedAgentAction).toContainText("complete", {
+      timeout: 180_000
+    });
     await expect(
       page.getByText(
         /agent\.fork\.start completed and its visible result entered working experience/
@@ -480,7 +383,9 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await page.getByRole("button", { name: "Runtime card" }).click();
     await expect(page.getByText("Transparent runtime", { exact: true })).toBeVisible();
     await expect(page.getByText("Current context", { exact: true })).toBeVisible();
-    await expect(page.getByText("Working memory", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("Latent assembly workspace", { exact: true })
+    ).toBeVisible();
   } finally {
     await application?.close().catch(() => undefined);
     await rm(dataDirectory, {

@@ -56,6 +56,9 @@ describe("project integrity", () => {
     expect(read("licenses/imageio-ffmpeg-BSD-2-Clause.txt")).toContain(
       "Copyright (c) 2019-2025, imageio"
     );
+    expect(read("licenses/GPL-2.0.txt")).toContain(
+      "GNU GENERAL PUBLIC LICENSE"
+    );
     expect(packageDocument.build.extraResources).toContainEqual({
       from: "THIRD_PARTY_NOTICES.md",
       to: "licenses/THIRD_PARTY_NOTICES.md"
@@ -63,6 +66,10 @@ describe("project integrity", () => {
     expect(packageDocument.build.extraResources).toContainEqual({
       from: "licenses/imageio-ffmpeg-BSD-2-Clause.txt",
       to: "licenses/imageio-ffmpeg-BSD-2-Clause.txt"
+    });
+    expect(packageDocument.build.extraResources).toContainEqual({
+      from: "licenses/GPL-2.0.txt",
+      to: "licenses/GPL-2.0.txt"
     });
   });
 
@@ -130,6 +137,7 @@ describe("project integrity", () => {
     expect(renderer).not.toContain('type="range"');
     expect(renderer).not.toContain("Internal freedom");
     expect(renderer).not.toContain("curiosityDrive");
+    expect(renderer).not.toContain("crawlConcurrency");
     expect(renderer).toContain('imagination: "auto"');
     expect(renderer).toContain("Remove only changes this build list");
     expect(renderer).toContain("window.omni?.data.discardBuildResource");
@@ -161,6 +169,43 @@ describe("project integrity", () => {
     expect(controller).not.toContain("parseModelActions");
     expect(protocol).toContain("monotonically increasing");
     expect(protocol).toContain("never parsed into actions");
+  });
+
+  it("keeps working-memory, imagination, and dataset status evidence-bounded", () => {
+    const renderer = read("src/renderer/src/App.tsx");
+    const readme = read("README.md");
+    const audit = read("docs/COMPLETION_AUDIT.md");
+    const compliance = read("docs/ORIGINAL_REQUEST_COMPLIANCE.md");
+
+    expect(renderer).not.toContain("activity={0.82}");
+    expect(renderer).not.toContain("Everything outside learned parameters");
+    expect(renderer).not.toContain("Default response budget");
+    expect(renderer).not.toContain("Learned sources");
+    expect(renderer).toContain("Baseline response budget");
+    expect(renderer).toContain("adjusted per turn from neural state");
+    expect(renderer).toContain("Processing turn");
+    expect(renderer).toContain("Idle / ready");
+    expect(renderer).not.toContain("<i /> pondering");
+    expect(renderer).not.toContain("Following a quieter association");
+    expect(renderer).toContain('pondering ? "pondering"');
+    expect(renderer).toContain("Encoded source ledger");
+    expect(renderer).toContain("incomplete/resumable");
+    expect(renderer).toContain("Progressive imagination");
+    expect(readme).toContain(
+      "Compatible imported checkpoints retain their recorded context/model shape"
+    );
+    expect(readme).toContain(
+      "128, 256, 512, or 1,024 recurrent latent assembly slots"
+    );
+    expect(readme).toContain(
+      "Token context and latent assembly slots are separate"
+    );
+    expect(readme).toContain("neither frame-synchronous");
+    expect(compliance).toContain("committed deterministic manifest/source snapshot");
+    expect(compliance).toContain("traversal accounting does not claim");
+    expect(audit).not.toContain("passed 103 tests");
+    expect(audit).not.toContain("passed 106/106");
+    expect(audit).toContain("final merged commit");
   });
 
   it("keeps both Windows architectures in continuous packaging coverage", () => {

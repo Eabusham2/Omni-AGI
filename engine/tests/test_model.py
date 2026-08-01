@@ -60,7 +60,7 @@ class TernaryDecoderTests(unittest.TestCase):
             self.assertGreater(float(module.weight.grad.abs().sum()), 0.0)
 
     def test_attention_is_causal_and_finite(self):
-        config = OmniConfig.micro(dropout=0.0, parallel_thoughts=1)
+        config = OmniConfig.micro(dropout=0.0)
         model = OmniDecoder(config).eval()
         first = torch.tensor([[1, 10, 11, 12, 13]], dtype=torch.long)
         second = first.clone()
@@ -71,10 +71,14 @@ class TernaryDecoderTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(left).all())
         self.assertTrue(torch.allclose(left[:, :-1], right[:, :-1], atol=1e-6))
 
+    def test_global_workspace_latents_expand_past_the_old_fixed_ceiling(self):
+        config = OmniConfig.micro(working_memory_slots=512)
+        model = OmniDecoder(config)
+        self.assertEqual(model.global_workspace.latents.shape[0], 128)
+
     def test_tiny_ternary_decoder_can_overfit(self):
         config = OmniConfig.micro(
             dropout=0.0,
-            parallel_thoughts=1,
             learning_rate=0.01,
             max_seq_len=32,
         )
@@ -98,7 +102,6 @@ class TernaryDecoderTests(unittest.TestCase):
     def test_continuing_dialogue_training_strengthens_a_slang_response(self):
         config = OmniConfig.micro(
             dropout=0.0,
-            parallel_thoughts=1,
             learning_rate=0.01,
             max_seq_len=32,
         )

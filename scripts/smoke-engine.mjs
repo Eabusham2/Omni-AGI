@@ -109,8 +109,7 @@ try {
     hardwareTier: "micro",
     config: {
       name: "Packaged worker smoke",
-      hardwareTier: "micro",
-      parallelThoughts: 1
+      hardwareTier: "micro"
     }
   });
   if (created?.brainId !== "packaged-smoke-brain") {

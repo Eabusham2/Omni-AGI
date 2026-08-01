@@ -6,15 +6,20 @@ can safely parse one JSON response/notification per line.
 """
 
 import base64
+import copy
 import json
 import os
 import platform
 import shutil
 import sys
+import threading
+import time
 import traceback
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 WORKER_DIR = Path(__file__).resolve().parent
@@ -25,10 +30,13 @@ import torch
 
 from omni_core import AdaptiveBrain, OmniConfig, __version__
 from omni_core.evolution import NeuralEvolutionManager
+from omni_core.persistence import copy_substrate_snapshot
 
 
 PROTOCOL_VERSION = 1
 MAX_LINE_BYTES = 32 * 1024 * 1024
+INLINE_GENERATION_TTL_SECONDS = 5 * 60
+_STDOUT_LOCK = threading.Lock()
 
 
 class RpcFault(Exception):
@@ -39,11 +47,95 @@ class RpcFault(Exception):
         self.data = data
 
 
+class DeferredEventLog:
+    """Collect background events for main-thread SQLite commit.
+
+    sqlite3 connections are thread-affine by default. Inline imagination uses
+    an isolated neural snapshot and records its audit payload here; the worker
+    that owns the real brain commits the event only when the corresponding
+    typed tool job claims the generated artifact.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._events: List[Tuple[str, Dict[str, Any], Optional[str]]] = []
+
+    def append(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+        job_id: Optional[str] = None,
+    ) -> str:
+        with self._lock:
+            self._events.append(
+                (str(kind), copy.deepcopy(payload), str(job_id) if job_id else None)
+            )
+        return uuid.uuid4().hex
+
+    def take(self) -> List[Tuple[str, Dict[str, Any], Optional[str]]]:
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+        return events
+
+
+class IsolatedModalityDecoder:
+    """A private copy of exactly one selected modality generator."""
+
+    def __init__(self, modality: str, module: torch.nn.Module):
+        self.modality = modality
+        self.module = module
+        self.module.eval()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        modality: str,
+        idea: torch.Tensor,
+        seed: int = 0,
+        preview_callback: Optional[Callable[[float, torch.Tensor], None]] = None,
+    ) -> torch.Tensor:
+        if modality != self.modality:
+            raise ValueError("isolated modality snapshot does not match request")
+        generator = torch.Generator(device=idea.device)
+        generator.manual_seed(int(seed))
+        return self.module.generate(
+            idea,
+            generator,
+            preview_callback=preview_callback,
+        )
+
+
+@dataclass
+class InlineGeneration:
+    brain_id: str
+    action_id: str
+    stream_id: str
+    signature: str
+    staging_root: Path
+    events: DeferredEventLog
+    created_at: float = field(default_factory=time.monotonic)
+    first_preview: threading.Event = field(default_factory=threading.Event)
+    preview_emit_lock: threading.Lock = field(default_factory=threading.Lock)
+    future: Optional[Future] = None
+    job_id: str = ""
+    preview_revision: int = 0
+    latest_preview: Optional[Dict[str, Any]] = None
+    cancelled: bool = False
+
+
 class Worker:
     def __init__(self):
         self.brains: Dict[str, AdaptiveBrain] = {}
         self.cancelled_jobs = set()
         self.running = True
+        self._inline_lock = threading.RLock()
+        self._inline_generations: Dict[Tuple[str, str], InlineGeneration] = {}
+        self._inline_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="omni-inline-imagination",
+        )
+        self._inline_executor_closed = False
         self.methods: Dict[str, Callable[[Dict[str, Any], Optional[str]], Any]] = {
             "health": self.health,
             "create": self.create,
@@ -52,6 +144,7 @@ class Worker:
             "unload": self.unload,
             "restore_snapshot": self.restore_snapshot,
             "update_config": self.update_config,
+            "preview_overlay": self.preview_overlay,
             "merge_overlay": self.merge_overlay,
             "install_modality_pack": self.install_modality_pack,
             "list": self.list_brains,
@@ -105,8 +198,12 @@ class Worker:
             separators=(",", ":"),
             allow_nan=False,
         )
-        sys.stdout.write(serialized + "\n")
-        sys.stdout.flush()
+        # Chat tokens and background media previews can be emitted by separate
+        # threads. Keep each protocol line atomic so Electron never receives
+        # interleaved JSON fragments.
+        with _STDOUT_LOCK:
+            sys.stdout.write(serialized + "\n")
+            sys.stdout.flush()
 
     def notify(
         self,
@@ -140,6 +237,375 @@ class Worker:
         self._send({"jsonrpc": "2.0", "method": "event", "params": params})
 
     @staticmethod
+    def _inline_request(value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        modality = str(value.get("modality", "")).strip().lower()
+        if modality not in {"image", "audio", "video"}:
+            return None
+        prompt = value.get("prompt", "")
+        if prompt is None:
+            prompt = ""
+        if not isinstance(prompt, str):
+            return None
+        prompt = prompt[:1_000_000]
+        raw_concepts = value.get("conceptIds", [])
+        if raw_concepts is None:
+            raw_concepts = []
+        if not isinstance(raw_concepts, (list, tuple)) or not all(
+            isinstance(item, str) for item in raw_concepts
+        ):
+            return None
+        raw_settings = value.get("settings", {})
+        if raw_settings is None:
+            raw_settings = {}
+        if not isinstance(raw_settings, dict):
+            return None
+        input_path = value.get("inputPath", "")
+        if input_path is None:
+            input_path = ""
+        if not isinstance(input_path, str):
+            return None
+        seed = value.get("seed")
+        if seed is not None and (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or abs(seed) > 9_007_199_254_740_991
+        ):
+            return None
+        return {
+            "modality": modality,
+            "prompt": prompt,
+            "conceptIds": list(raw_concepts),
+            "inputPath": input_path,
+            "settings": copy.deepcopy(raw_settings),
+            "seed": seed,
+        }
+
+    @classmethod
+    def _inline_signature(cls, value: Dict[str, Any]) -> str:
+        normalized = cls._inline_request(value)
+        if normalized is None:
+            return ""
+        try:
+            return json.dumps(
+                normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _valid_inline_action_id(value: Any) -> str:
+        action_id = str(value or "").strip().lower()
+        if len(action_id) != 32:
+            return ""
+        if any(character not in "0123456789abcdef" for character in action_id):
+            return ""
+        return action_id
+
+    @staticmethod
+    def _clear_inline_staging(engine_path: Path) -> None:
+        staging = Path(engine_path) / ".inline-imagination"
+        if staging.is_symlink() or staging.is_file():
+            staging.unlink(missing_ok=True)
+        elif staging.is_dir():
+            shutil.rmtree(staging)
+
+    @staticmethod
+    def _remove_inline_root(record: InlineGeneration) -> None:
+        root = record.staging_root
+        try:
+            if root.is_symlink() or root.is_file():
+                root.unlink(missing_ok=True)
+            elif root.is_dir():
+                shutil.rmtree(root)
+            if root.parent.name == ".inline-imagination":
+                root.parent.rmdir()
+        except OSError:
+            # This is a disposable, app-owned staging cache. A later worker
+            # start retries exact-directory cleanup before loading the brain.
+            pass
+
+    def _cleanup_expired_inline_generations(self) -> None:
+        cutoff = time.monotonic() - INLINE_GENERATION_TTL_SECONDS
+        expired: List[InlineGeneration] = []
+        with self._inline_lock:
+            for key, record in list(self._inline_generations.items()):
+                if record.created_at > cutoff:
+                    continue
+                record.cancelled = True
+                if record.future is not None:
+                    record.future.cancel()
+                expired.append(record)
+                self._inline_generations.pop(key, None)
+        for record in expired:
+            if record.future is None or record.future.done():
+                self._remove_inline_root(record)
+
+    def _shutdown_inline_generations(self) -> None:
+        if self._inline_executor_closed:
+            return
+        with self._inline_lock:
+            records = list(self._inline_generations.values())
+            for record in records:
+                record.cancelled = True
+                if record.future is not None:
+                    record.future.cancel()
+        self._inline_executor.shutdown(wait=True, cancel_futures=True)
+        self._inline_executor_closed = True
+        for record in records:
+            self._remove_inline_root(record)
+        with self._inline_lock:
+            self._inline_generations.clear()
+
+    def _discard_inline_generations(self, brain_id: str) -> None:
+        records: List[InlineGeneration] = []
+        with self._inline_lock:
+            for key, record in list(self._inline_generations.items()):
+                if record.brain_id != brain_id:
+                    continue
+                record.cancelled = True
+                if record.future is not None:
+                    record.future.cancel()
+                records.append(record)
+                self._inline_generations.pop(key, None)
+        for record in records:
+            if record.future is not None:
+                try:
+                    record.future.result()
+                except Exception:
+                    pass
+            self._remove_inline_root(record)
+
+    def _start_inline_generation(
+        self,
+        brain: AdaptiveBrain,
+        action_id: str,
+        stream_id: str,
+        action: Dict[str, Any],
+        emit_preview: Callable[[InlineGeneration, Dict[str, Any]], None],
+    ) -> Optional[InlineGeneration]:
+        if self._inline_executor_closed:
+            return None
+        action_id = self._valid_inline_action_id(action_id)
+        arguments = action.get("arguments")
+        if (
+            not action_id
+            or action.get("kind") != "imagine"
+            or action.get("toolId") != "modality.imagine"
+            or action.get("action") != "generate"
+            or not isinstance(arguments, dict)
+        ):
+            return None
+        request = self._inline_request(arguments)
+        signature = self._inline_signature(arguments)
+        if request is None or not signature:
+            return None
+        key = (brain.brain_id, action_id)
+        with self._inline_lock:
+            existing = self._inline_generations.get(key)
+            if existing is not None:
+                return existing
+
+        # Capture the idea and a private copy of the modality parameters on the
+        # chat thread. Subsequent slow-weight learning may safely continue on
+        # the authoritative brain while the snapshot decodes in parallel.
+        staging_root = (
+            brain.engine_path / ".inline-imagination" / action_id
+        ).resolve()
+        staging_parent = (brain.engine_path / ".inline-imagination").resolve()
+        try:
+            staging_root.relative_to(staging_parent)
+            staging_root.mkdir(parents=True, exist_ok=False)
+            with torch.no_grad():
+                idea = brain._modality_idea(
+                    request["prompt"], request["conceptIds"]
+                ).detach().clone()
+                modality_snapshot = IsolatedModalityDecoder(
+                    request["modality"],
+                    copy.deepcopy(
+                        getattr(brain.modalities, request["modality"])
+                    ),
+                )
+        except Exception:
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
+            return None
+
+        deferred_events = DeferredEventLog()
+        snapshot = copy.copy(brain)
+        snapshot.modalities = modality_snapshot
+        snapshot.events = deferred_events
+        snapshot.engine_path = staging_root
+        snapshot.counters = dict(brain.counters)
+        snapshot.modality_training = dict(brain.modality_training)
+        snapshot.installed_modality_packs = copy.deepcopy(
+            brain.installed_modality_packs
+        )
+        snapshot._modality_idea = (
+            lambda _prompt="", _concept_ids=None: idea.detach().clone()
+        )
+        record = InlineGeneration(
+            brain_id=brain.brain_id,
+            action_id=action_id,
+            stream_id=stream_id,
+            signature=signature,
+            staging_root=staging_root,
+            events=deferred_events,
+        )
+
+        def preview(
+            generation_progress: float,
+            mime_type: str,
+            payload: bytes,
+        ) -> None:
+            bounded_progress = 0.2 + 0.75 * max(
+                0.0, min(float(generation_progress), 1.0)
+            )
+            preview_value: Dict[str, Any] = {
+                "progress": bounded_progress,
+                "statusLabel": "Decoding the current neural latent",
+                "mimeType": str(mime_type),
+            }
+            if len(payload) <= 12 * 1024 * 1024:
+                preview_value["dataUrl"] = (
+                    "data:%s;base64,%s"
+                    % (
+                        mime_type,
+                        base64.b64encode(payload).decode("ascii"),
+                    )
+                )
+            # Serialize job binding/replay with new revisions. This preserves
+            # monotonic previews when the queued tool request claims a decode
+            # at the exact moment a new frame/sample is emitted.
+            with record.preview_emit_lock:
+                with self._inline_lock:
+                    if record.cancelled:
+                        return
+                    revision = record.preview_revision
+                    record.preview_revision += 1
+                    preview_value["revision"] = revision
+                    record.latest_preview = copy.deepcopy(preview_value)
+                emit_preview(record, preview_value)
+                record.first_preview.set()
+
+        def generate() -> Dict[str, Any]:
+            try:
+                result = snapshot.generate_modality(
+                    modality=request["modality"],
+                    prompt=request["prompt"],
+                    concept_ids=request["conceptIds"],
+                    input_path=request["inputPath"],
+                    settings=request["settings"],
+                    seed=request["seed"],
+                    preview_callback=preview,
+                )
+                with self._inline_lock:
+                    cancelled = record.cancelled
+                if cancelled:
+                    self._remove_inline_root(record)
+                    raise RuntimeError("inline imagination was cancelled")
+                return result
+            except Exception:
+                self._remove_inline_root(record)
+                raise
+
+        with self._inline_lock:
+            self._inline_generations[key] = record
+        try:
+            record.future = self._inline_executor.submit(generate)
+        except Exception:
+            with self._inline_lock:
+                self._inline_generations.pop(key, None)
+            self._remove_inline_root(record)
+            return None
+        return record
+
+    def _claim_inline_generation(
+        self,
+        brain: AdaptiveBrain,
+        params: Dict[str, Any],
+        job_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        action_id = self._valid_inline_action_id(params.get("neuralActionId"))
+        signature = self._inline_signature(params)
+        if not action_id or not signature:
+            return None
+        key = (brain.brain_id, action_id)
+        with self._inline_lock:
+            record = self._inline_generations.get(key)
+        if record is None:
+            return None
+        with record.preview_emit_lock:
+            with self._inline_lock:
+                if record.signature != signature or record.cancelled:
+                    return None
+                record.job_id = job_id
+                latest_preview = copy.deepcopy(record.latest_preview)
+                future = record.future
+            if latest_preview is not None:
+                self.notify(
+                    "modality-preview",
+                    brain_id=brain.brain_id,
+                    job_id=job_id,
+                    action_id=action_id,
+                    sequence=int(latest_preview.get("revision", 0)),
+                    progress=float(latest_preview.get("progress", 0.0)),
+                    message=str(latest_preview.get("statusLabel", "")),
+                    data={"preview": latest_preview},
+                )
+        if future is None:
+            return None
+
+        try:
+            result = dict(future.result())
+            if job_id and job_id in self.cancelled_jobs:
+                raise RpcFault(-32800, "job was cancelled")
+            raw_path = result.get("path")
+            if not isinstance(raw_path, str) or not raw_path:
+                raise RuntimeError("inline imagination produced no artifact path")
+            source = Path(raw_path).resolve()
+            artifact_root = (record.staging_root / "artifacts").resolve()
+            try:
+                source.relative_to(artifact_root)
+            except ValueError as error:
+                raise RuntimeError(
+                    "inline imagination artifact escaped its staging area"
+                ) from error
+            if not source.is_file():
+                raise RuntimeError("inline imagination artifact is missing")
+            destination_root = (brain.engine_path / "artifacts").resolve()
+            destination_root.mkdir(parents=True, exist_ok=True)
+            destination = destination_root / source.name
+            while destination.exists():
+                destination = destination_root / (
+                    uuid.uuid4().hex + source.suffix.lower()
+                )
+            os.replace(str(source), str(destination))
+            result["path"] = str(destination)
+            result["neuralActionId"] = action_id
+            result["generatedDuringChat"] = True
+
+            for kind, payload, deferred_job_id in record.events.take():
+                committed = dict(payload)
+                if committed.get("outputPath") == raw_path:
+                    committed["outputPath"] = str(destination)
+                committed["neuralActionId"] = action_id
+                committed["generatedDuringChat"] = True
+                brain.events.append(
+                    kind,
+                    committed,
+                    job_id=job_id or deferred_job_id,
+                )
+            return result
+        finally:
+            with self._inline_lock:
+                self._inline_generations.pop(key, None)
+            self._remove_inline_root(record)
+
+    @staticmethod
     def _brain_id(params: Dict[str, Any], required: bool = True) -> str:
         value = params.get("brainId") or params.get("brain_id")
         if value is None and required:
@@ -163,6 +629,10 @@ class Worker:
                     "brainId is already loaded from a different storagePath",
                 )
             return existing
+        # A hard process interruption can leave only disposable inline media
+        # staging behind. It is never an authoritative brain artifact and is
+        # removed before the persistent checkpoint is opened again.
+        self._clear_inline_staging(storage / "engine")
         if (storage / "engine" / "brain.json").exists():
             brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
         else:
@@ -242,6 +712,8 @@ class Worker:
     def create(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain_id = self._brain_id(params, required=False) or uuid.uuid4().hex
         storage = self._storage(params, brain_id)
+        self._discard_inline_generations(brain_id)
+        self._clear_inline_staging(storage / "engine")
         raw_config = params.get("config") or {}
         if not isinstance(raw_config, dict):
             raise RpcFault(-32602, "params.config must be an object")
@@ -268,9 +740,11 @@ class Worker:
     def reload(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
         brain_id = self._brain_id(params)
+        self._discard_inline_generations(brain_id)
         previous = self.brains.pop(brain_id, None)
         if previous is not None:
             previous.events.close()
+        self._clear_inline_staging(self._storage(params, brain_id) / "engine")
         brain = AdaptiveBrain.load(
             self._storage(params, brain_id), expected_brain_id=brain_id
         )
@@ -280,6 +754,7 @@ class Worker:
     def unload(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
         brain_id = self._brain_id(params)
+        self._discard_inline_generations(brain_id)
         previous = self.brains.pop(brain_id, None)
         if previous is not None:
             previous.events.close()
@@ -309,15 +784,24 @@ class Worker:
                 if not source.is_file():
                     raise RpcFault(-32602, "snapshot is missing %s" % filename)
             engine = storage / "engine"
-            for filename in (
-                "core.safetensors",
-                "plasticity.safetensors",
-                "brain.json",
-            ):
+            try:
+                # Validate and materialize every blob referenced by the
+                # immutable shard graph before brain.json can commit it.
+                copy_substrate_snapshot(snapshot, engine)
+            except (OSError, ValueError) as error:
+                raise RpcFault(
+                    -32602,
+                    "snapshot neural substrate failed validation: %s" % error,
+                ) from error
+            for filename in ("core.safetensors", "plasticity.safetensors"):
                 source = snapshot / filename
                 temporary = engine / (filename + ".restore.tmp")
                 shutil.copy2(str(source), str(temporary))
                 os.replace(str(temporary), str(engine / filename))
+            source = snapshot / "brain.json"
+            temporary = engine / "brain.json.restore.tmp"
+            shutil.copy2(str(source), str(temporary))
+            os.replace(str(temporary), str(engine / "brain.json"))
         restored = self.reload(params, request_id)
         brain = self.brains[brain_id]
         brain.export_packed_ternary()
@@ -353,7 +837,39 @@ class Worker:
         }
         target = self._get(target_params)
         source = self._get(source_params)
-        return target.merge_overlay(source)
+        expected_digest = str(params.get("expectedPreviewDigest", ""))
+        if not expected_digest:
+            raise RpcFault(
+                -32602, "params.expectedPreviewDigest is required"
+            )
+        try:
+            return target.merge_overlay(source, expected_digest)
+        except ValueError as error:
+            raise RpcFault(-32009, str(error)) from error
+
+    def preview_overlay(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        target_id = str(params.get("targetBrainId", ""))
+        source_id = str(params.get("sourceBrainId", ""))
+        if not target_id or not source_id:
+            raise RpcFault(
+                -32602, "targetBrainId and sourceBrainId are required"
+            )
+        target = self._get(
+            {
+                "brainId": target_id,
+                "storagePath": params.get("targetStoragePath"),
+            }
+        )
+        source = self._get(
+            {
+                "brainId": source_id,
+                "storagePath": params.get("sourceStoragePath"),
+            }
+        )
+        return target.preview_overlay(source)
 
     def install_modality_pack(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -524,43 +1040,121 @@ class Worker:
         ):
             raise RpcFault(-32602, "params.streamId is invalid")
         sequence = 0
+        sequence_lock = threading.Lock()
+        inline_records: List[InlineGeneration] = []
+        imagination_grant = next(
+            (
+                str(schema.get("grant", "ask")).strip().lower()
+                for schema in tool_schemas
+                if schema.get("id") == "modality.imagine"
+                and "generate" in schema.get("actions", [])
+            ),
+            "off",
+        )
 
         def stream(kind: str, payload: Dict[str, Any]) -> None:
             nonlocal sequence
             if not stream_id:
                 return
-            if kind == "token":
-                self.notify(
-                    "chat-token",
-                    brain_id=brain.brain_id,
-                    stream_id=stream_id,
-                    sequence=sequence,
-                    data={"delta": str(payload.get("delta", ""))},
-                )
-            elif kind == "action":
-                self.notify(
-                    "chat-action",
-                    brain_id=brain.brain_id,
-                    stream_id=stream_id,
-                    sequence=sequence,
-                    action_id=str(payload.get("actionId", "")),
-                    data={"action": payload.get("action")},
-                )
-            else:
-                raise RuntimeError("unsupported neural chat stream event")
-            sequence += 1
+            action: Optional[Dict[str, Any]] = None
+            action_id = ""
+            with sequence_lock:
+                if kind == "token":
+                    self.notify(
+                        "chat-token",
+                        brain_id=brain.brain_id,
+                        stream_id=stream_id,
+                        sequence=sequence,
+                        data={"delta": str(payload.get("delta", ""))},
+                    )
+                elif kind == "action":
+                    raw_action = payload.get("action")
+                    action = raw_action if isinstance(raw_action, dict) else None
+                    action_id = str(payload.get("actionId", ""))
+                    self.notify(
+                        "chat-action",
+                        brain_id=brain.brain_id,
+                        stream_id=stream_id,
+                        sequence=sequence,
+                        action_id=action_id,
+                        data={"action": action},
+                    )
+                elif kind == "preview":
+                    preview_value = payload.get("preview")
+                    if not isinstance(preview_value, dict):
+                        raise RuntimeError("neural modality preview is invalid")
+                    self.notify(
+                        "modality-preview",
+                        brain_id=brain.brain_id,
+                        job_id=str(payload.get("jobId", "")),
+                        stream_id=stream_id,
+                        sequence=sequence,
+                        action_id=str(payload.get("actionId", "")),
+                        progress=float(preview_value.get("progress", 0.0)),
+                        message=str(preview_value.get("statusLabel", "")),
+                        data={"preview": preview_value},
+                    )
+                else:
+                    raise RuntimeError("unsupported neural chat stream event")
+                sequence += 1
 
-        result = brain.chat(
-            value,
-            max_new_tokens=int(params.get("maxNewTokens", 48)),
-            seed=(
-                int(params["seed"])
-                if params.get("seed") is not None
-                else None
-            ),
-            tool_schemas=tool_schemas,
-            stream_callback=stream if stream_id else None,
-        )
+            # The permission-bearing capability schema is authoritative. Ask
+            # and Off actions must not begin work before the trusted Electron
+            # permission controller approves them.
+            if (
+                kind == "action"
+                and action is not None
+                and imagination_grant in {"auto", "full"}
+            ):
+                record = self._start_inline_generation(
+                    brain,
+                    action_id,
+                    stream_id,
+                    action,
+                    lambda current, preview: stream(
+                        "preview",
+                        {
+                            "actionId": current.action_id,
+                            "jobId": current.job_id,
+                            "preview": preview,
+                        },
+                    ),
+                )
+                if record is not None and record not in inline_records:
+                    inline_records.append(record)
+
+        try:
+            result = brain.chat(
+                value,
+                max_new_tokens=(
+                    int(params["maxNewTokens"])
+                    if params.get("maxNewTokens") is not None
+                    else None
+                ),
+                seed=(
+                    int(params["seed"])
+                    if params.get("seed") is not None
+                    else None
+                ),
+                tool_schemas=tool_schemas,
+                stream_callback=stream if stream_id else None,
+            )
+        except Exception:
+            for record in inline_records:
+                with self._inline_lock:
+                    record.cancelled = True
+                    if record.future is not None:
+                        record.future.cancel()
+            raise
+
+        # A streamed Auto/Full imagination action always publishes at least one
+        # real decoder preview before the chat RPC resolves. Longer generation
+        # continues concurrently and becomes the same typed tool job/artifact.
+        for record in inline_records:
+            while not record.first_preview.wait(timeout=0.05):
+                future = record.future
+                if future is None or future.done():
+                    break
         self.notify(
             "brain-mutated",
             brain_id=brain.brain_id,
@@ -662,6 +1256,16 @@ class Worker:
         brain, job_id, progress = self._job(
             params, request_id, "modality-generation"
         )
+        inline_result = self._claim_inline_generation(brain, params, job_id)
+        if inline_result is not None:
+            progress(0.98, "Committing the imagination formed during chat")
+            self._job_complete(
+                brain,
+                job_id,
+                "modality-generation",
+                inline_result,
+            )
+            return inline_result
         progress(0.2, "Activating internal idea vectors")
         preview_revision = 0
 
@@ -885,16 +1489,37 @@ class Worker:
         if not job_id:
             raise RpcFault(-32602, "params.jobId is required")
         self.cancelled_jobs.add(job_id)
-        return {"jobId": job_id, "cancelled": True}
+        inline_cancelled = 0
+        cleanup: List[InlineGeneration] = []
+        with self._inline_lock:
+            for key, record in list(self._inline_generations.items()):
+                if record.job_id != job_id:
+                    continue
+                record.cancelled = True
+                if record.future is not None:
+                    record.future.cancel()
+                self._inline_generations.pop(key, None)
+                cleanup.append(record)
+                inline_cancelled += 1
+        for record in cleanup:
+            if record.future is None or record.future.done():
+                self._remove_inline_root(record)
+        return {
+            "jobId": job_id,
+            "cancelled": True,
+            "inlineGenerationsCancelled": inline_cancelled,
+        }
 
     def shutdown(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
         del params, request_id
         self.running = False
+        self._shutdown_inline_generations()
         return {"stopping": True}
 
     def dispatch(self, request: Any) -> Optional[Dict[str, Any]]:
+        self._cleanup_expired_inline_generations()
         if not isinstance(request, dict):
             raise RpcFault(-32600, "request must be a JSON object")
         if request.get("jsonrpc") != "2.0":
@@ -990,6 +1615,7 @@ def main() -> int:
             brain.events.close()
         except Exception:
             pass
+    worker._shutdown_inline_generations()
     return 0
 
 

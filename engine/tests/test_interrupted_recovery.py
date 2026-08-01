@@ -25,7 +25,6 @@ class InterruptedCandidateRecoveryTests(unittest.TestCase):
         )
         self.root = Path(self.temporary.name) / "brain"
         config = OmniConfig.micro(
-            parallel_thoughts=1,
             max_seq_len=40,
             learn_from_own_messages=False,
         )

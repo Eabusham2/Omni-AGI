@@ -148,24 +148,6 @@ const api: OmniApi = {
       invoke(IPC.catalog.installModalityPackFile, brainId),
     listModalityPacks: (brainId) => invoke(IPC.catalog.listModalityPacks, brainId),
     hardwareProfile: () => invoke(IPC.catalog.hardwareProfile)
-  },
-
-  app: windowApi,
-  brains: {
-    list: () => invoke(IPC.brain.list),
-    get: (id) => invoke(IPC.brain.get, id),
-    create: (request) => invoke(IPC.brain.create, request),
-    updateConfig: (id, config) => invoke(IPC.brain.update, id, config),
-    chat: (id, input) => invoke(IPC.chat.send, id, input),
-    feedback: (request) => invoke(IPC.chat.feedback, request),
-    consolidate: (id) => invoke(IPC.train.consolidate, id),
-    fork: (id, name) => invoke(IPC.brain.fork, id, name),
-    remove: (id) => invoke(IPC.brain.remove, id),
-    export: (id) => invoke(IPC.brain.export, id),
-    importFile: () => invoke(IPC.brain.importFile),
-    importUrl: (request) => invoke(IPC.catalog.importUrl, request),
-    ingestFiles: (id) => invoke(IPC.data.ingestFiles, { brainId: id }),
-    runtimeHealth: (id) => invoke(IPC.legacy.runtimeHealth, id)
   }
 };
 

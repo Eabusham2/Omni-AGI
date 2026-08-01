@@ -11,6 +11,7 @@ export interface IdleBrainRepository {
 
 export interface IdleActionController {
   idle(brainId: string, minimumIdleSeconds?: number): Promise<IdleCycleResult>;
+  isBusy?(brainId: string): boolean;
 }
 
 export interface IdleCognitionSchedulerOptions {
@@ -71,6 +72,7 @@ export class IdleCognitionScheduler {
         const summary = brains[index]!;
         const brain = await this.repository.get(summary.id);
         if (!brain.config.idleCognition) continue;
+        if (this.actions.isBusy?.(brain.id) === true) continue;
         this.cursor = (index + 1) % brains.length;
         return await this.actions.idle(
           brain.id,

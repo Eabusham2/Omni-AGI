@@ -10,6 +10,7 @@ import { ToolExecutor } from "./toolExecutor";
 import { ChatActionController } from "./chatActionController";
 import { EvolutionController } from "./evolutionController";
 import { IdleCognitionScheduler } from "./idleCognitionScheduler";
+import { ElectronSourceRuntimeLifecycle } from "./sourceRuntimeLifecycle";
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const developmentRendererUrl = process.env.ELECTRON_RENDERER_URL;
@@ -246,7 +247,12 @@ async function bootstrap(): Promise<void> {
   });
   const service = new BrainService(repository, engine);
   const jobs = new RuntimeJobManager(service, engine);
-  const tools = new ToolExecutor(service, jobs);
+  const sourceRuntime = new ElectronSourceRuntimeLifecycle({
+    app,
+    userDataPath: app.getPath("userData"),
+    resourcesPath: process.resourcesPath
+  });
+  const tools = new ToolExecutor(service, jobs, sourceRuntime);
   const evolution = new EvolutionController(repository, tools, engine);
   const actions = new ChatActionController(service, tools, evolution);
   idleCognition = new IdleCognitionScheduler(repository, actions, {

@@ -66,7 +66,6 @@ class ReleaseGateTests(unittest.TestCase):
     def make_brain(self, brain_id: str, **overrides) -> AdaptiveBrain:
         config = OmniConfig.micro(
             name=brain_id,
-            parallel_thoughts=1,
             max_seq_len=40,
             learn_from_own_messages=False,
             **overrides,
@@ -130,10 +129,14 @@ class ReleaseGateTests(unittest.TestCase):
         )
         before = brain.parameter_checksum()
         try:
-            result = brain.ingest(path=str(gif), kind="video", policy="encode")
+            # Native file/crawler classification presents GIF as an image. The
+            # neural worker must discover temporal frames and reroute it.
+            result = brain.ingest(path=str(gif), kind="image", policy="encode")
         finally:
             hook.remove()
         self.assertTrue(result["source"]["modality_trained"])
+        self.assertEqual(result["source"]["kind"], "video")
+        self.assertEqual(result["coverage"]["modalityCounts"], {"video": 1})
         self.assertFalse(result["warnings"])
         self.assertNotEqual(before, result["parameterChecksumAfter"])
         self.assertEqual(result["mediaCoverage"]["processedFrames"], 3)
@@ -146,6 +149,26 @@ class ReleaseGateTests(unittest.TestCase):
         tail_window = observed[-1]
         self.assertTrue(torch.equal(tail_window[:, :, 0], tail_window[:, :, 1]))
         self.assertGreater(float(tail_window[:, 2].mean()), 0.7)
+        brain.events.close()
+
+    def test_real_static_gif_remains_in_the_image_learning_path(self):
+        brain = self.make_brain("static-gif-brain")
+        gif = self.root / "still.gif"
+        Image.new("RGB", (10, 10), (80, 120, 220)).save(gif, format="GIF")
+        observed = []
+        hook = brain.modalities.image.register_forward_pre_hook(
+            lambda _module, inputs: observed.append(
+                inputs[0].detach().cpu().clone()
+            )
+        )
+        try:
+            result = brain.ingest(path=str(gif), kind="image", policy="encode")
+        finally:
+            hook.remove()
+        self.assertTrue(result["source"]["modality_trained"])
+        self.assertEqual(result["source"]["kind"], "image")
+        self.assertEqual(result["coverage"]["modalityCounts"], {"image": 1})
+        self.assertGreater(len(observed), 0)
         brain.events.close()
 
     @unittest.skipUnless(
@@ -234,8 +257,6 @@ class ReleaseGateTests(unittest.TestCase):
     def test_expert_growth_is_persisted_and_reloadable(self):
         brain = self.make_brain(
             "growth-brain",
-            growth_policy="elastic",
-            max_experts=2,
             growth_novelty_threshold=0.0,
             growth_patience=1,
         )

@@ -342,8 +342,15 @@ export interface WorkspaceSnapshot {
   queriedAt: string;
   contextWindow: {
     capacityTokens: number;
+    /** Baseline output budget; the live action state may adjust it per turn. */
+    generationBudgetTokens?: number;
+    capacityPolicy?: "hardware-derived-resource-guarded";
+    expandable?: boolean;
     tokenCount: number;
     tokenHash: string;
+    recentTokenCount?: number;
+    recentTokenHash?: string;
+    evictions?: number;
     sensorySlots: number;
     extended: boolean;
     updatedAt: string;
@@ -574,8 +581,14 @@ export interface WebCrawlResult {
   startUrl: string;
   visited: number;
   skipped: number;
+  /** Recent diagnostic results; the complete receipt ledger remains in resultLog. */
   results: IngestResult[];
+  resultCount: number;
+  resultsTruncated: boolean;
+  resultLog: string;
   warnings: string[];
+  warningCount: number;
+  warningsTruncated: boolean;
   frontierRemaining: number;
   stopped: boolean;
   coverage: TrainingCoverage;
@@ -651,6 +664,9 @@ export interface ModalityGenerateRequest {
   conceptIds?: string[];
   inputPath?: string;
   settings?: Record<string, number | string | boolean>;
+  /** Worker-issued correlation for media already decoding during chat. */
+  neuralActionId?: string;
+  seed?: number;
 }
 
 export interface TraceQuery {
@@ -733,10 +749,54 @@ export interface InstallModalityPackUrlRequest extends ImportUrlRequest {
   brainId: string;
 }
 
+export interface AgentMergeSubstratePreview {
+  schemaVersion: 1;
+  engineSchemaVersion: 1;
+  digest: string;
+  sourceStateSha256: string;
+  targetStateSha256: string;
+  sourceParameterSha256: string;
+  targetParameterSha256: string;
+  sourceConfigSha256: string;
+  targetConfigSha256: string;
+  sourceCounts: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+    replayExamples: number;
+  };
+  targetCounts: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+    replayExamples: number;
+  };
+  additions: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+    replayExamples: number;
+  };
+  duplicates: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+    replayExamples: number;
+  };
+  divergent: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+  };
+  weightsAveraged: false;
+}
+
 export interface AgentMergePreview {
   sourceBrainId: string;
   targetBrainId: string;
   reviewToken: string;
+  /** Authoritative worker state bound into reviewToken and rechecked at merge. */
+  substrate: AgentMergeSubstratePreview;
   newConcepts: number;
   newIdeas: number;
   newSynapses: number;
@@ -835,6 +895,8 @@ export interface StructuredAction {
 export interface ActionEvent {
   id: string;
   brainId: string;
+  /** Opaque worker correlation; never part of the model-facing arguments. */
+  neuralActionId?: string;
   action: StructuredAction;
   state:
     | "proposed"
@@ -1038,10 +1100,10 @@ export interface EvolutionStartRequest {
   recursive?: boolean;
   parentCandidateId?: string;
   /**
-   * Source remains the compatibility default. Neural and data candidates use
-   * isolated, worker-owned safe-tensor overlays. Stable v1 intentionally
-   * rejects architecture candidates because tensor-shape migration is not
-   * implemented.
+   * Edit-free requests default to a substrate overlay. Source candidates are
+   * accepted only with exact typed sourceEdits. Neural, data, substrate, and
+   * compatible expert-growth architecture candidates use isolated worker-owned
+   * safe-tensor overlays. Incompatible tensor-shape migration remains rejected.
    */
   candidateKind?: "source" | "neural" | "data" | "substrate" | "architecture";
   texts?: string[];
@@ -1186,34 +1248,6 @@ export interface OmniApi {
     listModalityPacks(brainId: string): Promise<InstalledModalityPack[]>;
     hardwareProfile(): Promise<HardwareProfile>;
   };
-
-  /** @deprecated Compatibility alias for the first renderer scaffold. */
-  app: {
-    minimize(): Promise<void>;
-    maximize(): Promise<void>;
-    close(): Promise<void>;
-    isMaximized(): Promise<boolean>;
-    openExternal(url: string): Promise<void>;
-    revealDataFolder(): Promise<void>;
-    platform(): Promise<string>;
-  };
-  /** @deprecated Compatibility alias for the first renderer scaffold. */
-  brains: {
-    list(): Promise<BrainSummary[]>;
-    get(id: string): Promise<BrainDocument>;
-    create(request: CreateBrainRequest): Promise<BrainDocument>;
-    updateConfig(id: string, config: BrainConfig): Promise<BrainDocument>;
-    chat(id: string, input: string): Promise<ChatResult>;
-    feedback(request: FeedbackRequest): Promise<BrainDocument>;
-    consolidate(id: string): Promise<BrainDocument>;
-    fork(id: string, name?: string): Promise<BrainDocument>;
-    remove(id: string): Promise<boolean>;
-    export(id: string): Promise<string | null>;
-    importFile(): Promise<BrainDocument | null>;
-    importUrl(request: ImportUrlRequest): Promise<BrainDocument>;
-    ingestFiles(id: string): Promise<IngestResult[]>;
-    runtimeHealth(id: string): Promise<RuntimeHealth>;
-  };
 }
 
 export const DEFAULT_CONFIG: BrainConfig = {
@@ -1227,7 +1261,7 @@ export const DEFAULT_CONFIG: BrainConfig = {
   recursiveImprovement: true,
   idleCognition: true,
 
-  workingMemorySlots: 24,
+  workingMemorySlots: 256,
   learningRate: 0.14,
   traceDetail: "standard",
 

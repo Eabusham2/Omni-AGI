@@ -41,6 +41,7 @@ from .persistence import (
     EventLog,
     atomic_save_tensors,
     atomic_write_json,
+    copy_substrate_snapshot,
     load_tensors,
     read_json,
     snapshot_files,
@@ -117,7 +118,6 @@ class AdaptiveBrain:
         config.stdp_plasticity = True
         config.liquid_dynamics = True
         config.vector_symbolic_memory = True
-        config.growth_policy = "unbounded"
         config.memory_injection = "working-memory"
         config.validate()
         self.brain_id = str(brain_id)
@@ -190,6 +190,11 @@ class AdaptiveBrain:
         self.liquid_state = torch.zeros(1, config.idea_dim, device=self.device)
         self.working_memory: List[torch.Tensor] = []
         self.workspace_items: List[Dict[str, Any]] = []
+        # Temporary multi-turn language-boundary state. Long-term facts remain
+        # authoritative only in the neural substrate and learned parameters;
+        # this bounded ring is the explicit token working memory shown in the
+        # Runtime Card.
+        self.recent_token_context: List[int] = []
         self.current_context: Dict[str, Any] = {
             "tokenCount": 0,
             "tokenHash": "",
@@ -212,6 +217,7 @@ class AdaptiveBrain:
             "metaplastic_updates": 0,
             "workspace_evictions": 0,
             "workspace_rehearsals": 0,
+            "context_token_evictions": 0,
             "idle_cognition_cycles": 0,
         }
         self.modality_training: Dict[str, int] = {
@@ -646,6 +652,7 @@ class AdaptiveBrain:
             "trainedParameterChecksum": self.parameter_checksum(),
             "corpusPassagesVisited": len(STARTER_CORPUS),
             "meanCorpusLoss": sum(losses) / max(1, len(losses)),
+            "corpusLossCurve": losses,
             "actionTraining": action_training,
             "modalityTraining": modality_training,
             "hiddenBehavioralPrompt": False,
@@ -683,11 +690,16 @@ class AdaptiveBrain:
                 "candidate stable checkpoint is incomplete: %s"
                 % ", ".join(missing)
             )
-        for filename in filenames:
+        for filename in ("core.safetensors", "plasticity.safetensors"):
             source = stable / filename
             temporary = engine_path / (filename + ".recovery.tmp")
             shutil.copy2(str(source), str(temporary))
             os.replace(str(temporary), str(engine_path / filename))
+        copy_substrate_snapshot(stable, engine_path)
+        source = stable / "brain.json"
+        temporary = engine_path / "brain.json.recovery.tmp"
+        shutil.copy2(str(source), str(temporary))
+        os.replace(str(temporary), str(engine_path / "brain.json"))
 
     @staticmethod
     def _recover_interrupted_candidates(engine_path: Path) -> List[Dict[str, Any]]:
@@ -826,10 +838,31 @@ class AdaptiveBrain:
         brain.current_context = dict(
             metadata.get("current_context", brain.current_context)
         )
-        brain.memory = NeuralSubstrate.from_state(
-            metadata.get("substrate", {}), plastic, prefix="substrate."
-        )
-        brain.memory.growth_guard = brain._allow_substrate_growth
+        stored_recent = metadata.get("recent_token_context", [])
+        if isinstance(stored_recent, list):
+            brain.recent_token_context = [
+                int(token)
+                for token in stored_recent[-brain.config.max_seq_len :]
+                if isinstance(token, int)
+                and 0 <= int(token) < brain.config.vocab_size
+            ]
+        substrate_metadata = metadata.get("substrate", {})
+        if isinstance(substrate_metadata, dict) and isinstance(
+            substrate_metadata.get("persistence"), dict
+        ):
+            brain.memory = NeuralSubstrate.load_sharded(
+                engine_path / "substrate",
+                substrate_metadata,
+                growth_guard=brain._allow_substrate_growth,
+            )
+        else:
+            # Backward-safe internal stable-v1 loading. The public beta format
+            # remains rejected above; early stable checkpoints stored these
+            # vectors in plasticity.safetensors.
+            brain.memory = NeuralSubstrate.from_state(
+                substrate_metadata, plastic, prefix="substrate."
+            )
+            brain.memory.growth_guard = brain._allow_substrate_growth
         replay = plastic.get("state.replay")
         if replay is not None:
             brain.replay = [row.detach().cpu() for row in replay]
@@ -892,11 +925,14 @@ class AdaptiveBrain:
         packed_path = engine_path / "packed-ternary"
         if (packed_path / "manifest.json").is_file():
             synapse_ids, dynamic_values = brain._dynamic_synapse_export()
-            del synapse_ids
+            dynamic_name = "substrate.dynamic_synapses.weights"
+            expected_synapse_order_hash = hashlib.sha256(
+                "\0".join(synapse_ids).encode("utf-8")
+            ).hexdigest()
             expected_specs = collect_module_ternary_tensors(
                 brain._ternary_export_roots(),
                 dynamic_synapses={
-                    "substrate.dynamic_synapses.weights": dynamic_values,
+                    dynamic_name: dynamic_values,
                 },
             )
             expected_names = [spec.name for spec in expected_specs]
@@ -907,7 +943,30 @@ class AdaptiveBrain:
             packed_parameter_checksum = str(
                 packed_metadata.get("parameterChecksum", "")
             )
-            if packed_parameter_checksum != brain.parameter_checksum():
+            packed_dynamic_values = verified_packed.tensors.get(dynamic_name)
+            packed_dynamic_count = packed_metadata.get("dynamicSynapseCount")
+            packed_dynamic_order_hash = packed_metadata.get(
+                "dynamicSynapseOrderSha256"
+            )
+            dynamic_pack_is_stale = (
+                isinstance(packed_dynamic_count, bool)
+                or not isinstance(packed_dynamic_count, int)
+                or packed_dynamic_count != len(synapse_ids)
+                or not isinstance(packed_dynamic_order_hash, str)
+                or packed_dynamic_order_hash != expected_synapse_order_hash
+                or packed_dynamic_values is None
+                or packed_dynamic_values.dtype != torch.int8
+                or tuple(packed_dynamic_values.shape)
+                != tuple(dynamic_values.shape)
+                or not torch.equal(
+                    packed_dynamic_values.detach().cpu(),
+                    dynamic_values.detach().cpu(),
+                )
+            )
+            if (
+                packed_parameter_checksum != brain.parameter_checksum()
+                or dynamic_pack_is_stale
+            ):
                 brain.export_packed_ternary()
             else:
                 verify_ternary_shards(
@@ -951,7 +1010,6 @@ class AdaptiveBrain:
 
     def _plastic_tensors(self) -> Dict[str, torch.Tensor]:
         tensors = _prefixed_state(self.router, "router.")
-        tensors.update(self.memory.tensor_state(prefix="substrate."))
         tensors["state.liquid"] = self.liquid_state.detach()
         if self.working_memory:
             tensors["state.working_memory"] = torch.stack(self.working_memory)
@@ -983,17 +1041,19 @@ class AdaptiveBrain:
             "traces": self.traces[-1000:],
             "training_sources": self.training_sources,
             "workspace_items": self.workspace_items,
+            "recent_token_context": self.recent_token_context,
             "current_context": self.current_context,
             "counters": self.counters,
             "modality_training": self.modality_training,
             "installed_modality_packs": self.installed_modality_packs,
             "starter_training_manifest": self.starter_training_manifest,
             "packed_ternary_manifest": self.packed_ternary_manifest,
-            "substrate": self.memory.metadata(),
+            "substrate": self.memory.metadata(include_records=False),
             "runtime_card": self.runtime_card(),
             "files": {
                 "core": "core.safetensors",
                 "plasticity": "plasticity.safetensors",
+                "substrate": "substrate/manifest.json",
                 "origin": "origin/",
                 "snapshots": "snapshots/",
                 "artifacts": "artifacts/",
@@ -1004,6 +1064,9 @@ class AdaptiveBrain:
     def save(self) -> None:
         self.updated_at = _iso_now()
         self.engine_path.mkdir(parents=True, exist_ok=True)
+        # The bounded, content-addressed substrate generation is complete
+        # before metadata can point at it. Unchanged shard blobs are reused.
+        self.memory.save_sharded(self.engine_path / "substrate")
         # Candidate tensors are fully written before metadata points at them.
         atomic_save_tensors(
             self.engine_path / "core.safetensors",
@@ -1546,6 +1609,96 @@ class AdaptiveBrain:
         weights = weights / weights.sum()
         return torch.tanh((recent * weights[:, None]).sum(dim=0, keepdim=True))
 
+    @staticmethod
+    def _token_sequence_hash(tokens: Sequence[int]) -> str:
+        return hashlib.sha256(
+            ",".join(str(int(value)) for value in tokens).encode("ascii")
+        ).hexdigest()
+
+    def _bounded_completed_turn_tokens(
+        self, human: str, brain: str
+    ) -> Tuple[List[int], int]:
+        """Encode one completed turn while preserving both role markers."""
+
+        human_tokens = self.tokenizer.encode(human)
+        brain_tokens = self.tokenizer.encode(brain)
+        capacity = max(3, int(self.config.max_seq_len))
+        payload_capacity = capacity - 3
+        removed = max(
+            0, len(human_tokens) + len(brain_tokens) - payload_capacity
+        )
+        if removed:
+            # Preserve recent material from both sides of the exchange. A
+            # brain response receives half the available bytes and the human
+            # side receives the remainder.
+            brain_budget = min(len(brain_tokens), payload_capacity // 2)
+            human_budget = min(
+                len(human_tokens), payload_capacity - brain_budget
+            )
+            unused = payload_capacity - human_budget - brain_budget
+            if unused and len(brain_tokens) > brain_budget:
+                add = min(unused, len(brain_tokens) - brain_budget)
+                brain_budget += add
+                unused -= add
+            if unused and len(human_tokens) > human_budget:
+                human_budget += min(unused, len(human_tokens) - human_budget)
+            human_tokens = human_tokens[-human_budget:] if human_budget else []
+            brain_tokens = brain_tokens[-brain_budget:] if brain_budget else []
+        return (
+            [self.tokenizer.human_id]
+            + human_tokens
+            + [self.tokenizer.brain_id]
+            + brain_tokens
+            + [self.tokenizer.eos_id],
+            removed,
+        )
+
+    def _append_recent_dialogue(self, human: str, brain: str) -> None:
+        turn, removed = self._bounded_completed_turn_tokens(human, brain)
+        combined = self.recent_token_context + turn
+        overflow = max(0, len(combined) - self.config.max_seq_len)
+        if overflow:
+            combined = combined[overflow:]
+            # Avoid retaining an unlabelled fragment of an evicted old turn.
+            try:
+                boundary = combined.index(self.tokenizer.human_id)
+            except ValueError:
+                boundary = 0
+            if boundary:
+                combined = combined[boundary:]
+                overflow += boundary
+        self.recent_token_context = combined
+        self.counters["context_token_evictions"] += removed + overflow
+
+    def _prompt_with_recent_context(
+        self, human: str
+    ) -> Tuple[List[int], List[int]]:
+        """Build a bounded prompt from explicit recent working context."""
+
+        capacity = max(3, int(self.config.max_seq_len))
+        human_payload = self.tokenizer.encode(human)
+        current_budget = capacity - 3
+        if len(human_payload) > current_budget:
+            human_payload = human_payload[-current_budget:]
+        current = (
+            [self.tokenizer.human_id]
+            + human_payload
+            + [self.tokenizer.brain_id]
+        )
+        history_budget = max(0, capacity - 1 - len(current))
+        history = self.recent_token_context[-history_budget:]
+        if history:
+            # Use only role-labelled history. When pressure cuts into the
+            # oldest retained turn, drop that fragment rather than presenting
+            # it as unlabelled hidden text.
+            role_boundaries = {
+                self.tokenizer.human_id,
+                self.tokenizer.brain_id,
+            }
+            while history and history[0] not in role_boundaries:
+                history = history[1:]
+        return [self.tokenizer.bos_id] + history + current, history
+
     def workspace_snapshot(self) -> Dict[str, Any]:
         items = [
             {
@@ -1563,11 +1716,21 @@ class AdaptiveBrain:
             "queriedAt": _iso_now(),
             "contextWindow": {
                 "capacityTokens": self.config.max_seq_len,
+                "generationBudgetTokens": (
+                    self.config.generation_token_budget()
+                ),
+                "capacityPolicy": "hardware-derived-resource-guarded",
+                "expandable": True,
                 "extended": self.config.extended_working_memory,
                 "tokenCount": max(
                     0, int(self.current_context.get("tokenCount", 0))
                 ),
                 "tokenHash": str(self.current_context.get("tokenHash", "")),
+                "recentTokenCount": len(self.recent_token_context),
+                "recentTokenHash": self._token_sequence_hash(
+                    self.recent_token_context
+                ),
+                "evictions": self.counters["context_token_evictions"],
                 "sensorySlots": max(
                     0, int(self.current_context.get("sensorySlots", 0))
                 ),
@@ -2890,6 +3053,7 @@ class AdaptiveBrain:
                             "organic": True,
                         }
                     )
+                    self._append_recent_dialogue("", message)
         mode = (
             "ponder"
             if organic["tension"] >= max(0.5, organic["curiosity"])
@@ -3129,6 +3293,178 @@ class AdaptiveBrain:
                 return value[:8 * 1024 * 1024]
         return None
 
+    @classmethod
+    def _explicit_powershell_arguments(
+        cls, text: str
+    ) -> Optional[Dict[str, str]]:
+        """Read a user-delimited command and working directory verbatim.
+
+        A PowerShell proposal is intentionally impossible from vague prose.
+        Both the command and an absolute, explicitly labelled cwd must occur
+        in the user's current message; generated text is never consulted.
+        """
+
+        if not re.search(r"\b(?:powershell|pwsh)\b", text, re.IGNORECASE):
+            return None
+        fenced = re.search(
+            r"\b(?:powershell|pwsh)(?:\s+command)?\s*(?:is\s*)?[:=]?\s*"
+            r"```(?:powershell|pwsh)?\s*\n(?P<command>[\s\S]*?)```",
+            text,
+            re.IGNORECASE,
+        )
+        quoted = re.search(
+            r"\b(?:run|execute)\s+(?:this\s+)?(?:powershell|pwsh)"
+            r"(?:\s+command)?\s*(?:is\s*)?[:=]?\s*"
+            r"(?P<quote>[\"'`])(?P<command>[\s\S]*?)(?P=quote)",
+            text,
+            re.IGNORECASE,
+        )
+        command_match = fenced or quoted
+        if command_match is None:
+            return None
+        command = command_match.group("command").replace("\x00", "").strip()
+        if not command or len(command) > 100_000:
+            return None
+
+        cwd_quoted = re.search(
+            r"\b(?:cwd|working\s+directory)\s*(?:is\s*)?(?:[:=]|to)?\s*"
+            r"(?P<quote>[\"'`])(?P<cwd>[\s\S]*?)(?P=quote)",
+            text,
+            re.IGNORECASE,
+        )
+        cwd_plain = re.search(
+            r"\b(?:cwd|working\s+directory)\s*(?:is\s*)?(?:[:=]|to)?\s*"
+            r"(?P<cwd>(?:[A-Za-z]:[\\/]|\\\\|/)[^\s<>\"'`]+)",
+            text,
+            re.IGNORECASE,
+        )
+        cwd_match = cwd_quoted or cwd_plain
+        if cwd_match is None:
+            return None
+        cwd_value = cwd_match.group("cwd").replace("\x00", "").strip()
+        cwd_paths = cls._explicit_absolute_paths(cwd_value)
+        if len(cwd_paths) != 1:
+            return None
+        return {"command": command, "cwd": cwd_paths[0]}
+
+    @staticmethod
+    def _explicit_browser_steps(
+        text: str,
+        initial_url: str,
+    ) -> List[Dict[str, Any]]:
+        """Encode only literal browser steps present in the user's message."""
+
+        positioned: List[Tuple[int, Dict[str, Any]]] = []
+
+        def quoted_value(match: re.Match[str], name: str) -> Optional[str]:
+            value = match.group(name).replace("\x00", "").strip()
+            if not value or "\r" in value or "\n" in value:
+                return None
+            return value
+
+        for match in re.finditer(
+            r"\bnavigate\s+(?:to\s+)?(?P<url>https://[^\s<>\"'`]+)",
+            text,
+            re.IGNORECASE,
+        ):
+            url = match.group("url").rstrip(".,;!?)]}")
+            if url != initial_url and url in AdaptiveBrain._explicit_https_urls(url):
+                positioned.append((match.start(), {"kind": "navigate", "url": url}))
+
+        for match in re.finditer(
+            r"\bclick(?:\s+on)?\s+(?P<quote>[\"'`])"
+            r"(?P<selector>.*?)(?P=quote)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            selector = quoted_value(match, "selector")
+            if selector and len(selector) <= 2_000:
+                positioned.append(
+                    (match.start(), {"kind": "click", "selector": selector})
+                )
+
+        for match in re.finditer(
+            r"\btype\s+(?P<value_quote>[\"'`])(?P<value>.*?)"
+            r"(?P=value_quote)\s+(?:into|in)\s+"
+            r"(?P<selector_quote>[\"'`])(?P<selector>.*?)"
+            r"(?P=selector_quote)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            value = quoted_value(match, "value")
+            selector = quoted_value(match, "selector")
+            if value and selector and len(value) <= 100_000 and len(selector) <= 2_000:
+                positioned.append(
+                    (
+                        match.start(),
+                        {
+                            "kind": "type",
+                            "selector": selector,
+                            "value": value,
+                            "clear": True,
+                        },
+                    )
+                )
+
+        for match in re.finditer(
+            r"\bpress\s+(?:(?P<quote>[\"'`])(?P<quoted_key>.*?)"
+            r"(?P=quote)|(?P<plain_key>[A-Za-z0-9_+.-]{1,32}))",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            key = (
+                match.group("quoted_key")
+                if match.group("quoted_key") is not None
+                else match.group("plain_key")
+            )
+            key = key.replace("\x00", "").strip()
+            if key and "\r" not in key and "\n" not in key and len(key) <= 64:
+                positioned.append((match.start(), {"kind": "press", "key": key}))
+
+        for match in re.finditer(
+            r"\bwait\s+(?:for\s+)?(?P<quote>[\"'`])"
+            r"(?P<selector>.*?)(?P=quote)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            selector = quoted_value(match, "selector")
+            if selector and len(selector) <= 2_000:
+                positioned.append(
+                    (match.start(), {"kind": "wait", "selector": selector})
+                )
+        for match in re.finditer(
+            r"\bwait\s+(?P<milliseconds>\d{1,8})\s*(?:ms|milliseconds?)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            milliseconds = int(match.group("milliseconds"))
+            if 0 < milliseconds <= 30_000:
+                positioned.append(
+                    (match.start(), {"kind": "wait", "milliseconds": milliseconds})
+                )
+
+        for match in re.finditer(
+            r"\bextract(?:\s+(?:text|links|data))?(?:\s+from)?\s+"
+            r"(?P<quote>[\"'`])(?P<selector>.*?)(?P=quote)",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            selector = quoted_value(match, "selector")
+            if selector and len(selector) <= 2_000:
+                positioned.append(
+                    (match.start(), {"kind": "extract", "selector": selector})
+                )
+
+        for match in re.finditer(
+            r"\b(?:take\s+(?:a\s+)?)?screenshot\b",
+            text,
+            re.IGNORECASE,
+        ):
+            positioned.append((match.start(), {"kind": "screenshot"}))
+
+        positioned.sort(key=lambda item: item[0])
+        return [step for _position, step in positioned[:200]]
+
     def _materialize_generic_tool_action(
         self,
         *,
@@ -3186,6 +3522,15 @@ class AdaptiveBrain:
                 lowered,
             )
         )
+        powershell_arguments = self._explicit_powershell_arguments(input_text)
+        if powershell_arguments is not None:
+            add(
+                8.0,
+                "windows.powershell",
+                "run",
+                powershell_arguments,
+                "run execute powershell command in explicit working directory",
+            )
         if len(paths) == 1:
             path = paths[0]
             extension = Path(path.replace("\\", "/")).suffix.lower()
@@ -3279,11 +3624,15 @@ class AdaptiveBrain:
                 if "task" in enabled.get("browser.automation", set())
                 else "open"
             )
+            browser_steps = self._explicit_browser_steps(input_text, url)
+            browser_arguments: Dict[str, Any] = {"url": url}
+            if browser_steps:
+                browser_arguments["steps"] = browser_steps
             add(
-                5.9 if browser_intent else 2.5,
+                7.2 if browser_steps else (5.9 if browser_intent else 2.5),
                 "browser.automation",
                 browser_action,
-                {"url": url},
+                browser_arguments,
                 "open visit browse navigate website page url",
             )
 
@@ -3462,6 +3811,12 @@ class AdaptiveBrain:
             and self.config.recursive_improvement
             and "propose" in available.get("source.self-modify", set())
         ):
+            # An organic action head cannot author a trustworthy source patch:
+            # exact paths, complete replacement text, and expected hashes must
+            # come through the typed source-edit channel.  Route an edit-free
+            # thought into the worker-owned substrate overlay instead.  The
+            # current turn has already entered latent replay, so this is a
+            # viable isolated experiment rather than an empty Git candidate.
             actions.append(
                 {
                     "kind": "evolve",
@@ -3471,6 +3826,8 @@ class AdaptiveBrain:
                         **base_arguments,
                         "objective": input_text,
                         "recursive": True,
+                        "candidateKind": "substrate",
+                        "latentReplay": True,
                     },
                     "confidence": confidence,
                 }
@@ -3499,7 +3856,7 @@ class AdaptiveBrain:
     def chat(
         self,
         text: str,
-        max_new_tokens: int = 48,
+        max_new_tokens: Optional[int] = None,
         seed: Optional[int] = None,
         tool_schemas: Optional[Sequence[Mapping[str, Any]]] = None,
         stream_callback: Optional[
@@ -3511,6 +3868,11 @@ class AdaptiveBrain:
             raise ValueError("chat input cannot be empty")
         if len(clean) > 1_000_000:
             raise ValueError("chat input is too large")
+        requested_generation_tokens = (
+            max(1, int(max_new_tokens))
+            if max_new_tokens is not None
+            else None
+        )
         before_checksum = self.parameter_checksum()
         before_parameters = self._parameter_copy()
         normalized_tools = self._normalize_tool_schemas(tool_schemas)
@@ -3522,6 +3884,7 @@ class AdaptiveBrain:
             )
         else:
             recalled_vector, recalled = cue, []
+        recall_audit = dict(self.memory._last_recall_audit)
         experience = self.learn_experience(
             clean,
             kind="question" if clean.rstrip().endswith("?") else "experience",
@@ -3557,20 +3920,24 @@ class AdaptiveBrain:
             ).encode("utf-8")
             seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little")
             seed &= 0x7FFFFFFF
-        prompt_list = self.tokenizer.dialogue(clean, brain="", complete=False)
+        prompt_list, recent_prompt_tokens = self._prompt_with_recent_context(
+            clean
+        )
         prompt_ids = torch.tensor(
-            [prompt_list[-self.config.max_seq_len :]],
+            [prompt_list],
             dtype=torch.long,
             device=self.device,
         )
-        prompt_token_hash = hashlib.sha256(
-            ",".join(str(value) for value in prompt_ids[0].tolist()).encode(
-                "ascii"
-            )
-        ).hexdigest()
+        prompt_token_hash = self._token_sequence_hash(
+            prompt_ids[0].tolist()
+        )
         self.current_context = {
             "tokenCount": int(prompt_ids.shape[1]),
             "tokenHash": prompt_token_hash,
+            "recentTokenCount": len(self.recent_token_context),
+            "recentTokenHash": self._token_sequence_hash(
+                self.recent_token_context
+            ),
             "sensorySlots": 0,
             "updatedAt": _iso_now(),
         }
@@ -3606,6 +3973,11 @@ class AdaptiveBrain:
                 + 0.22 * novelty
                 + 0.14 * max(0.0, liquid_ponder - 1.0),
             ),
+        )
+        generation_tokens = (
+            requested_generation_tokens
+            if requested_generation_tokens is not None
+            else self.config.generation_token_budget(compute_demand)
         )
         ponder_factors = {
             "liquid": liquid_ponder,
@@ -3655,7 +4027,7 @@ class AdaptiveBrain:
             candidate, branch_entropies = self.decoder.generate(
                 prompt_ids,
                 memory_bias=internal_memory,
-                max_new_tokens=max(1, min(int(max_new_tokens), 512)),
+                max_new_tokens=generation_tokens,
                 temperature=self.config.temperature,
                 top_k=self.config.top_k,
                 noise=organic_noise * (1.0 + 0.04 * ponder_steps),
@@ -3797,7 +4169,7 @@ class AdaptiveBrain:
             replayed, replay_entropies = self.decoder.generate(
                 prompt_ids,
                 memory_bias=internal_memory,
-                max_new_tokens=max(1, min(int(max_new_tokens), 512)),
+                max_new_tokens=generation_tokens,
                 temperature=self.config.temperature,
                 top_k=self.config.top_k,
                 noise=organic_noise * (1.0 + 0.04 * ponder_steps),
@@ -3852,6 +4224,16 @@ class AdaptiveBrain:
             "created_at": _iso_now(),
         }
         self.messages.extend([user_message, assistant_message])
+        self._append_recent_dialogue(clean, response)
+        self.current_context.update(
+            {
+                "recentTokenCount": len(self.recent_token_context),
+                "recentTokenHash": self._token_sequence_hash(
+                    self.recent_token_context
+                ),
+                "updatedAt": _iso_now(),
+            }
+        )
         train_loss = float(experience["training"]["loss"])
         if pair_training is not None:
             train_loss = (train_loss + float(pair_training["loss"])) / 2.0
@@ -3861,9 +4243,26 @@ class AdaptiveBrain:
             "seed": int(seed),
             "input_sha256": hashlib.sha256(clean.encode("utf-8")).hexdigest(),
             "textual_memory_injected": False,
+            "long_term_source_text_injected": False,
             "tool_schema_text_injected": False,
-            "prompt_text_expanded": False,
+            "hidden_prompt_text_expanded": False,
+            "prompt_text_expanded": bool(recent_prompt_tokens),
             "prompt_token_count": int(prompt_ids.shape[1]),
+            "recent_dialogue_context_injected": bool(recent_prompt_tokens),
+            "recent_dialogue_token_count": len(recent_prompt_tokens),
+            "recent_dialogue_token_ids_sha256": self._token_sequence_hash(
+                recent_prompt_tokens
+            ),
+            "context_token_evictions": self.counters[
+                "context_token_evictions"
+            ],
+            "working_context_capacity_tokens": self.config.max_seq_len,
+            "generation_budget_tokens": generation_tokens,
+            "generation_budget_source": (
+                "caller"
+                if requested_generation_tokens is not None
+                else "hardware-and-organic-state"
+            ),
             "prompt_token_ids_sha256": prompt_token_hash,
             "available_tool_ids": [
                 schema["id"] for schema in normalized_tools
@@ -3893,6 +4292,7 @@ class AdaptiveBrain:
             "recalled_idea_ids": [
                 item["idea_id"] for item in recalled
             ],
+            "spreading_activation": recall_audit,
             "expert_route": expert_route,
             "expert_grew": bool(experience["grew_expert"]),
             "growth_pause": self.growth_pause,
@@ -3921,26 +4321,47 @@ class AdaptiveBrain:
             "steps": [
                 {
                     "stage": "encode",
-                    "detail": "Encoded the current turn at the UTF-8 token boundary.",
+                    "detail": (
+                        "Encoded the current turn plus explicit bounded recent "
+                        "dialogue at the UTF-8 token boundary."
+                    ),
                     "value": "%d tokens" % prompt_ids.shape[1],
                 },
                 {
                     "stage": "idea-memory",
-                    "detail": "Spread activation through distributed neuron assemblies; no remembered source text entered the token stream.",
-                    "value": "%d active assemblies" % len(recalled),
+                    "detail": (
+                        "Settled signed recurrent activation using exact ternary "
+                        "synapse contributions; inhibitory pathways competed "
+                        "without using latent master magnitude, and no remembered "
+                        "source text entered the token stream."
+                    ),
+                    "value": (
+                        "%d active, %d inhibited signals, %d settling rounds"
+                        % (
+                            len(recalled),
+                            int(recall_audit.get("inhibitorySignals", 0)),
+                            int(recall_audit.get("settledRounds", 0)),
+                        )
+                    ),
                 },
                 {
                     "stage": "working-memory",
                     "detail": (
-                        "Blended bounded recurrent activity vectors; no prior "
-                        "message text was added to prompt tokens."
+                        "Used the explicit bounded recent-dialogue token ring "
+                        "and blended recurrent activity vectors; no long-term "
+                        "source, behavioral prompt, or tool-schema prose was "
+                        "added."
                         if working_model is not None
-                        else "Recurrent working-memory injection is disabled."
+                        else (
+                            "Used only the explicit bounded recent-dialogue "
+                            "token ring; recurrent-vector injection is disabled."
+                        )
                     ),
                     "value": (
-                        "%d active vectors" % working_memory_used
+                        "%d recent tokens, %d active vectors"
+                        % (len(recent_prompt_tokens), working_memory_used)
                         if working_model is not None
-                        else "parameter-only mode"
+                        else "%d recent tokens" % len(recent_prompt_tokens)
                     ),
                 },
                 {
@@ -4338,13 +4759,23 @@ class AdaptiveBrain:
         candidate_id, candidate_dir = self._begin_candidate("consolidation")
         promoted = False
         rejection = ""
+        organic = self._organic_state()
+        rehearsal_noise = max(
+            0.01,
+            min(
+                0.12,
+                0.015
+                + 0.045 * float(organic["predictionError"])
+                + 0.030 * float(organic["uncertainty"])
+                + 0.020 * float(organic["novelty"])
+                + 0.010 * float(organic["tension"]),
+            ),
+        )
         try:
             for index in range(steps):
                 target = self.replay[index % len(self.replay)].to(self.device).reshape(1, -1)
                 optimizer.zero_grad(set_to_none=True)
-                noisy = target + torch.randn_like(target) * (
-                    0.03 + self.config.noise * 0.05
-                )
+                noisy = target + torch.randn_like(target) * rehearsal_noise
                 prediction = self.idea_adapter(noisy)
                 reconstruction_loss = F.mse_loss(prediction, target.detach())
                 stability_loss = self._stability_penalty(
@@ -4540,6 +4971,25 @@ class AdaptiveBrain:
     def _media_idea(self, source_name: str) -> torch.Tensor:
         vector = self.memory.vector_for_text(source_name or "media experience")
         return self._idea_model_vector(vector).detach()
+
+    @staticmethod
+    def _effective_media_kind(path: str, requested_kind: str) -> str:
+        """Route animated GIF experiences through temporal video learning."""
+
+        if requested_kind != "image" or Path(path).suffix.lower() != ".gif":
+            return requested_kind
+        try:
+            from PIL import Image
+
+            with Image.open(path) as opened:
+                if bool(getattr(opened, "is_animated", False)) and int(
+                    getattr(opened, "n_frames", 1)
+                ) > 1:
+                    return "video"
+        except (ImportError, OSError, ValueError):
+            # The normal image decoder will produce the attributable error.
+            return requested_kind
+        return requested_kind
 
     def _decode_image(self, path: str) -> torch.Tensor:
         try:
@@ -5301,6 +5751,13 @@ class AdaptiveBrain:
                 if record_kind in {"image", "audio", "video"}:
                     record_path = getattr(record, "local_path", None)
                     if not record_path:
+                        failure_message = (
+                            "Binary modality record has no leased local path."
+                        )
+                        coverage.reject_processed(
+                            record_name,
+                            failure_message,
+                        )
                         failure_coverage = self._empty_media_coverage(record_kind)
                         media_reports.append(
                             {
@@ -5316,12 +5773,25 @@ class AdaptiveBrain:
                                 "loss": 0.0,
                                 "steps": 0,
                                 "coverage": failure_coverage,
-                                "warnings": [
-                                    "Binary modality record has no leased local path."
-                                ],
+                                "warnings": [failure_message],
                             }
                         )
                         continue
+                    effective_kind = self._effective_media_kind(
+                        str(record_path), record_kind
+                    )
+                    if effective_kind != record_kind:
+                        prior_count = int(
+                            coverage.modality_counts.get(record_kind, 0)
+                        )
+                        if prior_count <= 1:
+                            coverage.modality_counts.pop(record_kind, None)
+                        else:
+                            coverage.modality_counts[record_kind] = prior_count - 1
+                        coverage.modality_counts[effective_kind] = (
+                            coverage.modality_counts.get(effective_kind, 0) + 1
+                        )
+                        record_kind = effective_kind
                     # Archive and remote-manifest paths are leases. They must be
                     # decoded and trained completely before the iterator is
                     # advanced, because advancing removes the temporary file.
@@ -5341,6 +5811,17 @@ class AdaptiveBrain:
                             "coverage": self._empty_media_coverage(record_kind),
                             "warnings": [str(error)],
                         }
+                    if not bool(trained_media.get("trained", False)):
+                        training_warnings = [
+                            str(value)
+                            for value in trained_media.get("warnings", [])
+                            if str(value).strip()
+                        ]
+                        coverage.reject_processed(
+                            record_name,
+                            "; ".join(training_warnings)
+                            or "%s media decoding/training failed" % record_kind,
+                        )
                     media_reports.append(
                         {
                             "name": record_name,
@@ -5385,6 +5866,16 @@ class AdaptiveBrain:
                 "audio",
                 "video",
             }:
+                missing_path_message = (
+                    "Binary modality ingestion requires a local file path."
+                )
+                if coverage.processed_records > 0:
+                    coverage.reject_processed(
+                        source_name,
+                        missing_path_message,
+                    )
+                else:
+                    coverage.reject(source_name, missing_path_message)
                 media_reports.append(
                     {
                         "name": source_name,
@@ -5395,9 +5886,7 @@ class AdaptiveBrain:
                         "loss": 0.0,
                         "steps": 0,
                         "coverage": self._empty_media_coverage(resolved_kind),
-                        "warnings": [
-                            "Binary modality ingestion requires a local file path."
-                        ],
+                        "warnings": [missing_path_message],
                     }
                 )
             elif source_path is None and extracted.strip():
@@ -5432,6 +5921,13 @@ class AdaptiveBrain:
             *list(media_result["warnings"]),
             *dataset_warnings,
         ]
+        effective_source_kind = resolved_kind
+        if (
+            resolved_kind == "image"
+            and len(media_reports) == 1
+            and str(media_reports[0].get("kind", "")) == "video"
+        ):
+            effective_source_kind = "video"
         source_record: Dict[str, Any] = {
             "id": (
                 str(duplicate.get("id"))
@@ -5439,7 +5935,7 @@ class AdaptiveBrain:
                 else uuid.uuid4().hex
             ),
             "name": source_name,
-            "kind": resolved_kind,
+            "kind": effective_source_kind,
             "bytes": source_bytes,
             "content_hash": content_hash,
             "policy": policy,
@@ -6081,6 +6577,12 @@ class AdaptiveBrain:
         checksum = hashlib.sha256(
             (destination / "core.safetensors").read_bytes()
             + (destination / "plasticity.safetensors").read_bytes()
+            + str(
+                read_json(destination / "brain.json")
+                .get("substrate", {})
+                .get("persistence", {})
+                .get("contentSha256", "")
+            ).encode("ascii")
         ).hexdigest()
         result = {
             "id": snapshot_id,
@@ -6162,6 +6664,7 @@ class AdaptiveBrain:
             "metadata": str(self.engine_path / "brain.json"),
             "core": str(self.engine_path / "core.safetensors"),
             "plasticity": str(self.engine_path / "plasticity.safetensors"),
+            "substrate": str(self.engine_path / "substrate" / "manifest.json"),
             "events": str(self.engine_path / "events.sqlite3"),
             "origin": str(self.engine_path / "origin"),
             "snapshots": str(self.engine_path / "snapshots"),
@@ -6221,7 +6724,6 @@ class AdaptiveBrain:
         self.config.stdp_plasticity = True
         self.config.liquid_dynamics = True
         self.config.vector_symbolic_memory = True
-        self.config.growth_policy = "unbounded"
         self.config.memory_injection = "working-memory"
         requested_liquid = str(raw.get("liquidMode", self.config.liquid_mode))
         if requested_liquid not in {"cfc", "ltc"}:
@@ -6258,23 +6760,268 @@ class AdaptiveBrain:
                 if isinstance(module, BitLinear):
                     module.ternary = True
 
-    def merge_overlay(self, source: "AdaptiveBrain") -> Dict[str, Any]:
-        """Merge inspectable ideas/replay, never whole-model weight averages."""
+    @staticmethod
+    def _overlay_tensor_sha256(value: Optional[torch.Tensor]) -> Optional[str]:
+        if value is None:
+            return None
+        tensor = value.detach().cpu().contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(
+            ",".join(str(dimension) for dimension in tensor.shape).encode("ascii")
+        )
+        digest.update(b"\0")
+        digest.update(tensor.numpy().tobytes())
+        return digest.hexdigest()
+
+    def _overlay_state_identity(self) -> Dict[str, Any]:
+        """Hash authoritative merge inputs without materializing one huge object."""
+
+        digest = hashlib.sha256()
+        config_sha256 = hashlib.sha256(
+            json.dumps(
+                self.config.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        digest.update(b"engine-schema\0")
+        digest.update(str(ENGINE_SCHEMA_VERSION).encode("ascii"))
+        digest.update(b"\nbrain\0")
+        digest.update(self.brain_id.encode("utf-8"))
+        digest.update(b"\nconfig\0")
+        digest.update(config_sha256.encode("ascii"))
+        digest.update(b"\n")
+
+        def add_record(
+            kind: str,
+            identity: str,
+            record: Mapping[str, Any],
+            vector: Optional[torch.Tensor] = None,
+        ) -> None:
+            digest.update(kind.encode("ascii"))
+            digest.update(b"\0")
+            digest.update(identity.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(
+                json.dumps(
+                    dict(record),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            digest.update(b"\0")
+            vector_sha256 = self._overlay_tensor_sha256(vector)
+            digest.update((vector_sha256 or "-").encode("ascii"))
+            digest.update(b"\n")
+
+        for neuron_id in sorted(self.memory.neurons):
+            add_record(
+                "neuron",
+                neuron_id,
+                self.memory.neurons[neuron_id],
+                self.memory.neuron_vectors.get(neuron_id),
+            )
+        assemblies = sorted(
+            self.memory.assemblies, key=lambda item: str(item.get("id", ""))
+        )
+        for assembly in assemblies:
+            assembly_id = str(assembly.get("id", ""))
+            add_record(
+                "assembly",
+                assembly_id,
+                assembly,
+                self.memory.assembly_vectors.get(assembly_id),
+            )
+        for synapse_id in sorted(self.memory.synapses):
+            add_record(
+                "synapse",
+                synapse_id,
+                self.memory.synapses[synapse_id],
+            )
+        replay_sha256 = []
+        for index, vector in enumerate(self.replay):
+            checksum = self._overlay_tensor_sha256(vector)
+            if checksum is None:
+                continue
+            replay_sha256.append(checksum)
+            digest.update(b"replay\0")
+            digest.update(str(index).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(checksum.encode("ascii"))
+            digest.update(b"\n")
+        parameter_sha256 = self.parameter_checksum()
+        digest.update(b"parameters\0")
+        digest.update(parameter_sha256.encode("ascii"))
+        return {
+            "stateSha256": digest.hexdigest(),
+            "parameterSha256": parameter_sha256,
+            "configSha256": config_sha256,
+            "engineSchemaVersion": ENGINE_SCHEMA_VERSION,
+            "counts": {
+                "neurons": len(self.memory.neurons),
+                "assemblies": len(self.memory.assemblies),
+                "synapses": len(self.memory.synapses),
+                "replayExamples": len(self.replay),
+            },
+            "replaySha256": replay_sha256,
+        }
+
+    def preview_overlay(self, source: "AdaptiveBrain") -> Dict[str, Any]:
+        """Describe and bind the exact worker state that a fork merge can add."""
+
+        if source.brain_id == self.brain_id:
+            raise ValueError("cannot preview a brain overlay into itself")
+        source_identity = source._overlay_state_identity()
+        target_identity = self._overlay_state_identity()
+        target_fingerprints = {
+            str(idea.get("fingerprint", "")) for idea in self.memory.ideas
+        }
+        target_assemblies_by_id = {
+            str(idea.get("id", "")): idea for idea in self.memory.ideas
+        }
+        target_assemblies_by_fingerprint = {
+            str(idea.get("fingerprint", "")): idea
+            for idea in self.memory.ideas
+        }
+        source_replay = source_identity["replaySha256"]
+        target_replay = set(target_identity["replaySha256"])
+        divergent_neurons = sum(
+            1
+            for neuron_id, neuron in source.memory.neurons.items()
+            if neuron_id in self.memory.neurons
+            and (
+                self.memory.neurons[neuron_id] != neuron
+                or self._overlay_tensor_sha256(
+                    self.memory.neuron_vectors.get(neuron_id)
+                )
+                != self._overlay_tensor_sha256(
+                    source.memory.neuron_vectors.get(neuron_id)
+                )
+            )
+        )
+        divergent_synapses = sum(
+            1
+            for synapse_id, synapse in source.memory.synapses.items()
+            if synapse_id in self.memory.synapses
+            and self.memory.synapses[synapse_id] != synapse
+        )
+        divergent_assemblies = 0
+        for assembly in source.memory.ideas:
+            assembly_id = str(assembly.get("id", ""))
+            fingerprint = str(assembly.get("fingerprint", ""))
+            existing = (
+                target_assemblies_by_fingerprint.get(fingerprint)
+                or target_assemblies_by_id.get(assembly_id)
+            )
+            if existing is None:
+                continue
+            existing_id = str(existing.get("id", ""))
+            if (
+                existing != assembly
+                or self._overlay_tensor_sha256(
+                    self.memory.assembly_vectors.get(existing_id)
+                )
+                != self._overlay_tensor_sha256(
+                    source.memory.assembly_vectors.get(assembly_id)
+                )
+            ):
+                divergent_assemblies += 1
+        additions = {
+            "neurons": sum(
+                neuron_id not in self.memory.neurons
+                for neuron_id in source.memory.neurons
+            ),
+            "assemblies": sum(
+                str(idea.get("fingerprint", "")) not in target_fingerprints
+                and str(idea.get("id", "")) not in target_assemblies_by_id
+                for idea in source.memory.ideas
+            ),
+            "synapses": sum(
+                synapse_id not in self.memory.synapses
+                for synapse_id in source.memory.synapses
+            ),
+            "replayExamples": sum(
+                checksum not in target_replay for checksum in source_replay
+            ),
+        }
+        duplicates = {
+            "neurons": len(source.memory.neurons) - additions["neurons"],
+            "assemblies": len(source.memory.ideas) - additions["assemblies"],
+            "synapses": len(source.memory.synapses) - additions["synapses"],
+            "replayExamples": len(source_replay) - additions["replayExamples"],
+        }
+        descriptor = {
+            "schemaVersion": 1,
+            "sourceBrainId": source.brain_id,
+            "targetBrainId": self.brain_id,
+            "sourceStateSha256": source_identity["stateSha256"],
+            "targetStateSha256": target_identity["stateSha256"],
+            "sourceParameterSha256": source_identity["parameterSha256"],
+            "targetParameterSha256": target_identity["parameterSha256"],
+            "sourceConfigSha256": source_identity["configSha256"],
+            "targetConfigSha256": target_identity["configSha256"],
+            "engineSchemaVersion": ENGINE_SCHEMA_VERSION,
+            "sourceCounts": source_identity["counts"],
+            "targetCounts": target_identity["counts"],
+            "additions": additions,
+            "duplicates": duplicates,
+            "divergent": {
+                "neurons": divergent_neurons,
+                "assemblies": divergent_assemblies,
+                "synapses": divergent_synapses,
+            },
+            "weightsAveraged": False,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                descriptor,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return {**descriptor, "digest": digest}
+
+    def merge_overlay(
+        self, source: "AdaptiveBrain", expected_preview_digest: str
+    ) -> Dict[str, Any]:
+        """Merge a reviewed authoritative overlay, never whole-model weights."""
 
         if source.brain_id == self.brain_id:
             raise ValueError("cannot merge a brain overlay into itself")
+        if not re.fullmatch(r"[a-f0-9]{64}", expected_preview_digest or ""):
+            raise ValueError("an exact authoritative overlay preview digest is required")
+        preview = self.preview_overlay(source)
+        if preview["digest"] != expected_preview_digest:
+            raise ValueError(
+                "authoritative overlay changed after review; request a new preview"
+            )
         existing_fingerprints = {
             idea["fingerprint"] for idea in self.memory.ideas
+        }
+        existing_assembly_ids = {
+            str(idea.get("id", "")) for idea in self.memory.ideas
         }
         added_concepts = 0
         added_ideas = 0
         added_relations = 0
         added_replay = 0
+        additions = preview["additions"]
         estimated_bytes = (
-            len(source.memory.neurons)
+            int(additions["neurons"])
             * (self.config.vsa_dim * 4 + 640)
-            + len(source.memory.assemblies) * (self.config.vsa_dim * 4 + 1024)
-            + len(source.memory.synapses) * 384
+            + int(additions["assemblies"])
+            * (self.config.vsa_dim * 4 + 1024)
+            + int(additions["synapses"]) * 384
+            + int(additions["replayExamples"])
+            * (max(self.config.idea_dim, self.config.d_model) * 4 + 128)
         )
         if not self._allow_substrate_growth(estimated_bytes):
             raise SubstrateResourcePause(
@@ -6289,7 +7036,10 @@ class AdaptiveBrain:
                 self.memory.concept_vectors[concept_id] = vector.detach().cpu().clone()
             added_concepts += 1
         for idea in source.memory.ideas:
-            if idea["fingerprint"] in existing_fingerprints:
+            if (
+                idea["fingerprint"] in existing_fingerprints
+                or str(idea.get("id", "")) in existing_assembly_ids
+            ):
                 continue
             copied = dict(idea)
             if not (
@@ -6302,6 +7052,7 @@ class AdaptiveBrain:
             if vector is not None:
                 self.memory.idea_vectors[idea["id"]] = vector.detach().cpu().clone()
             existing_fingerprints.add(idea["fingerprint"])
+            existing_assembly_ids.add(str(idea.get("id", "")))
             added_ideas += 1
         for relation_id, relation in source.memory.relations.items():
             if relation_id in self.memory.relations:
@@ -6332,6 +7083,7 @@ class AdaptiveBrain:
             "relations": added_relations,
             "replayExamples": added_replay,
             "weightsAveraged": False,
+            "reviewedDigest": expected_preview_digest,
             "metrics": self.metrics(),
         }
         self.events.append("overlay-merged", result)

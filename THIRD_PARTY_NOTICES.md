@@ -46,7 +46,7 @@ GPL-2.0-or-later program rather than relicensed as part of Omni.
 - FFmpeg 7.1 source: <https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz>
 - FFmpeg license terms: <https://github.com/FFmpeg/FFmpeg/blob/n7.1/LICENSE.md>
 - FFmpeg build and external-library licensing notes: <https://ffmpeg.org/general.html>
-- GNU GPL version 2 text: <https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt>
+- GNU GPL version 2 text: `licenses/GPL-2.0.txt`
 
 The packaged application includes this notice under `resources/licenses/`.
 Anyone redistributing a release must also satisfy the corresponding-source and
@@ -56,6 +56,13 @@ for a downstream distributor's compliance review.
 
 ## Research inspirations
 
-The architecture is informed by BitNet b1.58, liquid time-constant networks, closed-form continuous-time networks, vector-symbolic architectures/hyperdimensional computing, spike-timing-dependent plasticity, adaptive computation time, elastic/synaptic consolidation, experience replay, sparse growable experts, diffusion transformers, latent video diffusion, and neural audio codecs. See `RESEARCH.md` for the source-to-feature and license-boundary ledger.
+The architecture is informed by LLaMA-style decoder components, BitNet b1.58,
+liquid time-constant networks, closed-form continuous-time networks,
+vector-symbolic architectures/hyperdimensional computing, Perceiver-style
+global latent integration, spike-timing-dependent plasticity, adaptive
+computation time, elastic/synaptic consolidation, dynamically expandable
+networks, sparse growable experts, Darwin-Gödel-style evolutionary lineage,
+diffusion transformers, latent video diffusion, and neural audio codecs. See
+`RESEARCH.md` for the source-to-feature and license-boundary ledger.
 
 No third-party pretrained model weights are bundled. Imported datasets and model packs require their own provenance and license manifests.

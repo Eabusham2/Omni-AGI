@@ -23,11 +23,9 @@ class StructuredToolSchemaTests(unittest.TestCase):
         )
         self.root = Path(self.temporary.name)
         self.config = OmniConfig.micro(
-            parallel_thoughts=1,
             online_learning=False,
             learn_from_own_messages=False,
             spiking_dynamics=False,
-            noise=0.0,
         )
 
     def tearDown(self):
@@ -83,6 +81,8 @@ class StructuredToolSchemaTests(unittest.TestCase):
         self.assertEqual(trace["prompt_token_count"], expected.shape[1])
         self.assertEqual(trace["prompt_token_ids_sha256"], expected_hash)
         self.assertFalse(trace["prompt_text_expanded"])
+        self.assertFalse(trace["hidden_prompt_text_expanded"])
+        self.assertFalse(trace["long_term_source_text_injected"])
         self.assertFalse(trace["tool_schema_text_injected"])
         self.assertFalse(trace["textual_memory_injected"])
         self.assertEqual(
@@ -241,6 +241,162 @@ class StructuredToolSchemaTests(unittest.TestCase):
             organic_state={"computeDemand": 0.8},
         )
         self.assertEqual(actions, [])
+        brain.events.close()
+
+    def test_powershell_materialization_requires_explicit_command_and_absolute_cwd(self):
+        brain = self.make_brain("typed-powershell")
+        logits = torch.tensor(
+            [[-8.0, 12.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0]]
+        )
+        scores, actions = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "windows.powershell",
+                    "actions": ["run"],
+                    "grant": "ask",
+                }
+            ],
+            input_text=(
+                'Run PowerShell command "Get-ChildItem -Force" with '
+                'cwd "C:\\Users\\Eyad\\Omni".'
+            ),
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertEqual(
+            actions,
+            [
+                {
+                    "kind": "tool",
+                    "toolId": "windows.powershell",
+                    "action": "run",
+                    "arguments": {
+                        "assemblyIds": [],
+                        "organic": True,
+                        "command": "Get-ChildItem -Force",
+                        "cwd": "C:\\Users\\Eyad\\Omni",
+                    },
+                    "confidence": scores["tool"],
+                }
+            ],
+        )
+
+        _, missing_absolute_cwd = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "windows.powershell",
+                    "actions": ["run"],
+                    "grant": "auto",
+                }
+            ],
+            input_text=(
+                'Run PowerShell command "Get-ChildItem -Force" with '
+                'cwd "relative-project".'
+            ),
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertEqual(missing_absolute_cwd, [])
+        brain.events.close()
+
+    def test_browser_materialization_preserves_explicit_ordered_steps(self):
+        brain = self.make_brain("typed-browser")
+        logits = torch.tensor(
+            [[-8.0, 12.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0]]
+        )
+        scores, actions = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "browser.automation",
+                    "actions": ["task"],
+                    "grant": "ask",
+                }
+            ],
+            input_text=(
+                "In the browser, open https://example.com/login then "
+                'click "#email", type "user@example.com" into "#email", '
+                'press "Enter", wait for ".ready", extract text from '
+                '".result", then take a screenshot.'
+            ),
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertEqual(
+            actions,
+            [
+                {
+                    "kind": "tool",
+                    "toolId": "browser.automation",
+                    "action": "task",
+                    "arguments": {
+                        "assemblyIds": [],
+                        "organic": True,
+                        "url": "https://example.com/login",
+                        "steps": [
+                            {"kind": "click", "selector": "#email"},
+                            {
+                                "kind": "type",
+                                "selector": "#email",
+                                "value": "user@example.com",
+                                "clear": True,
+                            },
+                            {"kind": "press", "key": "Enter"},
+                            {"kind": "wait", "selector": ".ready"},
+                            {"kind": "extract", "selector": ".result"},
+                            {"kind": "screenshot"},
+                        ],
+                    },
+                    "confidence": scores["tool"],
+                }
+            ],
+        )
+
+        _, vague = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "browser.automation",
+                    "actions": ["task"],
+                    "grant": "auto",
+                }
+            ],
+            input_text="Use the browser to log me into my account.",
+            assembly_ids=[],
+            organic_state={"computeDemand": 0.8},
+        )
+        self.assertEqual(vague, [])
+        brain.events.close()
+
+    def test_organic_evolution_routes_to_viable_substrate_replay(self):
+        brain = self.make_brain("organic-evolution")
+        brain.config.recursive_improvement = True
+        logits = torch.tensor(
+            [[-8.0, -8.0, -8.0, -8.0, -8.0, -8.0, 12.0, -8.0]]
+        )
+        scores, actions = brain._select_structured_actions(
+            logits,
+            schemas=[
+                {
+                    "id": "source.self-modify",
+                    "actions": ["propose"],
+                    "grant": "ask",
+                }
+            ],
+            input_text="Reduce this measured prediction error.",
+            assembly_ids=["active-assembly"],
+            organic_state={"computeDemand": 0.9, "predictionError": 0.8},
+        )
+        self.assertGreater(scores["evolve"], 0.99)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["kind"], "evolve")
+        self.assertEqual(
+            actions[0]["arguments"]["candidateKind"], "substrate"
+        )
+        self.assertTrue(actions[0]["arguments"]["latentReplay"])
+        self.assertNotIn("sourceEdits", actions[0]["arguments"])
         brain.events.close()
 
     def test_off_tool_schema_cannot_participate_in_action_selection(self):

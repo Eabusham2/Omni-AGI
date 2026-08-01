@@ -12,9 +12,20 @@ if (-not (Test-Path $Worker)) {
   throw "OmniCortex worker not found at $Worker"
 }
 
-& $Python -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
-if ($LASTEXITCODE -ne 0) {
-  throw "Installing PyInstaller failed with exit code $LASTEXITCODE"
+if ($env:OMNI_SKIP_BUILD_DEPENDENCY_INSTALL -eq "1") {
+  & $Python -c "import PyInstaller; major=int(PyInstaller.__version__.split('.')[0]); assert major == 6"
+  if ($LASTEXITCODE -ne 0) {
+    throw (
+      "Protected runtime evolution requires an existing PyInstaller 6.x; " +
+      "automatic dependency installation is disabled."
+    )
+  }
+}
+else {
+  & $Python -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
+  if ($LASTEXITCODE -ne 0) {
+    throw "Installing PyInstaller failed with exit code $LASTEXITCODE"
+  }
 }
 
 if (Test-Path $DistRoot) {

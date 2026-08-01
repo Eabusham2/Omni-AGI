@@ -63,7 +63,7 @@ class StableConfigTests(unittest.TestCase):
         self.assertTrue(config.vector_symbolic_memory)
         self.assertTrue(config.consolidation_enabled)
         self.assertTrue(config.metaplasticity)
-        self.assertEqual(config.growth_policy, "unbounded")
+        self.assertFalse(hasattr(config, "growth_policy"))
         self.assertTrue(RETIRED_BETA_CONTROLS.isdisjoint(config.to_dict()))
 
     def test_extended_workspace_is_hardware_derived_not_a_numeric_slider(self):
@@ -77,10 +77,54 @@ class StableConfigTests(unittest.TestCase):
                 "workingMemorySlots": 1,
             }
         )
-        self.assertEqual(ordinary.max_seq_len, 256)
-        self.assertEqual(extended.max_seq_len, 512)
-        self.assertEqual(ordinary.working_memory_slots, 96)
-        self.assertEqual(extended.working_memory_slots, 192)
+        self.assertEqual(ordinary.max_seq_len, 2048)
+        self.assertEqual(extended.max_seq_len, 4096)
+        self.assertEqual(ordinary.working_memory_slots, 512)
+        self.assertEqual(extended.working_memory_slots, 1024)
+
+    def test_every_hardware_tier_has_large_resource_guarded_context(self):
+        expected = {
+            "micro": (256, 128),
+            "personal": (1024, 256),
+            "gpu": (2048, 512),
+            "workstation": (4096, 1024),
+        }
+        for tier, (tokens, slots) in expected.items():
+            with self.subTest(tier=tier):
+                ordinary = OmniConfig.from_external({"hardwareTier": tier})
+                extended = OmniConfig.from_external(
+                    {
+                        "hardwareTier": tier,
+                        "extendedWorkingMemory": True,
+                        # Stable v1 ignores numeric builder overrides.
+                        "workingMemorySlots": 1,
+                    }
+                )
+                self.assertEqual(ordinary.max_seq_len, tokens)
+                self.assertEqual(ordinary.working_memory_slots, slots)
+                self.assertEqual(extended.max_seq_len, tokens * 2)
+                self.assertEqual(extended.working_memory_slots, slots * 2)
+
+    def test_response_budget_is_separate_and_state_scaled(self):
+        config = OmniConfig.from_external(
+            {"hardwareTier": "personal", "extendedWorkingMemory": False}
+        )
+        quiet = config.generation_token_budget(0.0)
+        active = config.generation_token_budget(1.0)
+        self.assertEqual(quiet, 144)
+        self.assertEqual(active, 240)
+        self.assertLess(active, config.max_seq_len)
+
+        extended = OmniConfig.from_external(
+            {"hardwareTier": "personal", "extendedWorkingMemory": True}
+        )
+        self.assertGreater(
+            extended.generation_token_budget(0.5),
+            config.generation_token_budget(0.5),
+        )
+        self.assertLess(
+            extended.generation_token_budget(1.0), extended.max_seq_len
+        )
 
     def test_legacy_internal_dictionary_loads_but_retires_controls_on_save(self):
         config = OmniConfig.from_dict(
@@ -99,8 +143,8 @@ class StableConfigTests(unittest.TestCase):
                 "parallel_thoughts": 2,
             }
         )
-        self.assertEqual(config.max_concepts, 7)
-        self.assertEqual(config.parallel_thoughts, 2)
+        self.assertFalse(hasattr(config, "max_concepts"))
+        self.assertFalse(hasattr(config, "parallel_thoughts"))
         self.assertTrue(RETIRED_BETA_CONTROLS.isdisjoint(config.to_dict()))
 
 

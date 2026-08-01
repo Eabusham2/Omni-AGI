@@ -71,7 +71,9 @@ export function detectDatasetFormat(path: string): DatasetFormat {
   }
   if (extension === ".pdf") return "pdf";
   if (extension === ".epub") return "epub";
-  if ([".docx", ".odt", ".pptx"].includes(extension)) return "office";
+  if ([".docx", ".pptx", ".xlsx", ".odt", ".ods", ".odp"].includes(extension)) {
+    return "office";
+  }
   if (extension === ".csv") return "csv";
   if (extension === ".tsv") return "tsv";
   if (extension === ".json") return "json";
@@ -492,6 +494,21 @@ export interface CrawlFrontierCounts {
   visited: number;
   skipped: number;
   processedBytes: number;
+  resultCount: number;
+  warningCount: number;
+  modalityCounts: Partial<Record<DatasetFormat, number>>;
+}
+
+export interface CrawlResultReceipt {
+  sourceId: string;
+  sourceName: string;
+  kind: DatasetFormat;
+  bytes: number;
+  contentHash?: string;
+  learnedIdeas: number;
+  learnedConcepts: number;
+  learnedSynapses: number;
+  warnings: string[];
 }
 
 export class CrawlFrontierStore {
@@ -556,6 +573,19 @@ export class CrawlFrontierStore {
         url TEXT NOT NULL,
         message TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS result_receipts (
+        url TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        source_name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        bytes INTEGER NOT NULL DEFAULT 0,
+        content_hash TEXT,
+        learned_ideas INTEGER NOT NULL DEFAULT 0,
+        learned_concepts INTEGER NOT NULL DEFAULT 0,
+        learned_synapses INTEGER NOT NULL DEFAULT 0,
+        warnings_json TEXT NOT NULL DEFAULT '[]',
+        recorded_at TEXT NOT NULL
+      );
     `);
     const visitedColumns = this.database
       .prepare("PRAGMA table_info(visited)")
@@ -570,7 +600,9 @@ export class CrawlFrontierStore {
       throw new Error("The crawl id belongs to a different start URL.");
     }
     if (!resume) {
-      this.database.exec("DELETE FROM frontier; DELETE FROM visited; DELETE FROM warnings;");
+      this.database.exec(
+        "DELETE FROM frontier; DELETE FROM visited; DELETE FROM warnings; DELETE FROM result_receipts;"
+      );
     }
     const insertMeta = this.database.prepare(
       "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)"
@@ -641,8 +673,8 @@ export class CrawlFrontierStore {
     return entries;
   }
 
-  visited(url: string, bytes = 0): void {
-    this.finish(url, "visited", undefined, bytes);
+  visited(url: string, bytes = 0, receipt?: CrawlResultReceipt): void {
+    this.finish(url, "visited", undefined, bytes, receipt);
   }
 
   skipped(url: string, message?: string): void {
@@ -659,7 +691,8 @@ export class CrawlFrontierStore {
     url: string,
     status: "visited" | "skipped",
     error?: string,
-    bytes = 0
+    bytes = 0,
+    receipt?: CrawlResultReceipt
   ): void {
     this.transact(() => {
       this.database.prepare("DELETE FROM frontier WHERE url = ?").run(url);
@@ -673,10 +706,39 @@ export class CrawlFrontierStore {
           .prepare("INSERT INTO warnings(url, message) VALUES (?, ?)")
           .run(url, error);
       }
+      if (receipt) {
+        this.database
+          .prepare(
+            `INSERT OR REPLACE INTO result_receipts(
+              url, source_id, source_name, kind, bytes, content_hash,
+              learned_ideas, learned_concepts, learned_synapses,
+              warnings_json, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            url,
+            receipt.sourceId,
+            receipt.sourceName,
+            receipt.kind,
+            Math.max(0, Math.round(receipt.bytes)),
+            receipt.contentHash ?? null,
+            Math.max(0, Math.round(receipt.learnedIdeas)),
+            Math.max(0, Math.round(receipt.learnedConcepts)),
+            Math.max(0, Math.round(receipt.learnedSynapses)),
+            JSON.stringify(receipt.warnings),
+            new Date().toISOString()
+          );
+      }
       this.database
         .prepare("INSERT OR REPLACE INTO meta(key, value) VALUES ('updatedAt', ?)")
         .run(new Date().toISOString());
     });
+  }
+
+  recordWarning(url: string, message: string): void {
+    this.database
+      .prepare("INSERT INTO warnings(url, message) VALUES (?, ?)")
+      .run(url, message);
   }
 
   counts(): CrawlFrontierCounts {
@@ -688,22 +750,37 @@ export class CrawlFrontierStore {
         "SELECT status, COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes FROM visited GROUP BY status"
       )
       .all() as unknown as Array<{ status: string; count: number; bytes: number }>;
+    const receiptCounts = this.database
+      .prepare("SELECT kind, COUNT(*) AS count FROM result_receipts GROUP BY kind")
+      .all() as unknown as Array<{ kind: DatasetFormat; count: number }>;
+    const warnings = this.database
+      .prepare("SELECT COUNT(*) AS count FROM warnings")
+      .get() as { count: number };
+    const modalityCounts: Partial<Record<DatasetFormat, number>> = {};
+    for (const entry of receiptCounts) {
+      modalityCounts[entry.kind] = Number(entry.count);
+    }
     return {
       queued: Number(queued.count),
       visited: Number(counts.find((entry) => entry.status === "visited")?.count ?? 0),
       skipped: Number(counts.find((entry) => entry.status === "skipped")?.count ?? 0),
       processedBytes: Number(
         counts.find((entry) => entry.status === "visited")?.bytes ?? 0
-      )
+      ),
+      resultCount: receiptCounts.reduce((sum, entry) => sum + Number(entry.count), 0),
+      warningCount: Number(warnings.count),
+      modalityCounts
     };
   }
 
-  warnings(): string[] {
-    return (
-      this.database
-        .prepare("SELECT url, message FROM warnings ORDER BY id")
-        .all() as unknown as Array<{ url: string; message: string }>
-    ).map((entry) => `${entry.url}: ${entry.message}`);
+  warnings(limit = 64): string[] {
+    const records = this.database
+      .prepare("SELECT url, message FROM warnings ORDER BY id DESC LIMIT ?")
+      .all(Math.max(1, Math.round(limit))) as unknown as Array<{
+      url: string;
+      message: string;
+    }>;
+    return records.reverse().map((entry) => `${entry.url}: ${entry.message}`);
   }
 
   close(): void {

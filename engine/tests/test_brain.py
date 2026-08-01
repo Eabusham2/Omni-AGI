@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -23,6 +23,7 @@ from omni_core import AdaptiveBrain, OmniConfig
 from omni_core.model import BitLinear
 from omni_core.starter import STARTER_CORPUS
 from omni_core.ternary_packing import verify_ternary_shards
+from omni_core.vsa import ConceptMemory, SubstrateResourcePause
 
 
 class AdaptiveBrainTests(unittest.TestCase):
@@ -37,7 +38,6 @@ class AdaptiveBrainTests(unittest.TestCase):
 
     def make_brain(self, **overrides):
         config = OmniConfig.micro(
-            parallel_thoughts=1,
             max_seq_len=40,
             learn_from_own_messages=False,
             **overrides,
@@ -58,6 +58,25 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertFalse(result["source"]["raw_text_retained"])
         self.assertTrue((brain.engine_path / "core.safetensors").is_file())
         self.assertTrue((brain.engine_path / "plasticity.safetensors").is_file())
+        self.assertFalse(
+            any(
+                name.startswith("substrate.")
+                for name in load_file(
+                    str(brain.engine_path / "plasticity.safetensors")
+                )
+            )
+        )
+        engine_metadata = json.loads(
+            (brain.engine_path / "brain.json").read_text("utf-8")
+        )
+        self.assertNotIn("neurons", engine_metadata["substrate"])
+        self.assertGreater(
+            engine_metadata["substrate"]["persistence"]["shardCount"],
+            1,
+        )
+        self.assertTrue(
+            (brain.engine_path / "substrate" / "manifest.json").is_file()
+        )
         self.assertTrue((brain.engine_path / "events.sqlite3").is_file())
         brain.events.close()
 
@@ -74,7 +93,6 @@ class AdaptiveBrainTests(unittest.TestCase):
             blank_root,
             OmniConfig.micro(
                 origin_kind="blank",
-                parallel_thoughts=1,
                 max_seq_len=40,
             ),
         )
@@ -88,7 +106,6 @@ class AdaptiveBrainTests(unittest.TestCase):
             starter_root,
             OmniConfig.micro(
                 origin_kind="starter",
-                parallel_thoughts=1,
                 max_seq_len=40,
             ),
         )
@@ -96,6 +113,21 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertIsNotNone(manifest)
         assert manifest is not None
         self.assertEqual(manifest["corpusPassagesVisited"], len(STARTER_CORPUS))
+        self.assertEqual(len(manifest["corpusLossCurve"]), len(STARTER_CORPUS))
+        self.assertTrue(
+            all(loss >= 0.0 for loss in manifest["corpusLossCurve"])
+        )
+        self.assertEqual(
+            sum(entry["records"] for entry in manifest["datasetLedger"]),
+            len(STARTER_CORPUS) + manifest["actionTrajectories"],
+        )
+        self.assertTrue(
+            all(
+                len(entry["sha256"]) == 64
+                and entry["upstreamModel"] is None
+                for entry in manifest["datasetLedger"]
+            )
+        )
         self.assertFalse(manifest["rlhf"])
         self.assertFalse(manifest["dpo"])
         self.assertFalse(manifest["rewardModel"])
@@ -117,6 +149,14 @@ class AdaptiveBrainTests(unittest.TestCase):
             (
                 starter.engine_path / "origin" / "plasticity.safetensors"
             ).read_bytes(),
+        )
+        self.assertTrue(
+            (
+                starter.engine_path
+                / "origin"
+                / "substrate"
+                / "manifest.json"
+            ).is_file()
         )
         current_packed = verify_ternary_shards(
             starter.engine_path / "packed-ternary"
@@ -229,6 +269,51 @@ class AdaptiveBrainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum mismatch"):
             AdaptiveBrain.load(self.root, "brain-test")
 
+    def test_load_refreshes_valid_pack_when_dynamic_synapse_order_or_values_are_stale(self):
+        brain = self.make_brain()
+        brain.learn_experience(
+            "Dynamic inference packs must match every persisted ternary synapse.",
+            steps=0,
+        )
+        synapse_ids, expected_before = brain._dynamic_synapse_export()
+        self.assertTrue(synapse_ids)
+        target_id = synapse_ids[0]
+        previous = int(brain.memory.synapses[target_id]["effective_weight"])
+        replacement = 1 if previous != 1 else -1
+        brain.memory.synapses[target_id]["effective_weight"] = replacement
+        brain.save()
+        expected_checksum = brain.parameter_checksum()
+        brain.events.close()
+
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        verified = verify_ternary_shards(
+            reloaded.engine_path / "packed-ternary"
+        )
+        reloaded_ids, reloaded_values = reloaded._dynamic_synapse_export()
+        packed_values = verified.tensors[
+            "substrate.dynamic_synapses.weights"
+        ]
+        self.assertEqual(
+            verified.manifest["metadata"]["parameterChecksum"],
+            expected_checksum,
+        )
+        self.assertEqual(
+            verified.manifest["metadata"]["dynamicSynapseCount"],
+            len(reloaded_ids),
+        )
+        self.assertEqual(
+            verified.manifest["metadata"]["dynamicSynapseOrderSha256"],
+            __import__("hashlib").sha256(
+                "\0".join(reloaded_ids).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertTrue(torch.equal(packed_values, reloaded_values))
+        self.assertNotEqual(
+            int(packed_values[0]),
+            int(expected_before[0]),
+        )
+        reloaded.events.close()
+
     def test_explicit_dataset_epoch_replays_without_duplicate_source_records(self):
         brain = self.make_brain()
         text = "Each requested epoch must revisit this valid record."
@@ -273,6 +358,7 @@ class AdaptiveBrainTests(unittest.TestCase):
             "train_loss",
             "ponder_factors",
             "branches",
+            "spreading_activation",
         ):
             self.assertIn(field, trace)
         self.assertFalse(trace["textual_memory_injected"])
@@ -281,12 +367,60 @@ class AdaptiveBrainTests(unittest.TestCase):
             trace["parameter_checksum_after"],
         )
         self.assertGreaterEqual(len(trace["branches"]), 1)
+        self.assertTrue(
+            trace["spreading_activation"]["exactTernaryContribution"]
+        )
+        self.assertFalse(
+            trace["spreading_activation"]["latentMagnitudeUsed"]
+        )
         self.assertIn("action_policy_scores", trace)
         self.assertEqual(
             set(trace["action_policy_scores"]),
             {"talk", "tool", "imagine", "agent", "ponder", "learn", "evolve", "stop"},
         )
         self.assertFalse(result["runtimeCard"]["hidden_behavioral_prompt"])
+        brain.events.close()
+
+    def test_default_response_budget_is_state_scaled_not_the_context_ceiling(self):
+        brain = AdaptiveBrain.create(
+            "long-response-brain",
+            self.root,
+            OmniConfig.micro(
+                max_seq_len=520,
+                learn_from_own_messages=False,
+            ),
+        )
+        observed: list[int] = []
+
+        def generate(input_ids, **kwargs):
+            observed.append(int(kwargs["max_new_tokens"]))
+            suffix = torch.tensor(
+                [[ord("A") + brain.tokenizer.byte_offset]],
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            return torch.cat((input_ids, suffix), dim=1), [0.0]
+
+        with mock.patch.object(brain.decoder, "generate", side_effect=generate):
+            result = brain.chat("Use the hardware-sized response workspace.", seed=17)
+        self.assertEqual(result["text"], "A")
+        self.assertTrue(observed)
+        self.assertEqual(len(set(observed)), 1)
+        budget = observed[0]
+        self.assertGreaterEqual(
+            budget, brain.config.generation_token_budget(0.0)
+        )
+        self.assertLessEqual(
+            budget, brain.config.generation_token_budget(1.0)
+        )
+        self.assertLess(budget, brain.config.max_seq_len)
+        self.assertEqual(
+            result["trace"]["generation_budget_source"],
+            "hardware-and-organic-state",
+        )
+        self.assertEqual(
+            result["trace"]["generation_budget_tokens"], budget
+        )
         brain.events.close()
 
     def test_substrate_inspection_is_paged_read_only_and_invalidates_stale_cursor(self):
@@ -493,7 +627,6 @@ class AdaptiveBrainTests(unittest.TestCase):
             self.root / "tail-right",
             OmniConfig.micro(
                 seed=91,
-                parallel_thoughts=1,
                 max_seq_len=40,
                 learn_from_own_messages=False,
             ),
@@ -605,6 +738,52 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertTrue(torch.all(tail_target[tail:] == 0.0))
         brain.events.close()
 
+    def test_failed_media_decode_is_an_explicit_rejected_record(self):
+        brain = self.make_brain(image_enabled=True, vision_enabled=True)
+        image_path = self.root / "corrupt.png"
+        image_path.write_bytes(b"not-a-decodable-image")
+
+        with mock.patch.object(
+            brain,
+            "_decode_image",
+            side_effect=RuntimeError("corrupt image fixture"),
+        ):
+            result = brain.ingest(
+                path=str(image_path),
+                kind="image",
+                policy="encode",
+            )
+
+        self.assertFalse(result["source"]["modality_trained"])
+        self.assertEqual(result["mediaCoverage"]["failedRecords"], 1)
+        self.assertFalse(result["mediaCoverage"]["complete"])
+        self.assertEqual(
+            result["coverage"],
+            {
+                "discoveredFiles": 1,
+                "completedFiles": 1,
+                "processedFiles": 1,
+                "rejectedFiles": 0,
+                "discoveredRecords": 1,
+                "processedRecords": 0,
+                "rejectedRecords": 1,
+                "processedBytes": len(b"not-a-decodable-image"),
+                "shards": 0,
+                "modalityCounts": {"image": 1},
+                "errors": [
+                    {
+                        "source": "corrupt.png",
+                        "message": "corrupt image fixture",
+                    }
+                ],
+                "complete": True,
+            },
+        )
+        self.assertTrue(
+            any("corrupt image fixture" in warning for warning in result["warnings"])
+        )
+        brain.events.close()
+
     def test_archive_media_is_trained_while_temporary_record_path_is_leased(self):
         brain = self.make_brain()
         wav_path = self.root / "leased.wav"
@@ -700,14 +879,73 @@ class AdaptiveBrainTests(unittest.TestCase):
 
     def test_snapshot_and_append_only_event_log(self):
         brain = self.make_brain()
+        brain.learn_experience(
+            "Snapshot shards preserve this distributed neural assembly.",
+            steps=0,
+        )
         result = brain.snapshot("checkpoint")
         self.assertTrue(Path(result["path"], "core.safetensors").is_file())
+        snapshot_path = Path(result["path"])
+        snapshot_metadata = json.loads(
+            (snapshot_path / "brain.json").read_text("utf-8")
+        )
+        restored_memory = ConceptMemory.load_sharded(
+            snapshot_path / "substrate",
+            snapshot_metadata["substrate"],
+        )
+        self.assertEqual(brain.memory.neurons, restored_memory.neurons)
+        self.assertEqual(brain.memory.assemblies, restored_memory.assemblies)
+        self.assertEqual(brain.memory.synapses, restored_memory.synapses)
         self.assertEqual(brain.events.integrity(), "ok")
         with self.assertRaises(sqlite3.DatabaseError):
             brain.events.connection.execute(
                 "UPDATE events SET kind='changed' WHERE sequence=1"
             )
         brain.events.close()
+
+    def test_interrupted_shard_save_keeps_prior_generation_loadable(self):
+        brain = self.make_brain()
+        prior_metadata_bytes = (
+            brain.engine_path / "brain.json"
+        ).read_bytes()
+        prior_metadata = json.loads(prior_metadata_bytes.decode("utf-8"))
+        prior_generation = prior_metadata["substrate"]["persistence"][
+            "activeGeneration"
+        ]
+        prior_assemblies = len(brain.memory.assemblies)
+
+        # Simulate a state mutation followed by the host reserve pausing before
+        # any new generation pointer or engine metadata can be promoted.
+        saved_guard = brain.memory.growth_guard
+        brain.memory.growth_guard = None
+        brain.memory.learn(
+            "An interrupted save must not replace the committed shard generation."
+        )
+        brain.memory.growth_guard = lambda _estimated: False
+        with self.assertRaises(SubstrateResourcePause):
+            brain.save()
+        self.assertEqual(
+            (brain.engine_path / "brain.json").read_bytes(),
+            prior_metadata_bytes,
+        )
+        self.assertEqual(
+            json.loads(
+                (
+                    brain.engine_path / "substrate" / "manifest.json"
+                ).read_text("utf-8")
+            )["activeGeneration"],
+            prior_generation,
+        )
+        brain.memory.growth_guard = saved_guard
+        brain.events.close()
+
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        self.assertEqual(len(reloaded.memory.assemblies), prior_assemblies)
+        self.assertEqual(
+            reloaded.memory.persistence_manifest["activeGeneration"],
+            prior_generation,
+        )
+        reloaded.events.close()
 
     def test_hardware_profile_and_timescales_are_exposed(self):
         config = OmniConfig.from_external(
@@ -725,13 +963,10 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertEqual(config.hardware_tier, "gpu")
         self.assertEqual(config.d_model, 96)
         self.assertEqual(config.liquid_mode, "ltc")
-        self.assertEqual(config.working_memory_slots, 96)
-        self.assertEqual(
-            config.parallel_thoughts,
-            OmniConfig().parallel_thoughts,
-        )
-        self.assertEqual(config.train_batch_size, 8)
-        self.assertEqual(config.gradient_accumulation, 2)
+        self.assertEqual(config.working_memory_slots, 512)
+        self.assertFalse(hasattr(config, "parallel_thoughts"))
+        self.assertEqual(config.train_batch_size, 2)
+        self.assertEqual(config.gradient_accumulation, 8)
         self.assertTrue(config.gradient_checkpointing)
 
     def test_slow_training_uses_profile_batch_and_gradient_accumulation(self):
@@ -762,7 +997,6 @@ class AdaptiveBrainTests(unittest.TestCase):
         parameter_config = OmniConfig.micro(
             name="parameter",
             seed=81,
-            parallel_thoughts=1,
             max_seq_len=40,
             online_learning=False,
             learn_from_own_messages=False,
@@ -772,7 +1006,6 @@ class AdaptiveBrainTests(unittest.TestCase):
         working_config = OmniConfig.micro(
             name="working",
             seed=81,
-            parallel_thoughts=1,
             max_seq_len=40,
             online_learning=False,
             learn_from_own_messages=False,
@@ -811,6 +1044,128 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertIsNotNone(reloaded._working_memory_vector())
         reloaded.events.close()
 
+    def test_recent_dialogue_tokens_participate_without_hidden_prompt_text(self):
+        brain = AdaptiveBrain.create(
+            "recent-context",
+            self.root / "recent-context",
+            OmniConfig.micro(
+                max_seq_len=96,
+                online_learning=False,
+                learn_from_own_messages=False,
+            ),
+        )
+        observed: list[list[int]] = []
+
+        def generate(input_ids, **_kwargs):
+            observed.append(input_ids[0].detach().cpu().tolist())
+            suffix = torch.tensor(
+                [[ord("A") + brain.tokenizer.byte_offset]],
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            return torch.cat((input_ids, suffix), dim=1), [0.0]
+
+        with mock.patch.object(brain.decoder, "generate", side_effect=generate):
+            first = brain.chat("Remember first-marker.", max_new_tokens=1, seed=3)
+            first_call_count = len(observed)
+            second = brain.chat(
+                "Use it in this turn.",
+                max_new_tokens=1,
+                seed=4,
+                tool_schemas=[
+                    {
+                        "id": "code.execute",
+                        "actions": ["run"],
+                        "grant": "ask",
+                        "description": "HIDDEN TOOL PROSE MUST NOT ENTER",
+                    }
+                ],
+            )
+
+        completed, _removed = brain._bounded_completed_turn_tokens(
+            "Remember first-marker.", first["text"]
+        )
+        second_prompts = observed[first_call_count:]
+        self.assertTrue(second_prompts)
+        self.assertTrue(
+            all(
+                prompt[0] == brain.tokenizer.bos_id
+                and completed == prompt[1 : 1 + len(completed)]
+                for prompt in second_prompts
+            )
+        )
+        decoded_prompt = brain.tokenizer.decode(second_prompts[0])
+        self.assertIn("first-marker", decoded_prompt)
+        self.assertNotIn("HIDDEN TOOL PROSE", decoded_prompt)
+        self.assertTrue(second["trace"]["recent_dialogue_context_injected"])
+        self.assertGreater(second["trace"]["recent_dialogue_token_count"], 0)
+        self.assertTrue(second["trace"]["prompt_text_expanded"])
+        self.assertFalse(second["trace"]["hidden_prompt_text_expanded"])
+        self.assertFalse(second["trace"]["long_term_source_text_injected"])
+        self.assertFalse(second["trace"]["textual_memory_injected"])
+        self.assertFalse(second["trace"]["tool_schema_text_injected"])
+        self.assertFalse(second["runtimeCard"]["hidden_behavioral_prompt"])
+        brain.events.close()
+
+    def test_recent_dialogue_ring_evicts_by_capacity_and_survives_reload(self):
+        root = self.root / "recent-reload"
+        brain = AdaptiveBrain.create(
+            "recent-reload",
+            root,
+            OmniConfig.micro(
+                max_seq_len=24,
+                online_learning=False,
+                learn_from_own_messages=False,
+            ),
+        )
+
+        def generate(input_ids, **_kwargs):
+            suffix = torch.tensor(
+                [[ord("R") + brain.tokenizer.byte_offset]],
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            return torch.cat((input_ids, suffix), dim=1), [0.0]
+
+        with mock.patch.object(brain.decoder, "generate", side_effect=generate):
+            brain.chat(
+                "A deliberately oversized first working-memory turn.",
+                max_new_tokens=1,
+                seed=8,
+            )
+            brain.chat(
+                "A newer turn replaces the oldest bounded token activity.",
+                max_new_tokens=1,
+                seed=9,
+            )
+        snapshot = brain.workspace_snapshot()
+        recent_before = list(brain.recent_token_context)
+        self.assertLessEqual(len(recent_before), brain.config.max_seq_len)
+        self.assertEqual(recent_before[0], brain.tokenizer.human_id)
+        self.assertIn(brain.tokenizer.brain_id, recent_before)
+        self.assertEqual(recent_before[-1], brain.tokenizer.eos_id)
+        self.assertGreater(snapshot["contextWindow"]["evictions"], 0)
+        self.assertEqual(
+            snapshot["contextWindow"]["recentTokenCount"], len(recent_before)
+        )
+        self.assertEqual(
+            snapshot["contextWindow"]["recentTokenHash"],
+            brain._token_sequence_hash(recent_before),
+        )
+        evictions = brain.counters["context_token_evictions"]
+        brain.events.close()
+
+        reloaded = AdaptiveBrain.load(root, "recent-reload")
+        self.assertEqual(reloaded.recent_token_context, recent_before)
+        self.assertEqual(
+            reloaded.counters["context_token_evictions"], evictions
+        )
+        self.assertEqual(
+            reloaded.workspace_snapshot()["contextWindow"]["recentTokenHash"],
+            snapshot["contextWindow"]["recentTokenHash"],
+        )
+        reloaded.events.close()
+
     def test_slow_metaplastic_anchors_persist_and_penalize_drift(self):
         brain = self.make_brain(metaplasticity=True)
         brain.learn_experience("Stable amber knowledge should resist drift.")
@@ -838,10 +1193,6 @@ class AdaptiveBrainTests(unittest.TestCase):
 
     def test_unbounded_sparse_memory_expands_until_resource_guard(self):
         brain = self.make_brain(
-            growth_policy="unbounded",
-            max_concepts=1,
-            max_ideas=1,
-            max_synapses=1,
             growth_novelty_threshold=2.0,
         )
         brain._resource_readings = lambda: {

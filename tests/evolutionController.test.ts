@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrainRepository } from "../src/main/brainRepository";
+import { ChatActionController } from "../src/main/chatActionController";
 import {
   EvolutionController,
   type EvolutionToolExecutor
@@ -12,6 +14,7 @@ import { EVOLUTION_BENCHMARK_DOMAINS } from "../src/main/evolutionPolicy";
 import {
   DEFAULT_CONFIG,
   type BrainDocument,
+  type ChatResult,
   type ToolExecutionResult,
   type ToolInvocation
 } from "../src/shared/types";
@@ -29,6 +32,20 @@ const WORKER_CANDIDATE_PARAMETER_SHA256 = "6".repeat(64);
 const WORKER_CANDIDATE_STATE_SHA256 = "7".repeat(64);
 const WORKER_DIFF_SHA256 = "8".repeat(64);
 const WORKER_EVALUATION_SHA256 = "9".repeat(64);
+const SOURCE_EDITS = [
+  {
+    path: "src/evolution-fixture.ts",
+    content: "export const evolutionFixture = true;\n",
+    expectedSha256: null
+  }
+] as const;
+
+function sourceRequest() {
+  return {
+    candidateKind: "source" as const,
+    sourceEdits: SOURCE_EDITS.map((edit) => ({ ...edit }))
+  };
+}
 
 function workerCandidate(
   status = "ready",
@@ -86,13 +103,26 @@ function workerEvaluation(passed = true): Record<string, unknown> {
 }
 
 function proposalOutput(worktree: string, branch: string, parentCommit = PARENT_COMMIT) {
+  const sourceEditLineage = SOURCE_EDITS.map((edit) => ({
+    path: edit.path,
+    expectedSha256: edit.expectedSha256,
+    resultSha256: createHash("sha256").update(edit.content).digest("hex"),
+    bytes: Buffer.byteLength(edit.content)
+  }));
   return {
     worktree,
     branch,
     parentCommit,
     evaluatorVersion: 1,
     evaluatorSha256: EVALUATOR_SHA256,
-    benchmarkDomains: [...EVOLUTION_BENCHMARK_DOMAINS]
+    benchmarkDomains: [...EVOLUTION_BENCHMARK_DOMAINS],
+    sourceEditLineage,
+    authoredChangedPaths: SOURCE_EDITS.map((edit) => edit.path),
+    authoredDiffSha256: DIFF_SHA256,
+    authoredBytes: sourceEditLineage.reduce(
+      (total, edit) => total + edit.bytes,
+      0
+    )
   };
 }
 
@@ -204,7 +234,8 @@ describe("EvolutionController", () => {
     ]);
     const run = await controller.start({
       brainId: brain.id,
-      objective: "Reduce inference latency without retention loss"
+      objective: "Reduce inference latency without retention loss",
+      ...sourceRequest()
     });
     expect(run).toMatchObject({
       state: "experimenting",
@@ -292,6 +323,140 @@ describe("EvolutionController", () => {
     });
   });
 
+  it("defaults edit-free improvement to substrate and refuses untyped source changes", async () => {
+    await expect(
+      new EvolutionController(repository, {
+        execute: vi.fn(),
+        cancel: vi.fn(() => 0)
+      }).start({
+        brainId: brain.id,
+        objective: "Do not invent a source patch from prose",
+        candidateKind: "source"
+      })
+    ).rejects.toThrow(/requires one or more exact typed sourceEdits/i);
+
+    await setEvolutionPermission("ask");
+    const request = vi.fn(async (method: string) => {
+      if (method === "evolution.propose") return workerCandidate();
+      if (method === "evolution.list") {
+        return { candidates: [workerCandidate()] };
+      }
+      throw new Error(`Unexpected method ${method}.`);
+    });
+    const evolution = new EvolutionController(
+      repository,
+      { execute: vi.fn(), cancel: vi.fn(() => 0) },
+      { request } as unknown as EngineSupervisor
+    );
+    const run = await evolution.start({
+      brainId: brain.id,
+      objective: "Reduce a measured uncertainty without editing source"
+    });
+    expect(run).toMatchObject({
+      state: "experimenting",
+      candidateKind: "substrate"
+    });
+    expect(request).toHaveBeenCalledWith(
+      "evolution.propose",
+      expect.objectContaining({
+        latentReplay: true,
+        provenance: expect.objectContaining({ route: "substrate" })
+      }),
+      30 * 60_000
+    );
+  });
+
+  it("carries a worker-emitted organic evolve action into a viable isolated substrate candidate", async () => {
+    await setEvolutionPermission("ask");
+    const request = vi.fn(async (method: string) => {
+      if (method === "evolution.propose") return workerCandidate();
+      if (method === "evolution.list") {
+        return { candidates: [workerCandidate()] };
+      }
+      throw new Error(`Unexpected method ${method}.`);
+    });
+    const evolution = new EvolutionController(
+      repository,
+      { execute: vi.fn(), cancel: vi.fn(() => 0) },
+      { request } as unknown as EngineSupervisor
+    );
+    const now = new Date().toISOString();
+    let chatCall = 0;
+    const chat = vi.fn(async (): Promise<ChatResult> => {
+      chatCall += 1;
+      return {
+        brain: await repository.get(brain.id),
+        humanMessage: {
+          id: `human-${chatCall}`,
+          role: "human",
+          content: "measured uncertainty",
+          createdAt: now
+        },
+        brainMessage: {
+          id: `brain-${chatCall}`,
+          role: "brain",
+          content: chatCall === 1 ? "I formed an isolated experiment." : "The experiment is visible.",
+          createdAt: now
+        },
+        trace: {
+          id: `trace-${chatCall}`,
+          createdAt: now,
+          steps: []
+        } as unknown as ChatResult["trace"],
+        proposedActions:
+          chatCall === 1
+            ? [
+                {
+                  kind: "evolve",
+                  source: "brain",
+                  toolId: "source.self-modify",
+                  action: "propose",
+                  arguments: {
+                    objective: "reduce measured uncertainty",
+                    organic: true,
+                    recursive: true,
+                    candidateKind: "substrate",
+                    latentReplay: true
+                  }
+                }
+              ]
+            : []
+      };
+    });
+    const controller = new ChatActionController(
+      { chat },
+      {
+        execute: vi.fn(),
+        cancel: vi.fn(() => 0)
+      },
+      evolution
+    );
+    const result = await controller.send(
+      brain.id,
+      "What limitation is currently measurable?"
+    );
+    expect(result.actionEvents?.[0]).toMatchObject({
+      state: "complete",
+      evolutionRunId: expect.any(String),
+      action: {
+        kind: "evolve",
+        arguments: expect.objectContaining({
+          candidateKind: "substrate",
+          latentReplay: true
+        })
+      }
+    });
+    expect(request).toHaveBeenCalledWith(
+      "evolution.propose",
+      expect.objectContaining({
+        latentReplay: true,
+        provenance: expect.objectContaining({ route: "substrate" })
+      }),
+      30 * 60_000
+    );
+    expect(chat).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects an evaluator result that claims an empty source candidate passed", async () => {
     const execute = vi.fn(async (invocation: ToolInvocation) => {
       if (invocation.action === "propose") {
@@ -331,7 +496,8 @@ describe("EvolutionController", () => {
     });
     const run = await controller.start({
       brainId: brain.id,
-      objective: "Do not promote an empty source fork"
+      objective: "Do not promote an empty source fork",
+      ...sourceRequest()
     });
     const candidate = (await controller.listCandidates(brain.id, run.id))[0]!;
 
@@ -824,7 +990,7 @@ describe("EvolutionController", () => {
     const held = await controller.start({
       brainId: brain.id,
       objective: "Keep source candidate awaiting explicit review",
-      candidateKind: "source"
+      ...sourceRequest()
     });
     expect(held.state).toBe("experimenting");
     expect(execute.mock.calls.map(([invocation]) => invocation.action)).toEqual([
@@ -835,7 +1001,7 @@ describe("EvolutionController", () => {
     const promoted = await controller.start({
       brainId: brain.id,
       objective: "Promote verified source candidate under full authority",
-      candidateKind: "source"
+      ...sourceRequest()
     });
     expect(promoted.state).toBe("promoted");
     expect(execute.mock.calls.map(([invocation]) => invocation.action)).toEqual(
@@ -843,7 +1009,7 @@ describe("EvolutionController", () => {
     );
   });
 
-  it("records evaluations, consumes exact promotion approval, recurses, and rolls back by commit", async () => {
+  it("records evaluations, consumes exact promotion approval, and rolls back by commit", async () => {
     let proposal = 0;
     const execute = vi.fn(async (invocation: ToolInvocation): Promise<ToolExecutionResult> => {
       if (invocation.action === "propose") {
@@ -901,7 +1067,8 @@ describe("EvolutionController", () => {
     const run = await controller.start({
       brainId: brain.id,
       objective: "Improve the improvement evaluator",
-      recursive: true
+      recursive: false,
+      ...sourceRequest()
     });
     const initial = (await controller.listCandidates(brain.id, run.id))[0]!;
     const promoted = await controller.approve({
@@ -932,17 +1099,6 @@ describe("EvolutionController", () => {
         ]
       })
     ]);
-    const allCandidates = await controller.listCandidates(brain.id);
-    expect(allCandidates).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          parentCandidateId: promoted.id,
-          generation: 1,
-          state: "experimenting"
-        })
-      ])
-    );
-
     const rolledBack = await controller.rollback({
       brainId: brain.id,
       candidateId: promoted.id
@@ -1031,7 +1187,8 @@ describe("EvolutionController", () => {
 
     const run = await controller.start({
       brainId: brain.id,
-      objective: "Reduce observed failures"
+      objective: "Reduce observed failures",
+      ...sourceRequest()
     });
     expect(run.limitations.length).toBeGreaterThan(0);
     expect(run.hypothesis).toMatch(/measured limitation/i);
@@ -1069,7 +1226,8 @@ describe("EvolutionController", () => {
     });
     const run = await controller.start({
       brainId: brain.id,
-      objective: "Attempt evaluator drift"
+      objective: "Attempt evaluator drift",
+      ...sourceRequest()
     });
     const candidate = (await controller.listCandidates(brain.id, run.id))[0]!;
     const rejected = await controller.approve({
@@ -1104,7 +1262,8 @@ describe("EvolutionController", () => {
     });
     const run = await controller.start({
       brainId: brain.id,
-      objective: "Attempt without permission"
+      objective: "Attempt without permission",
+      ...sourceRequest()
     });
     expect(run).toMatchObject({
       state: "failed",

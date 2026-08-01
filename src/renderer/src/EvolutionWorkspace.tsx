@@ -50,11 +50,6 @@ const candidateKinds: Array<{
     id: "architecture",
     label: "Compatible growth",
     description: "Add one ternary residual expert without changing tensor shapes"
-  },
-  {
-    id: "source",
-    label: "Studio source",
-    description: "Isolated Git worktree, build, tests, promotion, and rollback"
   }
 ];
 
@@ -435,6 +430,10 @@ export function EvolutionWorkspace({
               );
             })}
           </fieldset>
+          <p className="evolution-route-note">
+            Source candidates enter through exact hash-bound typed edit actions
+            in chat; an objective alone is never treated as source code.
+          </p>
           <label className="evolution-recursive">
             <input
               type="checkbox"

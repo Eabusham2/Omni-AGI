@@ -250,9 +250,9 @@ jobs:
           name: omni-v1-linux-${{ matrix.arch }}
           if-no-files-found: error
           path: |
-            release/*-Linux-${{ matrix.arch }}.AppImage
-            release/*-Linux-${{ matrix.arch }}.deb
-            release/*-Linux-${{ matrix.arch }}.tar.gz
+            release/*-Linux-*.AppImage
+            release/*-Linux-*.deb
+            release/*-Linux-*.tar.gz
             release/linux-package-smoke-${{ matrix.arch }}.json
 
   publish:

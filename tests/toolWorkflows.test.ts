@@ -1,14 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import {
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrainService,
@@ -16,6 +18,13 @@ import type {
 } from "../src/main/brainService";
 import { BrainRepository } from "../src/main/brainRepository";
 import { ToolExecutor } from "../src/main/toolExecutor";
+import {
+  inspectRuntimeArtifacts,
+  sha256File,
+  type SourceRuntimeLifecycle,
+  type SourceRuntimeManifest,
+  type SourceRuntimeStageRequest
+} from "../src/main/sourceRuntimeContract";
 import {
   DEFAULT_CONFIG,
   type BrainDocument,
@@ -97,7 +106,10 @@ describe("ToolExecutor complete workflows", () => {
     await repository.save(current);
   }
 
-  function executorFor(chat?: BrainService["chat"]): ToolExecutor {
+  function executorFor(
+    chat?: BrainService["chat"],
+    sourceRuntime?: SourceRuntimeLifecycle
+  ): ToolExecutor {
     const service = {
       repository,
       listToolPermissions: async (brainId: string) => {
@@ -112,7 +124,8 @@ describe("ToolExecutor complete workflows", () => {
         generate: vi.fn(() => {
           throw new Error("Unexpected modality job.");
         })
-      } as unknown as RuntimeJobManager
+      } as unknown as RuntimeJobManager,
+      sourceRuntime
     );
   }
 
@@ -122,7 +135,8 @@ describe("ToolExecutor complete workflows", () => {
     const runningBinary = join(sourceRepository, "release", "running-binary.exe");
     await Promise.all([
       mkdir(join(sourceRepository, "release"), { recursive: true }),
-      mkdir(join(sourceRepository, "tests"), { recursive: true })
+      mkdir(join(sourceRepository, "tests"), { recursive: true }),
+      mkdir(join(sourceRepository, "node_modules"), { recursive: true })
     ]);
     await Promise.all([
       writeFile(
@@ -131,7 +145,12 @@ describe("ToolExecutor complete workflows", () => {
           name: "omni-evolution-fixture",
           private: true,
           scripts: {
-            test: "node -e \"process.stdout.write('allowlisted unit test passed')\""
+            test:
+              "node -e \"const fs=require('node:fs');" +
+              "const linked=fs.lstatSync('node_modules').isSymbolicLink();" +
+              "const expected=process.env.OMNI_EVOLUTION_CANDIDATE_WORKTREE==='1';" +
+              "if(linked!==expected)process.exit(3);" +
+              "process.stdout.write('allowlisted unit test passed')\""
           }
         })
       ),
@@ -360,6 +379,9 @@ describe("ToolExecutor complete workflows", () => {
         expect.objectContaining({ name: "diff-check", passed: true })
       ])
     );
+    await expect(
+      lstat(join(proposal.worktree, "node_modules"))
+    ).rejects.toMatchObject({ code: "ENOENT" });
 
     await writeFile(
       join(proposal.worktree, "new-capability.txt"),
@@ -439,7 +461,7 @@ describe("ToolExecutor complete workflows", () => {
       promoted: true,
       diffSha256: revalidation.diffSha256,
       evaluatorSha256: proposal.evaluatorSha256,
-      note: expect.stringMatching(/running binary was not overwritten or restarted/i)
+      note: expect.stringMatching(/did not activate or replace the running executable/i)
     });
     expect(promotion.commit).toMatch(/^[a-f0-9]{40,64}$/);
     expect(promotion.parentCommit).toMatch(/^[a-f0-9]{40,64}$/);
@@ -496,7 +518,8 @@ describe("ToolExecutor complete workflows", () => {
     const evolutionRoot = join(temporaryRoot, "bounded-candidates");
     await Promise.all([
       mkdir(join(sourceRepository, "src"), { recursive: true }),
-      mkdir(join(sourceRepository, "tests"), { recursive: true })
+      mkdir(join(sourceRepository, "tests"), { recursive: true }),
+      mkdir(join(sourceRepository, "node_modules"), { recursive: true })
     ]);
     await Promise.all([
       writeFile(
@@ -505,7 +528,12 @@ describe("ToolExecutor complete workflows", () => {
           name: "omni-bounded-evolution-fixture",
           private: true,
           scripts: {
-            test: "node -e \"process.stdout.write('bounded evaluator passed')\""
+            test:
+              "node -e \"const fs=require('node:fs');" +
+              "const linked=fs.lstatSync('node_modules').isSymbolicLink();" +
+              "const expected=process.env.OMNI_EVOLUTION_CANDIDATE_WORKTREE==='1';" +
+              "if(linked!==expected)process.exit(3);" +
+              "process.stdout.write('bounded evaluator passed')\""
           }
         })
       ),
@@ -567,7 +595,12 @@ describe("ToolExecutor complete workflows", () => {
               name: "omni-bounded-evolution-fixture",
               private: true,
               scripts: {
-                test: "node -e \"process.stdout.write('bounded evaluator passed')\""
+                test:
+                  "node -e \"const fs=require('node:fs');" +
+                  "const linked=fs.lstatSync('node_modules').isSymbolicLink();" +
+                  "const expected=process.env.OMNI_EVOLUTION_CANDIDATE_WORKTREE==='1';" +
+                  "if(linked!==expected)process.exit(3);" +
+                  "process.stdout.write('bounded evaluator passed')\""
               }
             })
           )
@@ -697,6 +730,275 @@ describe("ToolExecutor complete workflows", () => {
     expect((await run("git", ["status", "--porcelain"], sourceRepository)).stdout).toBe("");
   }, 60_000);
 
+  it("stages and schedules only Full-Authority runtimes and fails closed before merge", async () => {
+    const sourceRepository = join(temporaryRoot, "activation-source");
+    const evolutionRoot = join(temporaryRoot, "activation-candidates");
+    const runtimeRoot = join(temporaryRoot, "activation-runtimes");
+    await Promise.all([
+      mkdir(join(sourceRepository, "src"), { recursive: true }),
+      mkdir(join(sourceRepository, "tests"), { recursive: true }),
+      mkdir(join(sourceRepository, "node_modules"), { recursive: true }),
+      mkdir(runtimeRoot, { recursive: true })
+    ]);
+    const unitScript =
+      "node -e \"const fs=require('node:fs');" +
+      "const linked=fs.lstatSync('node_modules').isSymbolicLink();" +
+      "const expected=process.env.OMNI_EVOLUTION_CANDIDATE_WORKTREE==='1';" +
+      "if(linked!==expected)process.exit(3);process.stdout.write('activation checks passed')\"";
+    await Promise.all([
+      writeFile(
+        join(sourceRepository, "package.json"),
+        JSON.stringify({
+          name: "omni-activation-fixture",
+          private: true,
+          scripts: {
+            pretest: "node -e \"process.exit(91)\"",
+            test: unitScript
+          }
+        })
+      ),
+      writeFile(
+        join(sourceRepository, "src", "runtime.txt"),
+        "runtime version one\n"
+      ),
+      writeFile(
+        join(sourceRepository, "tests", "immutable-evaluator.test.js"),
+        "export const immutableEvaluator = true;\n"
+      )
+    ]);
+    await run("git", ["init"], sourceRepository);
+    await run("git", ["config", "core.autocrlf", "false"], sourceRepository);
+    await run("git", ["config", "core.eol", "lf"], sourceRepository);
+    await run("git", ["config", "user.name", "Activation Workflow Test"], sourceRepository);
+    await run(
+      "git",
+      ["config", "user.email", "activation-workflow@local.invalid"],
+      sourceRepository
+    );
+    await run("git", ["add", "-A"], sourceRepository);
+    await run("git", ["commit", "-m", "Initial activation fixture"], sourceRepository);
+    process.env.OMNI_SOURCE_REPOSITORY = sourceRepository;
+    process.env.OMNI_EVOLUTION_ROOT = evolutionRoot;
+
+    let failStaging = false;
+    let tamperStaging = false;
+    const stage = vi.fn(
+      async (request: SourceRuntimeStageRequest) => {
+        if (failStaging) throw new Error("native staging fixture failed");
+        const linkedModules = join(request.worktree, "node_modules");
+        expect((await lstat(linkedModules)).isSymbolicLink()).toBe(true);
+        expect(await realpath(linkedModules)).toBe(
+          await realpath(join(sourceRepository, "node_modules"))
+        );
+        const slotId = `source-fixture-${stage.mock.calls.length}`;
+        const rootPath = join(runtimeRoot, slotId);
+        const executablePath = join(rootPath, "desktop", "omni-test-runtime");
+        await mkdir(dirname(executablePath), { recursive: true });
+        await writeFile(executablePath, `runtime for ${request.diffSha256}\n`);
+        const currentExecutableSha256 = (
+          await sha256File(request.currentExecutablePath)
+        ).sha256;
+        const artifacts = await inspectRuntimeArtifacts(rootPath);
+        const executableSha256 = (await sha256File(executablePath)).sha256;
+        const manifest: SourceRuntimeManifest = {
+          schemaVersion: 1,
+          slotId,
+          createdAt: new Date().toISOString(),
+          state: "staged",
+          platform: request.platform,
+          architecture: request.architecture,
+          lineage: {
+            parentCommit: request.parentCommit,
+            diffSha256: request.diffSha256,
+            evaluatorSha256: request.evaluatorSha256,
+            brainSnapshotId: request.brainSnapshotId
+          },
+          executableRelativePath: "desktop/omni-test-runtime",
+          executableSha256,
+          currentExecutableSha256,
+          artifactSha256: artifacts.artifactSha256,
+          artifacts: artifacts.artifacts,
+          engineStrategy: "reused-current-worker"
+        };
+        const manifestPath = join(rootPath, "runtime-manifest.json");
+        await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+        const result = {
+          slotId,
+          rootPath,
+          manifestPath,
+          manifestSha256: (await sha256File(manifestPath)).sha256,
+          executablePath,
+          manifest
+        };
+        if (tamperStaging) {
+          await writeFile(executablePath, "tampered after manifest\n");
+        }
+        return result;
+      }
+    );
+    const scheduleActivation = vi.fn(
+      async (
+        request: Parameters<SourceRuntimeLifecycle["scheduleActivation"]>[0]
+      ) => {
+        const manifest = await readFile(request.stage.manifestPath, "utf8").then(
+          (value) => JSON.parse(value) as SourceRuntimeManifest
+        );
+        const updated: SourceRuntimeManifest = {
+          ...manifest,
+          state: "deferred",
+          promotionCommit: request.promotionCommit,
+          candidateCommit: request.candidateCommit,
+          activation: {
+            state: "deferred",
+            scheduledAt: new Date().toISOString(),
+            delayMs: request.delayMs,
+            reason: "test host does not relaunch"
+          }
+        };
+        await writeFile(
+          request.stage.manifestPath,
+          JSON.stringify(updated, null, 2)
+        );
+        return {
+          state: "deferred" as const,
+          slotId: request.stage.slotId,
+          executablePath: request.stage.executablePath,
+          manifestPath: request.stage.manifestPath,
+          manifestSha256: (await sha256File(request.stage.manifestPath)).sha256,
+          promotionCommit: request.promotionCommit,
+          delayMs: request.delayMs,
+          reason: "test host does not relaunch"
+        };
+      }
+    );
+    const abandonStage = vi.fn(async () => undefined);
+    const lifecycle: SourceRuntimeLifecycle = {
+      stage,
+      scheduleActivation,
+      abandonStage
+    };
+    const executor = executorFor(undefined, lifecycle);
+    let currentContents = "runtime version one\n";
+    const promote = async (
+      level: "ask" | "auto" | "full",
+      nextContents: string
+    ): Promise<ToolExecutionResult> => {
+      await setPermission("source.self-modify", level);
+      const proposal = completeOutput<{
+        worktree: string;
+        evaluatorSha256: string;
+      }>(
+        await executor.execute({
+          brainId: brain.id,
+          toolId: "source.self-modify",
+          action: "propose",
+          arguments: {
+            objective: `Promote ${level} activation fixture`,
+            sourceEdits: [
+              {
+                path: "src/runtime.txt",
+                content: nextContents,
+                expectedSha256: sha256(currentContents)
+              }
+            ]
+          }
+        })
+      );
+      const validation = completeOutput<{ diffSha256: string }>(
+        await executor.execute({
+          brainId: brain.id,
+          toolId: "source.self-modify",
+          action: "test",
+          arguments: {
+            worktree: proposal.worktree,
+            tests: ["unit"],
+            expectedEvaluatorSha256: proposal.evaluatorSha256,
+            timeoutMs: 30_000
+          }
+        })
+      );
+      const invocation = {
+        brainId: brain.id,
+        toolId: "source.self-modify",
+        action: "promote",
+        arguments: {
+          worktree: proposal.worktree,
+          expectedDiffSha256: validation.diffSha256,
+          expectedEvaluatorSha256: proposal.evaluatorSha256
+        }
+      };
+      let result = await executor.execute(invocation);
+      if (result.state === "approval-required") {
+        result = await executor.execute({
+          ...invocation,
+          approvalToken: result.approvalToken
+        });
+      }
+      if (result.state === "complete") currentContents = nextContents;
+      return result;
+    };
+
+    const currentExecutableBefore = await sha256File(process.execPath);
+    expect((await promote("ask", "runtime version ask\n")).state).toBe("complete");
+    expect((await promote("auto", "runtime version auto\n")).state).toBe("complete");
+    expect(stage).not.toHaveBeenCalled();
+    expect(scheduleActivation).not.toHaveBeenCalled();
+
+    const full = await promote("full", "runtime version full\n");
+    expect(full.state, full.error).toBe("complete");
+    expect(full.output).toMatchObject({
+      promoted: true,
+      brainSnapshotId: expect.any(String),
+      runtimeActivation: {
+        state: "deferred",
+        slotId: expect.stringMatching(/^source-fixture-/),
+        delayMs: 5_000,
+        reason: "test host does not relaunch"
+      }
+    });
+    expect(stage).toHaveBeenCalledTimes(1);
+    expect(scheduleActivation).toHaveBeenCalledTimes(1);
+    const fullWorktree = stage.mock.calls[0]![0].worktree;
+    await expect(lstat(join(fullWorktree, "node_modules"))).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    expect(await sha256File(process.execPath)).toEqual(currentExecutableBefore);
+    expect((await repository.listSnapshots(brain.id)).length).toBeGreaterThan(0);
+
+    const headBeforeFailure = (
+      await run("git", ["rev-parse", "HEAD"], sourceRepository)
+    ).stdout.trim();
+    failStaging = true;
+    const failedStage = await promote("full", "runtime version failed-stage\n");
+    expect(failedStage).toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/native staging fixture failed/i)
+    });
+    expect(
+      (await run("git", ["rev-parse", "HEAD"], sourceRepository)).stdout.trim()
+    ).toBe(headBeforeFailure);
+    await expect(
+      readFile(join(sourceRepository, "src", "runtime.txt"), "utf8")
+    ).resolves.toBe("runtime version full\n");
+
+    failStaging = false;
+    tamperStaging = true;
+    const headBeforeTamper = (
+      await run("git", ["rev-parse", "HEAD"], sourceRepository)
+    ).stdout.trim();
+    const tampered = await promote("full", "runtime version tampered-stage\n");
+    expect(tampered).toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/artifact tree failed hash verification/i)
+    });
+    expect(
+      (await run("git", ["rev-parse", "HEAD"], sourceRepository)).stdout.trim()
+    ).toBe(headBeforeTamper);
+    expect(abandonStage).toHaveBeenCalledTimes(1);
+    expect(scheduleActivation).toHaveBeenCalledTimes(1);
+    expect(await sha256File(process.execPath)).toEqual(currentExecutableBefore);
+  }, 120_000);
+
   it("runs isolated subagent forks and leaves the parent's neural state unchanged", async () => {
     await setPermission("agent.fork", "full");
     const parentBefore = await repository.get(brain.id);
@@ -785,7 +1087,10 @@ describe("ToolExecutor complete workflows", () => {
       expect(chat).toHaveBeenCalledWith(
         forkId,
         objective,
-        expect.any(AbortSignal)
+        expect.any(AbortSignal),
+        undefined,
+        undefined,
+        96
       );
       const fork = await repository.get(forkId);
       expect(fork.lineage).toMatchObject({

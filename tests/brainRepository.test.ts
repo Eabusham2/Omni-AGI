@@ -3,8 +3,11 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { strFromU8, unzipSync, zipSync } from "fflate";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BrainRepository } from "../src/main/brainRepository";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  BrainRepository,
+  SUBSTRATE_STORE_FORMAT
+} from "../src/main/brainRepository";
 import { DEFAULT_CONFIG } from "../src/shared/types";
 
 function emptySafetensors(): Buffer {
@@ -39,7 +42,7 @@ function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
     .join(",")}}`;
 }
@@ -95,11 +98,19 @@ async function writePackedTernaryFixture(directory: string): Promise<void> {
     ],
     metadata: { fixture: true }
   };
+  // Python's canonical encoder preserves this field's float identity as 1.0;
+  // the TypeScript verifier must not collapse it and reject a genuine pack.
+  const canonicalBody = canonicalJson(manifestBody).replace(
+    '"scale":1,',
+    '"scale":1.0,'
+  );
   const manifest = {
     ...manifestBody,
-    contentSha256: digest(canonicalJson(manifestBody))
+    contentSha256: digest(canonicalBody)
   };
-  const manifestBytes = Buffer.from(canonicalJson(manifest));
+  const manifestBytes = Buffer.from(
+    canonicalJson(manifest).replace('"scale":1,', '"scale":1.0,')
+  );
   await mkdir(directory, { recursive: true });
   await Promise.all([
     writeFile(join(directory, "manifest.json"), manifestBytes),
@@ -109,6 +120,68 @@ async function writePackedTernaryFixture(directory: string): Promise<void> {
       shard
     )
   ]);
+}
+
+async function writeSubstrateFixture(engineDirectory: string): Promise<Record<string, unknown>> {
+  const store = join(engineDirectory, "substrate");
+  const record = {
+    kind: "neurons",
+    ids: ["neuron-fixture"],
+    records: [{ id: "neuron-fixture", region: "cortical" }],
+    vectorIds: []
+  };
+  const recordBytes = Buffer.from(canonicalJson(record));
+  const recordHash = digest(recordBytes);
+  const generationBody = {
+    format: "omni-substrate-shards",
+    formatVersion: 1,
+    schema: 1,
+    dimensions: 16,
+    seed: 7,
+    growthEvents: 1,
+    growthPauses: 0,
+    recordsPerShard: 512,
+    counts: { neurons: 1, assemblies: 0, synapses: 0 },
+    shards: [
+      {
+        kind: "neurons",
+        bucket: "a",
+        part: 0,
+        count: 1,
+        records: {
+          path: `blobs/${recordHash}.json`,
+          sha256: recordHash,
+          bytes: recordBytes.byteLength
+        },
+        tensors: null
+      }
+    ]
+  };
+  const contentHash = digest(canonicalJson(generationBody));
+  const generation = { ...generationBody, contentSha256: contentHash };
+  const generationBytes = Buffer.from(canonicalJson(generation));
+  const generationHash = digest(generationBytes);
+  const generationRelative = `generations/${contentHash}/manifest.json`;
+  const pointer = {
+    format: "omni-substrate-shards",
+    formatVersion: 1,
+    activeGeneration: contentHash,
+    generationManifest: generationRelative,
+    generationManifestSha256: generationHash,
+    counts: generationBody.counts,
+    shardCount: 1,
+    contentSha256: contentHash
+  };
+  await Promise.all([
+    mkdir(join(store, "blobs"), { recursive: true }),
+    mkdir(join(store, "generations", contentHash), { recursive: true })
+  ]);
+  await Promise.all([
+    writeFile(join(store, "blobs", `${recordHash}.json`), recordBytes),
+    writeFile(join(store, ...generationRelative.split("/")), generationBytes),
+    writeFile(join(store, "manifest.json"), canonicalJson(pointer))
+  ]);
+  return pointer;
 }
 
 describe("BrainRepository lifecycle", () => {
@@ -123,6 +196,19 @@ describe("BrainRepository lifecycle", () => {
 
   afterEach(async () => {
     await rm(temporaryRoot, { recursive: true, force: true });
+  });
+
+  it("shares the authoritative substrate-store format with the Python worker", async () => {
+    const pythonSource = await readFile(
+      join(process.cwd(), "engine", "omni_core", "vsa.py"),
+      "utf8"
+    );
+    expect(pythonSource).toMatch(
+      new RegExp(
+        `_SUBSTRATE_STORE_FORMAT\\s*=\\s*["']${SUBSTRATE_STORE_FORMAT}["']`
+      )
+    );
+    expect(pythonSource).toMatch(/hexdigest\(\)\[:1\]/);
   });
 
   it("persists only stable v1 choices and discards beta behavior controls", async () => {
@@ -161,10 +247,30 @@ describe("BrainRepository lifecycle", () => {
     }
   });
 
+  it("preserves an imported checkpoint workspace above the former product cap", async () => {
+    const recordedSlots = 8_192;
+    const source = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Large imported workspace",
+      workingMemorySlots: recordedSlots
+    });
+    const bundle = join(temporaryRoot, "large-workspace.omni");
+
+    await repository.exportBundle(source.id, bundle, "current");
+    const imported = await repository.importBundle(bundle);
+
+    expect(source.config.workingMemorySlots).toBe(recordedSlots);
+    expect(imported.config.workingMemorySlots).toBe(recordedSlots);
+    expect((await repository.get(imported.id)).config.workingMemorySlots).toBe(
+      recordedSlots
+    );
+  });
+
   it("creates an immutable origin and copy-on-write neural fork", async () => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Ada" });
     const engine = join(repository.brainDirectory(brain.id), "engine");
     await mkdir(engine, { recursive: true });
+    const substratePointer = await writeSubstrateFixture(engine);
     await writeFile(
       join(engine, "brain.json"),
       JSON.stringify({
@@ -174,7 +280,8 @@ describe("BrainRepository lifecycle", () => {
         brain_id: brain.id,
         name: brain.name,
         config: {},
-        expert_count: 0
+        expert_count: 0,
+        substrate: { persistence: substratePointer }
       })
     );
     await Promise.all([
@@ -188,12 +295,38 @@ describe("BrainRepository lifecycle", () => {
     ) as { brain_id: string; name: string };
 
     expect(fork.lineage.parentId).toBe(brain.id);
+    await expect(
+      readFile(
+        join(
+          repository.brainDirectory(fork.id),
+          "engine",
+          "substrate",
+          "manifest.json"
+        ),
+        "utf8"
+      )
+    ).resolves.toBe(canonicalJson(substratePointer));
     expect(fork.lineage.rootId).toBe(brain.id);
     expect(forkEngine.brain_id).toBe(fork.id);
     expect(forkEngine.name).toBe("Ada branch");
     await expect(
       readFile(join(repository.brainDirectory(fork.id), "engine", "origin", "core.safetensors"))
     ).resolves.toBeInstanceOf(Buffer);
+
+    const visibleBeforeFailure = (await repository.list()).map((item) => item.id).sort();
+    const cloneFailure = vi
+      .spyOn(repository, "storeFileAsBlob")
+      .mockRejectedValueOnce(new Error("simulated clone staging failure"));
+    try {
+      await expect(repository.fork(brain.id, "Broken fork")).rejects.toThrow(
+        /simulated clone staging failure/
+      );
+    } finally {
+      cloneFailure.mockRestore();
+    }
+    expect((await repository.list()).map((item) => item.id).sort()).toEqual(
+      visibleBeforeFailure
+    );
   });
 
   it("duplicates every brain as an independent copy-on-write identity", async () => {
@@ -345,6 +478,7 @@ describe("BrainRepository lifecycle", () => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Snapshot mind" });
     const engine = join(repository.brainDirectory(brain.id), "engine");
     await mkdir(engine, { recursive: true });
+    const substratePointer = await writeSubstrateFixture(engine);
     await writeFile(
       join(engine, "brain.json"),
       JSON.stringify({
@@ -352,7 +486,8 @@ describe("BrainRepository lifecycle", () => {
         format: "omni-cortex-engine",
         release_format: "stable-1.0",
         brain_id: brain.id,
-        marker: "before"
+        marker: "before",
+        substrate: { persistence: substratePointer }
       })
     );
     await Promise.all([
@@ -380,6 +515,22 @@ describe("BrainRepository lifecycle", () => {
       })
     );
     await writeFile(join(engine, "packed-ternary", "manifest.json"), "{}");
+    await rm(join(engine, "substrate"), { recursive: true, force: true });
+
+    const stagedFailure = vi
+      .spyOn(repository, "storeFileAsBlob")
+      .mockRejectedValueOnce(new Error("simulated snapshot staging failure"));
+    try {
+      await expect(repository.restoreSnapshot(brain.id, snapshot.id)).rejects.toThrow(
+        /simulated snapshot staging failure/
+      );
+    } finally {
+      stagedFailure.mockRestore();
+    }
+    await expect(repository.get(brain.id)).resolves.toMatchObject({ name: "Mutated" });
+    await expect(
+      readFile(join(engine, "brain.json"), "utf8")
+    ).resolves.toContain('"marker":"after"');
 
     const restored = await repository.restoreSnapshot(brain.id, snapshot.id);
     const engineState = JSON.parse(await readFile(join(engine, "brain.json"), "utf8")) as {
@@ -391,12 +542,17 @@ describe("BrainRepository lifecycle", () => {
     await expect(
       readFile(join(engine, "packed-ternary", "manifest.json"))
     ).resolves.toEqual(packedBefore);
+    await expect(
+      readFile(join(engine, "substrate", "manifest.json"), "utf8")
+    ).resolves.toBe(canonicalJson(substratePointer));
   });
 
   it("round-trips a checksum-verified ZIP and omits private sources by default", async () => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Portable mind" });
     const engine = join(repository.brainDirectory(brain.id), "engine");
     await mkdir(join(engine, "origin"), { recursive: true });
+    const substratePointer = await writeSubstrateFixture(engine);
+    await writeSubstrateFixture(join(engine, "origin"));
     const engineState = {
       schema_version: 1,
       format: "omni-cortex-engine",
@@ -405,7 +561,13 @@ describe("BrainRepository lifecycle", () => {
       name: brain.name,
       config: { name: brain.name },
       expert_count: 0,
-      training_sources: []
+      training_sources: [],
+      substrate: {
+        schema: 1,
+        dimensions: 16,
+        seed: 7,
+        persistence: substratePointer
+      }
     };
     await Promise.all([
       writeFile(join(engine, "brain.json"), JSON.stringify(engineState)),
@@ -467,6 +629,9 @@ describe("BrainRepository lifecycle", () => {
         "tensors/core.safetensors",
         "packed/current/manifest.json",
         "packed/origin/manifest.json",
+        "substrate/current/manifest.json",
+        `substrate/current/${String(substratePointer.generationManifest)}`,
+        "substrate/origin/manifest.json",
         "origin/state/brain.json"
       ])
     );
@@ -519,12 +684,40 @@ describe("BrainRepository lifecycle", () => {
         )
       )
     ).resolves.toBeInstanceOf(Buffer);
+    await expect(
+      readFile(
+        join(
+          repository.brainDirectory(imported.id),
+          "engine",
+          "substrate",
+          "manifest.json"
+        ),
+        "utf8"
+      )
+    ).resolves.toBe(canonicalJson(substratePointer));
+
+    const visibleBeforeFailure = (await repository.list()).map((item) => item.id).sort();
+    const storeFailure = vi
+      .spyOn(repository, "storeFileAsBlob")
+      .mockRejectedValueOnce(new Error("simulated streamed install failure"));
+    try {
+      await expect(repository.importBundle(portablePath)).rejects.toThrow(
+        /simulated streamed install failure/
+      );
+    } finally {
+      storeFailure.mockRestore();
+    }
+    expect((await repository.list()).map((item) => item.id).sort()).toEqual(
+      visibleBeforeFailure
+    );
 
     const privatePath = join(temporaryRoot, "private.omni");
     await repository.exportBundle(brain.id, privatePath, "private-archive");
     const privateEntries = unzipSync(new Uint8Array(await readFile(privatePath)));
     expect(privateEntries[`blobs/${blobHash}`]).toBeDefined();
-  });
+    await repository.importBundle(privatePath);
+    await expect(repository.getBlob(blobHash)).resolves.toEqual(sourceBytes);
+  }, 20_000);
 
   it("rejects ZIP traversal entries before extraction", async () => {
     const malicious = Buffer.from(

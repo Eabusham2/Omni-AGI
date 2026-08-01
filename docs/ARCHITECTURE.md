@@ -12,7 +12,8 @@ The word “brain” is a product metaphor. The implementation keeps these state
 - effective ternary weights and their higher-precision master weights;
 - plastic fast weights, LIF activity, and STDP traces;
 - liquid recurrent state;
-- VSA idea vectors, concept nodes, and typed relations;
+- distributed substrate neurons and assemblies, VSA hypervectors, and typed
+  signed ternary synapses;
 - bounded conversation and working-memory state;
 - optional retained source material;
 - modality-pack parameters;
@@ -66,14 +67,14 @@ exists and mutates the current copy.
 
 1. Text crosses a UTF-8 byte-token boundary; supported media crosses its trainable pack.
 2. Electron derives a bounded structural list of enabled tool IDs, actions, and grants. The worker normalizes it and binds deterministic VSA symbols for each capability; it does not serialize tool descriptions into prompt text.
-3. The concept memory creates or recalls a continuous VSA idea representation and blends it with the tool-capability vector.
-4. Sparse concept relations activate associated ideas.
+3. `NeuralSubstrate` creates or recalls a distributed neuron assembly, blends its VSA representation with the tool-capability vector, and remains the sole authority for associative memory.
+4. Signed ternary recurrent pathways spread excitation and inhibition through related assemblies. Fan-in normalization and damping settle the state without a fixed hop count.
 5. A stateful LIF router integrates activity and emits spikes.
 6. Pair-based STDP updates recurrent fast weights when plasticity is enabled.
 7. CfC or LTC-like state evolves and emits retention, threshold, noise, and ponder controls.
-8. The idea vector conditions the ternary decoder or a modality generator.
-9. Novelty and sampled uncertainty can allocate a bounded number of generation branches.
-10. The selected output, seed, spike metrics, routes, recalled idea IDs, parameter delta, prompt-token digest, and tool-channel status are recorded in the neural trace.
+8. The active assembly vector conditions the ternary decoder or a modality generator.
+9. Novelty and sampled uncertainty can allocate competing generation branches until score convergence, workspace pressure, or host-resource pressure settles them; there is no fixed thought-count budget.
+10. The selected output, seed, spike metrics, routes, active assembly IDs, parameter delta, prompt-token digest, and tool-channel status are recorded in the neural trace.
 11. The worker persists model state atomically and appends checksummed operational events to SQLite.
 12. Slow training and consolidation run as candidate updates with a baseline/final-loss gate.
 13. A passing candidate is saved; a regressing, non-finite, or failed candidate is restored from the in-memory backup and recorded as rejected.
@@ -81,7 +82,7 @@ exists and mutates the current copy.
     load after worker termination quarantines unfinished training and restores
     that backup when promotion had started, before any model tensor is read.
 
-Default parameter-only generation does not convert recalled long-term memories or tool schemas into hidden prose. It uses recalled vectors, capability vectors, fast weights, recurrent state, and learned parameters. Trace fields explicitly report that prompt text was not expanded, identify the VSA-internal tool channel, and hash the actual input token IDs. The trace's generated explanation is a model self-report, not a guaranteed private chain-of-thought transcript.
+Default parameter-only generation does not convert recalled long-term memories or tool schemas into hidden prose. It uses recalled vectors, capability vectors, fast weights, recurrent state, learned parameters, and the explicitly reported bounded recent-dialogue token ring. Trace fields distinguish truthful recent-context expansion from hidden-prompt expansion, which remains false; they also identify the VSA-internal tool channel and hash the actual input and recent token IDs. The trace's generated explanation is a model self-report, not a guaranteed private chain-of-thought transcript.
 
 ## Text cortex
 
@@ -94,14 +95,16 @@ The current engine uses a deliberately small decoder-only transformer so CPU fix
 - gated feed-forward blocks;
 - `BitLinear` projections with effective `{-1, 0, +1}` weights;
 - higher-precision trainable master weights and a straight-through estimator;
-- shared idea-space conditioning;
+- shared assembly-space conditioning;
 - next-symbol prediction.
 
 Every eligible `BitLinear`, ternary convolution, and recurrent STDP projection
-is ternary during the forward pass. Embeddings, activations, optimizer state,
-liquid state, plastic traces, and floating learning masters are not 1.58-bit.
-Stable v1 exposes no dense-forward toggle, and its packed inference shards must
-cover every eligible projection and dynamic synapse.
+is ternary during the forward pass. Sparse recurrent propagation uses the exact
+effective sign (`-1` for inhibition, `+1` for excitation); the higher-precision
+latent master does not scale a live edge. Embeddings, activations, optimizer
+state, liquid state, plastic traces, and floating learning masters are not
+1.58-bit. Stable v1 exposes no dense-forward toggle, and its packed inference
+shards must cover every eligible projection and dynamic synapse.
 
 ## Plastic and growable state
 
@@ -109,10 +112,22 @@ The spiking router stores recurrent weights, pre/post traces, stability, use cou
 
 The neural substrate stores distributed neurons, assemblies, and their
 effective ternary synapses as authoritative memory. Concept and idea labels are
-inspection views derived from that state; their hypervectors live in safe
-tensors. Stable v1 has no configured neuron, assembly, synapse, idea, concept,
-or expert cardinality ceiling. Host RAM and disk reserve checks gate
-allocation, record measured pauses, and allow later growth to resume.
+inspection views derived from that state. Recurrent recall uses signed edge
+contributions, including negative signals that suppress competing assemblies,
+then applies a fan-in-normalized damped update until convergence or
+working-memory/resource pressure. Stable v1 has no configured neuron,
+assembly, synapse, idea, concept, expert, recall-hop, or shard-count ceiling.
+Host RAM and disk reserve checks gate allocation, record measured pauses, and
+allow later growth to resume.
+
+The substrate persists in immutable, content-addressed generations rather than
+inside one ever-growing plasticity tensor. Hash-bucketed JSON shards hold
+neuron, assembly, and synapse records; safe-tensor shards hold hypervectors and
+higher-precision sparse learning state. The atomically promoted engine metadata
+selects one generation, so an interrupted save cannot make an orphaned newer
+root pointer authoritative. Unchanged shards are reused by saves, snapshots,
+origins, forks, evolution rollback points, and exports. See
+[SUBSTRATE_PERSISTENCE.md](SUBSTRATE_PERSISTENCE.md).
 
 Sustained novelty can add small residual decoder experts under the same
 resource guard. Expert growth is live and sparse; the next atomic save persists
@@ -125,17 +140,36 @@ Slow parameters have a second metaplastic protection path. Squared gradients upd
 
 | Recipe | Exact source text | Idea/vector memory | Fast weights | Slow consolidation | Current generation path |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Human Consolidation | No | Yes, lossy | Yes | Yes | Neural/vector conditioning |
-| Total Recall | Optional local retention | Yes | Yes | Yes | Neural/vector conditioning |
-| Synapses Only | No | Yes, without source text | Yes | Yes | Neural/vector conditioning |
+| Human Consolidation | No | Yes, lossy | Yes | Yes | Recent-dialogue tokens plus neural/vector conditioning |
+| Total Recall | Optional local retention | Yes | Yes | Yes | Recent-dialogue tokens plus neural/vector conditioning |
+| Synapses Only | No | Yes, without source text | Yes | Yes | Recent-dialogue tokens plus neural/vector conditioning |
 
-Total Recall's retained text is available for explicit source-selected training and private archival export. The worker never silently retrieves it into chat prompts. In `parameter-only` mode, generation receives learned parameters, semantic/VSA recall, fast weights, and liquid state. In `working-memory` mode it additionally blends a bounded, recency-weighted recurrent activity vector. Both paths leave the input token sequence unchanged; the trace reports the selected channel, vector count, and token digest.
+Total Recall's retained text is available for explicit source-selected training and private archival export. The worker never silently retrieves it into chat prompts. Both modes prepend only the bounded, persisted recent human/brain role-boundary token ring. In `parameter-only` mode, all older knowledge enters through learned parameters, semantic/VSA recall, fast weights, and liquid state. In `working-memory` mode it additionally blends a bounded, recency-weighted recurrent activity vector. The trace reports recent-token occupancy, hashes and eviction count separately from hidden/long-term injection, which remains absent.
 
-Working-memory slots, short-term half-life, replay threshold, forgetting rate, and consolidation rate are configurable. They improve control over retention; they do not guarantee exact recall.
+For newly materialized Blank and bundled Starter builds, hardware profiling
+derives token capacity and latent assembly slots: Micro resolves to 256 tokens /
+128 recurrent slots, Personal to 1,024 / 256, GPU to 2,048 / 512, and
+Workstation to 4,096 / 1,024. The optional Extended working memory checkbox
+doubles both.
+Compatible imported checkpoints retain their recorded context/model shape;
+their effective values remain visible in the architecture manifest and Runtime
+Card. Token context and latent assembly slots are separate temporary working
+spaces. Whole-input integration latents scale at one quarter of the recurrent
+workspace without the former fixed 32-latent ceiling. Response generation has
+a separate hardware- and organic-state-derived budget, so a large temporary
+context does not force equally long output. These values are not personality or
+curiosity controls. Working memory remains temporary and does not guarantee
+exact recall.
+
+Decay lowers transient activation, eligibility, and unconsolidated latent
+strength but never cardinality-deletes a neuron, assembly, synapse, or vector
+record. Metaplastic stability and replay reduce catastrophic interference; the
+immutable origin and snapshots provide rollback. Parameter-only memory remains
+lossy, so exact source recovery requires Total Recall / Retain exact sources.
 
 ## Multimodal baselines
 
-All current packs share the configured idea dimension. A blank build initializes them randomly; a compatible materialized starter may supply trained pack weights:
+All current packs share the configured assembly/hypervector dimension. A blank build initializes them randomly; a compatible materialized starter may supply trained pack weights:
 
 - a compact convolutional vision encoder;
 - a VQ image autoencoder with a ternary, idea/time-conditioned latent transformer trained against an explicit latent noise-prediction objective;
@@ -172,12 +206,20 @@ brains/
         brain.json
         core.safetensors
         plasticity.safetensors
+        substrate/                     exact referenced sharded generation
     artifacts/
       browser/                       guarded browser-task screenshots and evidence
     engine/
       brain.json                     current neural metadata
       core.safetensors               decoder, liquid, adapters, modalities
-      plasticity.safetensors         SNN, VSA vectors, replay, liquid activity
+      plasticity.safetensors         SNN, replay, and liquid activity
+      substrate/
+        manifest.json                atomic pointer to committed generation
+        generations/<sha256>/
+          manifest.json              immutable bounded-shard index
+        blobs/
+          <sha256>.json              neuron/assembly/synapse record shards
+          <sha256>.safetensors       hypervector and synapse-learning shards
       packed-ternary/
         manifest.json                exact eligible-forward coverage
         manifest.sha256              canonical-manifest checksum
@@ -187,24 +229,49 @@ brains/
         brain.json
         core.safetensors
         plasticity.safetensors
+        substrate/                   immutable-origin referenced generation
         packed-ternary/              immutable-origin exact ternary shards
       candidates/<candidate-id>/
       snapshots/<snapshot-id>/
       artifacts/
 ```
 
-JSON and safe-tensor replacements use temporary files plus atomic rename. The event database uses WAL mode, full synchronization, payload hashes, and triggers that reject updates or deletes.
+JSON and safe-tensor replacements use temporary files plus atomic rename.
+Substrate generation manifests and blobs are immutable and content-addressed;
+the metadata commit record moves last. The event database uses WAL mode, full
+synchronization, payload hashes, and triggers that reject updates or deletes.
 
-Forks receive independent application state and neural metadata. Immutable tensor bytes are materialized from the repository's content-addressed store with hard links where supported and copy fallback elsewhere; subsequent atomic replacement makes the branches diverge. Merge preview inventories novel concepts, ideas, relations, evidence records, and branch-local artifacts. Every regular file is hashed, size-bounded, and assigned a content-addressed target path; symlinks, non-regular files, corrupt blobs, and out-of-branch paths are skipped and surfaced as review conflicts. The preview token binds the exact source/target state and file hashes, so a changed branch must be reviewed again. Merge copies those overlays and replay examples, emits a hash-backed merge manifest, preserves target-side divergent nodes, and never averages complete dense checkpoints.
+Forks receive independent application state and neural metadata. Immutable tensor bytes are materialized from the repository's content-addressed store with hard links where supported and copy fallback elsewhere; subsequent atomic replacement makes the branches diverge. Merge preview inventories novel neurons, assemblies, ternary synapses, replay examples, evidence records, and branch-local artifacts. The authoritative worker streams a canonical digest over each brain's ID, engine/config identity, neural parameter checksum, substrate records and vectors, and replay vectors; it also reports addition, duplicate, and divergence counts. Electron binds that digest and every reviewed file hash into the review token. The merge RPC recomputes and requires the exact worker digest before mutation, so either the source fork or target base changing after review is rejected. Every regular file is separately hashed and assigned a content-addressed target path; symlinks, non-regular files, corrupt blobs, and out-of-branch paths are skipped and surfaced as review conflicts. Merge copies reviewed overlays and replay examples, emits a hash-backed merge manifest, preserves target-side divergent nodes, and never averages complete dense checkpoints.
 
 ## `.omni` boundary
 
-`.omni` is the only supported portable whole-brain checkpoint container. It carries both the selected current/origin payload and the immutable origin payload, with JSON state, safe tensors, a model card, lineage, and SHA-256 records. The exact version-1 contract and privacy limitations are documented in [OMNI_FORMAT.md](OMNI_FORMAT.md). Declarative builder recipes and modality-only `.omnipack` files have separate non-executable contracts in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
+`.omni` is the only supported portable whole-brain checkpoint container. It
+carries both the selected current/origin payload and the immutable origin
+payload, including each selected substrate generation, JSON state, safe
+tensors, packed inference shards, a model card, lineage, and SHA-256 records.
+The exact version-1 contract and privacy limitations are documented in
+[OMNI_FORMAT.md](OMNI_FORMAT.md). Declarative builder recipes and modality-only
+`.omnipack` files have separate non-executable contracts in
+[CATALOG_FORMATS.md](CATALOG_FORMATS.md).
 
-Downloaded bundles are treated as data. The importer validates ZIP paths, size limits, duplicate names, encryption/symlink flags, executable extensions, checksums, exact manifest byte lengths, the `OmniCortex` architecture name and current schema version, materialized engine format, secret-redaction declaration, source license ledger, and safe-tensor headers. Recipes reject unknown fields and contain no command field. Modality packs are revalidated by both Electron and the neural worker and may replace only declared `modalities.<kind>.*` tensors with exact compatible shapes and finite values. No path loads pickle data or runs repository setup scripts.
+Downloaded bundles are treated as data. A streaming ZIP/ZIP64 reader validates
+paths, duplicate names, overlapping payloads, encryption/symlink flags,
+compression methods, CRCs, declared lengths, executable extensions, checksums,
+the `OmniCortex` architecture name and current schema version, materialized
+engine format, substrate manifests/blobs, secret-redaction declaration, source
+license ledger, and safe-tensor headers. There is no product-defined archive
+byte, entry-count, or expanded-size ceiling; extraction pauses before crossing
+the disk reserve, and ordinary filesystem/platform limits still apply. Recipes
+reject unknown fields and contain no command field. Modality packs are
+revalidated by both Electron and the neural worker and may replace only
+declared `modalities.<kind>.*` tensors with exact compatible shapes and finite
+values. No path loads pickle data or runs repository setup scripts.
 
 Current, origin, and private-archive exports carry materialized current and
-immutable-origin safe tensors plus both exact packed-ternary trees. A
+immutable-origin safe tensors, the exact referenced substrate generations, and
+both exact packed-ternary trees. Export writes entries incrementally and
+upgrades to ZIP64 when physical ZIP fields require it; import extracts and
+hashes entries incrementally before an atomic brain promotion. A
 `referenced-local` export replaces safe tensors with valid placeholders and
 packed files with local-reference markers, recording every real object hash.
 Import resolves every object before verifying safe-tensor headers and packed
@@ -213,7 +280,7 @@ objects, so it is a storage convenience, not a shareable checkpoint.
 
 ## Tools and agents
 
-Tool schemas are structured VSA model inputs; grant enforcement stays in Electron. They describe capability, not persona or behavior, and create no additional language-prompt tokens. A learned action head selects among `talk`, `tool`, `imagine`, `agent`, `ponder`, `learn`, `evolve`, and `stop`. Its dedicated typed worker channel materializes enabled tool IDs, actions, and validated arguments; response prose, slash commands, and tagged text are ignored. Tool results are displayed and returned as visible structured experience. Long-running imagination calls stream previews, remain cancellable, and enter experience only after final artifact metadata is available.
+Tool schemas are structured VSA model inputs; grant enforcement stays in Electron. They describe capability, not persona or behavior, and create no additional language-prompt tokens. A learned action head selects among `talk`, `tool`, `imagine`, `agent`, `ponder`, `learn`, `evolve`, and `stop`. Its dedicated typed worker channel materializes enabled tool IDs, actions, and validated arguments; response prose, slash commands, and tagged text are ignored. An edit-free `evolve` decision routes to a substrate candidate with latent replay. A source candidate exists only when the action carries exact typed path/content/parent-hash edits, preventing objective-only actions from producing guaranteed-empty Git candidates. Tool results are displayed and returned as visible structured experience. Long-running imagination calls stream previews, remain cancellable, and enter experience only after final artifact metadata is available.
 
 `Off` rejects execution. `Ask` issues a five-minute, single-use approval token bound to the exact brain ID, tool ID, action, and SHA-256 digest of the serialized JSON arguments. `Auto` executes its safe subset but still asks for writes and other risky operations; its file reads are confined by real-path checks to the selected brain directory. `Full Authority` executes a valid invocation without an approval token. All levels append permission, invocation, result, cancellation, and failure stages to the same operational trace used by the brain. Arguments are represented by names and digests rather than copied file contents. Active processes, fetches, browser loads, and modality jobs have cancellation paths; a cancelled worker job is interrupted and late results are ignored.
 
@@ -221,9 +288,9 @@ The browser executor runs a sandboxed persistent partition scoped to one brain. 
 
 Files, PowerShell, code execution, guarded web fetch/search, browser automation, modality generation, brain agents, and source evolution have local executors.
 
-Source evolution requires an explicitly authorized Git clone. `propose` creates a separate branch/worktree and applies only declared typed UTF-8 compare-and-write edits whose existing-file SHA-256 (or new-file absence) still matches. It publishes the candidate only after all paths and temporary files pass traversal, symlink, protected-evaluator, setup-script, binary, size, and stale-input checks; the lineage records every before/after hash and the complete authored diff hash. `diff` validates the worktree boundary and inventories tracked changes plus bounded untracked-file hashes. `test` runs only the allowlisted typecheck, unit-test, and build commands plus `git diff --check`, recording validation against the exact diff digest. Empty candidates cannot pass. `promote` requires that digest, a matching passing validation, and a clean target clone before committing and merging the candidate branch. Generated response prose is never interpreted as source code. The running binary is never replaced or restarted mid-execution.
+Source evolution requires an explicitly authorized Git clone. `propose` creates a separate branch/worktree and applies only declared typed UTF-8 compare-and-write edits whose existing-file SHA-256 (or new-file absence) still matches. It publishes the candidate only after all paths and temporary files pass traversal, symlink, protected-evaluator, setup-script, binary, size, and stale-input checks; the lineage records every before/after hash and the complete authored diff hash. `diff` validates the worktree boundary and inventories tracked changes plus bounded untracked-file hashes. `test` runs only the allowlisted typecheck, unit-test, and build commands plus `git diff --check`, recording validation against the exact diff digest. Candidate checks temporarily link only the authorized clone's existing `node_modules`, disable npm lifecycle hooks, never install dependencies, and remove and revalidate the link afterward. Empty candidates cannot pass. `promote` requires that digest, a matching passing validation, and a clean target clone before committing and merging the candidate branch. Under Full Authority, the trusted Electron host first snapshots the brain and builds a native unpacked runtime into a separate app-managed slot. It independently verifies the executable, complete artifact tree, current-executable hash, source/evaluator lineage, and unchanged candidate before merge; a packaged host then schedules a delayed side-by-side relaunch, while development/test hosts defer it. Ask and Auto never activate source binaries. Generated response prose is never interpreted as source code, and the running binary is never overwritten mid-execution.
 
-An `agent.fork` action creates one to four copy-on-write brain forks and runs one objective turn in each isolated identity. The parent receives result summaries but no neural mutation. Merge remains a separate, previewed user action that copies novel ideas, relations, deduplicated evidence metadata, retained source blobs allowed by the target memory recipe, branch-local artifacts, replay examples, and related overlays. `Synapses Only` targets receive evidence provenance but no raw source text or source blob. Whole-model weights are never averaged. The current executor runs these bounded fork turns sequentially, so this is not a claim of an open-ended parallel autonomous society.
+An `agent.fork` action creates one to four copy-on-write brain forks and runs one objective turn in each isolated identity. The parent receives result summaries but no neural mutation. Merge remains a separate, previewed user action that copies reviewed neurons, distributed assemblies, ternary synapses, deduplicated evidence metadata, retained source blobs allowed by the target memory recipe, branch-local artifacts, replay examples, and related overlays. `Synapses Only` targets receive evidence provenance but no raw source text or source blob. Whole-model weights are never averaged. The current executor runs these bounded fork turns sequentially, so this is not a claim of an open-ended parallel autonomous society.
 
 ## Cross-platform packaging
 

@@ -28,7 +28,16 @@ if [[ ! -f "${WORKER}" ]]; then
   exit 2
 fi
 
-"${PYTHON_BIN}" -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
+if [[ "${OMNI_SKIP_BUILD_DEPENDENCY_INSTALL:-0}" == "1" ]]; then
+  "${PYTHON_BIN}" -c \
+    "import PyInstaller; major=int(PyInstaller.__version__.split('.')[0]); assert major == 6" \
+    || {
+      echo "Protected runtime evolution requires an existing PyInstaller 6.x; automatic dependency installation is disabled." >&2
+      exit 1
+    }
+else
+  "${PYTHON_BIN}" -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
+fi
 
 # These are fixed, repository-local build directories rather than user paths.
 rm -rf -- "${DIST_ROOT}" "${WORK_ROOT}"

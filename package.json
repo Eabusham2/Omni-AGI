@@ -105,6 +105,10 @@
       {
         "from": "licenses/imageio-ffmpeg-BSD-2-Clause.txt",
         "to": "licenses/imageio-ffmpeg-BSD-2-Clause.txt"
+      },
+      {
+        "from": "licenses/GPL-2.0.txt",
+        "to": "licenses/GPL-2.0.txt"
       }
     ],
     "win": {

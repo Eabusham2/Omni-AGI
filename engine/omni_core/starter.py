@@ -83,12 +83,23 @@ STARTER_ACTION_EXAMPLES: List[Tuple[str, str]] = [
 
 
 def starter_manifest() -> Dict[str, Any]:
+    corpus_payload = json.dumps(
+        STARTER_CORPUS,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    action_payload = json.dumps(
+        STARTER_ACTION_EXAMPLES,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
     payload = json.dumps(
         {
-            "corpus": STARTER_CORPUS,
-            "actions": STARTER_ACTION_EXAMPLES,
+            "corpusSha256": hashlib.sha256(corpus_payload).hexdigest(),
+            "actionsSha256": hashlib.sha256(action_payload).hexdigest(),
         },
-        ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -113,4 +124,22 @@ def starter_manifest() -> Dict[str, Any]:
         "personaPrompt": False,
         "source": "Project-authored synthetic seed corpus",
         "license": "PolyForm-Noncommercial-1.0.0-or-commercial-license",
+        "datasetLedger": [
+            {
+                "id": "omni-starter-project-corpus-1",
+                "kind": "text",
+                "records": len(STARTER_CORPUS),
+                "sha256": hashlib.sha256(corpus_payload).hexdigest(),
+                "license": "PolyForm-Noncommercial-1.0.0-or-commercial-license",
+                "upstreamModel": None,
+            },
+            {
+                "id": "omni-starter-action-trajectories-1",
+                "kind": "structured-action",
+                "records": len(STARTER_ACTION_EXAMPLES),
+                "sha256": hashlib.sha256(action_payload).hexdigest(),
+                "license": "PolyForm-Noncommercial-1.0.0-or-commercial-license",
+                "upstreamModel": None,
+            },
+        ],
     }

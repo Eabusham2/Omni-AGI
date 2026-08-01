@@ -750,9 +750,6 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     service.listModalityPacks(requireId(brainId, "brain id"))
   );
   handle(IPC.catalog.hardwareProfile, () => hardwareProfile());
-  handle(IPC.legacy.runtimeHealth, (_event, id: string) =>
-    service.runtimeHealth(requireId(id))
-  );
 
   const jobListener = (event: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) {

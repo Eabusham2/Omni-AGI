@@ -4,11 +4,10 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict
 
 
-# Stable v1 no longer exposes these beta builder controls.  The dataclass
-# fields remain temporarily so legacy internal fixtures and explicitly loaded
-# architecture dictionaries can still be interpreted, but new engine metadata
-# must not make them look like supported BrainConfig or architecture-manifest
-# knobs.  Mandatory substrate features are enforced by AdaptiveBrain.
+# Stable v1 no longer exposes these beta builder controls. Removed fields are
+# accepted-and-discarded by the legacy dictionary loader; a few mandatory
+# substrate flags remain internal implementation state but are filtered from
+# saved public configuration. AdaptiveBrain enforces those invariants.
 _DEPRECATED_BETA_CONTROL_FIELDS = frozenset(
     {
         "ternary_weights",
@@ -38,15 +37,18 @@ _DEPRECATED_BETA_CONTROL_FIELDS = frozenset(
 class OmniConfig:
     """Serializable architecture and learning configuration.
 
-    Defaults deliberately describe a tiny model so a blank brain can be
-    created and tested on a CPU.  The desktop application may scale these
-    values after profiling the Windows machine.
+    Defaults describe the Personal hardware profile. Tests and constrained
+    hosts use :meth:`micro`; the desktop resolves all new builds from an
+    operating-system hardware profile.
     """
 
     name: str = "New OmniCortex"
     seed: int = 7
     vocab_size: int = 261
-    max_seq_len: int = 128
+    # Stable-v1 Personal defaults.  This is temporary neural working context,
+    # not long-term memory and not a response-length control.  New desktop
+    # builds resolve it from the hardware profiles in ``from_external``.
+    max_seq_len: int = 1024
     d_model: int = 64
     n_heads: int = 4
     n_layers: int = 2
@@ -80,7 +82,6 @@ class OmniConfig:
     online_steps: int = 1
     slow_stability_strength: float = 0.025
     slow_importance_decay: float = 0.97
-    noise: float = 0.08
     temperature: float = 0.9
     top_k: int = 40
 
@@ -102,22 +103,13 @@ class OmniConfig:
     extended_working_memory: bool = False
     recursive_improvement: bool = True
     idle_cognition: bool = True
-    max_concepts: int = 50000
-    max_ideas: int = 10000
     replay_capacity: int = 2048
-    working_memory_slots: int = 24
+    working_memory_slots: int = 256
     short_term_half_life_minutes: float = 45.0
     long_term_threshold: float = 0.62
     forgetting_rate: float = 0.002
     consolidation_rate: float = 0.06
-    max_synapses: int = 1000000
-    novelty_drive: float = 0.72
-    coherence_drive: float = 0.88
-    curiosity_drive: float = 0.58
-    parallel_thoughts: int = 3
 
-    growth_policy: str = "unbounded"
-    max_experts: int = 8
     growth_novelty_threshold: float = 0.92
     growth_patience: int = 3
 
@@ -153,8 +145,6 @@ class OmniConfig:
             raise ValueError("unsupported memory_injection")
         if self.liquid_mode not in {"cfc", "ltc"}:
             raise ValueError("liquid_mode must be cfc or ltc")
-        if self.growth_policy not in {"fixed", "elastic", "unbounded"}:
-            raise ValueError("unsupported growth_policy")
         if self.hardware_tier not in {"micro", "personal", "gpu", "workstation"}:
             raise ValueError("unsupported hardware_tier")
         if self.origin_kind not in {"blank", "starter"}:
@@ -163,8 +153,8 @@ class OmniConfig:
             raise ValueError("image_size must be a multiple of four and at least 8")
         if self.video_frames < 2:
             raise ValueError("video_frames must be at least 2")
-        if self.working_memory_slots < 1 or self.parallel_thoughts < 1:
-            raise ValueError("memory slots and parallel thoughts must be positive")
+        if self.working_memory_slots < 1:
+            raise ValueError("working-memory slots must be positive")
         if self.train_batch_size < 1 or self.gradient_accumulation < 1:
             raise ValueError("training batch size and accumulation must be positive")
         if self.short_term_half_life_minutes <= 0:
@@ -180,6 +170,32 @@ class OmniConfig:
             for key, value in asdict(self).items()
             if key not in _DEPRECATED_BETA_CONTROL_FIELDS
         }
+
+    def generation_token_budget(self, cognitive_demand: float = 0.5) -> int:
+        """Return a context-independent, state-scaled response budget.
+
+        A larger working window must not make a CPU brain emit thousands of
+        tokens on every turn.  The learned recurrent state supplies
+        ``cognitive_demand``; hardware tier and the Extended checkbox set the
+        base.  Explicit caller-provided generation limits still take
+        precedence in :meth:`AdaptiveBrain.chat`.
+        """
+
+        base_by_tier = {
+            "micro": 96,
+            "personal": 192,
+            "gpu": 320,
+            "workstation": 512,
+        }
+        demand = max(0.0, min(1.0, float(cognitive_demand)))
+        extended_scale = 1.5 if self.extended_working_memory else 1.0
+        state_scale = 0.75 + 0.5 * demand
+        resolved = round(
+            base_by_tier.get(self.hardware_tier, 192)
+            * extended_scale
+            * state_scale
+        )
+        return max(1, min(int(self.max_seq_len), max(48, resolved)))
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "OmniConfig":
@@ -204,7 +220,8 @@ class OmniConfig:
             "micro": {
                 "dimensions": 32,
                 "layers": 1,
-                "sequence": 64,
+                "sequence": 256,
+                "workspace": 128,
                 "router": 24,
                 "image": 8,
                 "audio": 64,
@@ -217,7 +234,8 @@ class OmniConfig:
             "personal": {
                 "dimensions": 64,
                 "layers": 2,
-                "sequence": 128,
+                "sequence": 1024,
+                "workspace": 256,
                 "router": 64,
                 "image": 16,
                 "audio": 256,
@@ -230,28 +248,30 @@ class OmniConfig:
             "gpu": {
                 "dimensions": 96,
                 "layers": 4,
-                "sequence": 256,
+                "sequence": 2048,
+                "workspace": 512,
                 "router": 96,
                 "image": 32,
                 "audio": 512,
                 "frames": 6,
                 "channels": 24,
-                "batch": 8,
-                "accumulation": 2,
+                "batch": 2,
+                "accumulation": 8,
                 "checkpointing": True,
             },
             "workstation": {
                 "dimensions": 128,
                 "layers": 6,
-                "sequence": 512,
+                "sequence": 4096,
+                "workspace": 1024,
                 "router": 128,
                 "image": 32,
                 "audio": 1024,
                 "frames": 8,
                 "channels": 32,
-                "batch": 16,
-                "accumulation": 1,
-                "checkpointing": False,
+                "batch": 1,
+                "accumulation": 16,
+                "checkpointing": True,
             },
         }
         if tier not in profiles:
@@ -265,12 +285,8 @@ class OmniConfig:
         context_tokens = int(profile["sequence"]) * (
             2 if extended_working else 1
         )
-        workspace_slots = max(
-            16,
-            min(
-                512,
-                dimensions * (2 if extended_working else 1),
-            ),
+        workspace_slots = int(profile["workspace"]) * (
+            2 if extended_working else 1
         )
         values: Dict[str, Any] = {
             "name": str(raw.get("name", "New OmniCortex")),
@@ -322,7 +338,6 @@ class OmniConfig:
                 raw.get("recursiveImprovement", True)
             ),
             "idle_cognition": bool(raw.get("idleCognition", True)),
-            "growth_policy": "unbounded",
             "working_memory_slots": workspace_slots,
             "device": str(raw.get("device", "cpu")),
         }
@@ -336,7 +351,7 @@ class OmniConfig:
     def micro(cls, name: str = "Micro OmniCortex", **overrides: Any) -> "OmniConfig":
         values: Dict[str, Any] = {
             "name": name,
-            "max_seq_len": 48,
+            "max_seq_len": 256,
             "d_model": 32,
             "n_heads": 4,
             "n_layers": 1,
@@ -344,11 +359,11 @@ class OmniConfig:
             "idea_dim": 32,
             "vsa_dim": 64,
             "router_neurons": 24,
+            "working_memory_slots": 128,
             "image_size": 8,
             "audio_samples": 64,
             "video_frames": 2,
             "modality_channels": 8,
-            "max_experts": 3,
             "hardware_tier": "micro",
             "train_batch_size": 1,
             "gradient_accumulation": 8,

@@ -9,6 +9,7 @@ import {
   realpath,
   rename,
   stat,
+  symlink,
   unlink,
   writeFile
 } from "node:fs/promises";
@@ -42,12 +43,27 @@ import {
   EVOLUTION_TEST_NAMES,
   isProtectedEvolutionPath
 } from "./evolutionPolicy";
+import {
+  inspectRuntimeArtifacts,
+  normalizeRuntimeRelativePath,
+  readRuntimeManifest,
+  sha256File,
+  type SourceRuntimeActivationResult,
+  type SourceRuntimeLifecycle,
+  type SourceRuntimeManifest,
+  type SourceRuntimeStageResult
+} from "./sourceRuntimeContract";
 
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_PROCESS_OUTPUT = 2 * 1024 * 1024;
 const MAX_WEB_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_EDIT_TOTAL_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_EDIT_COUNT = 256;
+// Subagents report a focused result into the parent workspace. Their response
+// length is deliberately independent of the brain's much larger working-memory
+// context so hardware-scaled context growth does not multiply CPU latency for
+// every isolated fork.
+const SUBAGENT_RESPONSE_TOKENS = 96;
 
 const SOURCE_TEXT_EXTENSIONS = new Set([
   ".c",
@@ -529,7 +545,8 @@ export class ToolExecutor {
 
   constructor(
     private readonly service: BrainService,
-    private readonly jobs: RuntimeJobManager
+    private readonly jobs: RuntimeJobManager,
+    private readonly sourceRuntime?: SourceRuntimeLifecycle
   ) {}
 
   async execute(
@@ -574,7 +591,12 @@ export class ToolExecutor {
       this.activeExecutions.set(id, { brainId: invocation.brainId, controller });
       let output: unknown;
       try {
-        output = await this.dispatch(invocation, controller.signal, onProgress);
+        output = await this.dispatch(
+          invocation,
+          controller.signal,
+          onProgress,
+          permission
+        );
       } catch (error) {
         if (controller.signal.aborted) throw toolCancellationError();
         throw error;
@@ -609,6 +631,22 @@ export class ToolExecutor {
       cancelled += 1;
     }
     return cancelled;
+  }
+
+  hasPendingOrActive(brainId: string): boolean {
+    const now = Date.now();
+    for (const [token, approval] of this.approvals) {
+      if (approval.expiresAt < now) this.approvals.delete(token);
+    }
+    return (
+      [...this.approvals.values()].some(
+        (approval) => approval.brainId === brainId
+      ) ||
+      [...this.activeExecutions.values()].some(
+        (execution) =>
+          execution.brainId === brainId && !execution.controller.signal.aborted
+      )
+    );
   }
 
   private async permission(brainId: string, toolId: string): Promise<ToolPermissionLevel> {
@@ -650,7 +688,8 @@ export class ToolExecutor {
   private async dispatch(
     invocation: ToolInvocation,
     signal: AbortSignal,
-    onProgress?: (job: RuntimeJob) => void
+    onProgress?: (job: RuntimeJob) => void,
+    permission?: ToolPermissionLevel
   ): Promise<unknown> {
     switch (invocation.toolId) {
       case "windows.files":
@@ -681,7 +720,13 @@ export class ToolExecutor {
       case "browser.automation":
         return this.browser(invocation.brainId, invocation.action, invocation.arguments, signal);
       case "source.self-modify":
-        return this.sourceEvolution(invocation.action, invocation.arguments, signal);
+        return this.sourceEvolution(
+          invocation.brainId,
+          invocation.action,
+          invocation.arguments,
+          signal,
+          permission ?? "off"
+        );
       default:
         throw new Error("Unknown tool protocol.");
     }
@@ -1154,6 +1199,16 @@ export class ToolExecutor {
     if (!["image", "audio", "video"].includes(modality)) {
       throw new Error("Imagination modality must be image, audio, or video.");
     }
+    const neuralActionId =
+      typeof args.neuralActionId === "string" &&
+      /^[a-f0-9]{32}$/.test(args.neuralActionId)
+        ? args.neuralActionId
+        : undefined;
+    const seed =
+      typeof args.seed === "number" &&
+      Number.isSafeInteger(args.seed)
+        ? args.seed
+        : undefined;
     const job = this.jobs.generate({
       brainId,
       modality: modality as "image" | "audio" | "video",
@@ -1164,7 +1219,9 @@ export class ToolExecutor {
       settings:
         typeof args.settings === "object" && args.settings !== null
           ? (args.settings as Record<string, string | number | boolean>)
-          : undefined
+          : undefined,
+      ...(neuralActionId ? { neuralActionId } : {}),
+      ...(seed !== undefined ? { seed } : {})
     });
     onProgress?.(job);
     const progressListener = ({ job: update }: { job: RuntimeJob }): void => {
@@ -1234,7 +1291,14 @@ export class ToolExecutor {
     const results = [];
     for (const fork of forks) {
       assertToolActive(signal);
-      const result = await this.service.chat(fork.id, objective, signal);
+      const result = await this.service.chat(
+        fork.id,
+        objective,
+        signal,
+        undefined,
+        undefined,
+        SUBAGENT_RESPONSE_TOKENS
+      );
       assertToolActive(signal);
       results.push({
         forkId: fork.id,
@@ -1254,10 +1318,189 @@ export class ToolExecutor {
     };
   }
 
+  private async verifyRuntimeStage(
+    stage: SourceRuntimeStageResult,
+    expected: {
+      repository: string;
+      worktree: string;
+      parentCommit: string;
+      diffSha256: string;
+      evaluatorSha256: string;
+      brainSnapshotId: string;
+      currentExecutablePath: string;
+      currentExecutableSha256: string;
+    }
+  ): Promise<SourceRuntimeStageResult> {
+    if (
+      !stage ||
+      typeof stage !== "object" ||
+      !/^[a-z0-9][a-z0-9-]{5,127}$/i.test(stage.slotId ?? "")
+    ) {
+      throw new Error("The staged runtime returned an invalid slot identity.");
+    }
+    if (!["win32", "darwin", "linux"].includes(process.platform)) {
+      throw new Error(`Native runtime activation is unsupported on ${process.platform}.`);
+    }
+    if (!["x64", "arm64"].includes(process.arch)) {
+      throw new Error(`Native runtime activation is unsupported on ${process.arch}.`);
+    }
+    const [root, manifestPath, executablePath, repository, worktree, currentExecutable] =
+      await Promise.all([
+        realpath(stage.rootPath),
+        realpath(stage.manifestPath),
+        realpath(stage.executablePath),
+        realpath(expected.repository),
+        realpath(expected.worktree),
+        realpath(expected.currentExecutablePath)
+      ]);
+    const within = (parent: string, child: string): boolean => {
+      const fromParent = relative(parent, child);
+      return (
+        fromParent === "" ||
+        (!fromParent.startsWith("..") && !isAbsolute(fromParent))
+      );
+    };
+    if (
+      !within(root, manifestPath) ||
+      !within(root, executablePath) ||
+      within(repository, root) ||
+      within(worktree, root) ||
+      resolve(executablePath) === resolve(currentExecutable)
+    ) {
+      throw new Error(
+        "The staged runtime must be side-by-side, outside source worktrees, and distinct from the running executable."
+      );
+    }
+    if (
+      resolve(manifestPath) !== resolve(join(root, "runtime-manifest.json"))
+    ) {
+      throw new Error("The staged runtime manifest must be rooted in its exact slot.");
+    }
+    const manifestFile = await sha256File(manifestPath);
+    if (
+      !/^[a-f0-9]{64}$/i.test(stage.manifestSha256) ||
+      manifestFile.sha256 !== stage.manifestSha256.toLocaleLowerCase()
+    ) {
+      throw new Error("The staged runtime manifest hash does not match its artifact.");
+    }
+    const manifest = await readRuntimeManifest(manifestPath);
+    const lineage = manifest.lineage;
+    if (
+      manifest.schemaVersion !== 1 ||
+      manifest.slotId !== stage.slotId ||
+      manifest.state !== "staged" ||
+      manifest.platform !== process.platform ||
+      manifest.architecture !== process.arch ||
+      lineage?.parentCommit !== expected.parentCommit ||
+      lineage?.diffSha256 !== expected.diffSha256 ||
+      lineage?.evaluatorSha256 !== expected.evaluatorSha256 ||
+      lineage?.brainSnapshotId !== expected.brainSnapshotId ||
+      manifest.currentExecutableSha256 !== expected.currentExecutableSha256 ||
+      !["reused-current-worker", "rebuilt-protected-worker"].includes(
+        manifest.engineStrategy
+      )
+    ) {
+      throw new Error("The staged runtime manifest lineage is invalid or mismatched.");
+    }
+    if (JSON.stringify(stage.manifest) !== JSON.stringify(manifest)) {
+      throw new Error("The runtime host result does not match its persisted manifest.");
+    }
+    const inspected = await inspectRuntimeArtifacts(root);
+    if (
+      inspected.artifactSha256 !== manifest.artifactSha256 ||
+      JSON.stringify(inspected.artifacts) !== JSON.stringify(manifest.artifacts)
+    ) {
+      throw new Error("The staged runtime artifact tree failed hash verification.");
+    }
+    const executableRelativePath = normalizeRuntimeRelativePath(
+      manifest.executableRelativePath
+    );
+    const recordedExecutable = await realpath(
+      resolve(root, ...executableRelativePath.split("/"))
+    );
+    if (resolve(recordedExecutable) !== resolve(executablePath)) {
+      throw new Error("The staged executable path does not match its manifest.");
+    }
+    const executableArtifact = inspected.artifacts.find(
+      (artifact) => artifact.path === executableRelativePath
+    );
+    const executableHash = await sha256File(executablePath);
+    if (
+      executableArtifact?.kind !== "file" ||
+      executableArtifact.sha256 !== executableHash.sha256 ||
+      manifest.executableSha256 !== executableHash.sha256
+    ) {
+      throw new Error("The staged executable failed independent hash verification.");
+    }
+    const currentAfterStage = await sha256File(currentExecutable);
+    if (currentAfterStage.sha256 !== expected.currentExecutableSha256) {
+      throw new Error("The running executable changed while staging its side-by-side successor.");
+    }
+    return {
+      ...stage,
+      rootPath: root,
+      manifestPath,
+      executablePath,
+      manifestSha256: manifestFile.sha256,
+      manifest
+    };
+  }
+
+  private async verifyRuntimeActivation(
+    activation: SourceRuntimeActivationResult,
+    stage: SourceRuntimeStageResult,
+    promotionCommit: string,
+    currentExecutablePath: string,
+    currentExecutableSha256: string
+  ): Promise<SourceRuntimeActivationResult> {
+    if (
+      !activation ||
+      !["scheduled", "deferred"].includes(activation.state) ||
+      activation.slotId !== stage.slotId ||
+      resolve(activation.executablePath) !== resolve(stage.executablePath) ||
+      resolve(activation.manifestPath) !== resolve(stage.manifestPath) ||
+      activation.promotionCommit !== promotionCommit ||
+      !Number.isSafeInteger(activation.delayMs) ||
+      activation.delayMs < 3_000
+    ) {
+      throw new Error("The runtime host returned an invalid activation schedule.");
+    }
+    const [manifestFile, manifest, currentExecutable, inspected] = await Promise.all([
+      sha256File(stage.manifestPath),
+      readRuntimeManifest(stage.manifestPath),
+      sha256File(currentExecutablePath),
+      inspectRuntimeArtifacts(stage.rootPath)
+    ]);
+    if (
+      manifestFile.sha256 !== activation.manifestSha256 ||
+      manifest.slotId !== stage.slotId ||
+      manifest.state !== activation.state ||
+      manifest.promotionCommit !== promotionCommit ||
+      manifest.activation?.state !== activation.state ||
+      manifest.activation.delayMs !== activation.delayMs ||
+      inspected.artifactSha256 !== stage.manifest.artifactSha256 ||
+      JSON.stringify(inspected.artifacts) !==
+        JSON.stringify(stage.manifest.artifacts) ||
+      currentExecutable.sha256 !== currentExecutableSha256
+    ) {
+      throw new Error(
+        "The scheduled runtime manifest is invalid or the running executable was replaced."
+      );
+    }
+    return {
+      ...activation,
+      executablePath: stage.executablePath,
+      manifestPath: stage.manifestPath,
+      manifestSha256: manifestFile.sha256
+    };
+  }
+
   private async sourceEvolution(
+    brainId: string,
     action: string,
     args: Record<string, unknown>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    permission: ToolPermissionLevel
   ): Promise<unknown> {
     assertToolActive(signal);
     const configured = process.env.OMNI_SOURCE_REPOSITORY;
@@ -1384,6 +1627,87 @@ export class ToolExecutor {
       }
       await readProposal(candidate);
       return candidate;
+    };
+    const withCandidateDependencies = async <T>(
+      worktree: string,
+      operation: () => Promise<T>
+    ): Promise<T> => {
+      const [authorizedRoot, candidateRoot] = await Promise.all([
+        realpath(repository),
+        realpath(worktree)
+      ]);
+      const candidateFromRepository = relative(authorizedRoot, candidateRoot);
+      if (
+        candidateFromRepository === "" ||
+        (!candidateFromRepository.startsWith("..") &&
+          !isAbsolute(candidateFromRepository))
+      ) {
+        throw new Error("Evolution dependencies require a sibling isolated Git worktree.");
+      }
+      const sourceModulesPath = join(authorizedRoot, "node_modules");
+      const sourceModules = await lstat(sourceModulesPath).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error(
+            "The authorized source repository has no existing node_modules to reuse; dependencies are never installed during evolution."
+          );
+        }
+        throw error;
+      });
+      if (!sourceModules.isDirectory() || sourceModules.isSymbolicLink()) {
+        throw new Error(
+          "The authorized source repository node_modules must be a real directory."
+        );
+      }
+      const sourceModulesRoot = await realpath(sourceModulesPath);
+      if (resolve(sourceModulesRoot) !== resolve(sourceModulesPath)) {
+        throw new Error("The authorized node_modules root resolved outside its exact path.");
+      }
+      const candidateModulesPath = join(candidateRoot, "node_modules");
+      try {
+        await lstat(candidateModulesPath);
+        throw new Error("The isolated candidate already contains node_modules.");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await symlink(
+        sourceModulesRoot,
+        candidateModulesPath,
+        process.platform === "win32" ? "junction" : "dir"
+      );
+      try {
+        const [linked, linkedRoot] = await Promise.all([
+          lstat(candidateModulesPath),
+          realpath(candidateModulesPath)
+        ]);
+        if (
+          !linked.isSymbolicLink() ||
+          resolve(linkedRoot) !== resolve(sourceModulesRoot)
+        ) {
+          throw new Error(
+            "Candidate dependency linkage did not resolve to the authorized repository."
+          );
+        }
+        return await operation();
+      } finally {
+        const linked = await lstat(candidateModulesPath).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+          throw error;
+        });
+        if (linked) {
+          if (!linked.isSymbolicLink()) {
+            throw new Error(
+              "Candidate dependency link was replaced during execution and was not removed."
+            );
+          }
+          const linkedRoot = await realpath(candidateModulesPath);
+          if (resolve(linkedRoot) !== resolve(sourceModulesRoot)) {
+            throw new Error(
+              "Candidate dependency link target changed during execution and was not removed."
+            );
+          }
+          await unlink(candidateModulesPath);
+        }
+      }
     };
 
     const diffSnapshot = async (
@@ -1871,45 +2195,55 @@ export class ToolExecutor {
         stderr: string;
         truncated: boolean;
       }> = [];
-      for (const name of names) {
-        const commandArgs =
-          process.platform === "win32"
-            ? ["/d", "/c", "npm.cmd", ...commands[name]!]
-            : commands[name]!;
-        const baselineStartedAt = Date.now();
-        const baseline = await runEvolutionProcess(
-          executable,
-          commandArgs,
-          repository,
-          boundedTimeout(args.timeoutMs, 600_000)
-        );
-        baselineChecks.push({
-          name,
-          passed: baseline.exitCode === 0,
-          exitCode: baseline.exitCode,
-          durationMs: Date.now() - baselineStartedAt,
-          stdout: baseline.stdout,
-          stderr: baseline.stderr,
-          truncated: baseline.truncated
-        });
-        const candidateStartedAt = Date.now();
-        const result = await runEvolutionProcess(
-          executable,
-          commandArgs,
-          worktree,
-          boundedTimeout(args.timeoutMs, 600_000)
-        );
-        checks.push({
-          name,
-          passed: result.exitCode === 0,
-          exitCode: result.exitCode,
-          durationMs: Date.now() - candidateStartedAt,
-          stdout: result.stdout,
-          stderr: result.stderr,
-          truncated: result.truncated
-        });
-        if (result.exitCode !== 0) break;
-      }
+      await withCandidateDependencies(worktree, async () => {
+        for (const name of names) {
+          const commandArgs =
+            process.platform === "win32"
+              ? ["/d", "/c", "npm.cmd", ...commands[name]!]
+              : commands[name]!;
+          const environment = {
+            npm_config_ignore_scripts: "true",
+            NPM_CONFIG_IGNORE_SCRIPTS: "true"
+          };
+          const baselineStartedAt = Date.now();
+          const baseline = await runProcess(
+            executable,
+            commandArgs,
+            repository,
+            boundedTimeout(args.timeoutMs, 600_000),
+            { ...environment, OMNI_EVOLUTION_CANDIDATE_WORKTREE: "0" },
+            signal
+          );
+          baselineChecks.push({
+            name,
+            passed: baseline.exitCode === 0,
+            exitCode: baseline.exitCode,
+            durationMs: Date.now() - baselineStartedAt,
+            stdout: baseline.stdout,
+            stderr: baseline.stderr,
+            truncated: baseline.truncated
+          });
+          const candidateStartedAt = Date.now();
+          const result = await runProcess(
+            executable,
+            commandArgs,
+            worktree,
+            boundedTimeout(args.timeoutMs, 600_000),
+            { ...environment, OMNI_EVOLUTION_CANDIDATE_WORKTREE: "1" },
+            signal
+          );
+          checks.push({
+            name,
+            passed: result.exitCode === 0,
+            exitCode: result.exitCode,
+            durationMs: Date.now() - candidateStartedAt,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            truncated: result.truncated
+          });
+          if (result.exitCode !== 0) break;
+        }
+      });
       const diffCheck = await runEvolutionProcess(
         "git",
         ["-C", worktree, "diff", "--check"],
@@ -2073,88 +2407,220 @@ export class ToolExecutor {
       ) {
         throw new Error("Authorized source changed after the candidate was forked; rebase and retest it.");
       }
-      await unlink(join(worktree, "OMNI_EVOLUTION_TASK.md")).catch(() => undefined);
-      const added = await runEvolutionProcess(
-        "git",
-        ["-C", worktree, "add", "-A"],
-        worktree,
-        60_000
-      );
-      if (added.exitCode !== 0) throw new Error(`Could not stage candidate: ${added.stderr}`);
-      const committed = await runEvolutionProcess(
-        "git",
-        [
-          "-C",
-          worktree,
-          "-c",
-          "user.name=OmniCortex Evolution",
-          "-c",
-          "user.email=omni-evolution@local.invalid",
-          "commit",
-          "-m",
-          `Promote OmniCortex evolution ${basename(worktree)}`
-        ],
-        worktree,
-        120_000
-      );
-      if (committed.exitCode !== 0) {
-        throw new Error(`Candidate commit failed (an empty candidate cannot be promoted): ${committed.stderr}`);
+      let runtimeStage: SourceRuntimeStageResult | undefined;
+      let activationSnapshotId: string | undefined;
+      let currentExecutablePath: string | undefined;
+      let currentExecutableSha256: string | undefined;
+      if (permission === "full") {
+        if (!this.sourceRuntime) {
+          throw new Error(
+            "Full-Authority source promotion requires an injected side-by-side runtime lifecycle."
+          );
+        }
+        if (
+          !["win32", "darwin", "linux"].includes(process.platform) ||
+          !["x64", "arm64"].includes(process.arch)
+        ) {
+          throw new Error(
+            `Full-Authority runtime activation is unsupported on ${process.platform}-${process.arch}.`
+          );
+        }
+        const snapshotSummary = await this.service.repository.snapshot(
+          brainId,
+          `Before Full-Authority source activation ${basename(worktree)}`
+        );
+        activationSnapshotId = snapshotSummary.id;
+        currentExecutablePath = await realpath(process.execPath);
+        currentExecutableSha256 = (await sha256File(currentExecutablePath)).sha256;
+        let staged: SourceRuntimeStageResult | undefined;
+        try {
+          staged = await withCandidateDependencies(worktree, () =>
+            this.sourceRuntime!.stage(
+              {
+                brainId,
+                authorizedRepository: repository,
+                worktree,
+                parentCommit: proposal.parentCommit,
+                diffSha256: expected,
+                evaluatorSha256: proposal.evaluatorSha256,
+                changedPaths: snapshot.changedPaths,
+                brainSnapshotId: activationSnapshotId!,
+                currentExecutablePath: currentExecutablePath!,
+                platform: process.platform as "win32" | "darwin" | "linux",
+                architecture: process.arch as "x64" | "arm64"
+              },
+              signal
+            )
+          );
+          runtimeStage = await this.verifyRuntimeStage(staged, {
+            repository,
+            worktree,
+            parentCommit: proposal.parentCommit,
+            diffSha256: expected,
+            evaluatorSha256: proposal.evaluatorSha256,
+            brainSnapshotId: activationSnapshotId,
+            currentExecutablePath,
+            currentExecutableSha256
+          });
+          await verifyEvaluatorBoundary(
+            worktree,
+            proposal,
+            args.expectedEvaluatorSha256
+          );
+          const afterStage = await diffSnapshot(worktree, proposal.parentCommit);
+          if (afterStage.sha256 !== expected) {
+            throw new Error(
+              "Runtime staging changed the validated source candidate; promotion was not merged."
+            );
+          }
+        } catch (error) {
+          if (staged) {
+            await this.sourceRuntime
+              .abandonStage?.(
+                staged,
+                error instanceof Error ? error.message : String(error)
+              )
+              .catch(() => undefined);
+          }
+          throw error;
+        }
       }
-      const commit = await runEvolutionProcess(
-        "git",
-        ["-C", worktree, "rev-parse", "HEAD"],
-        worktree,
-        30_000
-      );
-      if (commit.exitCode !== 0) throw new Error(`Could not resolve candidate commit: ${commit.stderr}`);
-      let merged: Awaited<ReturnType<typeof runProcess>>;
       try {
-        merged = await runEvolutionProcess(
+        await unlink(join(worktree, "OMNI_EVOLUTION_TASK.md")).catch(() => undefined);
+        const added = await runEvolutionProcess(
+          "git",
+          ["-C", worktree, "add", "-A"],
+          worktree,
+          60_000
+        );
+        if (added.exitCode !== 0) {
+          throw new Error(`Could not stage candidate: ${added.stderr}`);
+        }
+        const committed = await runEvolutionProcess(
           "git",
           [
             "-C",
-            repository,
-            "merge",
-            "--no-ff",
+            worktree,
+            "-c",
+            "user.name=OmniCortex Evolution",
+            "-c",
+            "user.email=omni-evolution@local.invalid",
+            "commit",
             "-m",
-            `Promote OmniCortex evolution ${basename(worktree)}`,
-            commit.stdout.trim()
+            `Promote OmniCortex evolution ${basename(worktree)}`
           ],
-          repository,
+          worktree,
           120_000
         );
-      } catch (error) {
-        await runProcess(
+        if (committed.exitCode !== 0) {
+          throw new Error(
+            `Candidate commit failed (an empty candidate cannot be promoted): ${committed.stderr}`
+          );
+        }
+        const commit = await runEvolutionProcess(
           "git",
-          ["-C", repository, "merge", "--abort"],
+          ["-C", worktree, "rev-parse", "HEAD"],
+          worktree,
+          30_000
+        );
+        if (commit.exitCode !== 0) {
+          throw new Error(`Could not resolve candidate commit: ${commit.stderr}`);
+        }
+        let merged: Awaited<ReturnType<typeof runProcess>>;
+        try {
+          merged = await runEvolutionProcess(
+            "git",
+            [
+              "-C",
+              repository,
+              "merge",
+              "--no-ff",
+              "-m",
+              `Promote OmniCortex evolution ${basename(worktree)}`,
+              commit.stdout.trim()
+            ],
+            repository,
+            120_000
+          );
+        } catch (error) {
+          await runProcess(
+            "git",
+            ["-C", repository, "merge", "--abort"],
+            repository,
+            30_000
+          ).catch(() => undefined);
+          throw error;
+        }
+        if (merged.exitCode !== 0) {
+          await runProcess(
+            "git",
+            ["-C", repository, "merge", "--abort"],
+            repository,
+            30_000
+          );
+          throw new Error(
+            `Candidate promotion failed and was aborted: ${merged.stderr}`
+          );
+        }
+        const promotionCommit = await runEvolutionProcess(
+          "git",
+          ["-C", repository, "rev-parse", "HEAD"],
           repository,
           30_000
-        ).catch(() => undefined);
+        );
+        if (promotionCommit.exitCode !== 0) {
+          throw new Error(
+            `Could not resolve the promotion commit: ${promotionCommit.stderr}`
+          );
+        }
+        let runtimeActivation: SourceRuntimeActivationResult | undefined;
+        if (
+          permission === "full" &&
+          runtimeStage &&
+          currentExecutablePath &&
+          currentExecutableSha256
+        ) {
+          const scheduled = await this.sourceRuntime!.scheduleActivation({
+            stage: runtimeStage,
+            promotionCommit: promotionCommit.stdout.trim(),
+            candidateCommit: commit.stdout.trim(),
+            delayMs: 5_000
+          });
+          runtimeActivation = await this.verifyRuntimeActivation(
+            scheduled,
+            runtimeStage,
+            promotionCommit.stdout.trim(),
+            currentExecutablePath,
+            currentExecutableSha256
+          );
+        }
+        return {
+          worktree,
+          promoted: true,
+          commit: promotionCommit.stdout.trim(),
+          candidateCommit: commit.stdout.trim(),
+          parentCommit: parentCommit.stdout.trim(),
+          diffSha256: expected,
+          evaluatorSha256: proposal.evaluatorSha256,
+          brainSnapshotId: activationSnapshotId,
+          runtimeActivation,
+          note: runtimeActivation
+            ? runtimeActivation.state === "scheduled"
+              ? "Source was merged; a verified side-by-side runtime restart was scheduled without replacing the running executable."
+              : "Source was merged; the verified side-by-side runtime is safely deferred in this development/test host."
+            : "Source was merged; Ask/Auto promotion did not activate or replace the running executable."
+        };
+      } catch (error) {
+        if (runtimeStage) {
+          await this.sourceRuntime
+            ?.abandonStage?.(
+              runtimeStage,
+              error instanceof Error ? error.message : String(error)
+            )
+            .catch(() => undefined);
+        }
         throw error;
       }
-      if (merged.exitCode !== 0) {
-        await runProcess("git", ["-C", repository, "merge", "--abort"], repository, 30_000);
-        throw new Error(`Candidate promotion failed and was aborted: ${merged.stderr}`);
-      }
-      const promotionCommit = await runEvolutionProcess(
-        "git",
-        ["-C", repository, "rev-parse", "HEAD"],
-        repository,
-        30_000
-      );
-      if (promotionCommit.exitCode !== 0) {
-        throw new Error(`Could not resolve the promotion commit: ${promotionCommit.stderr}`);
-      }
-      return {
-        worktree,
-        promoted: true,
-        commit: promotionCommit.stdout.trim(),
-        candidateCommit: commit.stdout.trim(),
-        parentCommit: parentCommit.stdout.trim(),
-        diffSha256: expected,
-        evaluatorSha256: proposal.evaluatorSha256,
-        note: "Source was merged; the running binary was not overwritten or restarted."
-      };
     }
 
     if (action === "rollback") {

@@ -6,6 +6,11 @@ A blank brain is initialized from a recorded random seed. It has architecture bu
 
 A starter brain is an OmniCortex checkpoint trained by the same engine. Installing one is not an API call to another AI; its tensors become the brain's starting parameters. Its model card must disclose all upstream data and post-training.
 
+The bundled default is documented in
+[OMNI_STARTER.md](OMNI_STARTER.md). Its materialized manifest records the exact
+project-authored dataset hashes, objectives, parameter checksums, and local
+loss/pack metrics before the immutable origin snapshot is created.
+
 ## Hardware profiles
 
 Profiles change scale, not the meaning of a module:
@@ -60,7 +65,7 @@ These mechanisms reduce forgetting; they cannot guarantee perfect retention.
 
 ## Conversation learning
 
-The current human turn is ordinary model input. Long-term memory is not pasted beside it. Parameter-only mode conditions activations with learned semantic state; working-memory mode additionally blends bounded recency-weighted recurrent vectors without adding earlier message tokens. After the turn:
+The current human turn and the explicitly reported, capacity-bounded ring of recent human/brain dialogue tokens are ordinary model input. Long-term sources are never silently pasted beside them. Parameter-only mode conditions activations with learned semantic state; working-memory mode additionally blends bounded recency-weighted recurrent vectors. The trace separately reports recent-dialogue expansion and confirms that hidden/long-term prompt expansion is absent. After the turn:
 
 - human text is eligible for self-supervised learning;
 - generated text receives a lower default replay weight to limit self-amplifying errors;
@@ -80,10 +85,19 @@ WebDataset shards, EPUB/Office archives, and local Hugging Face-style
 entire table.
 
 The web crawler uses a brain-local SQLite frontier. It follows the same site by
-default, fetches concurrently, obeys `robots.txt` by default, and continues
+default, automatically sizes concurrent fetching from the host's available
+processors, obeys `robots.txt` by default, and continues
 until stopped, an optional page/depth condition is reached, or its frontier is
 empty. Resume requeues in-flight pages and retains visited URLs, failures, and
-provenance. Neither datasets nor crawls are concatenated into a prompt or
+provenance. Per-URL learning receipts and aggregate modality/error coverage stay
+in SQLite across resumes; only a bounded recent diagnostic window is returned
+to the renderer, so an indefinite crawl does not accumulate an indefinite
+in-memory result list. Explicit dataset epochs revisit every valid record in the
+committed deterministic manifest/source snapshot even when its content was
+learned before that manifest, whereas a repeated one-off upload remains
+deduplicated. Fatal neural, resource, or worker failures preserve incomplete
+coverage and a resumable cursor rather than advancing it or claiming
+completion. Neither datasets nor crawls are concatenated into a prompt or
 in-memory corpus. The training engine does not execute code found in a dataset
 or repository unless the separate code tool is explicitly granted authority.
 

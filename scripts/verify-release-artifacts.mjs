@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+import { releaseArtifactName } from "./release-artifact-names.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
@@ -43,7 +44,15 @@ function requiredNames(product, version) {
       names.push(`${product}-${version}-macOS-${arch}.${extension}`);
     }
     for (const extension of ["AppImage", "deb", "tar.gz"]) {
-      names.push(`${product}-${version}-Linux-${arch}.${extension}`);
+      names.push(
+        releaseArtifactName({
+          product,
+          version,
+          platform: "linux",
+          architecture: arch,
+          extension
+        })
+      );
     }
     names.push(`windows-package-smoke-${arch}.json`);
     names.push(`mac-package-smoke-${arch}.json`);
@@ -275,9 +284,15 @@ for (const arch of ["x64", "arm64"]) {
     `Linux ${arch} must label code signing as not applicable.`
   );
   const expectedLinuxArtifacts = [
-    `${product}-${version}-Linux-${arch}.AppImage`,
-    `${product}-${version}-Linux-${arch}.deb`,
-    `${product}-${version}-Linux-${arch}.tar.gz`
+    ...["AppImage", "deb", "tar.gz"].map((extension) =>
+      releaseArtifactName({
+        product,
+        version,
+        platform: "linux",
+        architecture: arch,
+        extension
+      })
+    )
   ];
   requireValue(
     Array.isArray(linux.artifacts) && linux.artifacts.length === expectedLinuxArtifacts.length,

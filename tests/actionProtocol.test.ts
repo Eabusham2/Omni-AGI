@@ -93,7 +93,7 @@ describe("structured chat actions", () => {
             onStream?.({
               type: "chat-action",
               sequence: 0,
-              actionId: "neural-action-1",
+              actionId: "11111111111111111111111111111111",
               action: proposed
             });
             return chatResult("I will form that image.");
@@ -125,7 +125,8 @@ describe("structured chat actions", () => {
         action: "generate",
         arguments: {
           modality: "image",
-          conceptIds: ["emergent-city"]
+          conceptIds: ["emergent-city"],
+          neuralActionId: "11111111111111111111111111111111"
         }
       },
       expect.any(Function)
@@ -136,6 +137,47 @@ describe("structured chat actions", () => {
       expect.objectContaining({ state: "complete", execution })
     ]);
     expect(streamed).toEqual(["proposed", "running", "complete"]);
+  });
+
+  it("settles repeated imagination intent when only transient assemblies change", async () => {
+    const recurring = (assemblyId: string) => ({
+      kind: "imagine" as const,
+      source: "brain" as const,
+      toolId: "modality.imagine",
+      action: "generate",
+      arguments: {
+        modality: "image",
+        assemblyIds: [assemblyId]
+      }
+    });
+    const service = {
+      chat: vi
+        .fn()
+        .mockResolvedValueOnce(chatResult("I formed the scene.", [recurring("first")]))
+        .mockResolvedValueOnce(chatResult("The artifact changed my active assembly.", [recurring("second")]))
+    };
+    const tools = {
+      execute: vi.fn().mockResolvedValue({
+        id: "one-image",
+        toolId: "modality.imagine",
+        action: "generate",
+        state: "complete",
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        output: { artifactPath: "one-image.png" }
+      } satisfies ToolExecutionResult),
+      cancel: vi.fn(() => 0)
+    };
+    const controller = new ChatActionController(service, tools, { start: vi.fn() });
+
+    const result = await controller.send("brain-settling", "Visualize this scene.");
+
+    expect(service.chat).toHaveBeenCalledTimes(2);
+    expect(tools.execute).toHaveBeenCalledTimes(1);
+    expect(result.actionEvents).toHaveLength(1);
+    expect(result.brainMessage.content).toBe(
+      "The artifact changed my active assembly."
+    );
   });
 
   it("streams organic imagination progress while the response remains in flight", async () => {
@@ -189,13 +231,13 @@ describe("structured chat actions", () => {
         onStream?.({
           type: "chat-action",
           sequence: 1,
-          actionId: "story-imagination",
+          actionId: "22222222222222222222222222222222",
           action: proposed
         });
         onStream?.({
           type: "modality-preview",
           sequence: 2,
-          actionId: "story-imagination",
+          actionId: "22222222222222222222222222222222",
           preview: {
             revision: 0,
             progress: 0.08,
@@ -356,6 +398,56 @@ describe("structured chat actions", () => {
       }),
       expect.any(Function)
     );
+  });
+
+  it("executes a ponder action as an additional prompt-free neural cycle", async () => {
+    const ponder = {
+      kind: "ponder" as const,
+      source: "brain" as const,
+      arguments: { assemblyIds: ["unresolved-assembly"], organic: true },
+      confidence: 0.91
+    };
+    const service = {
+      chat: vi.fn().mockResolvedValue(
+        chatResult("I need another internal pass.", [ponder])
+      ),
+      idleCycle: vi.fn().mockResolvedValue({
+        brainId: "brain-ponder",
+        ran: true,
+        actions: [],
+        trace: {
+          mode: "ponder",
+          promptTokenCount: 0,
+          hiddenBehavioralPrompt: false,
+          parameterDeltaNorm: 0.02
+        }
+      })
+    };
+    const tools = {
+      execute: vi.fn(),
+      cancel: vi.fn(() => 0)
+    };
+    const controller = new ChatActionController(
+      service,
+      tools,
+      { start: vi.fn() }
+    );
+
+    const result = await controller.send(
+      "brain-ponder",
+      "Stay with the unresolved relation."
+    );
+
+    expect(service.chat).toHaveBeenCalledOnce();
+    expect(service.idleCycle).toHaveBeenCalledOnce();
+    expect(service.idleCycle).toHaveBeenCalledWith("brain-ponder", 0);
+    expect(tools.execute).not.toHaveBeenCalled();
+    expect(result.actionEvents).toEqual([
+      expect.objectContaining({
+        state: "complete",
+        action: expect.objectContaining({ kind: "ponder" })
+      })
+    ]);
   });
 
   it("runs model-proposed actions, stops on approval, and archives evolve requests", async () => {
