@@ -53,6 +53,7 @@ import {
   type SourceRuntimeManifest,
   type SourceRuntimeStageResult
 } from "./sourceRuntimeContract";
+import { withBrainWrite } from "./brainWriteCoordinator";
 
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_PROCESS_OUTPUT = 2 * 1024 * 1024;
@@ -2712,6 +2713,15 @@ export class ToolExecutor {
   }
 
   private async audit(
+    invocation: ToolInvocation,
+    result: ToolExecutionResult
+  ): Promise<void> {
+    return withBrainWrite(this.service.repository, invocation.brainId, () =>
+      this.auditUnlocked(invocation, result)
+    );
+  }
+
+  private async auditUnlocked(
     invocation: ToolInvocation,
     result: ToolExecutionResult
   ): Promise<void> {

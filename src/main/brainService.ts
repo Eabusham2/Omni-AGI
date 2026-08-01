@@ -63,6 +63,7 @@ import {
   validateBuildRecipe
 } from "./catalogInstaller";
 import { BrainRepository } from "./brainRepository";
+import { withBrainWrite } from "./brainWriteCoordinator";
 import { EngineSupervisor, type EngineEvent } from "./engineSupervisor";
 import { normalizeStructuredAction, parseModelActions } from "./actionProtocol";
 import {
@@ -1458,6 +1459,22 @@ export class BrainService {
     turnId = randomUUID(),
     responseTokenBudget?: number
   ): Promise<ChatResult> {
+    return withBrainWrite(
+      this.repository,
+      id,
+      () => this.chatUnlocked(id, input, signal, onStream, turnId, responseTokenBudget),
+      signal
+    );
+  }
+
+  private async chatUnlocked(
+    id: string,
+    input: string,
+    signal?: AbortSignal,
+    onStream?: (event: NeuralChatStreamEvent) => void,
+    turnId = randomUUID(),
+    responseTokenBudget?: number
+  ): Promise<ChatResult> {
     signal?.throwIfAborted();
     if (
       responseTokenBudget !== undefined &&
@@ -1583,6 +1600,15 @@ export class BrainService {
     brainId: string,
     minimumIdleSeconds = 45
   ): Promise<IdleCycleResult> {
+    return withBrainWrite(this.repository, brainId, () =>
+      this.idleCycleUnlocked(brainId, minimumIdleSeconds)
+    );
+  }
+
+  private async idleCycleUnlocked(
+    brainId: string,
+    minimumIdleSeconds: number
+  ): Promise<IdleCycleResult> {
     const brain = await this.repository.get(brainId);
     if (!brain.config.idleCognition) {
       return {
@@ -1664,6 +1690,15 @@ export class BrainService {
     if (!request || !["up", "down"].includes(request.direction)) {
       throw new Error("Invalid neural feedback direction.");
     }
+    return withBrainWrite(this.repository, request.brainId, () =>
+      this.feedbackUnlocked(request)
+    );
+  }
+
+  private async feedbackUnlocked(request: FeedbackRequest): Promise<BrainDocument> {
+    if (!request || !["up", "down"].includes(request.direction)) {
+      throw new Error("Invalid neural feedback direction.");
+    }
     const brain = await this.repository.get(request.brainId);
     const message = brain.messages.find((entry) => entry.id === request.messageId);
     if (!message) throw new Error("The message was not found.");
@@ -1714,6 +1749,10 @@ export class BrainService {
   }
 
   async consolidate(id: string): Promise<BrainDocument> {
+    return withBrainWrite(this.repository, id, () => this.consolidateUnlocked(id));
+  }
+
+  private async consolidateUnlocked(id: string): Promise<BrainDocument> {
     const brain = await this.repository.get(id);
     const result = await this.engine.tryRequest(
       "consolidate",
@@ -1942,6 +1981,18 @@ export class BrainService {
     epoch = 0,
     forceReplay = false
   ): Promise<IngestResult> {
+    return withBrainWrite(this.repository, brainId, () =>
+      this.ingestOnePathUnlocked(brainId, path, policy, epoch, forceReplay)
+    );
+  }
+
+  private async ingestOnePathUnlocked(
+    brainId: string,
+    path: string,
+    policy: DataIngestionPolicy,
+    epoch: number,
+    forceReplay: boolean
+  ): Promise<IngestResult> {
     let brain = await this.repository.get(brainId);
     const fileInfo = await stat(path);
     if (!fileInfo.isFile()) throw new Error(`${path} is not a regular file.`);
@@ -2119,6 +2170,17 @@ export class BrainService {
     raw: string,
     contentType: string
   ): Promise<IngestResult> {
+    return withBrainWrite(this.repository, request.brainId, () =>
+      this.ingestWebContentUnlocked(request, finalUrl, raw, contentType)
+    );
+  }
+
+  private async ingestWebContentUnlocked(
+    request: IngestWebRequest,
+    finalUrl: URL,
+    raw: string,
+    contentType: string
+  ): Promise<IngestResult> {
     const text = contentType.includes("html") ? htmlToText(raw) : raw.replace(/\0/g, "");
     const contentHash = sha256(text);
     let brain = await this.repository.get(request.brainId);
@@ -2208,6 +2270,18 @@ export class BrainService {
   }
 
   private async ingestCrawledMedia(
+    request: IngestWebRequest,
+    finalUrl: URL,
+    path: string,
+    contentType: string,
+    kind: "image" | "audio" | "video"
+  ): Promise<IngestResult> {
+    return withBrainWrite(this.repository, request.brainId, () =>
+      this.ingestCrawledMediaUnlocked(request, finalUrl, path, contentType, kind)
+    );
+  }
+
+  private async ingestCrawledMediaUnlocked(
     request: IngestWebRequest,
     finalUrl: URL,
     path: string,
@@ -2833,6 +2907,16 @@ export class BrainService {
     toolId: string,
     level: ToolPermissionLevel
   ): Promise<ToolPermissionRecord[]> {
+    return withBrainWrite(this.repository, brainId, () =>
+      this.setToolPermissionUnlocked(brainId, toolId, level)
+    );
+  }
+
+  private async setToolPermissionUnlocked(
+    brainId: string,
+    toolId: string,
+    level: ToolPermissionLevel
+  ): Promise<ToolPermissionRecord[]> {
     if (!["off", "ask", "auto", "full"].includes(level)) throw new Error("Invalid permission level.");
     const brain = await this.repository.get(brainId);
     const id = normalizeToolId(toolId);
@@ -3197,6 +3281,16 @@ export class BrainService {
   }
 
   async merge(
+    sourceBrainId: string,
+    targetBrainId: string,
+    reviewToken: string
+  ): Promise<BrainDocument> {
+    return withBrainWrite(this.repository, [sourceBrainId, targetBrainId], () =>
+      this.mergeUnlocked(sourceBrainId, targetBrainId, reviewToken)
+    );
+  }
+
+  private async mergeUnlocked(
     sourceBrainId: string,
     targetBrainId: string,
     reviewToken: string

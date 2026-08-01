@@ -39,6 +39,7 @@ import {
   type ExtractedZipArchive,
   type StreamingZipSource
 } from "./streamingZip";
+import { withBrainWrite } from "./brainWriteCoordinator";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const BUNDLE_FORMAT = "omni-brain";
@@ -1780,6 +1781,13 @@ export class BrainRepository {
   }
 
   async updateConfig(id: string, config: BrainConfig): Promise<BrainDocument> {
+    return withBrainWrite(this, id, () => this.updateConfigUnlocked(id, config));
+  }
+
+  private async updateConfigUnlocked(
+    id: string,
+    config: BrainConfig
+  ): Promise<BrainDocument> {
     const brain = await this.get(id);
     brain.config = normalizeConfig(config);
     brain.name = brain.config.name;
@@ -1787,11 +1795,11 @@ export class BrainRepository {
   }
 
   async fork(id: string, name?: string): Promise<BrainDocument> {
-    return this.copyOnWriteClone(id, name, "fork");
+    return withBrainWrite(this, id, () => this.copyOnWriteClone(id, name, "fork"));
   }
 
   async duplicate(id: string, name?: string): Promise<BrainDocument> {
-    return this.copyOnWriteClone(id, name, "duplicate");
+    return withBrainWrite(this, id, () => this.copyOnWriteClone(id, name, "duplicate"));
   }
 
   private async copyOnWriteClone(
@@ -1851,6 +1859,10 @@ export class BrainRepository {
   }
 
   async remove(id: string): Promise<boolean> {
+    return withBrainWrite(this, id, () => this.removeUnlocked(id));
+  }
+
+  private async removeUnlocked(id: string): Promise<boolean> {
     const source = this.brainDirectory(id);
     if (!(await pathExists(source))) return false;
     const trashName = `${requireSafeId(id)}-${Date.now()}`;
@@ -1859,6 +1871,13 @@ export class BrainRepository {
   }
 
   async snapshot(id: string, label?: string): Promise<BrainSnapshotSummary> {
+    return withBrainWrite(this, id, () => this.snapshotUnlocked(id, label));
+  }
+
+  private async snapshotUnlocked(
+    id: string,
+    label?: string
+  ): Promise<BrainSnapshotSummary> {
     const brain = await this.get(id);
     const snapshotId = randomUUID();
     const createdAt = new Date().toISOString();
@@ -1935,6 +1954,13 @@ export class BrainRepository {
   }
 
   async restoreSnapshot(id: string, snapshotId: string): Promise<BrainDocument> {
+    return withBrainWrite(this, id, () => this.restoreSnapshotUnlocked(id, snapshotId));
+  }
+
+  private async restoreSnapshotUnlocked(
+    id: string,
+    snapshotId: string
+  ): Promise<BrainDocument> {
     requireSafeId(snapshotId, "snapshot id");
     const current = await this.get(id);
     const base = join(this.brainDirectory(id), "snapshots", snapshotId);

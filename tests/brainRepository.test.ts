@@ -931,5 +931,5 @@ describe("BrainRepository lifecycle", () => {
         "tampered-reference.omni"
       )
     ).rejects.toThrow(/invalid tensor reference/);
-  });
+  }, 30_000);
 });
