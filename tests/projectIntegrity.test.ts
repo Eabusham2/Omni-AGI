@@ -273,6 +273,11 @@ describe("project integrity", () => {
     expect(read("playwright.config.ts")).toContain(
       "retries: process.env.CI ? 1 : 0"
     );
+    const electronE2e = read("tests/e2e/electron.spec.ts");
+    expect(electronE2e).toContain("chromium.connectOverCDP");
+    expect(electronE2e).toContain("--remote-debugging-port=${port}");
+    expect(electronE2e).toContain("Packaged app exited before CDP became ready");
+    expect(electronE2e).toContain("terminateProcessTree(child)");
   });
 
   it("defines the stable v1 release across Windows, macOS, and Linux", () => {
