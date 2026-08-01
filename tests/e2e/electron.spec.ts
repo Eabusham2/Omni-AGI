@@ -130,7 +130,7 @@ async function waitForPage(browser: Browser): Promise<Page> {
   throw new Error("Packaged app connected over CDP but did not create a renderer page.");
 }
 
-async function launchInstalled(
+async function launchInstalledWithCdp(
   executablePath: string,
   dataDirectory: string
 ): Promise<RunningApplication> {
@@ -200,6 +200,51 @@ async function launchInstalled(
     await terminateProcessTree(child);
     throw error;
   }
+}
+
+async function launchInstalledWithPlaywright(
+  executablePath: string,
+  dataDirectory: string
+): Promise<RunningApplication> {
+  let application: ElectronApplication | undefined;
+  try {
+    application = await electron.launch({
+      executablePath,
+      args: [
+        `--user-data-dir=${join(dataDirectory, "electron-profile")}`,
+        "--disable-gpu"
+      ],
+      cwd: dirname(executablePath),
+      env: environment(dataDirectory, true),
+      // Portable tar archives cannot preserve root ownership for
+      // chrome-sandbox. This affects only the test launch, not shipped defaults.
+      chromiumSandbox: false,
+      timeout: 180_000
+    });
+    const page = await application.firstWindow({ timeout: 120_000 });
+    let closed = false;
+    return {
+      page,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await application?.close();
+      }
+    };
+  } catch (error) {
+    await application?.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function launchInstalled(
+  executablePath: string,
+  dataDirectory: string
+): Promise<RunningApplication> {
+  if (process.platform === "win32" && process.arch === "arm64") {
+    return launchInstalledWithCdp(executablePath, dataDirectory);
+  }
+  return launchInstalledWithPlaywright(executablePath, dataDirectory);
 }
 
 async function launch(dataDirectory: string): Promise<RunningApplication> {
