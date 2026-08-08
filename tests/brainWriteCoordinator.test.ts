@@ -301,6 +301,34 @@ describe("per-brain writer coordination", () => {
     expect((await repository.get(brain.id)).messages).toEqual([]);
   });
 
+  it("preserves a cold-load failure and gives a brain-sized timeout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-brain-writer-load-error-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Cold load" });
+    const request = vi.fn(async () => {
+      throw new Error("sentinel cold-load failure");
+    });
+    const requestStream = vi.fn();
+    const service = new BrainService(
+      repository,
+      { request, requestStream } as unknown as EngineSupervisor
+    );
+
+    await expect(service.chat(brain.id, "load before chat")).rejects.toThrow(
+      "sentinel cold-load failure"
+    );
+    expect(request).toHaveBeenCalledWith(
+      "load",
+      expect.any(Object),
+      300_000,
+      undefined
+    );
+    expect(requestStream).not.toHaveBeenCalled();
+    expect((await repository.get(brain.id)).messages).toEqual([]);
+  });
+
   it("distinguishes an empty neural response from an unavailable worker", async () => {
     const root = await mkdtemp(join(tmpdir(), "omni-brain-writer-empty-chat-"));
     temporaryRoots.push(root);

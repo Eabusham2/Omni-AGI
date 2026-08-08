@@ -1598,7 +1598,9 @@ def main() -> int:
                 {"jsonrpc": "2.0", "id": request_id, "error": payload}
             )
         except Exception as error:
-            traceback.print_exc(file=sys.stderr)
+            diagnostic = traceback.format_exc()
+            sys.stderr.write(diagnostic)
+            sys.stderr.flush()
             Worker._send(
                 {
                     "jsonrpc": "2.0",
@@ -1607,6 +1609,7 @@ def main() -> int:
                         "code": -32000,
                         "message": "%s: %s"
                         % (error.__class__.__name__, str(error)),
+                        "data": {"traceback": diagnostic[-8_000:]},
                     },
                 }
             )

@@ -37,6 +37,19 @@ interface PythonCandidate {
   prefix: string[];
 }
 
+interface ChildLifecycle {
+  child: ChildProcessWithoutNullStreams;
+  closed: Promise<void>;
+  resolveClosed(): void;
+  stdoutBuffer: string;
+  stdoutListener(chunk: string): void;
+  stderrListener(chunk: string): void;
+  stderr: string[];
+  processError?: string;
+  forcedClose?: NodeJS.Timeout;
+  settled: boolean;
+}
+
 export interface EngineEvent {
   type: string;
   brainId?: string;
@@ -110,13 +123,23 @@ function messageFromError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function workerTraceback(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const traceback = (value as Record<string, unknown>).traceback;
+  if (typeof traceback !== "string") return undefined;
+  const bounded = traceback.replace(/\0/g, "").trim().slice(-8_000);
+  return bounded || undefined;
+}
+
 export class EngineSupervisor extends EventEmitter {
   private readonly options: EngineSupervisorOptions;
   private child?: ChildProcessWithoutNullStreams;
   private pending = new Map<string, PendingRequest>();
-  private stdoutBuffer = "";
   private starting?: Promise<boolean>;
   private terminating?: Promise<void>;
+  private lifecycle?: ChildLifecycle;
   private stopping = false;
   private lastError = "Python worker has not been started.";
   private recentStderr: string[] = [];
@@ -131,6 +154,15 @@ export class EngineSupervisor extends EventEmitter {
   }
 
   async start(): Promise<boolean> {
+    if (this.terminating) await this.terminating;
+    if (this.child && !this.child.killed && this.child.exitCode === null) return true;
+    const lifecycle = this.lifecycle;
+    if (this.child && lifecycle?.child === this.child) {
+      // An exited process is not replaced until all of its stdio streams have
+      // closed. This keeps its pending requests and stderr diagnostics from
+      // crossing into the replacement worker.
+      await lifecycle.closed;
+    }
     if (this.terminating) await this.terminating;
     if (this.child && !this.child.killed && this.child.exitCode === null) return true;
     if (this.starting) return this.starting;
@@ -218,24 +250,45 @@ export class EngineSupervisor extends EventEmitter {
       child.once("spawn", onSpawn);
     });
 
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolveClose) => {
+      resolveClosed = resolveClose;
+    });
+    const lifecycle = {} as ChildLifecycle;
+    Object.assign(lifecycle, {
+      child,
+      closed,
+      resolveClosed,
+      stdoutBuffer: "",
+      stdoutListener: (chunk: string) => this.consumeStdout(lifecycle, chunk),
+      stderrListener: (chunk: string) => {
+        lifecycle.stderr.push(chunk.trim().slice(-4_000));
+        lifecycle.stderr.splice(0, Math.max(0, lifecycle.stderr.length - 12));
+      },
+      stderr: [],
+      settled: false
+    } satisfies Omit<ChildLifecycle, "processError" | "forcedClose">);
     this.child = child;
-    this.stdoutBuffer = "";
-    this.recentStderr = [];
+    this.lifecycle = lifecycle;
+    this.recentStderr = lifecycle.stderr;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk));
-    child.stderr.on("data", (chunk: string) => {
-      this.recentStderr.push(chunk.trim().slice(-4_000));
-      this.recentStderr = this.recentStderr.filter(Boolean).slice(-12);
+    child.stdout.on("data", lifecycle.stdoutListener);
+    child.stderr.on("data", lifecycle.stderrListener);
+    child.once("error", (error) => {
+      lifecycle.processError = `Worker process error: ${error.message}`;
     });
-    child.once("error", (error) =>
-      this.handleExit(child, `Worker process error: ${error.message}`)
-    );
     child.once("exit", (code, signal) => {
-      this.handleExit(
-        child,
-        `Worker exited with code ${String(code)} and signal ${String(signal)}.`
-      );
+      if (this.child !== child) return;
+      this.lastError = `Worker exited with code ${String(code)} and signal ${String(signal)}.`;
+      lifecycle.forcedClose = setTimeout(() => {
+        this.handleClose(lifecycle, code, signal);
+      }, 3_100);
+    });
+    // `close` runs after the stdio streams close, so crash diagnostics include
+    // the complete bounded stderr tail rather than racing the final writes.
+    child.once("close", (code, signal) => {
+      this.handleClose(lifecycle, code, signal);
     });
 
     try {
@@ -246,19 +299,22 @@ export class EngineSupervisor extends EventEmitter {
     }
   }
 
-  private consumeStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    if (this.stdoutBuffer.length > MAX_PROTOCOL_LINE && !this.stdoutBuffer.includes("\n")) {
+  private consumeStdout(lifecycle: ChildLifecycle, chunk: string): void {
+    if (this.lifecycle !== lifecycle || this.child !== lifecycle.child || lifecycle.settled) {
+      return;
+    }
+    lifecycle.stdoutBuffer += chunk;
+    if (lifecycle.stdoutBuffer.length > MAX_PROTOCOL_LINE && !lifecycle.stdoutBuffer.includes("\n")) {
       this.lastError = "Worker emitted an oversized protocol line.";
       void this.terminateChild();
       return;
     }
-    let newline = this.stdoutBuffer.indexOf("\n");
+    let newline = lifecycle.stdoutBuffer.indexOf("\n");
     while (newline >= 0) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+      const line = lifecycle.stdoutBuffer.slice(0, newline).trim();
+      lifecycle.stdoutBuffer = lifecycle.stdoutBuffer.slice(newline + 1);
       if (line) this.consumeLine(line);
-      newline = this.stdoutBuffer.indexOf("\n");
+      newline = lifecycle.stdoutBuffer.indexOf("\n");
     }
   }
 
@@ -284,9 +340,13 @@ export class EngineSupervisor extends EventEmitter {
           typeof record.error.message === "string"
             ? record.error.message
             : "The Python worker returned an error.";
-        const stderr = this.recentStderr.filter(Boolean).join("\n").slice(-8_000);
+        const traceback = workerTraceback(record.error.data);
         pending.reject(
-          new Error(stderr ? `${message}\nWorker stderr:\n${stderr}` : message)
+          new Error(
+            traceback
+              ? `${message}\nWorker traceback:\n${traceback}`
+              : message
+          )
         );
       } else {
         pending.resolve(record.result);
@@ -511,25 +571,45 @@ export class EngineSupervisor extends EventEmitter {
     return this.start();
   }
 
-  private handleExit(child: ChildProcessWithoutNullStreams, detail: string): void {
-    if (this.child !== child) return;
-    const stderr = this.recentStderr.filter(Boolean).join("\n").slice(-8_000);
-    const diagnostic = stderr ? `${detail}\nWorker stderr:\n${stderr}` : detail;
-    this.lastError = diagnostic;
-    const error = new Error(diagnostic);
-    for (const request of this.pending.values()) {
-      request.cleanup();
-      request.reject(error);
+  private handleClose(
+    lifecycle: ChildLifecycle,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): void {
+    const { child } = lifecycle;
+    if (lifecycle.settled) return;
+    lifecycle.settled = true;
+    if (lifecycle.forcedClose) clearTimeout(lifecycle.forcedClose);
+    child.stdout.removeListener("data", lifecycle.stdoutListener);
+    child.stderr.removeListener("data", lifecycle.stderrListener);
+    try {
+      if (this.child !== child) return;
+      const exitDetail = `Worker exited with code ${String(code)} and signal ${String(signal)}.`;
+      const detail = lifecycle.processError
+        ? `${lifecycle.processError}\n${exitDetail}`
+        : exitDetail;
+      const stderr = lifecycle.stderr.filter(Boolean).join("\n").slice(-8_000);
+      const diagnostic = stderr ? `${detail}\nWorker stderr:\n${stderr}` : detail;
+      this.lastError = diagnostic;
+      const error = new Error(diagnostic);
+      for (const request of this.pending.values()) {
+        request.cleanup();
+        request.reject(error);
+      }
+      this.pending.clear();
+      this.child = undefined;
+      if (this.lifecycle === lifecycle) this.lifecycle = undefined;
+      if (!this.stopping) this.emit("exit", diagnostic);
+    } finally {
+      lifecycle.resolveClosed();
     }
-    this.pending.clear();
-    this.child = undefined;
-    if (!this.stopping) this.emit("exit", detail);
   }
 
   private terminateChild(): Promise<void> {
     if (this.terminating) return this.terminating;
     const child = this.child;
     if (!child) return Promise.resolve();
+    const lifecycle = this.lifecycle?.child === child ? this.lifecycle : undefined;
     this.child = undefined;
     if (this.pending.size > 0) {
       const error = new Error("Python worker was stopped.");
@@ -540,9 +620,8 @@ export class EngineSupervisor extends EventEmitter {
       this.pending.clear();
     }
     const terminate = async (): Promise<void> => {
-      if (child.exitCode !== null) return;
-      child.kill();
-      await new Promise<void>((resolveExit) => {
+      if (child.exitCode === null && !child.killed) child.kill();
+      await new Promise<void>((resolveClose) => {
         let finished = false;
         let forceTimeout: NodeJS.Timeout | undefined;
         let gracefulTimeout: NodeJS.Timeout;
@@ -551,18 +630,26 @@ export class EngineSupervisor extends EventEmitter {
           finished = true;
           clearTimeout(gracefulTimeout);
           if (forceTimeout) clearTimeout(forceTimeout);
-          child.removeListener("exit", finish);
-          resolveExit();
+          if (lifecycle) {
+            this.handleClose(lifecycle, child.exitCode, child.signalCode);
+          } else {
+            child.removeListener("close", finish);
+          }
+          resolveClose();
         };
         gracefulTimeout = setTimeout(() => {
           if (child.exitCode === null) child.kill("SIGKILL");
           forceTimeout = setTimeout(finish, 1_000);
         }, 2_000);
-        child.once("exit", finish);
-        if (child.exitCode !== null) finish();
+        if (lifecycle) {
+          void lifecycle.closed.then(finish);
+        } else {
+          child.once("close", finish);
+        }
       });
     };
     const operation = terminate().finally(() => {
+      if (this.lifecycle === lifecycle) this.lifecycle = undefined;
       if (this.terminating === operation) this.terminating = undefined;
     });
     this.terminating = operation;

@@ -1492,7 +1492,7 @@ export class BrainService {
         config: brain.config,
         storagePath: this.repository.brainDirectory(id)
       },
-      30_000,
+      300_000,
       signal
     );
     signal?.throwIfAborted();
