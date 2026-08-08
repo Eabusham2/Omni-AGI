@@ -212,8 +212,12 @@ describe("project integrity", () => {
     const workflow = read(".github/workflows/windows.yml");
     const packageDocument = readJson<{
       scripts: Record<string, string>;
+      devDependencies: Record<string, string>;
       build: { win: { target: string[] }; nsis: { useZip: boolean } };
     }>("package.json");
+    const lockDocument = readJson<{
+      packages: Record<string, { version?: string }>;
+    }>("package-lock.json");
 
     expect(workflow).toContain('runs-on: ${{ matrix.runner }}');
     expect(workflow).toContain("arch: x64");
@@ -263,24 +267,22 @@ describe("project integrity", () => {
     expect(packageDocument.scripts["package:win:arm64"]).toContain("-Arch arm64");
     expect(packageDocument.build.win.target).toEqual(expect.arrayContaining(["nsis", "zip"]));
     expect(packageDocument.build.nsis.useZip).toBe(false);
-    const installerInclude = read("build/installer.nsh");
-    expect(installerInclude).toContain("!macro customInstall");
-    expect(installerInclude).toContain("!ifdef APP_ARM64");
-    expect(installerInclude).toContain(
-      'File "${PROJECT_DIR}\\release\\win-arm64-unpacked\\${APP_EXECUTABLE_FILENAME}"'
+    // 26.15.6 fixed NSIS archive filters that skipped ARM64 PE and native files.
+    expect(packageDocument.devDependencies["electron-builder"]).toBe("26.15.7");
+    expect(lockDocument.packages["node_modules/electron-builder"]?.version).toBe(
+      "26.15.7"
     );
-    expect(installerInclude).not.toMatch(/File\s+\/oname=/);
+    expect(lockDocument.packages["node_modules/app-builder-lib"]?.version).toBe(
+      "26.15.7"
+    );
     expect(read("playwright.config.ts")).toContain(
       "retries: process.env.CI ? 1 : 0"
     );
     const electronE2e = read("tests/e2e/electron.spec.ts");
-    expect(electronE2e).toContain(
-      'process.platform === "win32" && process.arch === "arm64"'
-    );
-    expect(electronE2e).toContain("chromium.connectOverCDP");
-    expect(electronE2e).toContain("--remote-debugging-port=${port}");
-    expect(electronE2e).toContain("Packaged app exited before CDP became ready");
-    expect(electronE2e).toContain("terminateProcessTree(child)");
+    expect(electronE2e).toContain("electron.launch({");
+    expect(electronE2e).toContain("executablePath,");
+    expect(electronE2e).not.toContain("chromium.connectOverCDP");
+    expect(electronE2e).not.toContain("process.arch === \"arm64\"");
   });
 
   it("defines the stable v1 release across Windows, macOS, and Linux", () => {

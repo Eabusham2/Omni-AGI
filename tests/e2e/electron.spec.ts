@@ -1,14 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
   _electron as electron,
-  chromium,
   expect,
   test,
-  type Browser,
   type ElectronApplication,
   type Page
 } from "@playwright/test";
@@ -38,171 +34,7 @@ function environment(dataDirectory: string, installed: boolean): Record<string, 
   };
 }
 
-async function reservePort(): Promise<number> {
-  return new Promise((resolvePort, rejectPort) => {
-    const server = createServer();
-    server.unref();
-    server.once("error", rejectPort);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close();
-        rejectPort(new Error("Could not reserve a local CDP port."));
-        return;
-      }
-      server.close((error) => {
-        if (error) rejectPort(error);
-        else resolvePort(address.port);
-      });
-    });
-  });
-}
-
-function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve(true);
-  }
-  return new Promise((resolveExit) => {
-    const timer = setTimeout(() => {
-      child.off("exit", onExit);
-      resolveExit(false);
-    }, timeoutMs);
-    const onExit = (): void => {
-      clearTimeout(timer);
-      resolveExit(true);
-    };
-    child.once("exit", onExit);
-  });
-}
-
-async function terminateProcessTree(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === "win32" && child.pid) {
-    await new Promise<void>((resolveTermination) => {
-      const terminator = spawn(
-        "taskkill",
-        ["/PID", String(child.pid), "/T", "/F"],
-        { stdio: "ignore", windowsHide: true }
-      );
-      terminator.once("error", () => resolveTermination());
-      terminator.once("exit", () => resolveTermination());
-    });
-    return;
-  }
-  child.kill("SIGKILL");
-  await waitForExit(child, 5_000);
-}
-
-async function waitForCdp(
-  endpoint: string,
-  child: ChildProcess,
-  diagnostics: () => string
-): Promise<void> {
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(
-        `Packaged app exited before CDP became ready (code ${String(child.exitCode)}, signal ${String(child.signalCode)}).\n${diagnostics()}`
-      );
-    }
-    try {
-      const response = await fetch(`${endpoint}/json/version`);
-      if (response.ok) return;
-    } catch {
-      // Native and emulated packaged processes can take several seconds to
-      // expose their debugging endpoint on hosted runners.
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
-  }
-  throw new Error(`Timed out waiting for packaged app CDP endpoint.\n${diagnostics()}`);
-}
-
-async function waitForPage(browser: Browser): Promise<Page> {
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    const page = browser
-      .contexts()
-      .flatMap((context) => context.pages())
-      .find((candidate) => !candidate.url().startsWith("devtools://"));
-    if (page) return page;
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-  }
-  throw new Error("Packaged app connected over CDP but did not create a renderer page.");
-}
-
-async function launchInstalledWithCdp(
-  executablePath: string,
-  dataDirectory: string
-): Promise<RunningApplication> {
-  const port = await reservePort();
-  const endpoint = `http://127.0.0.1:${port}`;
-  const child = spawn(
-    executablePath,
-    [
-      `--remote-debugging-port=${port}`,
-      "--remote-allow-origins=*",
-      `--user-data-dir=${join(dataDirectory, "electron-profile")}`,
-      "--disable-gpu",
-      // Portable archives cannot preserve root ownership for chrome-sandbox.
-      // This affects only the package test launch, not shipped defaults.
-      "--no-sandbox"
-    ],
-    {
-      cwd: dirname(executablePath),
-      env: environment(dataDirectory, true),
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
-    }
-  );
-  let output = "";
-  const capture = (chunk: Buffer): void => {
-    output = `${output}${chunk.toString("utf8")}`.slice(-16_000);
-  };
-  child.stdout?.on("data", capture);
-  child.stderr?.on("data", capture);
-
-  let browser: Browser | undefined;
-  try {
-    await waitForCdp(endpoint, child, () => output);
-    browser = await chromium.connectOverCDP(endpoint, { timeout: 120_000 });
-    const page = await waitForPage(browser);
-    try {
-      await page.waitForLoadState("domcontentloaded", { timeout: 120_000 });
-    } catch (error) {
-      throw new Error(
-        `Packaged renderer closed before DOMContentLoaded (code ${String(child.exitCode)}, signal ${String(child.signalCode)}).\n${output}\n${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-    let closed = false;
-    return {
-      page,
-      close: async () => {
-        if (closed) return;
-        closed = true;
-        if (!page.isClosed()) {
-          await page
-            .evaluate(() =>
-              (
-                window as unknown as {
-                  omni: { window: { close(): Promise<void> } };
-                }
-              ).omni.window.close()
-            )
-            .catch(() => undefined);
-        }
-        await browser?.close().catch(() => undefined);
-        const exitedCleanly = await waitForExit(child, 30_000);
-        if (!exitedCleanly) await terminateProcessTree(child);
-      }
-    };
-  } catch (error) {
-    await browser?.close().catch(() => undefined);
-    await terminateProcessTree(child);
-    throw error;
-  }
-}
-
-async function launchInstalledWithPlaywright(
+async function launchInstalled(
   executablePath: string,
   dataDirectory: string
 ): Promise<RunningApplication> {
@@ -235,16 +67,6 @@ async function launchInstalledWithPlaywright(
     await application?.close().catch(() => undefined);
     throw error;
   }
-}
-
-async function launchInstalled(
-  executablePath: string,
-  dataDirectory: string
-): Promise<RunningApplication> {
-  if (process.platform === "win32" && process.arch === "arm64") {
-    return launchInstalledWithCdp(executablePath, dataDirectory);
-  }
-  return launchInstalledWithPlaywright(executablePath, dataDirectory);
 }
 
 async function launch(dataDirectory: string): Promise<RunningApplication> {
