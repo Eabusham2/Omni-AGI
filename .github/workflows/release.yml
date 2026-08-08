@@ -162,15 +162,24 @@ jobs:
 
       - name: Package, sign, and notarize macOS when credentials exist
         env:
-          CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: npm run package:mac:${{ matrix.arch }}
+          OMNI_RELEASE_CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
+          OMNI_RELEASE_CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
+          OMNI_RELEASE_APPLE_ID: ${{ secrets.APPLE_ID }}
+          OMNI_RELEASE_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          OMNI_RELEASE_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          OMNI_RELEASE_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          OMNI_RELEASE_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          OMNI_RELEASE_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [[ -n "${OMNI_RELEASE_CSC_LINK:-}" ]]; then export CSC_LINK="$OMNI_RELEASE_CSC_LINK"; fi
+          if [[ -n "${OMNI_RELEASE_CSC_KEY_PASSWORD:-}" ]]; then export CSC_KEY_PASSWORD="$OMNI_RELEASE_CSC_KEY_PASSWORD"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_ID:-}" ]]; then export APPLE_ID="$OMNI_RELEASE_APPLE_ID"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then export APPLE_APP_SPECIFIC_PASSWORD="$OMNI_RELEASE_APPLE_APP_SPECIFIC_PASSWORD"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_TEAM_ID:-}" ]]; then export APPLE_TEAM_ID="$OMNI_RELEASE_APPLE_TEAM_ID"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_API_KEY:-}" ]]; then export APPLE_API_KEY="$OMNI_RELEASE_APPLE_API_KEY"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_API_KEY_ID:-}" ]]; then export APPLE_API_KEY_ID="$OMNI_RELEASE_APPLE_API_KEY_ID"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_API_ISSUER:-}" ]]; then export APPLE_API_ISSUER="$OMNI_RELEASE_APPLE_API_ISSUER"; fi
+          npm run package:mac:${{ matrix.arch }}
 
       - name: Smoke macOS package
         env:

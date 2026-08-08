@@ -47,6 +47,18 @@ npm run build
 bash scripts/build-engine-posix.sh "${TARGET_PLATFORM}"
 
 if [[ "${TARGET_PLATFORM}" == "mac" ]]; then
+  # GitHub renders an absent secret as an exported empty string. Electron-builder
+  # treats a present empty CSC_LINK as the working directory, so normalize empty
+  # signing variables back to truly absent before deciding whether to sign.
+  [[ -n "${CSC_LINK:-}" ]] || unset CSC_LINK
+  [[ -n "${CSC_KEY_PASSWORD:-}" ]] || unset CSC_KEY_PASSWORD
+  [[ -n "${APPLE_ID:-}" ]] || unset APPLE_ID
+  [[ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]] || unset APPLE_APP_SPECIFIC_PASSWORD
+  [[ -n "${APPLE_TEAM_ID:-}" ]] || unset APPLE_TEAM_ID
+  [[ -n "${APPLE_API_KEY:-}" ]] || unset APPLE_API_KEY
+  [[ -n "${APPLE_API_KEY_ID:-}" ]] || unset APPLE_API_KEY_ID
+  [[ -n "${APPLE_API_ISSUER:-}" ]] || unset APPLE_API_ISSUER
+
   if [[ -z "${CSC_LINK:-}" && -n "${CSC_KEY_PASSWORD:-}" ]]; then
     echo "CSC_KEY_PASSWORD was provided without CSC_LINK." >&2
     exit 2

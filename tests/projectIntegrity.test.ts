@@ -340,6 +340,16 @@ describe("project integrity", () => {
     expect(release).toContain('tags: ["v*.*.*"]');
     expect(release).toContain("git merge-base --is-ancestor HEAD origin/main");
     expect(release).toContain("verify-release-artifacts.mjs");
+    expect(release).toContain("OMNI_RELEASE_CSC_LINK");
+    expect(release).toContain(
+      'if [[ -n "${OMNI_RELEASE_CSC_LINK:-}" ]]; then export CSC_LINK='
+    );
+    expect(release).not.toMatch(
+      /^\s+CSC_LINK: \$\{\{ secrets\.MACOS_CSC_LINK \}\}$/m
+    );
+    expect(read("scripts/package-posix.sh")).toContain(
+      '[[ -n "${CSC_LINK:-}" ]] || unset CSC_LINK'
+    );
     expect(read("scripts/verify-release-artifacts.mjs")).toContain(
       "SHA256SUMS.txt"
     );
