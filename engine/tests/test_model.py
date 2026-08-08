@@ -76,6 +76,70 @@ class TernaryDecoderTests(unittest.TestCase):
         model = OmniDecoder(config)
         self.assertEqual(model.global_workspace.latents.shape[0], 128)
 
+    def test_right_padded_batch_matches_individual_workspace_and_expert_routes(self):
+        config = OmniConfig.micro(dropout=0.0, max_seq_len=24)
+        model = OmniDecoder(config).eval()
+        model.grow_expert(torch.linspace(-1.0, 1.0, config.d_model))
+        model.grow_expert(torch.linspace(1.0, -1.0, config.d_model))
+        rows = [
+            torch.tensor([1, 259, 40, 41, 260], dtype=torch.long),
+            torch.tensor([1, 259, 88, 260], dtype=torch.long),
+        ]
+        memory = torch.randn(2, config.idea_dim)
+        input_ids = torch.zeros((2, 5), dtype=torch.long)
+        attention_mask = torch.zeros((2, 5), dtype=torch.bool)
+        for index, row in enumerate(rows):
+            input_ids[index, : row.numel()] = row
+            attention_mask[index, : row.numel()] = True
+
+        with torch.no_grad():
+            individual = [
+                model(
+                    row.unsqueeze(0),
+                    memory_bias=memory[index : index + 1],
+                    use_global_workspace=True,
+                )
+                for index, row in enumerate(rows)
+            ]
+            batched = model(
+                input_ids,
+                memory_bias=memory,
+                use_global_workspace=True,
+                attention_mask=attention_mask,
+            )
+
+        for index, row in enumerate(rows):
+            final = int(row.numel()) - 1
+            self.assertTrue(
+                torch.allclose(
+                    batched["hidden"][index, final],
+                    individual[index]["hidden"][0, -1],
+                    atol=1e-6,
+                )
+            )
+            self.assertTrue(
+                torch.allclose(
+                    batched["workspace"][index],
+                    individual[index]["workspace"][0],
+                    atol=1e-6,
+                )
+            )
+            self.assertTrue(
+                torch.allclose(
+                    batched["expert_routing"][index],
+                    individual[index]["expert_routing"][0],
+                    atol=1e-6,
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "right padding"):
+            model(
+                input_ids,
+                attention_mask=torch.tensor(
+                    [[True, False, True, False, False]] * 2
+                ),
+            )
+
     def test_tiny_ternary_decoder_can_overfit(self):
         config = OmniConfig.micro(
             dropout=0.0,

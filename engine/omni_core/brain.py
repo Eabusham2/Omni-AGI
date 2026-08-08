@@ -3,6 +3,7 @@
 import array
 import base64
 import binascii
+import copy
 import hashlib
 import io
 import itertools
@@ -64,6 +65,18 @@ from .vsa import NeuralSubstrate, SubstrateResourcePause
 
 ENGINE_SCHEMA_VERSION = 1
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+ACTION_PROPOSAL_CONFIDENCE = 0.62
+STARTER_ACTION_TARGET_CONFIDENCE = 0.70
+ACTION_KIND_EMISSION_CONFIDENCE = {
+    "talk": 0.0,
+    "tool": ACTION_PROPOSAL_CONFIDENCE,
+    "imagine": ACTION_PROPOSAL_CONFIDENCE,
+    "agent": ACTION_PROPOSAL_CONFIDENCE,
+    "ponder": 0.30,
+    "learn": 0.30,
+    "evolve": ACTION_PROPOSAL_CONFIDENCE,
+    "stop": 0.90,
+}
 
 
 def _iso_now() -> str:
@@ -99,6 +112,20 @@ def _finite_number(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+def _clone_state_to_cpu(value: Any) -> Any:
+    """Clone nested optimizer state without retaining accelerator storage."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _clone_state_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_state_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_state_to_cpu(item) for item in value)
+    return copy.deepcopy(value)
 
 
 class AdaptiveBrain:
@@ -219,6 +246,9 @@ class AdaptiveBrain:
             "workspace_rehearsals": 0,
             "context_token_evictions": 0,
             "idle_cognition_cycles": 0,
+            "action_retention_checks": 0,
+            "action_retention_replays": 0,
+            "action_retention_failures": 0,
         }
         self.modality_training: Dict[str, int] = {
             "vision": 0,
@@ -229,6 +259,10 @@ class AdaptiveBrain:
         self.installed_modality_packs: List[Dict[str, Any]] = []
         self.starter_training_manifest: Optional[Dict[str, Any]] = None
         self.packed_ternary_manifest: Optional[Dict[str, Any]] = None
+        self._starter_action_language_cache: Optional[torch.Tensor] = None
+        self._starter_action_internal_cache: Optional[torch.Tensor] = None
+        self._starter_action_target_cache: Optional[torch.Tensor] = None
+        self._bundled_origin_verified = False
         self.novelty_streak = 0
         self.growth_pause: Optional[Dict[str, Any]] = None
         self.last_activity_decay = time.time()
@@ -341,12 +375,19 @@ class AdaptiveBrain:
         if updated:
             self.counters["metaplastic_updates"] += 1
 
-    def _commit_slow_anchors(self, rate: float = 1.0) -> None:
+    def _commit_slow_anchors(
+        self,
+        rate: float = 1.0,
+        parameters: Optional[Iterable[nn.Parameter]] = None,
+    ) -> None:
         if not self.config.metaplasticity:
             return
         rate = max(0.0, min(float(rate), 1.0))
+        allowed = None if parameters is None else {id(item) for item in parameters}
         self._sync_stability_state()
         for name, parameter in self._named_slow_parameters().items():
+            if allowed is not None and id(parameter) not in allowed:
+                continue
             current = parameter.detach().float().cpu()
             self.slow_anchors[name].lerp_(current, rate)
 
@@ -371,6 +412,99 @@ class AdaptiveBrain:
         }
         self._sync_stability_state()
 
+    def _slow_transaction_modules(self) -> Dict[str, nn.Module]:
+        """Modules which the online chat slow-learning phase may mutate."""
+
+        return {
+            "decoder": self.decoder,
+            "memory_bridge": self.memory_bridge,
+            "idea_adapter": self.idea_adapter,
+            "liquid": self.liquid,
+        }
+
+    def _slow_parameter_checksum(self) -> str:
+        return tensor_checksum(
+            [
+                parameter
+                for module in self._slow_transaction_modules().values()
+                for parameter in module.parameters()
+            ]
+        )
+
+    def _snapshot_slow_transaction_state(self) -> Dict[str, Any]:
+        """Capture a complete rollback point for one chat slow mutation.
+
+        The snapshot is taken only after the current turn has entered the fast
+        substrate and working memory. Restoring it therefore rolls back slow
+        gradient/growth work without erasing the valid fast experience.
+        """
+
+        cuda_rng_state = None
+        if self.device_backend == "cuda" and torch.cuda.is_available():
+            cuda_rng_state = [
+                value.clone() for value in torch.cuda.get_rng_state_all()
+            ]
+        return {
+            "modules": {
+                name: {
+                    key: value.detach().cpu().clone()
+                    for key, value in module.state_dict().items()
+                }
+                for name, module in self._slow_transaction_modules().items()
+            },
+            "expert_count": int(self.decoder.expert_count),
+            "optimizer": _clone_state_to_cpu(self._optimizer.state_dict()),
+            "stability": self._stability_copy(),
+            "counters": dict(self.counters),
+            "novelty_streak": int(self.novelty_streak),
+            "growth_pause": copy.deepcopy(self.growth_pause),
+            "cpu_rng_state": torch.random.get_rng_state().clone(),
+            "cuda_rng_state": cuda_rng_state,
+            "checksum": self._slow_parameter_checksum(),
+        }
+
+    def _restore_slow_transaction_state(
+        self, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Restore a chat slow mutation, including dynamic expert topology."""
+
+        expected_experts = int(snapshot["expert_count"])
+        while self.decoder.expert_count < expected_experts:
+            self.decoder.grow_expert()
+        if self.decoder.expert_count > expected_experts:
+            self.decoder.experts = nn.ModuleList(
+                list(self.decoder.experts)[:expected_experts]
+            )
+            self.decoder.expert_prototypes = nn.ParameterList(
+                list(self.decoder.expert_prototypes)[:expected_experts]
+            )
+
+        module_states = snapshot["modules"]
+        for name, module in self._slow_transaction_modules().items():
+            module.load_state_dict(module_states[name], strict=True)
+
+        # Growth replaces the main optimizer. Rebuild it against the restored
+        # parameter objects before loading the exact pre-transaction moments,
+        # groups, learning rates, and step counters.
+        self._optimizer = self._new_optimizer()
+        self._optimizer.load_state_dict(copy.deepcopy(snapshot["optimizer"]))
+        self._restore_stability(snapshot["stability"])
+        self.counters.clear()
+        self.counters.update(snapshot["counters"])
+        self.novelty_streak = int(snapshot["novelty_streak"])
+        self.growth_pause = copy.deepcopy(snapshot["growth_pause"])
+        torch.random.set_rng_state(snapshot["cpu_rng_state"])
+        cuda_rng_state = snapshot.get("cuda_rng_state")
+        if cuda_rng_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+
+        restored_checksum = self._slow_parameter_checksum()
+        if restored_checksum != snapshot["checksum"]:
+            raise RuntimeError(
+                "slow-learning rollback checksum mismatch: expected %s, got %s"
+                % (snapshot["checksum"], restored_checksum)
+            )
+
     @classmethod
     def create(
         cls,
@@ -392,6 +526,11 @@ class AdaptiveBrain:
             brain.engine_path / "packed-ternary",
             origin / "packed-ternary",
         )
+        if config.origin_kind == "starter":
+            brain._write_bundled_origin_provenance()
+            brain._bundled_origin_verified = (
+                brain._verify_bundled_origin_provenance()
+            )
         brain.events.append(
             "brain-created",
             {
@@ -408,107 +547,791 @@ class AdaptiveBrain:
         )
         return brain
 
-    def _train_starter_action_policy(self) -> Dict[str, Any]:
-        """Imitate typed action trajectories without a reward/preference model."""
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _bundled_origin_provenance_payload(self) -> Dict[str, Any]:
+        origin = self.engine_path / "origin"
+        metadata = read_json(origin / "brain.json")
+        substrate = metadata.get("substrate", {})
+        persistence = (
+            substrate.get("persistence", {})
+            if isinstance(substrate, Mapping)
+            else {}
+        )
+        manifest = metadata.get("starter_training_manifest", {})
+        return {
+            "format": "omni-bundled-origin-provenance-1",
+            # A fork/duplicate keeps the immutable origin but receives a new
+            # live identity. Provenance therefore binds to the identity stored
+            # inside the origin snapshot, not the mutable current brain id.
+            "originBrainId": metadata.get("brain_id"),
+            "starterId": manifest.get("id"),
+            "starterManifestSha256": manifest.get("sha256"),
+            "originParameterChecksum": manifest.get(
+                "trainedParameterChecksum"
+            ),
+            "coreSha256": self._file_sha256(
+                origin / "core.safetensors"
+            ),
+            "plasticitySha256": self._file_sha256(
+                origin / "plasticity.safetensors"
+            ),
+            "brainMetadataSha256": self._file_sha256(
+                origin / "brain.json"
+            ),
+            "substrateContentSha256": persistence.get("contentSha256"),
+            "packedManifestSha256": self._file_sha256(
+                origin / "packed-ternary" / "manifest.json"
+            ),
+        }
+
+    def _write_bundled_origin_provenance(self) -> None:
+        payload = self._bundled_origin_provenance_payload()
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        atomic_write_json(
+            self.engine_path / "origin" / "provenance.json",
+            {
+                **payload,
+                "contentSha256": hashlib.sha256(content).hexdigest(),
+            },
+        )
+
+    def _verify_bundled_origin_provenance(self) -> bool:
+        provenance_path = self.engine_path / "origin" / "provenance.json"
+        if self.config.origin_kind != "starter" or not provenance_path.is_file():
+            return False
+        try:
+            recorded = read_json(provenance_path)
+            content_sha = str(recorded.pop("contentSha256", ""))
+            expected_content = hashlib.sha256(
+                json.dumps(
+                    recorded,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if content_sha != expected_content:
+                return False
+            expected = starter_manifest()
+            actual = self._bundled_origin_provenance_payload()
+            return (
+                recorded == actual
+                and actual["starterId"] == expected["id"]
+                and actual["starterManifestSha256"] == expected["sha256"]
+                and isinstance(actual["originParameterChecksum"], str)
+                and len(actual["originParameterChecksum"]) == 64
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def _action_chat_tensor(self, text: str) -> torch.Tensor:
+        """Encode the current turn exactly as the chat action channel sees it."""
+
+        payload = self.tokenizer.encode(text)
+        payload_budget = max(0, int(self.config.max_seq_len) - 3)
+        if len(payload) > payload_budget:
+            payload = payload[-payload_budget:]
+        return torch.tensor(
+            [[
+                self.tokenizer.bos_id,
+                self.tokenizer.human_id,
+                *payload,
+                self.tokenizer.brain_id,
+            ]],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    def _starter_action_features(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Materialize current neural features in one mask-correct batch.
+
+        The rows have different chat-boundary lengths. Right padding is hidden
+        from the bidirectional global workspace and expert pooling, while the
+        causal blocks cannot see padding after each row's final valid token.
+        Consequently every gathered feature is the same current neural route
+        as an individual public-chat forward, without sixteen serial passes.
+        """
 
         self.decoder.eval()
-        language_features: List[torch.Tensor] = []
         assembly_features: List[torch.Tensor] = []
+        token_rows: List[torch.Tensor] = []
         targets: List[int] = []
         with torch.no_grad():
             for text, kind in STARTER_ACTION_EXAMPLES:
-                ids = self.tokenizer.tensor(
-                    text,
-                    self.device,
-                    max_length=self.config.max_seq_len,
-                    add_bos=True,
-                    add_eos=True,
+                # This is the real public chat boundary, not a bare-text or
+                # synthetic instruction representation: bos, human, text,
+                # brain. The same helper is used by runtime action selection.
+                ids = self._action_chat_tensor(text)
+                token_rows.append(ids[0])
+                assembly_feature = self._idea_model_vector(
+                    self.memory.vector_for_text(text)
                 )
-                hidden = self.decoder(
-                    ids,
-                    use_global_workspace=True,
-                )["hidden"][:, -1]
-                language_features.append(hidden.detach())
                 targets.append(ACTION_KINDS.index(kind))
                 # Idle cognition selects from active internal assemblies rather
                 # than token-decoder hidden states. Train the same typed head on
                 # that neural channel so spontaneous actions do not need a
                 # synthetic instruction or hidden prompt.
-                assembly_feature = self._idea_model_vector(
-                    self.memory.vector_for_text(text)
-                )
                 assembly_features.append(assembly_feature.detach())
-        language_batch = torch.cat(language_features, dim=0)
-        assembly_batch = torch.cat(assembly_features, dim=0)
-        target_batch = torch.tensor(
-            targets,
-            dtype=torch.long,
-            device=self.device,
+
+            lengths = torch.tensor(
+                [int(row.numel()) for row in token_rows],
+                dtype=torch.long,
+                device=self.device,
+            )
+            maximum = int(lengths.max().item())
+            input_ids = torch.full(
+                (len(token_rows), maximum),
+                int(self.tokenizer.pad_id),
+                dtype=torch.long,
+                device=self.device,
+            )
+            attention_mask = torch.zeros(
+                (len(token_rows), maximum),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            for row_index, row in enumerate(token_rows):
+                size = int(row.numel())
+                input_ids[row_index, :size] = row
+                attention_mask[row_index, :size] = True
+            assembly_batch = torch.cat(assembly_features, dim=0)
+            routed = self.decoder(
+                input_ids,
+                memory_bias=self.idea_adapter(assembly_batch),
+                use_global_workspace=True,
+                attention_mask=attention_mask,
+            )
+            hidden = routed["hidden"][
+                torch.arange(len(token_rows), device=self.device),
+                lengths - 1,
+            ]
+            # The language action channel binds the actual chat-framed decoder
+            # state to its current neural idea. Runtime uses the identical
+            # fusion, with capability embeddings supplied as a bounded memory
+            # bias rather than behavioral prose.
+            language_batch = hidden + 0.5 * assembly_batch
+        return (
+            language_batch.detach(),
+            assembly_batch.detach(),
+            torch.tensor(targets, dtype=torch.long, device=self.device),
         )
+
+    @staticmethod
+    def _action_calibration_reading(
+        language_logits: torch.Tensor,
+        internal_logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> Dict[str, float]:
+        target_column = targets.unsqueeze(-1)
+        language_probabilities = F.softmax(
+            language_logits.detach().float(), dim=-1
+        )
+        internal_probabilities = F.softmax(
+            internal_logits.detach().float(), dim=-1
+        )
+        deployed_probabilities = F.softmax(
+            0.35 * language_logits.detach().float()
+            + 0.65 * internal_logits.detach().float(),
+            dim=-1,
+        )
+        language_targets = language_probabilities.gather(
+            1, target_column
+        ).squeeze(-1)
+        internal_targets = internal_probabilities.gather(
+            1, target_column
+        ).squeeze(-1)
+        deployed_targets = deployed_probabilities.gather(
+            1, target_column
+        ).squeeze(-1)
+        required = torch.tensor(
+            [
+                max(
+                    STARTER_ACTION_TARGET_CONFIDENCE,
+                    ACTION_KIND_EMISSION_CONFIDENCE[ACTION_KINDS[int(index)]]
+                    + 0.02,
+                )
+                for index in targets.detach().cpu().tolist()
+            ],
+            dtype=torch.float32,
+            device=language_targets.device,
+        )
+        return {
+            "languageAccuracy": float(
+                language_probabilities.argmax(dim=-1)
+                .eq(targets)
+                .float()
+                .mean()
+                .item()
+            ),
+            "internalAccuracy": float(
+                internal_probabilities.argmax(dim=-1)
+                .eq(targets)
+                .float()
+                .mean()
+                .item()
+            ),
+            "deployedAccuracy": float(
+                deployed_probabilities.argmax(dim=-1)
+                .eq(targets)
+                .float()
+                .mean()
+                .item()
+            ),
+            "minimumLanguageTargetConfidence": float(
+                language_targets.min().item()
+            ),
+            "minimumInternalTargetConfidence": float(
+                internal_targets.min().item()
+            ),
+            "minimumDeployedTargetConfidence": float(
+                deployed_targets.min().item()
+            ),
+            "minimumLanguageThresholdMargin": float(
+                (language_targets - required).min().item()
+            ),
+            "minimumInternalThresholdMargin": float(
+                (internal_targets - required).min().item()
+            ),
+            "minimumDeployedThresholdMargin": float(
+                (deployed_targets - required).min().item()
+            ),
+        }
+
+    def _calibrate_starter_action_policy(
+        self,
+        *,
+        max_steps: int,
+        minimum_steps: int = 0,
+        strict: bool = True,
+    ) -> Dict[str, Any]:
+        """Rehearse typed trajectories after shared representations learn.
+
+        Only the two neural action heads are optimized. The decoder and neural
+        substrate still supply the features, so this is latent replay rather
+        than a phrase/regular-expression command path.
+        """
+
         parameters = [
             *self.decoder.action_policy.parameters(),
             *self.decoder.internal_action_policy.parameters(),
         ]
-        optimizer = torch.optim.AdamW(parameters, lr=0.02, weight_decay=1e-5)
+        parameter_ids = {id(parameter) for parameter in parameters}
+        self._sync_stability_state()
+        action_parameter_names = {
+            name
+            for name, parameter in self._named_slow_parameters().items()
+            if id(parameter) in parameter_ids
+        }
+        head_snapshot = {
+            "language": {
+                key: value.detach().clone()
+                for key, value in self.decoder.action_policy.state_dict().items()
+            },
+            "internal": {
+                key: value.detach().clone()
+                for key, value in self.decoder.internal_action_policy.state_dict().items()
+            },
+        }
+        stability_snapshot = {
+            name: (
+                self.slow_anchors[name].clone(),
+                self.slow_importance[name].clone(),
+            )
+            for name in action_parameter_names
+        }
+        counter_snapshot = {
+            key: int(self.counters[key])
+            for key in ("training_steps", "metaplastic_updates")
+        }
         initial_loss = 0.0
         final_loss = 0.0
-        accuracy = 0.0
-        language_accuracy = 0.0
-        internal_accuracy = 0.0
         completed = 0
-        for step in range(192):
-            optimizer.zero_grad(set_to_none=True)
-            language_logits = self.decoder.action_policy(language_batch)
-            internal_logits = self.decoder.internal_action_policy(assembly_batch)
-            loss = F.cross_entropy(
-                language_logits, target_batch
-            ) + F.cross_entropy(internal_logits, target_batch)
-            if not bool(torch.isfinite(loss)):
-                raise RuntimeError("non-finite bundled starter action loss")
-            loss.backward()
-            self._accumulate_slow_importance(parameters)
-            torch.nn.utils.clip_grad_norm_(parameters, self.config.grad_clip)
-            optimizer.step()
-            completed = step + 1
-            final_loss = float(loss.detach().item())
-            if step == 0:
-                initial_loss = final_loss
+        readings: Dict[str, float] = {}
+        calibrated = False
+        try:
+            language_batch, assembly_batch, target_batch = (
+                self._starter_action_features()
+            )
+            if strict and self._starter_action_language_cache is None:
+                self._starter_action_language_cache = (
+                    language_batch.detach().cpu().clone()
+                )
+                self._starter_action_internal_cache = (
+                    assembly_batch.detach().cpu().clone()
+                )
+                self._starter_action_target_cache = (
+                    target_batch.detach().cpu().clone()
+                )
+            optimizer = torch.optim.AdamW(
+                parameters, lr=0.02, weight_decay=1e-5
+            )
             with torch.no_grad():
-                language_accuracy = float(
-                    self.decoder.action_policy(language_batch)
-                    .argmax(dim=-1)
-                    .eq(target_batch)
-                    .float()
-                    .mean()
-                    .item()
+                initial_language_logits = self.decoder.action_policy(
+                    language_batch
                 )
-                internal_accuracy = float(
-                    self.decoder.internal_action_policy(assembly_batch)
-                    .argmax(dim=-1)
-                    .eq(target_batch)
-                    .float()
-                    .mean()
-                    .item()
+                initial_internal_logits = self.decoder.internal_action_policy(
+                    assembly_batch
                 )
-                accuracy = 0.5 * (language_accuracy + internal_accuracy)
-            self.counters["training_steps"] += 1
-            if step >= 31 and accuracy >= 0.99 and final_loss <= 0.50:
-                break
-        self._commit_slow_anchors(rate=1.0)
+                initial_loss = float(
+                    (
+                        F.cross_entropy(initial_language_logits, target_batch)
+                        + F.cross_entropy(initial_internal_logits, target_batch)
+                    ).item()
+                )
+                readings = self._action_calibration_reading(
+                    initial_language_logits,
+                    initial_internal_logits,
+                    target_batch,
+                )
+            final_loss = initial_loss
+            calibrated = (
+                readings["minimumLanguageThresholdMargin"] > 0.0
+                and readings["minimumInternalThresholdMargin"] > 0.0
+                and readings["minimumDeployedThresholdMargin"] > 0.0
+            )
+            for step in range(max(0, int(max_steps))):
+                if calibrated and completed >= max(0, int(minimum_steps)):
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                language_logits = self.decoder.action_policy(language_batch)
+                internal_logits = self.decoder.internal_action_policy(
+                    assembly_batch
+                )
+                loss = F.cross_entropy(
+                    language_logits, target_batch
+                ) + F.cross_entropy(internal_logits, target_batch)
+                if not bool(torch.isfinite(loss)):
+                    raise RuntimeError(
+                        "non-finite bundled starter action loss"
+                    )
+                loss.backward()
+                self._accumulate_slow_importance(parameters)
+                torch.nn.utils.clip_grad_norm_(
+                    parameters, self.config.grad_clip
+                )
+                optimizer.step()
+                completed = step + 1
+                final_loss = float(loss.detach().item())
+                with torch.no_grad():
+                    readings = self._action_calibration_reading(
+                        self.decoder.action_policy(language_batch),
+                        self.decoder.internal_action_policy(assembly_batch),
+                        target_batch,
+                    )
+                    calibrated = (
+                        readings["minimumLanguageThresholdMargin"] > 0.0
+                        and readings["minimumInternalThresholdMargin"] > 0.0
+                        and readings["minimumDeployedThresholdMargin"] > 0.0
+                    )
+                self.counters["training_steps"] += 1
+            if not calibrated:
+                raise RuntimeError(
+                    "bundled starter action policy did not retain its neural "
+                    "confidence margin"
+                )
+            if completed:
+                self._commit_slow_anchors(
+                    rate=1.0,
+                    parameters=parameters,
+                )
+        except Exception as error:
+            self.decoder.action_policy.load_state_dict(
+                head_snapshot["language"]
+            )
+            self.decoder.internal_action_policy.load_state_dict(
+                head_snapshot["internal"]
+            )
+            for name, (anchor, importance) in stability_snapshot.items():
+                self.slow_anchors[name] = anchor
+                self.slow_importance[name] = importance
+            self.counters.update(counter_snapshot)
+            if strict:
+                raise
+            return {
+                "examples": len(STARTER_ACTION_EXAMPLES),
+                "trainingVectors": len(STARTER_ACTION_EXAMPLES) * 2,
+                "neuralChannels": [
+                    "language-decoder",
+                    "internal-assembly",
+                ],
+                "languageChatFraming": [
+                    "bos",
+                    "human",
+                    "text",
+                    "brain",
+                ],
+                "steps": 0,
+                "attemptedSteps": completed,
+                "featurePasses": 1,
+                "featureVectors": len(STARTER_ACTION_EXAMPLES),
+                "featureBatching": "right-padded-mask-correct",
+                "applied": False,
+                "initialLoss": initial_loss,
+                "finalLoss": final_loss,
+                **readings,
+                "proposalConfidenceThreshold": ACTION_PROPOSAL_CONFIDENCE,
+                "requiredTargetConfidence": STARTER_ACTION_TARGET_CONFIDENCE,
+                "perKindEmissionConfidence": (
+                    ACTION_KIND_EMISSION_CONFIDENCE
+                ),
+                "deployedBlend": {
+                    "language": 0.35,
+                    "internal": 0.65,
+                },
+                "minimumConfidenceMargin": None,
+                "calibrated": False,
+                "rolledBack": True,
+                "failureType": type(error).__name__,
+                "failure": str(error)[:240],
+                "objective": "structured action trajectory imitation",
+                "preferenceLabels": False,
+                "rewardModel": False,
+            }
+        accuracy = 0.5 * (
+            readings["languageAccuracy"] + readings["internalAccuracy"]
+        )
         return {
             "examples": len(STARTER_ACTION_EXAMPLES),
-            "trainingVectors": len(targets) * 2,
+            "trainingVectors": int(target_batch.numel()) * 2,
             "neuralChannels": ["language-decoder", "internal-assembly"],
+            "languageChatFraming": ["bos", "human", "text", "brain"],
             "steps": completed,
+            "attemptedSteps": completed,
+            "featurePasses": 1,
+            "featureVectors": len(STARTER_ACTION_EXAMPLES),
+            "featureBatching": "right-padded-mask-correct",
+            "applied": completed > 0,
             "initialLoss": initial_loss,
             "finalLoss": final_loss,
             "accuracy": accuracy,
-            "languageAccuracy": language_accuracy,
-            "internalAccuracy": internal_accuracy,
+            **readings,
+            "proposalConfidenceThreshold": ACTION_PROPOSAL_CONFIDENCE,
+            "requiredTargetConfidence": STARTER_ACTION_TARGET_CONFIDENCE,
+            "perKindEmissionConfidence": ACTION_KIND_EMISSION_CONFIDENCE,
+            "deployedBlend": {"language": 0.35, "internal": 0.65},
+            "minimumConfidenceMargin": min(
+                readings["minimumLanguageThresholdMargin"],
+                readings["minimumInternalThresholdMargin"],
+                readings["minimumDeployedThresholdMargin"],
+            ),
+            "calibrated": calibrated,
+            "rolledBack": False,
             "objective": "structured action trajectory imitation",
             "preferenceLabels": False,
             "rewardModel": False,
         }
+
+    def _train_starter_action_policy(self) -> Dict[str, Any]:
+        """Imitate typed action trajectories without a reward/preference model."""
+
+        return self._calibrate_starter_action_policy(
+            max_steps=96,
+            minimum_steps=16,
+        )
+
+    def _can_retain_bundled_action_policy(self) -> bool:
+        expected = starter_manifest()
+        return bool(
+            self.config.origin_kind == "starter"
+            and self._bundled_origin_verified
+            and self.starter_training_manifest is not None
+            and self.starter_training_manifest.get("id") == expected["id"]
+            and self.starter_training_manifest.get("sha256")
+            == expected["sha256"]
+            and self._starter_action_language_cache is not None
+            and self._starter_action_internal_cache is not None
+            and self._starter_action_target_cache is not None
+        )
+
+    def _retain_starter_action_policy(
+        self,
+        *,
+        pre_language_logits: torch.Tensor,
+        pre_internal_logits: torch.Tensor,
+        pre_action_emitted: bool,
+        post_language_feature: torch.Tensor,
+        post_internal_feature: torch.Tensor,
+        exact_route_decoder_forwards: int = 0,
+        max_steps: int = 96,
+    ) -> Optional[Dict[str, Any]]:
+        """Distill one exact routed decision after a slow representation update.
+
+        The caller performs one post-update forward through the exact runtime
+        route. This method performs one additional, mask-correct decoder batch
+        over all bundled trajectories using the *current* decoder, memory
+        bridge, global workspace, expert router, and action inputs. Origin
+        caches authenticate eligibility but never stand in for current neural
+        features.
+        """
+
+        if not self._can_retain_bundled_action_policy():
+            return None
+        assert self._starter_action_language_cache is not None
+        assert self._starter_action_internal_cache is not None
+        assert self._starter_action_target_cache is not None
+        parameters = [
+            *self.decoder.action_policy.parameters(),
+            *self.decoder.internal_action_policy.parameters(),
+        ]
+        parameter_ids = {id(parameter) for parameter in parameters}
+        self._sync_stability_state()
+        action_names = {
+            name
+            for name, parameter in self._named_slow_parameters().items()
+            if id(parameter) in parameter_ids
+        }
+        head_snapshot = {
+            "language": {
+                key: value.detach().clone()
+                for key, value in self.decoder.action_policy.state_dict().items()
+            },
+            "internal": {
+                key: value.detach().clone()
+                for key, value in self.decoder.internal_action_policy.state_dict().items()
+            },
+        }
+        stability_snapshot = {
+            name: (
+                self.slow_anchors[name].clone(),
+                self.slow_importance[name].clone(),
+            )
+            for name in action_names
+        }
+        counter_snapshot = {
+            key: int(self.counters[key])
+            for key in ("training_steps", "metaplastic_updates")
+        }
+        pre_language = pre_language_logits.detach().to(self.device)
+        pre_internal = pre_internal_logits.detach().to(self.device)
+        pre_deployed = F.softmax(
+            0.35 * pre_language.float() + 0.65 * pre_internal.float(),
+            dim=-1,
+        )
+        target = pre_deployed.argmax(dim=-1)
+        target_index = int(target.item())
+        target_kind = ACTION_KINDS[target_index]
+        pre_confidence = float(pre_deployed[0, target_index].item())
+        emission_threshold = ACTION_KIND_EMISSION_CONFIDENCE[target_kind]
+        required_confidence = (
+            max(emission_threshold + 0.02, min(pre_confidence, 0.90))
+            if pre_action_emitted
+            else max(0.0, pre_confidence - 0.02)
+        )
+        canonical_language, canonical_internal, canonical_targets = (
+            self._starter_action_features()
+        )
+        post_language = post_language_feature.detach().to(self.device)
+        post_internal = post_internal_feature.detach().to(self.device)
+        optimizer = torch.optim.AdamW(
+            parameters,
+            lr=0.02,
+            weight_decay=1e-5,
+        )
+        completed = 0
+        actual_confidence = 0.0
+        actual_kind = "talk"
+        canonical_readings: Dict[str, float] = {}
+
+        def reading() -> Tuple[bool, bool]:
+            nonlocal actual_confidence, actual_kind, canonical_readings
+            with torch.no_grad():
+                canonical_language_logits = self.decoder.action_policy(
+                    canonical_language
+                )
+                canonical_internal_logits = (
+                    self.decoder.internal_action_policy(canonical_internal)
+                )
+                canonical_readings = self._action_calibration_reading(
+                    canonical_language_logits,
+                    canonical_internal_logits,
+                    canonical_targets,
+                )
+                actual_language_logits = self.decoder.action_policy(
+                    post_language
+                )
+                actual_internal_logits = self.decoder.internal_action_policy(
+                    post_internal
+                )
+                actual_probabilities = F.softmax(
+                    0.35 * actual_language_logits.float()
+                    + 0.65 * actual_internal_logits.float(),
+                    dim=-1,
+                )
+                actual_index = int(actual_probabilities.argmax(dim=-1).item())
+                actual_kind = ACTION_KINDS[actual_index]
+                actual_confidence = float(
+                    actual_probabilities[0, target_index].item()
+                )
+                exact_ready = (
+                    actual_index == target_index
+                    and actual_confidence >= required_confidence
+                )
+                if (
+                    not pre_action_emitted
+                    and emission_threshold > 0.0
+                    and pre_confidence < emission_threshold
+                ):
+                    exact_ready = (
+                        exact_ready
+                        and actual_confidence < emission_threshold
+                    )
+                canonical_ready = (
+                    canonical_readings["minimumLanguageThresholdMargin"] > 0.0
+                    and canonical_readings["minimumInternalThresholdMargin"] > 0.0
+                    and canonical_readings["minimumDeployedThresholdMargin"] > 0.0
+                )
+                return exact_ready, canonical_ready
+
+        try:
+            exact_ready, canonical_ready = reading()
+            for step in range(max(0, min(96, int(max_steps)))):
+                if exact_ready and canonical_ready:
+                    break
+                optimizer.zero_grad(set_to_none=True)
+                language_features = torch.cat(
+                    (canonical_language, post_language), dim=0
+                )
+                internal_features = torch.cat(
+                    (canonical_internal, post_internal), dim=0
+                )
+                language_logits = self.decoder.action_policy(
+                    language_features
+                )
+                internal_logits = self.decoder.internal_action_policy(
+                    internal_features
+                )
+                canonical_count = int(canonical_targets.numel())
+                canonical_loss = F.cross_entropy(
+                    language_logits[:canonical_count], canonical_targets
+                ) + F.cross_entropy(
+                    internal_logits[:canonical_count], canonical_targets
+                )
+                actual_language_logits = language_logits[-1:]
+                actual_internal_logits = internal_logits[-1:]
+                actual_logits = (
+                    0.35 * actual_language_logits
+                    + 0.65 * actual_internal_logits
+                )
+                hard_loss = (
+                    F.cross_entropy(actual_logits, target)
+                    if pre_action_emitted
+                    else torch.zeros((), device=self.device)
+                )
+                distillation_loss = F.kl_div(
+                    F.log_softmax(actual_language_logits.float(), dim=-1),
+                    F.softmax(pre_language.float(), dim=-1),
+                    reduction="batchmean",
+                ) + F.kl_div(
+                    F.log_softmax(actual_internal_logits.float(), dim=-1),
+                    F.softmax(pre_internal.float(), dim=-1),
+                    reduction="batchmean",
+                )
+                loss = (
+                    0.25 * canonical_loss
+                    + hard_loss
+                    + (0.20 if pre_action_emitted else 1.0)
+                    * distillation_loss
+                )
+                if not bool(torch.isfinite(loss)):
+                    raise RuntimeError("non-finite exact-route retention loss")
+                loss.backward()
+                self._accumulate_slow_importance(parameters)
+                torch.nn.utils.clip_grad_norm_(parameters, self.config.grad_clip)
+                optimizer.step()
+                self.counters["training_steps"] += 1
+                completed = step + 1
+                exact_ready, canonical_ready = reading()
+            if not exact_ready or not canonical_ready:
+                raise RuntimeError(
+                    "exact-route action retention did not recover its margin"
+                )
+            if completed:
+                self._commit_slow_anchors(rate=1.0, parameters=parameters)
+            cleared_main_optimizer_states = 0
+            if completed:
+                for parameter in parameters:
+                    if parameter in self._optimizer.state:
+                        self._optimizer.state.pop(parameter)
+                        cleared_main_optimizer_states += 1
+            result: Dict[str, Any] = {
+                "mode": "exact-route-self-distillation+current-neural-replay",
+                "calibrated": True,
+                "rolledBack": False,
+                "steps": completed,
+                "attemptedSteps": completed,
+                "applied": completed > 0,
+                "exactRouteDecoderForwards": max(
+                    0, int(exact_route_decoder_forwards)
+                ),
+                "canonicalDecoderForwards": 1,
+                "canonicalFeatureVectors": int(canonical_targets.numel()),
+                "actualPreKind": target_kind,
+                "actualPreConfidence": pre_confidence,
+                "actualPreActionEmitted": pre_action_emitted,
+                "actualPostKind": actual_kind,
+                "actualPostConfidence": actual_confidence,
+                "actualRequiredConfidence": required_confidence,
+                "actualRoutePreserved": True,
+                "canonicalReplayReady": canonical_ready,
+                "canonicalReplayMetrics": canonical_readings,
+                "mainOptimizerHeadStatesCleared": (
+                    cleared_main_optimizer_states
+                ),
+                "syntheticDeployedGuarantee": False,
+            }
+        except Exception as error:
+            self.decoder.action_policy.load_state_dict(head_snapshot["language"])
+            self.decoder.internal_action_policy.load_state_dict(
+                head_snapshot["internal"]
+            )
+            for name, (anchor, importance) in stability_snapshot.items():
+                self.slow_anchors[name] = anchor
+                self.slow_importance[name] = importance
+            self.counters.update(counter_snapshot)
+            result = {
+                "mode": "exact-route-self-distillation+current-neural-replay",
+                "calibrated": False,
+                "rolledBack": True,
+                "steps": 0,
+                "attemptedSteps": completed,
+                "applied": False,
+                "exactRouteDecoderForwards": max(
+                    0, int(exact_route_decoder_forwards)
+                ),
+                "canonicalDecoderForwards": 1,
+                "canonicalFeatureVectors": int(canonical_targets.numel()),
+                "actualPreKind": target_kind,
+                "actualPreConfidence": pre_confidence,
+                "actualPreActionEmitted": pre_action_emitted,
+                "actualPostKind": actual_kind,
+                "actualPostConfidence": actual_confidence,
+                "actualRequiredConfidence": required_confidence,
+                "actualRoutePreserved": False,
+                "canonicalReplayReady": False,
+                "syntheticDeployedGuarantee": False,
+                "failureType": type(error).__name__,
+                "failure": str(error)[:240],
+            }
+        self.counters["action_retention_checks"] += 1
+        if result["calibrated"]:
+            self.counters["action_retention_replays"] += int(result["steps"])
+        else:
+            self.counters["action_retention_failures"] += 1
+        return result
 
     def _train_starter_modalities(self) -> Dict[str, Any]:
         """Train every enabled baseline on deterministic synthetic perceptions."""
@@ -866,6 +1689,17 @@ class AdaptiveBrain:
         replay = plastic.get("state.replay")
         if replay is not None:
             brain.replay = [row.detach().cpu() for row in replay]
+        cached_language = plastic.get("state.starter_action_language_features")
+        cached_internal = plastic.get("state.starter_action_internal_features")
+        cached_targets = plastic.get("state.starter_action_targets")
+        if (
+            cached_language is not None
+            and cached_internal is not None
+            and cached_targets is not None
+        ):
+            brain._starter_action_language_cache = cached_language.detach().cpu()
+            brain._starter_action_internal_cache = cached_internal.detach().cpu()
+            brain._starter_action_target_cache = cached_targets.detach().cpu()
         anchors = {
             key[len("stability.anchor.") :]: value.detach().cpu()
             for key, value in plastic.items()
@@ -921,6 +1755,39 @@ class AdaptiveBrain:
             metadata.get("last_activity_decay", time.time())
         )
         brain.last_idle_cycle_at = float(metadata.get("last_idle_cycle_at", 0.0))
+        brain._bundled_origin_verified = (
+            brain._verify_bundled_origin_provenance()
+        )
+        if brain._bundled_origin_verified:
+            origin_plastic = load_tensors(
+                engine_path / "origin" / "plasticity.safetensors",
+                device="cpu",
+            )
+            origin_language = origin_plastic.get(
+                "state.starter_action_language_features"
+            )
+            origin_internal = origin_plastic.get(
+                "state.starter_action_internal_features"
+            )
+            origin_targets = origin_plastic.get(
+                "state.starter_action_targets"
+            )
+            if (
+                origin_language is None
+                or origin_internal is None
+                or origin_targets is None
+            ):
+                brain._bundled_origin_verified = False
+            else:
+                brain._starter_action_language_cache = (
+                    origin_language.detach().cpu()
+                )
+                brain._starter_action_internal_cache = (
+                    origin_internal.detach().cpu()
+                )
+                brain._starter_action_target_cache = (
+                    origin_targets.detach().cpu()
+                )
         brain._optimizer = brain._new_optimizer()
         packed_path = engine_path / "packed-ternary"
         if (packed_path / "manifest.json").is_file():
@@ -1015,6 +1882,18 @@ class AdaptiveBrain:
             tensors["state.working_memory"] = torch.stack(self.working_memory)
         if self.replay:
             tensors["state.replay"] = torch.stack(self.replay)
+        if self._starter_action_language_cache is not None:
+            tensors["state.starter_action_language_features"] = (
+                self._starter_action_language_cache
+            )
+        if self._starter_action_internal_cache is not None:
+            tensors["state.starter_action_internal_features"] = (
+                self._starter_action_internal_cache
+            )
+        if self._starter_action_target_cache is not None:
+            tensors["state.starter_action_targets"] = (
+                self._starter_action_target_cache
+            )
         self._sync_stability_state()
         for name, value in self.slow_anchors.items():
             tensors["stability.anchor." + name] = value
@@ -1686,7 +2565,11 @@ class AdaptiveBrain:
             + [self.tokenizer.brain_id]
         )
         history_budget = max(0, capacity - 1 - len(current))
-        history = self.recent_token_context[-history_budget:]
+        history = (
+            self.recent_token_context[-history_budget:]
+            if history_budget
+            else []
+        )
         if history:
             # Use only role-labelled history. When pressure cuts into the
             # oldest retained turn, drop that fragment rather than presenting
@@ -2624,7 +3507,10 @@ class AdaptiveBrain:
                 "active_synapses": 0.0,
             }
         requested_steps = self.config.online_steps if steps is None else steps
-        if self.config.online_learning and int(requested_steps) > 0:
+        slow_learning_applied = bool(
+            self.config.online_learning and int(requested_steps) > 0
+        )
+        if slow_learning_applied:
             train_result = self._optimize_experience(
                 text,
                 learned["vector"],
@@ -2653,7 +3539,15 @@ class AdaptiveBrain:
             source=source,
             salience=workspace_salience,
         )
-        grew = self._maybe_grow(float(learned["novelty"]), routed[0])
+        # Expert allocation changes decoder topology and therefore belongs to
+        # the same slow-mutation transaction as gradient learning. Fast-only
+        # experiences (steps=0) may update substrate/STDP/working activity, but
+        # must not append random decoder parameters before an action decision.
+        grew = (
+            self._maybe_grow(float(learned["novelty"]), routed[0])
+            if slow_learning_applied
+            else False
+        )
         self.counters["experiences"] += 1
         self.counters["plasticity_events"] = int(
             self.router.synapses.plasticity_events.item()
@@ -2993,7 +3887,7 @@ class AdaptiveBrain:
             if (
                 not actions
                 and max(action_scores, key=action_scores.get) == "talk"
-                and talk_confidence >= 0.62
+                and talk_confidence >= ACTION_PROPOSAL_CONFIDENCE
                 and compute_demand >= 0.35
             ):
                 boundary = torch.tensor(
@@ -3743,7 +4637,7 @@ class AdaptiveBrain:
                     }
                 )
             return scores, actions
-        if confidence < 0.62:
+        if confidence < ACTION_PROPOSAL_CONFIDENCE:
             return scores, actions
 
         base_arguments: Dict[str, Any] = {
@@ -3890,7 +4784,10 @@ class AdaptiveBrain:
             kind="question" if clean.rstrip().endswith("?") else "experience",
             source="conversation",
             source_label="chat",
-            steps=self.config.online_steps,
+            # Fast substrate/STDP activity happens before the decision. Slow
+            # shared-representation learning is committed after generation so
+            # the current action uses the previously persisted calibration.
+            steps=0,
             importance=0.7,
         )
         recall_model = self._idea_model_vector(recalled_vector)
@@ -3941,6 +4838,40 @@ class AdaptiveBrain:
             "sensorySlots": 0,
             "updatedAt": _iso_now(),
         }
+        self.decoder.eval()
+        with torch.no_grad():
+            # This is the exact deployed action route: the complete bounded
+            # runtime prompt plus the same recalled, working, sensory, and
+            # capability-conditioned memory used by generation.
+            routing_output = self.decoder(
+                prompt_ids,
+                memory_bias=internal_memory,
+                use_global_workspace=True,
+            )
+            if prompt_ids.shape[1] > 1:
+                routed_ids = prompt_ids[
+                    :, -routing_output["logits"].shape[1] :
+                ]
+                decision_prediction_loss = float(
+                    F.cross_entropy(
+                        routing_output["logits"][:, :-1].float().reshape(
+                            -1, routing_output["logits"].shape[-1]
+                        ),
+                        routed_ids[:, 1:].reshape(-1),
+                    ).item()
+                )
+            else:
+                decision_prediction_loss = 0.0
+            action_cue = self._idea_model_vector(cue)
+            language_action_feature = (
+                routing_output["hidden"][:, -1] + 0.5 * action_cue
+            )
+            language_action_logits = self.decoder.action_policy(
+                language_action_feature
+            )
+            internal_action_logits = self.decoder.internal_action_policy(
+                action_cue
+            )
         uncertainties = [
             float(self.memory.concepts[concept_id]["uncertainty"])
             for concept_id in experience["concept_ids"]
@@ -3949,7 +4880,7 @@ class AdaptiveBrain:
         uncertainty = (
             sum(uncertainties) / len(uncertainties) if uncertainties else 0.5
         )
-        training_loss = float(experience["training"]["loss"])
+        training_loss = decision_prediction_loss
         prediction_error = training_loss / (1.0 + abs(training_loss))
         novelty = float(experience["novelty"])
         learning_progress = self._organic_state()["learningProgress"]
@@ -4098,11 +5029,6 @@ class AdaptiveBrain:
         generated = selected["tensor"]
         entropies = selected["entropies"]
         with torch.no_grad():
-            routing_output = self.decoder(
-                prompt_ids,
-                memory_bias=internal_memory,
-                use_global_workspace=True,
-            )
             expert_route = (
                 routing_output["expert_routing"][0].detach().cpu().tolist()
                 if "expert_routing" in routing_output
@@ -4126,11 +5052,8 @@ class AdaptiveBrain:
                 for item in recalled
                 if str(item.get("idea_id", "")) not in active_assemblies
             )
-            internal_action_logits = self.decoder.internal_action_policy(
-                self._idea_model_vector(cue)
-            )
             action_scores, proposed_actions = self._select_structured_actions(
-                0.35 * routing_output["action_logits"]
+                0.35 * language_action_logits
                 + 0.65 * internal_action_logits,
                 schemas=normalized_tools,
                 input_text=clean,
@@ -4202,10 +5125,153 @@ class AdaptiveBrain:
                 importance=0.35,
             )
         pair_training = None
-        if self.config.online_learning:
-            pair_training = self._optimize_dialogue_pair(
-                clean, response, cue, steps=1
-            )
+        action_calibration = None
+        slow_mutation_requested = bool(
+            self.config.online_learning and int(self.config.online_steps) > 0
+        )
+        slow_mutation_applied = False
+        slow_mutation_rolled_back = False
+        slow_mutation_failure: Optional[Dict[str, Any]] = None
+        slow_mutation_stage = "disabled"
+        slow_parameter_checksum_before = self._slow_parameter_checksum()
+        slow_parameter_checksum_after = slow_parameter_checksum_before
+        if slow_mutation_requested:
+            slow_snapshot = self._snapshot_slow_transaction_state()
+            pre_slow_training = copy.deepcopy(experience["training"])
+            slow_parameter_checksum_before = str(slow_snapshot["checksum"])
+            try:
+                slow_mutation_stage = "experience-learning"
+                experience["training"] = self._optimize_experience(
+                    clean,
+                    cue,
+                    steps=int(self.config.online_steps),
+                )
+                slow_mutation_stage = "dialogue-learning"
+                pair_training = self._optimize_dialogue_pair(
+                    clean, response, cue, steps=1
+                )
+                # The current turn and optional self-response entered fast
+                # neural state before action selection with steps=0. Defer
+                # topology growth until the full slow update is available for
+                # starter-policy retention to validate atomically.
+                slow_mutation_stage = "expert-growth"
+                experience["grew_expert"] = self._maybe_grow(
+                    float(experience["novelty"]),
+                    experience["idea"][0],
+                )
+                if own_training is not None:
+                    own_training["grew_expert"] = self._maybe_grow(
+                        float(own_training["novelty"]),
+                        own_training["idea"][0],
+                    )
+                if self._can_retain_bundled_action_policy():
+                    # Recompute this exact runtime route once after the shared
+                    # representation mutation. Retention then revalidates every
+                    # bundled trajectory against current neural representations
+                    # in one separate mask-correct batch.
+                    slow_mutation_stage = "action-retention"
+                    post_recall_model = self._idea_model_vector(recalled_vector)
+                    post_tool_model = self._tool_schema_vector(normalized_tools)
+                    post_working_model = self._working_memory_vector()
+                    post_components = [
+                        (
+                            0.58 if post_working_model is not None else 0.65,
+                            experience["idea"],
+                        ),
+                        (
+                            0.25 if post_working_model is not None else 0.35,
+                            post_recall_model,
+                        ),
+                    ]
+                    if post_working_model is not None:
+                        post_components.append((0.17, post_working_model))
+                    if post_tool_model is not None:
+                        post_components = [
+                            (weight * 0.88, value)
+                            for weight, value in post_components
+                        ]
+                        post_components.append((0.12, post_tool_model))
+                    post_combined_memory = sum(
+                        weight * value for weight, value in post_components
+                    )
+                    self.decoder.eval()
+                    with torch.no_grad():
+                        post_internal_memory = self.idea_adapter(
+                            post_combined_memory
+                        )
+                        post_routing_output = self.decoder(
+                            prompt_ids,
+                            memory_bias=post_internal_memory,
+                            use_global_workspace=True,
+                        )
+                        post_action_cue = self._idea_model_vector(cue)
+                        post_language_feature = (
+                            post_routing_output["hidden"][:, -1]
+                            + 0.5 * post_action_cue
+                        )
+                    action_calibration = self._retain_starter_action_policy(
+                        pre_language_logits=language_action_logits,
+                        pre_internal_logits=internal_action_logits,
+                        pre_action_emitted=bool(proposed_actions),
+                        post_language_feature=post_language_feature,
+                        post_internal_feature=post_action_cue,
+                        exact_route_decoder_forwards=1,
+                    )
+                    if (
+                        action_calibration is None
+                        or not bool(action_calibration.get("calibrated"))
+                        or bool(action_calibration.get("rolledBack"))
+                    ):
+                        raise RuntimeError(
+                            "starter action retention rejected the slow mutation"
+                        )
+                slow_mutation_stage = "committed"
+                slow_mutation_applied = True
+            except Exception as error:
+                failure_stage = slow_mutation_stage
+                failed_training = copy.deepcopy(experience["training"])
+                failed_pair_training = copy.deepcopy(pair_training)
+                failed_calibration = copy.deepcopy(action_calibration)
+                self._restore_slow_transaction_state(slow_snapshot)
+                if failure_stage == "action-retention":
+                    # The neural mutation is atomic, but its failed validation
+                    # remains an auditable event rather than disappearing with
+                    # the optimizer/training counters it caused.
+                    self.counters["action_retention_checks"] += 1
+                    self.counters["action_retention_failures"] += 1
+                experience["training"] = pre_slow_training
+                experience["grew_expert"] = False
+                if own_training is not None:
+                    own_training["grew_expert"] = False
+                pair_training = None
+                slow_mutation_applied = False
+                slow_mutation_rolled_back = True
+                slow_mutation_stage = "rolled-back"
+                slow_mutation_failure = {
+                    "stage": failure_stage,
+                    "type": type(error).__name__,
+                    "message": str(error)[:240],
+                    "attemptedTraining": failed_training,
+                    "attemptedDialogueTraining": failed_pair_training,
+                }
+                if failed_calibration is not None:
+                    action_calibration = {
+                        **failed_calibration,
+                        "transactionRolledBack": True,
+                    }
+                elif failure_stage == "action-retention":
+                    action_calibration = {
+                        "mode": (
+                            "exact-route-self-distillation+"
+                            "current-neural-replay"
+                        ),
+                        "calibrated": False,
+                        "rolledBack": True,
+                        "transactionRolledBack": True,
+                        "failureType": type(error).__name__,
+                        "failure": str(error)[:240],
+                    }
+            slow_parameter_checksum_after = self._slow_parameter_checksum()
 
         after_checksum = self.parameter_checksum()
         delta_norm = self._parameter_delta_norm(before_parameters)
@@ -4294,9 +5360,29 @@ class AdaptiveBrain:
             ],
             "spreading_activation": recall_audit,
             "expert_route": expert_route,
-            "expert_grew": bool(experience["grew_expert"]),
+            "expert_grew": bool(
+                experience["grew_expert"]
+                or (
+                    own_training is not None
+                    and own_training["grew_expert"]
+                )
+            ),
+            "own_response_expert_grew": bool(
+                own_training is not None
+                and own_training["grew_expert"]
+            ),
             "growth_pause": self.growth_pause,
             "train_loss": train_loss,
+            "decision_prediction_loss": decision_prediction_loss,
+            "slow_mutation_requested": slow_mutation_requested,
+            "slow_mutation_applied": slow_mutation_applied,
+            "slow_mutation_rolled_back": slow_mutation_rolled_back,
+            "slow_mutation_stage": slow_mutation_stage,
+            "slow_mutation_failure": slow_mutation_failure,
+            "slow_parameter_checksum_before": (
+                slow_parameter_checksum_before
+            ),
+            "slow_parameter_checksum_after": slow_parameter_checksum_after,
             "generation_entropy": (
                 sum(entropies) / len(entropies) if entropies else 0.0
             ),
@@ -4304,6 +5390,23 @@ class AdaptiveBrain:
             "ponder_factors": ponder_factors,
             "organic_state": action_state,
             "action_policy_scores": action_scores,
+            "action_policy_calibration": action_calibration,
+            "action_policy_channel": (
+                "exact-runtime-prompt+internal-memory+idea-fusion"
+            ),
+            "action_policy_prompt_token_ids_sha256": prompt_token_hash,
+            "action_policy_recent_dialogue_tokens": len(
+                recent_prompt_tokens
+            ),
+            "action_policy_working_memory_vectors": working_memory_used,
+            "action_policy_capability_conditioned": tool_model is not None,
+            "action_policy_deployed_kind": max(
+                action_scores, key=action_scores.get
+            ),
+            "action_policy_deployed_confidence": max(
+                action_scores.values()
+            ),
+            "action_policy_synthetic_guarantee": False,
             "proposed_action_kinds": [
                 action["kind"] for action in proposed_actions
             ],
@@ -4380,16 +5483,59 @@ class AdaptiveBrain:
                 },
                 {
                     "stage": "slow-learning",
-                    "detail": "Updated ternary decoder and idea-consolidation master parameters.",
-                    "value": "loss %.6f" % train_loss,
+                    "detail": (
+                        "Updated ternary decoder and idea-consolidation master "
+                        "parameters and committed the validated transaction."
+                        if slow_mutation_applied
+                        else (
+                            "Attempted the slow neural update, then restored "
+                            "all slow parameters, expert topology, optimizer, "
+                            "metaplastic state, and counters after validation "
+                            "failed. Fast substrate and working-memory state "
+                            "from the turn remain active."
+                            if slow_mutation_rolled_back
+                            else (
+                                "Online slow learning was disabled; no slow "
+                                "decoder or consolidation parameter was updated."
+                            )
+                        )
+                    ),
+                    "value": (
+                        "loss %.6f" % train_loss
+                        if slow_mutation_applied
+                        else (
+                            "rolled back at %s"
+                            % (
+                                slow_mutation_failure.get("stage", "unknown")
+                                if slow_mutation_failure is not None
+                                else "unknown"
+                            )
+                            if slow_mutation_rolled_back
+                            else "online_steps=0; no slow parameter update"
+                        )
+                    ),
                 },
                 {
                     "stage": "dialogue-learning",
-                    "detail": "Learned the completed human-to-brain role-boundary sequence.",
+                    "detail": (
+                        "Learned and committed the completed human-to-brain "
+                        "role-boundary sequence."
+                        if pair_training is not None
+                        else (
+                            "The attempted dialogue update was rolled back with "
+                            "the enclosing slow-learning transaction."
+                            if slow_mutation_rolled_back
+                            else "Online slow dialogue learning was disabled."
+                        )
+                    ),
                     "value": (
                         "loss %.6f" % pair_training["loss"]
                         if pair_training is not None
-                        else "online slow learning disabled"
+                        else (
+                            "rolled back"
+                            if slow_mutation_rolled_back
+                            else "online_steps=0; no dialogue parameter update"
+                        )
                     ),
                 },
                 {

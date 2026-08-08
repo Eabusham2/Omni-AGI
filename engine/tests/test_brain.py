@@ -1,5 +1,7 @@
+import copy
 import io
 import json
+import shutil
 import sqlite3
 import sys
 import tarfile
@@ -20,8 +22,12 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core import AdaptiveBrain, OmniConfig
-from omni_core.model import BitLinear
-from omni_core.starter import STARTER_CORPUS
+from omni_core.model import ACTION_KINDS, BitLinear
+from omni_core.starter import (
+    STARTER_ACTION_EXAMPLES,
+    STARTER_CORPUS,
+    starter_manifest,
+)
 from omni_core.ternary_packing import verify_ternary_shards
 from omni_core.vsa import ConceptMemory, SubstrateResourcePause
 
@@ -99,7 +105,37 @@ class AdaptiveBrainTests(unittest.TestCase):
         blank_checksum = blank.parameter_checksum()
         self.assertEqual(blank.counters["training_steps"], 0)
         self.assertIsNone(blank.starter_training_manifest)
+        blank_heads = {
+            key: value.detach().clone()
+            for key, value in blank.decoder.action_policy.state_dict().items()
+        }
+        blank_anchors = {
+            key: value.clone()
+            for key, value in blank.slow_anchors.items()
+        }
+        blank_counters = dict(blank.counters)
+        self.assertFalse(blank._can_retain_bundled_action_policy())
+        self.assertEqual(blank.counters, blank_counters)
+        self.assertTrue(
+            all(
+                torch.equal(value, blank_heads[key])
+                for key, value in blank.decoder.action_policy.state_dict().items()
+            )
+        )
+        self.assertTrue(
+            all(
+                torch.equal(value, blank_anchors[key])
+                for key, value in blank.slow_anchors.items()
+            )
+        )
+        blank.config.origin_kind = "starter"
+        blank.starter_training_manifest = starter_manifest()
+        blank.save()
         blank.events.close()
+        spoofed = AdaptiveBrain.load(blank_root, "blank-brain")
+        self.assertFalse(spoofed._bundled_origin_verified)
+        self.assertFalse(spoofed._can_retain_bundled_action_policy())
+        spoofed.events.close()
 
         starter = AdaptiveBrain.create(
             "starter-brain",
@@ -112,6 +148,10 @@ class AdaptiveBrainTests(unittest.TestCase):
         manifest = starter.starter_training_manifest
         self.assertIsNotNone(manifest)
         assert manifest is not None
+        self.assertTrue(starter._bundled_origin_verified)
+        self.assertTrue(
+            (starter.engine_path / "origin" / "provenance.json").is_file()
+        )
         self.assertEqual(manifest["corpusPassagesVisited"], len(STARTER_CORPUS))
         self.assertEqual(len(manifest["corpusLossCurve"]), len(STARTER_CORPUS))
         self.assertTrue(
@@ -140,6 +180,19 @@ class AdaptiveBrainTests(unittest.TestCase):
             {"vision", "image", "audio", "video"},
         )
         self.assertTrue(all(starter.modality_training.values()))
+        action_training = manifest["actionTraining"]
+        self.assertEqual(
+            action_training["languageChatFraming"],
+            ["bos", "human", "text", "brain"],
+        )
+        self.assertTrue(action_training["calibrated"])
+        self.assertGreater(
+            action_training["minimumLanguageTargetConfidence"], 0.62
+        )
+        self.assertGreater(
+            action_training["minimumInternalTargetConfidence"], 0.62
+        )
+        self.assertGreater(action_training["minimumConfidenceMargin"], 0.0)
         self.assertEqual(
             (starter.engine_path / "core.safetensors").read_bytes(),
             (starter.engine_path / "origin" / "core.safetensors").read_bytes(),
@@ -170,19 +223,19 @@ class AdaptiveBrainTests(unittest.TestCase):
             len(current_packed.tensors),
         )
         action_text = "make an image from this internal scene"
-        action_ids = starter.tokenizer.tensor(
-            action_text,
-            starter.device,
-            starter.config.max_seq_len,
-        )
+        action_ids = starter._action_chat_tensor(action_text)
         action_cue = starter._idea_model_vector(
             starter.memory.vector_for_text(action_text)
         )
         with torch.no_grad():
-            decoder_logits = starter.decoder(
+            action_hidden = starter.decoder(
                 action_ids,
+                memory_bias=starter.idea_adapter(action_cue),
                 use_global_workspace=True,
-            )["action_logits"]
+            )["hidden"][:, -1]
+            decoder_logits = starter.decoder.action_policy(
+                action_hidden + 0.5 * action_cue
+            )
             internal_logits = starter.decoder.internal_action_policy(action_cue)
             _scores, actions = starter._select_structured_actions(
                 0.35 * decoder_logits + 0.65 * internal_logits,
@@ -209,6 +262,804 @@ class AdaptiveBrainTests(unittest.TestCase):
             manifest["sha256"],
         )
         self.assertEqual(reloaded.parameter_checksum(), starter.parameter_checksum())
+        self.assertTrue(reloaded._bundled_origin_verified)
+        reloaded.events.close()
+
+        fork_root = self.root / "starter-fork"
+        shutil.copytree(starter_root, fork_root)
+        fork_metadata_path = fork_root / "engine" / "brain.json"
+        fork_metadata = json.loads(fork_metadata_path.read_text("utf-8"))
+        fork_metadata["brain_id"] = "starter-fork"
+        fork_metadata_path.write_text(
+            json.dumps(fork_metadata),
+            encoding="utf-8",
+        )
+        forked = AdaptiveBrain.load(fork_root, "starter-fork")
+        self.assertTrue(forked._bundled_origin_verified)
+        self.assertTrue(forked._can_retain_bundled_action_policy())
+        forked.events.close()
+
+    def test_starter_action_retention_survives_online_chat_trajectory(self):
+        brain = AdaptiveBrain.create(
+            "starter-action-retention",
+            self.root / "starter-action-retention",
+            OmniConfig.micro(
+                origin_kind="starter",
+                max_seq_len=96,
+                learn_from_own_messages=False,
+                vision_enabled=False,
+                image_enabled=False,
+                audio_enabled=False,
+                video_enabled=False,
+            ),
+        )
+        schemas = [
+            {
+                "id": "modality.imagine",
+                "actions": ["generate"],
+                "grant": "ask",
+            },
+            {
+                "id": "agent.fork",
+                "actions": ["start"],
+                "grant": "ask",
+            },
+        ]
+        visible_result = "\n".join(
+            [
+                "[Visible structured action result]",
+                "kind: imagine",
+                "tool: modality.imagine",
+                "action: generate",
+                "requested-by: brain",
+                "result:",
+                '{"status":"complete","artifact":"fixture-image"}',
+            ]
+        )
+        immutable_manifest = json.loads(
+            json.dumps(brain.starter_training_manifest)
+        )
+
+        # Force two independent representation shifts outside the action
+        # heads. Retention must replay all current starter routes through one
+        # padded decoder batch, recover every margin, and preserve the exact
+        # action that was emitted before the slow mutation.
+        agent_index = next(
+            index
+            for index, (_text, kind) in enumerate(STARTER_ACTION_EXAMPLES)
+            if kind == "agent"
+        )
+        retained_head_parameter = next(
+            iter(brain.decoder.action_policy.parameters())
+        )
+        unrelated_optimizer_parameter = brain.memory_bridge.weight
+        for parameter, fill in (
+            (retained_head_parameter, 0.75),
+            (unrelated_optimizer_parameter, 0.25),
+        ):
+            brain._optimizer.state[parameter] = {
+                "step": torch.tensor(3.0),
+                "exp_avg": torch.full_like(parameter, fill),
+                "exp_avg_sq": torch.full_like(parameter, fill * fill),
+            }
+        unrelated_optimizer_state = {
+            key: value.clone()
+            for key, value in brain._optimizer.state[
+                unrelated_optimizer_parameter
+            ].items()
+        }
+        retained_head_parameters = (
+            *brain.decoder.action_policy.parameters(),
+            *brain.decoder.internal_action_policy.parameters(),
+        )
+        expected_cleared_head_states = sum(
+            parameter in brain._optimizer.state
+            for parameter in retained_head_parameters
+        )
+        drift_pattern = torch.linspace(
+            0.97,
+            1.03,
+            brain.config.d_model,
+            device=brain.device,
+        )
+        for drift_cycle in range(2):
+            before_language, before_internal, _targets = (
+                brain._starter_action_features()
+            )
+            with torch.no_grad():
+                pre_language_logits = brain.decoder.action_policy(
+                    before_language[agent_index : agent_index + 1]
+                )
+                pre_internal_logits = brain.decoder.internal_action_policy(
+                    before_internal[agent_index : agent_index + 1]
+                )
+                brain.decoder.workspace_strength.add_(0.025)
+                brain.decoder.final_norm.scale.mul_(drift_pattern)
+                brain.memory_bridge.bias.add_(
+                    (drift_cycle + 1)
+                    * torch.linspace(
+                        -0.004,
+                        0.004,
+                        brain.config.idea_dim,
+                        device=brain.device,
+                    )
+                )
+            after_language, after_internal, _targets = (
+                brain._starter_action_features()
+            )
+            self.assertFalse(
+                torch.allclose(before_language, after_language, atol=1e-7)
+            )
+            with mock.patch.object(
+                brain.decoder,
+                "forward",
+                wraps=brain.decoder.forward,
+            ) as current_route_forward:
+                drift_retention = brain._retain_starter_action_policy(
+                    pre_language_logits=pre_language_logits,
+                    pre_internal_logits=pre_internal_logits,
+                    pre_action_emitted=True,
+                    post_language_feature=after_language[
+                        agent_index : agent_index + 1
+                    ],
+                    post_internal_feature=after_internal[
+                        agent_index : agent_index + 1
+                    ],
+                    exact_route_decoder_forwards=1,
+                )
+            self.assertEqual(current_route_forward.call_count, 1)
+            self.assertIsNotNone(drift_retention)
+            assert drift_retention is not None
+            self.assertTrue(drift_retention["calibrated"])
+            self.assertEqual(drift_retention["canonicalDecoderForwards"], 1)
+            self.assertTrue(drift_retention["canonicalReplayReady"])
+            if drift_cycle == 0:
+                self.assertGreater(drift_retention["steps"], 0)
+                self.assertTrue(
+                    all(
+                        parameter not in brain._optimizer.state
+                        for parameter in retained_head_parameters
+                    )
+                )
+                self.assertEqual(
+                    drift_retention["mainOptimizerHeadStatesCleared"],
+                    expected_cleared_head_states,
+                )
+                self.assertTrue(
+                    all(
+                        torch.equal(
+                            brain._optimizer.state[
+                                unrelated_optimizer_parameter
+                            ][name],
+                            value,
+                        )
+                        for name, value in unrelated_optimizer_state.items()
+                    )
+                )
+            current_language, current_internal, current_targets = (
+                brain._starter_action_features()
+            )
+            with torch.no_grad():
+                current_reading = brain._action_calibration_reading(
+                    brain.decoder.action_policy(current_language),
+                    brain.decoder.internal_action_policy(current_internal),
+                    current_targets,
+                )
+            self.assertGreater(
+                current_reading["minimumDeployedThresholdMargin"],
+                0.0,
+            )
+
+        for cycle in range(1):
+            seed = 1000 + cycle * 10
+            brain.chat(
+                "hello, tell me what you notice",
+                max_new_tokens=1,
+                seed=seed,
+                tool_schemas=schemas,
+            )
+            imagined = brain.chat(
+                "make an image from this internal scene",
+                max_new_tokens=1,
+                seed=seed + 1,
+                tool_schemas=schemas,
+            )
+            self.assertTrue(
+                any(action["kind"] == "imagine" for action in imagined["actions"])
+            )
+            brain.chat(
+                visible_result,
+                max_new_tokens=1,
+                seed=seed + 2,
+                tool_schemas=schemas,
+            )
+            delegated = brain.chat(
+                "fork agents to investigate these independent parts",
+                max_new_tokens=1,
+                seed=seed + 3,
+                tool_schemas=schemas,
+            )
+            self.assertTrue(
+                any(
+                    action["kind"] == "agent"
+                    and action["toolId"] == "agent.fork"
+                    and action["action"] == "start"
+                    for action in delegated["actions"]
+                )
+            )
+            self.assertIn("agent", delegated["trace"]["proposed_action_kinds"])
+            self.assertGreaterEqual(
+                delegated["trace"]["action_policy_scores"]["agent"], 0.62
+            )
+            agent_action = next(
+                action
+                for action in delegated["actions"]
+                if action["kind"] == "agent"
+            )
+            self.assertEqual(
+                agent_action["arguments"]["objective"],
+                "fork agents to investigate these independent parts",
+            )
+            self.assertNotIn("prompt", agent_action["arguments"])
+            calibration = delegated["trace"]["action_policy_calibration"]
+            self.assertTrue(calibration["calibrated"])
+            self.assertEqual(
+                calibration["mode"],
+                "exact-route-self-distillation+current-neural-replay",
+            )
+            self.assertLessEqual(calibration["steps"], 96)
+            self.assertEqual(
+                calibration["exactRouteDecoderForwards"], 1
+            )
+            self.assertEqual(calibration["canonicalDecoderForwards"], 1)
+            self.assertEqual(calibration["canonicalFeatureVectors"], 16)
+            self.assertEqual(calibration["actualPreKind"], "agent")
+            self.assertTrue(calibration["actualPreActionEmitted"])
+            self.assertTrue(calibration["actualRoutePreserved"])
+            self.assertFalse(calibration["syntheticDeployedGuarantee"])
+            self.assertEqual(
+                delegated["trace"]["action_policy_channel"],
+                "exact-runtime-prompt+internal-memory+idea-fusion",
+            )
+            self.assertGreater(
+                delegated["trace"]["action_policy_recent_dialogue_tokens"],
+                0,
+            )
+            self.assertGreater(
+                delegated["trace"]["action_policy_working_memory_vectors"],
+                0,
+            )
+            self.assertTrue(
+                delegated["trace"]["action_policy_capability_conditioned"]
+            )
+            self.assertEqual(
+                delegated["trace"]["action_policy_deployed_kind"], "agent"
+            )
+            self.assertGreaterEqual(
+                delegated["trace"]["action_policy_deployed_confidence"],
+                0.62,
+            )
+            self.assertFalse(
+                delegated["trace"]["action_policy_synthetic_guarantee"]
+            )
+            self.assertGreater(
+                delegated["trace"]["decision_prediction_loss"], 0.0
+            )
+            self.assertGreater(
+                delegated["trace"]["organic_state"]["predictionError"], 0.0
+            )
+            self.assertFalse(delegated["trace"]["hidden_prompt_text_expanded"])
+
+        self.assertEqual(brain.counters["action_retention_checks"], 6)
+        self.assertGreaterEqual(brain.counters["action_retention_replays"], 0)
+        self.assertEqual(brain.counters["action_retention_failures"], 0)
+        self.assertEqual(brain.starter_training_manifest, immutable_manifest)
+        persisted_checksum = delegated["trace"]["parameter_checksum_after"]
+        brain.events.close()
+
+        reloaded = AdaptiveBrain.load(
+            self.root / "starter-action-retention",
+            "starter-action-retention",
+        )
+        self.assertEqual(reloaded.parameter_checksum(), persisted_checksum)
+        replayed = reloaded.chat(
+            "fork agents to investigate these independent parts",
+            max_new_tokens=1,
+            seed=2024,
+            tool_schemas=schemas,
+        )
+        self.assertTrue(
+            any(
+                action["kind"] == "agent"
+                and action["toolId"] == "agent.fork"
+                for action in replayed["actions"]
+            )
+        )
+        self.assertGreaterEqual(
+            replayed["trace"]["action_policy_scores"]["agent"], 0.62
+        )
+
+        tool_index = ACTION_KINDS.index("tool")
+        subthreshold_logits = torch.zeros(
+            (1, len(ACTION_KINDS)),
+            dtype=torch.float32,
+            device=reloaded.device,
+        )
+        subthreshold_logits[0, tool_index] = 0.35
+        generator = torch.Generator(device=reloaded.device).manual_seed(44)
+        subthreshold_language_feature = torch.randn(
+            (1, reloaded.config.d_model),
+            generator=generator,
+            device=reloaded.device,
+        )
+        subthreshold_internal_feature = torch.randn(
+            (1, reloaded.config.d_model),
+            generator=generator,
+            device=reloaded.device,
+        )
+        with mock.patch.object(
+            reloaded.decoder,
+            "forward",
+            wraps=reloaded.decoder.forward,
+        ) as retention_decoder_forward:
+            subthreshold = reloaded._retain_starter_action_policy(
+                pre_language_logits=subthreshold_logits,
+                pre_internal_logits=subthreshold_logits,
+                pre_action_emitted=False,
+                post_language_feature=subthreshold_language_feature,
+                post_internal_feature=subthreshold_internal_feature,
+            )
+        self.assertEqual(retention_decoder_forward.call_count, 1)
+        self.assertIsNotNone(subthreshold)
+        assert subthreshold is not None
+        self.assertFalse(subthreshold["actualPreActionEmitted"])
+        with torch.no_grad():
+            retained_subthreshold_logits = (
+                0.35
+                * reloaded.decoder.action_policy(
+                    subthreshold_language_feature
+                )
+                + 0.65
+                * reloaded.decoder.internal_action_policy(
+                    subthreshold_internal_feature
+                )
+            )
+            retained_scores, retained_actions = (
+                reloaded._select_structured_actions(
+                    retained_subthreshold_logits,
+                    schemas=[
+                        {
+                            "id": "web.search",
+                            "actions": ["search"],
+                            "grant": "ask",
+                        }
+                    ],
+                    input_text="search the web for primary evidence",
+                    assembly_ids=[],
+                    organic_state={"computeDemand": 0.7},
+                )
+            )
+        self.assertLess(retained_scores["tool"], 0.62)
+        self.assertEqual(retained_actions, [])
+
+        reloaded.config.online_steps = 0
+        reloaded.config.growth_novelty_threshold = 0.0
+        reloaded.config.growth_patience = 1
+        reloaded.config.learn_from_own_messages = True
+        reloaded.novelty_streak = 0
+        slow_before_disabled_turn = reloaded._parameter_copy()
+        topology_before_disabled_turn = tuple(
+            (name, tuple(parameter.shape))
+            for name, parameter in reloaded.decoder.named_parameters()
+        )
+        experts_before_disabled_turn = reloaded.decoder.expert_count
+        training_steps_before_disabled_turn = reloaded.counters[
+            "training_steps"
+        ]
+        retention_before_disabled_turn = reloaded.counters[
+            "action_retention_checks"
+        ]
+        disabled_turn = reloaded.chat(
+            "hello, tell me what you notice",
+            max_new_tokens=1,
+            seed=3030,
+            tool_schemas=schemas,
+        )
+        self.assertFalse(disabled_turn["trace"]["slow_mutation_applied"])
+        disabled_slow_step = next(
+            step
+            for step in disabled_turn["trace"]["steps"]
+            if step["stage"] == "slow-learning"
+        )
+        self.assertIn("disabled", disabled_slow_step["detail"])
+        self.assertEqual(
+            disabled_slow_step["value"],
+            "online_steps=0; no slow parameter update",
+        )
+        self.assertIsNone(disabled_turn["trace"]["action_policy_calibration"])
+        self.assertFalse(disabled_turn["trace"]["expert_grew"])
+        self.assertFalse(
+            disabled_turn["trace"]["own_response_expert_grew"]
+        )
+        self.assertGreater(
+            disabled_turn["trace"]["decision_prediction_loss"], 0.0
+        )
+        self.assertEqual(
+            reloaded.counters["training_steps"],
+            training_steps_before_disabled_turn,
+        )
+        self.assertEqual(
+            reloaded.counters["action_retention_checks"],
+            retention_before_disabled_turn,
+        )
+        self.assertTrue(
+            all(
+                torch.equal(before, after)
+                for before, after in zip(
+                    slow_before_disabled_turn,
+                    reloaded._parameter_copy(),
+                )
+            )
+        )
+        self.assertEqual(
+            reloaded.decoder.expert_count,
+            experts_before_disabled_turn,
+        )
+        self.assertEqual(
+            tuple(
+                (name, tuple(parameter.shape))
+                for name, parameter in reloaded.decoder.named_parameters()
+            ),
+            topology_before_disabled_turn,
+        )
+
+        # The same forced novelty may allocate experts only once slow learning
+        # is active. Growth occurs after the deployed action decision and the
+        # current-route retention pass must cover the expanded topology.
+        reloaded.config.online_steps = 1
+        reloaded.novelty_streak = 0
+        experts_before_growth_turn = reloaded.decoder.expert_count
+        topology_before_growth_turn = tuple(
+            (name, tuple(parameter.shape))
+            for name, parameter in reloaded.decoder.named_parameters()
+        )
+        growth_turn = reloaded.chat(
+            "fork agents to investigate these independent parts",
+            max_new_tokens=1,
+            seed=3031,
+            tool_schemas=schemas,
+        )
+        self.assertTrue(growth_turn["trace"]["slow_mutation_applied"])
+        self.assertTrue(growth_turn["trace"]["expert_grew"])
+        self.assertTrue(growth_turn["trace"]["own_response_expert_grew"])
+        self.assertGreater(
+            reloaded.decoder.expert_count,
+            experts_before_growth_turn,
+        )
+        self.assertGreater(
+            len(tuple(reloaded.decoder.named_parameters())),
+            len(topology_before_growth_turn),
+        )
+        growth_calibration = growth_turn["trace"][
+            "action_policy_calibration"
+        ]
+        self.assertIsNotNone(growth_calibration)
+        assert growth_calibration is not None
+        self.assertTrue(growth_calibration["calibrated"])
+        self.assertTrue(growth_calibration["actualRoutePreserved"])
+        self.assertEqual(growth_calibration["canonicalDecoderForwards"], 1)
+        self.assertTrue(
+            any(
+                action["kind"] == "agent"
+                for action in growth_turn["actions"]
+            )
+        )
+
+        head_before_failure = {
+            "language": {
+                key: value.detach().clone()
+                for key, value in reloaded.decoder.action_policy.state_dict().items()
+            },
+            "internal": {
+                key: value.detach().clone()
+                for key, value in reloaded.decoder.internal_action_policy.state_dict().items()
+            },
+        }
+        action_names = {
+            name
+            for name, parameter in reloaded._named_slow_parameters().items()
+            if id(parameter)
+            in {
+                id(item)
+                for item in (
+                    *reloaded.decoder.action_policy.parameters(),
+                    *reloaded.decoder.internal_action_policy.parameters(),
+                )
+            }
+        }
+        anchors_before_failure = {
+            name: (
+                reloaded.slow_anchors[name].clone(),
+                reloaded.slow_importance[name].clone(),
+            )
+            for name in action_names
+        }
+        counters_before_failure = {
+            key: reloaded.counters[key]
+            for key in ("training_steps", "metaplastic_updates")
+        }
+        real_reading = reloaded._action_calibration_reading
+
+        def never_calibrated(*args):
+            reading = real_reading(*args)
+            reading["minimumLanguageThresholdMargin"] = -1.0
+            reading["minimumInternalThresholdMargin"] = -1.0
+            reading["minimumDeployedThresholdMargin"] = -1.0
+            return reading
+
+        with mock.patch.object(
+            reloaded,
+            "_action_calibration_reading",
+            side_effect=never_calibrated,
+        ):
+            failed = reloaded._calibrate_starter_action_policy(
+                max_steps=1,
+                strict=False,
+            )
+        self.assertFalse(failed["calibrated"])
+        self.assertTrue(failed["rolledBack"])
+        self.assertEqual(
+            {
+                key: reloaded.counters[key]
+                for key in ("training_steps", "metaplastic_updates")
+            },
+            counters_before_failure,
+        )
+        self.assertTrue(
+            all(
+                torch.equal(value, head_before_failure["language"][key])
+                for key, value in reloaded.decoder.action_policy.state_dict().items()
+            )
+        )
+        self.assertTrue(
+            all(
+                torch.equal(value, head_before_failure["internal"][key])
+                for key, value in reloaded.decoder.internal_action_policy.state_dict().items()
+            )
+        )
+        self.assertTrue(
+            all(
+                torch.equal(reloaded.slow_anchors[name], anchor)
+                and torch.equal(reloaded.slow_importance[name], importance)
+                for name, (anchor, importance) in anchors_before_failure.items()
+            )
+        )
+
+        # A failed retention gate rejects the entire enclosing slow mutation,
+        # not only the action heads. Force both deferred expert growth and a
+        # retention failure, then prove the valid fast turn survives while all
+        # slow tensors/topology/optimizer/stability/counters return exactly to
+        # their pre-transaction state and only that restored state is saved.
+        reloaded.config.online_steps = 1
+        reloaded.config.growth_novelty_threshold = 0.0
+        reloaded.config.growth_patience = 1
+        reloaded.config.learn_from_own_messages = True
+        reloaded.novelty_streak = 0
+        slow_parameters_before_transaction = {
+            "%s.%s" % (prefix, name): parameter.detach().cpu().clone()
+            for prefix, module in reloaded._slow_transaction_modules().items()
+            for name, parameter in module.named_parameters()
+        }
+        slow_shapes_before_transaction = {
+            name: tuple(parameter.shape)
+            for name, parameter in slow_parameters_before_transaction.items()
+        }
+        slow_checksum_before_transaction = (
+            reloaded._slow_parameter_checksum()
+        )
+        experts_before_transaction = reloaded.decoder.expert_count
+        optimizer_before_transaction = copy.deepcopy(
+            reloaded._optimizer.state_dict()
+        )
+        anchors_before_transaction = {
+            name: value.clone()
+            for name, value in reloaded.slow_anchors.items()
+        }
+        importance_before_transaction = {
+            name: value.clone()
+            for name, value in reloaded.slow_importance.items()
+        }
+        slow_counters_before_transaction = {
+            name: reloaded.counters[name]
+            for name in (
+                "training_steps",
+                "metaplastic_updates",
+                "action_retention_checks",
+                "action_retention_replays",
+                "action_retention_failures",
+            )
+        }
+        messages_before_transaction = len(reloaded.messages)
+        experiences_before_transaction = reloaded.counters["experiences"]
+        assemblies_before_transaction = len(reloaded.memory.assemblies)
+
+        def forced_retention_failure(**_kwargs):
+            # Ensure the outer transaction restores mutations performed inside
+            # retention as well as the preceding shared training and growth.
+            with torch.no_grad():
+                next(
+                    iter(reloaded.decoder.action_policy.parameters())
+                ).add_(3.0)
+                reloaded.memory_bridge.bias.add_(0.25)
+            return {
+                "mode": (
+                    "exact-route-self-distillation+current-neural-replay"
+                ),
+                "calibrated": False,
+                "rolledBack": True,
+                "failureType": "ForcedRetentionFailure",
+                "failure": "forced full-transaction regression",
+            }
+
+        with mock.patch.object(
+            reloaded,
+            "_retain_starter_action_policy",
+            side_effect=forced_retention_failure,
+        ):
+            rejected_turn = reloaded.chat(
+                "fork agents while retaining this new fast neural experience",
+                max_new_tokens=1,
+                seed=4040,
+                tool_schemas=schemas,
+            )
+
+        rejected_trace = rejected_turn["trace"]
+        self.assertTrue(rejected_trace["slow_mutation_requested"])
+        self.assertFalse(rejected_trace["slow_mutation_applied"])
+        self.assertTrue(rejected_trace["slow_mutation_rolled_back"])
+        self.assertEqual(rejected_trace["slow_mutation_stage"], "rolled-back")
+        self.assertEqual(
+            rejected_trace["slow_mutation_failure"]["stage"],
+            "action-retention",
+        )
+        self.assertTrue(
+            rejected_trace["action_policy_calibration"][
+                "transactionRolledBack"
+            ]
+        )
+        self.assertFalse(rejected_trace["expert_grew"])
+        self.assertFalse(rejected_trace["own_response_expert_grew"])
+        self.assertEqual(
+            rejected_trace["slow_parameter_checksum_before"],
+            slow_checksum_before_transaction,
+        )
+        self.assertEqual(
+            rejected_trace["slow_parameter_checksum_after"],
+            slow_checksum_before_transaction,
+        )
+        slow_step = next(
+            step
+            for step in rejected_trace["steps"]
+            if step["stage"] == "slow-learning"
+        )
+        self.assertIn("restored all slow parameters", slow_step["detail"])
+        self.assertIn("rolled back", slow_step["value"])
+
+        slow_parameters_after_transaction = {
+            "%s.%s" % (prefix, name): parameter.detach().cpu()
+            for prefix, module in reloaded._slow_transaction_modules().items()
+            for name, parameter in module.named_parameters()
+        }
+        self.assertEqual(
+            set(slow_parameters_after_transaction),
+            set(slow_parameters_before_transaction),
+        )
+        self.assertEqual(
+            {
+                name: tuple(parameter.shape)
+                for name, parameter in slow_parameters_after_transaction.items()
+            },
+            slow_shapes_before_transaction,
+        )
+        self.assertTrue(
+            all(
+                torch.equal(
+                    parameter,
+                    slow_parameters_before_transaction[name],
+                )
+                for name, parameter in slow_parameters_after_transaction.items()
+            )
+        )
+        self.assertEqual(
+            reloaded._slow_parameter_checksum(),
+            slow_checksum_before_transaction,
+        )
+        self.assertEqual(
+            reloaded.decoder.expert_count,
+            experts_before_transaction,
+        )
+        expected_slow_counters = dict(slow_counters_before_transaction)
+        expected_slow_counters["action_retention_checks"] += 1
+        expected_slow_counters["action_retention_failures"] += 1
+        self.assertEqual(
+            {
+                name: reloaded.counters[name]
+                for name in slow_counters_before_transaction
+            },
+            expected_slow_counters,
+        )
+        self.assertEqual(
+            set(reloaded.slow_anchors), set(anchors_before_transaction)
+        )
+        self.assertEqual(
+            set(reloaded.slow_importance), set(importance_before_transaction)
+        )
+        self.assertTrue(
+            all(
+                torch.equal(reloaded.slow_anchors[name], value)
+                for name, value in anchors_before_transaction.items()
+            )
+        )
+        self.assertTrue(
+            all(
+                torch.equal(reloaded.slow_importance[name], value)
+                for name, value in importance_before_transaction.items()
+            )
+        )
+
+        def assert_optimizer_tree_equal(expected, actual):
+            if isinstance(expected, torch.Tensor):
+                self.assertIsInstance(actual, torch.Tensor)
+                self.assertTrue(torch.equal(expected.cpu(), actual.cpu()))
+                return
+            if isinstance(expected, dict):
+                self.assertEqual(set(expected), set(actual))
+                for key in expected:
+                    assert_optimizer_tree_equal(expected[key], actual[key])
+                return
+            if isinstance(expected, (list, tuple)):
+                self.assertEqual(len(expected), len(actual))
+                for expected_item, actual_item in zip(expected, actual):
+                    assert_optimizer_tree_equal(expected_item, actual_item)
+                return
+            self.assertEqual(expected, actual)
+
+        assert_optimizer_tree_equal(
+            optimizer_before_transaction,
+            reloaded._optimizer.state_dict(),
+        )
+        # The rollback boundary begins after fast admission, so this valid turn
+        # still advances conversation, substrate assemblies, and experiences.
+        self.assertEqual(
+            len(reloaded.messages), messages_before_transaction + 2
+        )
+        self.assertEqual(
+            reloaded.counters["experiences"],
+            experiences_before_transaction + 2,
+        )
+        self.assertGreater(
+            len(reloaded.memory.assemblies), assemblies_before_transaction
+        )
+        self.assertTrue(rejected_turn["text"])
+
+        reloaded.events.close()
+        persisted_after_rejection = AdaptiveBrain.load(
+            self.root / "starter-action-retention",
+            "starter-action-retention",
+        )
+        self.assertEqual(
+            persisted_after_rejection._slow_parameter_checksum(),
+            slow_checksum_before_transaction,
+        )
+        self.assertEqual(
+            persisted_after_rejection.decoder.expert_count,
+            experts_before_transaction,
+        )
+        self.assertEqual(
+            len(persisted_after_rejection.messages),
+            messages_before_transaction + 2,
+        )
+        reloaded = persisted_after_rejection
         reloaded.events.close()
 
     def test_packed_inference_shards_refresh_after_dynamic_growth(self):

@@ -335,11 +335,26 @@ class GlobalWorkspace(nn.Module):
         nn.init.normal_(self.latents, mean=0.0, std=0.02)
 
     def forward(
-        self, inputs: torch.Tensor
+        self,
+        inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if inputs.ndim != 3:
             raise ValueError("global workspace expects [batch, sequence, dimensions]")
         batch = inputs.shape[0]
+        if attention_mask is not None:
+            if attention_mask.shape != inputs.shape[:2]:
+                raise ValueError(
+                    "global workspace attention_mask must match [batch, sequence]"
+                )
+            attention_mask = attention_mask.to(
+                device=inputs.device,
+                dtype=torch.bool,
+            )
+            if not bool(attention_mask.any(dim=1).all()):
+                raise ValueError(
+                    "global workspace attention_mask needs one token per row"
+                )
         latents = self.latents.unsqueeze(0).expand(batch, -1, -1)
         keys = self.key(inputs)
         values = self.value(inputs)
@@ -347,6 +362,11 @@ class GlobalWorkspace(nn.Module):
             queries = self.query(self.norm(latents))
             scores = torch.matmul(queries, keys.transpose(-2, -1))
             scores = scores / math.sqrt(float(self.dimensions))
+            if attention_mask is not None:
+                scores = scores.masked_fill(
+                    ~attention_mask[:, None, :],
+                    -torch.inf,
+                )
             attention = F.softmax(scores.float(), dim=-1).to(inputs.dtype)
             latents = latents + self.update(torch.matmul(attention, values))
         summary = self.broadcast(self.norm(latents)).mean(dim=1)
@@ -428,11 +448,23 @@ class OmniDecoder(nn.Module):
         return len(self.experts) - 1
 
     def _apply_experts(
-        self, hidden: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not self.experts:
             return hidden, None
-        pooled = F.normalize(hidden.mean(dim=1), dim=-1)
+        if attention_mask is None:
+            pooled_hidden = hidden.mean(dim=1)
+        else:
+            weights = attention_mask.to(
+                device=hidden.device,
+                dtype=hidden.dtype,
+            ).unsqueeze(-1)
+            pooled_hidden = (hidden * weights).sum(dim=1) / weights.sum(
+                dim=1
+            ).clamp_min(1.0)
+        pooled = F.normalize(pooled_hidden, dim=-1)
         prototypes = F.normalize(
             torch.stack(list(self.expert_prototypes)), dim=-1
         )
@@ -449,13 +481,36 @@ class OmniDecoder(nn.Module):
         memory_bias: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         use_global_workspace: Optional[bool] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "attention_mask must match input_ids [batch, sequence]"
+                )
+            attention_mask = attention_mask.to(
+                device=input_ids.device,
+                dtype=torch.bool,
+            )
+            if bool(
+                (
+                    attention_mask[:, 1:]
+                    & ~attention_mask[:, :-1]
+                ).any()
+            ):
+                raise ValueError("attention_mask must describe right padding")
         if input_ids.shape[1] > self.config.max_seq_len:
             input_ids = input_ids[:, -self.config.max_seq_len :]
             if labels is not None:
                 labels = labels[:, -self.config.max_seq_len :]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -self.config.max_seq_len :]
+        if attention_mask is not None and not bool(
+            attention_mask.any(dim=1).all()
+        ):
+            raise ValueError("attention_mask needs one token per row")
 
         hidden = self.embedding(input_ids)
         workspace_latents = None
@@ -465,7 +520,10 @@ class OmniDecoder(nn.Module):
             # bidirectional workspace explicitly before autoregressive decoding.
             use_global_workspace = False
         if use_global_workspace:
-            workspace_latents, workspace_summary = self.global_workspace(hidden)
+            workspace_latents, workspace_summary = self.global_workspace(
+                hidden,
+                attention_mask=attention_mask,
+            )
             hidden = hidden + torch.tanh(self.workspace_strength) * (
                 workspace_summary.unsqueeze(1)
             )
@@ -485,7 +543,10 @@ class OmniDecoder(nn.Module):
                 )
             else:
                 hidden = block(hidden)
-        hidden, routing = self._apply_experts(hidden)
+        hidden, routing = self._apply_experts(
+            hidden,
+            attention_mask=attention_mask,
+        )
         hidden = self.final_norm(hidden)
         logits = self.language_head(hidden)
         action_logits = self.action_policy(hidden)

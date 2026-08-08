@@ -48,6 +48,9 @@ const BUNDLE_VERSION = 1;
 export const SUBSTRATE_STORE_FORMAT = "omni-substrate-shards";
 const STABLE_RELEASE_FORMAT = "stable-1.0";
 const BETA_REVIEW_FILE = ".stable-v1-beta-review.json";
+const BUNDLED_STARTER_ID = "omni-starter-bundled-1";
+const BUNDLED_STARTER_MANIFEST_SHA256 =
+  "40091bacb930e5632d564e620e15cd68643073f7b87b73d05338bca30af916d4";
 
 interface OmniManifest {
   format: typeof BUNDLE_FORMAT;
@@ -220,6 +223,30 @@ function redactPortableValue(
         entryKey,
         redactPortableValue(entryValue, counter, entryKey)
       ])
+    );
+  }
+  return value;
+}
+
+async function readStructuredJsonWithoutPortableSecrets(
+  path: string,
+  label: string
+): Promise<unknown> {
+  const info = await lstat(path).catch(() => undefined);
+  if (!info?.isFile() || info.isSymbolicLink()) {
+    throw new Error(`${label} is not a regular JSON file.`);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw new Error(`${label} is invalid JSON.`);
+  }
+  const counter: RedactionCounter = { replacements: 0 };
+  redactPortableValue(value, counter);
+  if (counter.replacements > 0) {
+    throw new Error(
+      `${label} appears to contain credentials. Remove or sanitize it before export.`
     );
   }
   return value;
@@ -784,6 +811,112 @@ function portableEngineState(
   return strToU8(JSON.stringify(redactPortableValue(state, redactions), null, 2));
 }
 
+function isStarterOriginState(value: unknown): value is Record<string, unknown> {
+  return Boolean(
+    isRecord(value) &&
+      isRecord(value.config) &&
+      value.config.origin_kind === "starter" &&
+      isRecord(value.starter_training_manifest)
+  );
+}
+
+async function assertBundledOriginProvenance(
+  provenancePath: string,
+  originStatePath: string,
+  originCorePath: string,
+  originPlasticityPath: string,
+  originPackedManifestPath: string
+): Promise<void> {
+  for (const [path, label] of [
+    [provenancePath, "provenance"],
+    [originStatePath, "origin metadata"],
+    [originCorePath, "origin core"],
+    [originPlasticityPath, "origin plasticity"],
+    [originPackedManifestPath, "origin packed manifest"]
+  ] as const) {
+    const info = await lstat(path).catch(() => undefined);
+    if (!info?.isFile() || info.isSymbolicLink()) {
+      throw new Error(`The bundled starter ${label} is not a regular file.`);
+    }
+  }
+  for (const path of [dirname(provenancePath), dirname(originPackedManifestPath)]) {
+    const info = await lstat(path).catch(() => undefined);
+    if (!info?.isDirectory() || info.isSymbolicLink()) {
+      throw new Error("The bundled starter origin contains an unsafe directory link.");
+    }
+  }
+  let provenance: unknown;
+  let originState: unknown;
+  try {
+    [provenance, originState] = await Promise.all([
+      readFile(provenancePath, "utf8").then((value) => JSON.parse(value)),
+      readFile(originStatePath, "utf8").then((value) => JSON.parse(value))
+    ]);
+  } catch {
+    throw new Error("The bundled starter origin provenance is invalid.");
+  }
+  if (!isRecord(provenance) || !isRecord(originState)) {
+    throw new Error("The bundled starter origin provenance is invalid.");
+  }
+  const recorded = { ...provenance };
+  const contentSha256 = recorded.contentSha256;
+  delete recorded.contentSha256;
+  if (
+    typeof contentSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(contentSha256) ||
+    sha256(canonicalJson(recorded)) !== contentSha256
+  ) {
+    throw new Error("The bundled starter origin provenance checksum failed.");
+  }
+  const starter = isRecord(originState.starter_training_manifest)
+    ? originState.starter_training_manifest
+    : undefined;
+  const substrate = isRecord(originState.substrate)
+    ? originState.substrate
+    : undefined;
+  const persistence = substrate && isRecord(substrate.persistence)
+    ? substrate.persistence
+    : undefined;
+  if (
+    !isRecord(originState.config) ||
+    originState.config.origin_kind !== "starter" ||
+    !starter ||
+    starter.id !== BUNDLED_STARTER_ID ||
+    starter.sha256 !== BUNDLED_STARTER_MANIFEST_SHA256 ||
+    typeof starter.trainedParameterChecksum !== "string" ||
+    !/^[a-f0-9]{64}$/.test(starter.trainedParameterChecksum) ||
+    !persistence ||
+    typeof persistence.contentSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(persistence.contentSha256)
+  ) {
+    throw new Error(
+      "The bundled starter origin does not match the official Omni Starter manifest."
+    );
+  }
+  const [coreSha256, plasticitySha256, brainMetadataSha256, packedManifestSha256] =
+    await Promise.all([
+      fileSha256(originCorePath),
+      fileSha256(originPlasticityPath),
+      fileSha256(originStatePath),
+      fileSha256(originPackedManifestPath)
+    ]);
+  const actual = {
+    format: "omni-bundled-origin-provenance-1",
+    originBrainId: originState.brain_id,
+    starterId: starter.id,
+    starterManifestSha256: starter.sha256,
+    originParameterChecksum: starter.trainedParameterChecksum,
+    coreSha256,
+    plasticitySha256,
+    brainMetadataSha256,
+    substrateContentSha256: persistence.contentSha256,
+    packedManifestSha256
+  };
+  if (canonicalJson(recorded) !== canonicalJson(actual)) {
+    throw new Error("The bundled starter origin provenance does not match its neural state.");
+  }
+}
+
 function requireSafeId(id: string, label = "brain id"): string {
   if (!SAFE_ID.test(id)) {
     throw new Error(`Invalid ${label}.`);
@@ -933,6 +1066,43 @@ function normalizeBrain(value: unknown): BrainDocument {
   };
   brain.config.name = brain.name;
   return brain;
+}
+
+function originChecksumFor(brain: BrainDocument): string {
+  return sha256(JSON.stringify({ ...brain, originChecksum: undefined }));
+}
+
+function assertOriginChecksum(brain: BrainDocument, label: string): string {
+  const expected = originChecksumFor(brain);
+  if (brain.originChecksum !== expected) {
+    throw new Error(`${label} checksum does not match its immutable state.`);
+  }
+  return expected;
+}
+
+function assertUiNeuralOriginIdentity(
+  originBrain: BrainDocument,
+  originEngine: unknown
+): void {
+  if (
+    !isRecord(originEngine) ||
+    originEngine.format !== "omni-cortex-engine" ||
+    originEngine.release_format !== STABLE_RELEASE_FORMAT
+  ) {
+    return;
+  }
+  const engineConfig = isRecord(originEngine.config)
+    ? originEngine.config
+    : undefined;
+  if (
+    originEngine.brain_id !== originBrain.id ||
+    originEngine.name !== originBrain.name ||
+    (engineConfig?.name !== undefined && engineConfig.name !== originBrain.name)
+  ) {
+    throw new Error(
+      "The immutable UI origin does not match the immutable neural origin."
+    );
+  }
 }
 
 export function brainMetrics(brain: BrainDocument): BrainMetrics {
@@ -1456,14 +1626,31 @@ export class BrainRepository {
     await this.initialize();
     const hash = sha256(contents);
     const destination = join(this.root, ".blobs", hash);
-    if (!(await pathExists(destination))) {
-      try {
-        await writeFile(destination, contents, { flag: "wx", mode: 0o600 });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const temporary = join(this.root, ".blobs", `.incoming-${randomUUID()}`);
+    try {
+      // Never write directly to the digest path. A concurrent loser can see an
+      // EEXIST result while the winner's write is still in progress and would
+      // otherwise return a pointer to a partial file. Fully materialize a
+      // private temporary and atomically promote it, validating any winner.
+      await writeFile(temporary, contents, { flag: "wx", mode: 0o600 });
+      await retryFilesystemOperation(async () => {
+        if (await verifiedExistingBlob(destination, hash)) return;
+        try {
+          await rename(temporary, destination);
+        } catch (error) {
+          if (await verifiedExistingBlob(destination, hash)) return;
+          throw error;
+        }
+      }, BLOB_PROMOTION_RETRY_CODES);
+      if (!(await verifiedExistingBlob(destination, hash))) {
+        throw new Error("Content-addressed blob promotion failed.");
       }
+      await removeFileWithRetry(temporary);
+      return hash;
+    } catch (error) {
+      await removeFileWithRetry(temporary);
+      throw error;
     }
-    return hash;
   }
 
   async getBlob(hash: string): Promise<Buffer> {
@@ -1618,13 +1805,26 @@ export class BrainRepository {
     const sourceEngine = join(this.brainDirectory(sourceBrainId), "engine");
     const metadataPath = join(sourceEngine, "brain.json");
     if (!(await pathExists(metadataPath))) return;
-    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as unknown;
-    if (!isRecord(metadata)) throw new Error("The source engine metadata is invalid.");
+    const sourceMetadata = JSON.parse(await readFile(metadataPath, "utf8")) as unknown;
+    if (!isRecord(sourceMetadata)) {
+      throw new Error("The source engine metadata is invalid.");
+    }
+    const metadata = clone(sourceMetadata);
     metadata.brain_id = targetBrainId;
     metadata.name = targetName;
     if (isRecord(metadata.config)) metadata.config.name = targetName;
     const targetEngine = join(this.brainDirectory(targetBrainId), "engine");
     const targetOrigin = join(targetEngine, "origin");
+    const sourceOrigin = join(sourceEngine, "origin");
+    const sourceOriginMetadataPath = join(sourceOrigin, "brain.json");
+    const hasImmutableOrigin = await pathExists(sourceOriginMetadataPath);
+    const originSourceEngine = hasImmutableOrigin ? sourceOrigin : sourceEngine;
+    const originMetadata = hasImmutableOrigin
+      ? (JSON.parse(await readFile(sourceOriginMetadataPath, "utf8")) as unknown)
+      : sourceMetadata;
+    if (!isRecord(originMetadata)) {
+      throw new Error("The source immutable-origin metadata is invalid.");
+    }
     await awaitAllOrThrow([
       mkdir(targetEngine, { recursive: true }),
       mkdir(targetOrigin, { recursive: true })
@@ -1636,13 +1836,21 @@ export class BrainRepository {
     for (const [sourceName, targetNameValue] of tensors) {
       const sourcePath = join(sourceEngine, sourceName);
       if (!(await pathExists(sourcePath))) continue;
-      const hash = await this.storeFileAsBlob(sourcePath);
+      const originSourcePath = join(originSourceEngine, sourceName);
+      if (!(await pathExists(originSourcePath))) {
+        throw new Error(`The source immutable origin is missing ${sourceName}.`);
+      }
+      const [hash, originHash] = await Promise.all([
+        this.storeFileAsBlob(sourcePath),
+        this.storeFileAsBlob(originSourcePath)
+      ]);
       await awaitAllOrThrow([
         this.linkBlobTo(hash, join(targetEngine, targetNameValue)),
-        this.linkBlobTo(hash, join(targetOrigin, targetNameValue))
+        this.linkBlobTo(originHash, join(targetOrigin, targetNameValue))
       ]);
     }
     const packedSource = join(sourceEngine, "packed-ternary");
+    const originPackedSource = join(originSourceEngine, "packed-ternary");
     // Wait for every concurrent materializer before the caller can remove a
     // failed clone. Promise.all would reject early while sibling operations
     // continued recreating paths underneath the cleanup, leaving an orphaned
@@ -1653,21 +1861,51 @@ export class BrainRepository {
         join(targetEngine, "packed-ternary")
       ),
       this.copyPackedTernaryDirectory(
-        packedSource,
+        originPackedSource,
         join(targetOrigin, "packed-ternary")
       ),
       this.copySubstrateSnapshot(sourceEngine, targetEngine, metadata),
-      this.copySubstrateSnapshot(sourceEngine, targetOrigin, metadata)
+      this.copySubstrateSnapshot(
+        originSourceEngine,
+        targetOrigin,
+        originMetadata
+      )
     ]);
     const failedMaterialization = materialized.find(
       (result): result is PromiseRejectedResult => result.status === "rejected"
     );
     if (failedMaterialization) throw failedMaterialization.reason;
-    // Metadata is the commit record and therefore moves last.
-    await awaitAllOrThrow([
-      atomicWrite(join(targetEngine, "brain.json"), JSON.stringify(metadata, null, 2)),
-      atomicWrite(join(targetOrigin, "brain.json"), JSON.stringify(metadata, null, 2))
-    ]);
+    // The immutable origin follows the lineage byte-for-byte. Only the live
+    // engine identity changes. This keeps starter provenance valid through the
+    // real Duplicate/Fork path instead of silently treating the mutable current
+    // checkpoint as a new origin.
+    if (hasImmutableOrigin) {
+      const originMetadataHash = await this.storeFileAsBlob(
+        sourceOriginMetadataPath
+      );
+      await this.linkBlobTo(
+        originMetadataHash,
+        join(targetOrigin, "brain.json")
+      );
+      const provenancePath = join(sourceOrigin, "provenance.json");
+      if (await pathExists(provenancePath)) {
+        const provenanceHash = await this.storeFileAsBlob(provenancePath);
+        await this.linkBlobTo(
+          provenanceHash,
+          join(targetOrigin, "provenance.json")
+        );
+      }
+    } else {
+      await atomicWrite(
+        join(targetOrigin, "brain.json"),
+        JSON.stringify(sourceMetadata, null, 2)
+      );
+    }
+    // Current metadata is the clone commit record and therefore moves last.
+    await atomicWrite(
+      join(targetEngine, "brain.json"),
+      JSON.stringify(metadata, null, 2)
+    );
   }
 
   brainDirectory(id: string): string {
@@ -1715,7 +1953,7 @@ export class BrainRepository {
         }
       ]
     };
-    brain.originChecksum = sha256(JSON.stringify({ ...brain, originChecksum: undefined }));
+    brain.originChecksum = originChecksumFor(brain);
     const directory = this.brainDirectory(id);
     await mkdir(join(directory, "snapshots"), { recursive: true });
     await atomicWrite(this.documentPath(id), JSON.stringify(brain, null, 2));
@@ -1808,6 +2046,36 @@ export class BrainRepository {
     operation: "fork" | "duplicate"
   ): Promise<BrainDocument> {
     const source = await this.get(id);
+    const sourceOriginPath = join(this.brainDirectory(id), "origin.json");
+    const hasSourceOrigin = await pathExists(sourceOriginPath);
+    let sourceOriginBlob: string | undefined;
+    if (hasSourceOrigin) {
+      const sourceOrigin = normalizeBrain(
+        JSON.parse(await readFile(sourceOriginPath, "utf8"))
+      );
+      const inheritedChecksum = assertOriginChecksum(
+        sourceOrigin,
+        "The source origin"
+      );
+      if (source.originChecksum !== inheritedChecksum) {
+        throw new Error(
+          "The source brain does not reference its immutable origin checksum."
+        );
+      }
+      const neuralOriginPath = join(
+        this.brainDirectory(id),
+        "engine",
+        "origin",
+        "brain.json"
+      );
+      if (await pathExists(neuralOriginPath)) {
+        assertUiNeuralOriginIdentity(
+          sourceOrigin,
+          JSON.parse(await readFile(neuralOriginPath, "utf8"))
+        );
+      }
+      sourceOriginBlob = await this.storeFileAsBlob(sourceOriginPath);
+    }
     const fork = clone(source);
     const now = new Date().toISOString();
     fork.id = randomUUID();
@@ -1839,17 +2107,30 @@ export class BrainRepository {
         })
       }
     ];
-    fork.originChecksum = undefined;
-    fork.originChecksum = sha256(JSON.stringify(fork));
+    if (hasSourceOrigin) {
+      // A duplicate/fork branches the mutable identity, not its ancestry.
+      // Keep both the checksum pointer and immutable UI snapshot identical to
+      // the source lineage, matching engine/origin's copy-on-write semantics.
+      fork.originChecksum = source.originChecksum;
+    } else {
+      // Stable-v1 repositories always have origin.json. This fallback keeps a
+      // recoverable behavior for an older hand-created document missing it.
+      fork.originChecksum = undefined;
+      fork.originChecksum = originChecksumFor(fork);
+    }
     const directory = this.brainDirectory(fork.id);
     try {
       await mkdir(join(directory, "snapshots"), { recursive: true });
       await atomicWrite(this.documentPath(fork.id), JSON.stringify(fork, null, 2));
-      await writeFile(join(directory, "origin.json"), JSON.stringify(fork, null, 2), {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600
-      });
+      if (sourceOriginBlob) {
+        await this.linkBlobTo(sourceOriginBlob, join(directory, "origin.json"));
+      } else {
+        await writeFile(join(directory, "origin.json"), JSON.stringify(fork, null, 2), {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600
+        });
+      }
       await this.cloneEngineState(source.id, fork.id, fork.name);
       return clone(fork);
     } catch (error) {
@@ -2213,6 +2494,15 @@ export class BrainRepository {
     let originBrain = normalizeBrain(
       JSON.parse(await readFile(join(directory, "origin.json"), "utf8"))
     );
+    const storedOriginChecksum = assertOriginChecksum(
+      originBrain,
+      "The stored origin"
+    );
+    if (currentBrain.originChecksum !== storedOriginChecksum) {
+      throw new Error(
+        "The current brain does not reference its immutable origin checksum."
+      );
+    }
     originBrain.toolPermissions = (originBrain.toolPermissions ?? []).map((permission) => ({
       ...permission,
       level: permission.level === "off" ? "off" : "ask"
@@ -2231,23 +2521,55 @@ export class BrainRepository {
         : idea
     );
     originBrain = redactPortableValue(originBrain, redactions) as BrainDocument;
+    originBrain.originChecksum = undefined;
+    originBrain.originChecksum = originChecksumFor(originBrain);
+    if (mode === "origin") portableBrain = clone(originBrain);
+    else portableBrain.originChecksum = originBrain.originChecksum;
+    entries["state/brain.json"] = {
+      name: "state/brain.json",
+      contents: strToU8(JSON.stringify(portableBrain, null, 2))
+    };
     const immutableEngine = join(directory, "engine", "origin");
     const immutableStatePath = join(immutableEngine, "brain.json");
-    const immutableState = (await pathExists(immutableStatePath))
-      ? portableEngineState(await readFile(immutableStatePath), false, redactions)
-      : mode === "origin"
-        ? engineState
-        : strToU8(
-            JSON.stringify(
-              {
-                format: "omni-engine-unmaterialized",
-                brain_id: originBrain.id,
-                name: originBrain.name
-              },
-              null,
-              2
-            )
-          );
+    const immutableProvenancePath = join(immutableEngine, "provenance.json");
+    const immutableStateExists = await pathExists(immutableStatePath);
+    const immutableProvenanceExists = await pathExists(
+      immutableProvenancePath
+    );
+    let immutableStateBytes: Buffer | undefined;
+    let immutableStateMetadata: unknown;
+    if (immutableStateExists) {
+      const [originDirectoryInfo, stateInfo] = await Promise.all([
+        lstat(immutableEngine),
+        lstat(immutableStatePath)
+      ]);
+      if (
+        !originDirectoryInfo.isDirectory() ||
+        originDirectoryInfo.isSymbolicLink() ||
+        !stateInfo.isFile() ||
+        stateInfo.isSymbolicLink()
+      ) {
+        throw new Error("The immutable origin contains an unsafe filesystem link.");
+      }
+      immutableStateBytes = await readFile(immutableStatePath);
+      try {
+        immutableStateMetadata = JSON.parse(immutableStateBytes.toString("utf8"));
+      } catch {
+        throw new Error("The immutable-origin Python engine metadata is invalid.");
+      }
+      assertUiNeuralOriginIdentity(originBrain, immutableStateMetadata);
+    }
+    const bundledStarterOrigin = isStarterOriginState(immutableStateMetadata);
+    if (bundledStarterOrigin && !immutableProvenanceExists) {
+      throw new Error(
+        "The bundled Omni Starter is missing immutable-origin provenance."
+      );
+    }
+    if (immutableProvenanceExists && !bundledStarterOrigin) {
+      throw new Error(
+        "Immutable-origin provenance is only valid for the official bundled Omni Starter."
+      );
+    }
     const immutableCorePath = join(immutableEngine, "core.safetensors");
     const immutablePlasticPath = join(immutableEngine, "plasticity.safetensors");
     const immutableCoreExists = await pathExists(immutableCorePath);
@@ -2263,7 +2585,7 @@ export class BrainRepository {
     }
     const immutablePackedPath = join(immutableEngine, "packed-ternary");
     const immutablePacked =
-      engineMaterialized &&
+      immutableStateExists &&
       (await pathExists(join(immutablePackedPath, "manifest.json")))
         ? await inspectPackedTernaryDirectory(immutablePackedPath, "Origin")
         : mode === "origin"
@@ -2274,6 +2596,68 @@ export class BrainRepository {
         "Materialized OmniCortex state is missing its immutable-origin packed ternary shards."
       );
     }
+    if (bundledStarterOrigin) {
+      if (!immutableCoreExists || !immutablePlasticExists || !immutablePacked) {
+        throw new Error(
+          "The bundled Omni Starter is missing immutable-origin neural state."
+        );
+      }
+      const packedManifestPath = immutablePacked.files.get("manifest.json");
+      if (!packedManifestPath) {
+        throw new Error(
+          "The bundled Omni Starter is missing its origin packed manifest."
+        );
+      }
+      await Promise.all([
+        readStructuredJsonWithoutPortableSecrets(
+          immutableStatePath,
+          "Immutable origin metadata"
+        ),
+        readStructuredJsonWithoutPortableSecrets(
+          immutableProvenancePath,
+          "Immutable origin provenance"
+        )
+      ]);
+      await assertBundledOriginProvenance(
+        immutableProvenancePath,
+        immutableStatePath,
+        immutableCorePath,
+        immutablePlasticPath,
+        packedManifestPath
+      );
+      // Provenance includes the committed substrate content hash. Validate the
+      // complete generation and every referenced shard before allowing exact
+      // immutable metadata bytes into a portable archive.
+      const verifiedSubstrate = await collectSubstrateSnapshot(
+        immutableEngine,
+        "substrate/origin",
+        immutableStateMetadata
+      );
+      if (!verifiedSubstrate) {
+        throw new Error(
+          "The bundled Omni Starter is missing its immutable neural substrate."
+        );
+      }
+    }
+    // Only a fully validated official starter may retain byte-exact engine
+    // metadata. Other origins pass through portable redaction/sanitization.
+    const immutableState = immutableStateBytes
+      ? bundledStarterOrigin
+        ? new Uint8Array(immutableStateBytes)
+        : portableEngineState(immutableStateBytes, false, redactions)
+      : mode === "origin"
+        ? engineState
+        : strToU8(
+            JSON.stringify(
+              {
+                format: "omni-engine-unmaterialized",
+                brain_id: originBrain.id,
+                name: originBrain.name
+              },
+              null,
+              2
+            )
+          );
     const references =
       mode === "referenced"
         ? {
@@ -2317,6 +2701,12 @@ export class BrainRepository {
       name: "origin/state/engine.json",
       contents: immutableState
     };
+    if (immutableProvenanceExists) {
+      entries["origin/provenance.json"] = {
+        name: "origin/provenance.json",
+        sourcePath: immutableProvenancePath
+      };
+    }
     entries["origin/tensors/core.safetensors"] = {
       name: "origin/tensors/core.safetensors",
       ...(references
@@ -2901,6 +3291,15 @@ export class BrainRepository {
 
     const imported = normalizeBrain(brainValue);
     const importedOrigin = normalizeBrain(originBrainValue);
+    const importedOriginChecksum = assertOriginChecksum(
+      importedOrigin,
+      "The bundled origin"
+    );
+    if (imported.originChecksum !== importedOriginChecksum) {
+      throw new Error(
+        "The bundled brain does not reference its immutable origin checksum."
+      );
+    }
     const engineMaterialized = manifestValue.engineMaterialized === true;
     if (
       engineMaterialized &&
@@ -2915,6 +3314,22 @@ export class BrainRepository {
     ) {
       throw new Error("Materialized engine state is invalid or belongs to the beta format.");
     }
+    if (engineMaterialized) {
+      assertUiNeuralOriginIdentity(importedOrigin, originEngineValue);
+    }
+    const bundledStarterOrigin = Boolean(
+      engineMaterialized && isStarterOriginState(originEngineValue)
+    );
+    if (bundledStarterOrigin && !names.has("origin/provenance.json")) {
+      throw new Error(
+        "The bundled Omni Starter is missing immutable-origin provenance."
+      );
+    }
+    if (names.has("origin/provenance.json") && !bundledStarterOrigin) {
+      throw new Error(
+        "Immutable-origin provenance is only valid for the official bundled Omni Starter."
+      );
+    }
     const [currentSubstratePaths, originSubstratePaths] = await Promise.all([
       validateExtractedSubstrateSnapshot(
         archive,
@@ -2927,32 +3342,62 @@ export class BrainRepository {
         originEngineValue
       )
     ]);
-    if (isRecord(engineValue)) engineValue.brain_id = imported.id;
-    if (isRecord(originEngineValue)) originEngineValue.brain_id = imported.id;
-    if (await pathExists(this.brainDirectory(imported.id))) {
-      const previousId = imported.id;
-      imported.id = randomUUID();
-      imported.lineage = {
-        parentId: previousId,
-        rootId: imported.lineage.rootId,
-        generation: imported.lineage.generation + 1
-      };
+    if (bundledStarterOrigin) {
+      const packedManifestPath = verifiedPackedOrigin?.files.get("manifest.json");
+      if (!packedManifestPath) {
+        throw new Error(
+          "The bundled Omni Starter is missing its origin packed manifest."
+        );
+      }
+      await Promise.all([
+        readStructuredJsonWithoutPortableSecrets(
+          entryPath("origin/state/engine.json"),
+          "Immutable origin metadata"
+        ),
+        readStructuredJsonWithoutPortableSecrets(
+          entryPath("origin/provenance.json"),
+          "Immutable origin provenance"
+        )
+      ]);
+      await assertBundledOriginProvenance(
+        entryPath("origin/provenance.json"),
+        entryPath("origin/state/engine.json"),
+        tensorPaths["origin/tensors/core.safetensors"]!,
+        tensorPaths["origin/tensors/plastic.safetensors"]!,
+        packedManifestPath
+      );
+    }
+    const bundledBrainId = imported.id;
+    const bundledGeneration = imported.lineage.generation;
+    let rekeyed = false;
+    let directory = this.brainDirectory(imported.id);
+    for (;;) {
+      try {
+        // Reserving the final directory is the cross-process compare-and-set.
+        // A prior pathExists check races when two imports carry the same id.
+        await mkdir(directory, { recursive: false });
+        break;
+      } catch (error) {
+        if (filesystemErrorCode(error) !== "EEXIST") throw error;
+        imported.id = randomUUID();
+        directory = this.brainDirectory(imported.id);
+        if (!rekeyed) {
+          imported.lineage = {
+            parentId: bundledBrainId,
+            rootId: imported.lineage.rootId,
+            generation: bundledGeneration + 1
+          };
+          rekeyed = true;
+        }
+      }
     }
     if (isRecord(engineValue)) {
       engineValue.brain_id = imported.id;
       engineValue.name = imported.name;
     }
-    if (isRecord(originEngineValue)) {
-      originEngineValue.brain_id = imported.id;
-      originEngineValue.name = imported.name;
-    }
-    importedOrigin.id = imported.id;
-    importedOrigin.name = imported.name;
-    importedOrigin.config.name = imported.name;
-    importedOrigin.lineage = imported.lineage;
-    importedOrigin.originChecksum = undefined;
-    const importedOriginChecksum = sha256(JSON.stringify(importedOrigin));
-    importedOrigin.originChecksum = importedOriginChecksum;
+    // The immutable UI and neural origins describe the same ancestral build.
+    // Import may re-key the live identity on collision, but must not rewrite
+    // the origin to that new identity or it would diverge from engine/origin.
     imported.originChecksum = importedOriginChecksum;
     imported.name = imported.name.slice(0, 120);
     imported.config.name = imported.name;
@@ -2967,7 +3412,6 @@ export class BrainRepository {
         summary: `Imported from ${basename(sourceLabel)}.`
       }
     ];
-    const directory = this.brainDirectory(imported.id);
     const materializeFile = async (source: string, destination: string): Promise<void> => {
       const hash = await this.storeFileAsBlob(source);
       await this.linkBlobTo(hash, destination);
@@ -3094,10 +3538,16 @@ export class BrainRepository {
         );
       }
       if (isRecord(originEngineValue) && originEngineValue.format === "omni-cortex-engine") {
-        await atomicWrite(
-          join(directory, "engine", "origin", "brain.json"),
-          JSON.stringify(originEngineValue, null, 2)
+        await materializeFile(
+          entryPath("origin/state/engine.json"),
+          join(directory, "engine", "origin", "brain.json")
         );
+        if (names.has("origin/provenance.json")) {
+          await materializeFile(
+            entryPath("origin/provenance.json"),
+            join(directory, "engine", "origin", "provenance.json")
+          );
+        }
       }
       for (const path of names) {
         if (!path.startsWith("blobs/")) continue;
@@ -3107,11 +3557,10 @@ export class BrainRepository {
           throw new Error(`Content-addressed blob validation failed for ${path}.`);
         }
       }
-      await writeFile(join(directory, "origin.json"), JSON.stringify(importedOrigin, null, 2), {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600
-      });
+      await materializeFile(
+        entryPath("origin/state/brain.json"),
+        join(directory, "origin.json")
+      );
       return clone(imported);
     } catch (error) {
       await removeTreeWithRetry(directory);

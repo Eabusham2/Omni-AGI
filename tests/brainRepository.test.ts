@@ -10,6 +10,9 @@ import {
 } from "../src/main/brainRepository";
 import { DEFAULT_CONFIG } from "../src/shared/types";
 
+const OFFICIAL_STARTER_MANIFEST_SHA256 =
+  "40091bacb930e5632d564e620e15cd68643073f7b87b73d05338bca30af916d4";
+
 function emptySafetensors(): Buffer {
   const header = Buffer.from(JSON.stringify({ __metadata__: { test: "true" } }).padEnd(128, " "));
   const prefix = Buffer.alloc(8);
@@ -45,6 +48,31 @@ function canonicalJson(value: unknown): string {
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
     .join(",")}}`;
+}
+
+function originChecksumForDocument(value: Record<string, unknown>): string {
+  return digest(JSON.stringify({ ...value, originChecksum: undefined }));
+}
+
+function refreshArchiveIntegrity(entries: Record<string, Uint8Array>): void {
+  const manifest = JSON.parse(strFromU8(entries["manifest.json"]!)) as {
+    files: Record<string, { sha256: string; bytes: number }>;
+  };
+  for (const [path, contents] of Object.entries(entries)) {
+    if (path === "manifest.json" || path === "checksums.sha256") continue;
+    manifest.files[path] = {
+      sha256: digest(contents),
+      bytes: contents.byteLength
+    };
+  }
+  entries["manifest.json"] = Buffer.from(JSON.stringify(manifest, null, 2));
+  entries["checksums.sha256"] = Buffer.from(
+    Object.entries(entries)
+      .filter(([path]) => path !== "checksums.sha256")
+      .map(([path, contents]) => `${digest(contents)}  ${path}`)
+      .sort()
+      .join("\n") + "\n"
+  );
 }
 
 async function writePackedTernaryFixture(directory: string): Promise<void> {
@@ -184,6 +212,49 @@ async function writeSubstrateFixture(engineDirectory: string): Promise<Record<st
   return pointer;
 }
 
+async function writeOriginProvenanceFixture(
+  engineDirectory: string
+): Promise<Buffer> {
+  const origin = join(engineDirectory, "origin");
+  const [metadataBytes, core, plasticity, packedManifest] = await Promise.all([
+    readFile(join(origin, "brain.json")),
+    readFile(join(origin, "core.safetensors")),
+    readFile(join(origin, "plasticity.safetensors")),
+    readFile(join(origin, "packed-ternary", "manifest.json"))
+  ]);
+  const metadata = JSON.parse(metadataBytes.toString("utf8")) as {
+    brain_id: string;
+    starter_training_manifest: {
+      id: string;
+      sha256: string;
+      trainedParameterChecksum: string;
+    };
+    substrate: { persistence: { contentSha256: string } };
+  };
+  const payload = {
+    format: "omni-bundled-origin-provenance-1",
+    originBrainId: metadata.brain_id,
+    starterId: metadata.starter_training_manifest.id,
+    starterManifestSha256: metadata.starter_training_manifest.sha256,
+    originParameterChecksum:
+      metadata.starter_training_manifest.trainedParameterChecksum,
+    coreSha256: digest(core),
+    plasticitySha256: digest(plasticity),
+    brainMetadataSha256: digest(metadataBytes),
+    substrateContentSha256:
+      metadata.substrate.persistence.contentSha256,
+    packedManifestSha256: digest(packedManifest)
+  };
+  const bytes = Buffer.from(
+    canonicalJson({
+      ...payload,
+      contentSha256: digest(canonicalJson(payload))
+    })
+  );
+  await writeFile(join(origin, "provenance.json"), bytes);
+  return bytes;
+}
+
 describe("BrainRepository lifecycle", () => {
   let temporaryRoot: string;
   let repository: BrainRepository;
@@ -276,6 +347,32 @@ describe("BrainRepository lifecycle", () => {
     ]);
   });
 
+  it("atomically promotes concurrent in-memory blobs and validates every winner", async () => {
+    // The race is in promotion, not payload size. Keep enough simultaneous
+    // writers to exercise the collision while leaving headroom for Vitest's
+    // other filesystem-heavy suites on slower CI runners.
+    const contents = byteTensorSafetensors(64 * 1024);
+    const expected = digest(contents);
+    const promoted = await Promise.all(
+      Array.from({ length: 12 }, () => repository.storeBlob(contents))
+    );
+
+    expect(new Set(promoted)).toEqual(new Set([expected]));
+    await expect(repository.getBlob(expected)).resolves.toEqual(contents);
+    expect((await readdir(join(repository.root, ".blobs"))).sort()).toEqual([
+      expected
+    ]);
+
+    const corrupt = Buffer.from("corrupt in-memory blob winner");
+    await writeFile(join(repository.root, ".blobs", expected), corrupt);
+    await expect(repository.storeBlob(contents)).rejects.toThrow(
+      /blob checksum failed/i
+    );
+    await expect(readFile(join(repository.root, ".blobs", expected))).resolves.toEqual(
+      corrupt
+    );
+  }, 15_000);
+
   it("preserves an imported checkpoint workspace above the former product cap", async () => {
     const recordedSlots = 8_192;
     const source = await repository.create({
@@ -292,6 +389,47 @@ describe("BrainRepository lifecycle", () => {
     expect(imported.config.workingMemorySlots).toBe(recordedSlots);
     expect((await repository.get(imported.id)).config.workingMemorySlots).toBe(
       recordedSlots
+    );
+  });
+
+  it("atomically reserves unique identities for concurrent imports of one bundle", async () => {
+    const source = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Concurrent import source"
+    });
+    const bundle = join(temporaryRoot, "concurrent-import.omni");
+    await repository.exportBundle(source.id, bundle, "current");
+    const bundleBytes = await readFile(bundle);
+
+    const destination = new BrainRepository(
+      join(temporaryRoot, "concurrent-import-destination")
+    );
+    await destination.initialize();
+    const imported = await Promise.all(
+      Array.from({ length: 6 }, (_, index) =>
+        destination.importBundleBuffer(
+          bundleBytes,
+          `concurrent-${index}.omni`
+        )
+      )
+    );
+
+    expect(new Set(imported.map((brain) => brain.id)).size).toBe(6);
+    expect(imported.filter((brain) => brain.id === source.id)).toHaveLength(1);
+    await Promise.all(
+      imported.map(async (brain) => {
+        await expect(destination.get(brain.id)).resolves.toMatchObject({
+          id: brain.id,
+          originChecksum: brain.originChecksum
+        });
+        const origin = JSON.parse(
+          await readFile(
+            join(destination.brainDirectory(brain.id), "origin.json"),
+            "utf8"
+          )
+        ) as Record<string, unknown>;
+        expect(brain.originChecksum).toBe(originChecksumForDocument(origin));
+      })
     );
   });
 
@@ -427,6 +565,367 @@ describe("BrainRepository lifecycle", () => {
       ).resolves.toBeInstanceOf(Buffer)
     ]);
   });
+
+  it("preserves immutable starter provenance through duplicate and .omni round trips", async () => {
+    const brain = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Verified starter"
+    });
+    const learnedSourceBytes = Buffer.from("knowledge learned after the immutable origin");
+    const learnedSourceHash = digest(learnedSourceBytes);
+    brain.trainingSources.push({
+      id: randomUUID(),
+      name: "learned-after-origin.txt",
+      kind: "text",
+      bytes: learnedSourceBytes.byteLength,
+      learnedIdeas: 8,
+      learnedConcepts: 5,
+      learnedSynapses: 21,
+      importedAt: new Date().toISOString(),
+      rawTextRetained: false,
+      contentHash: learnedSourceHash,
+      policy: "consolidate"
+    });
+    brain.messages.push({
+      id: randomUUID(),
+      role: "human",
+      content: "This turn exists only in mutable learned state.",
+      createdAt: new Date().toISOString()
+    });
+    brain.counters.plasticityEvents += 21;
+    await repository.save(brain);
+    const engine = join(repository.brainDirectory(brain.id), "engine");
+    const origin = join(engine, "origin");
+    await Promise.all([
+      mkdir(engine, { recursive: true }),
+      mkdir(origin, { recursive: true })
+    ]);
+    const [currentSubstrate, originSubstrate] = await Promise.all([
+      writeSubstrateFixture(engine),
+      writeSubstrateFixture(origin)
+    ]);
+    const starterManifest = {
+      id: "omni-starter-bundled-1",
+      sha256: OFFICIAL_STARTER_MANIFEST_SHA256,
+      trainedParameterChecksum: "b".repeat(64)
+    };
+    const currentState = {
+      schema_version: 1,
+      format: "omni-cortex-engine",
+      release_format: "stable-1.0",
+      brain_id: brain.id,
+      name: brain.name,
+      config: { name: brain.name, origin_kind: "starter" },
+      expert_count: 0,
+      starter_training_manifest: starterManifest,
+      substrate: {
+        schema: 1,
+        dimensions: 16,
+        seed: 7,
+        persistence: currentSubstrate
+      },
+      marker: "mutable-current"
+    };
+    const originState = {
+      ...currentState,
+      substrate: {
+        ...currentState.substrate,
+        persistence: originSubstrate
+      },
+      marker: "immutable-origin"
+    };
+    const currentCore = byteTensorSafetensors(32);
+    const currentPlasticity = byteTensorSafetensors(24);
+    const originCore = byteTensorSafetensors(16);
+    const originPlasticity = byteTensorSafetensors(8);
+    await Promise.all([
+      writeFile(join(engine, "brain.json"), canonicalJson(currentState)),
+      writeFile(join(engine, "core.safetensors"), currentCore),
+      writeFile(join(engine, "plasticity.safetensors"), currentPlasticity),
+      writeFile(join(origin, "brain.json"), canonicalJson(originState)),
+      writeFile(join(origin, "core.safetensors"), originCore),
+      writeFile(join(origin, "plasticity.safetensors"), originPlasticity),
+      writePackedTernaryFixture(join(engine, "packed-ternary")),
+      writePackedTernaryFixture(join(origin, "packed-ternary"))
+    ]);
+    const provenance = await writeOriginProvenanceFixture(engine);
+    const originMetadata = await readFile(join(origin, "brain.json"));
+    const uiOrigin = await readFile(
+      join(repository.brainDirectory(brain.id), "origin.json")
+    );
+
+    const duplicate = await repository.duplicate(brain.id);
+    const fork = await repository.fork(brain.id, "Verified starter branch");
+    const duplicateEngine = join(
+      repository.brainDirectory(duplicate.id),
+      "engine"
+    );
+    const duplicateCurrent = JSON.parse(
+      await readFile(join(duplicateEngine, "brain.json"), "utf8")
+    ) as { brain_id: string; marker: string };
+    expect(duplicateCurrent).toMatchObject({
+      brain_id: duplicate.id,
+      marker: "mutable-current"
+    });
+    expect(duplicate.originChecksum).toBe(brain.originChecksum);
+    expect(fork.originChecksum).toBe(brain.originChecksum);
+    expect(duplicate.trainingSources).toHaveLength(1);
+    expect(fork.trainingSources).toHaveLength(1);
+    await expect(
+      readFile(join(repository.brainDirectory(duplicate.id), "origin.json"))
+    ).resolves.toEqual(uiOrigin);
+    await expect(
+      readFile(join(repository.brainDirectory(fork.id), "origin.json"))
+    ).resolves.toEqual(uiOrigin);
+    await expect(
+      readFile(join(duplicateEngine, "origin", "brain.json"))
+    ).resolves.toEqual(originMetadata);
+    await expect(
+      readFile(join(duplicateEngine, "origin", "provenance.json"))
+    ).resolves.toEqual(provenance);
+    await expect(
+      readFile(join(duplicateEngine, "origin", "core.safetensors"))
+    ).resolves.toEqual(originCore);
+    await expect(
+      readFile(join(duplicateEngine, "core.safetensors"))
+    ).resolves.toEqual(currentCore);
+
+    const bundle = join(temporaryRoot, "verified-starter.omni");
+    await repository.exportBundle(brain.id, bundle, "current");
+    const archive = unzipSync(new Uint8Array(await readFile(bundle)));
+    expect(Buffer.from(archive["origin/provenance.json"]!)).toEqual(
+      provenance
+    );
+    expect(Buffer.from(archive["origin/state/engine.json"]!)).toEqual(
+      originMetadata
+    );
+
+    const imported = await repository.importBundle(bundle);
+    const importedEngine = join(
+      repository.brainDirectory(imported.id),
+      "engine"
+    );
+    const importedCurrent = JSON.parse(
+      await readFile(join(importedEngine, "brain.json"), "utf8")
+    ) as { brain_id: string };
+    expect(importedCurrent.brain_id).toBe(imported.id);
+    await expect(
+      readFile(join(importedEngine, "origin", "brain.json"))
+    ).resolves.toEqual(originMetadata);
+    await expect(
+      readFile(join(importedEngine, "origin", "provenance.json"))
+    ).resolves.toEqual(provenance);
+    await expect(
+      readFile(join(importedEngine, "origin", "core.safetensors"))
+    ).resolves.toEqual(originCore);
+
+    const originBundle = join(temporaryRoot, "verified-starter-origin.omni");
+    await repository.exportBundle(duplicate.id, originBundle, "origin");
+    const originArchive = unzipSync(new Uint8Array(await readFile(originBundle)));
+    const exportedOriginBrain = JSON.parse(
+      strFromU8(originArchive["state/brain.json"]!)
+    ) as { id: string; name: string; trainingSources: unknown[]; messages: unknown[] };
+    const exportedImmutableBrain = JSON.parse(
+      strFromU8(originArchive["origin/state/brain.json"]!)
+    ) as typeof exportedOriginBrain & { originChecksum: string };
+    const exportedCurrentBrain = JSON.parse(
+      strFromU8(originArchive["state/brain.json"]!)
+    ) as typeof exportedImmutableBrain;
+    expect(exportedOriginBrain).toMatchObject({
+      id: brain.id,
+      name: brain.name,
+      trainingSources: [],
+      messages: []
+    });
+    expect(exportedImmutableBrain).toEqual(exportedOriginBrain);
+    expect(exportedImmutableBrain.originChecksum).toBe(
+      originChecksumForDocument(exportedImmutableBrain)
+    );
+    expect(exportedCurrentBrain.originChecksum).toBe(
+      exportedImmutableBrain.originChecksum
+    );
+    expect(exportedImmutableBrain.originChecksum).not.toBe(
+      brain.originChecksum
+    );
+    expect(
+      JSON.parse(strFromU8(originArchive["state/engine.json"]!))
+    ).toMatchObject({ marker: "immutable-origin" });
+
+    const originImported = await repository.importBundle(originBundle);
+    expect(originImported.trainingSources).toHaveLength(0);
+    expect(originImported.messages).toHaveLength(0);
+    expect(originImported.originChecksum).toBe(
+      exportedImmutableBrain.originChecksum
+    );
+    await expect(
+      readFile(join(repository.brainDirectory(originImported.id), "origin.json"))
+    ).resolves.toEqual(Buffer.from(originArchive["origin/state/brain.json"]!));
+    await expect(
+      readFile(
+        join(
+          repository.brainDirectory(originImported.id),
+          "engine",
+          "origin",
+          "brain.json"
+        )
+      )
+    ).resolves.toEqual(originMetadata);
+
+    const badChecksumArchive = unzipSync(
+      new Uint8Array(await readFile(bundle))
+    );
+    const badChecksumOrigin = JSON.parse(
+      strFromU8(badChecksumArchive["origin/state/brain.json"]!)
+    ) as Record<string, unknown>;
+    const badChecksumCurrent = JSON.parse(
+      strFromU8(badChecksumArchive["state/brain.json"]!)
+    ) as Record<string, unknown>;
+    badChecksumOrigin.originChecksum = "0".repeat(64);
+    badChecksumCurrent.originChecksum = "0".repeat(64);
+    badChecksumArchive["origin/state/brain.json"] = Buffer.from(
+      JSON.stringify(badChecksumOrigin, null, 2)
+    );
+    badChecksumArchive["state/brain.json"] = Buffer.from(
+      JSON.stringify(badChecksumCurrent, null, 2)
+    );
+    refreshArchiveIntegrity(badChecksumArchive);
+    await expect(
+      repository.importBundleBuffer(
+        Buffer.from(zipSync(badChecksumArchive)),
+        "bad-origin-checksum.omni"
+      )
+    ).rejects.toThrow(/origin checksum does not match/i);
+
+    const mismatchedOriginArchive = unzipSync(
+      new Uint8Array(await readFile(bundle))
+    );
+    const mismatchedOrigin = JSON.parse(
+      strFromU8(mismatchedOriginArchive["origin/state/brain.json"]!)
+    ) as Record<string, unknown> & { config: Record<string, unknown> };
+    const mismatchedCurrent = JSON.parse(
+      strFromU8(mismatchedOriginArchive["state/brain.json"]!)
+    ) as Record<string, unknown>;
+    mismatchedOrigin.name = "A different UI origin";
+    mismatchedOrigin.config.name = mismatchedOrigin.name;
+    mismatchedOrigin.originChecksum = originChecksumForDocument(
+      mismatchedOrigin
+    );
+    mismatchedCurrent.originChecksum = mismatchedOrigin.originChecksum;
+    mismatchedOriginArchive["origin/state/brain.json"] = Buffer.from(
+      JSON.stringify(mismatchedOrigin, null, 2)
+    );
+    mismatchedOriginArchive["state/brain.json"] = Buffer.from(
+      JSON.stringify(mismatchedCurrent, null, 2)
+    );
+    refreshArchiveIntegrity(mismatchedOriginArchive);
+    await expect(
+      repository.importBundleBuffer(
+        Buffer.from(zipSync(mismatchedOriginArchive)),
+        "mismatched-origin-identities.omni"
+      )
+    ).rejects.toThrow(/UI origin does not match the immutable neural origin/i);
+
+    const forgedProvenance = JSON.parse(provenance.toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    delete forgedProvenance.contentSha256;
+    forgedProvenance.coreSha256 = "c".repeat(64);
+    forgedProvenance.contentSha256 = digest(
+      canonicalJson(forgedProvenance)
+    );
+    const forgedBytes = Buffer.from(canonicalJson(forgedProvenance));
+    archive["origin/provenance.json"] = forgedBytes;
+    const forgedManifest = JSON.parse(
+      strFromU8(archive["manifest.json"]!)
+    ) as {
+      files: Record<string, { sha256: string; bytes: number }>;
+    };
+    forgedManifest.files["origin/provenance.json"] = {
+      sha256: digest(forgedBytes),
+      bytes: forgedBytes.byteLength
+    };
+    archive["manifest.json"] = Buffer.from(
+      JSON.stringify(forgedManifest, null, 2)
+    );
+    archive["checksums.sha256"] = Buffer.from(
+      Object.entries(archive)
+        .filter(([path]) => path !== "checksums.sha256")
+        .map(([path, contents]) => `${digest(contents)}  ${path}`)
+        .sort()
+        .join("\n") + "\n"
+    );
+    await expect(
+      repository.importBundleBuffer(
+        Buffer.from(zipSync(archive)),
+        "forged-origin.omni"
+      )
+    ).rejects.toThrow(/provenance does not match its neural state/);
+
+    const provenancePath = join(origin, "provenance.json");
+    const unexpectedProvenance = JSON.parse(
+      provenance.toString("utf8")
+    ) as Record<string, unknown>;
+    delete unexpectedProvenance.contentSha256;
+    unexpectedProvenance.unexpectedField = "not allowed";
+    unexpectedProvenance.contentSha256 = digest(
+      canonicalJson(unexpectedProvenance)
+    );
+    await writeFile(provenancePath, canonicalJson(unexpectedProvenance));
+    await expect(
+      repository.exportBundle(
+        brain.id,
+        join(temporaryRoot, "unexpected-provenance.omni"),
+        "current"
+      )
+    ).rejects.toThrow(/provenance does not match its neural state/);
+
+    const secretProvenance = JSON.parse(
+      provenance.toString("utf8")
+    ) as Record<string, unknown>;
+    delete secretProvenance.contentSha256;
+    secretProvenance.binaryLookingPadding = "�".repeat(4_000);
+    secretProvenance.note = `api_key=sk-${"z".repeat(32)}`;
+    secretProvenance.contentSha256 = digest(canonicalJson(secretProvenance));
+    await writeFile(provenancePath, canonicalJson(secretProvenance));
+    await expect(
+      repository.exportBundle(
+        brain.id,
+        join(temporaryRoot, "secret-provenance.omni"),
+        "current"
+      )
+    ).rejects.toThrow(/appears to contain credentials/);
+
+    await rm(provenancePath);
+    await expect(
+      repository.exportBundle(
+        brain.id,
+        join(temporaryRoot, "missing-provenance.omni"),
+        "current"
+      )
+    ).rejects.toThrow(/missing immutable-origin provenance/);
+
+    const wrongStarterState = JSON.parse(
+      originMetadata.toString("utf8")
+    ) as {
+      starter_training_manifest: { sha256: string };
+    };
+    wrongStarterState.starter_training_manifest.sha256 = "a".repeat(64);
+    await writeFile(join(origin, "brain.json"), canonicalJson(wrongStarterState));
+    await writeOriginProvenanceFixture(engine);
+    await expect(
+      repository.exportBundle(
+        brain.id,
+        join(temporaryRoot, "wrong-starter.omni"),
+        "current"
+      )
+    ).rejects.toThrow(/official Omni Starter manifest/);
+
+    await Promise.all([
+      writeFile(join(origin, "brain.json"), originMetadata),
+      writeFile(provenancePath, provenance)
+    ]);
+  }, 30_000);
 
   it("enumerates only app-managed beta directories and deletes them only after confirmation", async () => {
     const stable = await repository.create({ ...DEFAULT_CONFIG, name: "Stable mind" });
