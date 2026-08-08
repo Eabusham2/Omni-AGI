@@ -29,6 +29,7 @@ $Scratch = Join-Path ([System.IO.Path]::GetTempPath()) (
 $ZipRoot = Join-Path $Scratch "zip"
 $InstallRoot = Join-Path $Scratch "installed"
 [System.IO.Directory]::CreateDirectory($Scratch) | Out-Null
+$SmokeFailure = $null
 
 function Get-OneArtifact {
   param(
@@ -126,6 +127,48 @@ function Remove-TreeWithRetry {
       Start-Sleep -Milliseconds 1000
     }
   }
+}
+
+function Stop-ProcessesUnderRoot {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root,
+    [int]$Attempts = 20
+  )
+  $NormalizedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd(
+    [System.IO.Path]::DirectorySeparatorChar,
+    [System.IO.Path]::AltDirectorySeparatorChar
+  ) + [System.IO.Path]::DirectorySeparatorChar
+  for ($Attempt = 1; $Attempt -le $Attempts; $Attempt++) {
+    $Processes = @(
+      Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+          if (-not $_.ExecutablePath) {
+            return $false
+          }
+          try {
+            $ExecutablePath = [System.IO.Path]::GetFullPath(
+              [string]$_.ExecutablePath
+            )
+            return $ExecutablePath.StartsWith(
+              $NormalizedRoot,
+              [System.StringComparison]::OrdinalIgnoreCase
+            )
+          }
+          catch {
+            return $false
+          }
+        }
+    )
+    if ($Processes.Count -eq 0) {
+      return
+    }
+    foreach ($Process in $Processes) {
+      & taskkill.exe /PID $Process.ProcessId /T /F *> $null
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "Processes launched from $Root did not exit during package cleanup."
 }
 
 function Get-InstalledAppExecutable {
@@ -280,6 +323,12 @@ try {
       }
       finally {
         Pop-Location
+        try {
+          Stop-ProcessesUnderRoot -Root $InstallRoot
+        }
+        catch {
+          Write-Warning "Installed desktop teardown will be retried during package cleanup: $_"
+        }
       }
       $AppLaunched = $true
       $DesktopE2E = $true
@@ -335,9 +384,37 @@ try {
   } | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 $EvidencePath
   Write-Host "Windows package smoke evidence: $EvidencePath"
 }
+catch {
+  $SmokeFailure = $_
+  throw
+}
 finally {
   Write-Host "Package smoke [$Arch]: cleaning temporary package state."
+  $CleanupErrors = [System.Collections.Generic.List[object]]::new()
+  if (Test-Path $InstallRoot) {
+    try {
+      Stop-ProcessesUnderRoot -Root $InstallRoot
+    }
+    catch {
+      $CleanupErrors.Add($_)
+    }
+  }
   if (Test-Path $Scratch) {
-    Remove-TreeWithRetry -Path $Scratch
+    try {
+      Remove-TreeWithRetry -Path $Scratch
+    }
+    catch {
+      $CleanupErrors.Add($_)
+    }
+  }
+  if ($CleanupErrors.Count -gt 0) {
+    if ($null -ne $SmokeFailure) {
+      foreach ($CleanupError in $CleanupErrors) {
+        Write-Warning "Package cleanup also failed after the original smoke failure: $CleanupError"
+      }
+    }
+    else {
+      throw $CleanupErrors[0]
+    }
   }
 }

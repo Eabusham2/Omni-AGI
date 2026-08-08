@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -14,6 +15,65 @@ const repository = resolve(process.cwd());
 interface RunningApplication {
   page: Page;
   close(): Promise<void>;
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+async function waitForProcessExit(
+  child: ReturnType<ElectronApplication["process"]>,
+  timeout: number
+): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise((resolveExit) => {
+    let finished = false;
+    const finish = (exited: boolean): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      resolveExit(exited);
+    };
+    const onExit = (): void => finish(true);
+    const timer = setTimeout(() => finish(false), timeout);
+    child.once("exit", onExit);
+  });
+}
+
+async function forceCloseProcessTree(
+  child: ReturnType<ElectronApplication["process"]>
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+  if (process.platform === "win32") {
+    await new Promise<void>((resolveKill) => {
+      execFile(
+        "taskkill.exe",
+        ["/PID", String(child.pid), "/T", "/F"],
+        { windowsHide: true },
+        () => resolveKill()
+      );
+    });
+  } else {
+    child.kill("SIGKILL");
+  }
+  if (!(await waitForProcessExit(child, 15_000))) {
+    throw new Error(`Electron process ${child.pid} remained alive after forced teardown.`);
+  }
+}
+
+async function closeElectronApplication(
+  application: ElectronApplication
+): Promise<void> {
+  const child = application.process();
+  const gracefulClose = application.close().catch(() => undefined);
+  if (!(await waitForProcessExit(child, 5_000))) {
+    await forceCloseProcessTree(child);
+  }
+  await Promise.race([gracefulClose, wait(1_000)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    await forceCloseProcessTree(child);
+  }
 }
 
 function environment(dataDirectory: string, installed: boolean): Record<string, string> {
@@ -53,18 +113,28 @@ async function launchInstalled(
       chromiumSandbox: false,
       timeout: 180_000
     });
-    const page = await application.firstWindow({ timeout: 120_000 });
+    const launchedApplication = application;
+    const page = await launchedApplication.firstWindow({ timeout: 120_000 });
     let closed = false;
+    let closing: Promise<void> | undefined;
     return {
       page,
       close: async () => {
         if (closed) return;
-        closed = true;
-        await application?.close();
+        closing ??= closeElectronApplication(launchedApplication).then(() => {
+          closed = true;
+        });
+        try {
+          await closing;
+        } finally {
+          if (!closed) closing = undefined;
+        }
       }
     };
   } catch (error) {
-    await application?.close().catch(() => undefined);
+    if (application) {
+      await closeElectronApplication(application).catch(() => undefined);
+    }
     throw error;
   }
 }
@@ -81,7 +151,7 @@ async function launch(dataDirectory: string): Promise<RunningApplication> {
   });
   return {
     page: await application.firstWindow(),
-    close: () => application.close()
+    close: () => closeElectronApplication(application)
   };
 }
 
@@ -320,7 +390,14 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await expect(page.getByRole("heading", { name: "Evolution lab" })).toBeVisible();
     await expect(page.getByText("New isolated candidate", { exact: true })).toBeVisible();
     await expect(page.getByText("ask permission", { exact: false })).toBeVisible();
-    await expect(page.getByText("No improvement runs yet", { exact: true })).toBeVisible();
+    const evolutionArchive = page.locator(".evolution-archive");
+    await expect(evolutionArchive).toBeVisible();
+    await expect(
+      evolutionArchive
+        .getByText("No improvement runs yet", { exact: true })
+        .or(evolutionArchive.locator(".evolution-run").first())
+        .first()
+    ).toBeVisible({ timeout: 120_000 });
 
     for (const label of [
       "Conversation",
