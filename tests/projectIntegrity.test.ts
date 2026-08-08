@@ -332,7 +332,11 @@ describe("project integrity", () => {
     expect(linux).toContain("runner: ubuntu-24.04");
     expect(linux).toContain("runner: ubuntu-24.04-arm");
     expect(linux).toContain("package:linux:${{ matrix.arch }}");
-    expect(read("scripts/smoke-posix-package.mjs")).toContain("xvfb-run");
+    const posixSmoke = read("scripts/smoke-posix-package.mjs");
+    expect(posixSmoke).toContain("xvfb-run");
+    expect(posixSmoke).toContain('rm(debRoot, { recursive: true, force: true })');
+    expect(posixSmoke).toContain('rm(appImageRoot, { recursive: true, force: true })');
+    expect(posixSmoke).toContain("Desktop smoke resources:");
     expect(release).toContain('tags: ["v*.*.*"]');
     expect(release).toContain("git merge-base --is-ancestor HEAD origin/main");
     expect(release).toContain("verify-release-artifacts.mjs");

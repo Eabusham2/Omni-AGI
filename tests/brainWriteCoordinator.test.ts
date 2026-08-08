@@ -193,7 +193,7 @@ describe("per-brain writer coordination", () => {
     const firstStarted = deferred();
     const releaseFirst = deferred();
     let chatCalls = 0;
-    const tryRequestStream = vi.fn(
+    const requestStream = vi.fn(
       async (_method: string, params: Record<string, unknown>) => {
         chatCalls += 1;
         if (chatCalls === 1) {
@@ -210,8 +210,8 @@ describe("per-brain writer coordination", () => {
     const service = new BrainService(
       repository,
       {
-        tryRequest: vi.fn(async () => ({})),
-        tryRequestStream
+        request: vi.fn(async () => ({})),
+        requestStream
       } as unknown as EngineSupervisor
     );
 
@@ -219,7 +219,7 @@ describe("per-brain writer coordination", () => {
     await firstStarted.promise;
     const second = service.chat(brain.id, "second turn");
     await eventLoopTurn();
-    expect(tryRequestStream).toHaveBeenCalledTimes(1);
+    expect(requestStream).toHaveBeenCalledTimes(1);
 
     releaseFirst.resolve();
     await Promise.all([first, second]);
@@ -243,8 +243,8 @@ describe("per-brain writer coordination", () => {
     const service = new BrainService(
       repository,
       {
-        tryRequest: vi.fn(async () => ({})),
-        tryRequestStream: vi.fn(async () => {
+        request: vi.fn(async () => ({})),
+        requestStream: vi.fn(async () => {
           chatStarted.resolve();
           await releaseChat.promise;
           return { text: "permission-safe response", trace: { id: "permission-trace" } };
@@ -277,6 +277,48 @@ describe("per-brain writer coordination", () => {
     expect(
       saved.toolPermissions?.find((record) => record.toolId === "windows.files")?.level
     ).toBe("off");
+  });
+
+  it("preserves a neural chat failure and never commits a phantom turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-brain-writer-chat-error-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Exact failure" });
+    const service = new BrainService(
+      repository,
+      {
+        request: vi.fn(async () => ({})),
+        requestStream: vi.fn(async () => {
+          throw new Error("sentinel neural failure");
+        })
+      } as unknown as EngineSupervisor
+    );
+
+    await expect(service.chat(brain.id, "do not hide this error")).rejects.toThrow(
+      "sentinel neural failure"
+    );
+    expect((await repository.get(brain.id)).messages).toEqual([]);
+  });
+
+  it("distinguishes an empty neural response from an unavailable worker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-brain-writer-empty-chat-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Empty response" });
+    const service = new BrainService(
+      repository,
+      {
+        request: vi.fn(async () => ({})),
+        requestStream: vi.fn(async () => ({ text: "" }))
+      } as unknown as EngineSupervisor
+    );
+
+    await expect(service.chat(brain.id, "return something")).rejects.toThrow(
+      "OmniCortex returned an empty neural response."
+    );
+    expect((await repository.get(brain.id)).messages).toEqual([]);
   });
 
   it("shares the repository queue with ToolExecutor audit commits", async () => {

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, readdir, rm, stat, statfs, writeFile } from "node:fs/promises";
+import { freemem, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { releaseArtifactName } from "./release-artifact-names.mjs";
 
@@ -324,6 +324,22 @@ if (platform === "mac") {
       );
     }
   }
+  // All three distributable formats are now structurally verified. Keep the
+  // portable payload used by desktop E2E, but release the other full Torch
+  // runtime copies before neural chat performs online learning and atomic
+  // checkpoint writes on a resource-constrained hosted runner.
+  await Promise.all([
+    rm(debRoot, { recursive: true, force: true }),
+    rm(appImageRoot, { recursive: true, force: true }),
+    rm(resolve("engine-dist"), { recursive: true, force: true }),
+    rm(
+      join(
+        releaseRoot,
+        arch === "arm64" ? "linux-arm64-unpacked" : "linux-unpacked"
+      ),
+      { recursive: true, force: true }
+    )
+  ]);
   formatValidation["tar.gz"] = { extracted: true };
   formatValidation.deb = {
     extracted: true,
@@ -349,6 +365,16 @@ if (workerEvidence.operatingSystem !== expectedPlatform) {
     `Archived worker reported ${String(workerEvidence.operatingSystem)} instead of ${expectedPlatform}.`
   );
 }
+await rm(join(scratch, "brain"), { recursive: true, force: true });
+
+const filesystem = await statfs(scratch);
+const resourcesBeforeDesktop = {
+  availableMemoryBytes: freemem(),
+  diskFreeBytes: filesystem.bavail * filesystem.bsize
+};
+process.stdout.write(
+  `Desktop smoke resources: ${JSON.stringify(resourcesBeforeDesktop)}\n`
+);
 
 if (desktopE2e) {
   const environment = {
@@ -386,6 +412,7 @@ const evidence = {
   desktopExecutable: relative(payloadRoot, desktopExecutable),
   workerSmoke: workerEvidence,
   desktopEndToEnd: desktopE2e,
+  resourcesBeforeDesktop,
   formatValidation,
   signing
 };

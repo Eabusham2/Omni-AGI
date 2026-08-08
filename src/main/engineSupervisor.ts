@@ -280,12 +280,13 @@ export class EngineSupervisor extends EventEmitter {
       this.pending.delete(record.id);
       pending.cleanup();
       if (record.error) {
+        const message =
+          typeof record.error.message === "string"
+            ? record.error.message
+            : "The Python worker returned an error.";
+        const stderr = this.recentStderr.filter(Boolean).join("\n").slice(-8_000);
         pending.reject(
-          new Error(
-            typeof record.error.message === "string"
-              ? record.error.message
-              : "The Python worker returned an error."
-          )
+          new Error(stderr ? `${message}\nWorker stderr:\n${stderr}` : message)
         );
       } else {
         pending.resolve(record.result);
@@ -512,8 +513,10 @@ export class EngineSupervisor extends EventEmitter {
 
   private handleExit(child: ChildProcessWithoutNullStreams, detail: string): void {
     if (this.child !== child) return;
-    this.lastError = detail;
-    const error = new Error(detail);
+    const stderr = this.recentStderr.filter(Boolean).join("\n").slice(-8_000);
+    const diagnostic = stderr ? `${detail}\nWorker stderr:\n${stderr}` : detail;
+    this.lastError = diagnostic;
+    const error = new Error(diagnostic);
     for (const request of this.pending.values()) {
       request.cleanup();
       request.reject(error);

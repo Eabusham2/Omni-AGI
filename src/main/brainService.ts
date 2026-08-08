@@ -1485,7 +1485,7 @@ export class BrainService {
     const brain = await this.repository.get(id);
     const message = cleanMessage(input);
     const toolSchemas = enabledToolSchemas(brain);
-    await this.engine.tryRequest(
+    await this.engine.request(
       "load",
       {
         brainId: id,
@@ -1496,7 +1496,7 @@ export class BrainService {
       signal
     );
     signal?.throwIfAborted();
-    const workerResult = await this.engine.tryRequestStream<WorkerChatResult>(
+    const workerResult = await this.engine.requestStream<WorkerChatResult>(
       "chat",
       {
         brainId: id,
@@ -1519,9 +1519,7 @@ export class BrainService {
     signal?.throwIfAborted();
     const generated = workerText(workerResult);
     if (!generated) {
-      throw new Error(
-        "The OmniCortex neural worker is unavailable; stable v1 will not substitute a separate Electron memory model."
-      );
+      throw new Error("OmniCortex returned an empty neural response.");
     }
     const result = recordNeuralChat(brain, message, generated);
     if (generated) {
