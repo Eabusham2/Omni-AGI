@@ -340,6 +340,10 @@ describe("project integrity", () => {
     expect(release).toContain('tags: ["v*.*.*"]');
     expect(release).toContain("git merge-base --is-ancestor HEAD origin/main");
     expect(release).toContain("verify-release-artifacts.mjs");
+    expect(release).toContain("Canonicalize public names");
+    expect(release).toContain(
+      "(cd artifacts && sha256sum --check SHA256SUMS.txt)"
+    );
     expect(release).toContain("OMNI_RELEASE_CSC_LINK");
     expect(release).toContain(
       'if [[ -n "${OMNI_RELEASE_CSC_LINK:-}" ]]; then export CSC_LINK='
@@ -352,6 +356,9 @@ describe("project integrity", () => {
     );
     expect(read("scripts/verify-release-artifacts.mjs")).toContain(
       "SHA256SUMS.txt"
+    );
+    expect(read("scripts/verify-release-artifacts.mjs")).toContain(
+      "publicReleaseAssetName"
     );
     expect(read("scripts/build-engine-posix.sh")).toContain(
       "--collect-all torch"

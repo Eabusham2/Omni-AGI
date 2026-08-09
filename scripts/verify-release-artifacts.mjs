@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { releaseArtifactName } from "./release-artifact-names.mjs";
+import {
+  publicReleaseAssetName,
+  releaseArtifactName
+} from "./release-artifact-names.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
@@ -64,18 +67,40 @@ function requiredNames(product, version) {
 async function validateRecordedArtifact(record, expectedName, files, label) {
   requireValue(record && typeof record === "object", `${label} is missing.`);
   requireValue(record.name === expectedName, `${label} names ${String(record.name)}, not ${expectedName}.`);
-  const path = files.get(expectedName);
-  requireValue(path, `${expectedName} is absent from the release set.`);
+  const publicName = publicReleaseAssetName(expectedName);
+  const path = files.get(publicName);
+  requireValue(path, `${publicName} is absent from the release set.`);
   const metadata = await stat(path);
   const actualHash = await sha256(path);
   requireValue(
     typeof record.sha256 === "string" && record.sha256.toLowerCase() === actualHash,
-    `${label} hash does not match ${expectedName}.`
+    `${label} hash does not match ${publicName}.`
   );
   if (record.bytes !== undefined) {
-    requireValue(record.bytes === metadata.size, `${label} size does not match ${expectedName}.`);
+    requireValue(record.bytes === metadata.size, `${label} size does not match ${publicName}.`);
   }
-  return { name: expectedName, bytes: metadata.size, sha256: actualHash };
+  return { name: publicName, bytes: metadata.size, sha256: actualHash };
+}
+
+async function canonicalizeReleaseAssetNames(directory, packagedNames, entries) {
+  const existing = new Set(entries.map((entry) => entry.name));
+  const renames = packagedNames
+    .map((packagedName) => ({
+      packagedName,
+      publicName: publicReleaseAssetName(packagedName)
+    }))
+    .filter(({ packagedName, publicName }) => packagedName !== publicName);
+
+  for (const { packagedName, publicName } of renames) {
+    requireValue(
+      !(existing.has(packagedName) && existing.has(publicName)),
+      `Release directory contains both packaged and public names: ${packagedName}, ${publicName}.`
+    );
+  }
+  for (const { packagedName, publicName } of renames) {
+    if (!existing.has(packagedName)) continue;
+    await rename(join(directory, packagedName), join(directory, publicName));
+  }
 }
 
 function validateWorkerSmoke(smoke, label) {
@@ -93,16 +118,19 @@ const directory = resolve(option("--directory") ?? "artifacts");
 const packageDocument = JSON.parse(await readFile("package.json", "utf8"));
 const product = packageDocument.build.productName;
 const version = packageDocument.version;
-const expected = requiredNames(product, version);
+const packagedExpected = requiredNames(product, version);
+const expected = packagedExpected.map((name) => publicReleaseAssetName(name));
 const generatedMetadata = new Set(["SHA256SUMS.txt", "RELEASE-MANIFEST.json"]);
 const allowed = new Set([...expected, ...generatedMetadata]);
 
-const entries = await readdir(directory, { withFileTypes: true });
-const nonFiles = entries.filter((entry) => !entry.isFile()).map((entry) => entry.name);
+const packagedEntries = await readdir(directory, { withFileTypes: true });
+const nonFiles = packagedEntries.filter((entry) => !entry.isFile()).map((entry) => entry.name);
 requireValue(
   nonFiles.length === 0,
   `Release directory contains non-file entries: ${nonFiles.join(", ")}.`
 );
+await canonicalizeReleaseAssetNames(directory, packagedExpected, packagedEntries);
+const entries = await readdir(directory, { withFileTypes: true });
 const unexpected = entries
   .filter((entry) => !allowed.has(entry.name))
   .map((entry) => entry.name)

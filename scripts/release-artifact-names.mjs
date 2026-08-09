@@ -34,3 +34,16 @@ export function releaseArtifactName({
   );
   return `${product}-${version}-${platformLabel}-${artifactArchitecture}.${extension}`;
 }
+
+/**
+ * GitHub release assets do not preserve spaces in uploaded file names. Produce
+ * the exact public name before checksums are written so downloaded files and
+ * SHA256SUMS.txt always refer to the same path.
+ */
+export function publicReleaseAssetName(name) {
+  const publicName = name.replace(/\s+/gu, ".");
+  if (!/^[A-Za-z0-9._-]+$/u.test(publicName)) {
+    throw new Error(`Release asset name contains unsupported characters: ${name}.`);
+  }
+  return publicName;
+}

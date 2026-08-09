@@ -284,8 +284,10 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Verify release set and write checksums
-        run: node scripts/verify-release-artifacts.mjs --directory artifacts
+      - name: Canonicalize public names, verify release set, and write checksums
+        run: |
+          node scripts/verify-release-artifacts.mjs --directory artifacts
+          (cd artifacts && sha256sum --check SHA256SUMS.txt)
 
       - name: Publish immutable GitHub release assets
         env:

@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +20,10 @@ const packageDocument = JSON.parse(
   build: { productName: string };
 };
 const temporaryDirectories: string[] = [];
+
+function publicName(name: string): string {
+  return name.replace(/\s+/gu, ".");
+}
 
 function linuxArtifactArchitecture(
   architecture: "x64" | "arm64",
@@ -177,12 +188,52 @@ describe("stable release artifact gate", () => {
     expect(verify(directory)).toContain("Verified 20 release files");
     const manifest = JSON.parse(
       readFileSync(join(directory, "RELEASE-MANIFEST.json"), "utf8")
-    ) as { artifactCount: number; platformStatus: Record<string, unknown> };
+    ) as {
+      artifactCount: number;
+      artifacts: Array<{ name: string }>;
+      platformStatus: Record<string, unknown>;
+    };
     expect(manifest.artifactCount).toBe(20);
     expect(manifest.platformStatus).toHaveProperty("windows.arm64.workerArchitecture", "x64");
-    expect(readFileSync(join(directory, "SHA256SUMS.txt"), "utf8").trim().split("\n")).toHaveLength(
-      20
+    expect(manifest.artifacts.map((artifact) => artifact.name)).not.toEqual(
+      expect.arrayContaining([expect.stringContaining(" ")])
     );
+    const checksums = readFileSync(join(directory, "SHA256SUMS.txt"), "utf8")
+      .trim()
+      .split("\n");
+    expect(checksums).toHaveLength(20);
+    const checksumNames = checksums.map((line) => line.replace(/^[a-f0-9]{64}  /u, ""));
+    expect(checksumNames).toEqual(manifest.artifacts.map((artifact) => artifact.name));
+    expect(checksumNames.every((name) => !name.includes(" "))).toBe(true);
+    for (const [index, name] of checksumNames.entries()) {
+      expect(hash(readFileSync(join(directory, name)))).toBe(checksums[index]?.slice(0, 64));
+    }
+    expect(verify(directory)).toContain("Verified 20 release files");
+    expect(
+      existsSync(
+        join(
+          directory,
+          publicName(
+            `${packageDocument.build.productName}-${packageDocument.version}-Windows-x64.exe`
+          )
+        )
+      )
+    ).toBe(true);
+    expect(
+      existsSync(
+        join(
+          directory,
+          `${packageDocument.build.productName}-${packageDocument.version}-Windows-x64.exe`
+        )
+      )
+    ).toBe(false);
+  });
+
+  it("rejects a packaged/public filename collision before writing metadata", () => {
+    const directory = writeReleaseFixture();
+    const packaged = `${packageDocument.build.productName}-${packageDocument.version}-Windows-x64.exe`;
+    copyFileSync(join(directory, packaged), join(directory, publicName(packaged)));
+    expect(() => verify(directory)).toThrow(/both packaged and public names/);
   });
 
   it("rejects an extra file that the publisher would otherwise upload", () => {

@@ -17,6 +17,11 @@ AppImage, `amd64` for DEB, and `x64` for tar.gz. The package smoke, upload
 patterns, and release verifier share one naming helper so these are not
 mistaken for missing artifacts.
 
+The final publish gate replaces spaces in package filenames with periods before
+writing release metadata or uploading assets. This matches GitHub's public
+asset-name rules, so every entry in `SHA256SUMS.txt` and
+`RELEASE-MANIFEST.json` is the exact downloadable filename.
+
 Each native-host job runs the Python and Node suites, builds the Electron
 application and PyInstaller brain worker, verifies their machine
 architectures, creates and reloads a safe-tensor/SQLite brain through the
