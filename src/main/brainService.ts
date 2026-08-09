@@ -17,6 +17,7 @@ import {
 import { isIP } from "node:net";
 import { availableParallelism } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import { EventEmitter } from "node:events";
 import { getHeapStatistics } from "node:v8";
 import type {
@@ -912,8 +913,8 @@ class DomainRequestScheduler {
     await predecessor;
     try {
       const waitUntil = Math.max(state.nextRequestAt, state.backoffUntil);
-      await abortableDelay(Math.max(0, waitUntil - Date.now()), signal);
-      state.nextRequestAt = Date.now() + this.minimumDelay;
+      await abortableDelay(Math.max(0, waitUntil - performance.now()), signal);
+      state.nextRequestAt = performance.now() + this.minimumDelay;
     } finally {
       release();
     }
@@ -935,7 +936,7 @@ class DomainRequestScheduler {
         delay = this.baseBackoff * 2 ** Math.min(6, state.failures - 1);
       }
       state.backoffUntil =
-        Date.now() + Math.min(60_000, Math.max(this.minimumDelay, delay));
+        performance.now() + Math.min(60_000, Math.max(this.minimumDelay, delay));
       return;
     }
     if (response.status < 500) {

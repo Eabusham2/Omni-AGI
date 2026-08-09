@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises"
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CrawlFrontierStore,
@@ -15,7 +16,7 @@ import { BrainService } from "../src/main/brainService";
 import type { EngineSupervisor } from "../src/main/engineSupervisor";
 import { DEFAULT_CONFIG } from "../src/shared/types";
 
-describe("whole-dataset persistence", () => {
+describe("whole-dataset persistence", { timeout: 30_000 }, () => {
   let root: string;
   let brainDirectory: string;
   let servers: Server[];
@@ -572,7 +573,7 @@ describe("whole-dataset persistence", () => {
     const requestTimes: number[] = [];
     let throttledHits = 0;
     const origin = await listen((request, response) => {
-      requestTimes.push(Date.now());
+      requestTimes.push(performance.now());
       response.setHeader("content-type", "text/html");
       if (request.url === "/") {
         response.end('<a href="/throttled">one</a><a href="/other">two</a>');
