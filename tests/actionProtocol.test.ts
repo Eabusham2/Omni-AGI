@@ -6,6 +6,7 @@ import {
 import { ChatActionController } from "../src/main/chatActionController";
 import type {
   ChatResult,
+  ChatStreamEvent,
   EvolutionRun,
   RuntimeJob,
   ToolExecutionResult
@@ -114,7 +115,11 @@ describe("structured chat actions", () => {
     const evolution = { start: vi.fn() };
     const controller = new ChatActionController(service, tools, evolution);
     const streamed: string[] = [];
-    controller.on("event", (event) => streamed.push(event.state));
+    const globalEvents: string[] = [];
+    controller.on("event", (event) => globalEvents.push(event.state));
+    controller.on("stream", (event) => {
+      if (event.type === "chat-action") streamed.push(event.actionEvent.state);
+    });
 
     const result = await controller.send("brain-1", "Generate an image of an emergent city");
 
@@ -137,6 +142,7 @@ describe("structured chat actions", () => {
       expect.objectContaining({ state: "complete", execution })
     ]);
     expect(streamed).toEqual(["proposed", "running", "complete"]);
+    expect(globalEvents).toEqual([]);
   });
 
   it("settles repeated imagination intent when only transient assemblies change", async () => {
@@ -319,15 +325,19 @@ describe("structured chat actions", () => {
       progress?: number;
       label?: string;
     }> = [];
-    controller.on("event", (event) =>
-      streamed.push({
-        state: event.state,
-        progress: event.progress,
-        label: event.statusLabel
-      })
-    );
-    const turnStream: string[] = [];
-    controller.on("stream", (event) => turnStream.push(event.type));
+    const globalEvents: unknown[] = [];
+    controller.on("event", (event) => globalEvents.push(event));
+    const turnStream: ChatStreamEvent[] = [];
+    controller.on("stream", (event) => {
+      turnStream.push(event);
+      if (event.type === "chat-action") {
+        streamed.push({
+          state: event.actionEvent.state,
+          progress: event.actionEvent.progress,
+          label: event.actionEvent.statusLabel
+        });
+      }
+    });
 
     const pending = controller.send(
       "brain-story",
@@ -335,10 +345,12 @@ describe("structured chat actions", () => {
       undefined,
       "turn-story"
     );
-    await vi.waitFor(() => expect(turnStream).toContain("modality-preview"));
+    await vi.waitFor(() =>
+      expect(turnStream.some((event) => event.type === "modality-preview")).toBe(true)
+    );
     expect(calls).toBe(1);
     expect(tools.execute).not.toHaveBeenCalled();
-    expect(turnStream.slice(0, 3)).toEqual([
+    expect(turnStream.slice(0, 3).map((event) => event.type)).toEqual([
       "chat-state",
       "chat-token",
       "chat-action"
@@ -356,6 +368,15 @@ describe("structured chat actions", () => {
       { state: "running", progress: 0.9, label: "Refreshing the live preview" },
       { state: "complete", progress: 0.9, label: "Refreshing the live preview" }
     ]);
+    expect(globalEvents).toEqual([]);
+    const serializedTurnStream = JSON.stringify(turnStream);
+    expect(serializedTurnStream.match(/c2Vjb25k/g)).toHaveLength(1);
+    expect(serializedTurnStream.match(/Zmlyc3Q=/g)).toHaveLength(1);
+    for (const event of turnStream) {
+      if (event.type !== "chat-action") continue;
+      expect(event.actionEvent.preview).toBeUndefined();
+      expect(event.actionEvent.execution?.output).toBeUndefined();
+    }
     expect(result.actionEvents?.[0]).toMatchObject({
       state: "complete",
       runtimeJobId: "video-job",
@@ -436,7 +457,9 @@ describe("structured chat actions", () => {
     };
     const controller = new ChatActionController(service, tools, { start: vi.fn() });
     const states: string[] = [];
-    controller.on("event", (event) => states.push(event.state));
+    controller.on("stream", (event) => {
+      if (event.type === "chat-action") states.push(event.actionEvent.state);
+    });
 
     const pending = controller.send(
       "brain-persistence",

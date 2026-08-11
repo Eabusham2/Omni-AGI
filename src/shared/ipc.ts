@@ -6,7 +6,8 @@ export const IPC = {
     isMaximized: "omni:window:is-maximized",
     openExternal: "omni:window:open-external",
     revealDataFolder: "omni:window:reveal-data-folder",
-    platform: "omni:window:platform"
+    platform: "omni:window:platform",
+    setAppearance: "omni:window:set-appearance"
   },
   brain: {
     list: "omni:brain:list",

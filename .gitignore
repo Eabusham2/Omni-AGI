@@ -6,6 +6,7 @@ coverage/
 test-results/
 playwright-report/
 .runtime/
+.venv/
 .engine-build/
 engine-dist/
 __pycache__/

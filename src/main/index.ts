@@ -1,6 +1,6 @@
 import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, dialog, session } from "electron";
+import { app, BrowserWindow, dialog, nativeTheme, session } from "electron";
 import { IPC } from "../shared/ipc";
 import { BrainRepository, resolveBrainDataRoot } from "./brainRepository";
 import { BrainService, RuntimeJobManager } from "./brainService";
@@ -174,22 +174,28 @@ async function reviewManagedBetaBrains(repository: BrainRepository): Promise<voi
 }
 
 async function createWindow(): Promise<BrowserWindow> {
+  const nativeDark = nativeTheme.shouldUseDarkColors;
+  const nativeBackground = nativeDark ? "#08080d" : "#f4f3f0";
+  const nativeSymbols = nativeDark ? "#f5f3fa" : "#1d1c23";
   const window = new BrowserWindow({
     width: 1480,
     height: 940,
-    minWidth: 1040,
-    minHeight: 700,
+    // Keep the desktop host usable on compact Windows tablets, split-screen
+    // layouts, and mobile-sized development shells. Responsive renderer
+    // navigation remains reachable down to this supported floor.
+    minWidth: 360,
+    minHeight: 480,
     show: false,
     title: "Omni AGI Studio",
-    backgroundColor: "#0b1018",
+    backgroundColor: nativeBackground,
     autoHideMenuBar: true,
     ...(process.platform === "win32"
       ? {
           backgroundMaterial: "mica" as const,
           titleBarStyle: "hidden" as const,
           titleBarOverlay: {
-            color: "#0b1018",
-            symbolColor: "#e8edf7",
+            color: nativeBackground,
+            symbolColor: nativeSymbols,
             height: 46
           }
         }
@@ -256,8 +262,9 @@ async function bootstrap(): Promise<void> {
   const evolution = new EvolutionController(repository, tools, engine);
   const actions = new ChatActionController(service, tools, evolution);
   idleCognition = new IdleCognitionScheduler(repository, actions, {
-    intervalMs: 60_000,
-    minimumIdleSeconds: 45,
+    intervalMs: 12_000,
+    minimumIdleSeconds: 6,
+    maxDutyCycle: 0.12,
     onError: (error) => console.error("Idle cognition cycle failed:", error)
   });
   disposeIpc = registerIpcHandlers({

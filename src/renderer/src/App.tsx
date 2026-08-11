@@ -1,6 +1,7 @@
 import {
   Fragment,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -27,6 +28,10 @@ import {
   type ToolPermissionRecord,
   type AgentMergePreview,
   type ActionEvent,
+  type AppearanceLayout,
+  type AppearanceMode,
+  type AppearancePalette,
+  type AppearancePreferences,
   type SubstratePage,
   type WorkspaceSnapshot
 } from "@shared/types";
@@ -37,6 +42,25 @@ import {
 import { demoSummaries, makeDemoBrain, makeDemoChat } from "./demo";
 import { EvolutionWorkspace } from "./EvolutionWorkspace";
 import { Icon, type IconName } from "./icons";
+import {
+  createTextFrameBatcher,
+  mergeChatActionEvent,
+  patchChatActionPreview,
+  type TextFrameBatcher
+} from "./chatStreaming";
+import {
+  APPEARANCE_LAYOUTS,
+  APPEARANCE_MODES,
+  APPEARANCE_PACKS,
+  APPEARANCE_PALETTES,
+  DEFAULT_APPEARANCE,
+  activeAppearancePack,
+  applyAppearanceAttributes,
+  loadAppearancePreferences,
+  preferencesForPack,
+  resolveColorScheme,
+  saveAppearancePreferences
+} from "./appearance";
 
 type AppPage = "library" | "build" | "workspace";
 type WorkspaceView =
@@ -221,16 +245,183 @@ function BrandMark({ size = 30 }: { size?: number }) {
   );
 }
 
+const appearanceModeLabels: Record<AppearanceMode, string> = {
+  system: "Auto",
+  light: "Light",
+  dark: "Dark"
+};
+
+const appearancePaletteLabels: Record<AppearancePalette, string> = {
+  violet: "Violet",
+  graphite: "Graphite",
+  spectrum: "Spectrum",
+  aqua: "Aqua"
+};
+
+const appearanceLayoutLabels: Record<AppearanceLayout, string> = {
+  standard: "Standard",
+  classic: "Blocky",
+  expressive: "Expressive",
+  glass: "Glass"
+};
+
+function AppearanceMenu({
+  preferences,
+  resolvedColorScheme,
+  onChange
+}: {
+  preferences: AppearancePreferences;
+  resolvedColorScheme: "light" | "dark";
+  onChange: (preferences: AppearancePreferences) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const container = useRef<HTMLDivElement>(null);
+  const activePack = activeAppearancePack(preferences);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnPointer = (event: globalThis.PointerEvent): void => {
+      if (!container.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        container.current?.querySelector<HTMLButtonElement>(".appearance-trigger")?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", closeOnPointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  return (
+    <div className="appearance-control" ref={container}>
+      <button
+        className="appearance-trigger"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-label="Appearance settings"
+        title="Appearance settings"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <Icon name="settings" size={14} />
+        <span>Appearance</span>
+        <i className="appearance-trigger__swatch" aria-hidden="true" />
+      </button>
+      {open ? (
+        <section className="appearance-panel" role="dialog" aria-label="Appearance settings">
+          <header>
+            <span>
+              <strong>Appearance</strong>
+              <small>Color and layout stay separate from every brain.</small>
+            </span>
+            <button
+              className="icon-button"
+              aria-label="Close appearance settings"
+              onClick={() => setOpen(false)}
+            >
+              <Icon name="close" size={14} />
+            </button>
+          </header>
+
+          <fieldset className="appearance-fieldset">
+            <legend>Mode</legend>
+            <div className="appearance-segments">
+              {APPEARANCE_MODES.map((mode) => (
+                <button
+                  key={mode}
+                  aria-pressed={preferences.mode === mode}
+                  className={preferences.mode === mode ? "is-active" : ""}
+                  onClick={() => onChange({ ...preferences, mode })}
+                >
+                  {appearanceModeLabels[mode]}
+                </button>
+              ))}
+            </div>
+            <small>
+              {preferences.mode === "system"
+                ? `Following the OS · currently ${resolvedColorScheme}`
+                : `Pinned to ${resolvedColorScheme}`}
+            </small>
+          </fieldset>
+
+          <fieldset className="appearance-fieldset">
+            <legend>Quick packs</legend>
+            <div className="appearance-packs">
+              {APPEARANCE_PACKS.map((pack) => (
+                <button
+                  key={pack.id}
+                  className={activePack === pack.id ? "is-active" : ""}
+                  aria-label={pack.name}
+                  aria-pressed={activePack === pack.id}
+                  onClick={() => onChange(preferencesForPack(preferences, pack.id))}
+                >
+                  <i data-pack-preview={pack.id} aria-hidden="true" />
+                  <span><strong>{pack.name}</strong><small>{pack.description}</small></span>
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <div className="appearance-independent">
+            <fieldset className="appearance-fieldset">
+              <legend>Palette</legend>
+              <div className="appearance-options appearance-options--palette">
+                {APPEARANCE_PALETTES.map((palette) => (
+                  <button
+                    key={palette}
+                    aria-label={`${appearancePaletteLabels[palette]} palette`}
+                    aria-pressed={preferences.palette === palette}
+                    className={preferences.palette === palette ? "is-active" : ""}
+                    onClick={() => onChange({ ...preferences, palette })}
+                  >
+                    <i data-palette-preview={palette} aria-hidden="true" />
+                    <span>{appearancePaletteLabels[palette]}</span>
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+            <fieldset className="appearance-fieldset">
+              <legend>Layout</legend>
+              <div className="appearance-options">
+                {APPEARANCE_LAYOUTS.map((layout) => (
+                  <button
+                    key={layout}
+                    aria-pressed={preferences.layout === layout}
+                    className={preferences.layout === layout ? "is-active" : ""}
+                    onClick={() => onChange({ ...preferences, layout })}
+                  >
+                    {appearanceLayoutLabels[layout]}
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
 function Titlebar({
   page,
   brain,
   demo,
-  onLibrary
+  onLibrary,
+  appearance,
+  resolvedColorScheme,
+  onAppearanceChange
 }: {
   page: AppPage;
   brain: BrainDocument | null;
   demo: boolean;
   onLibrary: () => void;
+  appearance: AppearancePreferences;
+  resolvedColorScheme: "light" | "dark";
+  onAppearanceChange: (preferences: AppearancePreferences) => void;
 }) {
   return (
     <header className="titlebar">
@@ -255,6 +446,11 @@ function Titlebar({
           <span>{demo ? "Design preview" : "Local engine"}</span>
           <span className="titlebar__status-detail">{demo ? "No engine connected" : "Private"}</span>
         </div>
+        <AppearanceMenu
+          preferences={appearance}
+          resolvedColorScheme={resolvedColorScheme}
+          onChange={onAppearanceChange}
+        />
       </div>
     </header>
   );
@@ -1100,6 +1296,7 @@ function WorkspaceShell({
   onToast: (message: string) => void;
 }) {
   const [health, setHealth] = useState("Adaptive core ready");
+  const [compactInspectorOpen, setCompactInspectorOpen] = useState(false);
   const toggleLearning = async () => {
     const nextConfig = { ...brain.config, onlineLearning: !brain.config.onlineLearning };
     try {
@@ -1132,6 +1329,19 @@ function WorkspaceShell({
       active = false;
     };
   }, [brain.id]);
+
+  useEffect(() => {
+    if (view !== "chat") setCompactInspectorOpen(false);
+  }, [view]);
+
+  useEffect(() => {
+    if (!compactInspectorOpen) return;
+    const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === "Escape") setCompactInspectorOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [compactInspectorOpen]);
 
   return (
     <main className="workspace">
@@ -1167,7 +1377,12 @@ function WorkspaceShell({
           </button>
         </div>
       </aside>
-      <section className="workspace-body">
+      <section
+        className={cx(
+          "workspace-body",
+          compactInspectorOpen && "workspace-body--inspector-open"
+        )}
+      >
         <header className="workspace-header">
           <div className="workspace-header__identity">
             <span className="workspace-header__view">{navItems.find((item) => item.id === view)?.label}</span>
@@ -1189,6 +1404,18 @@ function WorkspaceShell({
             </span>
           </div>
           <div className="workspace-header__actions">
+            {view === "chat" ? (
+              <button
+                className="icon-button workspace-inspector-toggle"
+                aria-controls="chat-cortex-panel"
+                aria-expanded={compactInspectorOpen}
+                aria-label={compactInspectorOpen ? "Close cortex inspector" : "Open cortex inspector"}
+                title={compactInspectorOpen ? "Close cortex inspector" : "Open live cortex and runtime card"}
+                onClick={() => setCompactInspectorOpen((open) => !open)}
+              >
+                <Icon name={compactInspectorOpen ? "close" : "brain"} size={16} />
+              </button>
+            ) : null}
             <button
               className="workspace-duplicate"
               aria-label={`Duplicate ${brain.name}`}
@@ -1207,9 +1434,20 @@ function WorkspaceShell({
             </button>
           </div>
         </header>
-        {view === "chat" ? (
-          <ChatWorkspace brain={brain} onBrainChange={onBrainChange} onToast={onToast} onNavigate={onView} />
-        ) : view === "data" ? (
+        <button
+          className="workspace-inspector-backdrop"
+          aria-label="Close cortex inspector"
+          tabIndex={compactInspectorOpen ? 0 : -1}
+          onClick={() => setCompactInspectorOpen(false)}
+        />
+        <ChatWorkspace
+          brain={brain}
+          hidden={view !== "chat"}
+          onBrainChange={onBrainChange}
+          onToast={onToast}
+          onNavigate={onView}
+        />
+        {view === "chat" ? null : view === "data" ? (
           <DataWorkspace brain={brain} onBrainChange={onBrainChange} onToast={onToast} />
         ) : view === "map" ? (
           <BrainMapWorkspace brain={brain} />
@@ -1410,11 +1648,13 @@ function AttachmentLearningCard({
 
 function ChatWorkspace({
   brain,
+  hidden,
   onBrainChange,
   onToast,
   onNavigate
 }: {
   brain: BrainDocument;
+  hidden?: boolean;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
   onNavigate: (view: WorkspaceView) => void;
@@ -1432,11 +1672,13 @@ function ChatWorkspace({
   const [actionEvents, setActionEvents] = useState<ActionEvent[]>([]);
   const [partialText, setPartialText] = useState("");
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [optimisticHumans, setOptimisticHumans] = useState<ChatMessage[]>([]);
   const [workspaceSnapshot, setWorkspaceSnapshot] = useState<WorkspaceSnapshot | null>(null);
   const [inspectorTab, setInspectorTab] = useState<"state" | "runtime">("state");
   const messagesEnd = useRef<HTMLDivElement>(null);
   const activeTurnIdRef = useRef<string | null>(null);
   const streamSequenceRef = useRef(new Map<string, number>());
+  const tokenBatcherRef = useRef<TextFrameBatcher | null>(null);
   const cancelRequestedRef = useRef(false);
 
   useEffect(() => {
@@ -1447,11 +1689,7 @@ function ChatWorkspace({
     if (!window.omni) return;
     return window.omni.chat.onAction((event) => {
       if (event.brainId !== brain.id) return;
-      setActionEvents((current) => {
-        const index = current.findIndex((candidate) => candidate.id === event.id);
-        if (index < 0) return [...current, event];
-        return current.map((candidate) => candidate.id === event.id ? event : candidate);
-      });
+      setActionEvents((current) => mergeChatActionEvent(current, event));
       const protocol = `${event.action.toolId ?? event.action.kind}.${event.action.action ?? event.action.kind}`;
       setToolRunning(event.state === "running");
       setToolStatus(
@@ -1488,26 +1726,47 @@ function ChatWorkspace({
 
   useEffect(() => {
     if (!window.omni) return;
-    return window.omni.chat.onStream((event: ChatStreamEvent) => {
+    const batcher = createTextFrameBatcher(
+      (delta) => setPartialText((current) => current + delta),
+      (callback) => window.requestAnimationFrame(callback),
+      (handle) => window.cancelAnimationFrame(handle)
+    );
+    tokenBatcherRef.current = batcher;
+    const removeListener = window.omni.chat.onStream((event: ChatStreamEvent) => {
       if (event.brainId !== brain.id) return;
       const lastSequence = streamSequenceRef.current.get(event.turnId) ?? -1;
       if (event.sequence <= lastSequence) return;
       streamSequenceRef.current.set(event.turnId, event.sequence);
       if (event.turnId !== activeTurnIdRef.current) return;
       if (event.type === "chat-token") {
-        setPartialText((current) => current + event.delta);
+        batcher.push(event.delta);
       } else if (event.type === "chat-action") {
-        setActionEvents((current) => {
-          const index = current.findIndex(
-            (candidate) => candidate.id === event.actionEvent.id
-          );
-          if (index < 0) return [...current, event.actionEvent];
-          return current.map((candidate) =>
-            candidate.id === event.actionEvent.id ? event.actionEvent : candidate
-          );
-        });
+        setActionEvents((current) =>
+          mergeChatActionEvent(current, event.actionEvent)
+        );
+        const protocol = `${event.actionEvent.action.toolId ?? event.actionEvent.action.kind}.${event.actionEvent.action.action ?? event.actionEvent.action.kind}`;
+        setToolRunning(event.actionEvent.state === "running");
+        setToolStatus(
+          event.actionEvent.state === "failed"
+            ? `${protocol} failed: ${event.actionEvent.error ?? "unknown error"}`
+            : `${protocol}: ${event.actionEvent.state}.`
+        );
+      } else if (event.type === "modality-preview") {
+        setActionEvents((current) =>
+          patchChatActionPreview(current, event.actionId, event.preview)
+        );
+      } else if (event.type === "chat-state" && event.state !== "started") {
+        batcher.flush();
+        streamSequenceRef.current.delete(event.turnId);
+        activeTurnIdRef.current = null;
       }
     });
+    return () => {
+      removeListener();
+      batcher.reset();
+      if (tokenBatcherRef.current === batcher) tokenBatcherRef.current = null;
+      streamSequenceRef.current.clear();
+    };
   }, [brain.id]);
 
   useEffect(() => {
@@ -1597,15 +1856,31 @@ function ChatWorkspace({
     if (!text || sending) return;
     setSending(true);
     cancelRequestedRef.current = false;
+    let optimisticHuman: ChatMessage | null = null;
     try {
       if (window.omni) {
         setInput("");
         const turnId = globalThis.crypto?.randomUUID?.() ??
           `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        optimisticHuman = {
+          id: `pending-${turnId}`,
+          role: "human",
+          content: text,
+          createdAt: new Date().toISOString()
+        };
+        // Keep speculative presentation state out of the authoritative brain
+        // document. This component stays mounted across workspace navigation,
+        // so the pending turn remains visible without becoming durable memory.
+        setOptimisticHumans((current) => [...current, optimisticHuman!]);
+        tokenBatcherRef.current?.reset();
+        streamSequenceRef.current.clear();
         activeTurnIdRef.current = turnId;
         setActiveTurnId(turnId);
         setPartialText("");
         const result = await window.omni.chat.send(brain.id, text, turnId);
+        setOptimisticHumans((current) =>
+          current.filter((message) => message.id !== optimisticHuman?.id)
+        );
         onBrainChange(result.brain);
         if (result.actionEvents?.length) {
           setActionEvents((current) => {
@@ -1654,10 +1929,25 @@ function ChatWorkspace({
         onBrainChange(makeDemoChat(brain, text).brain);
       }
     } catch (error) {
+      if (window.omni && optimisticHuman) {
+        setOptimisticHumans((current) =>
+          current.filter((message) => message.id !== optimisticHuman?.id)
+        );
+        // The main process commits the human and neural messages atomically.
+        // Reload after failure so any independently completed neural activity
+        // is reflected without ever persisting the optimistic bubble.
+        await window.omni.brain.get(brain.id).then(onBrainChange).catch(() => {
+          // The existing authoritative document remains valid if refresh fails.
+        });
+      }
       if (!cancelRequestedRef.current) {
         onToast(error instanceof Error ? error.message : "The local brain could not respond.");
       }
     } finally {
+      tokenBatcherRef.current?.reset();
+      if (activeTurnIdRef.current) {
+        streamSequenceRef.current.delete(activeTurnIdRef.current);
+      }
       activeTurnIdRef.current = null;
       setActiveTurnId(null);
       setPartialText("");
@@ -1810,9 +2100,10 @@ function ChatWorkspace({
     }
   };
 
+  const authoritativeAndPendingMessages = [...brain.messages, ...optimisticHumans];
   const displayedMessages =
-    brain.messages.length > 0
-      ? brain.messages
+    authoritativeAndPendingMessages.length > 0
+      ? authoritativeAndPendingMessages
       : window.omni
         ? []
         : [
@@ -1866,7 +2157,7 @@ function ChatWorkspace({
           : "Idle / ready";
 
   return (
-    <div className="chat-layout">
+    <div className="chat-layout" hidden={hidden}>
       <section
         className={cx(
           "conversation",
@@ -2063,7 +2354,7 @@ function ChatWorkspace({
         </div>
       </section>
 
-      <aside className="cortex-panel">
+      <aside id="chat-cortex-panel" className="cortex-panel" aria-label="Cortex and runtime inspector">
         <div className="panel-tabs">
           <button className={inspectorTab === "state" ? "is-active" : ""} onClick={() => setInspectorTab("state")}>
             Live cortex
@@ -4639,12 +4930,53 @@ function AgentsWorkspace({
 
 export function App() {
   const demo = !window.omni;
+  const [appearance, setAppearance] = useState<AppearancePreferences>(() => {
+    try {
+      return loadAppearancePreferences(window.localStorage);
+    } catch {
+      return { ...DEFAULT_APPEARANCE };
+    }
+  });
+  const [systemUsesDark, setSystemUsesDark] = useState(() =>
+    typeof window.matchMedia === "function"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : true
+  );
   const [page, setPage] = useState<AppPage>("library");
   const [summaries, setSummaries] = useState<BrainSummary[]>(demo ? demoSummaries : []);
   const [activeBrain, setActiveBrain] = useState<BrainDocument | null>(null);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("chat");
   const [loading, setLoading] = useState(!demo);
   const [toast, setToast] = useState("");
+  const resolvedColorScheme = resolveColorScheme(appearance.mode, systemUsesDark);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const update = (event: MediaQueryListEvent | MediaQueryList): void => {
+      setSystemUsesDark(event.matches);
+    };
+    update(query);
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  useLayoutEffect(() => {
+    applyAppearanceAttributes(document.documentElement, appearance, resolvedColorScheme);
+    try {
+      saveAppearancePreferences(window.localStorage, appearance);
+    } catch {
+      // Storage can be unavailable in hardened or ephemeral renderer profiles.
+    }
+    void window.omni?.window.setAppearance({
+      schemaVersion: 1,
+      mode: appearance.mode,
+      resolvedColorScheme,
+      layout: appearance.layout
+    }).catch(() => {
+      // DOM appearance remains functional if native chrome cannot be updated.
+    });
+  }, [appearance, resolvedColorScheme]);
 
   const showToast = (message: string) => {
     setToast(message);
@@ -4789,7 +5121,12 @@ export function App() {
   };
 
   const updateActiveBrain = (document: BrainDocument) => {
-    setActiveBrain(document);
+    // A turn may finish after the user has returned to the library or opened a
+    // different identity. Persist its summary, but never let that late result
+    // replace whichever brain is currently active.
+    setActiveBrain((current) =>
+      current?.id === document.id ? document : current
+    );
     setSummaries((current) =>
       current.map((summary) =>
         summary.id === document.id
@@ -4841,7 +5178,15 @@ export function App() {
     <div className="app-shell">
       <div className="mica-glow mica-glow--one" />
       <div className="mica-glow mica-glow--two" />
-      <Titlebar page={page} brain={activeBrain} demo={demo} onLibrary={() => setPage("library")} />
+      <Titlebar
+        page={page}
+        brain={activeBrain}
+        demo={demo}
+        onLibrary={() => setPage("library")}
+        appearance={appearance}
+        resolvedColorScheme={resolvedColorScheme}
+        onAppearanceChange={setAppearance}
+      />
       {page === "library" ? (
         <LibraryPage
           summaries={summaries}

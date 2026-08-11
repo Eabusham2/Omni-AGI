@@ -17,7 +17,8 @@ const windowApi: OmniApi["window"] = {
   isMaximized: () => invoke(IPC.window.isMaximized),
   openExternal: (url) => invoke(IPC.window.openExternal, url),
   revealDataFolder: () => invoke(IPC.window.revealDataFolder),
-  platform: () => invoke(IPC.window.platform)
+  platform: () => invoke(IPC.window.platform),
+  setAppearance: (request) => invoke(IPC.window.setAppearance, request)
 };
 
 const api: OmniApi = {

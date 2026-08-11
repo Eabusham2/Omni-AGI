@@ -76,4 +76,65 @@ describe("IdleCognitionScheduler", () => {
     expect(actions.isBusy).toHaveBeenCalledWith("active");
     expect(actions.idle).not.toHaveBeenCalled();
   });
+
+  it("keeps always-active cognition inside a wall-time duty budget", async () => {
+    let clock = 0;
+    const repository = {
+      list: vi.fn().mockResolvedValue([summary("active")]),
+      get: vi.fn().mockResolvedValue(brain("active", true))
+    };
+    const actions = {
+      idle: vi.fn(async () => {
+        clock += 100;
+        return { brainId: "active", ran: true, actions: [] };
+      })
+    };
+    const scheduler = new IdleCognitionScheduler(repository, actions, {
+      intervalMs: 1_000,
+      maxDutyCycle: 0.1,
+      now: () => clock
+    });
+
+    await scheduler.tick();
+    expect(actions.idle).toHaveBeenCalledOnce();
+
+    // The 100 ms neural cycle is followed by at least the scheduler interval,
+    // keeping the prompt-free loop bounded even when repeatedly ticked.
+    clock = 999;
+    await scheduler.tick();
+    expect(actions.idle).toHaveBeenCalledOnce();
+
+    clock = 1_100;
+    await scheduler.tick();
+    expect(actions.idle).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors a longer neural cooldown returned by the worker", async () => {
+    let clock = 0;
+    const repository = {
+      list: vi.fn().mockResolvedValue([summary("active")]),
+      get: vi.fn().mockResolvedValue(brain("active", true))
+    };
+    const actions = {
+      idle: vi.fn().mockResolvedValue({
+        brainId: "active",
+        ran: false,
+        reason: "cooldown",
+        retryAfterSeconds: 30,
+        actions: []
+      })
+    };
+    const scheduler = new IdleCognitionScheduler(repository, actions, {
+      intervalMs: 1_000,
+      now: () => clock
+    });
+
+    await scheduler.tick();
+    clock = 29_999;
+    await scheduler.tick();
+    expect(actions.idle).toHaveBeenCalledOnce();
+    clock = 30_001;
+    await scheduler.tick();
+    expect(actions.idle).toHaveBeenCalledTimes(2);
+  });
 });

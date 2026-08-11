@@ -85,6 +85,7 @@ function environment(dataDirectory: string, installed: boolean): Record<string, 
   return {
     ...inherited,
     NODE_ENV: "test",
+    OMNI_E2E_CHAT_DELAY_MS: "3000",
     OMNI_AGI_DATA_DIR: dataDirectory,
     OMNI_PACKAGED_ENGINE_REQUIRED: installed ? "1" : "",
     OMNI_PYTHON: installed
@@ -158,7 +159,8 @@ async function launch(dataDirectory: string): Promise<RunningApplication> {
 async function sendNaturalMessage(
   page: Page,
   brainName: string,
-  message: string
+  message: string,
+  navigateWhilePending = false
 ): Promise<void> {
   const composer = page.getByLabel(`Message ${brainName}`);
   const sendButton = page.getByLabel("Send message");
@@ -174,9 +176,18 @@ async function sendNaturalMessage(
     .locator(".message--human")
     .getByText(message, { exact: true });
   const errorToast = page.locator(".toast");
-  await expect(persistedMessage.or(errorToast).first()).toBeVisible({
-    timeout: 240_000
-  });
+  // Sending is optimistic: the human bubble must render immediately instead
+  // of waiting for the neural worker and its persisted response.
+  await expect(persistedMessage).toBeVisible({ timeout: 1_500 });
+  await expect(page.getByLabel("Stop current turn")).toBeVisible();
+  if (navigateWhilePending) {
+    await page.getByRole("button", { name: "Data & training", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Data & training" })).toBeVisible();
+    await page.getByRole("button", { name: "Conversation", exact: true }).click();
+    await expect(persistedMessage).toBeVisible();
+    await expect(page.getByLabel("Stop current turn")).toBeVisible();
+  }
+  await expect(persistedMessage.or(errorToast).first()).toBeVisible({ timeout: 240_000 });
   if (await errorToast.isVisible().catch(() => false)) {
     throw new Error(
       `Chat failed before persistence: ${(await errorToast.textContent())?.trim() ?? "unknown error"}`
@@ -301,7 +312,12 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
       runtimeCard.getByText("Latent assembly workspace", { exact: true })
     ).toBeVisible();
 
-    await sendNaturalMessage(page, "E2E Cortex", "hello, tell me what you notice");
+    await sendNaturalMessage(
+      page,
+      "E2E Cortex",
+      "hello, tell me what you notice",
+      true
+    );
     await expect(
       page.locator(".message--human").filter({
         hasText: "hello, tell me what you notice"
@@ -389,7 +405,9 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await page.getByRole("button", { name: "Evolution", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Evolution lab" })).toBeVisible();
     await expect(page.getByText("New isolated candidate", { exact: true })).toBeVisible();
-    await expect(page.getByText("ask permission", { exact: false })).toBeVisible();
+    await expect(
+      page.locator(".evolution-policy").getByText("ask permission", { exact: false })
+    ).toBeVisible();
     const evolutionArchive = page.locator(".evolution-archive");
     await expect(evolutionArchive).toBeVisible();
     await expect(

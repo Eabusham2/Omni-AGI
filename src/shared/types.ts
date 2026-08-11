@@ -1,5 +1,33 @@
 export const BRAIN_SCHEMA_VERSION = 1;
 
+export const APPEARANCE_SCHEMA_VERSION = 1;
+
+/** User-owned presentation choices. These never enter a brain's neural state. */
+export type AppearanceMode = "system" | "light" | "dark";
+export type ResolvedColorScheme = "light" | "dark";
+export type AppearancePalette = "violet" | "graphite" | "spectrum" | "aqua";
+export type AppearanceLayout = "standard" | "classic" | "expressive" | "glass";
+
+export interface AppearancePreferences {
+  schemaVersion: typeof APPEARANCE_SCHEMA_VERSION;
+  mode: AppearanceMode;
+  palette: AppearancePalette;
+  layout: AppearanceLayout;
+}
+
+/** Narrow, validated request used only to synchronize native window chrome. */
+export interface NativeAppearanceRequest {
+  schemaVersion: typeof APPEARANCE_SCHEMA_VERSION;
+  mode: AppearanceMode;
+  resolvedColorScheme: ResolvedColorScheme;
+  layout: AppearanceLayout;
+}
+
+export interface NativeAppearanceState extends NativeAppearanceRequest {
+  backgroundColor: string;
+  symbolColor: string;
+}
+
 export type ArchitecturePreset =
   | "whole-brain"
   | "ternary"
@@ -1146,6 +1174,7 @@ export interface OmniApi {
     openExternal(url: string): Promise<void>;
     revealDataFolder(): Promise<void>;
     platform(): Promise<string>;
+    setAppearance(request: NativeAppearanceRequest): Promise<NativeAppearanceState>;
   };
   brain: {
     list(): Promise<BrainSummary[]>;

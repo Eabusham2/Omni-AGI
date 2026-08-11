@@ -168,6 +168,23 @@ interface ActionOutcome {
   output?: unknown;
 }
 
+/**
+ * Active turns already have an ordered stream. Keep that transport light: a
+ * progressive preview is delivered exactly once through `modality-preview`,
+ * while the authoritative result (including any final tool output) returns
+ * through the chat invocation. Idle/global actions still use the complete
+ * legacy ActionEvent channel because they have no turn stream.
+ */
+export function actionEventForTurnStream(event: ActionEvent): ActionEvent {
+  const { preview: _preview, execution, ...rest } = event;
+  if (!execution) return rest;
+  const { output: _output, ...executionWithoutOutput } = execution;
+  return {
+    ...rest,
+    execution: executionWithoutOutput
+  };
+}
+
 export class ChatActionController extends EventEmitter {
   private readonly activeTurns = new Map<string, ActiveTurn>();
 
@@ -211,8 +228,14 @@ export class ChatActionController extends EventEmitter {
   }
 
   private publishAction(turn: ActiveTurn | undefined, event: ActionEvent): void {
+    if (turn) {
+      this.publishStream(turn, {
+        type: "chat-action",
+        actionEvent: actionEventForTurnStream(event)
+      });
+      return;
+    }
     this.publish(event);
-    if (turn) this.publishStream(turn, { type: "chat-action", actionEvent: event });
   }
 
   private async executeAction(

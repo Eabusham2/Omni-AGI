@@ -7,6 +7,7 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  nativeTheme,
   shell,
   type IpcMainInvokeEvent
 } from "electron";
@@ -29,6 +30,7 @@ import type {
   IngestFilesRequest,
   IngestWebRequest,
   ModalityGenerateRequest,
+  NativeAppearanceRequest,
   StartTrainingRequest,
   SubstrateQuery,
   ToolInvocation,
@@ -85,6 +87,22 @@ function requireId(value: unknown, label = "id"): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireNativeAppearance(value: unknown): NativeAppearanceRequest {
+  if (!isRecord(value) || value.schemaVersion !== 1) {
+    throw new Error("Invalid appearance request.");
+  }
+  if (!["system", "light", "dark"].includes(String(value.mode))) {
+    throw new Error("Invalid appearance mode.");
+  }
+  if (!["light", "dark"].includes(String(value.resolvedColorScheme))) {
+    throw new Error("Invalid resolved color scheme.");
+  }
+  if (!["standard", "classic", "expressive", "glass"].includes(String(value.layout))) {
+    throw new Error("Invalid appearance layout.");
+  }
+  return value as unknown as NativeAppearanceRequest;
 }
 
 function uploadDescriptor(value: unknown): {
@@ -213,6 +231,24 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   handle(IPC.window.close, (event) => senderWindow(event).close());
   handle(IPC.window.isMaximized, (event) => senderWindow(event).isMaximized());
   handle(IPC.window.platform, () => process.platform);
+  handle(IPC.window.setAppearance, (event, value: unknown) => {
+    const request = requireNativeAppearance(value);
+    const window = senderWindow(event);
+    nativeTheme.themeSource = request.mode;
+    const dark = request.resolvedColorScheme === "dark";
+    const backgroundColor = dark ? "#08080d" : "#f4f3f0";
+    const symbolColor = dark ? "#f5f3fa" : "#1d1c23";
+    window.setBackgroundColor(backgroundColor);
+    if (process.platform === "win32") {
+      window.setTitleBarOverlay({
+        color: request.layout === "glass" ? `${backgroundColor}cc` : backgroundColor,
+        symbolColor,
+        height: 46
+      });
+      window.setBackgroundMaterial(request.layout === "glass" ? "acrylic" : "mica");
+    }
+    return { ...request, backgroundColor, symbolColor };
+  });
   handle(IPC.window.openExternal, async (_event, rawUrl: string) => {
     if (typeof rawUrl !== "string" || rawUrl.length > 16_000) throw new Error("Invalid URL.");
     const url = new URL(rawUrl);
@@ -374,14 +410,25 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     service.workspace(requireId(id))
   );
 
-  handle(IPC.chat.send, (_event, id: string, input: string, turnId?: string) =>
-    actions.send(
+  handle(IPC.chat.send, async (_event, id: string, input: string, turnId?: string) => {
+    // Deterministic test latency proves the renderer shows a pending human turn
+    // before the worker reply. It is ignored outside the test environment.
+    const requestedTestDelay = process.env.NODE_ENV === "test"
+      ? Number.parseInt(process.env.OMNI_E2E_CHAT_DELAY_MS ?? "0", 10)
+      : 0;
+    const testDelay = Number.isFinite(requestedTestDelay)
+      ? Math.max(0, Math.min(requestedTestDelay, 10_000))
+      : 0;
+    if (testDelay > 0) {
+      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, testDelay));
+    }
+    return actions.send(
       requireId(id),
       input,
       undefined,
       typeof turnId === "string" ? requireId(turnId, "turn id") : undefined
-    )
-  );
+    );
+  });
   handle(IPC.chat.cancel, (_event, id: string, turnId?: string) =>
     actions.cancel(
       requireId(id),
