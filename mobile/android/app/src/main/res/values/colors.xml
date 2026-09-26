@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="omni_background">#F4F2F8</color>
+    <color name="omni_surface">#FFFFFFFF</color>
+    <color name="omni_surface_raised">#FFF9FB</color>
+    <color name="omni_text">#201D29</color>
+    <color name="omni_muted">#6B6675</color>
+    <color name="omni_accent">#6F4BD8</color>
+    <color name="omni_accent_soft">#E9E1FF</color>
+    <color name="omni_border">#DDD8E7</color>
+    <color name="omni_human_bubble">#6F4BD8</color>
+    <color name="omni_brain_bubble">#FFFFFFFF</color>
+    <color name="omni_on_accent">#FFFFFFFF</color>
+</resources>

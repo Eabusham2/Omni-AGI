@@ -34,10 +34,10 @@ class NeuralEvolutionTests(unittest.TestCase):
             "evolution-brain",
             self.root,
             OmniConfig.micro(
-                origin_kind="blank",
                 max_seq_len=40,
                 learn_from_own_messages=False,
             ),
+            initialize_ground_up=True,
         )
         self.manager = NeuralEvolutionManager(self.brain)
 
@@ -311,7 +311,8 @@ class NeuralEvolutionTests(unittest.TestCase):
             "list-neural-candidates",
         )
         self.assertEqual(listed["candidates"], [])
-        with contextlib.redirect_stdout(io.StringIO()):
+        notifications = io.StringIO()
+        with contextlib.redirect_stdout(notifications):
             architecture = worker.evolution_propose(
                 {
                     "brainId": self.brain.brain_id,
@@ -327,6 +328,21 @@ class NeuralEvolutionTests(unittest.TestCase):
                 },
                 "compatible-architecture-candidate",
             )
+        progress_events = [
+            json.loads(line)
+            for line in notifications.getvalue().splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(
+            any(
+                isinstance(event.get("params", {}).get("data"), dict)
+                and isinstance(
+                    event["params"]["data"].get("resourceReadings"), dict
+                )
+                for event in progress_events
+            ),
+            progress_events,
+        )
         self.assertEqual(architecture["candidateType"], "architecture")
         self.assertEqual(
             architecture["architectureMutation"]["mutation"],

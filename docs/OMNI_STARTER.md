@@ -1,60 +1,96 @@
-# Bundled Omni Starter model card
+# Retired Starter, foundation, and Nova research record
 
-## Scope
+This page is historical documentation, not a model catalog. Current Studio has
+one whole-brain architecture and origin boundary:
 
-`omni-starter-bundled-1` is the initially trained local baseline included with
-Omni AGI Studio v1. It is trained from random OmniCortex weights before the
-immutable origin snapshot is created. It is intended to prove the complete
-starter, continual-learning, action, modality, export, and restoration paths on
-ordinary hardware. It is not a frontier foundation model or a claim of AGI.
+- every new Build initializes and trains native OmniCortex locally under the
+  [ground-up contract](GROUND_UP_OMNICORTEX.md);
+- whole-brain Import accepts only the exact supported `.omni` schema when both
+  current state and immutable origin prove native ground-up OmniCortex;
+- the retired bundled Starter, random-only Blank origins, Falcon/FoundationCortex
+  adapters, Nova, and other legacy hybrids are not selectable, loadable, or
+  migration sources;
+- rejecting an old file does not delete or rewrite it.
 
-## Architecture and forward weights
+No historical result on this page establishes the quality of a current native
+Build.
 
-The starter uses the same custom OmniCortex architecture as a Blank Brain:
-ternary cortical projections, a growable neural substrate, LIF/STDP dynamics,
-CfC temporal state, a whole-input global workspace, a learned structured action
-head, and the four baseline modality packs. Every eligible inference weight is
-verified as exactly `-1`, `0`, or `+1` and exported in packed two-bit shards.
-Higher-precision master weights, activations, normalization, liquid state, and
-learning traces remain necessary for training.
+## Retired bundled Starter
 
-## Training data and provenance
+`omni-starter-bundled-1` was an earlier project-authored bootstrap. It began
+from random OmniCortex weights, trained on a small corpus, supervised dialogue
+pairs, typed action examples, and synthetic modality fixtures, then recorded an
+immutable origin. The mechanism exercised optimization, action, modality,
+export, and restoration paths, but its small curriculum never proved coherent
+general conversation, cleared-context recall, broad knowledge, coding ability,
+or useful media quality.
 
-The bundled source is entirely project-authored:
+The current Build does not use that corpus or Starter identity. It uses the
+hash-bound native capability curriculum and readiness receipt described in
+`GROUND_UP_OMNICORTEX.md`. A Starter manifest in either current or origin state
+is therefore rejection evidence, not an import option.
 
-- 12 short text passages about connected ideas, memory, uncertainty, tools,
-  imagination, agents, continual learning, and experimental improvement.
-- 16 typed action examples covering `talk`, `tool`, `imagine`, `agent`,
-  `ponder`, `learn`, `evolve`, and `stop`.
-- deterministic synthetic fixtures used only to initialize and verify the
-  vision, image, audio, and video learning paths.
+The retired bootstrap itself used no project-authored RLHF, DPO, preference
+labels, reward model, refusal/persona tuning, or hidden behavioral prompt. That
+historical statement cannot establish anything about an upstream foundation
+whose training history was incomplete.
 
-No third-party model or model-generated dataset is used. The materialized
-starter manifest records the exact record counts, canonical SHA-256 hashes,
-license, training parameter checksums, the per-passage corpus loss curve,
-action-training metrics, and modality-training metrics. Because the baseline is
-materialized locally for the selected hardware profile, these measurements are
-stored with that brain rather than claimed as one universal loss curve.
+## Retired Falcon/FoundationCortex experiment
 
-## Objectives
+Earlier research implemented a frozen packed foundation cortex with a mutable
+Omni adapter and reviewed two Falcon-E Base revisions:
 
-The baseline performs next-byte corpus prediction, whole-experience idea
-reconstruction, temporal prediction, spike homeostasis, structured-action
-trajectory imitation, and synthetic cross-modal training. Later user
-experiences follow the same neural learning path through immediate plasticity,
-assembly consolidation, replay, and slow-weight updates.
+| Historical artifact | Pinned revision | Recorded `model.safetensors` SHA-256 |
+| --- | --- | --- |
+| `tiiuae/Falcon-E-1B-Base` | `f4001b8b1c26d28a717d79a8ece14901816d92e8` | `f62c270b5640c9fce1dedf1ffe84aa8f138443ad1b065e90c7508a0eebc7c79d` |
+| `tiiuae/Falcon-E-3B-Base` | `ad18b0713c10a8696144b1112accf4ccd28af6d3` | `25dbd87d68cf853de3bea1ae4615bf2fa027f252b77ec2137a07e94c1a1a6ba2` |
 
-## Excluded post-training
+Those records are retained for audit and attribution only. Current Studio does
+not search `OMNI_FOUNDATION_ROOT`, download or load Falcon weights, construct a
+`FoundationCortex`, expose a Falcon choice, convert Falcon into OmniCortex, or
+accept a Falcon-backed `.omni`. Their model cards also did not establish
+complete corpus, dataset-license, training-stage, or preference-training
+provenance. The applicable Falcon license links remain in
+[`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).
 
-The starter uses no RLHF, DPO, preference labels, reward model, refusal or
-persona tuning, imported preference-tuned weights, or hidden behavioral system
-prompt. Tool capability schemas are typed neural inputs; they are not prose
-instructions about how the identity must behave.
+## Reviewed but never compatible: Ultron 0.3B Base
 
-## Limitations
+`1bitLabs/ultron-0.3b-base-experimental` was reviewed at revision
+`cc4f22f1b997dbf6e41a6c9bf2b2939e44ca81e4`. Its recorded base artifact,
+`ultron_r008_305m.pt`, was a 1,222,496,651-byte PyTorch ZIP checkpoint with
+SHA-256 `c67ebb6ed4910aea1935c878fda84caf669104f171ca2cac4689be69fcd027ae`.
+Loading it would have required pickle-compatible deserialization and upstream
+custom architecture code. It was never accepted by Omni's data-only,
+safetensors-only, no-remote-code boundary and remains neither a Build nor an
+Import option. Dataset names in its model card did not provide the exact
+revision, row-level provenance, and license ledger required by Omni.
 
-This small baseline cannot supply broad factual knowledge, reliable coding
-ability, frontier media quality, human-level reasoning, consciousness, or
-perfect recall. A compatible, separately published `.omni` starter may provide
-more training, but its own manifest, hashes, data licenses, objectives, and
-model card must be verified before installation.
+## Nova is not native-build evidence
+
+The saved trained Nova brain was a Falcon-backed legacy hybrid. Its frozen base,
+mutable adapter, substrate, replay, and optimizer state belonged to the retired
+foundation experiment. Consequently:
+
+- successful persistence or parameter mutation in Nova did not validate fresh
+  native OmniCortex initialization;
+- Nova's chat output did not validate the current ground-up curriculum or
+  readiness gate;
+- Nova recall or routing failures do not measure a newly trained native Build;
+- Nova cannot be selected or imported to stand in for missing native evidence.
+
+A current capability claim requires a newly constructed native OmniCortex,
+complete attributable training coverage, an exact readiness receipt, held-out
+evaluation after restart, exact ternary coverage, and the relevant packaged
+platform evidence. At the time of this record, a complete post-cleanup native
+Build and competence run still has to supply that evidence; architecture and
+unit tests alone are not proof of conversational quality, AGI, consciousness,
+human biological equivalence, perfect recall, or factual reliability.
+
+## Why this record remains
+
+Keeping hashes, upstream identities, negative findings, and license links makes
+old logs and user-held files interpretable without preserving a compatibility
+path. Research references—including BitNet, snnTorch, NCPS, and an ignored
+`.runtime/bitnet-src` checkout—remain useful inputs to independent OmniCortex
+engineering. They are not pretrained brains, fallback runtimes, or selectable
+product models.

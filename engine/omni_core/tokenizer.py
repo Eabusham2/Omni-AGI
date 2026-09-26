@@ -90,9 +90,11 @@ class ByteTokenizer:
         payload_size = int(max_length) - special
         if payload_size < 1:
             raise ValueError("max_length is too small for tokenizer specials")
-        payload = [
-            int(value) + self.byte_offset for value in text.encode("utf-8")
-        ]
+        # Keep one compact byte buffer and materialize only the current model
+        # window. The previous list-of-Python-ints representation amplified a
+        # large Parquet/JSON record by roughly an order of magnitude before
+        # the first training step.
+        payload = text.encode("utf-8")
         if not payload:
             values: List[int] = []
             if add_bos:
@@ -105,7 +107,10 @@ class ByteTokenizer:
             values = []
             if add_bos:
                 values.append(self.bos_id)
-            values.extend(payload[offset : offset + payload_size])
+            values.extend(
+                int(value) + self.byte_offset
+                for value in payload[offset : offset + payload_size]
+            )
             if add_eos:
                 values.append(self.eos_id)
             yield values

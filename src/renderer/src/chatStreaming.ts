@@ -97,10 +97,24 @@ export interface TextFrameBatcher {
 export function createTextFrameBatcher(
   commit: (delta: string) => void,
   schedule: (callback: () => void) => number,
-  cancel: (handle: number) => void
+  cancel: (handle: number) => void,
+  maxCharactersPerFrame = 96
 ): TextFrameBatcher {
   let buffer = "";
   let handle: number | null = null;
+  const frameLimit = Math.max(1, Math.floor(maxCharactersPerFrame));
+
+  const scheduleDrain = (): void => {
+    if (handle !== null || !buffer) return;
+    handle = schedule(() => {
+      handle = null;
+      if (!buffer) return;
+      const delta = buffer.slice(0, frameLimit);
+      buffer = buffer.slice(delta.length);
+      commit(delta);
+      scheduleDrain();
+    });
+  };
 
   const flush = (): void => {
     if (handle !== null) {
@@ -117,14 +131,7 @@ export function createTextFrameBatcher(
     push(delta) {
       if (!delta) return;
       buffer += delta;
-      if (handle !== null) return;
-      handle = schedule(() => {
-        handle = null;
-        if (!buffer) return;
-        const delta = buffer;
-        buffer = "";
-        commit(delta);
-      });
+      scheduleDrain();
     },
     flush,
     reset() {

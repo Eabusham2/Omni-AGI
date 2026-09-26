@@ -8,6 +8,7 @@ WORKER="${REPO_ROOT}/engine/worker.py"
 DIST_ROOT="${REPO_ROOT}/engine-dist"
 WORK_ROOT="${REPO_ROOT}/.engine-build"
 PYTHON_BIN="${OMNI_BUILD_PYTHON:-python3}"
+LOCK_INSTALLER="${REPO_ROOT}/scripts/install-engine-lock.py"
 
 case "$(uname -s)" in
   Darwin) HOST_PLATFORM="mac" ;;
@@ -28,15 +29,18 @@ if [[ ! -f "${WORKER}" ]]; then
   exit 2
 fi
 
+if [[ ! -f "${LOCK_INSTALLER}" ]]; then
+  echo "Engine dependency lock installer not found at ${LOCK_INSTALLER}" >&2
+  exit 2
+fi
+
 if [[ "${OMNI_SKIP_BUILD_DEPENDENCY_INSTALL:-0}" == "1" ]]; then
-  "${PYTHON_BIN}" -c \
-    "import PyInstaller; major=int(PyInstaller.__version__.split('.')[0]); assert major == 6" \
-    || {
-      echo "Protected runtime evolution requires an existing PyInstaller 6.x; automatic dependency installation is disabled." >&2
-      exit 1
-    }
+  "${PYTHON_BIN}" "${LOCK_INSTALLER}" --verify-only || {
+    echo "The existing Python environment does not match the reviewed engine release lock." >&2
+    exit 1
+  }
 else
-  "${PYTHON_BIN}" -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
+  "${PYTHON_BIN}" "${LOCK_INSTALLER}"
 fi
 
 # These are fixed, repository-local build directories rather than user paths.
@@ -56,6 +60,22 @@ rm -rf -- "${DIST_ROOT}" "${WORK_ROOT}"
   --collect-all imageio_ffmpeg \
   --collect-all soundfile \
   "${WORKER}"
+
+# Keep imageio-ffmpeg's BSD wrapper, but do not convey the separately licensed
+# wheel-provided FFmpeg executable without complete corresponding source and
+# build material. Fail closed if PyInstaller placed another FFmpeg executable
+# anywhere in the worker distribution.
+while IFS= read -r -d '' PACKAGED_FFMPEG; do
+  rm -f -- "${PACKAGED_FFMPEG}"
+done < <(
+  find "${DIST_ROOT}/omni-engine" -type f \
+    -path '*/imageio_ffmpeg/binaries/ffmpeg*' \
+    ! -name '*.py' ! -name '*.pyc' ! -name '*.pyo' \
+    ! -name '*.md' ! -name '*.txt' -print0
+)
+node "${REPO_ROOT}/scripts/verify-packaged-compliance.mjs" \
+  --repo-root "${REPO_ROOT}" \
+  --engine-dir "${DIST_ROOT}/omni-engine"
 
 EXECUTABLE="${DIST_ROOT}/omni-engine/omni-engine"
 if [[ ! -x "${EXECUTABLE}" ]]; then

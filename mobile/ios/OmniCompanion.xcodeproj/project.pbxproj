@@ -1,0 +1,262 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000201 /* OmniCompanionApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000101 /* OmniCompanionApp.swift */; };
+		100000000000000000000202 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000102 /* Models.swift */; };
+		100000000000000000000203 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000103 /* KeychainStore.swift */; };
+		100000000000000000000204 /* GatewayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000104 /* GatewayClient.swift */; };
+		100000000000000000000205 /* CompanionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000105 /* CompanionViewModel.swift */; };
+		100000000000000000000206 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000106 /* ContentView.swift */; };
+		100000000000000000000207 /* GatewayClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000108 /* GatewayClientTests.swift */; };
+		100000000000000000000208 /* CompanionSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000109 /* CompanionSmokeTests.swift */; };
+		100000000000000000000209 /* LICENSE.md in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000110 /* LICENSE.md */; };
+		100000000000000000000210 /* COMMERCIAL_LICENSE.md in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000111 /* COMMERCIAL_LICENSE.md */; };
+		100000000000000000000211 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000112 /* THIRD_PARTY_NOTICES.md */; };
+		100000000000000000000212 /* licenses in Resources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000113 /* licenses */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		100000000000000000000810 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 100000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 100000000000000000000401;
+			remoteInfo = OmniCompanion;
+		};
+		100000000000000000000811 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 100000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 100000000000000000000401;
+			remoteInfo = OmniCompanion;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		100000000000000000000101 /* OmniCompanionApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmniCompanionApp.swift; sourceTree = "<group>"; };
+		100000000000000000000102 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		100000000000000000000103 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		100000000000000000000104 /* GatewayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayClient.swift; sourceTree = "<group>"; };
+		100000000000000000000105 /* CompanionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionViewModel.swift; sourceTree = "<group>"; };
+		100000000000000000000106 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		100000000000000000000107 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		100000000000000000000108 /* GatewayClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayClientTests.swift; sourceTree = "<group>"; };
+		100000000000000000000109 /* CompanionSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionSmokeTests.swift; sourceTree = "<group>"; };
+		100000000000000000000110 /* LICENSE.md */ = {isa = PBXFileReference; lastKnownFileType = text; name = LICENSE.md; path = ../../LICENSE.md; sourceTree = "<group>"; };
+		100000000000000000000111 /* COMMERCIAL_LICENSE.md */ = {isa = PBXFileReference; lastKnownFileType = text; name = COMMERCIAL_LICENSE.md; path = ../../COMMERCIAL_LICENSE.md; sourceTree = "<group>"; };
+		100000000000000000000112 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = text; name = THIRD_PARTY_NOTICES.md; path = ../../THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
+		100000000000000000000113 /* licenses */ = {isa = PBXFileReference; lastKnownFileType = folder; name = licenses; path = ../../licenses; sourceTree = "<group>"; };
+		100000000000000000000901 /* Omni AGI Companion.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Omni AGI Companion.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000902 /* OmniCompanionTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmniCompanionTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000903 /* OmniCompanionUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmniCompanionUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		100000000000000000000511 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000521 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000531 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		100000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000004 /* OmniCompanion */,
+				100000000000000000000007 /* Legal */,
+				100000000000000000000005 /* OmniCompanionTests */,
+				100000000000000000000006 /* OmniCompanionUITests */,
+				100000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		100000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000901 /* Omni AGI Companion.app */,
+				100000000000000000000902 /* OmniCompanionTests.xctest */,
+				100000000000000000000903 /* OmniCompanionUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		100000000000000000000004 /* OmniCompanion */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000101 /* OmniCompanionApp.swift */,
+				100000000000000000000106 /* ContentView.swift */,
+				100000000000000000000105 /* CompanionViewModel.swift */,
+				100000000000000000000104 /* GatewayClient.swift */,
+				100000000000000000000102 /* Models.swift */,
+				100000000000000000000103 /* KeychainStore.swift */,
+				100000000000000000000107 /* Info.plist */,
+			);
+			path = OmniCompanion;
+			sourceTree = "<group>";
+		};
+		100000000000000000000005 /* OmniCompanionTests */ = {
+			isa = PBXGroup;
+			children = (100000000000000000000108 /* GatewayClientTests.swift */,);
+			path = OmniCompanionTests;
+			sourceTree = "<group>";
+		};
+		100000000000000000000006 /* OmniCompanionUITests */ = {
+			isa = PBXGroup;
+			children = (100000000000000000000109 /* CompanionSmokeTests.swift */,);
+			path = OmniCompanionUITests;
+			sourceTree = "<group>";
+		};
+		100000000000000000000007 /* Legal */ = {
+			isa = PBXGroup;
+			children = (
+				100000000000000000000110 /* LICENSE.md */,
+				100000000000000000000111 /* COMMERCIAL_LICENSE.md */,
+				100000000000000000000112 /* THIRD_PARTY_NOTICES.md */,
+				100000000000000000000113 /* licenses */,
+			);
+			name = Legal;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		100000000000000000000401 /* OmniCompanion */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000701 /* Build configuration list for PBXNativeTarget "OmniCompanion" */;
+			buildPhases = (
+				100000000000000000000510 /* Sources */,
+				100000000000000000000511 /* Frameworks */,
+				100000000000000000000512 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = OmniCompanion;
+			productName = "Omni AGI Companion";
+			productReference = 100000000000000000000901 /* Omni AGI Companion.app */;
+			productType = "com.apple.product-type.application";
+		};
+		100000000000000000000402 /* OmniCompanionTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000702 /* Build configuration list for PBXNativeTarget "OmniCompanionTests" */;
+			buildPhases = (
+				100000000000000000000520 /* Sources */,
+				100000000000000000000521 /* Frameworks */,
+				100000000000000000000522 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = (100000000000000000000801 /* PBXTargetDependency */,);
+			name = OmniCompanionTests;
+			productName = OmniCompanionTests;
+			productReference = 100000000000000000000902 /* OmniCompanionTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		100000000000000000000403 /* OmniCompanionUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000703 /* Build configuration list for PBXNativeTarget "OmniCompanionUITests" */;
+			buildPhases = (
+				100000000000000000000530 /* Sources */,
+				100000000000000000000531 /* Frameworks */,
+				100000000000000000000532 /* Resources */,
+			);
+			buildRules = ();
+			dependencies = (100000000000000000000802 /* PBXTargetDependency */,);
+			name = OmniCompanionUITests;
+			productName = OmniCompanionUITests;
+			productReference = 100000000000000000000903 /* OmniCompanionUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		100000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1660;
+				LastUpgradeCheck = 1660;
+				TargetAttributes = {
+					100000000000000000000401 = {CreatedOnToolsVersion = 16.4; };
+					100000000000000000000402 = {CreatedOnToolsVersion = 16.4; TestTargetID = 100000000000000000000401; };
+					100000000000000000000403 = {CreatedOnToolsVersion = 16.4; TestTargetID = 100000000000000000000401; };
+				};
+			};
+			buildConfigurationList = 100000000000000000000700 /* Build configuration list for PBXProject "OmniCompanion" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base,);
+			mainGroup = 100000000000000000000002;
+			productRefGroup = 100000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				100000000000000000000401 /* OmniCompanion */,
+				100000000000000000000402 /* OmniCompanionTests */,
+				100000000000000000000403 /* OmniCompanionUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		100000000000000000000512 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000209 /* LICENSE.md in Resources */,
+				100000000000000000000210 /* COMMERCIAL_LICENSE.md in Resources */,
+				100000000000000000000211 /* THIRD_PARTY_NOTICES.md in Resources */,
+				100000000000000000000212 /* licenses in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		100000000000000000000522 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000532 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		100000000000000000000510 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000201 /* OmniCompanionApp.swift in Sources */,
+				100000000000000000000202 /* Models.swift in Sources */,
+				100000000000000000000203 /* KeychainStore.swift in Sources */,
+				100000000000000000000204 /* GatewayClient.swift in Sources */,
+				100000000000000000000205 /* CompanionViewModel.swift in Sources */,
+				100000000000000000000206 /* ContentView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		100000000000000000000520 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000207 /* GatewayClientTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		100000000000000000000530 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (100000000000000000000208 /* CompanionSmokeTests.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		100000000000000000000801 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 100000000000000000000401 /* OmniCompanion */; targetProxy = 100000000000000000000810 /* PBXContainerItemProxy */; };
+		100000000000000000000802 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 100000000000000000000401 /* OmniCompanion */; targetProxy = 100000000000000000000811 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		100000000000000000000601 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; IPHONEOS_DEPLOYMENT_TARGET = 16.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; }; name = Debug; };
+		100000000000000000000602 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; IPHONEOS_DEPLOYMENT_TARGET = 16.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; VALIDATE_PRODUCT = YES; }; name = Release; };
+		100000000000000000000611 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 10100; DEVELOPMENT_TEAM = ""; ENABLE_PREVIEWS = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = OmniCompanion/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.1.0; PRODUCT_BUNDLE_IDENTIFIER = ai.omniagi.companion; PRODUCT_NAME = "Omni AGI Companion"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		100000000000000000000612 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 10100; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = OmniCompanion/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.1.0; PRODUCT_BUNDLE_IDENTIFIER = ai.omniagi.companion; PRODUCT_NAME = "Omni AGI Companion"; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		100000000000000000000621 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 16.0; PRODUCT_BUNDLE_IDENTIFIER = ai.omniagi.companion.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Omni AGI Companion.app/Omni AGI Companion"; }; name = Debug; };
+		100000000000000000000622 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 16.0; PRODUCT_BUNDLE_IDENTIFIER = ai.omniagi.companion.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Omni AGI Companion.app/Omni AGI Companion"; }; name = Release; };
+		100000000000000000000631 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 16.0; PRODUCT_BUNDLE_IDENTIFIER = ai.omniagi.companion.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = OmniCompanion; }; name = Debug; };
+		100000000000000000000632 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 16.0; PRODUCT_BUNDLE_IDENTIFIER = ai.omniagi.companion.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; TEST_TARGET_NAME = OmniCompanion; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		100000000000000000000700 /* Build configuration list for PBXProject "OmniCompanion" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000601 /* Debug */, 100000000000000000000602 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		100000000000000000000701 /* Build configuration list for PBXNativeTarget "OmniCompanion" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000611 /* Debug */, 100000000000000000000612 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		100000000000000000000702 /* Build configuration list for PBXNativeTarget "OmniCompanionTests" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000621 /* Debug */, 100000000000000000000622 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		100000000000000000000703 /* Build configuration list for PBXNativeTarget "OmniCompanionUITests" */ = {isa = XCConfigurationList; buildConfigurations = (100000000000000000000631 /* Debug */, 100000000000000000000632 /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = 100000000000000000000001 /* Project object */;
+}

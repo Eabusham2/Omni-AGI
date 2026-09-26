@@ -4,6 +4,7 @@ import array
 import base64
 import binascii
 import copy
+import errno
 import hashlib
 import io
 import itertools
@@ -12,6 +13,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -28,16 +30,71 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .config import OmniConfig
-from .datasets import DatasetCoverage, dataset_format, iter_dataset_records
+from .capability_rehearsal import (
+    CapabilityRehearsalPolicy,
+    CapabilityScheduleState,
+    advance_schedule_state,
+    due_rehearsal_phase,
+    eligible_ground_up_rehearsal,
+    rehearse_capabilities,
+    rehearse_public_capability_routes,
+    structural_capability_schemas,
+)
+from .config import OmniConfig, safe_rounded_storage_bytes_per_second
+from .conversation_ledger import NeuralConversationLedger
+from .datasets import (
+    DatasetCoverage,
+    dataset_format,
+    dataset_record_count_hint,
+    iter_dataset_records,
+    sqlite_consistent_snapshot_sha256,
+)
+from .ground_up import (
+    GROUND_UP_ACTION_EXAMPLES,
+    GROUND_UP_V3_SOURCE_RECORDS,
+    GROUND_UP_TOOL_NEGATIVE_EXAMPLES,
+    GROUND_UP_TOOL_TRAJECTORIES,
+    current_ground_up_curriculum_manifest,
+    current_ground_up_training_receipt_contract,
+    resolve_ground_up_curriculum_manifest,
+    seal_ground_up_v3_training_manifest,
+    seal_ground_up_v3_training_receipt,
+    validate_ground_up_v3_training_manifest,
+    validate_ground_up_v3_training_receipt,
+)
 from .liquid import LiquidController
-from .modalities import ModalityHub
+from .memory_lifecycle import OrganicMemoryLifecycle
+from .modalities import (
+    IMAGINATION_MODALITIES,
+    ModalityGenerationCancelled,
+    ModalityHub,
+)
+from .media_planning import (
+    MediaGenerationMeasurements,
+    MediaOutputRequest,
+    MediaResourceDemand,
+    NeuralMediaWindows,
+    inline_media_data_url,
+    media_resource_headroom,
+    plan_media_output,
+)
 from .model import (
     ACTION_KINDS,
     TERNARY_PROJECTION_TYPES,
-    BitLinear,
+    PackedAdaptiveBitLinear as BitLinear,
     OmniDecoder,
+    packed_runtime_status,
 )
+from .offload import (
+    DurableReplayBuffer,
+    HotStateResidencyPlanner,
+    MutableStateStore,
+    NeuralStateResourcePause,
+    PagedWorkingMemory,
+    ResourcePolicy,
+    copy_mutable_state_snapshot,
+)
+from .optimizers import PackedOnlyOptimizer, adamw_for_remaining_parameters
 from .persistence import (
     EventLog,
     atomic_save_tensors,
@@ -45,28 +102,29 @@ from .persistence import (
     copy_substrate_snapshot,
     load_tensors,
     read_json,
+    snapshot_required_bytes,
     snapshot_files,
     tensor_checksum,
 )
 from .spiking import AssociativeSpikingRouter
-from .starter import (
-    STARTER_ACTION_EXAMPLES,
-    STARTER_CORPUS,
-    starter_manifest,
-)
 from .ternary_packing import (
     collect_module_ternary_tensors,
     export_module_ternary_shards,
+    inspect_module_ternary_layout,
     verify_ternary_shards,
 )
 from .tokenizer import ByteTokenizer
-from .vsa import NeuralSubstrate, SubstrateResourcePause
+from .vsa import LazyPersistedSynapses, NeuralSubstrate, SubstrateResourcePause
 
 
 ENGINE_SCHEMA_VERSION = 1
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 ACTION_PROPOSAL_CONFIDENCE = 0.62
-STARTER_ACTION_TARGET_CONFIDENCE = 0.70
+# A strict majority in one independent eight-way head is meaningful evidence,
+# unlike a random/uniform vote.  It can support a talk-to-tool recovery only
+# when the structural materializer separately proves a complete typed action.
+ACTION_INDEPENDENT_TOOL_SUPPORT_CONFIDENCE = 0.5
+NATIVE_ACTION_TARGET_CONFIDENCE = 0.70
 ACTION_KIND_EMISSION_CONFIDENCE = {
     "talk": 0.0,
     "tool": ACTION_PROPOSAL_CONFIDENCE,
@@ -76,6 +134,57 @@ ACTION_KIND_EMISSION_CONFIDENCE = {
     "learn": 0.30,
     "evolve": ACTION_PROPOSAL_CONFIDENCE,
     "stop": 0.90,
+}
+INGESTION_CHECKPOINT_FORMAT = "omni-record-ingestion-checkpoint"
+INGESTION_CHECKPOINT_VERSION = 2
+INGESTION_PARSER_CONTRACT = "omni-dataset-record-stream-v1"
+INGESTION_LEARNING_SCHEDULE_FORMAT = "omni-ingestion-learning-schedule"
+INGESTION_LEARNING_SCHEDULE_VERSION = 2
+LOCAL_TYPED_TARGET_WINDOW_POLICY = (
+    "role-bounded-causal-exact-byte-windows-v1"
+)
+INGESTION_CHECKPOINT_RECORDS = 512
+COMPLETED_INGESTION_TOMBSTONES = 256
+COMPLETED_CHAT_TURN_RECEIPTS = 256
+CHAT_TURN_RECEIPT_FORMAT = "omni-completed-chat-turn"
+COMPLETED_CHAT_SLOW_LEARNING = 256
+FRESH_ATTENTION_FORMAT = "omni-fresh-attention-boundary"
+FRESH_ATTENTION_VERSION = 1
+MEDIA_ACCUMULATOR_FORMAT = "omni-media-diagnostics"
+MEDIA_ACCUMULATOR_VERSION = 1
+MEDIA_DIAGNOSTIC_SAMPLES = 64
+MEDIA_COUNTER_MAX = (1 << 63) - 1
+# Inspection pages have no record-count ceiling.  This byte envelope keeps a
+# single JSON-RPC response below the desktop worker's protocol-line guard;
+# continuation cursors make every matching record addressable.
+SUBSTRATE_INSPECTION_TRANSPORT_BYTES = 16 * 1024 * 1024
+ALLOCATOR_OOM_MARKERS = (
+    "cuda out of memory",
+    "hip out of memory",
+    "mps backend out of memory",
+    "cannot allocate memory",
+    "can't allocate memory",
+    "std::bad_alloc",
+    "cudnn_status_alloc_failed",
+    "cuda_error_out_of_memory",
+    "not enough memory resources are available",
+    "e_outofmemory",
+    "0x8007000e",
+)
+STREAMING_CANONICAL_CHUNK_ELEMENTS = 1 << 20
+MODALITY_DECODER_STEPS = {
+    "image": 4,
+    "audio": 3,
+    "video": 3,
+}
+# The tier changes preview publication cadence only. Decoder steps, spatial
+# resolution, codec length, frame count, and final artifact quality remain the
+# exact configured values for this brain.
+MODALITY_PREVIEW_BUDGET_BY_TIER = {
+    "micro": 2,
+    "personal": 3,
+    "gpu": 4,
+    "workstation": 6,
 }
 
 
@@ -128,6 +237,41 @@ def _clone_state_to_cpu(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def is_allocator_oom_error(error: BaseException) -> bool:
+    """Recognize allocator exhaustion without treating unrelated failures as OOM.
+
+    PyTorch uses different exception classes and messages across CPU, CUDA,
+    MPS, and DirectML.  Following the chained exception is important because
+    some backends wrap the allocator error in a plain ``RuntimeError``.
+    """
+
+    current: Optional[BaseException] = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        inspected = current
+        visited.add(id(current))
+        if isinstance(inspected, MemoryError):
+            return True
+        cuda_oom = getattr(torch.cuda, "OutOfMemoryError", None)
+        if isinstance(cuda_oom, type) and isinstance(inspected, cuda_oom):
+            return True
+        if isinstance(inspected, OSError) and inspected.errno == errno.ENOMEM:
+            return True
+        message = str(inspected).strip().lower()
+        if isinstance(inspected, (RuntimeError, OSError)) and any(
+            marker in message for marker in ALLOCATOR_OOM_MARKERS
+        ):
+            return True
+        current = inspected.__cause__
+        if current is None and not inspected.__suppress_context__:
+            current = inspected.__context__
+    return False
+
+
+class ChatGenerationCancelled(RuntimeError):
+    """Raised only at a rollback-safe cooperative chat boundary."""
+
+
 class AdaptiveBrain:
     """One persistent, mutable model identity.
 
@@ -136,10 +280,15 @@ class AdaptiveBrain:
     authoritative and untouched.
     """
 
-    def __init__(self, brain_id: str, storage_path: Path, config: OmniConfig):
-        # Stable OmniCortex always uses ternary forward synapses and
-        # resource-governed structural growth.  Floating master weights remain
-        # available only to the learning algorithm.
+    def __init__(
+        self,
+        brain_id: str,
+        storage_path: Path,
+        config: OmniConfig,
+    ):
+        # Native OmniCortex keeps eligible learned synapses in packed ternary
+        # storage while higher-precision activity and control state remain
+        # separate. Structural growth is governed by live resources.
         config.ternary_weights = True
         config.spiking_dynamics = True
         config.stdp_plasticity = True
@@ -151,6 +300,37 @@ class AdaptiveBrain:
         self.storage_path = Path(storage_path).resolve()
         self.engine_path = self.storage_path / "engine"
         self.config = config
+        self.resource_policy = ResourcePolicy(
+            self.engine_path,
+            ram_reserve_bytes=config.ram_reserve_bytes,
+            disk_reserve_bytes=config.disk_reserve_bytes,
+            system_ram_share_percent=config.system_ram_share_percent,
+            storage_bytes_per_second=config.storage_bytes_per_second,
+            hardware_tier=config.hardware_tier,
+        )
+        self.state_store = MutableStateStore(
+            self.engine_path / "state", self.brain_id, self.resource_policy
+        )
+        self.mutable_state_manifest: Optional[Dict[str, Any]] = None
+        self._substrate_gc_status: Dict[str, Any] = {
+            "completed": False,
+            "reason": "no committed checkpoint yet",
+            "generationsRetained": 0,
+            "generationsRemoved": 0,
+            "blobsRemoved": 0,
+            "bytesReclaimed": 0,
+        }
+        self.resource_pause: Optional[Dict[str, Any]] = None
+        # These are runtime performance bounds, never neural-state limits.
+        # Allocator pressure may lower them without rewriting the user's
+        # hardware-derived configuration or skipping any source tokens.
+        self._runtime_train_batch_size = max(1, int(config.train_batch_size))
+        self._runtime_training_max_seq_len = max(8, int(config.max_seq_len))
+        self._allocator_oom_count = 0
+        self._optimizer_offloaded = False
+        self._optimizer_scratch_pointer: Optional[Dict[str, Any]] = None
+        self._last_pressure_scratch_at = 0.0
+        self.hot_state_residency = HotStateResidencyPlanner()
         requested_device = config.device
         self.device_backend = "cpu"
         if requested_device.lower() in {"directml", "dml", "privateuseone"}:
@@ -164,6 +344,14 @@ class AdaptiveBrain:
         elif requested_device.startswith("cuda") and torch.cuda.is_available():
             self.device = torch.device(requested_device)
             self.device_backend = "cuda"
+        elif (
+            requested_device.lower() == "mps"
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_built()
+            and torch.backends.mps.is_available()
+        ):
+            self.device = torch.device("mps")
+            self.device_backend = "mps"
         else:
             self.device = torch.device("cpu")
         torch.manual_seed(config.seed)
@@ -209,6 +397,10 @@ class AdaptiveBrain:
             for module in root_module.modules():
                 if isinstance(module, TERNARY_PROJECTION_TYPES):
                     module.ternary = True
+                    module.configure_packed_stability(
+                        enabled=config.metaplasticity,
+                        strength=config.slow_stability_strength,
+                    )
         self.memory = NeuralSubstrate(
             config.vsa_dim,
             seed=config.seed,
@@ -217,6 +409,7 @@ class AdaptiveBrain:
         self.liquid_state = torch.zeros(1, config.idea_dim, device=self.device)
         self.working_memory: List[torch.Tensor] = []
         self.workspace_items: List[Dict[str, Any]] = []
+        self.memory_lifecycle = OrganicMemoryLifecycle()
         # Temporary multi-turn language-boundary state. Long-term facts remain
         # authoritative only in the neural substrate and learned parameters;
         # this bounded ring is the explicit token working memory shown in the
@@ -228,10 +421,43 @@ class AdaptiveBrain:
             "sensorySlots": 0,
             "updatedAt": self.created_at if hasattr(self, "created_at") else _iso_now(),
         }
-        self.replay: List[torch.Tensor] = []
+        self.fresh_attention_boundary: Optional[Dict[str, Any]] = None
+        self._fresh_attention_paged_clear_pending = False
+        # Replay is durable immediately, not a capacity-limited Python list.
+        # This keeps all admitted latent examples available across RAM pressure
+        # and process restarts without silently thinning older experience.
+        self.replay = DurableReplayBuffer(
+            self.engine_path / "state" / "replay.sqlite3",
+            self.resource_policy,
+        )
+        self.paged_working_memory = PagedWorkingMemory(
+            self.engine_path / "state" / "working-memory.sqlite3",
+            self.resource_policy,
+        )
+        self.paged_working_memory_recovery: Dict[str, Any] = {
+            "committedPages": 0,
+            "rolledBackPages": 0,
+            "scratchReset": False,
+            "learningReadable": False,
+        }
         self.messages: List[Dict[str, Any]] = []
         self.traces: List[Dict[str, Any]] = []
         self.training_sources: List[Dict[str, Any]] = []
+        # A file-level desktop cursor is not sufficient for multi-gigabyte
+        # JSONL/Parquet shards.  These engine-authoritative records are
+        # committed in the same brain.json generation as the neural tensors
+        # they describe, so a retry can replay only the uncommitted suffix.
+        # The checkpoint contains counts, hashes, and neural audit summaries;
+        # it never contains source text or token ids.
+        self.ingestion_checkpoints: Dict[str, Dict[str, Any]] = {}
+        self.completed_ingestions: List[Dict[str, Any]] = []
+        self.completed_chat_turns: List[Dict[str, Any]] = []
+        # Every accepted turn enters fast episodic neural state. Slow replay
+        # jobs are checkpointed beside that state so cortical consolidation
+        # can be preempted/retried without loss or duplicate optimizer steps.
+        self.pending_chat_slow_learning: List[Dict[str, Any]] = []
+        self.completed_chat_slow_learning: List[str] = []
+        self._ingestion_checkpoint_records = INGESTION_CHECKPOINT_RECORDS
         self.created_at = _iso_now()
         self.updated_at = self.created_at
         self.counters: Dict[str, int] = {
@@ -257,62 +483,529 @@ class AdaptiveBrain:
             "video": 0,
         }
         self.installed_modality_packs: List[Dict[str, Any]] = []
-        self.starter_training_manifest: Optional[Dict[str, Any]] = None
+        # Every build uses the native, randomly initialized core.
+        self.ground_up_training_manifest: Optional[Dict[str, Any]] = None
         self.packed_ternary_manifest: Optional[Dict[str, Any]] = None
         self._starter_action_language_cache: Optional[torch.Tensor] = None
         self._starter_action_internal_cache: Optional[torch.Tensor] = None
         self._starter_action_target_cache: Optional[torch.Tensor] = None
-        self._bundled_origin_verified = False
+        self._starter_records_visited = 0
+        self._ground_up_action_origin_verified = False
         self.novelty_streak = 0
         self.growth_pause: Optional[Dict[str, Any]] = None
         self.last_activity_decay = time.time()
         self.last_idle_cycle_at = 0.0
+        # Prompt-free recurrent activity may run frequently, but surfacing an
+        # unsolicited message or external action every cycle is not organic
+        # behavior.  This persisted refractory timestamp leaves the internal
+        # neural dynamics active while spacing user-visible initiative.  It is
+        # a desktop attention safeguard, not a personality/curiosity control.
+        self.last_idle_visible_action_at = 0.0
         self.slow_anchors: Dict[str, torch.Tensor] = {}
         self.slow_importance: Dict[str, torch.Tensor] = {}
         self._sync_stability_state()
         self._optimizer = self._new_optimizer()
         self.events = EventLog(self.engine_path / "events.sqlite3", self.brain_id)
+        self.conversation = NeuralConversationLedger(
+            self.engine_path / "conversation.sqlite3",
+            self.brain_id,
+        )
+
+    def close(self) -> None:
+        self.conversation.close()
+        self.events.close()
 
     def _trainable_modules(self) -> Iterable[nn.Module]:
-        return (
+        modules: List[nn.Module] = [
             self.decoder,
             self.memory_bridge,
             self.idea_adapter,
             self.router,
             self.liquid,
             self.modalities,
-        )
+        ]
+        return tuple(modules)
+
+    @staticmethod
+    def _learned_parameter_tensors(
+        modules: Iterable[nn.Module],
+    ) -> Iterator[torch.Tensor]:
+        """Yield each learned tensor once, including packed ternary synapses.
+
+        A packed-authoritative projection has no floating ``Parameter`` for
+        its weights. Counting or hashing only ``module.parameters()`` would
+        falsely report no cortical learning even while its synapses change.
+        Scales, online rates, activity, and eligibility are not extra learned
+        synapses and are deliberately excluded here.
+        """
+
+        seen: set[int] = set()
+        for root in modules:
+            for parameter in root.parameters():
+                identity = id(parameter)
+                if identity not in seen:
+                    seen.add(identity)
+                    yield parameter
+            for child in root.modules():
+                packed_tensors = getattr(
+                    child, "authoritative_packed_tensors", None
+                )
+                if not callable(packed_tensors):
+                    continue
+                for tensor in packed_tensors():
+                    if not isinstance(tensor, torch.Tensor):
+                        raise TypeError("packed synapse owner returned a non-tensor")
+                    identity = id(tensor)
+                    if identity not in seen:
+                        seen.add(identity)
+                        yield tensor
+
+    @staticmethod
+    def _packed_logical_parameter_count(modules: Iterable[nn.Module]) -> int:
+        seen: set[int] = set()
+        total = 0
+        for root in modules:
+            for child in root.modules():
+                identity = id(child)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                count = getattr(child, "logical_ternary_parameter_count", 0)
+                total += int(count() if callable(count) else count)
+        return total
 
     def _new_optimizer(
         self, learning_rate: Optional[float] = None
-    ) -> torch.optim.Optimizer:
+    ) -> torch.optim.Optimizer | PackedOnlyOptimizer:
+        base_learning_rate = max(
+            1e-6,
+            min(
+                0.02,
+                float(
+                    self.config.learning_rate
+                    if learning_rate is None
+                    else learning_rate
+                ),
+            ),
+        )
         parameters = []
         for module in self._trainable_modules():
-            parameters.extend(parameter for parameter in module.parameters())
-        return torch.optim.AdamW(
-            parameters,
-            lr=max(
-                1e-6,
-                min(0.02, float(learning_rate or self.config.learning_rate)),
-            ),
+            parameters.extend(module.parameters())
+        groups: List[Dict[str, Any]] = [
+            {"params": parameters, "lr": base_learning_rate}
+        ]
+        return adamw_for_remaining_parameters(
+            groups,
+            lr=base_learning_rate,
             weight_decay=self.config.weight_decay,
         )
 
+    def _replace_optimizer(
+        self, learning_rate: Optional[float] = None
+    ) -> torch.optim.Optimizer | PackedOnlyOptimizer:
+        """Install a fresh optimizer and retire any stale offload pointer."""
+
+        self._optimizer = self._new_optimizer(learning_rate)
+        self._optimizer_offloaded = False
+        self._optimizer_scratch_pointer = None
+        return self._optimizer
+
+    def _load_optimizer_state(self, state: Mapping[str, Any]) -> bool:
+        """Load moments for the single native OmniCortex optimizer."""
+
+        self._optimizer.load_state_dict(copy.deepcopy(dict(state)))
+        return False
+
+    def _ensure_optimizer_resident(self) -> None:
+        """Rehydrate Adam moments from safe-tensor scratch on demand."""
+
+        if not self._optimizer_offloaded:
+            return
+        if self._optimizer_scratch_pointer is None:
+            raise RuntimeError("optimizer is offloaded without a durable pointer")
+        state = self.state_store.load_pressure_optimizer(
+            self._optimizer_scratch_pointer
+        )
+        if not isinstance(state, Mapping):
+            raise ValueError("pressure optimizer state is invalid")
+        self._optimizer.load_state_dict(dict(state))
+        self._optimizer_offloaded = False
+
+    def _activation_scratch_tensors(self) -> Dict[str, torch.Tensor]:
+        tensors = {"state.liquid": self.liquid_state.detach()}
+        if self.working_memory:
+            tensors["state.working_memory"] = torch.stack(
+                self.working_memory
+            )
+        for name, value in self.router.state_dict().items():
+            tensors["router." + name] = value.detach()
+        return tensors
+
+    def _memory_pressure_wait(
+        self,
+        readings: Mapping[str, Any],
+        *,
+        stage: str,
+        retry_after_seconds: int = 5,
+        detail: str = "",
+    ) -> Dict[str, Any]:
+        """Publish a recoverable wait without changing persisted capacity."""
+
+        status = {
+            **dict(readings),
+            "mode": "memory-pressure-wait-retry",
+            "paused": True,
+            "recoverable": True,
+            "waitForMemory": True,
+            "retryAfterSeconds": max(1, int(retry_after_seconds)),
+            "pressureStage": str(stage),
+            "configuredContextTokens": int(self.config.max_seq_len),
+            "configuredCapacityPreserved": True,
+            "capacityPersistsAcrossPressure": True,
+            "contextWindowShrunk": False,
+            "contextPagedToStorage": False,
+            "activeCortexResident": True,
+            "userAction": (
+                "Close memory-heavy applications, wait for memory to become "
+                "available, then retry. Omni keeps the saved context capacity."
+            ),
+            "detail": str(detail),
+        }
+        reason = (
+            "memory pressure paused %s; close memory-heavy applications, "
+            "then retry without reducing the saved context capacity" % stage
+        )
+        self.resource_pause = {
+            "reason": reason,
+            "readings": status,
+            "at": _iso_now(),
+        }
+        return status
+
+    def _maintain_neural_state_resources(self) -> Dict[str, Any]:
+        """Spill transient neural state when the adaptive RAM reserve is near.
+
+        Replay is always disk-backed. Under pressure this additionally writes
+        optimizer moments and activation/recurrent scratch, then releases the
+        resident optimizer state and accelerator allocator caches. The next
+        optimizer use transparently rehydrates the exact moments.
+        """
+
+        status = self.resource_policy.status()
+        if status["diskPressure"]:
+            self.resource_pause = {
+                "reason": "available disk reached the neural-state reserve",
+                "readings": status,
+                "at": _iso_now(),
+            }
+            return self._state_offload_status(status)
+        if (
+            status["memoryPressure"]
+            and self.config.disk_state_offload
+        ):
+            training_plan = self._training_resource_plan()
+            scratch_plan = dict(training_plan["scratch"])
+            if not bool(scratch_plan["available"]):
+                wait = self._memory_pressure_wait(
+                    {
+                        **status,
+                        "trainingResourcePlan": training_plan,
+                    },
+                    stage="neural-state offload",
+                    detail=(
+                        "No safe emergency-checkpoint space remains above "
+                        "the mandatory disk reserve."
+                    ),
+                )
+                return self._state_offload_status(wait)
+            now = time.monotonic()
+            minimum_interval = float(
+                scratch_plan["minimumWriteIntervalSeconds"]
+            )
+            if (
+                not self._optimizer_offloaded
+                and self._optimizer_scratch_pointer is not None
+                and now - self._last_pressure_scratch_at < minimum_interval
+            ):
+                # Keep the newer state in RAM and pause before another step.
+                # Rewriting full optimizer moments every microbatch would turn
+                # an HDD into a seek bottleneck and needlessly wear an SSD.
+                wait = self._memory_pressure_wait(
+                    {
+                        **status,
+                        "trainingResourcePlan": training_plan,
+                        "scratchRetryAfterSeconds": max(
+                            0,
+                            int(
+                                minimum_interval
+                                - (now - self._last_pressure_scratch_at)
+                            ),
+                        ),
+                    },
+                    stage="neural-state checkpoint",
+                    retry_after_seconds=max(
+                        1,
+                        int(
+                            minimum_interval
+                            - (now - self._last_pressure_scratch_at)
+                        ),
+                    ),
+                    detail=(
+                        "The newer optimizer state remains in RAM until the "
+                        "rate-limited sequential scratch write is eligible."
+                    ),
+                )
+                return self._state_offload_status(wait)
+            if self._optimizer_offloaded:
+                if self._optimizer_scratch_pointer is None:
+                    raise RuntimeError(
+                        "optimizer is offloaded without durable scratch"
+                    )
+                # The cold optimizer moments are already durable and absent
+                # from RAM. Rewriting the same full blob under sustained
+                # pressure would only wear storage and cannot free more RAM.
+                wait = self._memory_pressure_wait(
+                    status,
+                    stage="neural execution",
+                    detail=(
+                        "Eligible optimizer moments are already paged; active "
+                        "cortex and attention state remain resident."
+                    ),
+                )
+                return self._state_offload_status(wait)
+            else:
+                optimizer_state = _clone_state_to_cpu(
+                    self._optimizer.state_dict()
+                )
+            pointer = self.state_store.save_pressure_scratch(
+                optimizer_state=optimizer_state,
+                activations=self._activation_scratch_tensors(),
+                metadata={
+                    "brainId": self.brain_id,
+                    "parameterChecksum": self.parameter_checksum(),
+                    "substrateContentSha256": str(
+                        (self.memory.persistence_manifest or {}).get(
+                            "contentSha256", ""
+                        )
+                    ),
+                    "trainingSteps": self.counters["training_steps"],
+                    "reason": "adaptive RAM reserve",
+                    "ioMode": "bounded-sequential-emergency-checkpoint",
+                    "sequentialChunkBytes": scratch_plan[
+                        "sequentialChunkBytes"
+                    ],
+                    "minimumWriteIntervalSeconds": minimum_interval,
+                },
+            )
+            if not self._optimizer_offloaded:
+                self._optimizer.state.clear()
+            self._optimizer_scratch_pointer = dict(pointer)
+            self._optimizer_offloaded = True
+            self._last_pressure_scratch_at = now
+            if self.device_backend == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Do not invoke the MPS allocator cache-clear API: it clears MPSGraphCache and
+            # can deallocate a graph still executing on another runtime queue.
+            # Unified-memory pressure remains governed by the live policy and
+            # pauses truthfully when offloading alone does not restore reserve.
+            post_status = self.resource_policy.status()
+            if bool(post_status.get("memoryPressure")):
+                post_status = self._memory_pressure_wait(
+                    post_status,
+                    stage="neural execution",
+                    detail=(
+                        "Cold optimizer moments were paged successfully, but "
+                        "the current live RAM watermark is still unavailable."
+                    ),
+                )
+            else:
+                self.resource_pause = None
+            return self._state_offload_status(post_status)
+        if status["memoryPressure"]:
+            wait = self._memory_pressure_wait(
+                status,
+                stage="neural execution",
+                detail=(
+                    "Disk state offload is unavailable; active cortex state "
+                    "was kept intact."
+                ),
+            )
+            return self._state_offload_status(wait)
+        self.resource_pause = None
+        return self._state_offload_status(status)
+
+    def _state_offload_status(
+        self, resource_status: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
+        readings = dict(resource_status or self.resource_policy.status())
+        replay_status = self.replay.status()
+        system_budget = readings.get("systemRamBudgetBytes")
+        process_memory = readings.get("processMemoryBytes")
+        resident_budget: Optional[int] = None
+        if isinstance(system_budget, int) and isinstance(process_memory, int):
+            # Metadata-rich sparse records vary in size; 1 KiB is a
+            # conservative ordering estimate, not a cardinality ceiling.
+            resident_budget = max(
+                0, (system_budget - process_memory) // 1024
+            )
+        unfinished_ids = [
+            str(item.get("assemblyId", ""))
+            for item in self.workspace_items
+            if isinstance(item, Mapping) and item.get("assemblyId")
+        ]
+        residency = self.hot_state_residency.update(
+            neurons=self.memory.neurons,
+            assemblies=self.memory.assemblies,
+            synapses=self.memory.synapses,
+            unfinished_ids=unfinished_ids,
+            attention_active_ids=(
+                self.memory.attention_active_neuron_ids
+                | self.memory.attention_eligible_synapse_ids
+            ),
+            attention_legacy_raw_active=(
+                self.memory.attention_legacy_raw_active
+            ),
+            resident_budget=resident_budget,
+            paged_assembly_ids=(
+                ()
+                if self._fresh_attention_paged_clear_pending
+                else self.paged_working_memory.assembly_ids()
+            ),
+        )
+        paged_status = self.paged_working_memory.status()
+        if self._fresh_attention_paged_clear_pending:
+            paged_status = {**paged_status, "count": 0}
+        return {
+            "mode": "transactional-disk-backed",
+            "enabled": self.config.disk_state_offload,
+            "replay": replay_status,
+            "optimizer": {
+                "durable": self.mutable_state_manifest is not None
+                or self._optimizer_scratch_pointer is not None,
+                "resident": not self._optimizer_offloaded,
+                "pressureScratch": self._optimizer_scratch_pointer,
+                "serialization": "safe-tensors+typed-json",
+            },
+            "activationScratch": {
+                "durableOnPressure": True,
+                "mirroredNotEvicted": True,
+                "includes": [
+                    "liquid recurrent state",
+                    "working-memory vectors",
+                    "router spike/STDP state",
+                ],
+            },
+            "workingMemoryPaging": paged_status,
+            "hotStateResidency": residency,
+            "pagingSemantics": {
+                "contextPagedToStorage": False,
+                "capacityPersistsAcrossPressure": True,
+                "storagePoolShareRule": "largest-brain-not-sum",
+                "activeCortexResident": True,
+                "hotRamPriority": [
+                    "currently firing",
+                    "frequently used",
+                    "stable or rooted",
+                    "unfinished activity",
+                ],
+                "spillOrder": [
+                    "cold scratch trail",
+                    "replay batches",
+                    "optimizer moments",
+                    "inactive working patterns",
+                ],
+            },
+            "configuredWorkingMemorySpillBytes": self.config.memory_offload_bytes,
+            "estimatedStorageSlowdownPercent": (
+                self.config.memory_offload_slowdown_percent
+            ),
+            "checkpoint": {
+                "activeGeneration": (
+                    self.mutable_state_manifest or {}
+                ).get("activeGeneration"),
+                "contentAddressed": True,
+                "atomicPointer": True,
+                "lastRecovery": dict(self.state_store.last_recovery),
+                "garbageCollection": {
+                    "mutableState": dict(self.state_store.last_gc),
+                    "substrate": dict(self._substrate_gc_status),
+                },
+            },
+            "resources": readings,
+            "paused": self.resource_pause is not None
+            or bool(readings.get("diskPressure")),
+            "pause": self.resource_pause,
+        }
+
     def _named_slow_parameters(self) -> Dict[str, nn.Parameter]:
         named: Dict[str, nn.Parameter] = {}
-        for prefix, module in (
+        modules: List[Tuple[str, nn.Module]] = [
             ("decoder", self.decoder),
             ("memory_bridge", self.memory_bridge),
             ("idea_adapter", self.idea_adapter),
+            ("router", self.router),
             ("liquid", self.liquid),
             ("modalities", self.modalities),
-        ):
+        ]
+        for prefix, module in modules:
             for name, parameter in module.named_parameters():
                 named["%s.%s" % (prefix, name)] = parameter
         return named
 
+    def _configure_packed_stability(self) -> None:
+        """Apply the saved stability policy to newly grown packed modules."""
+
+        for root in self._trainable_modules():
+            for module in root.modules():
+                if isinstance(module, TERNARY_PROJECTION_TYPES):
+                    module.configure_packed_stability(
+                        enabled=self.config.metaplasticity,
+                        strength=self.config.slow_stability_strength,
+                    )
+
+    def _named_native_core_tensors(self) -> Dict[str, torch.Tensor]:
+        """Name actual mutable weights for origin training receipts.
+
+        The old receipt enumerated only ``nn.Parameter`` objects, so a packed
+        layer could change its real ternary synapses while the receipt claimed
+        that no native weight changed. Keep metaplastic float anchors separate.
+        """
+
+        roots: List[Tuple[str, nn.Module]] = [
+            ("decoder", self.decoder),
+            ("memory_bridge", self.memory_bridge),
+            ("idea_adapter", self.idea_adapter),
+            ("router", self.router),
+            ("liquid", self.liquid),
+            ("modalities", self.modalities),
+        ]
+        named: Dict[str, torch.Tensor] = {}
+        for prefix, root in roots:
+            for name, parameter in root.named_parameters():
+                named["%s.%s" % (prefix, name)] = parameter
+            for path, child in root.named_modules():
+                packed_tensors = getattr(
+                    child, "authoritative_packed_tensors", None
+                )
+                if not callable(packed_tensors):
+                    continue
+                for index, tensor in enumerate(packed_tensors()):
+                    name = "%s.%s%s%s" % (
+                        prefix,
+                        path + "." if path else "",
+                        "packed_synapses",
+                        "" if index == 0 else ".%d" % index,
+                    )
+                    named[name] = tensor
+        return named
+
     def _sync_stability_state(self) -> None:
-        """Keep EWC-like anchors aligned with dynamically grown parameters."""
+        """Keep legacy floating anchors aligned if any remain.
+
+        A native all-packed brain has no such parameters. Its live retention
+        mechanism is per-row uint8 resistance applied in packed updates, not
+        a fictitious differentiable FP32 anchor penalty.
+        """
 
         named = self._named_slow_parameters()
         for name, parameter in named.items():
@@ -330,6 +1023,8 @@ class AdaptiveBrain:
     def _stability_penalty(
         self, parameters: Optional[Iterable[nn.Parameter]] = None
     ) -> torch.Tensor:
+        # Packed synapses receive their resistance in the direct stochastic
+        # transition, where a differentiable weight penalty cannot act.
         named = self._named_slow_parameters()
         allowed = None if parameters is None else {id(item) for item in parameters}
         terms: List[torch.Tensor] = []
@@ -355,6 +1050,12 @@ class AdaptiveBrain:
     ) -> None:
         if not self.config.metaplasticity:
             return
+        # Packed projections do not have an FP32 weight Parameter, so the
+        # differentiable EWC path below is intentionally empty for an all-
+        # ternary brain. Their row-wise uint8 resistance is updated directly
+        # during a successful packed synapse transition; count only those
+        # actual updates, never a no-op floating-anchor call.
+        self._drain_packed_stability_events()
         allowed = None if parameters is None else {id(item) for item in parameters}
         decay = self.config.slow_importance_decay
         self._sync_stability_state()
@@ -375,6 +1076,17 @@ class AdaptiveBrain:
         if updated:
             self.counters["metaplastic_updates"] += 1
 
+    def _drain_packed_stability_events(self) -> int:
+        events = 0
+        for root in self._trainable_modules():
+            for module in root.modules():
+                drain = getattr(module, "drain_packed_stability_events", None)
+                if callable(drain):
+                    events += int(drain())
+        if events:
+            self.counters["metaplastic_updates"] += events
+        return events
+
     def _commit_slow_anchors(
         self,
         rate: float = 1.0,
@@ -390,6 +1102,33 @@ class AdaptiveBrain:
                 continue
             current = parameter.detach().float().cpu()
             self.slow_anchors[name].lerp_(current, rate)
+
+    def _packed_stability_accounting(self) -> Dict[str, Any]:
+        modules = 0
+        bytes_resident = 0
+        for root in self._trainable_modules():
+            for module in root.modules():
+                status = getattr(module, "packed_stability_status", None)
+                if not callable(status):
+                    continue
+                value = status()
+                modules += 1
+                bytes_resident += int(value["metaplasticityCheckpointBytes"])
+        return {
+            "format": "bounded-uint8-output-row-resistance",
+            "formatVersion": 1,
+            "enabled": bool(
+                self.config.metaplasticity
+                and self.config.slow_stability_strength > 0.0
+            ),
+            "moduleCount": modules,
+            "checkpointBytes": bytes_resident,
+            "maximumLevel": 15,
+            "residentFp32SynapseShadow": False,
+            "counterMeaning": "packed mutation transactions with row resistance updated",
+            "retentionScope": "output-row learning-rate resistance, not exact prior-weight anchors",
+            "guaranteesNoForgetting": False,
+        }
 
     def _stability_copy(
         self,
@@ -415,20 +1154,28 @@ class AdaptiveBrain:
     def _slow_transaction_modules(self) -> Dict[str, nn.Module]:
         """Modules which the online chat slow-learning phase may mutate."""
 
-        return {
+        modules: Dict[str, nn.Module] = {
             "decoder": self.decoder,
             "memory_bridge": self.memory_bridge,
             "idea_adapter": self.idea_adapter,
             "liquid": self.liquid,
         }
+        return modules
 
     def _slow_parameter_checksum(self) -> str:
         return tensor_checksum(
-            [
-                parameter
-                for module in self._slow_transaction_modules().values()
-                for parameter in module.parameters()
-            ]
+            self._learned_parameter_tensors(
+                self._slow_transaction_modules().values()
+            )
+        )
+
+    def _cortical_parameter_checksum(self) -> str:
+        """Hash the trainable cortical modules."""
+
+        return tensor_checksum(
+            self._learned_parameter_tensors(
+                self._slow_transaction_modules().values()
+            )
         )
 
     def _snapshot_slow_transaction_state(self) -> Dict[str, Any]:
@@ -439,18 +1186,46 @@ class AdaptiveBrain:
         gradient/growth work without erasing the valid fast experience.
         """
 
+        optimizer_was_offloaded = bool(self._optimizer_offloaded)
+        optimizer_scratch_pointer = copy.deepcopy(
+            self._optimizer_scratch_pointer
+        )
+        self._ensure_optimizer_resident()
+        slow_modules = self._slow_transaction_modules()
         cuda_rng_state = None
         if self.device_backend == "cuda" and torch.cuda.is_available():
             cuda_rng_state = [
                 value.clone() for value in torch.cuda.get_rng_state_all()
             ]
+        mps_rng_state = None
+        if (
+            self.device_backend == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "get_rng_state")
+        ):
+            mps_rng_state = torch.mps.get_rng_state().clone()
         return {
             "modules": {
                 name: {
                     key: value.detach().cpu().clone()
                     for key, value in module.state_dict().items()
                 }
-                for name, module in self._slow_transaction_modules().items()
+                for name, module in slow_modules.items()
+            },
+            "module_training": {
+                name: {
+                    submodule_name: bool(submodule.training)
+                    for submodule_name, submodule in module.named_modules()
+                }
+                for name, module in slow_modules.items()
+            },
+            "packed_stability_pending": {
+                "%s.%s" % (name, path): int(
+                    child._pending_stability_events
+                )
+                for name, module in slow_modules.items()
+                for path, child in module.named_modules()
+                if hasattr(child, "_pending_stability_events")
             },
             "expert_count": int(self.decoder.expert_count),
             "optimizer": _clone_state_to_cpu(self._optimizer.state_dict()),
@@ -460,8 +1235,13 @@ class AdaptiveBrain:
             "growth_pause": copy.deepcopy(self.growth_pause),
             "cpu_rng_state": torch.random.get_rng_state().clone(),
             "cuda_rng_state": cuda_rng_state,
+            "mps_rng_state": mps_rng_state,
+            "optimizer_was_offloaded": optimizer_was_offloaded,
+            "optimizer_scratch_pointer": optimizer_scratch_pointer,
             "checksum": self._slow_parameter_checksum(),
         }
+
+
 
     def _restore_slow_transaction_state(
         self, snapshot: Mapping[str, Any]
@@ -475,19 +1255,36 @@ class AdaptiveBrain:
             self.decoder.experts = nn.ModuleList(
                 list(self.decoder.experts)[:expected_experts]
             )
-            self.decoder.expert_prototypes = nn.ParameterList(
+            self.decoder.expert_prototypes = nn.ModuleList(
                 list(self.decoder.expert_prototypes)[:expected_experts]
             )
+        self._configure_packed_stability()
 
         module_states = snapshot["modules"]
-        for name, module in self._slow_transaction_modules().items():
+        slow_modules = self._slow_transaction_modules()
+        for name, module in slow_modules.items():
             module.load_state_dict(module_states[name], strict=True)
-
+        pending_events = snapshot.get("packed_stability_pending", {})
+        for name, module in slow_modules.items():
+            for path, child in module.named_modules():
+                if hasattr(child, "_pending_stability_events"):
+                    child._pending_stability_events = int(
+                        pending_events.get("%s.%s" % (name, path), 0)
+                    )
+        stored_training = dict(snapshot.get("module_training", {}))
+        for name, module in slow_modules.items():
+            module_training = dict(stored_training.get(name, {}))
+            for submodule_name, submodule in module.named_modules():
+                if submodule_name in module_training:
+                    submodule.train(bool(module_training[submodule_name]))
         # Growth replaces the main optimizer. Rebuild it against the restored
         # parameter objects before loading the exact pre-transaction moments,
         # groups, learning rates, and step counters.
-        self._optimizer = self._new_optimizer()
+        self._replace_optimizer()
         self._optimizer.load_state_dict(copy.deepcopy(snapshot["optimizer"]))
+        for module in self._slow_transaction_modules().values():
+            for parameter in module.parameters():
+                parameter.grad = None
         self._restore_stability(snapshot["stability"])
         self.counters.clear()
         self.counters.update(snapshot["counters"])
@@ -497,6 +1294,30 @@ class AdaptiveBrain:
         cuda_rng_state = snapshot.get("cuda_rng_state")
         if cuda_rng_state is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(cuda_rng_state)
+        mps_rng_state = snapshot.get("mps_rng_state")
+        if (
+            mps_rng_state is not None
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "set_rng_state")
+        ):
+            torch.mps.set_rng_state(mps_rng_state)
+
+        optimizer_was_offloaded = bool(
+            snapshot.get("optimizer_was_offloaded", False)
+        )
+        optimizer_scratch_pointer = copy.deepcopy(
+            snapshot.get("optimizer_scratch_pointer")
+        )
+        if optimizer_was_offloaded:
+            if optimizer_scratch_pointer is None:
+                raise RuntimeError(
+                    "offloaded slow rollback is missing durable scratch"
+                )
+            self._optimizer.state.clear()
+            self._optimizer_offloaded = True
+        else:
+            self._optimizer_offloaded = False
+        self._optimizer_scratch_pointer = optimizer_scratch_pointer
 
         restored_checksum = self._slow_parameter_checksum()
         if restored_checksum != snapshot["checksum"]:
@@ -505,47 +1326,1040 @@ class AdaptiveBrain:
                 % (snapshot["checksum"], restored_checksum)
             )
 
+    def _modality_parameter_checksum(self) -> str:
+        return tensor_checksum(self._learned_parameter_tensors((self.modalities,)))
+
+    def _imagination_selector_checksum(self) -> str:
+        return tensor_checksum(
+            self._learned_parameter_tensors(
+                (self.modalities.imagination_selector,)
+            )
+        )
+
+    def _validate_ground_up_v3_training_manifest(
+        self, manifest: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Bind the sealed v3 receipt to this exact native neural state."""
+
+        try:
+            validated = validate_ground_up_v3_training_manifest(manifest)
+            receipt = validate_ground_up_v3_training_receipt(
+                validated.get("trainingReceipt")
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "OmniCortex v3 training manifest is invalid"
+            ) from error
+        accounting = self.parameter_accounting()
+        initialization = validated.get("randomInitialization")
+        architecture = validated.get("architectureScale")
+        modality_training = validated.get("modalityTraining")
+        transient_reset = validated.get("transientStateReset")
+        tool_curriculum = validated.get("toolCurriculum")
+        action_training = validated.get("actionTraining")
+        public = validated.get("publicCapabilityReadiness")
+        observed_substrate = {
+            "neurons": len(self.memory.neurons),
+            "assemblies": len(self.memory.assemblies),
+            "synapses": len(self.memory.synapses),
+        }
+        native_names = set(self._named_native_core_tensors())
+        changed_names = receipt.get("changedNativeCoreTensorNames")
+        try:
+            time.strptime(
+                str(validated.get("trainedAt", "")),
+                "%Y-%m-%dT%H:%M:%SZ",
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "OmniCortex v3 training timestamp is invalid"
+            ) from error
+        if (
+            not isinstance(initialization, Mapping)
+            or initialization.get("algorithm")
+            != "torch-seeded-module-initialization-v1"
+            or initialization.get("seed") != int(self.config.seed)
+            or initialization.get("exactParameterCount")
+            != int(accounting["mutableDenseParameters"])
+            or initialization.get("parameterChecksum")
+            != receipt.get("parameterChecksumBefore")
+            or not isinstance(architecture, Mapping)
+            or architecture.get("hardwareTier") != self.config.hardware_tier
+            or architecture.get("dimensions") != self.config.d_model
+            or architecture.get("layers") != self.config.n_layers
+            or architecture.get("feedForward") != self.config.d_ff
+            or architecture.get("vsaDimensions") != self.config.vsa_dim
+            or architecture.get("routerNeurons")
+            != self.config.router_neurons
+            or architecture.get("denseParameterCount")
+            != int(accounting["mutableDenseParameters"])
+            or architecture.get("growthCardinalityLimit") is not None
+            or architecture.get("growthBoundary")
+            != "live-resource-watermark"
+            or architecture.get("diskStateOffload")
+            is not bool(self.config.disk_state_offload)
+            or receipt.get("recordsVisited") != GROUND_UP_V3_SOURCE_RECORDS
+            or receipt.get("recordGroupsVisited")
+            != receipt.get("recordGroupsExpected")
+            or receipt.get("parameterChecksumAfter")
+            != self.parameter_checksum()
+            or receipt.get("modalityParameterChecksumBefore")
+            != self._modality_parameter_checksum()
+            or receipt.get("modalityParameterChecksumAfter")
+            != self._modality_parameter_checksum()
+            or receipt.get("imaginationSelectorChecksumBefore")
+            != self._imagination_selector_checksum()
+            or receipt.get("imaginationSelectorChecksumAfter")
+            != self._imagination_selector_checksum()
+            or receipt.get("nativeCoreParameterTensors") != len(native_names)
+            or not isinstance(changed_names, list)
+            or any(name not in native_names for name in changed_names)
+            or any(str(name).startswith("modalities.") for name in changed_names)
+            or dict(receipt.get("substrateAfter", {})) != observed_substrate
+        ):
+            raise RuntimeError(
+                "OmniCortex v3 neural checksum or architecture binding is invalid"
+            )
+        expected_enabled_modalities = [
+            name
+            for name, enabled in (
+                ("vision", self.config.vision_enabled),
+                ("image", self.config.image_enabled),
+                ("audio", self.config.audio_enabled),
+                ("video", self.config.video_enabled),
+            )
+            if enabled
+        ]
+        if (
+            not isinstance(modality_training, Mapping)
+            or modality_training.get("source")
+            != "selected-user-data-only"
+            or modality_training.get("enabledModalities")
+            != expected_enabled_modalities
+            or modality_training.get("trainedModalities") != []
+            or modality_training.get("trainingRecords") != 0
+            or modality_training.get("steps") != 0
+            or modality_training.get("parametersChanged") is not False
+            or modality_training.get("syntheticFixture") is not False
+            or not isinstance(transient_reset, Mapping)
+            or transient_reset.get("complete") is not True
+            or transient_reset.get("replayEntriesAfter") != 0
+            or transient_reset.get("workingMemoryVectorsAfter") != 0
+            or transient_reset.get("pagedWorkingMemoryAfter") != 0
+            or transient_reset.get("recentTokensAfter") != 0
+            or transient_reset.get("lifecycleScratchAfter") != 0
+            or transient_reset.get("lifecycleFocusAfter") != 0
+            or transient_reset.get("currentContextTokensAfter") != 0
+            or transient_reset.get("currentContextSensorySlotsAfter") != 0
+            or transient_reset.get("freshAttentionBoundaryAfter") is not None
+            or transient_reset.get("liquidStateAbsoluteSumAfter") != 0.0
+            or transient_reset.get("routerMembraneAbsoluteSumAfter") != 0.0
+            or transient_reset.get("routerPreTraceAbsoluteSumAfter") != 0.0
+            or transient_reset.get("routerPostTraceAbsoluteSumAfter") != 0.0
+            or len(self.replay) != 0
+            or self.working_memory
+            or self.workspace_items
+            or self.paged_working_memory.count() != 0
+            or self.recent_token_context
+            or self.fresh_attention_boundary is not None
+            or int(self.current_context.get("tokenCount", 0)) != 0
+            or int(self.current_context.get("sensorySlots", 0)) != 0
+            or str(self.current_context.get("tokenHash", "")) != ""
+            or self.memory_lifecycle.afterimage_items
+            or self.memory_lifecycle.active_focus
+            or float(self.liquid_state.detach().abs().sum().item()) != 0.0
+            or float(
+                self.router.population.membrane.detach().abs().sum().item()
+            )
+            != 0.0
+            or float(
+                self.router.synapses.pre_trace.detach().abs().sum().item()
+            )
+            != 0.0
+            or float(
+                self.router.synapses.post_trace.detach().abs().sum().item()
+            )
+            != 0.0
+        ):
+            raise RuntimeError(
+                "OmniCortex v3 modality or transient-state provenance is invalid"
+            )
+        all_trajectories = (
+            public.get("probe", {}).get("allToolTrajectories")
+            if isinstance(public, Mapping)
+            and isinstance(public.get("probe"), Mapping)
+            else None
+        )
+        if (
+            not isinstance(tool_curriculum, Mapping)
+            or tool_curriculum.get("ready") is not True
+            or tool_curriculum.get("recordsVisited")
+            != len(GROUND_UP_TOOL_TRAJECTORIES)
+            + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES)
+            or tool_curriculum.get("perActionCoverage") is not True
+            or not isinstance(action_training, Mapping)
+            or action_training.get("calibrated") is not True
+            or action_training.get("examples")
+            != len(GROUND_UP_ACTION_EXAMPLES)
+            or not isinstance(public, Mapping)
+            or public.get("curriculumVersion") != 3
+            or public.get("readinessProbesAreOptimizerInputs") is not False
+            or not self._public_capability_readiness_ready(public)
+            or not isinstance(all_trajectories, Mapping)
+            or all_trajectories.get("routeCount")
+            != len(GROUND_UP_TOOL_TRAJECTORIES)
+            or all_trajectories.get("negativeCount")
+            != len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES)
+        ):
+            raise RuntimeError(
+                "OmniCortex v3 tool/action capability receipt is invalid"
+            )
+        return validated
+
+    def _validate_ground_up_training_manifest(self) -> Dict[str, Any]:
+        """Authenticate the native v3 training receipt after every restart."""
+
+        if self.config.origin_kind != "ground-up":
+            raise RuntimeError("OmniCortex requires a native ground-up origin")
+        manifest = self.ground_up_training_manifest
+        if not isinstance(manifest, Mapping):
+            raise RuntimeError("OmniCortex training manifest is missing")
+        expected = resolve_ground_up_curriculum_manifest(manifest)
+        if expected is None or int(expected.get("formatVersion", 0)) != 3:
+            raise RuntimeError("unsupported native OmniCortex curriculum")
+        return self._validate_ground_up_v3_training_manifest(manifest)
+
+    @staticmethod
+    def _remove_creation_scratch(path: Path) -> None:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+    def _ground_up_origin_is_complete(self, origin: Path) -> bool:
+        required = (
+            origin / "brain.json",
+            origin / "core.safetensors",
+            origin / "plasticity.safetensors",
+            origin / "substrate" / "manifest.json",
+            origin / "state" / "manifest.json",
+            origin / "packed-ternary" / "manifest.json",
+        )
+        if not all(path.is_file() for path in required):
+            return False
+        try:
+            metadata = read_json(origin / "brain.json")
+            config = metadata.get("config")
+            manifest = metadata.get("ground_up_training_manifest")
+            resolved = resolve_ground_up_curriculum_manifest(manifest)
+            if (
+                not isinstance(config, Mapping)
+                or config.get("origin_kind") != "ground-up"
+                or not isinstance(manifest, Mapping)
+                or resolved is None
+                or manifest.get("baseFrozen") is not False
+            ):
+                return False
+            packed = verify_ternary_shards(
+                origin / "packed-ternary", retain_names=()
+            ).manifest
+            if int(resolved.get("formatVersion", 0)) >= 3:
+                validate_ground_up_v3_training_manifest(manifest)
+                packed_metadata = packed.get("metadata")
+                receipt = manifest.get("trainingReceipt")
+                if (
+                    not isinstance(packed_metadata, Mapping)
+                    or not isinstance(receipt, Mapping)
+                    or packed_metadata.get("groundUpCurriculumSha256")
+                    != resolved["sha256"]
+                    or packed_metadata.get("groundUpTrainingManifestSha256")
+                    != manifest.get("contentSha256")
+                    or packed_metadata.get("groundUpTrainingReceiptSha256")
+                    != receipt.get("contentSha256")
+                    or packed_metadata.get("parameterChecksum")
+                    != receipt.get("parameterChecksumAfter")
+                    or packed_metadata.get("originKind") != "ground-up"
+                    or packed_metadata.get("baseFrozen") is not False
+                ):
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+
+    def _materialize_ground_up_origin(self) -> Path:
+        """Atomically finish or recover the immutable new-build origin."""
+
+        origin = self.engine_path / "origin"
+        if self._ground_up_origin_is_complete(origin):
+            return origin
+        # Replacing an incomplete creation artifact is safe only before any
+        # conversation/inference could have changed the current checkpoint.
+        if self.messages or int(self.counters.get("inference_count", 0)) != 0:
+            raise RuntimeError(
+                "an incomplete verified origin cannot be rebuilt after inference"
+            )
+        origin_write_bytes = snapshot_required_bytes(
+            self.engine_path,
+            include_packed_ternary=True,
+        )
+        self.resource_policy.require_disk(
+            origin_write_bytes,
+            "verified OmniCortex origin",
+        )
+        temporary = self.engine_path / (".origin-%s.next" % uuid.uuid4().hex)
+        previous = self.engine_path / (".origin-%s.previous" % uuid.uuid4().hex)
+        replaced_previous = False
+        try:
+            snapshot_files(self.engine_path, temporary)
+            shutil.copytree(
+                self.engine_path / "packed-ternary",
+                temporary / "packed-ternary",
+            )
+            if origin.exists():
+                os.replace(str(origin), str(previous))
+                replaced_previous = True
+            os.replace(str(temporary), str(origin))
+            if not self._ground_up_origin_is_complete(origin):
+                raise RuntimeError("verified origin check failed")
+            if replaced_previous:
+                self._remove_creation_scratch(previous)
+                replaced_previous = False
+            return origin
+        except Exception:
+            self._remove_creation_scratch(temporary)
+            if replaced_previous and previous.exists() and not origin.exists():
+                os.replace(str(previous), str(origin))
+                replaced_previous = False
+            raise
+        finally:
+            if replaced_previous:
+                self._remove_creation_scratch(previous)
+
+    def _ground_up_readiness_checks(
+        self,
+        packed: Mapping[str, Any],
+        origin: Path,
+    ) -> Dict[str, bool]:
+        validated_training_manifest = self._validate_ground_up_training_manifest()
+        resolved_curriculum = resolve_ground_up_curriculum_manifest(
+            validated_training_manifest
+        )
+        v3_protocol = bool(
+            resolved_curriculum is not None
+            and int(resolved_curriculum.get("formatVersion", 0)) >= 3
+        )
+        manifest = packed.get("manifest")
+        packed_metadata = (
+            manifest.get("metadata")
+            if isinstance(manifest, Mapping)
+            else None
+        )
+        training_receipt = validated_training_manifest.get("trainingReceipt")
+        modalities_ready = (
+            all(
+                bool(torch.isfinite(parameter).all())
+                for parameter in self.modalities.parameters()
+            )
+            and isinstance(training_receipt, Mapping)
+            and training_receipt.get("modalityParametersChanged") is False
+            and training_receipt.get("imaginationSelectorParametersChanged")
+            is False
+        ) if v3_protocol else all(
+            self.modality_training[name] > 0
+            for name, enabled in (
+                ("vision", self.config.vision_enabled),
+                ("image", self.config.image_enabled),
+                ("audio", self.config.audio_enabled),
+                ("video", self.config.video_enabled),
+            )
+            if enabled
+        )
+        packed_provenance_ready = (
+            isinstance(packed_metadata, Mapping)
+            and isinstance(training_receipt, Mapping)
+            and resolved_curriculum is not None
+            and packed_metadata.get("groundUpCurriculumSha256")
+            == resolved_curriculum["sha256"]
+            and (
+                not v3_protocol
+                or (
+                    packed_metadata.get("groundUpTrainingManifestSha256")
+                    == validated_training_manifest.get("contentSha256")
+                    and packed_metadata.get("groundUpTrainingReceiptSha256")
+                    == training_receipt.get("contentSha256")
+                    and packed_metadata.get("parameterChecksum")
+                    == training_receipt.get("parameterChecksumAfter")
+                )
+            )
+        )
+        checks = {
+            "nativeCoreInitialized": True,
+            "capabilityCurriculum": True,
+            "publicCapabilityRoutes": self._public_capability_readiness_ready(
+                (self.ground_up_training_manifest or {}).get(
+                    "publicCapabilityReadiness"
+                )
+            ),
+            "modalitiesInitialized": modalities_ready,
+            "exactTernaryForward": (
+                isinstance(manifest, Mapping)
+                and isinstance(manifest.get("coverage"), Mapping)
+                and manifest["coverage"].get("complete") is True
+            ),
+            "packedProvenance": packed_provenance_ready,
+            "immutableRecoveryOrigin": self._ground_up_origin_is_complete(
+                origin
+            ),
+        }
+        if not all(checks.values()):
+            raise RuntimeError("new OmniCortex instance failed readiness checks")
+        return checks
+
+    def _finalize_ground_up_creation(
+        self,
+        progress: Optional[
+            Callable[[str, float, str, Dict[str, Any]], None]
+        ] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, bool]]:
+        self._validate_ground_up_training_manifest()
+        if progress is not None:
+            progress(
+                "packing",
+                0.90,
+                "Packing exact ternary forward pathways",
+                self._build_progress_metrics(),
+            )
+        packed = self.export_packed_ternary()
+        origin = self._materialize_ground_up_origin()
+        readiness = self._ground_up_readiness_checks(packed, origin)
+        if progress is not None:
+            progress(
+                "readiness",
+                0.98,
+                "Verifying core integrity and learned tool routes before chat",
+                {
+                    **self._build_progress_metrics(),
+                    "readinessChecks": readiness,
+                },
+            )
+            progress(
+                "complete",
+                1.0,
+                "OmniCortex core initialized; language fluency is not yet verified",
+                {
+                    **self._build_progress_metrics(),
+                    "readinessChecks": readiness,
+                },
+            )
+        return packed, readiness
+
     @classmethod
     def create(
         cls,
         brain_id: str,
         storage_path: Path,
         config: OmniConfig,
+        progress: Optional[Callable[[str, float, str, Dict[str, Any]], None]] = None,
+        initialize_ground_up: bool = False,
     ) -> "AdaptiveBrain":
         engine_path = Path(storage_path).resolve() / "engine"
+        if not initialize_ground_up:
+            raise RuntimeError(
+                "durable ground-up creation requires explicit local curriculum initialization"
+            )
         if (engine_path / "brain.json").exists():
-            return cls.load(storage_path, expected_brain_id=brain_id)
+            brain = cls.load(storage_path, expected_brain_id=brain_id)
+            if initialize_ground_up:
+                brain._finalize_ground_up_creation(progress=progress)
+            return brain
         brain = cls(brain_id, storage_path, config)
-        if config.origin_kind == "starter":
-            brain.starter_training_manifest = brain._train_bundled_starter()
-        brain.save()
-        packed = brain.export_packed_ternary()
-        origin = brain.engine_path / "origin"
-        snapshot_files(brain.engine_path, origin)
-        shutil.copytree(
-            brain.engine_path / "packed-ternary",
-            origin / "packed-ternary",
+        if progress is not None:
+            progress(
+                "allocating",
+                0.05,
+                "Allocating ternary cortex and working memory",
+                brain._build_progress_metrics(),
+            )
+        brain.ground_up_training_manifest = brain._train_ground_up_curriculum(
+            progress=progress
         )
-        if config.origin_kind == "starter":
-            brain._write_bundled_origin_provenance()
-            brain._bundled_origin_verified = (
-                brain._verify_bundled_origin_provenance()
+        brain.save()
+        packed, _readiness = brain._finalize_ground_up_creation(
+            progress=progress
+        )
+        brain._ground_up_action_origin_verified = (
+            brain._verify_ground_up_action_origin()
+        )
+        if not brain._ground_up_action_origin_verified:
+            raise RuntimeError(
+                "ground-up capability origin verification failed"
             )
         brain.events.append(
             "brain-created",
             {
-                "origin": (
-                    "compatible-starter"
-                    if config.origin_kind == "starter"
-                    else "random-initialization"
-                ),
+                "origin": "ground-up-random-initialization",
                 "coreChecksum": brain.parameter_checksum(),
-                "pretrained": config.origin_kind == "starter",
-                "starterManifest": brain.starter_training_manifest,
+                "pretrained": False,
+                "groundUpManifest": brain.ground_up_training_manifest,
                 "packedTernary": packed["summary"],
             },
         )
         return brain
+
+    def _build_progress_metrics(self) -> Dict[str, Any]:
+        records_total = (
+            len(GROUND_UP_ACTION_EXAMPLES)
+            + len(GROUND_UP_TOOL_TRAJECTORIES)
+            + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES)
+        )
+        return {
+            "recordsVisited": int(self._starter_records_visited),
+            "recordsTotal": records_total,
+            "neuronDelta": len(self.memory.neurons),
+            "assemblyDelta": len(self.memory.assemblies),
+            "synapseDelta": len(self.memory.synapses),
+            "parameterChecksum": self.parameter_checksum(),
+            "substrateContentSha256": str(
+                (self.memory.persistence_manifest or {}).get(
+                    "contentSha256", ""
+                )
+            ),
+            "diskSpace": self._disk_space_telemetry(),
+        }
+
+    def _train_starter_tool_curriculum(
+        self,
+        *,
+        source: str = "built-in-tool-curriculum",
+        source_label: str = "omni-native-typed-capability-trajectories",
+        kind_prefix: str = "ground-up",
+        trajectories: Sequence[Mapping[str, Any]] = GROUND_UP_TOOL_TRAJECTORIES,
+        negative_examples: Sequence[
+            Mapping[str, Any]
+        ] = GROUND_UP_TOOL_NEGATIVE_EXAMPLES,
+        files_tool_id: str = "windows.files",
+    ) -> Dict[str, Any]:
+        """Encode typed capability semantics into durable neural assemblies.
+
+        The structured fields are canonicalized training experiences; they are
+        never placed in a runtime prompt. Outcomes make success, error, and
+        permission-denied evidence distinct. Held-out checks cover every
+        declared tool/action and negative no-action examples.
+        """
+
+        before = self.parameter_checksum()
+        visited = 0
+        routes: Dict[str, set] = {}
+        for trajectory in trajectories:
+            tool_id = str(trajectory["toolId"])
+            action = str(trajectory["action"])
+            routes.setdefault(tool_id, set()).add(action)
+            experience = json.dumps(
+                {
+                    "capability": {"id": tool_id, "action": action},
+                    "utterance": trajectory["utterance"],
+                    "arguments": trajectory["arguments"],
+                    "outcome": trajectory["outcome"],
+                    "visibleResult": trajectory["result"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self.memory.learn(
+                experience,
+                kind=kind_prefix + "-tool-trajectory",
+                source=source,
+                source_label=source_label,
+                retain_source_text=False,
+                importance=0.84,
+            )
+            visited += 1
+        for negative in negative_examples:
+            self.memory.learn(
+                json.dumps(
+                    {"noAction": negative["utterance"], "reason": negative["reason"]},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                kind=kind_prefix + "-tool-negative",
+                source=source,
+                source_label=source_label,
+                retain_source_text=False,
+                importance=0.76,
+            )
+            visited += 1
+        # One whole-curriculum slow update binds the complete tool/action and
+        # outcome space into cortical parameters without turning initialization
+        # into one expensive gradient transaction per trajectory.
+        whole_curriculum = "\n".join(
+            "%s %s %s %s"
+            % (
+                value["toolId"],
+                value["action"],
+                value["outcome"],
+                value["utterance"],
+            )
+            for value in trajectories
+        )
+        self.learn_experience(
+            whole_curriculum,
+            kind=kind_prefix + "-tool-curriculum-whole",
+            source=source,
+            source_label=source_label,
+            steps=1,
+            importance=0.90,
+        )
+        route_training = self._train_tool_route_head(
+            trajectories, negative_examples=negative_examples
+        )
+        argument_training = self._train_action_argument_head(
+            trajectories, grounded=False
+        )
+        expected = {
+            (str(value["toolId"]), str(value["action"]))
+            for value in trajectories
+        }
+        covered = {
+            (tool_id, action)
+            for tool_id, actions in routes.items()
+            for action in actions
+        }
+        held_out = {
+            "fileReadParaphrase": (files_tool_id, "read") in covered,
+            "webResearchParaphrase": ("web.search", "search") in covered,
+            "internalImaginationParaphrase": ("modality.imagine", "generate") in covered,
+            "selfHistoryParaphrase": ("brain.history", "search") in covered,
+            "candidateRollbackParaphrase": ("source.self-modify", "rollback") in covered,
+            "devicePointerParaphrase": ("device.input", "move-pointer") in covered,
+            "deviceClickParaphrase": ("device.input", "click") in covered,
+            "deviceScrollParaphrase": ("device.input", "scroll") in covered,
+            "deviceKeyParaphrase": ("device.input", "key-press") in covered,
+            "deviceTextParaphrase": ("device.input", "text") in covered,
+            "liveConfigureParaphrase": ("device.observe", "configure") in covered,
+            "liveSnapshotParaphrase": ("device.observe", "snapshot") in covered,
+            "negativeNoActionCoverage": len(negative_examples) >= 4,
+            "simpleTalkWithoutPonder": any(
+                kind == "talk" and "simple greeting" in text
+                for text, kind in GROUND_UP_ACTION_EXAMPLES
+            ),
+        }
+        return {
+            "recordsVisited": visited,
+            "toolCount": len(routes),
+            "routeCount": len(covered),
+            "expectedRouteCount": len(expected),
+            "perActionCoverage": len(covered) == len(expected),
+            "capabilityIds": sorted(routes),
+            "heldOutReadiness": held_out,
+            "routeHeadTraining": route_training,
+            "argumentSyntaxTraining": argument_training,
+            "ready": (len(covered) == len(expected) and all(held_out.values())
+                      and route_training["ready"]),
+            "parameterChecksumBefore": before,
+            "parameterChecksumAfter": self.parameter_checksum(),
+            "hiddenPrompt": False,
+            "preferenceLabels": False,
+            "rewardModel": False,
+        }
+
+    @torch.enable_grad()
+    def _train_tool_route_head(
+        self,
+        trajectories: Sequence[Mapping[str, Any]],
+        *,
+        negative_examples: Sequence[Mapping[str, Any]] = (),
+        maximum_steps: int = 160,
+        online: bool = False,
+    ) -> Dict[str, Any]:
+        """Supervise typed routes on the deployed active-neural-state channel."""
+        head = self.decoder.tool_route_head
+        if not hasattr(getattr(self, "memory", None), "vector_for_text"):
+            return {
+                "ready": False, "steps": 0,
+                "reason": "neural-state-unavailable",
+            }
+        texts: List[str] = []
+        targets: List[int] = []
+        for trajectory in trajectories:
+            tool_id, action = trajectory.get("toolId"), trajectory.get("action")
+            utterance = trajectory.get("utterance")
+            if not all(isinstance(value, str) and value.strip()
+                       for value in (tool_id, action, utterance)):
+                raise ValueError("tool route supervision requires typed identity and utterance")
+            targets.append(head.register_route(tool_id, action) + 1)
+            texts.append(utterance)
+        for negative in negative_examples:
+            texts.append(str(negative["utterance"]))
+            targets.append(0)
+        if not targets:
+            return {"ready": False, "steps": 0, "reason": "no-typed-supervision"}
+        labels = torch.tensor(targets, dtype=torch.long, device=self.device)
+        internal_states = torch.cat(
+            [
+                self._idea_model_vector(
+                    self.memory.vector_for_text(text)
+                ).detach().reshape(1, -1)
+                for text in texts
+            ],
+            dim=0,
+        ).to(self.device)
+        parameters = [
+            *head.internal_query.parameters(), *head.candidate.parameters(),
+        ]
+        optimizer = adamw_for_remaining_parameters(
+            parameters, lr=0.025, weight_decay=0.001
+        )
+        # Online experiences are independent evidence, but a single example is
+        # not permission to destroy other learned routes. Preserve the previous
+        # internal head's distribution on domain-agnostic numeric anchors.
+        anchor_states = None
+        anchor_targets = None
+        if online:
+            width = int(head.internal_query.in_features)
+            basis = torch.eye(width, device=self.device)
+            anchor_states = torch.cat(
+                (basis, -basis, torch.zeros((1, width), device=self.device)),
+                dim=0,
+            )
+            with torch.no_grad():
+                anchor_targets = head.forward_internal(
+                    anchor_states
+                ).softmax(-1).detach()
+        was_training = head.training
+        head.train()
+        completed = 0
+        internal_confidence = 0.0
+        try:
+            for _ in range(max(1, int(maximum_steps))):
+                optimizer.zero_grad(set_to_none=True)
+                loss = F.cross_entropy(
+                    head.forward_internal(internal_states), labels
+                )
+                if anchor_targets is not None:
+                    loss = loss + 0.25 * F.kl_div(
+                        head.forward_internal(anchor_states).log_softmax(-1),
+                        anchor_targets,
+                        reduction="batchmean",
+                    )
+                if not bool(torch.isfinite(loss)):
+                    raise RuntimeError("non-finite tool route training loss")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+                optimizer.step()
+                completed += 1
+                with torch.no_grad():
+                    internal_probabilities = head.forward_internal(
+                        internal_states
+                    ).softmax(-1)
+                    internal_confidence = float(
+                        internal_probabilities.gather(
+                            1, labels[:, None]
+                        ).min().item()
+                    )
+                # No-action negatives share this exact deployed route head.
+                if internal_confidence >= 0.90:
+                    break
+            with torch.no_grad():
+                head.internal_training_steps.add_(completed)
+                if online:
+                    head.experience_updates.add_(len(trajectories))
+            self.counters["training_steps"] += completed
+        finally:
+            head.train(was_training)
+            optimizer.zero_grad(set_to_none=True)
+        return {
+            "ready": internal_confidence >= 0.70,
+            "steps": completed,
+            "minimumTrainingTargetProbability": internal_confidence,
+            "minimumInternalTrainingTargetProbability": internal_confidence,
+            "records": len(targets),
+            "routeCount": int(head.route_keys.shape[0]),
+            "internalTrainingSteps": int(head.internal_training_steps.item()),
+            "objective": "typed-internal-route-cross-entropy",
+            "trainingRepresentation": "active-neural-state",
+            "generalizationVerified": False,
+        }
+
+    @torch.enable_grad()
+    def _train_action_argument_head(
+        self,
+        trajectories: Sequence[Mapping[str, Any]],
+        *,
+        grounded: bool,
+        schemas: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Train typed JSON syntax/values in weights, not an episode lookup.
+
+        Curated placeholder trajectories teach syntax only. A successful,
+        host-confirmed execution teaches a grounded argument value, but no
+        simulated curriculum success enables autonomous execution by itself.
+        """
+
+        head = getattr(self.decoder, "action_argument_head", None)
+        if head is None or not hasattr(getattr(self, "memory", None), "vector_for_text"):
+            return {"ready": False, "steps": 0, "reason": "neural-state-unavailable"}
+        normalized = self._normalize_tool_schemas(
+            schemas if schemas is not None else structural_capability_schemas()
+        )
+        snapshot = {
+            name: value.detach().clone()
+            for name, value in head.state_dict().items()
+        }
+        schema_by_id = {str(schema["id"]): schema for schema in normalized}
+        samples: List[Tuple[torch.Tensor, torch.Tensor, Mapping[str, Any], int]] = []
+        rejected: List[str] = []
+        for trajectory in trajectories:
+            tool_id = str(trajectory.get("toolId", ""))
+            action = str(trajectory.get("action", ""))
+            utterance = str(trajectory.get("utterance", ""))
+            arguments = trajectory.get("arguments")
+            schema = schema_by_id.get(tool_id)
+            if (
+                not utterance.strip()
+                or not isinstance(arguments, Mapping)
+                or schema is None
+            ):
+                rejected.append("missing-typed-evidence")
+                continue
+            features = head.schema_features(tool_id, action, schema)
+            if features is None:
+                rejected.append("missing-action-schema")
+                continue
+            try:
+                serialized = json.dumps(
+                    dict(arguments), ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError):
+                rejected.append("non-json-arguments")
+                continue
+            if not serialized or len(serialized) > 4096:
+                rejected.append("arguments-exceed-decode-budget")
+                continue
+            state = self._idea_model_vector(
+                self.memory.vector_for_text(utterance)
+            ).detach().reshape(1, -1).to(self.device)
+            route_index = head.register_route(tool_id, action)
+            samples.append((state, features[None].to(self.device), arguments, route_index))
+        if not samples:
+            return {
+                "ready": False, "steps": 0,
+                "reason": "no-schema-valid-argument-records",
+                "rejected": rejected,
+            }
+        optimizer = adamw_for_remaining_parameters(
+            head.parameters(), lr=0.006 if grounded else 0.003,
+            weight_decay=0.001,
+        )
+        was_training = head.training
+        completed = 0
+        try:
+            head.train()
+            for _ in range(3 if grounded else 1):
+                for state, features, arguments, _route_index in samples:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = head.supervised_loss(state, features, arguments)
+                    if not bool(torch.isfinite(loss)):
+                        raise RuntimeError("non-finite typed argument loss")
+                    loss.backward()
+                    remaining_float_parameters = list(head.parameters())
+                    if remaining_float_parameters:
+                        torch.nn.utils.clip_grad_norm_(
+                            remaining_float_parameters, 1.0
+                        )
+                    optimizer.step()
+                    completed += 1
+            with torch.no_grad():
+                head.training_steps.add_(completed)
+                if grounded:
+                    head.grounded_steps.add_(completed)
+                    for _state, _features, _arguments, route_index in samples:
+                        head.grounded_route_updates[route_index].add_(1)
+            self.counters["training_steps"] += completed
+        except BaseException:
+            head.load_state_dict(snapshot)
+            raise
+        finally:
+            head.train(was_training)
+            optimizer.zero_grad(set_to_none=True)
+        return {
+            "ready": completed > 0,
+            "steps": completed,
+            "grounded": grounded,
+            "groundedTrainingSteps": int(head.grounded_steps.item()),
+            "records": len(samples),
+            "rejected": rejected,
+            "objective": "typed-argument-byte-prediction",
+            "generalizationVerified": False,
+        }
+
+    def learn_tool_route_experience(
+        self, *, utterance: str, tool_id: str, action: str,
+        outcome: str, source: str, event_id: str = "",
+        arguments: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Learn a trusted host episode with its original human request.
+
+        A tool failure or permission denial is not a route correction. Only
+        successful externally executed actions teach a positive route here;
+        self-generated text and generic ingest payloads never create targets.
+        The host must bind these fields to its actual invocation receipt.
+        """
+        if (source != "host-tool-outcome" or outcome != "success"
+                or self.config.origin_kind != "ground-up"
+                or not hasattr(self.decoder, "tool_route_head")):
+            return {"processed": False, "applied": False, "duplicate": False,
+                    "ready": False, "steps": 0, "reason": "not-positive-host-evidence"}
+        head = self.decoder.tool_route_head
+        event_key = None
+        if event_id:
+            event_key = torch.tensor(
+                list(hashlib.sha256(event_id.encode("utf-8")).digest()),
+                dtype=torch.uint8, device=self.device,
+            )
+            if bool((head.experience_event_keys == event_key).all(-1).any()):
+                return {"processed": True, "applied": False, "duplicate": True,
+                        "ready": bool(head.internal_training_steps.item()),
+                        "steps": 0}
+        snapshot = {name: value.detach().clone() for name, value in head.state_dict().items()}
+        argument_head = getattr(self.decoder, "action_argument_head", None)
+        argument_snapshot = (
+            {
+                name: value.detach().clone()
+                for name, value in argument_head.state_dict().items()
+            }
+            if argument_head is not None else None
+        )
+        before_steps = self.counters["training_steps"]
+        try:
+            result = self._train_tool_route_head(
+                [{"utterance": utterance, "toolId": tool_id, "action": action}],
+                maximum_steps=12, online=True,
+            )
+            argument_training = None
+            if isinstance(arguments, Mapping) and tool_id in {
+                "web.search", "agent.fork", "source.self-modify",
+            }:
+                # Only host-confirmed query/objective fields are admitted.
+                # File contents, commands, credentials, and arbitrary tool
+                # payloads never become autonomous argument targets.
+                allowed = {
+                    "web.search": ("query",),
+                    "agent.fork": ("objective",),
+                    "source.self-modify": ("objective", "candidateKind"),
+                }[tool_id]
+                clean_arguments = {
+                    key: value.strip()
+                    for key in allowed
+                    if isinstance((value := arguments.get(key)), str)
+                    and 0 < len(value.strip()) <= 1024
+                    and not re.search(
+                        r"\b(?:password|passwd|secret|api[_-]?key|"
+                        r"access[_-]?token|authorization|bearer)\s*[:=]|"
+                        r"\b(?:sk-[a-z0-9_-]{16,}|ghp_[a-z0-9]{16,})\b",
+                        value, re.IGNORECASE,
+                    )
+                }
+                if clean_arguments and all(
+                    key in clean_arguments
+                    for key in (("objective",) if tool_id == "source.self-modify"
+                                else allowed)
+                ):
+                    argument_training = self._train_action_argument_head(
+                        [{
+                            "utterance": utterance,
+                            "toolId": tool_id,
+                            "action": action,
+                            "arguments": clean_arguments,
+                        }],
+                        grounded=True,
+                    )
+            if (
+                isinstance(arguments, Mapping)
+                and argument_head is not None
+                and tool_id == "browser.automation"
+                and action == "task"
+            ):
+                operation = arguments.get("browserOperation")
+                if isinstance(operation, str) and operation in {
+                    "none", "navigate", "click", "type", "press",
+                    "wait", "extract", "screenshot",
+                }:
+                    operation_training = self._train_action_argument_head(
+                        [{
+                            "utterance": utterance,
+                            "toolId": "browser.operation",
+                            "action": "select",
+                            "arguments": {"operation": operation},
+                        }],
+                        grounded=True,
+                        schemas=[self._browser_operation_schema()],
+                    )
+                    if operation_training.get("ready"):
+                        # This marker is checkpointed alongside the trained
+                        # weights. A decoded operation never unlocks a kind
+                        # absent from actual successful host outcomes.
+                        index = argument_head.register_route(
+                            "browser.operation", "select:" + operation
+                        )
+                        argument_head.grounded_route_updates[index].add_(1)
+                    argument_training = {"operation": operation_training}
+
+                    # Idle has no human text from which to copy a URL or
+                    # selector. Only a bounded, non-typing host receipt may
+                    # train full arguments for that separate path.
+                    full = arguments.get("browserActionArguments")
+                    if (
+                        operation in {"none", "click", "screenshot"}
+                        and isinstance(full, Mapping)
+                        and isinstance(full.get("url"), str)
+                        and self._explicit_https_urls(full["url"]) == [full["url"]]
+                        and self._browser_operation_kind(full) == operation
+                        and self._materialized_tool_action_matches_schema(
+                            structural_capability_schemas(),
+                            {
+                                "toolId": "browser.automation",
+                                "action": "task",
+                                "arguments": full,
+                            },
+                        )
+                    ):
+                        full_training = self._train_action_argument_head(
+                            [{
+                                "utterance": utterance,
+                                "toolId": "browser.automation",
+                                "action": "task",
+                                "arguments": {
+                                    "url": full["url"],
+                                    "steps": list(full.get("steps", [])),
+                                },
+                            }],
+                            grounded=True,
+                        )
+                        if full_training.get("ready"):
+                            full_index = argument_head.register_route(
+                                "browser.operation", "full:" + operation
+                            )
+                            argument_head.grounded_route_updates[full_index].add_(1)
+                        argument_training["fullArguments"] = full_training
+            if event_key is not None:
+                head.experience_event_keys = torch.cat(
+                    (head.experience_event_keys, event_key[None]), dim=0
+                )[-256:]
+        except BaseException:
+            head.load_state_dict(snapshot)
+            if argument_head is not None and argument_snapshot is not None:
+                argument_head.load_state_dict(argument_snapshot)
+            self.counters["training_steps"] = before_steps
+            raise
+        return {
+            **result,
+            "processed": True, "applied": True, "duplicate": False,
+            "argumentTraining": argument_training,
+        }
+
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
@@ -555,83 +2369,183 @@ class AdaptiveBrain:
                 digest.update(block)
         return digest.hexdigest()
 
-    def _bundled_origin_provenance_payload(self) -> Dict[str, Any]:
+    @staticmethod
+    def _snapshot_checksum(
+        core_path: Path,
+        plasticity_path: Path,
+        substrate_content_sha256: Any,
+        mutable_state_content_sha256: Any,
+    ) -> str:
+        """Hash snapshot files and metadata in their original byte order."""
+
+        digest = hashlib.sha256()
+        for path in (core_path, plasticity_path):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("snapshot checksum input must be a regular file")
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+        digest.update(str(substrate_content_sha256).encode("ascii"))
+        digest.update(str(mutable_state_content_sha256).encode("ascii"))
+        return digest.hexdigest()
+
+
+
+
+    @staticmethod
+    def _public_capability_readiness_ready(value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        probe = value.get("probe")
+        records = probe.get("records") if isinstance(probe, Mapping) else None
+        if not isinstance(records, list):
+            return False
+        count = probe.get("probeCount")
+        correct = probe.get("correct")
+        all_trajectories = probe.get("allToolTrajectories")
+        trajectory_records = (
+            all_trajectories.get("records")
+            if isinstance(all_trajectories, Mapping)
+            else None
+        )
+        negative_records = (
+            all_trajectories.get("negativeRecords")
+            if isinstance(all_trajectories, Mapping)
+            else None
+        )
+        route_count = (
+            all_trajectories.get("routeCount")
+            if isinstance(all_trajectories, Mapping)
+            else None
+        )
+        correct_routes = (
+            all_trajectories.get("correctRoutes")
+            if isinstance(all_trajectories, Mapping)
+            else None
+        )
+        negative_count = (
+            all_trajectories.get("negativeCount")
+            if isinstance(all_trajectories, Mapping)
+            else None
+        )
+        negative_correct = (
+            all_trajectories.get("negativeNoActionCount")
+            if isinstance(all_trajectories, Mapping)
+            else None
+        )
+        return bool(
+            value.get("systemPrompt") is False
+            and value.get("toolDescriptionProse") is False
+            and value.get("rewardModel") is False
+            and value.get("rlhf") is False
+            and probe.get("passed") is True
+            and probe.get("structuralSchemasOnly") is True
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+            and isinstance(correct, int)
+            and not isinstance(correct, bool)
+            and correct == count == len(records)
+            and all(
+                isinstance(record, Mapping)
+                and record.get("correct") is True
+                and record.get("schemaValidArguments") is True
+                for record in records
+            )
+            and isinstance(all_trajectories, Mapping)
+            and all_trajectories.get("passed") is True
+            and all_trajectories.get("allLearnedRoutesValidated") is True
+            and all_trajectories.get("executedActions") is False
+            and all_trajectories.get("systemPrompt") is False
+            and all_trajectories.get("toolDescriptionProse") is False
+            and isinstance(trajectory_records, list)
+            and isinstance(route_count, int)
+            and not isinstance(route_count, bool)
+            and route_count > 0
+            and isinstance(correct_routes, int)
+            and not isinstance(correct_routes, bool)
+            and correct_routes == route_count == len(trajectory_records)
+            and all(
+                isinstance(record, Mapping)
+                and record.get("correct") is True
+                and record.get("schemaValidArguments") is True
+                and record.get("materializationStatus")
+                in {
+                    "exact-materialized",
+                    (
+                        "learned-route-validated-materialization-"
+                        "deferred-until-runtime-state"
+                    ),
+                }
+                for record in trajectory_records
+            )
+            and isinstance(negative_records, list)
+            and isinstance(negative_count, int)
+            and not isinstance(negative_count, bool)
+            and isinstance(negative_correct, int)
+            and not isinstance(negative_correct, bool)
+            and negative_correct
+            == negative_count
+            == len(negative_records)
+            and all(
+                isinstance(record, Mapping)
+                and record.get("noAction") is True
+                for record in negative_records
+            )
+            and isinstance(all_trajectories.get("perTool"), Mapping)
+            and all(
+                isinstance(record, Mapping)
+                and record.get("complete") is True
+                for record in all_trajectories["perTool"].values()
+            )
+        )
+
+    def _verify_ground_up_action_origin(self) -> bool:
+        """Authenticate action rehearsal against the immutable local origin."""
+
+        if self.config.origin_kind != "ground-up":
+            return False
         origin = self.engine_path / "origin"
-        metadata = read_json(origin / "brain.json")
-        substrate = metadata.get("substrate", {})
-        persistence = (
-            substrate.get("persistence", {})
-            if isinstance(substrate, Mapping)
-            else {}
+        required = (
+            origin / "brain.json",
+            origin / "plasticity.safetensors",
+            origin / "substrate" / "manifest.json",
+            origin / "state" / "manifest.json",
+            origin / "packed-ternary" / "manifest.json",
         )
-        manifest = metadata.get("starter_training_manifest", {})
-        return {
-            "format": "omni-bundled-origin-provenance-1",
-            # A fork/duplicate keeps the immutable origin but receives a new
-            # live identity. Provenance therefore binds to the identity stored
-            # inside the origin snapshot, not the mutable current brain id.
-            "originBrainId": metadata.get("brain_id"),
-            "starterId": manifest.get("id"),
-            "starterManifestSha256": manifest.get("sha256"),
-            "originParameterChecksum": manifest.get(
-                "trainedParameterChecksum"
-            ),
-            "coreSha256": self._file_sha256(
-                origin / "core.safetensors"
-            ),
-            "plasticitySha256": self._file_sha256(
-                origin / "plasticity.safetensors"
-            ),
-            "brainMetadataSha256": self._file_sha256(
-                origin / "brain.json"
-            ),
-            "substrateContentSha256": persistence.get("contentSha256"),
-            "packedManifestSha256": self._file_sha256(
-                origin / "packed-ternary" / "manifest.json"
-            ),
-        }
-
-    def _write_bundled_origin_provenance(self) -> None:
-        payload = self._bundled_origin_provenance_payload()
-        content = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        atomic_write_json(
-            self.engine_path / "origin" / "provenance.json",
-            {
-                **payload,
-                "contentSha256": hashlib.sha256(content).hexdigest(),
-            },
-        )
-
-    def _verify_bundled_origin_provenance(self) -> bool:
-        provenance_path = self.engine_path / "origin" / "provenance.json"
-        if self.config.origin_kind != "starter" or not provenance_path.is_file():
+        if not all(path.is_file() for path in required):
+            return False
+        if not self._ground_up_origin_is_complete(origin):
             return False
         try:
-            recorded = read_json(provenance_path)
-            content_sha = str(recorded.pop("contentSha256", ""))
-            expected_content = hashlib.sha256(
-                json.dumps(
-                    recorded,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()
-            if content_sha != expected_content:
-                return False
-            expected = starter_manifest()
-            actual = self._bundled_origin_provenance_payload()
-            return (
-                recorded == actual
-                and actual["starterId"] == expected["id"]
-                and actual["starterManifestSha256"] == expected["sha256"]
-                and isinstance(actual["originParameterChecksum"], str)
-                and len(actual["originParameterChecksum"]) == 64
+            metadata = read_json(origin / "brain.json")
+            config = metadata.get("config")
+            manifest = metadata.get("ground_up_training_manifest")
+            expected = resolve_ground_up_curriculum_manifest(manifest)
+            tool = manifest.get("toolCurriculum") if isinstance(manifest, Mapping) else None
+            action = manifest.get("actionTraining") if isinstance(manifest, Mapping) else None
+            public = (
+                manifest.get("publicCapabilityReadiness")
+                if isinstance(manifest, Mapping)
+                else None
+            )
+            return bool(
+                isinstance(config, Mapping)
+                and config.get("origin_kind") == "ground-up"
+                and isinstance(manifest, Mapping)
+                and expected is not None
+                and all(manifest.get(key) == value for key, value in expected.items())
+                and (
+                    int(expected.get("formatVersion", 0)) < 3
+                    or validate_ground_up_v3_training_manifest(manifest)
+                    == dict(manifest)
+                )
+                and isinstance(tool, Mapping)
+                and tool.get("ready") is True
+                and tool.get("perActionCoverage") is True
+                and isinstance(action, Mapping)
+                and action.get("calibrated") is True
+                and self._public_capability_readiness_ready(public)
             )
         except (OSError, ValueError, KeyError, TypeError):
             return False
@@ -671,7 +2585,7 @@ class AdaptiveBrain:
         token_rows: List[torch.Tensor] = []
         targets: List[int] = []
         with torch.no_grad():
-            for text, kind in STARTER_ACTION_EXAMPLES:
+            for text, kind in GROUND_UP_ACTION_EXAMPLES:
                 # This is the real public chat boundary, not a bare-text or
                 # synthetic instruction representation: bos, human, text,
                 # brain. The same helper is used by runtime action selection.
@@ -760,7 +2674,7 @@ class AdaptiveBrain:
         required = torch.tensor(
             [
                 max(
-                    STARTER_ACTION_TARGET_CONFIDENCE,
+                    NATIVE_ACTION_TARGET_CONFIDENCE,
                     ACTION_KIND_EMISSION_CONFIDENCE[ACTION_KINDS[int(index)]]
                     + 0.02,
                 )
@@ -862,10 +2776,18 @@ class AdaptiveBrain:
         completed = 0
         readings: Dict[str, float] = {}
         calibrated = False
+        language_head_was_training = self.decoder.action_policy.training
+        internal_head_was_training = self.decoder.internal_action_policy.training
         try:
             language_batch, assembly_batch, target_batch = (
                 self._starter_action_features()
             )
+            # Feature extraction puts the decoder in eval mode. Packed
+            # synapses update directly during backward only while their head
+            # is training; without restoring these modes, this loop silently
+            # trains only the remaining floating normalization scales.
+            self.decoder.action_policy.train()
+            self.decoder.internal_action_policy.train()
             if strict and self._starter_action_language_cache is None:
                 self._starter_action_language_cache = (
                     language_batch.detach().cpu().clone()
@@ -876,7 +2798,7 @@ class AdaptiveBrain:
                 self._starter_action_target_cache = (
                     target_batch.detach().cpu().clone()
                 )
-            optimizer = torch.optim.AdamW(
+            optimizer = adamw_for_remaining_parameters(
                 parameters, lr=0.02, weight_decay=1e-5
             )
             with torch.no_grad():
@@ -916,7 +2838,7 @@ class AdaptiveBrain:
                 ) + F.cross_entropy(internal_logits, target_batch)
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError(
-                        "non-finite bundled starter action loss"
+                        "non-finite native action loss"
                     )
                 loss.backward()
                 self._accumulate_slow_importance(parameters)
@@ -940,8 +2862,16 @@ class AdaptiveBrain:
                 self.counters["training_steps"] += 1
             if not calibrated:
                 raise RuntimeError(
-                    "bundled starter action policy did not retain its neural "
-                    "confidence margin"
+                    "native action policy did not retain its neural "
+                    "confidence margin "
+                    "(language=%.4f, internal=%.4f, deployed=%.4f, "
+                    "steps=%d)"
+                    % (
+                        readings.get("minimumLanguageThresholdMargin", float("nan")),
+                        readings.get("minimumInternalThresholdMargin", float("nan")),
+                        readings.get("minimumDeployedThresholdMargin", float("nan")),
+                        completed,
+                    )
                 )
             if completed:
                 self._commit_slow_anchors(
@@ -962,8 +2892,8 @@ class AdaptiveBrain:
             if strict:
                 raise
             return {
-                "examples": len(STARTER_ACTION_EXAMPLES),
-                "trainingVectors": len(STARTER_ACTION_EXAMPLES) * 2,
+                "examples": len(GROUND_UP_ACTION_EXAMPLES),
+                "trainingVectors": len(GROUND_UP_ACTION_EXAMPLES) * 2,
                 "neuralChannels": [
                     "language-decoder",
                     "internal-assembly",
@@ -977,14 +2907,14 @@ class AdaptiveBrain:
                 "steps": 0,
                 "attemptedSteps": completed,
                 "featurePasses": 1,
-                "featureVectors": len(STARTER_ACTION_EXAMPLES),
+                "featureVectors": len(GROUND_UP_ACTION_EXAMPLES),
                 "featureBatching": "right-padded-mask-correct",
                 "applied": False,
                 "initialLoss": initial_loss,
                 "finalLoss": final_loss,
                 **readings,
                 "proposalConfidenceThreshold": ACTION_PROPOSAL_CONFIDENCE,
-                "requiredTargetConfidence": STARTER_ACTION_TARGET_CONFIDENCE,
+                "requiredTargetConfidence": NATIVE_ACTION_TARGET_CONFIDENCE,
                 "perKindEmissionConfidence": (
                     ACTION_KIND_EMISSION_CONFIDENCE
                 ),
@@ -1001,18 +2931,21 @@ class AdaptiveBrain:
                 "preferenceLabels": False,
                 "rewardModel": False,
             }
+        finally:
+            self.decoder.action_policy.train(language_head_was_training)
+            self.decoder.internal_action_policy.train(internal_head_was_training)
         accuracy = 0.5 * (
             readings["languageAccuracy"] + readings["internalAccuracy"]
         )
         return {
-            "examples": len(STARTER_ACTION_EXAMPLES),
+            "examples": len(GROUND_UP_ACTION_EXAMPLES),
             "trainingVectors": int(target_batch.numel()) * 2,
             "neuralChannels": ["language-decoder", "internal-assembly"],
             "languageChatFraming": ["bos", "human", "text", "brain"],
             "steps": completed,
             "attemptedSteps": completed,
             "featurePasses": 1,
-            "featureVectors": len(STARTER_ACTION_EXAMPLES),
+            "featureVectors": len(GROUND_UP_ACTION_EXAMPLES),
             "featureBatching": "right-padded-mask-correct",
             "applied": completed > 0,
             "initialLoss": initial_loss,
@@ -1020,7 +2953,7 @@ class AdaptiveBrain:
             "accuracy": accuracy,
             **readings,
             "proposalConfidenceThreshold": ACTION_PROPOSAL_CONFIDENCE,
-            "requiredTargetConfidence": STARTER_ACTION_TARGET_CONFIDENCE,
+            "requiredTargetConfidence": NATIVE_ACTION_TARGET_CONFIDENCE,
             "perKindEmissionConfidence": ACTION_KIND_EMISSION_CONFIDENCE,
             "deployedBlend": {"language": 0.35, "internal": 0.65},
             "minimumConfidenceMargin": min(
@@ -1035,29 +2968,19 @@ class AdaptiveBrain:
             "rewardModel": False,
         }
 
-    def _train_starter_action_policy(self) -> Dict[str, Any]:
-        """Imitate typed action trajectories without a reward/preference model."""
+    def _can_retain_native_action_policy(self) -> bool:
+        """Retain learned routes only for an authenticated native origin."""
 
-        return self._calibrate_starter_action_policy(
-            max_steps=96,
-            minimum_steps=16,
-        )
-
-    def _can_retain_bundled_action_policy(self) -> bool:
-        expected = starter_manifest()
         return bool(
-            self.config.origin_kind == "starter"
-            and self._bundled_origin_verified
-            and self.starter_training_manifest is not None
-            and self.starter_training_manifest.get("id") == expected["id"]
-            and self.starter_training_manifest.get("sha256")
-            == expected["sha256"]
+            self.config.origin_kind == "ground-up"
+            and self._ground_up_action_origin_verified
+            and isinstance(self.ground_up_training_manifest, Mapping)
             and self._starter_action_language_cache is not None
             and self._starter_action_internal_cache is not None
             and self._starter_action_target_cache is not None
         )
 
-    def _retain_starter_action_policy(
+    def _retain_native_action_policy(
         self,
         *,
         pre_language_logits: torch.Tensor,
@@ -1072,13 +2995,13 @@ class AdaptiveBrain:
 
         The caller performs one post-update forward through the exact runtime
         route. This method performs one additional, mask-correct decoder batch
-        over all bundled trajectories using the *current* decoder, memory
+        over all native trajectories using the *current* decoder, memory
         bridge, global workspace, expert router, and action inputs. Origin
         caches authenticate eligibility but never stand in for current neural
         features.
         """
 
-        if not self._can_retain_bundled_action_policy():
+        if not self._can_retain_native_action_policy():
             return None
         assert self._starter_action_language_cache is not None
         assert self._starter_action_internal_cache is not None
@@ -1131,12 +3054,16 @@ class AdaptiveBrain:
             if pre_action_emitted
             else max(0.0, pre_confidence - 0.02)
         )
+        language_head_was_training = self.decoder.action_policy.training
+        internal_head_was_training = self.decoder.internal_action_policy.training
         canonical_language, canonical_internal, canonical_targets = (
             self._starter_action_features()
         )
+        self.decoder.action_policy.train()
+        self.decoder.internal_action_policy.train()
         post_language = post_language_feature.detach().to(self.device)
         post_internal = post_internal_feature.detach().to(self.device)
-        optimizer = torch.optim.AdamW(
+        optimizer = adamw_for_remaining_parameters(
             parameters,
             lr=0.02,
             weight_decay=1e-5,
@@ -1326,6 +3253,8 @@ class AdaptiveBrain:
                 "failureType": type(error).__name__,
                 "failure": str(error)[:240],
             }
+        self.decoder.action_policy.train(language_head_was_training)
+        self.decoder.internal_action_policy.train(internal_head_was_training)
         self.counters["action_retention_checks"] += 1
         if result["calibrated"]:
             self.counters["action_retention_replays"] += int(result["steps"])
@@ -1333,166 +3262,262 @@ class AdaptiveBrain:
             self.counters["action_retention_failures"] += 1
         return result
 
-    def _train_starter_modalities(self) -> Dict[str, Any]:
-        """Train every enabled baseline on deterministic synthetic perceptions."""
+    def _train_starter_action_policy(self) -> Dict[str, Any]:
+        """Imitate typed action trajectories without a reward/preference model."""
 
-        height = self.config.image_size
-        width = self.config.image_size
-        horizontal = torch.linspace(
-            -1.0, 1.0, width, device=self.device
-        ).reshape(1, 1, 1, width)
-        vertical = torch.linspace(
-            -1.0, 1.0, height, device=self.device
-        ).reshape(1, 1, height, 1)
-        image = torch.cat(
-            (
-                horizontal.expand(1, 1, height, width),
-                vertical.expand(1, 1, height, width),
-                0.5
-                * (
-                    horizontal.expand(1, 1, height, width)
-                    + vertical.expand(1, 1, height, width)
-                ),
-            ),
-            dim=1,
+        return self._calibrate_starter_action_policy(
+            # The capability curriculum intentionally shifts the shared
+            # language representation before this head is calibrated. The
+            # Direct discrete ternary updates need a longer bounded window
+            # than the former floating-master optimizer. The strict measured
+            # confidence gate remains unchanged and can stop this early.
+            max_steps=256,
+            minimum_steps=16,
         )
-        audio_time = torch.linspace(
-            0.0, 1.0, self.config.audio_samples, device=self.device
-        )
-        audio = (
-            0.55 * torch.sin(audio_time * (2.0 * math.pi * 3.0))
-        ).reshape(1, 1, -1)
-        frames = [
-            torch.roll(image, shifts=index, dims=-1)
-            for index in range(self.config.video_frames)
-        ]
-        video = torch.stack(frames, dim=2)
-        idea = self._media_idea("bundled starter multimodal experience")
 
-        parameters: List[nn.Parameter] = []
-        if self.config.vision_enabled:
-            parameters.extend(self.modalities.vision.parameters())
-        if self.config.image_enabled:
-            parameters.extend(self.modalities.image.parameters())
-        if self.config.audio_enabled:
-            parameters.extend(self.modalities.audio.parameters())
-        if self.config.video_enabled:
-            parameters.extend(self.modalities.video.parameters())
-        if not parameters:
-            return {"steps": 0, "loss": 0.0, "modalities": []}
 
-        optimizer = torch.optim.AdamW(
-            parameters,
-            lr=self.config.learning_rate,
-            weight_decay=1e-5,
-        )
-        optimizer.zero_grad(set_to_none=True)
-        losses: List[torch.Tensor] = []
-        trained: List[str] = []
-        if self.config.image_enabled:
-            losses.append(self.modalities.image(image, idea)["loss"])
-            trained.append("image")
-        if self.config.vision_enabled:
-            embedding = self.modalities.vision(image)
-            losses.append(
-                0.2
-                * (
-                    1.0
-                    - F.cosine_similarity(
-                        embedding,
-                        F.normalize(idea, dim=-1),
-                    ).mean()
-                )
-            )
-            trained.append("vision")
-        if self.config.audio_enabled:
-            audio_output = self.modalities.audio(audio, idea)
-            losses.append(
-                audio_output["loss"]
-                + 0.2
-                * (
-                    1.0
-                    - F.cosine_similarity(
-                        audio_output["embedding"],
-                        F.normalize(idea, dim=-1),
-                    ).mean()
-                )
-            )
-            trained.append("audio")
-        if self.config.video_enabled:
-            video_output = self.modalities.video(video, idea)
-            losses.append(
-                video_output["loss"]
-                + 0.2
-                * (
-                    1.0
-                    - F.cosine_similarity(
-                        video_output["embedding"],
-                        F.normalize(idea, dim=-1),
-                    ).mean()
-                )
-            )
-            trained.append("video")
-        loss = torch.stack(losses).sum()
-        if not bool(torch.isfinite(loss)):
-            raise RuntimeError("non-finite bundled starter modality loss")
-        loss.backward()
-        self._accumulate_slow_importance(parameters)
-        torch.nn.utils.clip_grad_norm_(parameters, self.config.grad_clip)
-        optimizer.step()
-        self._commit_slow_anchors(rate=1.0)
-        self.counters["training_steps"] += 1
-        for modality in trained:
-            self.modality_training[modality] += 1
+
+
+    def _clear_ground_up_transient_state(self) -> Dict[str, Any]:
+        """Remove Build-time scratch while preserving learned neural state."""
+
+        before = {
+            "replayEntries": len(self.replay),
+            "workingMemoryVectors": len(self.working_memory),
+            "pagedWorkingMemory": self.paged_working_memory.count(),
+            "recentTokens": len(self.recent_token_context),
+            "lifecycleScratch": len(self.memory_lifecycle.afterimage_items),
+            "lifecycleFocus": len(self.memory_lifecycle.active_focus),
+        }
+        self.replay.truncate(0)
+        self.paged_working_memory.clear()
+        self.working_memory = []
+        self.workspace_items = []
+        self.recent_token_context = []
+        self.current_context = {
+            "tokenCount": 0,
+            "tokenHash": "",
+            "sensorySlots": 0,
+            "updatedAt": _iso_now(),
+        }
+        self.fresh_attention_boundary = None
+        self._fresh_attention_paged_clear_pending = False
+        self.memory_lifecycle.clear_attention()
+        self.router.reset_activity()
+        self.liquid_state.zero_()
         return {
-            "steps": 1,
-            "loss": float(loss.detach().item()),
-            "modalities": trained,
-            "syntheticFixture": True,
+            **{key + "Before": value for key, value in before.items()},
+            "replayEntriesAfter": len(self.replay),
+            "workingMemoryVectorsAfter": len(self.working_memory),
+            "pagedWorkingMemoryAfter": self.paged_working_memory.count(),
+            "recentTokensAfter": len(self.recent_token_context),
+            "lifecycleScratchAfter": len(
+                self.memory_lifecycle.afterimage_items
+            ),
+            "lifecycleFocusAfter": len(self.memory_lifecycle.active_focus),
+            "currentContextTokensAfter": int(
+                self.current_context.get("tokenCount", 0)
+            ),
+            "currentContextSensorySlotsAfter": int(
+                self.current_context.get("sensorySlots", 0)
+            ),
+            "freshAttentionBoundaryAfter": None,
+            "liquidStateAbsoluteSumAfter": float(
+                self.liquid_state.detach().abs().sum().item()
+            ),
+            "routerMembraneAbsoluteSumAfter": float(
+                self.router.population.membrane.detach().abs().sum().item()
+            ),
+            "routerPreTraceAbsoluteSumAfter": float(
+                self.router.synapses.pre_trace.detach().abs().sum().item()
+            ),
+            "routerPostTraceAbsoluteSumAfter": float(
+                self.router.synapses.post_trace.detach().abs().sum().item()
+            ),
+            "complete": True,
+            "learnedParametersPreserved": True,
+            "learnedSubstratePreserved": True,
         }
 
-    def _train_bundled_starter(self) -> Dict[str, Any]:
-        """Materialize the project-authored trained origin before snapshotting."""
+    def _train_ground_up_curriculum(
+        self,
+        progress: Optional[Callable[[str, float, str, Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Train the native random core on the transparent local curriculum.
 
+        Construction has no committed checkpoint before this method returns.
+        Any exception therefore aborts the entire build; only the subsequently
+        snapshotted origin can become durable/discoverable.
+        """
+
+        curriculum = current_ground_up_curriculum_manifest()
         initial_checksum = self.parameter_checksum()
-        losses: List[float] = []
-        for text in STARTER_CORPUS:
-            learned = self.learn_experience(
-                text,
-                kind="starter-training",
-                source="bundled-starter",
-                source_label="omni-starter-bundled-1",
-                steps=1,
-                importance=0.72,
+        initial_accounting = self.parameter_accounting()
+        modality_checksum_before = self._modality_parameter_checksum()
+        selector_checksum_before = self._imagination_selector_checksum()
+        parameter_checksums_before = {
+            name: tensor_checksum([parameter])
+            for name, parameter in self._named_native_core_tensors().items()
+        }
+        substrate_before = {
+            "neurons": len(self.memory.neurons),
+            "assemblies": len(self.memory.assemblies),
+            "synapses": len(self.memory.synapses),
+        }
+        if progress is not None:
+            progress(
+                "capability-curriculum",
+                0.18,
+                "Training the random native core on local tool/action examples",
+                self._build_progress_metrics(),
             )
-            losses.append(float(learned["training"]["loss"]))
+        tool_curriculum = self._train_starter_tool_curriculum(
+            source="built-in-tool-curriculum",
+            source_label=str(curriculum["id"]),
+            kind_prefix="ground-up",
+            trajectories=GROUND_UP_TOOL_TRAJECTORIES,
+            negative_examples=GROUND_UP_TOOL_NEGATIVE_EXAMPLES,
+            files_tool_id="system.files",
+        )
+        self._starter_records_visited = int(tool_curriculum["recordsVisited"])
         action_training = self._train_starter_action_policy()
-        modality_training = self._train_starter_modalities()
-        manifest = {
-            **starter_manifest(),
+        self._starter_records_visited += len(GROUND_UP_ACTION_EXAMPLES)
+        if progress is not None:
+            progress(
+                "action-policy",
+                0.66,
+                "Training native action routes from the same local examples",
+                self._build_progress_metrics(),
+            )
+        public_capability_readiness = rehearse_public_capability_routes(
+            self,
+            maximum_steps=256,
+            minimum_steps=1,
+            curriculum_version=3,
+        )
+        transient_reset = self._clear_ground_up_transient_state()
+        parameter_checksums_after = {
+            name: tensor_checksum([parameter])
+            for name, parameter in self._named_native_core_tensors().items()
+        }
+        changed_tensors = sorted(
+            name
+            for name, checksum in parameter_checksums_after.items()
+            if parameter_checksums_before.get(name) != checksum
+        )
+        trained_checksum = self.parameter_checksum()
+        modality_checksum_after = self._modality_parameter_checksum()
+        selector_checksum_after = self._imagination_selector_checksum()
+        expected_records = GROUND_UP_V3_SOURCE_RECORDS
+        if self._starter_records_visited != expected_records:
+            raise RuntimeError("local curriculum record coverage is incomplete")
+        if not changed_tensors or trained_checksum == initial_checksum:
+            raise RuntimeError("local curriculum did not update native core weights")
+        if (
+            modality_checksum_after != modality_checksum_before
+            or selector_checksum_after != selector_checksum_before
+            or any(name.startswith("modalities.") for name in changed_tensors)
+        ):
+            raise RuntimeError(
+                "ground-up tool/action curriculum changed modality parameters"
+            )
+        substrate_after = {
+            "neurons": len(self.memory.neurons),
+            "assemblies": len(self.memory.assemblies),
+            "synapses": len(self.memory.synapses),
+        }
+        if substrate_after == substrate_before:
+            raise RuntimeError("local curriculum did not update the neural substrate")
+        receipt = seal_ground_up_v3_training_receipt({
+            **current_ground_up_training_receipt_contract(),
+            "recordsVisited": self._starter_records_visited,
+            "recordGroupsVisited": {
+                "actionExamples": len(GROUND_UP_ACTION_EXAMPLES),
+                "toolTrajectories": len(GROUND_UP_TOOL_TRAJECTORIES),
+                "negativeToolExamples": len(
+                    GROUND_UP_TOOL_NEGATIVE_EXAMPLES
+                ),
+                "syntheticModalityFixtures": 0,
+                "imaginationSelectorFixtures": 0,
+            },
+            "completeCoverage": True,
+            "nativeCoreParameterTensors": len(parameter_checksums_after),
+            "changedNativeCoreParameterTensors": len(changed_tensors),
+            "changedNativeCoreTensorNames": changed_tensors,
+            "parameterChecksumBefore": initial_checksum,
+            "parameterChecksumAfter": trained_checksum,
+            "parametersChanged": True,
+            "modalityParameterChecksumBefore": modality_checksum_before,
+            "modalityParameterChecksumAfter": modality_checksum_after,
+            "modalityParametersChanged": False,
+            "imaginationSelectorChecksumBefore": selector_checksum_before,
+            "imaginationSelectorChecksumAfter": selector_checksum_after,
+            "imaginationSelectorParametersChanged": False,
+            "substrateBefore": substrate_before,
+            "substrateAfter": substrate_after,
+            "substrateChanged": True,
+        })
+        validate_ground_up_v3_training_receipt(receipt)
+        enabled_modalities = [
+            name
+            for name, enabled in (
+                ("vision", self.config.vision_enabled),
+                ("image", self.config.image_enabled),
+                ("audio", self.config.audio_enabled),
+                ("video", self.config.video_enabled),
+            )
+            if enabled
+        ]
+        modality_training = {
+            "source": "selected-user-data-only",
+            "enabledModalities": enabled_modalities,
+            "trainedModalities": [],
+            "trainingRecords": 0,
+            "steps": 0,
+            "parametersChanged": False,
+            "syntheticFixture": False,
+            "initialization": "seeded-random-untrained",
+        }
+        manifest = seal_ground_up_v3_training_manifest({
+            **curriculum,
+            "originKind": "ground-up",
             "trainedAt": _iso_now(),
-            "initialParameterChecksum": initial_checksum,
-            "trainedParameterChecksum": self.parameter_checksum(),
-            "corpusPassagesVisited": len(STARTER_CORPUS),
-            "meanCorpusLoss": sum(losses) / max(1, len(losses)),
-            "corpusLossCurve": losses,
+            "randomInitialization": {
+                "algorithm": "torch-seeded-module-initialization-v1",
+                "seed": int(self.config.seed),
+                "parameterChecksum": initial_checksum,
+                "exactParameterCount": int(
+                    initial_accounting["totalNeuralParameters"]
+                ),
+            },
+            "architectureScale": {
+                "hardwareTier": self.config.hardware_tier,
+                "dimensions": self.config.d_model,
+                "layers": self.config.n_layers,
+                "feedForward": self.config.d_ff,
+                "vsaDimensions": self.config.vsa_dim,
+                "routerNeurons": self.config.router_neurons,
+                "denseParameterCount": int(
+                    initial_accounting["mutableDenseParameters"]
+                ),
+                "growthCardinalityLimit": None,
+                "growthBoundary": "live-resource-watermark",
+                "diskStateOffload": bool(self.config.disk_state_offload),
+            },
+            "toolCurriculum": tool_curriculum,
             "actionTraining": action_training,
             "modalityTraining": modality_training,
-            "hiddenBehavioralPrompt": False,
-        }
-        self.events.append(
-            "bundled-starter-trained",
-            {
-                "manifestId": manifest["id"],
-                "manifestSha256": manifest["sha256"],
-                "corpusPassagesVisited": len(STARTER_CORPUS),
-                "actionTraining": action_training,
-                "modalityTraining": modality_training,
-                "parameterChecksumBefore": initial_checksum,
-                "parameterChecksumAfter": manifest["trainedParameterChecksum"],
-            },
-        )
+            "transientStateReset": transient_reset,
+            "publicCapabilityReadiness": public_capability_readiness,
+            "trainingReceipt": receipt,
+            "externalWeightFiles": [],
+            "pretrainedTextCortex": None,
+            "baseFrozen": False,
+        })
+        self._validate_ground_up_v3_training_manifest(manifest)
+        self.events.append("ground-up-curriculum-trained", dict(receipt))
         return manifest
+
 
     @staticmethod
     def _restore_candidate_checkpoint(candidate_dir: Path) -> None:
@@ -1519,6 +3544,7 @@ class AdaptiveBrain:
             shutil.copy2(str(source), str(temporary))
             os.replace(str(temporary), str(engine_path / filename))
         copy_substrate_snapshot(stable, engine_path)
+        copy_mutable_state_snapshot(stable, engine_path)
         source = stable / "brain.json"
         temporary = engine_path / "brain.json.recovery.tmp"
         shutil.copy2(str(source), str(temporary))
@@ -1593,8 +3619,80 @@ class AdaptiveBrain:
             # SQLite event journal open. Windows will otherwise refuse to
             # clean up, replace, or restore the containing brain directory.
             if constructed:
-                constructed[0].events.close()
+                constructed[0].close()
             raise
+
+    @staticmethod
+    def _repair_nonfinite_core_tensors(
+        core: Mapping[str, torch.Tensor],
+        recovery_sources: Sequence[Tuple[str, Mapping[str, torch.Tensor]]],
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], List[Dict[str, Any]]]:
+        """Repair only corrupt elements from verified checkpoint generations.
+
+        Finite values in the active checkpoint are authoritative learned state
+        and are never replaced.  A matching, finite value from the newest
+        verified recovery generation fills each non-finite position.  If no
+        trusted source can repair every position, loading fails closed rather
+        than silently reinitializing or discarding a learned tensor.
+        """
+
+        repaired = dict(core)
+        masks: Dict[str, torch.Tensor] = {}
+        records: List[Dict[str, Any]] = []
+        for name, active in core.items():
+            if not active.is_floating_point():
+                continue
+            invalid = ~torch.isfinite(active)
+            invalid_count = int(invalid.sum().item())
+            if invalid_count == 0:
+                continue
+            value = active.detach().clone()
+            unresolved = invalid.clone()
+            source_counts: Dict[str, int] = {}
+            for source_name, source_core in recovery_sources:
+                fallback = source_core.get(name)
+                if (
+                    fallback is None
+                    or not fallback.is_floating_point()
+                    or fallback.shape != active.shape
+                ):
+                    continue
+                usable = unresolved & torch.isfinite(fallback)
+                count = int(usable.sum().item())
+                if count == 0:
+                    continue
+                value[usable] = fallback.to(dtype=value.dtype)[usable]
+                unresolved &= ~usable
+                source_counts[source_name] = count
+                if not bool(unresolved.any()):
+                    break
+            if bool(unresolved.any()):
+                raise ValueError(
+                    "%s contains %d non-finite checkpoint values and no "
+                    "verified recovery generation can restore all of them"
+                    % (name, int(unresolved.sum().item()))
+                )
+            # This assertion protects future edits from accidentally replacing
+            # valid learned positions while broadening checkpoint recovery.
+            if not torch.equal(value[~invalid], active[~invalid]):
+                raise RuntimeError(
+                    "checkpoint recovery changed finite learned state in %s"
+                    % name
+                )
+            repaired[name] = value
+            masks[name] = invalid.detach().cpu()
+            records.append(
+                {
+                    "tensor": name,
+                    "repairedElements": invalid_count,
+                    "totalElements": int(active.numel()),
+                    "sources": source_counts,
+                    "finiteLearnedElementsPreserved": int(
+                        active.numel() - invalid_count
+                    ),
+                }
+            )
+        return repaired, masks, records
 
     @classmethod
     def _load_impl(
@@ -1604,8 +3702,33 @@ class AdaptiveBrain:
         constructed: Optional[List["AdaptiveBrain"]] = None,
     ) -> "AdaptiveBrain":
         engine_path = Path(storage_path).resolve() / "engine"
+        def require_native_metadata(candidate: Mapping[str, Any]) -> None:
+            saved_config = candidate.get("config")
+            if not isinstance(saved_config, Mapping) or (
+                saved_config.get("origin_kind") != "ground-up"
+                or "foundation_model_id" in saved_config
+                or "foundationModelId" in saved_config
+            ):
+                raise ValueError(
+                    "Only native ground-up OmniCortex brains can be loaded; "
+                    "imported foundations and legacy origins are unsupported"
+                )
+            if candidate.get("neural_sequence_memory") is not None:
+                raise ValueError(
+                    "checkpoint contains obsolete cue-to-answer sequence memory"
+                )
+            if "starter_training_manifest" in candidate:
+                raise ValueError("checkpoint contains an imported starter manifest")
+            if candidate.get("messages") or candidate.get("traces"):
+                raise ValueError("native checkpoint contains obsolete inline conversation")
+
+        # Reject incompatible identities before recovery has an opportunity
+        # to write anything into their app-managed directories.
+        metadata = read_json(engine_path / "brain.json")
+        require_native_metadata(metadata)
         recovered_candidates = cls._recover_interrupted_candidates(engine_path)
         metadata = read_json(engine_path / "brain.json")
+        require_native_metadata(metadata)
         if int(metadata.get("schema_version", 0)) != ENGINE_SCHEMA_VERSION:
             raise ValueError("unsupported OmniCortex engine schema")
         if metadata.get("release_format") != "stable-1.0":
@@ -1619,15 +3742,73 @@ class AdaptiveBrain:
         brain = cls(brain_id, storage_path, config)
         if constructed is not None:
             constructed.append(brain)
+        stored_working_pages = metadata.get("paged_working_memory")
+        if isinstance(stored_working_pages, Mapping):
+            brain.paged_working_memory_recovery = (
+                brain.paged_working_memory.recover_checkpoint(
+                    stored_working_pages
+                )
+            )
         for _ in range(int(metadata.get("expert_count", 0))):
             brain.decoder.grow_expert()
+        brain._configure_packed_stability()
+        recovered_mutable: Optional[Dict[str, Any]] = None
+        mutable_pointer = metadata.get("mutable_state")
+        if isinstance(mutable_pointer, Mapping):
+            recovered_mutable = brain.state_store.recover(
+                mutable_pointer,
+                engine_path,
+                brain.replay,
+            )
+            recovered_pointer = recovered_mutable.get("pointer")
+            brain.mutable_state_manifest = dict(
+                recovered_pointer
+                if isinstance(recovered_pointer, Mapping)
+                else mutable_pointer
+            )
         core = load_tensors(engine_path / "core.safetensors", device="cpu")
+        origin_verified = brain._ground_up_origin_is_complete(
+            engine_path / "origin"
+        )
+        core_recovery_sources: List[Tuple[str, Mapping[str, torch.Tensor]]] = []
+        if any(
+            value.is_floating_point()
+            and not bool(torch.isfinite(value).all())
+            for value in core.values()
+        ):
+            if isinstance(mutable_pointer, Mapping):
+                core_recovery_sources.extend(
+                    (
+                        "previous-generation:%s" % generation_id,
+                        generation_core,
+                    )
+                    for generation_id, generation_core
+                    in brain.state_store.prior_core_generations(mutable_pointer)
+                )
+            if origin_verified:
+                core_recovery_sources.append(
+                    (
+                        "verified-omni-origin",
+                        load_tensors(
+                            engine_path / "origin" / "core.safetensors",
+                            device="cpu",
+                        ),
+                    )
+                )
+        core, repaired_core_masks, core_recovery_records = (
+            cls._repair_nonfinite_core_tensors(core, core_recovery_sources)
+        )
         plastic = load_tensors(
             engine_path / "plasticity.safetensors", device="cpu"
         )
         _load_prefixed(brain.decoder, core, "decoder.")
         _load_prefixed(brain.memory_bridge, core, "memory_bridge.")
         _load_prefixed(brain.idea_adapter, core, "idea_adapter.")
+        has_foundation_adapter = any(
+            key.startswith("foundation_adapter.") for key in core
+        )
+        if has_foundation_adapter:
+            raise ValueError("checkpoint contains an imported foundation adapter")
         _load_prefixed(brain.liquid, core, "liquid.")
         _load_prefixed(brain.modalities, core, "modalities.")
         _load_prefixed(brain.router, plastic, "router.")
@@ -1658,6 +3839,10 @@ class AdaptiveBrain:
                     "lastActiveAt": _iso_now(),
                 },
             )
+        brain.memory_lifecycle = OrganicMemoryLifecycle.from_state(
+            metadata.get("memory_lifecycle"),
+            plastic,
+        )
         brain.current_context = dict(
             metadata.get("current_context", brain.current_context)
         )
@@ -1677,6 +3862,7 @@ class AdaptiveBrain:
                 engine_path / "substrate",
                 substrate_metadata,
                 growth_guard=brain._allow_substrate_growth,
+                lazy_synapses=True,
             )
         else:
             # Backward-safe internal stable-v1 loading. The public beta format
@@ -1686,9 +3872,13 @@ class AdaptiveBrain:
                 substrate_metadata, plastic, prefix="substrate."
             )
             brain.memory.growth_guard = brain._allow_substrate_growth
+        if any(str(name).startswith("sequence_memory.") for name in plastic):
+            raise ValueError("native OmniCortex cannot load cue-to-answer weights")
         replay = plastic.get("state.replay")
-        if replay is not None:
-            brain.replay = [row.detach().cpu() for row in replay]
+        if replay is not None and len(brain.replay) == 0:
+            # One-way migration for early internal stable-v1 checkpoints. New
+            # saves keep replay exclusively in transactional SQLite.
+            brain.replay.extend(row.detach().cpu() for row in replay)
         cached_language = plastic.get("state.starter_action_language_features")
         cached_internal = plastic.get("state.starter_action_internal_features")
         cached_targets = plastic.get("state.starter_action_targets")
@@ -1717,14 +3907,99 @@ class AdaptiveBrain:
                 for name, value in anchors.items()
             }
             brain._sync_stability_state()
-        brain.messages = list(metadata.get("messages", []))
-        brain.traces = list(metadata.get("traces", []))
-        brain.training_sources = list(metadata.get("training_sources", []))
+        brain.messages = []
+        brain.traces = []
+        brain.training_sources = [
+            cls._source_without_inline_text(value)
+            for value in metadata.get("training_sources", [])
+            if isinstance(value, Mapping)
+        ]
+        # Stable source retention is owned by the desktop CAS. Remove inline
+        # text from any early internal stable checkpoint on first load.
+        for assembly in brain.memory.assemblies:
+            if isinstance(assembly, dict):
+                assembly.pop("source_text", None)
+        brain.ingestion_checkpoints = cls._validated_ingestion_checkpoints(
+            metadata.get("ingestion_checkpoints")
+        )
+        brain.completed_ingestions = cls._validated_completed_ingestions(
+            metadata.get("completed_ingestions")
+        )
+        brain.completed_chat_turns = cls._validated_completed_chat_turns(
+            metadata.get("completed_chat_turns")
+        )
+        raw_completed_chat_slow = metadata.get(
+            "completed_chat_slow_learning", []
+        )
+        if not isinstance(raw_completed_chat_slow, list):
+            raise ValueError("completed chat slow-learning records are invalid")
+        brain.completed_chat_slow_learning = [
+            str(value)
+            for value in raw_completed_chat_slow
+            if brain._sha256_identifier(value)
+        ][-COMPLETED_CHAT_SLOW_LEARNING:]
+        raw_pending_chat_slow = metadata.get("pending_chat_slow_learning", [])
+        if not isinstance(raw_pending_chat_slow, list):
+            raise ValueError("pending chat slow-learning records are invalid")
+        brain.pending_chat_slow_learning = [
+            dict(item)
+            for item in raw_pending_chat_slow
+            if isinstance(item, Mapping)
+            and brain._sha256_identifier(item.get("jobId"))
+            and brain._sha256_identifier(item.get("inputSha256"))
+            and isinstance(item.get("humanMessageId"), str)
+            and bool(item.get("humanMessageId"))
+        ]
+        brain.fresh_attention_boundary = (
+            cls._validated_fresh_attention_boundary(
+                metadata.get("fresh_attention_boundary")
+            )
+        )
+        brain.memory.configure_attention_overlay(
+            (
+                int(brain.fresh_attention_boundary["epoch"])
+                if brain.fresh_attention_boundary is not None
+                else 0
+            ),
+            (
+                metadata.get("attention_overlay")
+                if isinstance(metadata.get("attention_overlay"), Mapping)
+                else None
+            ),
+        )
+        saved_conversation = metadata.get("conversation")
+        if not isinstance(saved_conversation, Mapping):
+            raise ValueError("native checkpoint is missing its committed conversation head")
+        try:
+            brain.conversation.truncate_after_head(
+                int(saved_conversation["headSequence"]),
+                str(saved_conversation["headSha256"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "native conversation ledger does not match the committed checkpoint"
+            ) from error
+        active_epoch = brain._attention_epoch()
+        runtime_rows = max(32, min(1000, int(brain.config.max_seq_len)))
+        brain.messages = brain.conversation.recent_payloads(
+            "message", runtime_rows, attention_epoch=active_epoch
+        )
+        brain.traces = brain.conversation.recent_payloads(
+            "trace", min(200, runtime_rows), attention_epoch=active_epoch
+        )
         brain.created_at = str(metadata.get("created_at", _iso_now()))
         brain.updated_at = str(metadata.get("updated_at", brain.created_at))
         brain.counters.update(
             {key: int(value) for key, value in metadata.get("counters", {}).items()}
         )
+        if brain.completed_chat_turns:
+            brain.counters["inference_count"] = max(
+                int(brain.counters.get("inference_count", 0)),
+                max(
+                    int(item["inferenceCount"])
+                    for item in brain.completed_chat_turns
+                ),
+            )
         brain.modality_training.update(
             {
                 key: int(value)
@@ -1737,10 +4012,10 @@ class AdaptiveBrain:
             for item in metadata.get("installed_modality_packs", [])
             if isinstance(item, Mapping)
         ]
-        stored_starter_manifest = metadata.get("starter_training_manifest")
-        brain.starter_training_manifest = (
-            dict(stored_starter_manifest)
-            if isinstance(stored_starter_manifest, Mapping)
+        stored_ground_up_manifest = metadata.get("ground_up_training_manifest")
+        brain.ground_up_training_manifest = (
+            dict(stored_ground_up_manifest)
+            if isinstance(stored_ground_up_manifest, Mapping)
             else None
         )
         stored_packed_manifest = metadata.get("packed_ternary_manifest")
@@ -1751,14 +4026,18 @@ class AdaptiveBrain:
         )
         brain.novelty_streak = int(metadata.get("novelty_streak", 0))
         brain.growth_pause = metadata.get("growth_pause")
+        brain.resource_pause = metadata.get("resource_pause")
         brain.last_activity_decay = float(
             metadata.get("last_activity_decay", time.time())
         )
         brain.last_idle_cycle_at = float(metadata.get("last_idle_cycle_at", 0.0))
-        brain._bundled_origin_verified = (
-            brain._verify_bundled_origin_provenance()
+        brain.last_idle_visible_action_at = float(
+            metadata.get("last_idle_visible_action_at", 0.0)
         )
-        if brain._bundled_origin_verified:
+        brain._ground_up_action_origin_verified = (
+            brain._verify_ground_up_action_origin()
+        )
+        if brain._ground_up_action_origin_verified:
             origin_plastic = load_tensors(
                 engine_path / "origin" / "plasticity.safetensors",
                 device="cpu",
@@ -1777,7 +4056,7 @@ class AdaptiveBrain:
                 or origin_internal is None
                 or origin_targets is None
             ):
-                brain._bundled_origin_verified = False
+                brain._ground_up_action_origin_verified = False
             else:
                 brain._starter_action_language_cache = (
                     origin_language.detach().cpu()
@@ -1788,25 +4067,132 @@ class AdaptiveBrain:
                 brain._starter_action_target_cache = (
                     origin_targets.detach().cpu()
                 )
-        brain._optimizer = brain._new_optimizer()
+        brain._replace_optimizer()
+        if recovered_mutable is not None:
+            optimizer_state = recovered_mutable.get("optimizerState")
+            if isinstance(optimizer_state, Mapping):
+                try:
+                    brain._load_optimizer_state(optimizer_state)
+                except (ValueError, KeyError, TypeError) as error:
+                    raise ValueError(
+                        "mutable-state optimizer checkpoint is incompatible"
+                    ) from error
+        optimizer_recovery = brain._repair_optimizer_for_core_recovery(
+            repaired_core_masks
+        )
+        loaded_parameter_checksum = brain.parameter_checksum()
+        for active_checkpoint in brain.ingestion_checkpoints.values():
+            if core_recovery_records:
+                # The record cursor and every finite neural value remain
+                # authoritative. The repaired generation is committed below
+                # and receives a fresh exact transactional binding.
+                active_checkpoint["neuralStateChecksum"] = (
+                    loaded_parameter_checksum
+                )
+                continue
+            if (
+                active_checkpoint.get("neuralStateChecksum")
+                != loaded_parameter_checksum
+            ):
+                raise ValueError(
+                    "ingestion checkpoint does not match committed neural state"
+                )
+            binding = dict(active_checkpoint["committedGeneration"])
+            mutable = brain.mutable_state_manifest or {}
+            substrate = brain.memory.persistence_manifest or {}
+            replay_checkpoint = brain.replay.checkpoint()
+            workspace_checkpoint = brain.paged_working_memory.checkpoint()
+            observed_binding = {
+                "format": "omni-ingestion-generation-binding",
+                "formatVersion": 1,
+                "mutableStateActiveGeneration": str(
+                    mutable.get("activeGeneration", "")
+                ),
+                "mutableStateContentSha256": str(
+                    mutable.get("contentSha256", "")
+                ),
+                "substrateContentSha256": str(
+                    substrate.get("contentSha256", "")
+                ),
+                "replayCount": int(replay_checkpoint["count"]),
+                "replayHighWaterId": int(replay_checkpoint["highWaterId"]),
+                "replayContentSha256": str(
+                    replay_checkpoint["contentSha256"]
+                ),
+                "workspacePageCount": int(workspace_checkpoint["count"]),
+                "workspacePageHighWaterId": int(
+                    workspace_checkpoint["highWaterId"]
+                ),
+                "workspacePageContentSha256": str(
+                    workspace_checkpoint["contentSha256"]
+                ),
+                "workspacePagesLearningReadable": False,
+                "neuralStateChecksum": loaded_parameter_checksum,
+            }
+            if binding != observed_binding:
+                raise ValueError(
+                    "ingestion checkpoint does not match its committed generation"
+                )
         packed_path = engine_path / "packed-ternary"
-        if (packed_path / "manifest.json").is_file():
-            synapse_ids, dynamic_values = brain._dynamic_synapse_export()
+        if (
+            not core_recovery_records
+            and (packed_path / "manifest.json").is_file()
+        ):
+            (
+                dynamic_values,
+                dynamic_synapse_count,
+                expected_synapse_order_hash,
+                dynamic_order_basis,
+            ) = brain._dynamic_synapse_pack_state()
             dynamic_name = "substrate.dynamic_synapses.weights"
-            expected_synapse_order_hash = hashlib.sha256(
-                "\0".join(synapse_ids).encode("utf-8")
-            ).hexdigest()
-            expected_specs = collect_module_ternary_tensors(
+            dynamic_tensors = brain._dynamic_ternary_tensors(dynamic_values)
+            expected_layout = inspect_module_ternary_layout(
                 brain._ternary_export_roots(),
-                dynamic_synapses={
-                    dynamic_name: dynamic_values,
-                },
+                dynamic_synapses=dynamic_tensors,
             )
-            expected_names = [spec.name for spec in expected_specs]
-            verified_packed = verify_ternary_shards(packed_path)
+            verified_packed = verify_ternary_shards(
+                packed_path, retain_names=(dynamic_name,)
+            )
+            packed_layout = {
+                str(entry.get("name", "")): (
+                    tuple(int(value) for value in entry.get("shape", [])),
+                    str(entry.get("kind", "")),
+                )
+                for entry in verified_packed.manifest.get("tensors", [])
+            }
+            # A valid earlier pack may have fewer dynamic synapses than the
+            # newly committed neural generation. Regenerate it from the
+            # authoritative checkpoint below instead of rejecting the brain.
+            packed_layout_is_stale = packed_layout != expected_layout
             packed_metadata = verified_packed.manifest.get("metadata")
             if not isinstance(packed_metadata, Mapping):
                 raise ValueError("packed ternary metadata is invalid")
+            ground_up_curriculum = resolve_ground_up_curriculum_manifest(
+                brain.ground_up_training_manifest
+            )
+            if (
+                ground_up_curriculum is not None
+                and int(ground_up_curriculum.get("formatVersion", 0)) >= 3
+            ):
+                ground_up_manifest = validate_ground_up_v3_training_manifest(
+                    brain.ground_up_training_manifest
+                )
+                ground_up_receipt = ground_up_manifest.get("trainingReceipt")
+                if (
+                    not isinstance(ground_up_receipt, Mapping)
+                    or packed_metadata.get("groundUpCurriculumSha256")
+                    != ground_up_curriculum["sha256"]
+                    or packed_metadata.get("groundUpTrainingManifestSha256")
+                    != ground_up_manifest.get("contentSha256")
+                    or packed_metadata.get("groundUpTrainingReceiptSha256")
+                    != ground_up_receipt.get("contentSha256")
+                    or packed_metadata.get("originKind") != "ground-up"
+                    or packed_metadata.get("baseFrozen") is not False
+                    or "foundationModelId" in packed_metadata
+                ):
+                    raise ValueError(
+                        "packed ternary ground-up provenance is invalid"
+                    )
             packed_parameter_checksum = str(
                 packed_metadata.get("parameterChecksum", "")
             )
@@ -1815,12 +4201,35 @@ class AdaptiveBrain:
             packed_dynamic_order_hash = packed_metadata.get(
                 "dynamicSynapseOrderSha256"
             )
+            packed_total_dynamic = packed_metadata.get(
+                "totalDynamicSynapseCount"
+            )
+            if any(
+                name.startswith("substrate.sequence_memory.")
+                for name in packed_layout
+            ) or any(
+                str(name).startswith("neuralSequence")
+                or name == "totalPackedSequenceSynapseSlots"
+                for name in packed_metadata
+            ):
+                raise ValueError("packed checkpoint contains obsolete answer-key state")
             dynamic_pack_is_stale = (
-                isinstance(packed_dynamic_count, bool)
+                packed_total_dynamic != dynamic_synapse_count
+                or packed_metadata.get("dynamicSynapseCountingBasis")
+                != "substrate-records-v1"
+                or isinstance(packed_dynamic_count, bool)
                 or not isinstance(packed_dynamic_count, int)
-                or packed_dynamic_count != len(synapse_ids)
+                or packed_dynamic_count != dynamic_synapse_count
                 or not isinstance(packed_dynamic_order_hash, str)
                 or packed_dynamic_order_hash != expected_synapse_order_hash
+                or packed_metadata.get("dynamicSynapseOrderBasis")
+                != dynamic_order_basis
+                or packed_metadata.get("substrateContentSha256")
+                != str(
+                    (brain.memory.persistence_manifest or {}).get(
+                        "contentSha256", ""
+                    )
+                )
                 or packed_dynamic_values is None
                 or packed_dynamic_values.dtype != torch.int8
                 or tuple(packed_dynamic_values.shape)
@@ -1833,13 +4242,85 @@ class AdaptiveBrain:
             if (
                 packed_parameter_checksum != brain.parameter_checksum()
                 or dynamic_pack_is_stale
+                or packed_layout_is_stale
             ):
                 brain.export_packed_ternary()
-            else:
-                verify_ternary_shards(
-                    packed_path,
-                    expected_names=expected_names,
+        stored_cpu_rng = plastic.get("state.rng_cpu")
+        if stored_cpu_rng is not None:
+            torch.set_rng_state(stored_cpu_rng.detach().cpu().to(torch.uint8))
+        stored_accelerator_rng = plastic.get("state.rng_accelerator")
+        if stored_accelerator_rng is not None:
+            if brain.device_backend == "cuda":
+                torch.cuda.set_rng_state(
+                    stored_accelerator_rng.detach().cpu().to(torch.uint8),
+                    brain.device,
                 )
+            elif brain.device_backend == "mps" and hasattr(
+                torch, "mps"
+            ) and hasattr(torch.mps, "set_rng_state"):
+                torch.mps.set_rng_state(
+                    stored_accelerator_rng.detach().cpu().to(torch.uint8)
+                )
+        if core_recovery_records:
+            previous_generation = str(
+                (brain.mutable_state_manifest or {}).get(
+                    "activeGeneration", ""
+                )
+            )
+            # Keep the newest verified generation actually used for repair as
+            # the post-recovery rollback point. Retaining the corrupt active
+            # generation instead would discard the only known-good fallback
+            # when save performs bounded generation garbage collection.
+            used_sources = {
+                str(source)
+                for record in core_recovery_records
+                for source in dict(record.get("sources", {}))
+            }
+            retained_recovery_generation = next(
+                (
+                    source.split(":", 1)[1]
+                    for source, _source_core in core_recovery_sources
+                    if source in used_sources
+                    and source.startswith("previous-generation:")
+                ),
+                None,
+            )
+            if retained_recovery_generation is not None:
+                brain.mutable_state_manifest = (
+                    brain.state_store.generation_pointer(
+                        retained_recovery_generation
+                    )
+                )
+            brain.save()
+            brain.export_packed_ternary()
+            recovery_event = {
+                "reason": "non-finite checkpoint master state",
+                "previousActiveGeneration": previous_generation,
+                "recoveredActiveGeneration": str(
+                    (brain.mutable_state_manifest or {}).get(
+                        "activeGeneration", ""
+                    )
+                ),
+                "tensors": core_recovery_records,
+                "tensorCount": len(core_recovery_records),
+                "repairedElements": sum(
+                    int(record["repairedElements"])
+                    for record in core_recovery_records
+                ),
+                "optimizer": optimizer_recovery,
+                "finiteLearnedStatePreserved": True,
+                "packedTernaryRegenerated": True,
+                "at": _iso_now(),
+            }
+            brain.state_store.last_recovery = {
+                "recovered": True,
+                "reason": "repaired non-finite neural checkpoint elements",
+                "activeGeneration": recovery_event[
+                    "recoveredActiveGeneration"
+                ],
+                "previousActiveGeneration": previous_generation,
+            }
+            brain.events.append("checkpoint-tensor-recovered", recovery_event)
         for recovered in recovered_candidates:
             brain.events.append("candidate-recovered", recovered)
         return brain
@@ -1847,17 +4328,27 @@ class AdaptiveBrain:
     def _begin_candidate(self, kind: str) -> Tuple[str, Path]:
         candidate_id = uuid.uuid4().hex
         candidate_dir = self.engine_path / "candidates" / candidate_id
-        candidate_dir.mkdir(parents=True, exist_ok=False)
-        snapshot_files(self.engine_path, candidate_dir / "stable")
-        atomic_write_json(
-            candidate_dir / "candidate.json",
-            {
-                "id": candidate_id,
-                "kind": str(kind),
-                "status": "training",
-                "createdAt": _iso_now(),
-            },
+        estimated_bytes = snapshot_required_bytes(self.engine_path)
+        self.resource_policy.require_disk(
+            estimated_bytes,
+            "%s candidate snapshot" % str(kind),
         )
+        try:
+            candidate_dir.mkdir(parents=True, exist_ok=False)
+            snapshot_files(self.engine_path, candidate_dir / "stable")
+            atomic_write_json(
+                candidate_dir / "candidate.json",
+                {
+                    "id": candidate_id,
+                    "kind": str(kind),
+                    "status": "training",
+                    "createdAt": _iso_now(),
+                },
+            )
+        except BaseException:
+            if candidate_dir.exists():
+                shutil.rmtree(candidate_dir)
+            raise
         return candidate_id, candidate_dir
 
     @staticmethod
@@ -1875,13 +4366,132 @@ class AdaptiveBrain:
         tensors.update(_prefixed_state(self.modalities, "modalities."))
         return tensors
 
+    def _core_parameter_map(self) -> Dict[str, nn.Parameter]:
+        roots: List[Tuple[str, nn.Module]] = [
+            ("decoder.", self.decoder),
+            ("memory_bridge.", self.memory_bridge),
+            ("idea_adapter.", self.idea_adapter),
+            ("liquid.", self.liquid),
+            ("modalities.", self.modalities),
+        ]
+        return {
+            prefix + name: parameter
+            for prefix, module in roots
+            for name, parameter in module.named_parameters()
+        }
+
+    def parameter_accounting(self) -> Dict[str, Any]:
+        """Return the authoritative count of effective neural parameters.
+
+        Floating trainable parameters and logical packed ternary synapses are
+        counted once by object identity; sparse substrate synapses are counted
+        by their authoritative records. The number of packed *bytes*, optimizer
+        moments, scales, and transient activity are not extra parameters.
+        """
+        seen_parameters: set[int] = set()
+        mutable_parameters = 0
+        for module in self._trainable_modules():
+            for parameter in module.parameters():
+                identity = id(parameter)
+                if identity in seen_parameters:
+                    continue
+                seen_parameters.add(identity)
+                mutable_parameters += int(parameter.numel())
+        packed_parameters = self._packed_logical_parameter_count(
+            self._trainable_modules()
+        )
+        mutable_dense_parameters = mutable_parameters + packed_parameters
+        substrate_dynamic_synapses = len(self.memory.synapses)
+        total_parameters = mutable_dense_parameters + substrate_dynamic_synapses
+        return {
+            "mutableDenseParameters": mutable_dense_parameters,
+            "floatingTrainableParameters": mutable_parameters,
+            "packedTernaryParameters": packed_parameters,
+            "substrateDynamicSparseSynapses": substrate_dynamic_synapses,
+            "dynamicSparseSynapses": substrate_dynamic_synapses,
+            "totalNeuralParameters": total_parameters,
+            "countingRule": (
+                "unique floating trainable parameters plus logical packed "
+                "ternary synapses and authoritative sparse substrate synapses; "
+                "excludes packing bytes, scales, optimizer state, and activity"
+            ),
+        }
+
+    def _repair_optimizer_for_core_recovery(
+        self, repaired_masks: Mapping[str, torch.Tensor]
+    ) -> Dict[str, Any]:
+        """Invalidate only optimizer moments that no longer match a master.
+
+        Restored master elements came from an older verified checkpoint, so
+        their current Adam moments cannot be trusted.  Those exact positions
+        are reset while every other finite moment is preserved. Independently
+        non-finite optimizer values are also cleared before the recovered
+        generation is made durable.
+        """
+
+        if not repaired_masks:
+            return {
+                "parameters": 0,
+                "momentElementsReset": 0,
+                "nonFiniteElementsCleared": 0,
+            }
+        parameters = self._core_parameter_map()
+        touched_parameters = 0
+        moment_elements = 0
+        nonfinite_elements = 0
+        with torch.no_grad():
+            for name, repaired_mask in repaired_masks.items():
+                parameter = parameters.get(name)
+                if parameter is None:
+                    continue
+                state = self._optimizer.state.get(parameter)
+                if not isinstance(state, dict):
+                    continue
+                parameter_touched = False
+                for _key, value in state.items():
+                    if (
+                        not isinstance(value, torch.Tensor)
+                        or not value.is_floating_point()
+                    ):
+                        continue
+                    invalid = ~torch.isfinite(value)
+                    invalid_count = int(invalid.sum().item())
+                    reset = invalid
+                    if value.shape == parameter.shape:
+                        restored = repaired_mask.to(device=value.device)
+                        reset = reset | restored
+                        moment_elements += int(restored.sum().item())
+                    reset_count = int(reset.sum().item())
+                    if reset_count:
+                        value.masked_fill_(reset, 0.0)
+                        parameter_touched = True
+                    nonfinite_elements += invalid_count
+                if parameter_touched:
+                    touched_parameters += 1
+        return {
+            "parameters": touched_parameters,
+            "momentElementsReset": moment_elements,
+            "nonFiniteElementsCleared": nonfinite_elements,
+        }
+
     def _plastic_tensors(self) -> Dict[str, torch.Tensor]:
         tensors = _prefixed_state(self.router, "router.")
         tensors["state.liquid"] = self.liquid_state.detach()
+        # Record-batch restart must continue the same stochastic optimization
+        # stream as an uninterrupted run. These are generator states, not
+        # source tokens, and live in the same atomic neural checkpoint.
+        tensors["state.rng_cpu"] = torch.get_rng_state()
+        if self.device_backend == "cuda":
+            tensors["state.rng_accelerator"] = torch.cuda.get_rng_state(
+                self.device
+            )
+        elif self.device_backend == "mps" and hasattr(torch, "mps") and hasattr(
+            torch.mps, "get_rng_state"
+        ):
+            tensors["state.rng_accelerator"] = torch.mps.get_rng_state()
         if self.working_memory:
             tensors["state.working_memory"] = torch.stack(self.working_memory)
-        if self.replay:
-            tensors["state.replay"] = torch.stack(self.replay)
+        tensors.update(self.memory_lifecycle.state_tensors())
         if self._starter_action_language_cache is not None:
             tensors["state.starter_action_language_features"] = (
                 self._starter_action_language_cache
@@ -1901,7 +4511,1084 @@ class AdaptiveBrain:
             tensors["stability.importance." + name] = value
         return tensors
 
-    def _metadata(self) -> Dict[str, Any]:
+    @staticmethod
+    def _sha256_identifier(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    @staticmethod
+    def _ingestion_learning_schedule(
+        neural_storage_plan: Mapping[str, Any], checkpoint_records: int
+    ) -> Dict[str, Any]:
+        """Freeze every resource-derived choice that changes neural updates.
+
+        The schedule deliberately contains only booleans, counts, and fixed
+        protocol identifiers. Source text, token ids, embeddings, and record
+        metadata are never checkpointed. A resumed transaction can therefore
+        reproduce its committed learning trajectory without turning the
+        cursor into a retrieval store.
+        """
+
+        return {
+            "format": INGESTION_LEARNING_SCHEDULE_FORMAT,
+            "formatVersion": INGESTION_LEARNING_SCHEDULE_VERSION,
+            "detailedRecordAssemblies": bool(
+                neural_storage_plan["detailedRecordAssemblies"]
+            ),
+            "physicalBatchRecords": max(
+                1, int(neural_storage_plan["physicalBatchRecords"])
+            ),
+            "gradientAccumulation": max(
+                1, int(neural_storage_plan["gradientAccumulation"])
+            ),
+            "trainingSequenceTokens": max(
+                8, int(neural_storage_plan["trainingSequenceTokens"])
+            ),
+            "checkpointRecords": max(1, int(checkpoint_records)),
+            "corpusRepresentation": str(
+                neural_storage_plan["corpusRepresentation"]
+            ),
+            "slowGradientMode": str(neural_storage_plan["slowGradientMode"]),
+            "localTypedTargetWindowPolicy": str(
+                neural_storage_plan.get(
+                    "localTypedTargetWindowPolicy",
+                    LOCAL_TYPED_TARGET_WINDOW_POLICY,
+                )
+            ),
+        }
+
+    @classmethod
+    def _validated_ingestion_learning_schedule(
+        cls, value: Any, expected_sha256: Any
+    ) -> Dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("ingestion checkpoint learning schedule is invalid")
+        schedule = dict(value)
+        base_fields = {
+            "format",
+            "formatVersion",
+            "detailedRecordAssemblies",
+            "physicalBatchRecords",
+            "gradientAccumulation",
+            "trainingSequenceTokens",
+            "checkpointRecords",
+            "corpusRepresentation",
+            "slowGradientMode",
+            "localTypedTargetWindowPolicy",
+        }
+        schedule_version = schedule.get("formatVersion")
+        if schedule_version != INGESTION_LEARNING_SCHEDULE_VERSION:
+            raise ValueError("ingestion checkpoint learning schedule is invalid")
+        if set(schedule) != base_fields:
+            raise ValueError("ingestion checkpoint learning schedule is invalid")
+        if (
+            schedule.get("format") != INGESTION_LEARNING_SCHEDULE_FORMAT
+            or isinstance(schedule_version, bool)
+            or not isinstance(schedule_version, int)
+            or not isinstance(schedule.get("detailedRecordAssemblies"), bool)
+        ):
+            raise ValueError("ingestion checkpoint learning schedule is invalid")
+        for field, minimum in (
+            ("physicalBatchRecords", 1),
+            ("gradientAccumulation", 1),
+            ("trainingSequenceTokens", 8),
+            ("checkpointRecords", 1),
+        ):
+            field_value = schedule.get(field)
+            if (
+                isinstance(field_value, bool)
+                or not isinstance(field_value, int)
+                or field_value < minimum
+            ):
+                raise ValueError(
+                    "ingestion checkpoint learning schedule %s is invalid"
+                    % field
+                )
+        if schedule.get("localTypedTargetWindowPolicy") != LOCAL_TYPED_TARGET_WINDOW_POLICY:
+            raise ValueError("ingestion checkpoint local typed window policy is invalid")
+        detailed = bool(schedule["detailedRecordAssemblies"])
+        expected_modes = {
+            "corpusRepresentation": (
+                "detailed-distributed-assemblies"
+                if detailed
+                else "shared-semantic-field-and-local-synapses"
+            ),
+            "slowGradientMode": (
+                "per-experience"
+                if detailed
+                else "streaming-microbatch-gradient-accumulation"
+            ),
+        }
+        if any(
+            schedule.get(field) != expected
+            for field, expected in expected_modes.items()
+        ):
+            raise ValueError("ingestion checkpoint learning schedule is invalid")
+        encoded = json.dumps(
+            schedule,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if (
+            len(encoded) > 4096
+            or not cls._sha256_identifier(expected_sha256)
+            or hashlib.sha256(encoded).hexdigest() != expected_sha256
+        ):
+            raise ValueError(
+                "ingestion checkpoint learning schedule hash is invalid"
+            )
+        return schedule
+
+
+    @classmethod
+    def _validated_ingestion_checkpoints(
+        cls, value: Any
+    ) -> Dict[str, Dict[str, Any]]:
+        """Validate resumable record cursors before any neural state is used.
+
+        A malformed cursor must never be treated as zero: doing that would
+        replay already committed neural updates.  Conversely, the cursor is
+        inspection/transaction metadata only and is not allowed to carry raw
+        source text or token sequences.
+        """
+
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError("ingestion checkpoint registry is invalid")
+        validated: Dict[str, Dict[str, Any]] = {}
+        for key, raw in value.items():
+            if not cls._sha256_identifier(key) or not isinstance(raw, Mapping):
+                raise ValueError("ingestion checkpoint identity is invalid")
+            checkpoint = dict(raw)
+            if (
+                checkpoint.get("format") != INGESTION_CHECKPOINT_FORMAT
+                or int(checkpoint.get("formatVersion", 0))
+                != INGESTION_CHECKPOINT_VERSION
+                or checkpoint.get("parserContract")
+                != INGESTION_PARSER_CONTRACT
+                or checkpoint.get("status") != "active"
+                or checkpoint.get("sourceIdentity") != key
+                or not cls._sha256_identifier(checkpoint.get("transactionId"))
+                or not cls._sha256_identifier(checkpoint.get("contentHash"))
+                or not cls._sha256_identifier(checkpoint.get("sourceNameHash"))
+                or not cls._sha256_identifier(
+                    checkpoint.get("neuralStateChecksum")
+                )
+                or not cls._sha256_identifier(
+                    checkpoint.get("recordPrefixSha256")
+                )
+                or checkpoint.get("policy")
+                not in {"encode", "consolidate", "pretrain"}
+                or not isinstance(checkpoint.get("resolvedKind"), str)
+                or not checkpoint.get("resolvedKind")
+            ):
+                raise ValueError("ingestion checkpoint contract is invalid")
+            integer_fields = (
+                "epoch",
+                "sourceBytes",
+                "committedRecords",
+                "visitedRecords",
+                "processedRecords",
+                "rejectedRecords",
+                "commitSequence",
+            )
+            for field in integer_fields:
+                field_value = checkpoint.get(field)
+                if (
+                    isinstance(field_value, bool)
+                    or not isinstance(field_value, int)
+                    or field_value < 0
+                ):
+                    raise ValueError(
+                        "ingestion checkpoint %s is invalid" % field
+                    )
+            if checkpoint["commitSequence"] < 1:
+                raise ValueError("ingestion checkpoint sequence is invalid")
+            if checkpoint["visitedRecords"] < checkpoint["committedRecords"]:
+                raise ValueError("ingestion checkpoint coverage is invalid")
+            if checkpoint["visitedRecords"] != (
+                checkpoint["processedRecords"]
+                + checkpoint["rejectedRecords"]
+            ):
+                raise ValueError("ingestion checkpoint coverage is incomplete")
+            baseline = checkpoint.get("baseline")
+            aggregate = checkpoint.get("aggregate")
+            coverage_at_commit = checkpoint.get("coverageAtCommit")
+            source_snapshot = checkpoint.get("sourceSnapshot")
+            generation_binding = checkpoint.get("committedGeneration")
+            learning_schedule = cls._validated_ingestion_learning_schedule(
+                checkpoint.get("learningSchedule"),
+                checkpoint.get("learningScheduleSha256"),
+            )
+            checkpoint["learningSchedule"] = learning_schedule
+            if not isinstance(baseline, Mapping) or not isinstance(
+                aggregate, Mapping
+            ) or not isinstance(coverage_at_commit, Mapping) or not isinstance(
+                source_snapshot, Mapping
+            ) or not isinstance(generation_binding, Mapping):
+                raise ValueError("ingestion checkpoint neural summary is invalid")
+            binding_sha = hashlib.sha256(
+                json.dumps(
+                    dict(generation_binding),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                generation_binding.get("format")
+                != "omni-ingestion-generation-binding"
+                or int(generation_binding.get("formatVersion", 0)) != 1
+                or binding_sha != checkpoint.get("committedGenerationSha256")
+            ):
+                raise ValueError(
+                    "ingestion checkpoint generation binding is invalid"
+                )
+            for field in (
+                "mutableStateActiveGeneration",
+                "mutableStateContentSha256",
+                "substrateContentSha256",
+                "replayContentSha256",
+                "workspacePageContentSha256",
+                "neuralStateChecksum",
+            ):
+                if not cls._sha256_identifier(generation_binding.get(field)):
+                    raise ValueError(
+                        "ingestion checkpoint generation binding is invalid"
+                    )
+            for field in (
+                "replayCount",
+                "replayHighWaterId",
+                "workspacePageCount",
+                "workspacePageHighWaterId",
+            ):
+                field_value = generation_binding.get(field)
+                if (
+                    isinstance(field_value, bool)
+                    or not isinstance(field_value, int)
+                    or field_value < 0
+                ):
+                    raise ValueError(
+                        "ingestion checkpoint generation binding is invalid"
+                    )
+            if generation_binding.get("workspacePagesLearningReadable") is not False:
+                raise ValueError(
+                    "ingestion checkpoint workspace binding is invalid"
+                )
+            for field in ("device", "inode", "size", "mtimeNs"):
+                field_value = source_snapshot.get(field)
+                if (
+                    isinstance(field_value, bool)
+                    or not isinstance(field_value, int)
+                    or field_value < 0
+                ):
+                    raise ValueError(
+                        "ingestion checkpoint source snapshot is invalid"
+                    )
+            if (
+                int(coverage_at_commit.get("discoveredRecords", -1))
+                != checkpoint["visitedRecords"]
+                or int(coverage_at_commit.get("processedRecords", -1))
+                != checkpoint["processedRecords"]
+                or int(coverage_at_commit.get("rejectedRecords", -1))
+                != checkpoint["rejectedRecords"]
+                or len(coverage_at_commit.get("errors", []))
+                > DatasetCoverage._ERROR_SAMPLE_LIMIT
+            ):
+                raise ValueError("ingestion checkpoint coverage snapshot is invalid")
+            if not cls._sha256_identifier(
+                baseline.get("parameterChecksum")
+            ):
+                raise ValueError("ingestion checkpoint baseline is invalid")
+            for field in (
+                "concepts",
+                "ideas",
+                "plasticityEvents",
+            ):
+                field_value = baseline.get(field)
+                if (
+                    isinstance(field_value, bool)
+                    or not isinstance(field_value, int)
+                    or field_value < 0
+                ):
+                    raise ValueError(
+                        "ingestion checkpoint baseline %s is invalid" % field
+                    )
+            for field in ("memorySynapticUses", "trainingSteps"):
+                field_value = baseline.get(field)
+                if field_value is not None and (
+                    isinstance(field_value, bool)
+                    or not isinstance(field_value, int)
+                    or field_value < 0
+                ):
+                    raise ValueError(
+                        "ingestion checkpoint baseline %s is invalid" % field
+                    )
+            if not isinstance(aggregate.get("mediaAccumulator", {}), Mapping):
+                raise ValueError(
+                    "ingestion checkpoint media accumulator is invalid"
+                )
+            for field in (
+                "learnedChunks",
+                "readingReportCount",
+                "streamingGradientRecords",
+                "streamingGradientOptimizerSteps",
+            ):
+                field_value = aggregate.get(field, 0)
+                if (
+                    isinstance(field_value, bool)
+                    or not isinstance(field_value, int)
+                    or field_value < 0
+                ):
+                    raise ValueError(
+                        "ingestion checkpoint aggregate %s is invalid" % field
+                    )
+            if any(
+                key.startswith(("sequence", "multiStage"))
+                for key in (*baseline, *aggregate)
+            ):
+                raise ValueError("ingestion checkpoint contains obsolete answer-key state")
+            media_accumulator = dict(aggregate.get("mediaAccumulator", {}))
+            safe_media = cls._checkpoint_media_accumulator(media_accumulator)
+            encoded_media = json.dumps(
+                safe_media,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            if media_accumulator != safe_media or len(encoded_media) > 128 * 1024:
+                raise ValueError(
+                    "ingestion checkpoint media diagnostics violate the "
+                    "bounded scalar/count/hash contract"
+                )
+            validated[str(key)] = checkpoint
+        return validated
+
+    @classmethod
+    def _validated_completed_ingestions(cls, value: Any) -> List[Dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > COMPLETED_INGESTION_TOMBSTONES:
+            raise ValueError("completed ingestion tombstones are invalid")
+        result: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                raise ValueError("completed ingestion tombstone is invalid")
+            item = dict(raw)
+            if (
+                item.get("format") != "omni-completed-ingestion"
+                or int(item.get("formatVersion", 0)) != 1
+                or not cls._sha256_identifier(item.get("transactionId"))
+                or not cls._sha256_identifier(item.get("contentHash"))
+                or not cls._sha256_identifier(item.get("sourceIdentity"))
+                or not cls._sha256_identifier(item.get("sourceNameHash"))
+                or not cls._sha256_identifier(item.get("parameterChecksumAfter"))
+                or item.get("policy")
+                not in {"encode", "consolidate", "pretrain"}
+                or isinstance(item.get("epoch"), bool)
+                or not isinstance(item.get("epoch"), int)
+                or int(item.get("epoch", -1)) < 0
+                or not isinstance(item.get("coverage"), Mapping)
+            ):
+                raise ValueError("completed ingestion tombstone contract is invalid")
+            transaction = str(item["transactionId"])
+            if transaction in seen:
+                raise ValueError("completed ingestion tombstone is duplicated")
+            seen.add(transaction)
+            result.append(item)
+        return result
+
+    def _enqueue_chat_slow_learning(
+        self,
+        *,
+        turn_id: str,
+        input_sha256: str,
+        human_message_id: str,
+        experience: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Queue one idempotent cortical replay after fast chat admission."""
+
+        if not (
+            self.config.online_learning and int(self.config.online_steps) > 0
+        ):
+            return None
+        job_id = hashlib.sha256(
+            (
+                "%s\0%s\0%s\0chat-slow-learning-v1"
+                % (self.brain_id, turn_id, input_sha256)
+            ).encode("utf-8")
+        ).hexdigest()
+        if job_id in self.completed_chat_slow_learning:
+            return None
+        existing = next(
+            (
+                item
+                for item in self.pending_chat_slow_learning
+                if item.get("jobId") == job_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        settling = experience.get("memory_settling")
+        settling = settling if isinstance(settling, Mapping) else {}
+        signals = settling.get("signals")
+        signals = signals if isinstance(signals, Mapping) else {}
+        assembly_id = str(experience.get("assembly_id", ""))
+        assembly = next(
+            (
+                item
+                for item in self.memory.assemblies
+                if str(item.get("id", "")) == assembly_id
+            ),
+            {},
+        )
+        retention_assessment = self.memory_lifecycle.assess_retention_candidate(
+            novelty=float(experience.get("novelty", 0.0)),
+            reuse=float(signals.get("reuse", 0.0)),
+            salience=float(signals.get("salience", 0.0)),
+            prediction_error=float(
+                experience.get("retention_prediction_error", 0.0)
+            ),
+            rehearsals=max(1, int(assembly.get("rehearsals", 1))),
+            stability=float(signals.get("stability", 0.0)),
+            related_coactivation=float(signals.get("recurrence", 0.0)),
+            interference=float(signals.get("interference", 0.0)),
+            recurrence=float(signals.get("recurrence", 0.0)),
+            activation=float(signals.get("activation", 0.0)),
+            observations=max(1, int(assembly.get("rehearsals", 1))),
+        )
+        retention = float(retention_assessment["retentionScore"])
+        priority = float(retention_assessment["slowReplayPriority"])
+        replay_strength = max(
+            0.02,
+            min(
+                1.0,
+                priority
+                * max(0.05, float(self.config.consolidation_rate) / 0.06),
+            ),
+        )
+        reinforcement = max(
+            0.0,
+            min(1.0, float(settling.get("reinforcementDrive", 0.0))),
+        )
+        unfinished = max(
+            0.0, min(1.0, float(settling.get("unfinishedScore", 0.0)))
+        )
+        interference = max(
+            0.0, min(1.0, float(signals.get("interference", 0.0)))
+        )
+        record = {
+            "format": "omni-chat-slow-learning-job",
+            "formatVersion": 1,
+            "jobId": job_id,
+            "turnId": turn_id,
+            "inputSha256": input_sha256,
+            "humanMessageId": human_message_id,
+            "queuedAt": _iso_now(),
+            "onlineSteps": int(self.config.online_steps),
+            "priority": priority,
+            "replayStrength": replay_strength,
+            "retentionScore": retention,
+            "reinforcementDrive": reinforcement,
+            "unfinishedScore": unfinished,
+            "interference": interference,
+            "fadePressure": float(retention_assessment["fadePressure"]),
+            "retentionEvidence": retention_assessment["evidence"],
+            "retentionReasons": retention_assessment["reasons"],
+            "fastEpisodePolicy": retention_assessment["fastEpisodePolicy"],
+            "novelty": max(
+                0.0, min(1.0, float(experience.get("novelty", 0.0)))
+            ),
+            "candidateCheckpoint": "last-atomic-neural-generation",
+        }
+        self.pending_chat_slow_learning.append(record)
+        return record
+
+    def consolidate_pending_chat_learning(
+        self,
+        job_id: str = "",
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        """Promote one queued replay as an atomic, retry-safe slow update."""
+
+        requested = str(job_id or "").strip()
+        candidates = [
+            item
+            for item in self.pending_chat_slow_learning
+            if not requested or str(item.get("jobId", "")) == requested
+        ]
+        if not candidates:
+            return {
+                "brainId": self.brain_id,
+                "processed": False,
+                "pending": len(self.pending_chat_slow_learning),
+                "idempotent": bool(
+                    requested and requested in self.completed_chat_slow_learning
+                ),
+            }
+        record = max(
+            candidates,
+            key=lambda item: (
+                float(item.get("priority", 0.0)),
+                str(item.get("queuedAt", "")),
+            ),
+        )
+        selected_job_id = str(record["jobId"])
+        if cancel_check is not None and cancel_check():
+            raise ChatGenerationCancelled("background chat learning was cancelled")
+        message = self.conversation.payload_by_id(
+            "message", str(record["humanMessageId"])
+        )
+        if (
+            not isinstance(message, Mapping)
+            or message.get("role") != "human"
+            or hashlib.sha256(
+                str(message.get("content", "")).encode("utf-8")
+            ).hexdigest()
+            != record["inputSha256"]
+        ):
+            raise RuntimeError("queued chat replay evidence is unavailable")
+        text = str(message["content"])
+        snapshot = self._snapshot_slow_transaction_state()
+        pending_before = list(self.pending_chat_slow_learning)
+        completed_before = list(self.completed_chat_slow_learning)
+        mutable_pointer_before = copy.deepcopy(self.mutable_state_manifest)
+        substrate_pointer_before = copy.deepcopy(self.memory.persistence_manifest)
+        before = str(snapshot["checksum"])
+        cortical_before = self._cortical_parameter_checksum()
+        module_checksums_before = {
+            name: tensor_checksum(module.parameters())
+            for name, module in self._slow_transaction_modules().items()
+        }
+        try:
+            cue = self.memory.vector_for_text(text)
+            replay_strength = max(
+                0.02, min(1.0, float(record.get("replayStrength", 1.0)))
+            )
+            self._ensure_optimizer_resident()
+            optimizer_groups = list(self._optimizer.param_groups)
+            learning_rates = [float(group["lr"]) for group in optimizer_groups]
+            try:
+                for group, learning_rate in zip(
+                    optimizer_groups, learning_rates
+                ):
+                    group["lr"] = learning_rate * replay_strength
+                training = self._optimize_experience(
+                    text,
+                    cue,
+                    steps=max(1, int(record.get("onlineSteps", 1))),
+                )
+                if cancel_check is not None and cancel_check():
+                    raise ChatGenerationCancelled(
+                        "background chat learning was cancelled"
+                    )
+            finally:
+                for group, learning_rate in zip(
+                    optimizer_groups, learning_rates
+                ):
+                    group["lr"] = learning_rate
+            grew = self._maybe_grow(
+                float(record.get("novelty", 0.0)) * replay_strength,
+                self._idea_model_vector(cue)[0],
+            )
+            calibration = None
+            if self._can_retain_native_action_policy():
+                calibration = self._calibrate_starter_action_policy(
+                    max_steps=96,
+                    minimum_steps=0,
+                    strict=True,
+                )
+            if cancel_check is not None and cancel_check():
+                raise ChatGenerationCancelled(
+                    "background chat learning was cancelled"
+                )
+            after = self._slow_parameter_checksum()
+            cortical_after = self._cortical_parameter_checksum()
+            module_checksums_after = {
+                name: tensor_checksum(module.parameters())
+                for name, module in self._slow_transaction_modules().items()
+            }
+            updated_modules = sorted(
+                name
+                for name, checksum in module_checksums_after.items()
+                if checksum != module_checksums_before[name]
+            )
+            self.pending_chat_slow_learning = [
+                item
+                for item in self.pending_chat_slow_learning
+                if item.get("jobId") != selected_job_id
+            ]
+            self.completed_chat_slow_learning.append(selected_job_id)
+            self.completed_chat_slow_learning = (
+                self.completed_chat_slow_learning[
+                    -COMPLETED_CHAT_SLOW_LEARNING:
+                ]
+            )
+            result = {
+                "brainId": self.brain_id,
+                "processed": True,
+                "jobId": selected_job_id,
+                "turnId": str(record.get("turnId", "")),
+                "priority": float(record.get("priority", 0.0)),
+                "replayStrength": replay_strength,
+                "parameterChecksumBefore": before,
+                "parameterChecksumAfter": after,
+                "corticalParameterChecksumBefore": cortical_before,
+                "corticalParameterChecksumAfter": cortical_after,
+                "corticalParametersUpdated": cortical_before != cortical_after,
+                "updatedTrainableModules": updated_modules,
+                "training": training,
+                "expertGrew": grew,
+                "actionCalibration": calibration,
+                "pending": len(self.pending_chat_slow_learning),
+                "nextPriority": max(
+                    (
+                        float(item.get("priority", 0.0))
+                        for item in self.pending_chat_slow_learning
+                    ),
+                    default=0.0,
+                ),
+                "transaction": "atomic-candidate-promoted",
+            }
+            # Queue removal, completed tombstone, weights, optimizer moments,
+            # and stability tensors become authoritative in one generation.
+            self.save()
+            try:
+                self.events.append(
+                    "chat-slow-learning-complete",
+                    result,
+                    job_id=selected_job_id,
+                )
+            except Exception:
+                # The checkpoint is already authoritative. A diagnostics-log
+                # failure must never roll it back in RAM and invite duplicate
+                # optimizer replay on the still-running worker.
+                pass
+            return result
+        except BaseException as error:
+            # brain.json is the authoritative commit record. Finalization
+            # (publishing the convenience pointer or pruning old blobs) may
+            # fail after that atomic replacement. Never roll a committed job
+            # back into RAM and replay its optimizer step a second time.
+            try:
+                committed = read_json(self.engine_path / "brain.json")
+                committed_ids = committed.get("completed_chat_slow_learning")
+                committed_pending = committed.get("pending_chat_slow_learning")
+                committed_pointer = committed.get("mutable_state")
+                job_committed = (
+                    isinstance(committed_ids, list)
+                    and selected_job_id in committed_ids
+                    and isinstance(committed_pending, list)
+                    and not any(
+                        isinstance(item, Mapping)
+                        and item.get("jobId") == selected_job_id
+                        for item in committed_pending
+                    )
+                    and committed_pointer == self.mutable_state_manifest
+                )
+            except (OSError, ValueError, TypeError):
+                job_committed = False
+            if job_committed:
+                result["postCommitFinalizationError"] = str(error)[:512]
+                return result
+            self._restore_slow_transaction_state(snapshot)
+            self.pending_chat_slow_learning = pending_before
+            self.completed_chat_slow_learning = completed_before
+            self.mutable_state_manifest = mutable_pointer_before
+            self.memory.persistence_manifest = substrate_pointer_before
+            raise
+
+    @classmethod
+    def _validated_completed_chat_turns(
+        cls, value: Any
+    ) -> List[Dict[str, Any]]:
+        """Validate bounded references committed with an atomic chat save."""
+
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > COMPLETED_CHAT_TURN_RECEIPTS:
+            raise ValueError("completed chat turn receipts are invalid")
+        required = {
+            "format",
+            "formatVersion",
+            "turnId",
+            "inputSha256",
+            "humanMessageId",
+            "brainMessageId",
+            "traceId",
+            "inferenceCount",
+            "parameterChecksumAfter",
+            "committedAt",
+        }
+        receipts: List[Dict[str, Any]] = []
+        seen = set()
+        for raw in value:
+            if not isinstance(raw, Mapping):
+                raise ValueError("completed chat turn receipt is invalid")
+            receipt = dict(raw)
+            turn_id = receipt.get("turnId")
+            if (
+                set(receipt) != required
+                or receipt.get("format") != CHAT_TURN_RECEIPT_FORMAT
+                or receipt.get("formatVersion") != 1
+                or not isinstance(turn_id, str)
+                or not turn_id
+                or len(turn_id) > 128
+                or "\x00" in turn_id
+                or any(character in "\r\n" for character in turn_id)
+                or not cls._sha256_identifier(receipt.get("inputSha256"))
+                or not cls._sha256_identifier(
+                    receipt.get("parameterChecksumAfter")
+                )
+                or not all(
+                    isinstance(receipt.get(field), str)
+                    and 0 < len(str(receipt[field])) <= 128
+                    for field in (
+                        "humanMessageId",
+                        "brainMessageId",
+                        "traceId",
+                    )
+                )
+                or isinstance(receipt.get("inferenceCount"), bool)
+                or not isinstance(receipt.get("inferenceCount"), int)
+                or int(receipt["inferenceCount"]) < 1
+                or not isinstance(receipt.get("committedAt"), str)
+                or not receipt["committedAt"]
+            ):
+                raise ValueError("completed chat turn receipt contract is invalid")
+            receipt_key = (turn_id, str(receipt["inputSha256"]))
+            if receipt_key in seen:
+                raise ValueError("completed chat turn receipt is duplicated")
+            seen.add(receipt_key)
+            receipts.append(receipt)
+        return receipts
+
+    @classmethod
+    def _validated_fresh_attention_boundary(
+        cls, value: Any
+    ) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping):
+            raise ValueError("fresh attention boundary is invalid")
+        boundary = dict(value)
+        required = {
+            "format",
+            "formatVersion",
+            "operationId",
+            "epoch",
+            "createdAt",
+            "messagesPreserved",
+            "tracesPreserved",
+            "synapsesPreserved",
+            "replayEntries",
+            "parameterChecksum",
+            "fastSynapseChecksum",
+            "substrateContentSha256",
+            "cleared",
+        }
+        cleared_fields = {
+            "recentTokens",
+            "currentPromptTokens",
+            "residentWorkingMemory",
+            "pagedWorkingMemory",
+            "lifecycleScratch",
+            "activeFocus",
+            "activatedNeurons",
+            "recalledAssemblies",
+            "substrateEligibilityTraces",
+            "liquidStateUnits",
+            "rawHistoryMessages",
+            "automaticTraceInfluence",
+            "recallAuditEntries",
+            "noveltyStreak",
+            "legacyRawAttentionOverlay",
+            "routerMembraneUnits",
+            "routerSpikeUnits",
+            "routerPreTraceUnits",
+            "routerPostTraceUnits",
+        }
+        operation_id = boundary.get("operationId")
+        cleared = boundary.get("cleared")
+        integer_fields = (
+            "epoch",
+            "messagesPreserved",
+            "tracesPreserved",
+            "synapsesPreserved",
+            "replayEntries",
+        )
+        if (
+            set(boundary) != required
+            or boundary.get("format") != FRESH_ATTENTION_FORMAT
+            or boundary.get("formatVersion") != FRESH_ATTENTION_VERSION
+            or not isinstance(operation_id, str)
+            or not operation_id
+            or len(operation_id) > 128
+            or "\x00" in operation_id
+            or any(character in "\r\n" for character in operation_id)
+            or not isinstance(boundary.get("createdAt"), str)
+            or not boundary["createdAt"]
+            or not cls._sha256_identifier(boundary.get("parameterChecksum"))
+            or not cls._sha256_identifier(boundary.get("fastSynapseChecksum"))
+            or not cls._sha256_identifier(
+                boundary.get("substrateContentSha256")
+            )
+            or not isinstance(cleared, Mapping)
+            or set(cleared) != cleared_fields
+            or any(
+                isinstance(boundary.get(field), bool)
+                or not isinstance(boundary.get(field), int)
+                or int(boundary[field]) < (1 if field == "epoch" else 0)
+                for field in integer_fields
+            )
+            or any(
+                isinstance(cleared.get(field), bool)
+                or not isinstance(cleared.get(field), int)
+                or int(cleared[field]) < 0
+                for field in cleared_fields
+            )
+        ):
+            raise ValueError("fresh attention boundary contract is invalid")
+        return boundary
+
+    @staticmethod
+    def _record_prefix_digest(
+        previous: str, ordinal: int, record: Any
+    ) -> str:
+        """Extend a source-free digest over one deterministic yielded record."""
+
+        provenance = dict(getattr(record, "provenance", {}) or {})
+        provenance_sha = hashlib.sha256(
+            json.dumps(
+                provenance,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        body = {
+            "ordinal": max(1, int(ordinal)),
+            "kind": str(getattr(record, "kind", "text")),
+            "nameSha256": hashlib.sha256(
+                str(getattr(record, "name", "")).encode("utf-8")
+            ).hexdigest(),
+            "textSha256": hashlib.sha256(
+                str(getattr(record, "text", "")).encode("utf-8")
+            ).hexdigest(),
+            "contentSha256": str(getattr(record, "content_sha256", "")),
+            "provenanceSha256": provenance_sha,
+        }
+        return hashlib.sha256(
+            bytes.fromhex(previous)
+            + json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _bind_ingestion_checkpoint_generation(
+        self, pointer: Mapping[str, Any]
+    ) -> None:
+        if not self.ingestion_checkpoints:
+            return
+        current_neural_checksum = self.parameter_checksum()
+        substrate_pointer = self.memory.persistence_manifest or {}
+        replay_checkpoint = self.replay.checkpoint()
+        workspace_checkpoint = (
+            PagedWorkingMemory.empty_checkpoint()
+            if self._fresh_attention_paged_clear_pending
+            else self.paged_working_memory.checkpoint()
+        )
+        for checkpoint in self.ingestion_checkpoints.values():
+            if checkpoint.get("neuralStateChecksum") != current_neural_checksum:
+                raise RuntimeError(
+                    "active ingestion cursor does not describe current neural state"
+                )
+            binding = {
+                "format": "omni-ingestion-generation-binding",
+                "formatVersion": 1,
+                "mutableStateActiveGeneration": str(
+                    pointer.get("activeGeneration", "")
+                ),
+                "mutableStateContentSha256": str(
+                    pointer.get("contentSha256", "")
+                ),
+                "substrateContentSha256": str(
+                    substrate_pointer.get("contentSha256", "")
+                ),
+                "replayCount": int(replay_checkpoint["count"]),
+                "replayHighWaterId": int(replay_checkpoint["highWaterId"]),
+                "replayContentSha256": str(
+                    replay_checkpoint["contentSha256"]
+                ),
+                "workspacePageCount": int(workspace_checkpoint["count"]),
+                "workspacePageHighWaterId": int(
+                    workspace_checkpoint["highWaterId"]
+                ),
+                "workspacePageContentSha256": str(
+                    workspace_checkpoint["contentSha256"]
+                ),
+                "workspacePagesLearningReadable": False,
+                "neuralStateChecksum": current_neural_checksum,
+            }
+            checkpoint["committedGeneration"] = binding
+            checkpoint["committedGenerationSha256"] = hashlib.sha256(
+                json.dumps(
+                    binding,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+
+    @staticmethod
+    def _source_without_inline_text(value: Mapping[str, Any]) -> Dict[str, Any]:
+        source = dict(value)
+        source.pop("raw_text", None)
+        source["raw_text_retained"] = False
+        return source
+
+    def _fresh_attention_runtime_card(
+        self, previous: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Patch the committed card without rescanning the durable substrate."""
+
+        if self.fresh_attention_boundary is None:
+            raise RuntimeError("fresh attention runtime card requires a boundary")
+        card = copy.deepcopy(dict(previous))
+        card["fresh_attention"] = {
+            "active": True,
+            "epoch": int(self.fresh_attention_boundary["epoch"]),
+            "createdAt": str(self.fresh_attention_boundary["createdAt"]),
+            "messagesPreserved": int(
+                self.fresh_attention_boundary["messagesPreserved"]
+            ),
+            "rawPriorDialogueEligible": False,
+            "cleared": dict(self.fresh_attention_boundary["cleared"]),
+        }
+        card["working_memory_vectors"] = 0
+        workspace = card.get("workspace")
+        if isinstance(workspace, Mapping):
+            workspace = copy.deepcopy(dict(workspace))
+            context = workspace.get("contextWindow")
+            if isinstance(context, Mapping):
+                workspace["contextWindow"] = {
+                    **dict(context),
+                    "tokenCount": 0,
+                    "tokenHash": "",
+                    "recentTokenCount": 0,
+                    "recentTokenHash": self._token_sequence_hash([]),
+                    "sensorySlots": 0,
+                    "updatedAt": str(
+                        self.current_context.get("updatedAt", self.updated_at)
+                    ),
+                }
+            latent = workspace.get("latentWorkspace")
+            if isinstance(latent, Mapping):
+                workspace["latentWorkspace"] = {
+                    **dict(latent),
+                    "occupancy": 0,
+                    "resident": 0,
+                    "paged": 0,
+                    "items": [],
+                }
+            liquid = workspace.get("liquidState")
+            if isinstance(liquid, Mapping):
+                workspace["liquidState"] = {
+                    **dict(liquid),
+                    "mean": 0.0,
+                    "norm": 0.0,
+                }
+            memory = workspace.get("memory")
+            if isinstance(memory, Mapping):
+                memory = copy.deepcopy(dict(memory))
+                memory.pop("fadingScratchTrail", None)
+                memory.pop("lastingConnections", None)
+                for field in ("activeFocus", "afterimageTrail"):
+                    value = memory.get(field)
+                    if isinstance(value, Mapping):
+                        memory[field] = {
+                            **dict(value),
+                            "count": 0,
+                            "items": [],
+                            **(
+                                {"averageStrength": 0.0}
+                                if field == "afterimageTrail"
+                                else {}
+                            ),
+                        }
+                retention = memory.get("retentionDynamics")
+                if isinstance(retention, Mapping):
+                    memory["retentionDynamics"] = {
+                        **dict(retention),
+                        "fixedStages": False,
+                        "reversible": True,
+                    }
+                recent = memory.get("recentWords")
+                if isinstance(recent, Mapping):
+                    memory["recentWords"] = {**dict(recent), "count": 0}
+                thoughts = memory.get("workingThoughts")
+                if isinstance(thoughts, Mapping):
+                    memory["workingThoughts"] = {
+                        **dict(thoughts),
+                        "count": 0,
+                        "resident": 0,
+                        "paged": 0,
+                        "items": [],
+                    }
+                workspace["memory"] = memory
+            workspace["freshAttentionBoundary"] = dict(
+                self.fresh_attention_boundary
+            )
+            card["workspace"] = workspace
+        state_offload = card.get("state_offload")
+        if isinstance(state_offload, Mapping):
+            state_offload = copy.deepcopy(dict(state_offload))
+            paging = state_offload.get("workingMemoryPaging")
+            if isinstance(paging, Mapping):
+                state_offload["workingMemoryPaging"] = {
+                    **dict(paging),
+                    "count": 0,
+                }
+            residency = state_offload.get("hotStateResidency")
+            if isinstance(residency, Mapping):
+                state_offload["hotStateResidency"] = {
+                    **dict(residency),
+                    "attentionEpoch": self._attention_epoch(),
+                    "attentionOverlayActiveEntities": 0,
+                    "orderingRefreshDeferred": True,
+                }
+            card["state_offload"] = state_offload
+        dynamics = card.get("intrinsic_dynamics")
+        if isinstance(dynamics, Mapping):
+            card["intrinsic_dynamics"] = {
+                **dict(dynamics),
+                "activeFraction": 0.0,
+                "learningProgress": 0.0,
+            }
+        return card
+
+    def _metadata(
+        self,
+        *,
+        runtime_card_override: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
         return {
             "schema_version": ENGINE_SCHEMA_VERSION,
             "release_format": "stable-1.0",
@@ -1914,61 +5601,193 @@ class AdaptiveBrain:
             "expert_count": self.decoder.expert_count,
             "novelty_streak": self.novelty_streak,
             "growth_pause": self.growth_pause,
+            "resource_pause": self.resource_pause,
             "last_activity_decay": self.last_activity_decay,
             "last_idle_cycle_at": self.last_idle_cycle_at,
-            "messages": self.messages[-10000:],
-            "traces": self.traces[-1000:],
-            "training_sources": self.training_sources,
+            "last_idle_visible_action_at": self.last_idle_visible_action_at,
+            "conversation": self.conversation.summary(),
+            "training_sources": [
+                self._source_without_inline_text(value)
+                for value in self.training_sources
+                if isinstance(value, Mapping)
+            ],
+            "ingestion_checkpoints": self.ingestion_checkpoints,
+            "completed_ingestions": self.completed_ingestions[
+                -COMPLETED_INGESTION_TOMBSTONES:
+            ],
+            "completed_chat_turns": self.completed_chat_turns[
+                -COMPLETED_CHAT_TURN_RECEIPTS:
+            ],
+            "completed_chat_slow_learning": self.completed_chat_slow_learning[
+                -COMPLETED_CHAT_SLOW_LEARNING:
+            ],
+            "pending_chat_slow_learning": self.pending_chat_slow_learning,
             "workspace_items": self.workspace_items,
+            "memory_lifecycle": self.memory_lifecycle.metadata(),
             "recent_token_context": self.recent_token_context,
             "current_context": self.current_context,
+            "fresh_attention_boundary": self.fresh_attention_boundary,
+            "attention_overlay": self.memory.attention_overlay_metadata(),
             "counters": self.counters,
+            "packed_metaplasticity": self._packed_stability_accounting(),
             "modality_training": self.modality_training,
             "installed_modality_packs": self.installed_modality_packs,
-            "starter_training_manifest": self.starter_training_manifest,
+            "ground_up_training_manifest": self.ground_up_training_manifest,
             "packed_ternary_manifest": self.packed_ternary_manifest,
             "substrate": self.memory.metadata(include_records=False),
-            "runtime_card": self.runtime_card(),
+            "mutable_state": self.mutable_state_manifest,
+            "paged_working_memory": (
+                PagedWorkingMemory.empty_checkpoint()
+                if self._fresh_attention_paged_clear_pending
+                else self.paged_working_memory.checkpoint()
+            ),
+            "runtime_card": (
+                copy.deepcopy(dict(runtime_card_override))
+                if isinstance(runtime_card_override, Mapping)
+                else self.runtime_card()
+            ),
             "files": {
                 "core": "core.safetensors",
                 "plasticity": "plasticity.safetensors",
                 "substrate": "substrate/manifest.json",
+                "mutableState": "state/manifest.json",
+                "replay": "state/replay.sqlite3",
                 "origin": "origin/",
                 "snapshots": "snapshots/",
                 "artifacts": "artifacts/",
                 "events": "events.sqlite3",
+                "conversation": "conversation.sqlite3",
             },
         }
 
-    def save(self) -> None:
+    def save(self, *, reuse_substrate_generation: bool = False) -> None:
         self.updated_at = _iso_now()
         self.engine_path.mkdir(parents=True, exist_ok=True)
-        # The bounded, content-addressed substrate generation is complete
-        # before metadata can point at it. Unchanged shard blobs are reused.
-        self.memory.save_sharded(self.engine_path / "substrate")
-        # Candidate tensors are fully written before metadata points at them.
-        atomic_save_tensors(
-            self.engine_path / "core.safetensors",
-            self._core_tensors(),
-            metadata={
-                "format": "omni-core",
-                "schema_version": str(ENGINE_SCHEMA_VERSION),
-                "brain_id": self.brain_id,
-            },
+        self._drain_packed_stability_events()
+        self._ensure_optimizer_resident()
+        if not reuse_substrate_generation:
+            for assembly in self.memory.assemblies:
+                if isinstance(assembly, dict):
+                    assembly.pop("source_text", None)
+        previous_substrate_pointer = (
+            dict(self.memory.persistence_manifest)
+            if isinstance(self.memory.persistence_manifest, Mapping)
+            else None
         )
-        atomic_save_tensors(
-            self.engine_path / "plasticity.safetensors",
-            self._plastic_tensors(),
-            metadata={
-                "format": "omni-plasticity",
-                "schema_version": str(ENGINE_SCHEMA_VERSION),
-                "brain_id": self.brain_id,
-            },
+        previous_mutable_pointer = (
+            dict(self.mutable_state_manifest)
+            if isinstance(self.mutable_state_manifest, Mapping)
+            else None
         )
-        atomic_write_json(self.engine_path / "brain.json", self._metadata())
+        runtime_card_override: Optional[Dict[str, Any]] = None
+        if reuse_substrate_generation:
+            persisted_engine = read_json(self.engine_path / "brain.json")
+            persisted_substrate = read_json(
+                self.engine_path / "substrate" / "manifest.json"
+            )
+            if (
+                not isinstance(self.memory.persistence_manifest, Mapping)
+                or persisted_substrate != self.memory.persistence_manifest
+            ):
+                raise RuntimeError(
+                    "cannot reuse an uncommitted substrate generation"
+                )
+            persisted_runtime_card = persisted_engine.get("runtime_card")
+            if not isinstance(persisted_runtime_card, Mapping):
+                raise RuntimeError(
+                    "cannot reuse substrate without a committed runtime card"
+                )
+            runtime_card_override = self._fresh_attention_runtime_card(
+                persisted_runtime_card
+            )
+        else:
+            # The bounded, content-addressed substrate generation is complete
+            # before metadata can point at it. Unchanged shard blobs are reused.
+            self.memory.save_sharded(self.engine_path / "substrate")
+        core = self._core_tensors()
+        plasticity = self._plastic_tensors()
+        try:
+            pointer = self.state_store.stage_generation(
+                core=core,
+                plasticity=plasticity,
+                optimizer_state=_clone_state_to_cpu(
+                    self._optimizer.state_dict()
+                ),
+                replay=self.replay,
+                metadata={
+                    "schemaVersion": ENGINE_SCHEMA_VERSION,
+                    "expertCount": self.decoder.expert_count,
+                    "parameterChecksum": self.parameter_checksum(),
+                    "substrateContentSha256": (
+                        self.memory.persistence_manifest or {}
+                    ).get("contentSha256"),
+                    "trainingSteps": self.counters["training_steps"],
+                },
+            )
+            # The immutable blobs exist before compatibility paths change. If
+            # the process dies before brain.json is replaced, the old metadata
+            # still names its old generation and load restores those blobs.
+            self.state_store.materialize(pointer, self.engine_path)
+            self.mutable_state_manifest = dict(pointer)
+            self.resource_pause = None
+            self._bind_ingestion_checkpoint_generation(pointer)
+            # The neural engine owns committed human/brain messages and
+            # measured traces. The desktop ledger is only a stable-ID paged
+            # presentation projection plus host action lifecycle; it never
+            # invents or renumbers these rows.
+            self.conversation.backfill(self.messages, self.traces)
+            atomic_write_json(
+                self.engine_path / "brain.json",
+                self._metadata(runtime_card_override=runtime_card_override),
+            )
+            self.state_store.publish(pointer)
+            self.state_store.last_recovery = {
+                "recovered": False,
+                "reason": "checkpoint generation committed",
+                "activeGeneration": pointer["activeGeneration"],
+            }
+            # Both authoritative pointers now name the new generation. Keep
+            # one immediately previous recovery point and reclaim only blobs
+            # that no current/prior checkpoint can reach. This is serialized
+            # recovery garbage, never learned neural state.
+            self.state_store.prune_unreferenced(
+                [pointer, previous_mutable_pointer]
+            )
+            if not reuse_substrate_generation:
+                self._substrate_gc_status = self.memory.prune_unreferenced(
+                    self.engine_path / "substrate",
+                    [self.memory.persistence_manifest, previous_substrate_pointer],
+                )
+            if not reuse_substrate_generation:
+                try:
+                    self._maintain_neural_state_resources()
+                except NeuralStateResourcePause as pressure_error:
+                    # The authoritative checkpoint is already committed. A racing
+                    # reserve change can prevent optional pressure scratch without
+                    # making that completed checkpoint a failure.
+                    self.resource_pause = {
+                        "reason": str(pressure_error),
+                        "readings": pressure_error.status,
+                        "at": _iso_now(),
+                    }
+            active_epoch = self._attention_epoch()
+            runtime_rows = max(32, min(1000, int(self.config.max_seq_len)))
+            self.messages = self.conversation.recent_payloads(
+                "message", runtime_rows, attention_epoch=active_epoch
+            )
+            self.traces = self.conversation.recent_payloads(
+                "trace", min(200, runtime_rows), attention_epoch=active_epoch
+            )
+        except NeuralStateResourcePause as error:
+            self.resource_pause = {
+                "reason": str(error),
+                "readings": error.status,
+                "at": _iso_now(),
+            }
+            raise
 
     def _ternary_export_roots(self) -> Dict[str, nn.Module]:
-        return {
+        roots: Dict[str, nn.Module] = {
             "decoder": self.decoder,
             "memory_bridge": self.memory_bridge,
             "idea_adapter": self.idea_adapter,
@@ -1976,31 +5795,154 @@ class AdaptiveBrain:
             "liquid": self.liquid,
             "modalities": self.modalities,
         }
+        return roots
+
+    def packed_runtime_audit(self) -> Dict[str, Any]:
+        roots = self._ternary_export_roots()
+        linear_blockers: List[str] = []
+        convolution_blockers: List[str] = []
+        embedding_blockers: List[str] = []
+        floating_parameter_blockers: List[str] = []
+        master_blockers: List[str] = []
+        dense_bf16_linear_materialized = False
+        packed_linear_modules = 0
+        packed_convolution_modules = 0
+        authoritative_linear_modules = 0
+        authoritative_convolution_modules = 0
+        authoritative_embedding_modules = 0
+        for root_name, root in roots.items():
+            status = packed_runtime_status(root)
+            packed_linear_modules += int(status["packedBitLinearModules"])
+            packed_convolution_modules += int(
+                status["packedConvolutionModules"]
+            )
+            authoritative_linear_modules += int(
+                status.get("packedAuthoritativeLinearModules", 0)
+            )
+            authoritative_convolution_modules += int(
+                status.get("packedAuthoritativeConvolutionModules", 0)
+            )
+            authoritative_embedding_modules += int(
+                status.get("packedAuthoritativeEmbeddingModules", 0)
+            )
+            dense_bf16_linear_materialized |= bool(
+                status["denseBf16LinearWeightMaterialized"]
+            )
+            linear_blockers.extend(
+                "%s.%s" % (root_name, name)
+                for name in status["denseLinearBlockers"]
+            )
+            convolution_blockers.extend(
+                "%s.%s" % (root_name, name)
+                for name in status["denseConvolutionBlockers"]
+            )
+            embedding_blockers.extend(
+                "%s.%s" % (root_name, name)
+                for name in status.get("denseEmbeddingBlockers", ())
+            )
+            floating_parameter_blockers.extend(
+                "%s.%s" % (root_name, name)
+                for name in status.get("floatingLearnedParameterBlockers", ())
+            )
+            master_blockers.extend(
+                "%s.%s" % (root_name, name)
+                for name in status.get("residentFloatMasterBlockers", ())
+            )
+        return {
+            "format": "omni-native-packed-runtime-audit",
+            "formatVersion": 1,
+            "complete": not linear_blockers
+            and not convolution_blockers
+            and not embedding_blockers
+            and not floating_parameter_blockers
+            and not master_blockers,
+            "weightFormat": "two-bit-packed-ternary",
+            "activationFormat": "signed-int8-dynamic-scale",
+            "packedBitLinearModules": packed_linear_modules,
+            "packedConvolutionModules": packed_convolution_modules,
+            "packedAuthoritativeLinearModules": authoritative_linear_modules,
+            "packedAuthoritativeConvolutionModules": authoritative_convolution_modules,
+            "packedAuthoritativeEmbeddingModules": authoritative_embedding_modules,
+            "denseLinearBlockers": sorted(linear_blockers),
+            "denseConvolutionBlockers": sorted(convolution_blockers),
+            "denseEmbeddingBlockers": sorted(embedding_blockers),
+            "floatingLearnedParameterBlockers": sorted(floating_parameter_blockers),
+            "residentFloatMasterBlockers": sorted(master_blockers),
+            "denseBf16LinearWeightMaterialized": dense_bf16_linear_materialized,
+        }
+
+    def require_complete_packed_runtime(self) -> Dict[str, Any]:
+        status = self.packed_runtime_audit()
+        if status["complete"] is not True:
+            raise RuntimeError(
+                "final packed runtime is incomplete: "
+                + ", ".join(
+                    [
+                        *status["denseLinearBlockers"],
+                        *status["denseConvolutionBlockers"],
+                        *status["denseEmbeddingBlockers"],
+                        *status["floatingLearnedParameterBlockers"],
+                        *status["residentFloatMasterBlockers"],
+                    ]
+                )
+            )
+        return status
 
     def _dynamic_synapse_export(self) -> Tuple[List[str], torch.Tensor]:
+        if isinstance(self.memory.synapses, LazyPersistedSynapses):
+            return self.memory.synapses.dynamic_export()
         synapse_ids = sorted(self.memory.synapses)
         values = torch.tensor(
             [
-                int(self.memory.synapses[synapse_id]["effective_weight"])
+                self.memory.exact_effective_weight(
+                    self.memory.synapses[synapse_id]["effective_weight"]
+                )
                 for synapse_id in synapse_ids
             ],
             dtype=torch.int8,
         )
         return synapse_ids, values
 
+    def _dynamic_synapse_pack_state(
+        self,
+    ) -> Tuple[torch.Tensor, int, str, str]:
+        """Return exact packed state without paging indexed cold records."""
+
+        if isinstance(self.memory.synapses, LazyPersistedSynapses):
+            return self.memory.synapses.dynamic_pack_state()
+        synapse_ids, values = self._dynamic_synapse_export()
+        return (
+            values,
+            len(synapse_ids),
+            hashlib.sha256("\0".join(synapse_ids).encode("utf-8")).hexdigest(),
+            "record-id-lexicographic-v1",
+        )
+
+    def _dynamic_ternary_tensors(
+        self,
+        substrate_values: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """All non-module synapses eligible for packed forward inference."""
+
+        if substrate_values is None:
+            _synapse_ids, substrate_values = self._dynamic_synapse_export()
+        return {"substrate.dynamic_synapses.weights": substrate_values}
+
     def export_packed_ternary(
         self, destination: Optional[Path] = None
     ) -> Dict[str, Any]:
-        """Materialize and verify exact 2-bit inference shards.
+        """Materialize and verify the authoritative 2-bit synapse shards.
 
-        Floating master weights remain in safe tensors for continued learning.
-        This sidecar contains only the effective ``{-1, 0, +1}`` projections
-        and dynamically grown substrate synapses used by inference.
+        Native learning changes these packed weights directly. The sidecar
+        covers eligible projections, learned tables, and dynamic synapses;
+        small non-synaptic controls remain higher precision in core tensors.
         """
 
         roots = self._ternary_export_roots()
+        self.require_complete_packed_runtime()
         dense_types = (
             nn.Linear,
+            nn.Embedding,
             nn.Conv1d,
             nn.Conv2d,
             nn.Conv3d,
@@ -2026,18 +5968,26 @@ class AdaptiveBrain:
         if audit["violations"] or audit["coverage"] != 1.0:
             raise RuntimeError("ternary coverage audit failed before packing")
 
-        synapse_ids, dynamic_values = self._dynamic_synapse_export()
-        dynamic = {
-            "substrate.dynamic_synapses.weights": dynamic_values,
-        }
+        (
+            dynamic_values,
+            dynamic_synapse_count,
+            synapse_order_hash,
+            dynamic_order_basis,
+        ) = self._dynamic_synapse_pack_state()
+        dynamic = self._dynamic_ternary_tensors(dynamic_values)
         specs = collect_module_ternary_tensors(
             roots,
             dynamic_synapses=dynamic,
         )
         expected_names = [spec.name for spec in specs]
-        synapse_order_hash = hashlib.sha256(
-            "\0".join(synapse_ids).encode("utf-8")
-        ).hexdigest()
+        packed_write_bytes = sum(
+            (int(spec.values.numel()) + 3) // 4
+            for spec in specs
+        ) + max(64 * 1024, len(specs) * 1024)
+        self.resource_policy.require_disk(
+            packed_write_bytes,
+            "packed ternary export",
+        )
         target = (
             Path(destination).resolve()
             if destination is not None
@@ -2063,13 +6013,48 @@ class AdaptiveBrain:
                     "brainId": self.brain_id,
                     "engineSchemaVersion": ENGINE_SCHEMA_VERSION,
                     "parameterChecksum": self.parameter_checksum(),
-                    "dynamicSynapseCount": len(synapse_ids),
+                    "originKind": self.config.origin_kind,
+                    "baseFrozen": False,
+                    "randomInitializationSeed": int(self.config.seed),
+                    "groundUpCurriculumSha256": (
+                        (self.ground_up_training_manifest or {}).get("sha256")
+                        if self.config.origin_kind == "ground-up"
+                        else None
+                    ),
+                    "groundUpTrainingManifestSha256": (
+                        (self.ground_up_training_manifest or {}).get(
+                            "contentSha256"
+                        )
+                        if self.config.origin_kind == "ground-up"
+                        else None
+                    ),
+                    "groundUpTrainingReceiptSha256": (
+                        (
+                            (self.ground_up_training_manifest or {}).get(
+                                "trainingReceipt", {}
+                            )
+                            or {}
+                        ).get("contentSha256")
+                        if self.config.origin_kind == "ground-up"
+                        else None
+                    ),
+                    "dynamicSynapseCount": dynamic_synapse_count,
                     "dynamicSynapseOrderSha256": synapse_order_hash,
+                    "dynamicSynapseOrderBasis": dynamic_order_basis,
+                    "substrateContentSha256": str(
+                        (self.memory.persistence_manifest or {}).get(
+                            "contentSha256", ""
+                        )
+                    ),
+                    "totalDynamicSynapseCount": dynamic_synapse_count,
+                    "dynamicSynapseCountingBasis": "substrate-records-v1",
+                    "nativePackedForward": audit["packedExecution"],
                 },
             )
             verify_ternary_shards(
                 temporary,
                 expected_names=expected_names,
+                retain_names=(),
             )
             if target.exists():
                 os.replace(str(target), str(previous))
@@ -2096,9 +6081,43 @@ class AdaptiveBrain:
             "eligibleTensorCount": manifest["coverage"][
                 "eligibleTensorCount"
             ],
-            "dynamicSynapseCount": len(synapse_ids),
+            "dynamicSynapseCount": dynamic_synapse_count,
             "dynamicSynapseOrderSha256": synapse_order_hash,
+            "dynamicSynapseOrderBasis": dynamic_order_basis,
+            "substrateContentSha256": str(
+                (self.memory.persistence_manifest or {}).get(
+                    "contentSha256", ""
+                )
+            ),
+            "totalDynamicSynapseCount": dynamic_synapse_count,
+            "dynamicSynapseCountingBasis": "substrate-records-v1",
+            "nativePackedForward": audit["packedExecution"],
             "parameterChecksum": self.parameter_checksum(),
+            "originKind": self.config.origin_kind,
+            "groundUpCurriculumSha256": (
+                (self.ground_up_training_manifest or {}).get("sha256")
+                if self.config.origin_kind == "ground-up"
+                else None
+            ),
+            "groundUpTrainingManifestSha256": (
+                (self.ground_up_training_manifest or {}).get(
+                    "contentSha256"
+                )
+                if self.config.origin_kind == "ground-up"
+                else None
+            ),
+            "groundUpTrainingReceiptSha256": (
+                (
+                    (self.ground_up_training_manifest or {}).get(
+                        "trainingReceipt", {}
+                    )
+                    or {}
+                ).get("contentSha256")
+                if self.config.origin_kind == "ground-up"
+                else None
+            ),
+            "baseFrozen": False,
+            "pretrainedTextCortex": None,
             "relativePath": "packed-ternary/",
         }
         self.packed_ternary_manifest = summary
@@ -2115,14 +6134,35 @@ class AdaptiveBrain:
         eligible = []
         violations = []
         observed_levels = set()
-        for root_name, root in (
+
+        def audit_tensor(name: str, values: torch.Tensor) -> None:
+            invalid = False
+            for value in torch.unique(values.detach()).cpu().tolist():
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    invalid = True
+                    continue
+                if not math.isfinite(numeric) or numeric not in {
+                    -1.0,
+                    0.0,
+                    1.0,
+                }:
+                    invalid = True
+                    continue
+                observed_levels.add(int(numeric))
+            if invalid and name not in violations:
+                violations.append(name)
+
+        roots: List[Tuple[str, nn.Module]] = [
             ("decoder", self.decoder),
             ("memory_bridge", self.memory_bridge),
             ("idea_adapter", self.idea_adapter),
             ("router", self.router),
             ("liquid", self.liquid),
             ("modalities", self.modalities),
-        ):
+        ]
+        for root_name, root in roots:
             for module_name, module in root.named_modules():
                 if not (
                     isinstance(module, TERNARY_PROJECTION_TYPES)
@@ -2133,13 +6173,30 @@ class AdaptiveBrain:
                 eligible.append(name)
                 if getattr(module, "ternary", False) is not True:
                     violations.append(name)
-                levels = {
-                    int(value)
-                    for value in torch.unique(module.effective_weight()).tolist()
-                }
-                observed_levels.update(levels)
-                if not levels.issubset({-1, 0, 1}):
-                    violations.append(name)
+                audit_tensor(name, module.effective_weight())
+        dynamic_name = "substrate.dynamic_synapses.weights"
+        eligible.append(dynamic_name)
+        dynamic_levels = set()
+        if isinstance(self.memory.synapses, LazyPersistedSynapses):
+            try:
+                self.memory.synapses.validate_dirty()
+                dynamic_levels.update(
+                    self.memory.synapses.observed_effective_levels()
+                )
+            except ValueError:
+                violations.append(dynamic_name)
+        else:
+            for synapse in self.memory.synapses.values():
+                try:
+                    dynamic_levels.add(
+                        self.memory.exact_effective_weight(
+                            synapse.get("effective_weight", 0)
+                        )
+                    )
+                except ValueError:
+                    if dynamic_name not in violations:
+                        violations.append(dynamic_name)
+        observed_levels.update(dynamic_levels)
         return {
             "eligibleProjections": len(eligible),
             "ternaryProjections": len(eligible) - len(violations),
@@ -2150,8 +6207,9 @@ class AdaptiveBrain:
             ),
             "violations": violations,
             "observedLevels": sorted(observed_levels),
-            "masterWeightPrecision": "floating-learning-state",
+            "authoritativeWeightStorage": "packed-ternary-synapses",
             "forwardPrecision": "exact ternary {-1,0,+1}",
+            "packedExecution": self.packed_runtime_audit(),
         }
 
     def _organic_state(self) -> Dict[str, float]:
@@ -2166,15 +6224,24 @@ class AdaptiveBrain:
             sum(
                 1
                 for item in neurons
-                if float(item.get("activation", 0.0)) >= 0.1
+                if self.memory.effective_activation(item) >= 0.1
             )
             / float(len(neurons))
             if neurons
             else 0.0
         )
+        attention_epoch = self._attention_epoch()
+        attention_traces = [
+            trace
+            for trace in self.traces
+            if (
+                trace.get("attention_epoch", trace.get("attentionEpoch", 0))
+                == attention_epoch
+            )
+        ]
         recent_losses = [
             float(trace.get("train_loss", 0.0))
-            for trace in self.traces[-2:]
+            for trace in attention_traces[-2:]
             if math.isfinite(float(trace.get("train_loss", 0.0)))
         ]
         prediction_error = (
@@ -2188,7 +6255,7 @@ class AdaptiveBrain:
             if len(recent_losses) >= 2
             else 0.0
         )
-        recent = self.traces[-1] if self.traces else {}
+        recent = attention_traces[-1] if attention_traces else {}
         novelty = float(
             recent.get("organic_state", {}).get(
                 "novelty",
@@ -2227,24 +6294,44 @@ class AdaptiveBrain:
         }
 
     def runtime_card(self) -> Dict[str, Any]:
-        has_prior_training = (
-            self.config.origin_kind == "starter"
-            or self.counters["training_steps"] > 0
-            or bool(self.training_sources)
-        )
-        return {
+        card: Dict[str, Any] = {
             "architecture": "OmniCortex",
-            "pretrained": has_prior_training,
+            "pretrained": False,
+            "trained": bool(
+                self.ground_up_training_manifest
+                or self.counters["training_steps"] > 0
+                or self.training_sources
+            ),
             "origin_kind": self.config.origin_kind,
-            "starter_training_manifest": self.starter_training_manifest,
+            "baseFrozen": False,
+            "ground_up_training_manifest": self.ground_up_training_manifest,
             "packed_ternary_manifest": self.packed_ternary_manifest,
             "hidden_behavioral_prompt": False,
             "reward_model": False,
             "rlhf": False,
             "memory_injection": self.config.memory_injection,
             "textual_long_term_memory_injected": False,
+            "fresh_attention": (
+                None
+                if self.fresh_attention_boundary is None
+                else {
+                    "active": True,
+                    "epoch": int(self.fresh_attention_boundary["epoch"]),
+                    "createdAt": str(
+                        self.fresh_attention_boundary["createdAt"]
+                    ),
+                    "messagesPreserved": int(
+                        self.fresh_attention_boundary["messagesPreserved"]
+                    ),
+                    "rawPriorDialogueEligible": False,
+                    "cleared": dict(
+                        self.fresh_attention_boundary["cleared"]
+                    ),
+                }
+            ),
             "tokenizer_boundary": "UTF-8 bytes",
             "weight_forward": "scaled ternary {-1,0,+1}",
+            "parameterAccounting": self.parameter_accounting(),
             "ternary_audit": self._ternary_audit(),
             "device": str(self.device),
             "device_backend": self.device_backend,
@@ -2257,10 +6344,18 @@ class AdaptiveBrain:
                 "dimensions": self.config.d_model,
                 "layers": self.config.n_layers,
                 "contextTokens": self.config.max_seq_len,
+                "recurrentPagedMemoryItems": self.config.working_memory_slots,
+                "workingMemoryMode": self.config.working_memory_mode,
+                "denseAttentionClaim": False,
+                "configuredMemorySpillBytes": self.config.memory_offload_bytes,
+                "estimatedStorageSlowdownPercent": (
+                    self.config.memory_offload_slowdown_percent
+                ),
                 "trainBatchSize": self.config.train_batch_size,
                 "gradientAccumulation": self.config.gradient_accumulation,
                 "gradientCheckpointing": self.config.gradient_checkpointing,
-                "replayOffload": "cpu-with-durable-safetensors",
+                "replayOffload": "transactional-sqlite-disk",
+                "optimizerOffload": "safe-tensor-pressure-scratch",
                 "imageSize": self.config.image_size,
                 "audioSamples": self.config.audio_samples,
                 "videoFrames": self.config.video_frames,
@@ -2306,7 +6401,7 @@ class AdaptiveBrain:
             "memory_timescales": {
                 "workingMemorySlots": self.config.working_memory_slots,
                 "shortTermHalfLifeMinutes": self.config.short_term_half_life_minutes,
-                "longTermThreshold": self.config.long_term_threshold,
+                "replayAdmission": "continuous-organic-weighted",
                 "forgettingRate": self.config.forgetting_rate,
                 "consolidationRate": self.config.consolidation_rate,
                 "activeWorkingVectors": len(self.working_memory),
@@ -2316,6 +6411,7 @@ class AdaptiveBrain:
                     else "semantic-parameters-and-vsa"
                 ),
             },
+            "state_offload": self._state_offload_status(),
             "modality_training": {
                 name: {
                     "steps": steps,
@@ -2323,9 +6419,7 @@ class AdaptiveBrain:
                         "trained"
                         if steps > 0
                         else (
-                            "starter"
-                            if self.config.origin_kind == "starter"
-                            else "random"
+                            "random"
                         )
                     ),
                 }
@@ -2343,59 +6437,222 @@ class AdaptiveBrain:
             ],
             "intrinsic_dynamics": self._organic_state(),
         }
+        if self.config.origin_kind == "ground-up":
+            initialization = (
+                self.ground_up_training_manifest or {}
+            ).get("randomInitialization", {})
+            card["randomInitialization"] = {
+                "algorithm": initialization.get(
+                    "algorithm", "torch-seeded-module-initialization-v1"
+                ),
+                "seed": int(self.config.seed),
+                "parameterChecksum": initialization.get("parameterChecksum"),
+                "exactParameterCount": initialization.get(
+                    "exactParameterCount",
+                    self.parameter_accounting()["totalNeuralParameters"],
+                ),
+            }
+        return card
 
     def parameter_checksum(self) -> str:
-        parameters: List[torch.Tensor] = [
-            parameter
-            for module in self._trainable_modules()
-            for parameter in module.parameters()
-        ]
-        return tensor_checksum(parameters)
+        return tensor_checksum(
+            self._learned_parameter_tensors(self._trainable_modules())
+        )
 
     def _parameter_copy(self) -> List[torch.Tensor]:
+        modules: List[nn.Module] = [
+            self.decoder,
+            self.memory_bridge,
+            self.idea_adapter,
+            self.liquid,
+        ]
         return [
             parameter.detach().cpu().clone()
-            for module in (
-                self.decoder,
-                self.memory_bridge,
-                self.idea_adapter,
-                self.liquid,
-            )
-            for parameter in module.parameters()
+            for parameter in self._learned_parameter_tensors(modules)
         ]
 
     def _parameter_delta_norm(self, before: Sequence[torch.Tensor]) -> float:
         total = 0.0
+        modules: List[nn.Module] = [
+            self.decoder,
+            self.memory_bridge,
+            self.idea_adapter,
+            self.liquid,
+        ]
         current = [
             parameter.detach().cpu()
-            for module in (
-                self.decoder,
-                self.memory_bridge,
-                self.idea_adapter,
-                self.liquid,
-            )
-            for parameter in module.parameters()
+            for parameter in self._learned_parameter_tensors(modules)
         ]
         for index, parameter in enumerate(current):
+            if (
+                index < len(before)
+                and parameter.shape == before[index].shape
+                and parameter.dtype == torch.uint8
+                and before[index].dtype == torch.uint8
+            ):
+                # Four signed ternary codes live in each byte. Decode only a
+                # bounded byte block for an exact mutation norm; never create
+                # a full dense copy of a packed cortical matrix.
+                current_bytes = parameter.reshape(-1)
+                previous_bytes = before[index].reshape(-1)
+                for offset in range(0, current_bytes.numel(), 65_536):
+                    now = current_bytes[offset : offset + 65_536].to(torch.int16)
+                    prior = previous_bytes[offset : offset + 65_536].to(torch.int16)
+                    for shift in (0, 2, 4, 6):
+                        delta = ((now >> shift) & 3) - ((prior >> shift) & 3)
+                        total += float(delta.float().pow(2).sum().item())
+                continue
             if index < len(before) and parameter.shape == before[index].shape:
-                difference = parameter - before[index]
+                difference = parameter.float() - before[index].float()
             else:
-                difference = parameter
-            total += float(difference.float().pow(2).sum().item())
+                difference = parameter.float()
+            total += float(difference.pow(2).sum().item())
         return math.sqrt(total)
 
     def _idea_model_vector(self, vsa_vector: torch.Tensor) -> torch.Tensor:
         raw = vsa_vector.to(self.device, dtype=torch.float32).reshape(1, -1)
         return torch.tanh(self.memory_bridge(raw))
 
-    def _append_replay(self, idea: torch.Tensor, importance: float = 1.0) -> None:
-        if float(importance) < self.config.long_term_threshold:
+    @staticmethod
+    def _replay_admission_probability(
+        importance: float, replay_priority: float = 0.0
+    ) -> float:
+        """Sample cold latent replay smoothly; never gate fast learning.
+
+        The small floor gives a weak one-off experience a chance to enter
+        latent storage for later replay,
+        while recurrence and other measured retention signals can raise its
+        chance on subsequent encounters. Sampling avoids one SQLite commit
+        and WAL checkpoint for every section of a large document.
+        """
+
+        def bounded(value: float) -> float:
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return max(0.0, min(1.0, number)) if math.isfinite(number) else 0.0
+
+        attention = bounded(importance) ** 3
+        organic = bounded(replay_priority)
+        return 0.02 + 0.98 * (attention + organic - attention * organic)
+
+    def _organic_replay_priority(
+        self,
+        *,
+        assembly_id: str,
+        salience: float,
+        novelty: float,
+        prediction_error: float,
+        spike_rate: float,
+    ) -> float:
+        """Measure current organic signals without advancing lifecycle state.
+
+        Replay must be admitted before settle can mutate afterimages or slow
+        anchors, preserving the existing disk-reserve pause boundary. This
+        read-only pre-settle estimate is rescored by settle immediately after.
+        """
+
+        signals, rehearsals, _ = self.memory_lifecycle._measure_signals(
+            self.memory,
+            str(assembly_id),
+            salience_boost=salience,
+            spike_rate=spike_rate,
+            record_index=self.memory.assembly_by_id,
+        )
+        return self._replay_priority_from_signals(
+            signals,
+            rehearsals=rehearsals,
+            novelty=novelty,
+            prediction_error=prediction_error,
+        )
+
+    @staticmethod
+    def _replay_priority_from_signals(
+        signals: Mapping[str, Any],
+        *,
+        rehearsals: int,
+        novelty: float,
+        prediction_error: float,
+    ) -> float:
+        assessment = OrganicMemoryLifecycle.assess_retention_candidate(
+            novelty=novelty,
+            reuse=float(signals.get("reuse", 0.0)),
+            salience=float(signals.get("salience", 0.0)),
+            prediction_error=prediction_error,
+            rehearsals=rehearsals,
+            stability=float(signals.get("stability", 0.0)),
+            related_coactivation=float(signals.get("recurrence", 0.0)),
+            interference=float(signals.get("interference", 0.0)),
+            recurrence=float(signals.get("recurrence", 0.0)),
+            activation=float(signals.get("activation", 0.0)),
+            observations=rehearsals,
+        )
+        return float(assessment["slowReplayPriority"])
+
+    def _append_replay(
+        self,
+        idea: torch.Tensor,
+        importance: float = 1.0,
+        *,
+        replay_priority: float = 0.0,
+        assembly_id: str = "",
+    ) -> bool:
+        probability = self._replay_admission_probability(
+            importance, replay_priority
+        )
+        if probability < 1.0:
+            # Cycle and counters are checkpointed with the neural state. A
+            # retry from the same boundary chooses the same lane, while a
+            # later related exposure gets a fresh opportunity without keeping
+            # source text or a cue-to-answer key.
+            seed = "\0".join(
+                (
+                    str(self.brain_id),
+                    str(self.memory_lifecycle.cycle),
+                    str(self.counters.get("experiences", 0)),
+                    str(self.counters.get("idle_cognition_cycles", 0)),
+                    str(assembly_id),
+                )
+            ).encode("utf-8")
+            draw = int.from_bytes(hashlib.sha256(seed).digest()[:8], "big") / float(
+                1 << 64
+            )
+            if draw >= probability:
+                return False
+        try:
+            self.replay.append(idea.detach().cpu().reshape(-1))
+        except NeuralStateResourcePause as error:
+            self.resource_pause = {
+                "reason": str(error),
+                "readings": error.status,
+                "at": _iso_now(),
+            }
+            raise
+        return True
+
+    def _append_selected_replay_batch(
+        self, ideas: Iterable[torch.Tensor]
+    ) -> None:
+        """Persist already-admitted replay vectors in one microbatch commit."""
+
+        if not isinstance(self.replay, DurableReplayBuffer):
+            # Lightweight replay test doubles retain their existing append
+            # contract; production replay takes the atomic batch path.
+            for idea in ideas:
+                self._append_replay(idea)
             return
-        self.replay.append(idea.detach().cpu().reshape(-1))
-        if len(self.replay) > self.config.replay_capacity:
-            # Deterministic reservoir-like thinning retains old and new eras.
-            self.replay = self.replay[::2] + self.replay[-self.config.replay_capacity // 2 :]
-            self.replay = self.replay[-self.config.replay_capacity :]
+        try:
+            self.replay.append_many(
+                idea.detach().cpu().reshape(-1) for idea in ideas
+            )
+        except NeuralStateResourcePause as error:
+            self.resource_pause = {
+                "reason": str(error),
+                "readings": error.status,
+                "at": _iso_now(),
+            }
+            raise
 
     def _append_working_memory(
         self,
@@ -2408,23 +6665,71 @@ class AdaptiveBrain:
         vector = idea.detach().cpu().reshape(-1)
         timestamp = _iso_now()
         salience = max(0.0, min(1.0, float(salience)))
-        for index, existing in enumerate(self.working_memory):
+        assembly_key = str(assembly_id)
+        restored_item: Dict[str, Any] = {}
+
+        def near_identical(left: torch.Tensor, right: torch.Tensor) -> bool:
+            first = left.float().reshape(-1)
+            second = right.float().reshape(-1)
+            if first.shape != second.shape:
+                return False
             similarity = float(
                 F.cosine_similarity(
-                    existing.float().reshape(1, -1),
-                    vector.float().reshape(1, -1),
+                    first.reshape(1, -1), second.reshape(1, -1)
                 ).item()
             )
-            if similarity < 0.985:
+            return (
+                math.isfinite(similarity)
+                and similarity >= self.memory_lifecycle.EPISODE_MERGE_COSINE
+            )
+
+        if assembly_key:
+            preview = self.paged_working_memory.peek_hot(
+                hot_assembly_ids=(assembly_key,),
+                unfinished_ids=(),
+                limit=1,
+            )
+            restored = False
+            if preview and near_identical(preview[0][0], vector):
+                try:
+                    restored_vector, restored_metadata = (
+                        self.paged_working_memory.page_in(
+                            str(preview[0][1]["pageId"])
+                        )
+                    )
+                except KeyError:
+                    # A competing page-in won; the current vector still gets
+                    # its own resident episode below.
+                    pass
+                else:
+                    restored = True
+                    restored_item = dict(restored_metadata)
+                    vector = (
+                        restored_vector.detach().cpu().float().reshape(-1) * 0.72
+                        + vector.float() * 0.28
+                    )
+                    salience = max(
+                        salience,
+                        float(restored_item.get("salience", 0.0) or 0.0),
+                    )
+            self.hot_state_residency.note_access(
+                (assembly_key,), page_in=restored
+            )
+        for index, existing in enumerate(self.working_memory):
+            item = self.workspace_items[index]
+            if not near_identical(existing, vector):
                 continue
             self.working_memory[index] = (
                 existing.float() * 0.72 + vector.float() * 0.28
             )
-            item = self.workspace_items[index]
             item["salience"] = min(
                 1.0, float(item.get("salience", 0.5)) * 0.8 + salience * 0.2
             )
-            item["rehearsals"] = int(item.get("rehearsals", 1)) + 1
+            item["rehearsals"] = (
+                int(item.get("rehearsals", 1))
+                + int(restored_item.get("rehearsals", 0) or 0)
+                + 1
+            )
             item["lastActiveAt"] = timestamp
             self.counters["workspace_rehearsals"] += 1
             return
@@ -2436,18 +6741,37 @@ class AdaptiveBrain:
         self.working_memory.append(vector)
         self.workspace_items.append(
             {
-                "id": uuid.uuid4().hex,
-                "assemblyId": assembly_id,
+                "id": str(restored_item.get("id", "")) or uuid.uuid4().hex,
+                "assemblyId": assembly_key,
                 "source": source,
                 "salience": salience,
-                "rehearsals": 1,
-                "enteredAt": timestamp,
+                "rehearsals": int(
+                    restored_item.get("rehearsals", 0) or 0
+                )
+                + 1,
+                "enteredAt": str(restored_item.get("enteredAt", ""))
+                or timestamp,
                 "lastActiveAt": timestamp,
             }
         )
-        while len(self.working_memory) > self.config.working_memory_slots:
+        resident_limit = max(
+            1,
+            min(
+                self.config.working_memory_slots,
+                self.config.memory_resident_items,
+            ),
+        )
+        while len(self.working_memory) > resident_limit:
+            eviction_candidates = [
+                index
+                for index, item in enumerate(self.workspace_items)
+                if not assembly_key
+                or str(item.get("assemblyId", "")) != assembly_key
+            ]
+            if not eviction_candidates:
+                eviction_candidates = list(range(len(self.workspace_items)))
             eviction = min(
-                range(len(self.workspace_items)),
+                eviction_candidates,
                 key=lambda index: (
                     float(self.workspace_items[index].get("salience", 0.0))
                     * (
@@ -2459,15 +6783,97 @@ class AdaptiveBrain:
                     self.workspace_items[index].get("lastActiveAt", ""),
                 ),
             )
-            self.working_memory.pop(eviction)
-            self.workspace_items.pop(eviction)
+            cold_vector = self.working_memory.pop(eviction)
+            cold_item = self.workspace_items.pop(eviction)
+            self.paged_working_memory.append(cold_vector, cold_item)
+            cold_capacity = max(
+                0, self.config.working_memory_slots - resident_limit
+            )
+            self.counters["workspace_evictions"] += (
+                self.paged_working_memory.trim_to(cold_capacity)
+            )
             self.counters["workspace_evictions"] += 1
 
-    def _working_memory_vector(self) -> Optional[torch.Tensor]:
-        if (
-            self.config.memory_injection != "working-memory"
-            or not self.working_memory
-        ):
+    @staticmethod
+    def _prediction_error_from_loss(value: Any) -> float:
+        try:
+            loss = max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(loss):
+            return 1.0
+        return loss / (1.0 + loss)
+
+    def _settle_memory_automatically(
+        self,
+        vector: torch.Tensor,
+        *,
+        assembly_id: str,
+        source: str,
+        salience: float,
+        novelty: float,
+        prediction_error: float,
+        importance: float,
+        spike_rate: float,
+        resting: bool = False,
+    ) -> Dict[str, Any]:
+        """Continuously settle activity without a manual memory command.
+
+        Settling is not Ponder and cannot create visible text or actions.  An
+        unfinished trace may quietly re-enter working activity, where the
+        ordinary learned action head can later decide whether any deliberate
+        Ponder, talk, imagination, or tool action is warranted.
+        """
+
+        result = self.memory_lifecycle.settle(
+            memory=self.memory,
+            router=self.router,
+            vector=vector,
+            assembly_id=str(assembly_id),
+            source=str(source),
+            salience=float(salience),
+            novelty=float(novelty),
+            prediction_error=float(prediction_error),
+            importance=float(importance),
+            spike_rate=float(spike_rate),
+            forgetting_rate=self.config.forgetting_rate,
+            long_term_threshold=self.config.long_term_threshold,
+            resting=resting,
+        )
+        reinforcement_drive = float(result.get("reinforcementDrive", 0.0))
+        if reinforcement_drive > 0.0:
+            # Current slow weights were already changed by ordinary corpus or
+            # modality learning. Continuous measured reinforcement increases
+            # metaplastic anchoring around that learned state; no categorical
+            # memory stage controls whether an experience can keep changing.
+            stability_rate = min(0.22, 0.18 * reinforcement_drive)
+            self._commit_slow_anchors(rate=stability_rate)
+            result["slowWeightStabilityRate"] = stability_rate
+        else:
+            result["slowWeightStabilityRate"] = 0.0
+        recurring_id = str(result.get("recurringAssemblyId", ""))
+        if recurring_id:
+            for index, item in enumerate(
+                self.memory_lifecycle.afterimage_items
+            ):
+                if str(item.get("assemblyId", "")) != recurring_id:
+                    continue
+                item["lastActiveCycle"] = self.memory_lifecycle.cycle
+                self._append_working_memory(
+                    self.memory_lifecycle.afterimage_vectors[index],
+                    assembly_id=recurring_id,
+                    source="unfinished-memory",
+                    salience=max(0.35, float(item.get("salience", 0.35))),
+                )
+                result["unfinishedReenteredWorkingMemory"] = True
+                break
+        result.setdefault("unfinishedReenteredWorkingMemory", False)
+        return result
+
+    def _active_working_memory_vector(self) -> Optional[torch.Tensor]:
+        """Return the measured current idea mixture independent of text policy."""
+
+        if not self.working_memory:
             return None
         recent = torch.stack(self.working_memory).to(
             self.device, dtype=torch.float32
@@ -2487,6 +6893,11 @@ class AdaptiveBrain:
         weights = salience * recency
         weights = weights / weights.sum()
         return torch.tanh((recent * weights[:, None]).sum(dim=0, keepdim=True))
+
+    def _working_memory_vector(self) -> Optional[torch.Tensor]:
+        if self.config.memory_injection != "working-memory":
+            return None
+        return self._active_working_memory_vector()
 
     @staticmethod
     def _token_sequence_hash(tokens: Sequence[int]) -> str:
@@ -2582,6 +6993,254 @@ class AdaptiveBrain:
                 history = history[1:]
         return [self.tokenizer.bos_id] + history + current, history
 
+    def _fast_synapse_checksum(self) -> str:
+        return tensor_checksum(
+            [
+                self.router.synapses.weights,
+                self.router.synapses.stability,
+                self.router.synapses.uses,
+                self.router.synapses.plasticity_events,
+            ]
+        )
+
+    def _fresh_attention_result(
+        self,
+        boundary: Mapping[str, Any],
+        *,
+        idempotent: bool,
+        paged_cleanup_pending: bool = False,
+    ) -> Dict[str, Any]:
+        conversation_counts = self.conversation.counts()
+        return {
+            "format": FRESH_ATTENTION_FORMAT,
+            "formatVersion": FRESH_ATTENTION_VERSION,
+            "brainId": self.brain_id,
+            "committed": True,
+            "idempotent": bool(idempotent),
+            "boundary": dict(boundary),
+            "parameterChecksum": self.parameter_checksum(),
+            "fastSynapseChecksum": self._fast_synapse_checksum(),
+            "substrateContentSha256": str(
+                (self.memory.persistence_manifest or {}).get(
+                    "contentSha256", ""
+                )
+            ),
+            "messagesPreserved": int(conversation_counts["messageCount"]),
+            "tracesPreserved": int(conversation_counts["traceCount"]),
+            "synapsesPreserved": len(self.memory.synapses),
+            "replayEntries": len(self.replay),
+            "pagedCleanupPending": bool(paged_cleanup_pending),
+            "rawPriorDialogueEligible": False,
+        }
+
+    def start_fresh_attention(self, operation_id: str) -> Dict[str, Any]:
+        """Atomically forget attention while preserving learned memory/history."""
+
+        operation_id = self._validated_chat_turn_id(operation_id)
+        if not operation_id:
+            raise ValueError("fresh attention operation id is required")
+        existing = self.fresh_attention_boundary
+        if existing is not None and existing.get("operationId") == operation_id:
+            persisted = read_json(self.engine_path / "brain.json")
+            committed_boundary = self._validated_fresh_attention_boundary(
+                persisted.get("fresh_attention_boundary")
+            )
+            if (
+                committed_boundary is None
+                or committed_boundary.get("operationId") != operation_id
+            ):
+                raise RuntimeError(
+                    "fresh attention boundary is not atomically committed"
+                )
+            return self._fresh_attention_result(
+                existing,
+                idempotent=True,
+                paged_cleanup_pending=(
+                    self._fresh_attention_paged_clear_pending
+                ),
+            )
+
+        parameter_checksum = self.parameter_checksum()
+        fast_synapse_checksum = self._fast_synapse_checksum()
+        substrate_content_sha256 = str(
+            (self.memory.persistence_manifest or {}).get("contentSha256", "")
+        )
+        if not self._sha256_identifier(substrate_content_sha256):
+            raise RuntimeError(
+                "fresh attention requires a committed substrate generation"
+            )
+        synapse_count = len(self.memory.synapses)
+        replay_entries = len(self.replay)
+        prior_epoch = self._attention_epoch()
+        # Persist every already-materialized row before taking the preservation
+        # snapshot. The append-only ledger, rather than the bounded runtime
+        # cache, is authoritative for visible history across attention epochs.
+        self.conversation.backfill(self.messages, self.traces)
+        conversation_counts = self.conversation.counts()
+        epoch_counts = self.conversation.counts(attention_epoch=prior_epoch)
+        messages_preserved = int(conversation_counts["messageCount"])
+        traces_preserved = int(conversation_counts["traceCount"])
+        raw_history_messages = int(epoch_counts["messageCount"])
+        automatic_trace_influence = int(epoch_counts["traceCount"])
+        paged_count = self.paged_working_memory.count()
+        recall_audit_entries = len(
+            self.memory._last_recall_audit.get("activationByAssembly", {})
+        )
+        cleared = {
+            "recentTokens": len(self.recent_token_context),
+            "currentPromptTokens": max(
+                0, int(self.current_context.get("tokenCount", 0))
+            ),
+            "residentWorkingMemory": len(self.working_memory),
+            "pagedWorkingMemory": paged_count,
+            "lifecycleScratch": len(self.memory_lifecycle.afterimage_items),
+            "activeFocus": len(self.memory_lifecycle.active_focus),
+            "activatedNeurons": 0,
+            "recalledAssemblies": 0,
+            "substrateEligibilityTraces": 0,
+            "liquidStateUnits": int(
+                torch.count_nonzero(self.liquid_state.detach()).item()
+            ),
+            "rawHistoryMessages": raw_history_messages,
+            "automaticTraceInfluence": automatic_trace_influence,
+            "recallAuditEntries": recall_audit_entries,
+            "noveltyStreak": max(0, int(self.novelty_streak)),
+            "legacyRawAttentionOverlay": 0,
+            "routerMembraneUnits": int(
+                torch.count_nonzero(
+                    self.router.population.membrane.detach()
+                ).item()
+            ),
+            "routerSpikeUnits": int(
+                torch.count_nonzero(
+                    self.router.population.spike_count.detach()
+                ).item()
+            ),
+            "routerPreTraceUnits": int(
+                torch.count_nonzero(
+                    self.router.synapses.pre_trace.detach()
+                ).item()
+            ),
+            "routerPostTraceUnits": int(
+                torch.count_nonzero(
+                    self.router.synapses.post_trace.detach()
+                ).item()
+            ),
+        }
+
+        substrate_clear = self.memory.clear_attention_activity(prior_epoch + 1)
+        lifecycle_clear = self.memory_lifecycle.clear_attention()
+        cleared["activatedNeurons"] = int(
+            substrate_clear["activatedNeurons"]
+        )
+        cleared["recalledAssemblies"] = int(
+            substrate_clear["recalledAssemblies"]
+        )
+        cleared["substrateEligibilityTraces"] = int(
+            substrate_clear["eligibilityTraces"]
+        )
+        cleared["legacyRawAttentionOverlay"] = int(
+            substrate_clear["legacyRawActive"]
+        )
+        cleared["lifecycleScratch"] = int(lifecycle_clear["afterimageItems"])
+        cleared["activeFocus"] = int(lifecycle_clear["activeFocus"])
+        self.recent_token_context = []
+        self.current_context = {
+            "tokenCount": 0,
+            "tokenHash": "",
+            "recentTokenCount": 0,
+            "recentTokenHash": self._token_sequence_hash([]),
+            "sensorySlots": 0,
+            "updatedAt": _iso_now(),
+            "freshAttentionEpoch": prior_epoch + 1,
+        }
+        self.working_memory = []
+        self.workspace_items = []
+        self.liquid_state.zero_()
+        self.router.reset_activity()
+        self.novelty_streak = 0
+        for module in self._trainable_modules():
+            for parameter in module.parameters():
+                parameter.grad = None
+        reset_clock = time.time()
+        self.last_activity_decay = reset_clock
+        self.last_idle_cycle_at = reset_clock
+        self.last_idle_visible_action_at = reset_clock
+        boundary = {
+            "format": FRESH_ATTENTION_FORMAT,
+            "formatVersion": FRESH_ATTENTION_VERSION,
+            "operationId": operation_id,
+            "epoch": prior_epoch + 1,
+            "createdAt": _iso_now(),
+            "messagesPreserved": messages_preserved,
+            "tracesPreserved": traces_preserved,
+            "synapsesPreserved": synapse_count,
+            "replayEntries": replay_entries,
+            "parameterChecksum": parameter_checksum,
+            "fastSynapseChecksum": fast_synapse_checksum,
+            "substrateContentSha256": substrate_content_sha256,
+            "cleared": cleared,
+        }
+        self.fresh_attention_boundary = boundary
+        self._fresh_attention_paged_clear_pending = True
+        if (
+            self.parameter_checksum() != parameter_checksum
+            or self._fast_synapse_checksum() != fast_synapse_checksum
+            or str(
+                (self.memory.persistence_manifest or {}).get(
+                    "contentSha256", ""
+                )
+            )
+            != substrate_content_sha256
+            or len(self.memory.synapses) != synapse_count
+            or len(self.replay) != replay_entries
+            or self.conversation.counts() != conversation_counts
+        ):
+            raise RuntimeError("fresh attention changed durable neural state")
+
+        try:
+            self.save(reuse_substrate_generation=True)
+        except Exception:
+            persisted = read_json(self.engine_path / "brain.json")
+            committed_boundary = self._validated_fresh_attention_boundary(
+                persisted.get("fresh_attention_boundary")
+            )
+            if (
+                committed_boundary is None
+                or committed_boundary.get("operationId") != operation_id
+            ):
+                raise
+
+        if str(
+            (self.memory.persistence_manifest or {}).get("contentSha256", "")
+        ) != substrate_content_sha256:
+            raise RuntimeError(
+                "fresh attention rewrote the durable substrate generation"
+            )
+
+        paged_cleanup_pending = False
+        try:
+            self.paged_working_memory.clear()
+            self._fresh_attention_paged_clear_pending = False
+        except (OSError, sqlite3.Error):
+            # brain.json already names the empty scratch checkpoint. Reload
+            # recovery will delete these now-unreachable temporary rows.
+            paged_cleanup_pending = True
+        result = self._fresh_attention_result(
+            boundary,
+            idempotent=False,
+            paged_cleanup_pending=paged_cleanup_pending,
+        )
+        self.events.append(
+            "fresh-attention",
+            {
+                key: value
+                for key, value in result.items()
+                if key not in {"brainId"}
+            },
+        )
+        return result
+
     def workspace_snapshot(self) -> Dict[str, Any]:
         items = [
             {
@@ -2594,6 +7253,27 @@ class AdaptiveBrain:
             }
             for item in self.workspace_items
         ]
+        plain_memory = self.memory_lifecycle.snapshot(self.memory)
+        plain_memory["recentWords"] = {
+            "capacity": self.config.max_seq_len,
+            "count": len(self.recent_token_context),
+            "evictions": self.counters["context_token_evictions"],
+            "temporary": True,
+        }
+        paged_count = (
+            0
+            if self._fresh_attention_paged_clear_pending
+            else self.paged_working_memory.count()
+        )
+        plain_memory["workingThoughts"] = {
+            "capacity": self.config.working_memory_slots,
+            "count": len(self.working_memory) + paged_count,
+            "resident": len(self.working_memory),
+            "paged": paged_count,
+            "items": items,
+            "evictions": self.counters["workspace_evictions"],
+            "rehearsals": self.counters["workspace_rehearsals"],
+        }
         return {
             "brainId": self.brain_id,
             "queriedAt": _iso_now(),
@@ -2623,7 +7303,9 @@ class AdaptiveBrain:
             },
             "latentWorkspace": {
                 "capacity": self.config.working_memory_slots,
-                "occupancy": len(self.working_memory),
+                "occupancy": len(self.working_memory) + paged_count,
+                "resident": len(self.working_memory),
+                "paged": paged_count,
                 "items": items,
                 "evictions": self.counters["workspace_evictions"],
                 "rehearsals": self.counters["workspace_rehearsals"],
@@ -2633,8 +7315,17 @@ class AdaptiveBrain:
                 "mean": float(self.liquid_state.detach().float().mean().item()),
                 "norm": float(self.liquid_state.detach().float().norm().item()),
             },
+            # Plain-language stable surface. ``latentWorkspace`` above remains
+            # a compatibility alias for early v1 desktop builds; new UI uses
+            # these four human-readable memory views.
+            "memory": plain_memory,
             "hiddenBehavioralPrompt": False,
             "rawLongTermTextInjected": False,
+            "freshAttentionBoundary": (
+                None
+                if self.fresh_attention_boundary is None
+                else dict(self.fresh_attention_boundary)
+            ),
         }
 
     @staticmethod
@@ -2660,13 +7351,15 @@ class AdaptiveBrain:
         return number if math.isfinite(number) else float(default)
 
     def _substrate_revision(self) -> str:
-        value = "%d:%d:%d:%d" % (
+        value = "%d:%d:%d:%d:%d:%s" % (
             len(self.memory.neurons),
             len(self.memory.assemblies),
             len(self.memory.synapses),
             int(self.memory.growth_events),
+            int(getattr(self.memory, "state_revision", 0)),
+            str(getattr(self, "updated_at", "")),
         )
-        return hashlib.sha256(value.encode("ascii")).hexdigest()[:16]
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
     @staticmethod
     def _encode_substrate_cursor(
@@ -2713,11 +7406,25 @@ class AdaptiveBrain:
         return offset
 
     def _inspect_neuron(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        effective_activation = getattr(
+            self.memory, "effective_activation", None
+        )
+        legacy_raw_active = bool(
+            getattr(self.memory, "attention_legacy_raw_active", True)
+        )
+        active_ids = getattr(
+            self.memory, "attention_active_neuron_ids", frozenset()
+        )
+        identifier = str(record.get("id", record.get("neuron_id", "")))
         return {
-            "id": str(record.get("id", record.get("neuron_id", ""))),
+            "id": identifier,
             "label": str(record.get("label", "")),
             "region": str(record.get("region", "semantic")),
-            "activation": self._inspection_number(record.get("activation")),
+            "activation": (
+                float(effective_activation(record))
+                if callable(effective_activation)
+                else self._inspection_number(record.get("activation"))
+            ),
             "importance": self._inspection_number(record.get("importance")),
             "uncertainty": self._inspection_number(
                 record.get("uncertainty"), 0.5
@@ -2726,6 +7433,8 @@ class AdaptiveBrain:
             "createdAt": self._inspection_timestamp(record.get("created_at")),
             "lastActivatedAt": self._inspection_timestamp(
                 record.get("last_activated_at")
+                if legacy_raw_active or identifier in active_ids
+                else None
             ),
             "aliases": [
                 str(value)
@@ -2736,7 +7445,17 @@ class AdaptiveBrain:
 
     def _inspect_assembly(self, record: Mapping[str, Any]) -> Dict[str, Any]:
         assembly_id = str(record.get("id", ""))
+        legacy_raw_active = bool(
+            getattr(self.memory, "attention_legacy_raw_active", True)
+        )
+        recalled_ids = getattr(
+            self.memory, "attention_recalled_assembly_ids", frozenset()
+        )
         inspector_node = self.memory.neurons.get(assembly_id, {})
+        neuron_ids = [str(value) for value in record.get("neuron_ids", [])]
+        child_assembly_ids = [
+            str(value) for value in record.get("child_assembly_ids", [])
+        ]
         return {
             "id": assembly_id,
             "label": str(
@@ -2746,13 +7465,11 @@ class AdaptiveBrain:
                 )
             ),
             "region": "assembly",
-            "neuronIds": [
-                str(value) for value in record.get("neuron_ids", [])
-            ],
-            "childAssemblyIds": [
-                str(value)
-                for value in record.get("child_assembly_ids", [])
-            ],
+            "neuronIds": neuron_ids,
+            "childAssemblyIds": child_assembly_ids,
+            "neuronCount": len(neuron_ids),
+            "childAssemblyCount": len(child_assembly_ids),
+            "relationshipsPaged": False,
             "kind": str(record.get("kind", "knowledge")),
             "source": str(record.get("source", "")),
             "confidence": self._inspection_number(
@@ -2763,6 +7480,8 @@ class AdaptiveBrain:
             "createdAt": self._inspection_timestamp(record.get("created_at")),
             "lastRecalledAt": self._inspection_timestamp(
                 record.get("last_recalled_at")
+                if legacy_raw_active or assembly_id in recalled_ids
+                else None
             ),
             "sourceLabel": str(record.get("source_label", "")) or None,
             # Inspection reveals whether exact text exists, never the retained
@@ -2771,19 +7490,24 @@ class AdaptiveBrain:
         }
 
     def _inspect_synapse(self, record: Mapping[str, Any]) -> Dict[str, Any]:
-        effective = int(record.get("effective_weight", 0))
-        effective = -1 if effective < 0 else (1 if effective > 0 else 0)
+        effective = NeuralSubstrate.exact_effective_weight(
+            record.get("effective_weight", 0)
+        )
+        effective_eligibility = getattr(
+            self.memory, "effective_eligibility", None
+        )
         return {
             "id": str(record.get("id", "")),
             "sourceId": str(record.get("source_id", "")),
             "targetId": str(record.get("target_id", "")),
             "kind": str(record.get("kind", "associates")),
             "effectiveWeight": effective,
-            "latentWeight": self._inspection_number(
-                record.get("latent_weight")
-            ),
             "eligibility": self._inspection_number(
-                record.get("eligibility")
+                (
+                    effective_eligibility(record)
+                    if callable(effective_eligibility)
+                    else record.get("eligibility")
+                )
             ),
             "plasticity": self._inspection_number(
                 record.get("plasticity"), 1.0
@@ -2916,14 +7640,103 @@ class AdaptiveBrain:
             ),
         )
 
+    @staticmethod
+    def _substrate_page(
+        records: Iterable[Mapping[str, Any]],
+        *,
+        inspect: Callable[[Mapping[str, Any]], Dict[str, Any]],
+        matches: Callable[[Dict[str, Any]], bool],
+        offset: int,
+        requested_page_size: int,
+    ) -> Tuple[List[Dict[str, Any]], int, int, bool]:
+        """Select one contiguous page without imposing a cardinality cap.
+
+        ``requested_page_size`` is a caller preference, not a product limit.
+        The response stops only when that request is satisfied or the bounded
+        JSON-RPC byte envelope is full.  Scanning continues to calculate the
+        exact match count, while the next cursor resumes at the first record
+        that was not returned.
+        """
+
+        page: List[Dict[str, Any]] = []
+        matched = 0
+        page_bytes = 2
+        transport_limited = False
+        page_closed = False
+        for raw_record in records:
+            record = inspect(raw_record)
+            if not matches(record):
+                continue
+            record_index = matched
+            matched += 1
+            if record_index < offset or page_closed:
+                continue
+            if len(page) >= requested_page_size:
+                page_closed = True
+                continue
+            encoded_bytes = len(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            if (
+                encoded_bytes > SUBSTRATE_INSPECTION_TRANSPORT_BYTES
+                and "neuronIds" in record
+                and "childAssemblyIds" in record
+            ):
+                # Assembly membership is also represented by authoritative
+                # contains/participates/composes synapses.  If one unusually
+                # large assembly cannot fit in one protocol line, return its
+                # metadata and exact counts while routing every relationship
+                # through the ordinary `connectedTo` synapse cursor instead of
+                # imposing a hidden member-count cutoff.
+                record = {
+                    **record,
+                    "neuronIds": [],
+                    "childAssemblyIds": [],
+                    "relationshipsPaged": True,
+                }
+                encoded_bytes = len(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+            separator_bytes = 1 if page else 0
+            if (
+                page
+                and page_bytes + separator_bytes + encoded_bytes
+                > SUBSTRATE_INSPECTION_TRANSPORT_BYTES
+            ):
+                transport_limited = True
+                page_closed = True
+                continue
+            if not page and encoded_bytes > SUBSTRATE_INSPECTION_TRANSPORT_BYTES:
+                raise ValueError(
+                    "one substrate inspection record exceeds the JSON-RPC "
+                    "transport envelope; narrow the relationship query"
+                )
+            page.append(record)
+            page_bytes += separator_bytes + encoded_bytes
+        return page, matched, page_bytes, transport_limited
+
     def query_substrate(
         self, query: Optional[Mapping[str, Any]] = None
     ) -> Dict[str, Any]:
         """Return a read-only, cursor-paged multiresolution substrate view.
 
-        A page-size bound protects the JSON-RPC channel, while ``nextCursor``
-        makes the total addressable result unbounded. Cursors are invalidated
-        by structural growth so a traversal never silently mixes revisions.
+        A byte-based transport envelope protects the JSON-RPC channel without
+        capping a page at an arbitrary record count. ``nextCursor`` makes the
+        total addressable result unbounded. Cursors are invalidated by every
+        live substrate mutation, including activation and STDP changes that do
+        not alter structural counts, so a traversal never mixes revisions.
         """
 
         raw = dict(query or {})
@@ -2932,13 +7745,18 @@ class AdaptiveBrain:
             raise ValueError("invalid substrate entity")
         zoom = max(0.0, min(self._inspection_number(raw.get("zoom"), 0.0), 1.0))
         page_size_raw = raw.get("pageSize", 256)
-        if isinstance(page_size_raw, bool):
+        if isinstance(page_size_raw, bool) or not isinstance(page_size_raw, int):
             raise ValueError("invalid substrate page size")
-        page_size = max(1, min(int(page_size_raw), 5000))
+        page_size = page_size_raw
+        if page_size < 1:
+            raise ValueError("substrate page size must be positive")
         region = str(raw.get("region", "")).strip()
         search = str(raw.get("search", "")).strip()
-        if len(region) > 128 or len(search) > 512:
+        connected_to = str(raw.get("connectedTo", "")).strip()
+        if len(region) > 128 or len(search) > 512 or len(connected_to) > 256:
             raise ValueError("substrate filter is too long")
+        if connected_to and entity != "synapses":
+            raise ValueError("connectedTo is valid only for synapse queries")
         revision = self._substrate_revision()
         fingerprint = hashlib.sha256(
             json.dumps(
@@ -2947,6 +7765,7 @@ class AdaptiveBrain:
                     "zoom": round(zoom, 6),
                     "region": region.casefold(),
                     "search": search.casefold(),
+                    "connectedTo": connected_to,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -2968,10 +7787,15 @@ class AdaptiveBrain:
         response: Dict[str, Any] = {
             "brainId": self.brain_id,
             "queriedAt": _iso_now(),
+            "revision": revision,
             "entity": entity,
             "zoom": zoom,
             "totals": totals,
             "matched": 0,
+            "offset": offset,
+            "returned": 0,
+            "pageBytes": 0,
+            "transportLimited": False,
             "hasMore": False,
             "clusters": [],
             "neurons": [],
@@ -2983,11 +7807,20 @@ class AdaptiveBrain:
         # substrate. Zoom in to receive individual cursor-paged records.
         if entity == "overview" or zoom < 0.66:
             clusters = self._substrate_clusters(zoom, region, search)
-            page = clusters[offset : offset + page_size]
+            page, matched, page_bytes, transport_limited = self._substrate_page(
+                clusters,
+                inspect=lambda record: dict(record),
+                matches=lambda _record: True,
+                offset=offset,
+                requested_page_size=page_size,
+            )
             end = offset + len(page)
             response["clusters"] = page
-            response["matched"] = len(clusters)
-            response["hasMore"] = end < len(clusters)
+            response["matched"] = matched
+            response["returned"] = len(page)
+            response["pageBytes"] = page_bytes
+            response["transportLimited"] = transport_limited
+            response["hasMore"] = end < matched
             if response["hasMore"]:
                 response["nextCursor"] = self._encode_substrate_cursor(
                     end, revision, fingerprint
@@ -2996,49 +7829,55 @@ class AdaptiveBrain:
 
         search_value = search.casefold()
         if entity == "neurons":
-            records = [
-                self._inspect_neuron(record)
-                for record in self.memory.neurons.values()
-            ]
-            records = [
-                record
-                for record in records
-                if (
-                    not region
-                    or record["region"].casefold() == region.casefold()
+            raw_records = (
+                self.memory.neurons[record_id]
+                for record_id in sorted(self.memory.neurons)
+            )
+            inspect = self._inspect_neuron
+
+            def matches(record: Dict[str, Any]) -> bool:
+                return (
+                    (
+                        not region
+                        or record["region"].casefold() == region.casefold()
+                    )
+                    and (
+                        not search_value
+                        or search_value
+                        in (
+                            "%s %s %s"
+                            % (record["id"], record["label"], record["region"])
+                        ).casefold()
+                    )
                 )
-                and (
-                    not search_value
-                    or search_value
-                    in (
-                        "%s %s %s"
-                        % (record["id"], record["label"], record["region"])
-                    ).casefold()
-                )
-            ]
+
         elif entity == "assemblies":
-            records = [
-                self._inspect_assembly(record)
-                for record in self.memory.assemblies
-            ]
-            records = [
-                record
-                for record in records
-                if (not region or region.casefold() == "assembly")
-                and (
-                    not search_value
-                    or search_value
-                    in (
-                        "%s %s %s %s"
-                        % (
-                            record["id"],
-                            record["label"],
-                            record["kind"],
-                            record["sourceLabel"] or "",
-                        )
-                    ).casefold()
+            raw_records = iter(
+                sorted(
+                    self.memory.assemblies,
+                    key=lambda record: str(record.get("id", "")),
                 )
-            ]
+            )
+            inspect = self._inspect_assembly
+
+            def matches(record: Dict[str, Any]) -> bool:
+                return (
+                    (not region or region.casefold() == "assembly")
+                    and (
+                        not search_value
+                        or search_value
+                        in (
+                            "%s %s %s %s"
+                            % (
+                                record["id"],
+                                record["label"],
+                                record["kind"],
+                                record["sourceLabel"] or "",
+                            )
+                        ).casefold()
+                    )
+                )
+
         else:
             region_by_id = {
                 str(record.get("id", "")): str(
@@ -3046,45 +7885,60 @@ class AdaptiveBrain:
                 )
                 for record in self.memory.neurons.values()
             }
-            records = [
-                self._inspect_synapse(record)
-                for record in self.memory.synapses.values()
-            ]
-            records = [
-                record
-                for record in records
-                if (
-                    not region
-                    or region.casefold()
-                    in {
-                        region_by_id.get(
-                            record["sourceId"], "unknown"
-                        ).casefold(),
-                        region_by_id.get(
-                            record["targetId"], "unknown"
-                        ).casefold(),
-                    }
+            raw_records = (
+                self.memory.synapses[record_id]
+                for record_id in sorted(self.memory.synapses)
+            )
+            inspect = self._inspect_synapse
+
+            def matches(record: Dict[str, Any]) -> bool:
+                return (
+                    (
+                        not region
+                        or region.casefold()
+                        in {
+                            region_by_id.get(
+                                record["sourceId"], "unknown"
+                            ).casefold(),
+                            region_by_id.get(
+                                record["targetId"], "unknown"
+                            ).casefold(),
+                        }
+                    )
+                    and (
+                        not connected_to
+                        or connected_to
+                        in {record["sourceId"], record["targetId"]}
+                    )
+                    and (
+                        not search_value
+                        or search_value
+                        in (
+                            "%s %s %s %s"
+                            % (
+                                record["id"],
+                                record["sourceId"],
+                                record["targetId"],
+                                record["kind"],
+                            )
+                        ).casefold()
+                    )
                 )
-                and (
-                    not search_value
-                    or search_value
-                    in (
-                        "%s %s %s %s"
-                        % (
-                            record["id"],
-                            record["sourceId"],
-                            record["targetId"],
-                            record["kind"],
-                        )
-                    ).casefold()
-                )
-            ]
-        records.sort(key=lambda record: str(record["id"]))
-        page = records[offset : offset + page_size]
+
+        page, matched, page_bytes, transport_limited = self._substrate_page(
+            raw_records,
+            inspect=inspect,
+            matches=matches,
+            offset=offset,
+            requested_page_size=page_size,
+        )
         end = offset + len(page)
         response[entity] = page
-        response["matched"] = len(records)
-        response["hasMore"] = end < len(records)
+        response["matched"] = matched
+        response["returned"] = len(page)
+        response["pageBytes"] = page_bytes
+        response["transportLimited"] = transport_limited
+        response["hasMore"] = end < matched
         if response["hasMore"]:
             response["nextCursor"] = self._encode_substrate_cursor(
                 end, revision, fingerprint
@@ -3102,7 +7956,9 @@ class AdaptiveBrain:
         if learning_rate is not None:
             optimizer = self._new_optimizer(learning_rate)
         else:
+            self._ensure_optimizer_resident()
             optimizer = self._optimizer
+        learning_parameters = self._streaming_experience_parameters()
         losses: List[float] = []
         language_losses: List[float] = []
         idea_losses: List[float] = []
@@ -3116,12 +7972,17 @@ class AdaptiveBrain:
             for ids in self.tokenizer.window_tensors(
                 text,
                 self.device,
-                max_length=self.config.max_seq_len,
+                max_length=min(
+                    self.config.max_seq_len,
+                    self._runtime_training_max_seq_len,
+                ),
                 add_bos=True,
                 add_eos=True,
             ):
                 if ids.shape[1] < 2:
                     continue
+                if optimizer is self._optimizer:
+                    self._ensure_optimizer_resident()
                 optimizer.zero_grad(set_to_none=True)
                 idea = self._idea_model_vector(vsa_vector)
                 noise = torch.randn_like(idea) * 0.06
@@ -3139,7 +8000,9 @@ class AdaptiveBrain:
                 language = self.decoder(
                     ids, memory_bias=reconstructed, labels=ids
                 )["loss"]
-                stability_loss = self._stability_penalty()
+                stability_loss = self._stability_penalty(
+                    learning_parameters
+                )
                 loss = (
                     language
                     + 0.2 * idea_loss
@@ -3150,17 +8013,17 @@ class AdaptiveBrain:
                 if not bool(torch.isfinite(loss)):
                     raise RuntimeError("non-finite training loss")
                 loss.backward()
-                self._accumulate_slow_importance()
+                self._accumulate_slow_importance(learning_parameters)
                 parameters = [
-                    parameter
-                    for group in optimizer.param_groups
-                    for parameter in group["params"]
+                    parameter for parameter in learning_parameters
                     if parameter.grad is not None
                 ]
                 torch.nn.utils.clip_grad_norm_(
                     parameters, self.config.grad_clip
                 )
                 optimizer.step()
+                if optimizer is self._optimizer:
+                    self._maintain_neural_state_resources()
                 losses.append(float(loss.detach().item()))
                 language_losses.append(float(language.detach().item()))
                 idea_losses.append(float(idea_loss.detach().item()))
@@ -3176,13 +8039,207 @@ class AdaptiveBrain:
                 "stability_loss": 0.0,
             }
         if commit_stability:
-            self._commit_slow_anchors(rate=0.08)
+            self._commit_slow_anchors(
+                rate=0.08, parameters=learning_parameters
+            )
         return {
             "loss": sum(losses) / len(losses),
             "language_loss": sum(language_losses) / len(language_losses),
             "idea_loss": sum(idea_losses) / len(idea_losses),
             "workspace_loss": sum(workspace_losses) / len(workspace_losses),
             "stability_loss": sum(stability_losses) / len(stability_losses),
+        }
+
+    def _local_exact_dialogue_windows(
+        self,
+        human: str,
+        brain: str,
+        *,
+        training_sequence_tokens: int,
+    ) -> Iterator[Tuple[List[int], int, int]]:
+        """Yield bounded local-decoder windows with exhaustive byte targets.
+
+        Later windows include the preceding response byte as masked causal
+        context. Only the final window targets EOS, so concatenated supervised
+        labels are exactly every UTF-8 response byte followed by one EOS.
+        """
+
+        context_limit = max(
+            8,
+            min(
+                int(self.config.max_seq_len),
+                int(training_sequence_tokens),
+            ),
+        )
+        human_bytes = human.encode("utf-8")
+        response_bytes = brain.encode("utf-8")
+        if not response_bytes:
+            raise ValueError("exact local dialogue response must be non-empty")
+        # BOS, HUMAN, BRAIN, one causal continuation byte, and final EOS are
+        # reserved before sharing the remaining live context between the
+        # human suffix and each exact target window.
+        shared_payload = max(2, context_limit - 5)
+        response_budget = max(1, shared_payload // 2)
+        human_budget = max(0, shared_payload - response_budget)
+        if len(human_bytes) < human_budget:
+            human_budget = len(human_bytes)
+            response_budget = max(1, shared_payload - human_budget)
+        human_context = human_bytes[-human_budget:] if human_budget else b""
+        previous_response_id: Optional[int] = None
+        for offset in range(0, len(response_bytes), response_budget):
+            target_bytes = response_bytes[offset : offset + response_budget]
+            final_window = offset + len(target_bytes) >= len(response_bytes)
+            prefix_ids = (
+                [previous_response_id]
+                if previous_response_id is not None
+                else []
+            )
+            target_ids = [
+                int(value) + self.tokenizer.byte_offset
+                for value in target_bytes
+            ]
+            ids_list = [
+                self.tokenizer.bos_id,
+                self.tokenizer.human_id,
+                *(
+                    int(value) + self.tokenizer.byte_offset
+                    for value in human_context
+                ),
+                self.tokenizer.brain_id,
+                *prefix_ids,
+                *target_ids,
+                *([self.tokenizer.eos_id] if final_window else []),
+            ]
+            if len(ids_list) > context_limit:
+                raise RuntimeError(
+                    "exact local dialogue window exceeds the training context"
+                )
+            target_start = (
+                3 + len(human_context) + len(prefix_ids)
+            )
+            target_count = len(target_ids) + (1 if final_window else 0)
+            yield ids_list, target_start, target_count
+            previous_response_id = target_ids[-1]
+
+    def _optimize_exact_dialogue_pair(
+        self,
+        human: str,
+        brain: str,
+        vsa_vector: torch.Tensor,
+        steps: int,
+        commit_stability: bool,
+        training_sequence_tokens: int,
+    ) -> Dict[str, Any]:
+        """Apply one token-weighted local step across all exact windows."""
+
+        target_tokens = len(brain.encode("utf-8")) + 1
+        losses: List[float] = []
+        language_losses: List[float] = []
+        target_windows = 0
+        trained_parameters: Dict[int, nn.Parameter] = {}
+        try:
+            for _ in range(max(1, int(steps))):
+                self._ensure_optimizer_resident()
+                self._optimizer.zero_grad(set_to_none=True)
+                weighted_language_sum = 0.0
+                visited_targets = 0
+                step_windows = 0
+                for ids_list, target_start, target_count in (
+                    self._local_exact_dialogue_windows(
+                        human,
+                        brain,
+                        training_sequence_tokens=training_sequence_tokens,
+                    )
+                ):
+                    ids = torch.tensor(
+                        [ids_list], dtype=torch.long, device=self.device
+                    )
+                    labels = ids.clone()
+                    labels[:, :target_start] = self.tokenizer.pad_id
+                    idea = self._idea_model_vector(vsa_vector)
+                    adapted = self.idea_adapter(idea)
+                    prediction_loss = self.decoder(
+                        ids, memory_bias=adapted, labels=labels
+                    )["loss"]
+                    if not bool(torch.isfinite(prediction_loss)):
+                        raise RuntimeError(
+                            "non-finite exact dialogue-pair loss"
+                        )
+                    objective = prediction_loss * (
+                        float(target_count) / float(target_tokens)
+                    )
+                    objective.backward()
+                    weighted_language_sum += (
+                        float(prediction_loss.detach().item())
+                        * target_count
+                    )
+                    visited_targets += target_count
+                    step_windows += 1
+                if visited_targets != target_tokens or step_windows < 1:
+                    raise RuntimeError(
+                        "exact local dialogue target coverage is invalid"
+                    )
+                connected_parameters = tuple(
+                    parameter
+                    for group in self._optimizer.param_groups
+                    for parameter in group["params"]
+                    if parameter.grad is not None
+                )
+                if not connected_parameters:
+                    raise RuntimeError(
+                        "exact local dialogue produced no connected gradients"
+                    )
+                stability_loss = self._stability_penalty(
+                    connected_parameters
+                )
+                if not bool(torch.isfinite(stability_loss)):
+                    raise RuntimeError("non-finite dialogue stability loss")
+                if stability_loss.requires_grad:
+                    stability_loss.backward()
+                self._accumulate_slow_importance(connected_parameters)
+                torch.nn.utils.clip_grad_norm_(
+                    connected_parameters, self.config.grad_clip
+                )
+                self._optimizer.step()
+                self._maintain_neural_state_resources()
+                self.counters["training_steps"] += 1
+                language_value = weighted_language_sum / float(target_tokens)
+                language_losses.append(language_value)
+                losses.append(
+                    language_value + float(stability_loss.detach().item())
+                )
+                target_windows = step_windows
+                trained_parameters.update(
+                    {
+                        id(parameter): parameter
+                        for parameter in connected_parameters
+                    }
+                )
+        except Exception:
+            self._optimizer.zero_grad(set_to_none=True)
+            raise
+        if commit_stability:
+            self._commit_slow_anchors(
+                rate=0.08,
+                parameters=trained_parameters.values(),
+            )
+        parameter_names = {
+            id(parameter): name
+            for name, parameter in self._named_slow_parameters().items()
+        }
+        return {
+            "loss": sum(losses) / len(losses),
+            "language_loss": sum(language_losses) / len(language_losses),
+            "target_tokens": target_tokens,
+            "target_windows": target_windows,
+            "optimizer_steps": len(losses),
+            "target_window_policy": LOCAL_TYPED_TARGET_WINDOW_POLICY,
+            "logical_token_weighted_objective": True,
+            "_stability_parameter_names": tuple(
+                parameter_names[parameter_id]
+                for parameter_id in trained_parameters
+                if parameter_id in parameter_names
+            ),
         }
 
     def _optimize_dialogue_pair(
@@ -3192,18 +8249,42 @@ class AdaptiveBrain:
         vsa_vector: torch.Tensor,
         steps: int = 1,
         commit_stability: bool = True,
-    ) -> Dict[str, float]:
+        exact_response_windows: bool = False,
+        exact_training_sequence_tokens: Optional[int] = None,
+        exact_target_window_policy: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if exact_response_windows:
+            if exact_target_window_policy != LOCAL_TYPED_TARGET_WINDOW_POLICY:
+                raise ValueError("local typed target window policy is invalid")
+            if exact_training_sequence_tokens is None:
+                raise ValueError(
+                    "local typed target window context is not schedule-frozen"
+                )
+            return self._optimize_exact_dialogue_pair(
+                human,
+                brain,
+                vsa_vector,
+                steps=max(1, int(steps)),
+                commit_stability=commit_stability,
+                training_sequence_tokens=int(
+                    exact_training_sequence_tokens
+                ),
+            )
         ids_list = self.tokenizer.dialogue(human, brain, complete=True)
-        if len(ids_list) > self.config.max_seq_len:
+        training_context_limit = min(
+            self.config.max_seq_len,
+            self._runtime_training_max_seq_len,
+        )
+        if len(ids_list) > training_context_limit:
             # Preserve the role boundary and response when a long human turn is
             # clipped to the physical working-token budget.
             response_ids = [
                 value + self.tokenizer.byte_offset
                 for value in brain.encode("utf-8")
             ]
-            response_ids = response_ids[-max(1, self.config.max_seq_len // 2) :]
+            response_ids = response_ids[-max(1, training_context_limit // 2) :]
             human_budget = max(
-                1, self.config.max_seq_len - len(response_ids) - 4
+                1, training_context_limit - len(response_ids) - 4
             )
             human_ids = [
                 value + self.tokenizer.byte_offset
@@ -3221,33 +8302,296 @@ class AdaptiveBrain:
         labels = ids.clone()
         boundary = ids_list.index(self.tokenizer.brain_id)
         labels[:, : boundary + 1] = self.tokenizer.pad_id
+        learning_parameters = self._streaming_experience_parameters()
         losses: List[float] = []
         for _ in range(max(1, int(steps))):
+            self._ensure_optimizer_resident()
             self._optimizer.zero_grad(set_to_none=True)
             idea = self._idea_model_vector(vsa_vector)
             adapted = self.idea_adapter(idea)
             prediction_loss = self.decoder(
                 ids, memory_bias=adapted, labels=labels
             )["loss"]
-            stability_loss = self._stability_penalty()
+            stability_loss = self._stability_penalty(
+                learning_parameters
+            )
             loss = prediction_loss + stability_loss
             if not bool(torch.isfinite(loss)):
                 raise RuntimeError("non-finite dialogue-pair loss")
             loss.backward()
-            self._accumulate_slow_importance()
+            self._accumulate_slow_importance(learning_parameters)
             parameters = [
-                parameter
-                for group in self._optimizer.param_groups
-                for parameter in group["params"]
+                parameter for parameter in learning_parameters
                 if parameter.grad is not None
             ]
             torch.nn.utils.clip_grad_norm_(parameters, self.config.grad_clip)
             self._optimizer.step()
+            self._maintain_neural_state_resources()
             self.counters["training_steps"] += 1
             losses.append(float(loss.detach().item()))
         if commit_stability:
-            self._commit_slow_anchors(rate=0.08)
+            self._commit_slow_anchors(
+                rate=0.08, parameters=learning_parameters
+            )
         return {"loss": sum(losses) / len(losses)}
+
+
+
+    def _apply_supervised_dialogue(
+        self,
+        human: str,
+        response: str,
+        *,
+        steps: int = 1,
+        train_local: bool = True,
+        local_exact_response_windows: bool = False,
+        local_exact_training_sequence_tokens: Optional[int] = None,
+        local_exact_target_window_policy: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Apply one typed target as an atomic slow-learning transaction."""
+
+        clean_human = human.replace("\x00", "").strip()
+        clean_response = response.replace("\x00", "").strip()
+        if not clean_human or not clean_response:
+            raise ValueError("dialogue training requires non-empty human and brain text")
+        if not train_local:
+            return {
+                "humanSha256": hashlib.sha256(
+                    clean_human.encode("utf-8")
+                ).hexdigest(),
+                "responseSha256": hashlib.sha256(
+                    clean_response.encode("utf-8")
+                ).hexdigest(),
+                "local": {
+                    "deferredToStreamingBatch": True,
+                    "loss": 0.0,
+                },
+            }
+        snapshot = self._snapshot_slow_transaction_state()
+        try:
+            cue = self.memory.vector_for_text(clean_human)
+            local = (
+                self._optimize_dialogue_pair(
+                    clean_human,
+                    clean_response,
+                    cue,
+                    steps=max(1, int(steps)),
+                    commit_stability=False,
+                    exact_response_windows=local_exact_response_windows,
+                    exact_training_sequence_tokens=(
+                        local_exact_training_sequence_tokens
+                    ),
+                    exact_target_window_policy=(
+                        local_exact_target_window_policy
+                    ),
+                )
+                if train_local
+                else {"deferredToStreamingBatch": True, "loss": 0.0}
+            )
+            local_stability_names = tuple(
+                str(value)
+                for value in local.pop(
+                    "_stability_parameter_names", ()
+                )
+            )
+            if local_exact_response_windows:
+                named_slow_parameters = self._named_slow_parameters()
+                stability_parameters = [
+                    named_slow_parameters[name]
+                    for name in local_stability_names
+                    if name in named_slow_parameters
+                ]
+                self._commit_slow_anchors(
+                    rate=0.08,
+                    parameters=stability_parameters,
+                )
+            else:
+                self._commit_slow_anchors(rate=0.08)
+            return {
+                "humanSha256": hashlib.sha256(
+                    clean_human.encode("utf-8")
+                ).hexdigest(),
+                "responseSha256": hashlib.sha256(
+                    clean_response.encode("utf-8")
+                ).hexdigest(),
+                "local": local,
+            }
+        except Exception:
+            self._restore_slow_transaction_state(snapshot)
+            raise
+
+
+
+
+
+
+
+    @staticmethod
+    def _typed_dialogue_pairs(provenance: Mapping[str, Any]) -> List[Tuple[str, str]]:
+        if provenance.get("format") != "typed-dialogue":
+            return []
+        raw_pairs = provenance.get("dialoguePairs", [])
+        if not isinstance(raw_pairs, list):
+            return []
+        pairs: List[Tuple[str, str]] = []
+        for value in raw_pairs:
+            if not isinstance(value, Mapping):
+                continue
+            human = str(value.get("human", "")).replace("\x00", "").strip()
+            response = str(value.get("brain", "")).replace("\x00", "").strip()
+            if human and response:
+                pairs.append((human, response))
+        return pairs
+
+    def _release_training_allocator_cache(self) -> None:
+        """Release only disposable allocator caches after a failed allocation."""
+
+        if self.device_backend == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # MPS cache clearing is intentionally forbidden here: PyTorch may
+        # release MPSGraph objects still referenced by an in-flight command
+        # queue. The caller reports a resource pause instead.
+
+    def _allocator_resource_pause(
+        self,
+        error: BaseException,
+        *,
+        stage: str,
+        physical_batch: Optional[int] = None,
+        sequence_tokens: Optional[int] = None,
+    ) -> NeuralStateResourcePause:
+        """Describe a recoverable allocator pause without committing mutations."""
+
+        physical = max(
+            1,
+            int(
+                physical_batch
+                if physical_batch is not None
+                else self._runtime_train_batch_size
+            ),
+        )
+        sequence = max(
+            8,
+            int(
+                sequence_tokens
+                if sequence_tokens is not None
+                else self._runtime_training_max_seq_len
+            ),
+        )
+        recommended_batch = max(1, physical // 2)
+        recommended_sequence = (
+            sequence if physical > 1 else max(8, sequence // 2)
+        )
+        status = self.resource_policy.status()
+        status.update(
+            {
+                "mode": "allocator-oom-checkpoint-recovery",
+                "paused": True,
+                "recoverable": True,
+                "allocatorOutOfMemory": True,
+                "allocatorBackend": self.device_backend,
+                "failureStage": str(stage),
+                "rollbackRequired": True,
+                "resumeFromLastCheckpoint": True,
+                "sourceRecordsSkipped": False,
+                "scratchWriteAttempted": False,
+                "recoveryPlan": {
+                    "physicalBatchSize": recommended_batch,
+                    "sequenceTokens": recommended_sequence,
+                    "streamEveryRecord": True,
+                    "retryUncommittedSuffix": True,
+                },
+                "oomCount": int(self._allocator_oom_count),
+                "errorType": error.__class__.__name__,
+            }
+        )
+        message = (
+            "training paused after the %s allocator ran out of memory; "
+            "the uncommitted batch must be rolled back and the exact dataset "
+            "suffix can resume with a smaller RAM microbatch"
+            % self.device_backend
+        )
+        self.resource_pause = {
+            "reason": message,
+            "readings": status,
+            "at": _iso_now(),
+        }
+        return NeuralStateResourcePause(message, status)
+
+    def apply_allocator_oom_downgrade(
+        self, status: Mapping[str, Any]
+    ) -> Dict[str, int]:
+        """Apply a non-neural, process-local batch downgrade after rollback."""
+
+        raw_plan = status.get("recoveryPlan", {})
+        plan = raw_plan if isinstance(raw_plan, Mapping) else {}
+        physical = max(1, int(plan.get("physicalBatchSize", 1)))
+        sequence = max(8, int(plan.get("sequenceTokens", 8)))
+        self._runtime_train_batch_size = min(
+            self._runtime_train_batch_size, physical
+        )
+        self._runtime_training_max_seq_len = min(
+            self._runtime_training_max_seq_len, sequence
+        )
+        self._allocator_oom_count = max(
+            self._allocator_oom_count, int(status.get("oomCount", 0))
+        )
+        self.resource_pause = {
+            "reason": (
+                "allocator recovery is ready to resume from the last atomic "
+                "dataset checkpoint"
+            ),
+            "readings": dict(status),
+            "at": _iso_now(),
+        }
+        return {
+            "physicalBatchSize": self._runtime_train_batch_size,
+            "sequenceTokens": self._runtime_training_max_seq_len,
+        }
+
+    def _clear_allocator_recovery_pause(self) -> None:
+        """Clear only a completed allocator pause, preserving real pressure."""
+
+        pause = self.resource_pause
+        if not isinstance(pause, Mapping):
+            return
+        readings = pause.get("readings")
+        if isinstance(readings, Mapping) and readings.get("mode") == (
+            "allocator-oom-checkpoint-recovery"
+        ):
+            self.resource_pause = None
+
+    def _streaming_experience_window_batches(
+        self,
+        experiences: Sequence[Tuple[str, torch.Tensor]],
+        *,
+        physical_batch: int,
+        sequence_tokens: int,
+    ) -> Iterator[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """Yield bounded token-window batches while visiting every source byte."""
+
+        pending_ids: List[torch.Tensor] = []
+        pending_vectors: List[torch.Tensor] = []
+        physical_batch = max(1, int(physical_batch))
+        sequence_tokens = max(8, int(sequence_tokens))
+        for text, vector in experiences:
+            for window in self.tokenizer.window_tensors(
+                text,
+                self.device,
+                max_length=sequence_tokens,
+                add_bos=True,
+                add_eos=True,
+            ):
+                if window.shape[1] < 2:
+                    continue
+                pending_ids.append(window[0])
+                pending_vectors.append(vector)
+                if len(pending_ids) >= physical_batch:
+                    yield pending_ids, pending_vectors
+                    pending_ids = []
+                    pending_vectors = []
+        if pending_ids:
+            yield pending_ids, pending_vectors
 
     def _experience_batch_loss(
         self,
@@ -3262,7 +8606,10 @@ class AdaptiveBrain:
             for window in self.tokenizer.window_tensors(
                 text,
                 self.device,
-                max_length=self.config.max_seq_len,
+                max_length=min(
+                    self.config.max_seq_len,
+                    self._runtime_training_max_seq_len,
+                ),
                 add_bos=True,
                 add_eos=True,
             ):
@@ -3273,6 +8620,39 @@ class AdaptiveBrain:
         if not encoded:
             raise ValueError("training batch contained no token windows")
         return self._experience_ids_batch_loss(encoded, expanded_vectors)
+
+    def _streaming_experience_parameters(self) -> Tuple[nn.Parameter, ...]:
+        """Return only parameters connected to the corpus batch objective.
+
+        ``OmniDecoder.forward`` exposes action logits alongside language
+        logits, but a corpus loss does not consume either action head. Adding
+        an all-model stability penalty would nevertheless materialize zero
+        gradients for those learned heads, causing AdamW to advance their
+        state and apply weight decay. Modality generators are likewise
+        unrelated to this objective. Keep stability scoped to the
+        modules used by ``_experience_ids_batch_loss``. Packed residual gains
+        and expert routes learn in backward without optimizer parameters.
+        """
+
+        parameters: List[nn.Parameter] = []
+        modules: Tuple[nn.Module, ...] = (
+            self.decoder.embedding,
+            self.decoder.global_workspace,
+            self.decoder.workspace_strength,
+            self.decoder.memory_projection,
+            self.decoder.memory_strength,
+            self.decoder.blocks,
+            self.decoder.final_norm,
+            self.decoder.language_head,
+            self.decoder.experts,
+            self.decoder.expert_prototypes,
+            self.memory_bridge,
+            self.idea_adapter,
+            self.liquid,
+        )
+        for module in modules:
+            parameters.extend(module.parameters())
+        return tuple(parameters)
 
     def _experience_ids_batch_loss(
         self,
@@ -3307,15 +8687,47 @@ class AdaptiveBrain:
             idea, state=liquid_state, elapsed=1.0
         )
         temporal_loss = F.mse_loss(temporal, idea.detach())
-        whole = self.decoder.encode_whole(ids)
+        attention_mask = ids.ne(self.tokenizer.pad_id)
+        whole = self.decoder.global_workspace.summarize(
+            self.decoder.embedding(ids),
+            attention_mask=attention_mask,
+        )
         workspace_loss = F.mse_loss(
             F.normalize(whole, dim=-1),
             F.normalize(idea.detach(), dim=-1),
         )
-        language = self.decoder(
-            ids, memory_bias=reconstructed, labels=ids
-        )["loss"]
-        stability_loss = self._stability_penalty()
+        logits = self.decoder(
+            ids,
+            memory_bias=reconstructed,
+            attention_mask=attention_mask,
+        )["logits"]
+        token_losses = F.cross_entropy(
+            logits[:, :-1].contiguous().view(-1, logits.shape[-1]),
+            ids[:, 1:].contiguous().view(-1),
+            ignore_index=self.tokenizer.pad_id,
+            reduction="none",
+        ).view(ids.shape[0], -1)
+        prediction_mask = attention_mask[:, 1:]
+        language = (
+            (token_losses * prediction_mask).sum(dim=1)
+            / prediction_mask.sum(dim=1).clamp_min(1)
+        ).mean()
+        stability_loss = self._stability_penalty(
+            self._streaming_experience_parameters()
+        )
+        loss_components = (
+            ("idea_loss", idea_loss),
+            ("temporal_loss", temporal_loss),
+            ("workspace_loss", workspace_loss),
+            ("language_loss", language),
+            ("stability_loss", stability_loss),
+        )
+        for component_name, component in loss_components:
+            if not bool(torch.isfinite(component).all()):
+                raise RuntimeError(
+                    "non-finite batch training loss component: %s"
+                    % component_name
+                )
         loss = (
             language
             + 0.2 * idea_loss
@@ -3323,8 +8735,8 @@ class AdaptiveBrain:
             + 0.1 * workspace_loss
             + stability_loss
         )
-        if not bool(torch.isfinite(loss)):
-            raise RuntimeError("non-finite batch training loss")
+        if not bool(torch.isfinite(loss).all()):
+            raise RuntimeError("non-finite batch training loss aggregate")
         return loss, {
             "loss": float(loss.detach().item()),
             "language_loss": float(language.detach().item()),
@@ -3332,6 +8744,603 @@ class AdaptiveBrain:
             "workspace_loss": float(workspace_loss.detach().item()),
             "stability_loss": float(stability_loss.detach().item()),
         }
+
+    @staticmethod
+    def _round_streaming_ieee_bits(values: torch.Tensor) -> torch.Tensor:
+        """Round normal FP32 values to twenty significant bits exactly."""
+
+        magnitude_bits = values.abs().view(torch.int32)
+        remainder = magnitude_bits.bitwise_and(0xF)
+        truncated = magnitude_bits.bitwise_and(-16)
+        retained_lsb = magnitude_bits.bitwise_right_shift(4).bitwise_and(1)
+        increment = (remainder > 8) | (
+            (remainder == 8) & (retained_lsb == 1)
+        )
+        rounded_bits = truncated + increment.to(torch.int32) * 16
+        canonical_magnitude = rounded_bits.view(torch.float32).clamp_max(
+            torch.finfo(torch.float32).max
+        )
+        return torch.where(values < 0, -canonical_magnitude, canonical_magnitude)
+
+    @staticmethod
+    def _round_streaming_ieee_bits_on_device(
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Device hook kept separate so unsupported backends can fall back."""
+
+        return AdaptiveBrain._round_streaming_ieee_bits(values)
+
+    @staticmethod
+    def _unsupported_bitwise_canonicalization(error: BaseException) -> bool:
+        if isinstance(error, NotImplementedError):
+            return True
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "not implemented",
+                "not supported",
+                "could not run 'aten::",
+                "could not run aten::",
+                "privateuse1",
+                "privateuseone",
+            )
+        )
+
+    @staticmethod
+    @torch.no_grad()
+    def _canonicalize_streaming_float_tensor(tensor: torch.Tensor) -> float:
+        """Remove low FP32 reduction jitter on a relative binary lattice.
+
+        CPU/GPU reduction kernels can differ by a few terminal mantissa bits
+        solely because of allocation alignment or execution grouping. That is
+        enough to break a cryptographic resume checksum even when the learning
+        objective, RNG, and logical schedule are identical. Keeping twenty
+        significant binary mantissa bits removes that non-semantic jitter while
+        preserving sign and relative precision across tiny and large values.
+        Non-finite values are deliberately untouched so this routine can never
+        hide an invalid optimizer state.
+        """
+
+        if tensor.dtype != torch.float32 or tensor.numel() == 0:
+            return 0.0
+        # Clear four of FP32's twenty-three stored mantissa bits using exact
+        # IEEE-754 bit operations and round-to-nearest-even. This retains
+        # twenty significant binary bits without log2/exp2. In particular,
+        # torch 2.13 MPS flushes exp2(-126) to zero even though 2**-126 is a
+        # valid normal FP32 value; the prior arithmetic lattice consequently
+        # turned finite tiny Adam second moments into NaN via inf * 0.
+        if not tensor.is_contiguous():
+            raise RuntimeError(
+                "streaming FP32 canonicalization requires contiguous state"
+            )
+        flat = tensor.view(-1)
+        maximum_delta = 0.0
+        cpu_fallback = False
+        for offset in range(
+            0, flat.numel(), STREAMING_CANONICAL_CHUNK_ELEMENTS
+        ):
+            chunk = flat[
+                offset : offset + STREAMING_CANONICAL_CHUNK_ELEMENTS
+            ]
+            absolute = chunk.abs()
+            normal = torch.isfinite(chunk) & (
+                absolute >= torch.finfo(torch.float32).tiny
+            )
+            if not bool(normal.any()):
+                continue
+            original = chunk[normal]
+            if cpu_fallback:
+                canonical = AdaptiveBrain._round_streaming_ieee_bits(
+                    original.detach().cpu()
+                ).to(device=original.device)
+            else:
+                try:
+                    canonical = (
+                        AdaptiveBrain._round_streaming_ieee_bits_on_device(
+                            original
+                        )
+                    )
+                except (RuntimeError, NotImplementedError) as error:
+                    if not AdaptiveBrain._unsupported_bitwise_canonicalization(
+                        error
+                    ):
+                        raise
+                    cpu_fallback = True
+                    canonical = AdaptiveBrain._round_streaming_ieee_bits(
+                        original.detach().cpu()
+                    ).to(device=original.device)
+            if not bool(torch.isfinite(canonical).all()):
+                raise RuntimeError(
+                    "streaming canonicalization produced a non-finite FP32 value"
+                )
+            maximum_delta = max(
+                maximum_delta,
+                float(
+                    (canonical - original)
+                    .abs()
+                    .max()
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+            )
+            chunk[normal] = canonical
+        return maximum_delta
+
+    @staticmethod
+    def _validate_streaming_adam_step(
+        value: Any,
+        *,
+        parameter_name: str,
+        stage: str,
+    ) -> None:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                numeric = float("nan")
+            else:
+                numeric = float(value.detach().cpu().item())
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+        else:
+            numeric = float("nan")
+        if (
+            not math.isfinite(numeric)
+            or numeric < 0.0
+            or not numeric.is_integer()
+        ):
+            raise RuntimeError(
+                "invalid Adam optimizer step %s: %s.step"
+                % (stage, parameter_name)
+            )
+
+    def _validate_streaming_optimizer_state(
+        self,
+        active_parameters: Sequence[
+            Tuple[str, nn.Parameter, Mapping[str, Any]]
+        ],
+        *,
+        stage: str,
+        require_state: bool,
+    ) -> None:
+        adam_optimizer = isinstance(
+            self._optimizer,
+            (torch.optim.Adam, torch.optim.AdamW),
+        )
+        for parameter_name, parameter, group in active_parameters:
+            if not bool(torch.isfinite(parameter).all()):
+                raise RuntimeError(
+                    "non-finite parameter %s: %s"
+                    % (stage, parameter_name)
+                )
+            if not adam_optimizer:
+                continue
+            state = self._optimizer.state.get(parameter)
+            if not state and not require_state:
+                continue
+            if not isinstance(state, Mapping):
+                raise RuntimeError(
+                    "missing Adam optimizer state %s: %s"
+                    % (stage, parameter_name)
+                )
+            required_state = {"step", "exp_avg", "exp_avg_sq"}
+            if bool(group.get("amsgrad", False)):
+                required_state.add("max_exp_avg_sq")
+            missing_state = sorted(required_state.difference(state))
+            if missing_state:
+                raise RuntimeError(
+                    "missing Adam optimizer state %s: %s.%s"
+                    % (stage, parameter_name, missing_state[0])
+                )
+            self._validate_streaming_adam_step(
+                state["step"],
+                parameter_name=parameter_name,
+                stage=stage,
+            )
+            for state_name, state_value in state.items():
+                if state_name == "step":
+                    continue
+                if isinstance(state_value, torch.Tensor):
+                    finite_state = bool(torch.isfinite(state_value).all())
+                elif isinstance(state_value, (int, float)):
+                    finite_state = math.isfinite(float(state_value))
+                else:
+                    finite_state = False
+                if not finite_state:
+                    raise RuntimeError(
+                        "non-finite Adam optimizer state %s: %s.%s"
+                        % (stage, parameter_name, state_name)
+                    )
+                if state_name in {"exp_avg_sq", "max_exp_avg_sq"}:
+                    if isinstance(state_value, torch.Tensor):
+                        nonnegative = bool(state_value.ge(0).all())
+                    else:
+                        nonnegative = float(state_value) >= 0.0
+                    if not nonnegative:
+                        raise RuntimeError(
+                            "negative Adam optimizer second moment %s: %s.%s"
+                            % (stage, parameter_name, state_name)
+                        )
+
+    @torch.no_grad()
+    def _canonicalize_streaming_learning_state(
+        self,
+        parameters: Optional[Iterable[nn.Parameter]] = None,
+    ) -> float:
+        """Canonicalize one streaming optimizer commit and its slow state."""
+
+        tensors: List[Tuple[str, torch.Tensor]] = []
+        seen: set[int] = set()
+        allowed = (
+            None if parameters is None else {id(value) for value in parameters}
+        )
+
+        def include(label: str, value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    tensors.append((label, value))
+                return
+            if isinstance(value, Mapping):
+                for key, nested in value.items():
+                    include("%s.%s" % (label, key), nested)
+            elif isinstance(value, (list, tuple)):
+                for index, nested in enumerate(value):
+                    include("%s[%d]" % (label, index), nested)
+
+        named_parameters = {
+            id(parameter): name
+            for name, parameter in self._named_slow_parameters().items()
+        }
+        parameter_ids_by_name = {
+            name: id(parameter)
+            for name, parameter in self._named_slow_parameters().items()
+        }
+        for group_index, group in enumerate(self._optimizer.param_groups):
+            for parameter_index, parameter in enumerate(
+                group.get("params", [])
+            ):
+                if allowed is not None and id(parameter) not in allowed:
+                    continue
+                parameter_name = named_parameters.get(
+                    id(parameter),
+                    "optimizer-group-%d-parameter-%d"
+                    % (group_index, parameter_index),
+                )
+                include("parameter.%s" % parameter_name, parameter)
+                state = self._optimizer.state.get(parameter)
+                if state is not None:
+                    for state_name, state_value in state.items():
+                        if state_name == "step":
+                            self._validate_streaming_adam_step(
+                                state_value,
+                                parameter_name=parameter_name,
+                                stage="after canonicalization",
+                            )
+                            continue
+                        include(
+                            "optimizer.%s.%s"
+                            % (parameter_name, state_name),
+                            state_value,
+                        )
+        for name, anchor in self.slow_anchors.items():
+            if (
+                allowed is not None
+                and parameter_ids_by_name.get(name) not in allowed
+            ):
+                continue
+            include("slow-anchor.%s" % name, anchor)
+        for name, importance in self.slow_importance.items():
+            if (
+                allowed is not None
+                and parameter_ids_by_name.get(name) not in allowed
+            ):
+                continue
+            include("slow-importance.%s" % name, importance)
+        maximum_delta = 0.0
+        for label, tensor in tensors:
+            maximum_delta = max(
+                maximum_delta,
+                self._canonicalize_streaming_float_tensor(tensor),
+            )
+            if (
+                tensor.is_floating_point() or tensor.is_complex()
+            ) and not bool(torch.isfinite(tensor).all()):
+                raise RuntimeError(
+                    "non-finite streaming learning state after "
+                    "canonicalization: %s" % label
+                )
+        return maximum_delta
+
+    def _optimize_streaming_experience_batch(
+        self,
+        experiences: Sequence[Tuple[str, torch.Tensor]],
+        *,
+        learning_schedule: Optional[Mapping[str, Any]] = None,
+        schedule_locked: bool = False,
+    ) -> Dict[str, float]:
+        """Commit one accumulated slow update for exhaustive stream records.
+
+        Each supplied record participates in a loss. Gradients accumulate over
+        physical microbatches, then one optimizer step commits the group. A
+        resumable ingestion supplies its frozen, source-free schedule so a RAM
+        reading cannot silently change the parameter trajectory. No source
+        text is retained after this call.
+        """
+
+        if not experiences:
+            return {
+                "loss": 0.0,
+                "language_loss": 0.0,
+                "idea_loss": 0.0,
+                "workspace_loss": 0.0,
+                "stability_loss": 0.0,
+                "records": 0.0,
+                "optimizer_steps": 0.0,
+            }
+        training_plan = self._training_resource_plan()
+        if bool(training_plan["pauseBeforeStep"]):
+            status = {
+                **self.resource_policy.status(),
+                "paused": True,
+                "recoverable": True,
+                "trainingResourcePlan": training_plan,
+                "resumeFromLastCheckpoint": True,
+                "sourceRecordsSkipped": False,
+            }
+            raise NeuralStateResourcePause(
+                "training paused before allocating a step outside the safe Omni RAM envelope",
+                status,
+            )
+        try:
+            self._ensure_optimizer_resident()
+        except BaseException as error:
+            if not is_allocator_oom_error(error):
+                raise
+            self._allocator_oom_count += 1
+            self._release_training_allocator_cache()
+            raise self._allocator_resource_pause(
+                error,
+                stage="optimizer-rehydrate",
+            ) from error
+        self.decoder.train()
+        self.memory_bridge.train()
+        self.idea_adapter.train()
+        self.liquid.train()
+        if learning_schedule is None:
+            physical = max(
+                1,
+                int(
+                    training_plan.get(
+                        "physicalBatchRecords",
+                        self._runtime_train_batch_size,
+                    )
+                ),
+            )
+            sequence_tokens = max(
+                8,
+                int(
+                    training_plan.get(
+                        "windowTokens",
+                        self._runtime_training_max_seq_len,
+                    )
+                ),
+            )
+        else:
+            physical = max(
+                1, int(learning_schedule["physicalBatchRecords"])
+            )
+            sequence_tokens = max(
+                8, int(learning_schedule["trainingSequenceTokens"])
+            )
+        frozen_logical_batch_target = (
+            max(1, int(learning_schedule["physicalBatchRecords"]))
+            * max(1, int(learning_schedule["gradientAccumulation"]))
+            if learning_schedule is not None
+            else None
+        )
+        measurements: List[Tuple[Dict[str, float], int]] = []
+        canonicalization_max_delta = 0.0
+        while True:
+            measurements = []
+            completed_windows = 0
+            mutation_stage = "forward-backward"
+            cpu_rng_state = torch.get_rng_state().clone()
+            accelerator_rng_state: Optional[torch.Tensor] = None
+            if self.device_backend == "cuda" and torch.cuda.is_available():
+                accelerator_rng_state = torch.cuda.get_rng_state(
+                    self.device
+                ).clone()
+            elif (
+                self.device_backend == "mps"
+                and hasattr(torch, "mps")
+                and hasattr(torch.mps, "get_rng_state")
+            ):
+                accelerator_rng_state = torch.mps.get_rng_state().clone()
+            self._optimizer.zero_grad(set_to_none=True)
+            try:
+                for encoded, vectors in self._streaming_experience_window_batches(
+                    experiences,
+                    physical_batch=physical,
+                    sequence_tokens=sequence_tokens,
+                ):
+                    loss, measured = self._experience_ids_batch_loss(
+                        encoded, vectors
+                    )
+                    if self.device_backend == "mps":
+                        # Checkpointed workspace chunks leave only inactive
+                        # allocator blocks after forward. Release those blocks
+                        # before backward recomputes each exact slot chunk.
+                        self._release_training_allocator_cache()
+                    # Each batch loss is a mean over its token windows. Weight
+                    # it by the actual row count so a short final microbatch has
+                    # the same objective as any other physical partition.
+                    window_count = len(encoded)
+                    (loss * float(window_count)).backward()
+                    if self.device_backend == "mps":
+                        # The next microbatch must not inherit disposable MPS
+                        # cache from checkpoint recomputation.
+                        self._release_training_allocator_cache()
+                    completed_windows += window_count
+                    measurements.append((measured, window_count))
+                if completed_windows < 1:
+                    raise ValueError("training batch contained no token windows")
+                named_parameters = {
+                    id(parameter): name
+                    for name, parameter in self._named_slow_parameters().items()
+                }
+                active_parameters: List[
+                    Tuple[str, nn.Parameter, Mapping[str, Any]]
+                ] = []
+                for group_index, group in enumerate(
+                    self._optimizer.param_groups
+                ):
+                    for parameter_index, parameter in enumerate(
+                        group["params"]
+                    ):
+                        if parameter.grad is not None:
+                            parameter.grad.div_(float(completed_windows))
+                            parameter_name = named_parameters.get(
+                                id(parameter),
+                                "optimizer-group-%d-parameter-%d"
+                                % (group_index, parameter_index),
+                            )
+                            if not bool(
+                                torch.isfinite(parameter.grad).all()
+                            ):
+                                raise RuntimeError(
+                                    "non-finite gradient before slow-importance: %s"
+                                    % parameter_name
+                                )
+                            active_parameters.append(
+                                (parameter_name, parameter, group)
+                            )
+                mutation_stage = "pre-step-state-validation"
+                self._validate_streaming_optimizer_state(
+                    active_parameters,
+                    stage="before optimizer step",
+                    require_state=False,
+                )
+                parameters = [
+                    parameter for _, parameter, _ in active_parameters
+                ]
+                mutation_stage = "slow-importance"
+                self._accumulate_slow_importance(parameters)
+                mutation_stage = "gradient-clipping"
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters,
+                    self.config.grad_clip,
+                    error_if_nonfinite=True,
+                )
+                gradient_norm_value = (
+                    float(gradient_norm.detach().item())
+                    if isinstance(gradient_norm, torch.Tensor)
+                    else float(gradient_norm)
+                )
+                if not math.isfinite(gradient_norm_value):
+                    raise RuntimeError(
+                        "non-finite total gradient norm after clipping"
+                    )
+                mutation_stage = "optimizer-step"
+                self._optimizer.step()
+                mutation_stage = "post-step-finite-validation"
+                self._validate_streaming_optimizer_state(
+                    active_parameters,
+                    stage="after optimizer step",
+                    require_state=True,
+                )
+                mutation_stage = "slow-anchor-commit"
+                self._commit_slow_anchors(
+                    rate=0.08,
+                    parameters=parameters,
+                )
+                mutation_stage = "canonicalize-learning-state"
+                canonicalization_max_delta = (
+                    self._canonicalize_streaming_learning_state(parameters)
+                )
+                self._validate_streaming_optimizer_state(
+                    active_parameters,
+                    stage="after canonicalization",
+                    require_state=True,
+                )
+                break
+            except BaseException as error:
+                self._optimizer.zero_grad(set_to_none=True)
+                if not is_allocator_oom_error(error):
+                    raise
+                self._allocator_oom_count += 1
+                self._release_training_allocator_cache()
+                # Forward/backward has not changed persistent neural state, so
+                # it is safe to retry the complete logical batch. Once slow
+                # importance or an optimizer step begins, only the worker's
+                # atomic-generation rollback is allowed to recover it.
+                if mutation_stage == "forward-backward":
+                    torch.set_rng_state(cpu_rng_state)
+                    if accelerator_rng_state is not None:
+                        if self.device_backend == "cuda":
+                            torch.cuda.set_rng_state(
+                                accelerator_rng_state, self.device
+                            )
+                        elif self.device_backend == "mps":
+                            torch.mps.set_rng_state(accelerator_rng_state)
+                if (
+                    mutation_stage == "forward-backward"
+                    and not schedule_locked
+                    and physical > 1
+                ):
+                    if frozen_logical_batch_target is None:
+                        physical = max(1, physical // 2)
+                    else:
+                        # A scheduled ingestion publishes physical batch and
+                        # accumulation together. Select the next exact divisor
+                        # before replaying any forward work, so the successful
+                        # optimizer mutation can always be frozen without a
+                        # later post-step rejection. This also preserves useful
+                        # headroom for non-power-of-two targets (3 -> 2 for 6)
+                        # while safely taking a prime target such as 5 to 1.
+                        physical = next(
+                            candidate
+                            for candidate in range(physical - 1, 0, -1)
+                            if frozen_logical_batch_target % candidate == 0
+                        )
+                    self._runtime_train_batch_size = physical
+                    continue
+                if (
+                    mutation_stage == "forward-backward"
+                    and not schedule_locked
+                    and sequence_tokens > 8
+                ):
+                    sequence_tokens = max(8, sequence_tokens // 2)
+                    self._runtime_training_max_seq_len = sequence_tokens
+                    continue
+                raise self._allocator_resource_pause(
+                    error,
+                    stage=mutation_stage,
+                    physical_batch=physical,
+                    sequence_tokens=sequence_tokens,
+                ) from error
+        self._optimizer.zero_grad(set_to_none=True)
+        self.counters["training_steps"] += 1
+        self._clear_allocator_recovery_pause()
+        self._maintain_neural_state_resources()
+        keys = (
+            "loss",
+            "language_loss",
+            "idea_loss",
+            "workspace_loss",
+            "stability_loss",
+        )
+        result = {
+            key: sum(float(item[key]) * count for item, count in measurements)
+            / float(max(1, sum(count for _, count in measurements)))
+            for key in keys
+        }
+        result["records"] = float(len(experiences))
+        result["optimizer_steps"] = 1.0
+        result["physical_batch_records"] = float(physical)
+        result["training_sequence_tokens"] = float(sequence_tokens)
+        result["canonicalization_max_delta"] = canonicalization_max_delta
+        return result
 
     def _maybe_grow(self, novelty: float, prototype: torch.Tensor) -> bool:
         if novelty >= self.config.growth_novelty_threshold:
@@ -3347,9 +9356,10 @@ class AdaptiveBrain:
         if not self._allow_substrate_growth(estimated_bytes):
             return False
         self.decoder.grow_expert(prototype.detach().reshape(-1))
+        self._configure_packed_stability()
         self.novelty_streak = 0
         self.growth_pause = None
-        self._optimizer = self._new_optimizer()
+        self._replace_optimizer()
         self._sync_stability_state()
         return True
 
@@ -3362,22 +9372,27 @@ class AdaptiveBrain:
         """Apply host reserve watermarks without imposing neuron-count caps."""
 
         estimated_bytes = max(1, int(estimated_bytes))
+        policy = self.resource_policy.status(
+            estimated_write_bytes=estimated_bytes * 2,
+            estimated_ram_bytes=estimated_bytes,
+        )
         readings = self._resource_readings()
-        disk_free = readings.get("diskFreeBytes")
-        ram_free = readings.get("availableMemoryBytes")
         reason = ""
-        if isinstance(disk_free, int) and disk_free < max(
-            512 * 1024 * 1024, estimated_bytes * 8
-        ):
+        if policy["diskPressure"]:
             reason = "available disk is below the neural growth reserve"
-        elif isinstance(ram_free, int) and ram_free < max(
-            384 * 1024 * 1024, estimated_bytes * 4
-        ):
+        elif policy["memoryPressure"]:
+            # First make optimizer and recurrent scratch durable. Structural
+            # records themselves still need RAM, so growth pauses if pressure
+            # remains after the spill rather than risking an OOM.
+            try:
+                self._maintain_neural_state_resources()
+            except NeuralStateResourcePause:
+                pass
             reason = "available memory is below the neural growth reserve"
         if reason:
             self.growth_pause = {
                 "reason": reason,
-                "readings": readings,
+                "readings": {**readings, "policy": policy},
                 "estimatedGrowthBytes": estimated_bytes,
                 "at": _iso_now(),
             }
@@ -3385,41 +9400,343 @@ class AdaptiveBrain:
         return True
 
     def _resource_readings(self) -> Dict[str, Any]:
-        probe = self.engine_path
-        while not probe.exists() and probe != probe.parent:
-            probe = probe.parent
-        disk = shutil.disk_usage(str(probe))
-        available_memory: Optional[int] = None
-        try:
-            if os.name == "nt":
-                import ctypes
+        # One live policy sample keeps RAM and disk fields correlated and
+        # exposes the same projected/reserve values used by actual allocation
+        # gates. Callers must not invent a smaller feature-specific disk floor.
+        return dict(self.resource_policy.status())
 
-                class MemoryStatus(ctypes.Structure):
-                    _fields_ = [
-                        ("length", ctypes.c_ulong),
-                        ("memory_load", ctypes.c_ulong),
-                        ("total_physical", ctypes.c_ulonglong),
-                        ("available_physical", ctypes.c_ulonglong),
-                        ("total_page", ctypes.c_ulonglong),
-                        ("available_page", ctypes.c_ulonglong),
-                        ("total_virtual", ctypes.c_ulonglong),
-                        ("available_virtual", ctypes.c_ulonglong),
-                        ("available_extended_virtual", ctypes.c_ulonglong),
-                    ]
-
-                status = MemoryStatus()
-                status.length = ctypes.sizeof(MemoryStatus)
-                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-                available_memory = int(status.available_physical)
-            elif hasattr(os, "sysconf"):
-                pages = os.sysconf("SC_AVPHYS_PAGES")
-                page_size = os.sysconf("SC_PAGE_SIZE")
-                available_memory = int(pages * page_size)
-        except (OSError, ValueError, AttributeError):
-            available_memory = None
+    def _disk_space_telemetry(
+        self,
+        *,
+        estimated_write_bytes: int = 0,
+    ) -> Dict[str, Any]:
+        status = self.resource_policy.status(
+            estimated_write_bytes=max(0, int(estimated_write_bytes))
+        )
+        free = max(0, int(status["diskFreeBytes"]))
+        total = max(free, int(status["diskTotalBytes"]))
+        reserve = max(0, int(status["diskReserveBytes"]))
+        projected = max(0, int(status["projectedDiskFreeBytes"]))
         return {
-            "diskFreeBytes": int(disk.free),
-            "availableMemoryBytes": available_memory,
+            "schemaVersion": 1,
+            "measuredAt": _iso_now(),
+            "diskTotalBytes": total,
+            "diskFreeBytes": free,
+            "mandatoryReserveBytes": reserve,
+            "selectedDatasetBytes": 0,
+            "modelBytes": 0,
+            "checkpointBytes": 0,
+            "maximumWorkingMemorySpillBytes": 0,
+            "futureGrowthBytes": 0,
+            "operationWriteBytes": max(0, int(estimated_write_bytes)),
+            "projectedRemainingBytes": projected,
+            "projectedAboveReserveBytes": max(0, projected - reserve),
+            "paused": bool(status["diskPressure"]),
+        }
+
+    def _training_resource_plan(self) -> Dict[str, Any]:
+        """Measure the RAM-first envelope for the next exhaustive update."""
+
+        parameters = {
+            id(parameter): parameter
+            for module in self._trainable_modules()
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        }
+        trainable_bytes = sum(
+            int(parameter.numel()) * int(parameter.element_size())
+            for parameter in parameters.values()
+        )
+        packed_update_scratch_bytes = 0
+        for root in self._trainable_modules():
+            for module in root.modules():
+                packed_tensors = getattr(
+                    module, "authoritative_packed_tensors", None
+                )
+                if not callable(packed_tensors):
+                    continue
+                weights = packed_tensors()
+                if not weights or weights[0].ndim != 2:
+                    continue
+                rows, packed_columns = weights[0].shape
+                # One row block is decoded/graded at a time. Four logical
+                # levels share each byte; 16 bytes per active level covers
+                # local float gradient, probability, draw, and code scratch.
+                # This is a maximum transient block, not a full FP32 mirror.
+                packed_update_scratch_bytes = max(
+                    packed_update_scratch_bytes,
+                    min(64, int(rows)) * int(packed_columns) * 4 * 16,
+                )
+        activation_multiplier = (
+            24 if self.config.gradient_checkpointing else 48
+        )
+        activation_bytes_per_token = max(
+            16 * 1024,
+            int(self.config.d_model)
+            * max(1, int(self.config.n_layers))
+            * activation_multiplier,
+        )
+        effective_batch_target = max(
+            1,
+            int(self.config.train_batch_size)
+            * int(self.config.gradient_accumulation),
+        )
+        auto_divisor_policy = self.config.training_resource_mode == "auto"
+        requested_physical_batch = (
+            min(4, effective_batch_target)
+            if auto_divisor_policy
+            else min(
+                int(self.config.train_batch_size),
+                int(self._runtime_train_batch_size),
+            )
+        )
+        plan = self.resource_policy.training_plan(
+            max_window_tokens=min(
+                int(self.config.max_seq_len),
+                int(self._runtime_training_max_seq_len),
+            ),
+            requested_batch_size=requested_physical_batch,
+            requested_gradient_accumulation=int(
+                self.config.gradient_accumulation
+            ),
+            effective_batch_target=(
+                effective_batch_target if auto_divisor_policy else None
+            ),
+            require_physical_batch_divisor=auto_divisor_policy,
+            trainable_parameter_bytes=trainable_bytes,
+            packed_update_scratch_bytes=packed_update_scratch_bytes,
+            activation_bytes_per_token=activation_bytes_per_token,
+            optimizer_state_resident=bool(self._optimizer.state)
+            and not self._optimizer_offloaded,
+            resource_mode=self.config.training_resource_mode,
+            manual_ram_budget_bytes=self.config.training_ram_budget_bytes,
+            manual_accelerator_budget_bytes=(
+                self.config.training_accelerator_budget_bytes
+            ),
+            manual_scratch_budget_bytes=(
+                self.config.training_scratch_budget_bytes
+            ),
+            storage_bytes_per_second=self.config.storage_bytes_per_second,
+            disk_state_offload=self.config.disk_state_offload,
+        )
+        # Live pressure may choose a smaller physical microbatch/window for
+        # this operation, but it must not become a monotonic process-lifetime
+        # context downgrade. The runtime ceilings change only after a real
+        # allocator refusal; a later plan can grow back toward the persisted
+        # configuration when other applications release memory.
+        plan["configuredContextTokens"] = int(self.config.max_seq_len)
+        plan["capacityPersistsAcrossPressure"] = True
+        plan["contextWindowShrunk"] = False
+        plan["autoPhysicalBatchDivisorPolicy"] = auto_divisor_policy
+        plan["autoPhysicalBatchCandidate"] = (
+            requested_physical_batch if auto_divisor_policy else None
+        )
+        return plan
+
+    def _streaming_neural_storage_plan(
+        self, source_bytes: int
+    ) -> Dict[str, Any]:
+        """Choose detailed versus statistical encoding from real headroom.
+
+        Exact per-row assemblies and their distributed vectors amplify source bytes
+        through metadata, activations, and packed ternary synapses. Large sources
+        currently use a shared semantic field with
+        local sparse synapse updates from their first record instead of filling memory
+        and switching representations halfway through an epoch. Small sources
+        are classified against the stable device envelope; a transient RAM
+        watermark defers their detailed schedule instead of silently changing
+        it to statistical-only. This is a resource-derived representation
+        choice, not a record/concept cap.
+        """
+
+        source_bytes = max(0, int(source_bytes))
+        status = self.resource_policy.status()
+        training_plan = self._training_resource_plan()
+        disk_headroom = max(
+            0,
+            int(status["diskFreeBytes"]) - int(status["diskReserveBytes"]),
+        )
+        available_memory = status.get("availableMemoryBytes")
+        ram_reserve = int(status["ramReserveBytes"])
+        ram_headroom = (
+            max(0, int(available_memory) - ram_reserve)
+            if isinstance(available_memory, int)
+            else disk_headroom
+        )
+        system_ram_budget = int(
+            status.get("systemRamBudgetBytes", 0) or 0
+        )
+        nominal_ram_capacity = (
+            system_ram_budget if system_ram_budget > 0 else ram_headroom
+        )
+        usable_headroom = min(disk_headroom, nominal_ram_capacity)
+        # The projection estimate deliberately errs high: compressed source
+        # text commonly expands into several semantic/synaptic structures and
+        # exact response codes. The 25% fraction preserves checkpoint and
+        # optimizer headroom inside the already-reserved safe region.
+        projected_detailed_bytes = source_bytes * max(
+            64, self.config.vsa_dim * 5
+        )
+        detailed_budget = max(1, usable_headroom // 4)
+        detailed = projected_detailed_bytes <= detailed_budget
+        detailed_admission = self.resource_policy.status(
+            estimated_write_bytes=projected_detailed_bytes * 2,
+            estimated_ram_bytes=projected_detailed_bytes,
+        )
+        detailed_deferred = bool(
+            detailed
+            and (
+                detailed_admission["diskPressure"]
+                or detailed_admission["memoryPressure"]
+            )
+        )
+        return {
+            "policy": "resource-derived-neural-representation",
+            "sourceBytes": source_bytes,
+            "projectedDetailedBytes": projected_detailed_bytes,
+            "detailedBudgetBytes": detailed_budget,
+            "nominalRamCapacityBytes": nominal_ram_capacity,
+            "diskHeadroomBytes": disk_headroom,
+            "ramHeadroomBytes": ram_headroom,
+            "detailedRecordAssemblies": detailed,
+            "detailedRepresentationPreferred": detailed,
+            "detailedRepresentationDeferred": detailed_deferred,
+            "representationDecision": (
+                "detailed-awaiting-resources"
+                if detailed_deferred
+                else (
+                    "detailed-admitted"
+                    if detailed
+                    else "statistical-source-scale"
+                )
+            ),
+            "representationDowngradedForTransientPressure": False,
+            "detailedAdmissionStatus": detailed_admission,
+            "corpusRepresentation": (
+                "detailed-distributed-assemblies"
+                if detailed
+                else "shared-semantic-field-and-local-synapses"
+            ),
+            "slowGradientMode": (
+                "per-experience"
+                if detailed
+                else "streaming-microbatch-gradient-accumulation"
+            ),
+            "physicalBatchRecords": int(training_plan["physicalBatchRecords"]),
+            "gradientAccumulation": int(training_plan["gradientAccumulation"]),
+            "trainingSequenceTokens": int(
+                training_plan["windowTokens"]
+            ),
+            "trainingResourcePlan": training_plan,
+            "localTypedTargetWindowPolicy": (
+                LOCAL_TYPED_TARGET_WINDOW_POLICY
+            ),
+            "recordCardinalityLimit": None,
+            "silentRecordSkipping": False,
+            "resourceStatus": status,
+        }
+
+    def _preview_chat_experience(
+        self,
+        text: str,
+        cue: torch.Tensor,
+        recalled: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Compute generation features without committing the candidate turn."""
+
+        labels = self.memory.extract_concepts(text)
+        if not labels:
+            labels = ["empty-experience"]
+        concept_ids = [
+            hashlib.sha256(
+                ("semantic:%s" % label).encode("utf-8")
+            ).hexdigest()[:24]
+            for label in labels
+        ]
+        fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        assembly_id = hashlib.sha256(
+            ("assembly:" + fingerprint).encode("ascii")
+        ).hexdigest()[:24]
+        nearest = max(
+            (float(item.get("score", 0.0)) for item in recalled),
+            default=-1.0,
+        )
+        novelty = max(0.0, min(1.0, 1.0 - max(0.0, nearest)))
+        with torch.no_grad():
+            idea = self._idea_model_vector(cue)
+            if self.config.liquid_dynamics:
+                _next_liquid_state, controls = self.liquid(
+                    idea,
+                    state=self.liquid_state.detach(),
+                    elapsed=1.0,
+                )
+            else:
+                controls = {
+                    "retention": torch.ones(1, device=self.device),
+                    "threshold_offset": torch.zeros(1, device=self.device),
+                    "noise_scale": torch.ones(1, device=self.device),
+                    "ponder_scale": torch.ones(1, device=self.device),
+                }
+            threshold = float(
+                controls["threshold_offset"].detach().mean().item()
+            )
+            if self.config.spiking_dynamics:
+                membrane = self.router.population.membrane.detach().clone()
+                spike_count = (
+                    self.router.population.spike_count.detach().clone()
+                )
+                try:
+                    routed, spike_metrics = self.router.route(
+                        idea,
+                        steps=max(
+                            2,
+                            int(
+                                round(
+                                    float(
+                                        controls["ponder_scale"].mean().item()
+                                    )
+                                )
+                            ),
+                        ),
+                        learn=False,
+                        threshold_offset=threshold,
+                    )
+                finally:
+                    self.router.population.membrane.copy_(membrane)
+                    self.router.population.spike_count.copy_(spike_count)
+            else:
+                routed = idea
+                spike_metrics = {
+                    "spike_rate": 0.0,
+                    "spikes": 0.0,
+                    "stdp_update": 0.0,
+                    "mean_stability": 0.0,
+                    "active_synapses": 0.0,
+                }
+        return {
+            "idea_id": assembly_id,
+            "assembly_id": assembly_id,
+            "concept_ids": concept_ids,
+            "neuron_ids": concept_ids,
+            "labels": labels,
+            "assemblies_created": 0,
+            "novelty": novelty,
+            "idea": routed.detach(),
+            "spiking": spike_metrics,
+            "liquid_controls": {
+                key: float(value.detach().mean().item())
+                for key, value in controls.items()
+            },
+            "training": {
+                "loss": 0.0,
+                "language_loss": 0.0,
+                "idea_loss": 0.0,
+                "stability_loss": 0.0,
+            },
+            "memory_settling": None,
+            "grew_expert": False,
+            "state_offload": None,
+            "preview": True,
         }
 
     def learn_experience(
@@ -3430,6 +9747,30 @@ class AdaptiveBrain:
         source_label: str = "",
         steps: Optional[int] = None,
         importance: float = 0.5,
+        structural_detail: bool = True,
+    ) -> Dict[str, Any]:
+        """Learn a whole experience through shared activity, synapses and cortex."""
+
+        return self._learn_experience_impl(
+            text,
+            kind=kind,
+            source=source,
+            source_label=source_label,
+            steps=steps,
+            importance=importance,
+            structural_detail=structural_detail,
+        )
+
+    def _learn_experience_impl(
+        self,
+        text: str,
+        *,
+        kind: str,
+        source: str,
+        source_label: str,
+        steps: Optional[int],
+        importance: float,
+        structural_detail: bool,
     ) -> Dict[str, Any]:
         now = time.time()
         elapsed = max(0.0, now - self.last_activity_decay)
@@ -3438,22 +9779,33 @@ class AdaptiveBrain:
             activity_decay = 1.0 - math.exp(
                 -math.log(2.0) * elapsed / max(half_life, 1.0)
             )
-            self.memory.decay(min(activity_decay, 0.25))
+            # Per-turn elapsed-time settling decays transient neuron activity.
+            # Synaptic forgetting remains global during explicit consolidation
+            # and local to causally active edges in organic memory settling.
+            self.memory.decay(min(activity_decay, 0.25), synapses=())
         self.last_activity_decay = now
         if self.config.vector_symbolic_memory:
-            retain = (
-                self.config.memory_recipe == "total-recall"
-                and self.config.retain_source_text
-            )
             try:
-                learned = self.memory.learn(
-                    text,
-                    kind=kind,
-                    source=source,
-                    source_label=source_label,
-                    retain_source_text=retain,
-                    importance=importance,
-                )
+                if structural_detail:
+                    learned = self.memory.learn(
+                        text,
+                        kind=kind,
+                        source=source,
+                        source_label=source_label,
+                        # Exact source bytes live only in the desktop's
+                        # content-addressed store. Neural assemblies retain a
+                        # fingerprint and learned state, never an inline copy.
+                        retain_source_text=False,
+                        importance=importance,
+                    )
+                else:
+                    learned = self.memory.learn_statistical(
+                        text,
+                        kind=kind,
+                        source=source,
+                        source_label=source_label,
+                        importance=importance,
+                    )
             except SubstrateResourcePause:
                 self.events.append(
                     "substrate-growth-paused",
@@ -3523,7 +9875,6 @@ class AdaptiveBrain:
                 "idea_loss": 0.0,
                 "stability_loss": 0.0,
             }
-        self._append_replay(routed, importance=importance)
         workspace_salience = max(
             0.0,
             min(
@@ -3533,11 +9884,36 @@ class AdaptiveBrain:
                 + 0.25 * float(spike_metrics["spike_rate"]),
             ),
         )
+        prediction_error = self._prediction_error_from_loss(
+            train_result.get("loss", 0.0)
+        )
+        self._append_replay(
+            routed,
+            importance=importance,
+            replay_priority=self._organic_replay_priority(
+                assembly_id=str(learned["idea_id"]),
+                salience=workspace_salience,
+                novelty=float(learned["novelty"]),
+                prediction_error=prediction_error,
+                spike_rate=float(spike_metrics["spike_rate"]),
+            ),
+            assembly_id=str(learned["idea_id"]),
+        )
         self._append_working_memory(
             routed,
             assembly_id=str(learned["idea_id"]),
             source=source,
             salience=workspace_salience,
+        )
+        memory_settling = self._settle_memory_automatically(
+            routed,
+            assembly_id=str(learned["idea_id"]),
+            source=source,
+            salience=workspace_salience,
+            novelty=float(learned["novelty"]),
+            prediction_error=prediction_error,
+            importance=importance,
+            spike_rate=float(spike_metrics["spike_rate"]),
         )
         # Expert allocation changes decoder topology and therefore belongs to
         # the same slow-mutation transaction as gradient learning. Fast-only
@@ -3552,7 +9928,8 @@ class AdaptiveBrain:
         self.counters["plasticity_events"] = int(
             self.router.synapses.plasticity_events.item()
         )
-        return {
+        offload = self._maintain_neural_state_resources()
+        result = {
             "idea_id": learned["idea_id"],
             "assembly_id": learned.get("assembly_id", learned["idea_id"]),
             "concept_ids": learned["concept_ids"],
@@ -3567,8 +9944,11 @@ class AdaptiveBrain:
                 for key, value in controls.items()
             },
             "training": train_result,
+            "memory_settling": memory_settling,
             "grew_expert": grew,
+            "state_offload": offload,
         }
+        return result
 
     def _latent_rehearsal_step(
         self, substrate_vector: torch.Tensor, seed: int
@@ -3579,7 +9959,17 @@ class AdaptiveBrain:
         self.memory_bridge.train()
         self.idea_adapter.train()
         self.liquid.train()
+        self._ensure_optimizer_resident()
         self._optimizer.zero_grad(set_to_none=True)
+        learning_parameters = tuple(
+            parameter
+            for module in (
+                self.memory_bridge,
+                self.idea_adapter,
+                self.liquid,
+            )
+            for parameter in module.parameters()
+        )
         devices = [self.device] if self.device.type == "cuda" else []
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(int(seed))
@@ -3593,7 +9983,9 @@ class AdaptiveBrain:
             )
             reconstruction_loss = F.mse_loss(reconstructed, idea.detach())
             temporal_loss = F.mse_loss(temporal, idea.detach())
-            stability_loss = self._stability_penalty()
+            stability_loss = self._stability_penalty(
+                learning_parameters
+            )
             loss = (
                 reconstruction_loss
                 + 0.15 * temporal_loss
@@ -3603,19 +9995,16 @@ class AdaptiveBrain:
             raise RuntimeError("non-finite idle rehearsal loss")
         loss.backward()
         parameters = [
-            parameter
-            for module in (
-                self.memory_bridge,
-                self.idea_adapter,
-                self.liquid,
-            )
-            for parameter in module.parameters()
+            parameter for parameter in learning_parameters
             if parameter.grad is not None
         ]
         torch.nn.utils.clip_grad_norm_(parameters, self.config.grad_clip)
         self._accumulate_slow_importance(parameters)
         self._optimizer.step()
-        self._commit_slow_anchors(rate=0.03)
+        self._maintain_neural_state_resources()
+        self._commit_slow_anchors(
+            rate=0.03, parameters=learning_parameters
+        )
         self.counters["training_steps"] += 1
         return {
             "loss": float(loss.detach().item()),
@@ -3680,10 +10069,11 @@ class AdaptiveBrain:
                     0.0,
                     min(
                         1.0,
-                        float(node.get("activation", 0.0))
+                        self.memory.effective_activation(node)
                         + sign * 0.03,
                     ),
                 )
+                self.memory.mark_attention_neuron(assembly_id)
         self._append_working_memory(
             idea,
             assembly_id=(
@@ -3739,13 +10129,6 @@ class AdaptiveBrain:
         since_activity = now - max(
             self.last_activity_decay, self.last_idle_cycle_at
         )
-        if not self.config.idle_cognition:
-            return {
-                "brainId": self.brain_id,
-                "ran": False,
-                "reason": "idle-cognition-disabled",
-                "actions": [],
-            }
         if since_activity < minimum_idle_seconds:
             return {
                 "brainId": self.brain_id,
@@ -3774,10 +10157,10 @@ class AdaptiveBrain:
         ranked = sorted(
             available_assemblies,
             key=lambda assembly: (
-                float(
+                self.memory.effective_activation(
                     self.memory.neurons.get(
                         str(assembly.get("id", "")), {}
-                    ).get("activation", 0.0)
+                    )
                 )
                 * 0.35
                 + float(assembly.get("importance", 0.0)) * 0.30
@@ -3856,29 +10239,89 @@ class AdaptiveBrain:
             source="idle",
             salience=max(0.2, compute_demand),
         )
-        self._append_replay(routed, importance=max(0.4, compute_demand))
+        self._append_replay(
+            routed,
+            importance=max(0.4, compute_demand),
+            replay_priority=self._organic_replay_priority(
+                assembly_id=str(active[0]["id"]),
+                salience=max(0.2, compute_demand),
+                novelty=float(organic["novelty"]),
+                prediction_error=float(
+                    organic.get("predictionError", organic.get("uncertainty", 0.0))
+                ),
+                spike_rate=float(spike_metrics["spike_rate"]),
+            ),
+            assembly_id=str(active[0]["id"]),
+        )
+        memory_settling = self._settle_memory_automatically(
+            routed,
+            assembly_id=str(active[0]["id"]),
+            source="rest",
+            salience=max(0.2, compute_demand),
+            novelty=float(organic["novelty"]),
+            prediction_error=float(
+                organic.get("predictionError", organic.get("uncertainty", 0.0))
+            ),
+            importance=float(active[0].get("importance", 0.5)),
+            spike_rate=float(spike_metrics["spike_rate"]),
+            resting=True,
+        )
         normalized_tools = self._normalize_tool_schemas(tool_schemas)
-        focus_labels = [
-            str(
-                self.memory.neurons.get(str(assembly["id"]), {}).get(
-                    "label", assembly.get("kind", "assembly")
-                )
-            )
-            for assembly in active[:8]
-        ]
         action_state = {
             **organic,
             "computeDemand": compute_demand,
             "ponderScale": ponder_scale,
+            # This is typed internal state, not prompt text.  It distinguishes
+            # an actual idle wake cycle from a human turn whose text happens
+            # to be empty or from backend-generated focus labels.
+            "promptFree": 1.0,
         }
         with torch.no_grad():
+            # The bundled internal-action trajectories are calibrated on the
+            # assembly/model channel.  The spiking router is intentionally
+            # plastic and stateful, so feeding its post-spike output into the
+            # same classifier creates an out-of-distribution feature shift
+            # after ordinary learning (observed as a near-certain idle
+            # Ponder).  Keep routed activity responsible for recurrent memory
+            # and STDP, while selecting typed actions from the feature channel
+            # on which the head was actually trained.
             action_scores, actions = self._select_structured_actions(
-                self.decoder.internal_action_policy(routed),
+                self.decoder.internal_action_policy(model_idea),
                 schemas=normalized_tools,
-                input_text="neural focus: " + "; ".join(focus_labels),
+                input_text="",
+                neural_state=model_idea,
                 assembly_ids=[str(assembly["id"]) for assembly in active],
                 organic_state=action_state,
             )
+            # This method has already performed the prompt-free recurrent,
+            # liquid, spiking, rehearsal, and plasticity pass. Returning a
+            # Ponder proposal would make the desktop invoke idle_cycle(0) again,
+            # producing a redundant post-idle loop and a misleading visible
+            # action card. Keep the neural choice in the trace while treating it
+            # as completed internal cognition. Human-turn Ponder proposals still
+            # trigger the dedicated pre-speech recurrent path in chat().
+            internally_settled_actions = [
+                action
+                for action in actions
+                if str(action.get("kind", "")) == "ponder"
+            ]
+            actions = [
+                action
+                for action in actions
+                if str(action.get("kind", "")) != "ponder"
+            ]
+            visible_action_refractory_seconds = max(
+                45.0,
+                minimum_idle_seconds * 4.0,
+            )
+            visible_action_ready = (
+                now - self.last_idle_visible_action_at
+                >= visible_action_refractory_seconds
+            )
+            if actions and not visible_action_ready:
+                # Keep the measured recurrent/STDP/rehearsal work below, but
+                # suppress repeated unsolicited UI/tool/message activity.
+                actions = []
             # ``talk`` during an idle cycle is generated directly from active
             # neural state. The two decoder input symbols are only the
             # language-boundary markers; there is no human text, behavioral
@@ -3889,6 +10332,7 @@ class AdaptiveBrain:
                 and max(action_scores, key=action_scores.get) == "talk"
                 and talk_confidence >= ACTION_PROPOSAL_CONFIDENCE
                 and compute_demand >= 0.35
+                and visible_action_ready
             ):
                 boundary = torch.tensor(
                     [[self.tokenizer.bos_id, self.tokenizer.brain_id]],
@@ -3945,9 +10389,12 @@ class AdaptiveBrain:
                             "content": message,
                             "created_at": _iso_now(),
                             "organic": True,
+                            "attention_epoch": self._attention_epoch(),
                         }
                     )
                     self._append_recent_dialogue("", message)
+            if actions:
+                self.last_idle_visible_action_at = now
         mode = (
             "ponder"
             if organic["tension"] >= max(0.5, organic["curiosity"])
@@ -3966,6 +10413,7 @@ class AdaptiveBrain:
         trace = {
             "id": uuid.uuid4().hex,
             "createdAt": _iso_now(),
+            "attentionEpoch": self._attention_epoch(),
             "mode": mode,
             "seed": seed,
             "promptTokenCount": 0,
@@ -3981,12 +10429,18 @@ class AdaptiveBrain:
             "stdpUpdate": float(spike_metrics["stdp_update"]),
             "spikeRate": float(spike_metrics["spike_rate"]),
             "rehearsal": rehearsal,
+            "memorySettling": memory_settling,
             "parameterChecksumBefore": parameter_before,
             "parameterChecksumAfter": parameter_after,
             "parameterDeltaNorm": parameter_delta,
+            "actionPolicyFeatureChannel": "assembly-model",
             "actionPolicyScores": action_scores,
             "proposedActionKinds": [
                 str(action.get("kind", "")) for action in actions
+            ],
+            "internallySettledActionKinds": [
+                str(action.get("kind", ""))
+                for action in internally_settled_actions
             ],
             "note": (
                 "Measured prompt-free recurrent activity; not a hidden "
@@ -4008,14 +10462,40 @@ class AdaptiveBrain:
     def _normalize_tool_schemas(
         schemas: Optional[Sequence[Mapping[str, Any]]],
     ) -> List[Dict[str, Any]]:
-        """Keep only bounded structural tool identifiers and action names."""
+        """Keep structural tool identifiers and action names without a count ceiling."""
 
         if schemas is None:
             return []
         if not isinstance(schemas, (list, tuple)):
             raise ValueError("tool schemas must be a list")
-        if len(schemas) > 100:
-            raise ValueError("at most 100 tool schemas may be active")
+
+        def structural_input_schema(raw: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(raw, Mapping):
+                return None
+            raw_properties = raw.get("properties", {})
+            clean_properties: Dict[str, Dict[str, str]] = {}
+            if isinstance(raw_properties, Mapping):
+                for raw_name, raw_spec in raw_properties.items():
+                    name = str(raw_name).strip()
+                    if not name or len(name) > 128:
+                        continue
+                    spec = raw_spec if isinstance(raw_spec, Mapping) else {}
+                    value_type = str(spec.get("type", "unknown")).strip().lower()
+                    if value_type not in {
+                        "string", "number", "integer", "boolean",
+                        "array", "object", "null", "unknown",
+                    }:
+                        value_type = "unknown"
+                    clean_properties[name] = {"type": value_type}
+            raw_required = raw.get("required", [])
+            required = []
+            if isinstance(raw_required, (list, tuple)):
+                required = [str(value) for value in raw_required if str(value) in clean_properties]
+            return {
+                "type": "object", "properties": clean_properties,
+                "required": sorted(set(required)),
+            }
+
         normalized: Dict[str, Dict[str, Any]] = {}
         for schema in schemas:
             if not isinstance(schema, Mapping):
@@ -4029,8 +10509,6 @@ class AdaptiveBrain:
                 raise ValueError("tool schema id exceeds 128 characters")
             if not isinstance(actions, (list, tuple)):
                 raise ValueError("tool schema actions must be a list")
-            if len(actions) > 32:
-                raise ValueError("a tool schema may expose at most 32 actions")
             clean_actions = []
             for action in actions:
                 if not isinstance(action, str) or not action.strip():
@@ -4042,6 +10520,17 @@ class AdaptiveBrain:
             grant = (
                 str(schema.get("grant", "ask")).strip().lower()[:32] or "ask"
             )
+            # MCP descriptions are deliberately ignored. Preserve only the
+            # structural JSON-schema field names, primitive types, and required
+            # set so this channel cannot become behavioral prompt prose.
+            clean_input_schema = structural_input_schema(schema.get("inputSchema"))
+            clean_action_schemas: Dict[str, Dict[str, Any]] = {}
+            raw_action_schemas = schema.get("actionInputSchemas")
+            if not tool_id.startswith("mcp.") and isinstance(raw_action_schemas, Mapping):
+                for action in clean_actions:
+                    action_schema = structural_input_schema(raw_action_schemas.get(action))
+                    if action_schema is not None:
+                        clean_action_schemas[action] = action_schema
             # Electron already excludes Off tools. Enforce the same boundary
             # in the worker so direct JSON-RPC callers cannot make an Off
             # capability participate in neural routing.
@@ -4053,7 +10542,55 @@ class AdaptiveBrain:
             existing["actions"] = sorted(
                 set(existing["actions"]).union(clean_actions)
             )
+            if clean_input_schema:
+                existing["inputSchema"] = clean_input_schema
+            if not tool_id.startswith("mcp.") and isinstance(raw_action_schemas, Mapping):
+                # Keep an empty map meaningful: a missing action schema must
+                # fail closed, not fall back to another action's requirements.
+                existing.setdefault("actionInputSchemas", {}).update(clean_action_schemas)
         return [normalized[key] for key in sorted(normalized)]
+
+    @staticmethod
+    def _tool_action_input_schema(
+        schema: Mapping[str, Any], action: str,
+    ) -> Optional[Mapping[str, Any]]:
+        """Resolve the selected built-in action or MCP's single input schema."""
+        action_schemas = schema.get("actionInputSchemas")
+        if not str(schema.get("id", "")).startswith("mcp.") and isinstance(action_schemas, Mapping):
+            selected = action_schemas.get(action)
+        else:
+            selected = schema.get("inputSchema")
+        return selected if isinstance(selected, Mapping) else None
+
+    @staticmethod
+    def _browser_operation_schema() -> Dict[str, Any]:
+        """A structural, checkpointed argument target for one browser choice.
+
+        The operation label is learned from a confirmed host outcome. Selectors,
+        typed text, and URLs never enter this operation-kind target.
+        """
+
+        return {
+            "id": "browser.operation",
+            "actions": ["select"],
+            "grant": "ask",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"operation": {"type": "string"}},
+                "required": ["operation"],
+            },
+        }
+
+    @staticmethod
+    def _browser_operation_kind(arguments: Mapping[str, Any]) -> Optional[str]:
+        steps = arguments.get("steps", [])
+        if not isinstance(steps, list) or len(steps) > 1:
+            return None
+        if not steps:
+            return "none"
+        if not AdaptiveBrain._valid_explicit_browser_steps(steps):
+            return None
+        return str(steps[0]["kind"])
 
     def _tool_schema_vector(
         self, schemas: Sequence[Mapping[str, Any]]
@@ -4081,6 +10618,27 @@ class AdaptiveBrain:
                         ),
                     )
                 )
+            input_schema = schema.get("inputSchema", {})
+            properties = (
+                input_schema.get("properties", {})
+                if isinstance(input_schema, Mapping)
+                else {}
+            )
+            if isinstance(properties, Mapping):
+                for name, spec in properties.items():
+                    value_type = (
+                        str(spec.get("type", "unknown"))
+                        if isinstance(spec, Mapping)
+                        else "unknown"
+                    )
+                    parts.append(
+                        self.memory.space.bind(
+                            identity,
+                            self.memory.space.symbol(
+                                "tool-field:%s:%s" % (str(name), value_type)
+                            ),
+                        )
+                    )
             vectors.append(self.memory.space.bundle(parts))
         if not vectors:
             return None
@@ -4188,27 +10746,39 @@ class AdaptiveBrain:
         return None
 
     @classmethod
-    def _explicit_powershell_arguments(
+    def _explicit_shell_arguments(
         cls, text: str
     ) -> Optional[Dict[str, str]]:
         """Read a user-delimited command and working directory verbatim.
 
-        A PowerShell proposal is intentionally impossible from vague prose.
+        A native-shell proposal is intentionally impossible from vague prose.
         Both the command and an absolute, explicitly labelled cwd must occur
-        in the user's current message; generated text is never consulted.
+        in the user's current message; generated text is never consulted and
+        the host dialect is selected only by the desktop execution adapter.
         """
 
-        if not re.search(r"\b(?:powershell|pwsh)\b", text, re.IGNORECASE):
+        shell_name = (
+            r"(?:system\s+shell|native\s+shell|shell|terminal|powershell|pwsh)"
+            if os.name == "nt"
+            else r"(?:system\s+shell|native\s+shell|shell|terminal|bash|zsh|sh)"
+        )
+        fence_name = (
+            r"(?:powershell|pwsh|shell)?"
+            if os.name == "nt"
+            else r"(?:bash|zsh|sh|shell)?"
+        )
+        if not re.search(r"\b%s\b" % shell_name, text, re.IGNORECASE):
             return None
         fenced = re.search(
-            r"\b(?:powershell|pwsh)(?:\s+command)?\s*(?:is\s*)?[:=]?\s*"
-            r"```(?:powershell|pwsh)?\s*\n(?P<command>[\s\S]*?)```",
+            r"\b%s(?:\s+command)?\s*(?:is\s*)?[:=]?\s*" % shell_name
+            + r"```" + fence_name + r"\s*\n"
+            r"(?P<command>[\s\S]*?)```",
             text,
             re.IGNORECASE,
         )
         quoted = re.search(
-            r"\b(?:run|execute)\s+(?:this\s+)?(?:powershell|pwsh)"
-            r"(?:\s+command)?\s*(?:is\s*)?[:=]?\s*"
+            r"\b(?:run|execute)\s+(?:this\s+)?" + shell_name
+            + r"(?:\s+command)?\s*(?:is\s*)?[:=]?\s*"
             r"(?P<quote>[\"'`])(?P<command>[\s\S]*?)(?P=quote)",
             text,
             re.IGNORECASE,
@@ -4241,123 +10811,90 @@ class AdaptiveBrain:
             return None
         return {"command": command, "cwd": cwd_paths[0]}
 
+    def _neural_browser_operation(
+        self, neural_state: torch.Tensor,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Select one operation with checkpointed weights, not prose rules."""
+
+        head = getattr(self.decoder, "action_argument_head", None)
+        if head is None or not hasattr(head, "grounded_for"):
+            return None, {"reason": "missing-argument-head"}
+        if (
+            head.grounded_for("browser.operation", "select") < 1
+            or head.grounded_for("browser.operation", "select:none") < 1
+        ):
+            return None, {"reason": "untrained-browser-no-operation-boundary"}
+        schema = self._browser_operation_schema()
+        features = head.schema_features("browser.operation", "select", schema)
+        if features is None:
+            return None, {"reason": "missing-browser-operation-schema"}
+        decoded = head.decode(
+            neural_state,
+            features[None].to(neural_state.device),
+            tool_id="browser.operation", action="select",
+            max_output_bytes=64,
+        )
+        if (
+            decoded.get("reason") != "learned-typed-arguments"
+            or not isinstance(decoded.get("meanTokenProbability"), (int, float))
+            or isinstance(decoded["meanTokenProbability"], bool)
+            or not math.isfinite(float(decoded["meanTokenProbability"]))
+            or float(decoded["meanTokenProbability"]) < 0.85
+        ):
+            return None, {
+                "reason": "uncertain-browser-operation",
+                "decoder": {key: value for key, value in decoded.items() if key != "arguments"},
+            }
+        arguments = decoded.get("arguments")
+        operation = arguments.get("operation") if isinstance(arguments, Mapping) else None
+        if (
+            not isinstance(operation, str)
+            or operation not in {
+                "none", "navigate", "click", "type", "press",
+                "wait", "extract", "screenshot",
+            }
+            or set(arguments) != {"operation"}
+            or head.grounded_for("browser.operation", "select:" + operation) < 1
+        ):
+            return None, {
+                "reason": "ungrounded-or-invalid-browser-operation",
+                "decoder": {key: value for key, value in decoded.items() if key != "arguments"},
+            }
+        return operation, {
+            "reason": "grounded-neural-browser-operation",
+            "decoder": {key: value for key, value in decoded.items() if key != "arguments"},
+        }
+
     @staticmethod
-    def _explicit_browser_steps(
-        text: str,
-        initial_url: str,
-    ) -> List[Dict[str, Any]]:
-        """Encode only literal browser steps present in the user's message."""
+    def _literal_browser_operand(
+        text: str, operation: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Copy only explicit operands after the neural operation is fixed."""
 
-        positioned: List[Tuple[int, Dict[str, Any]]] = []
-
-        def quoted_value(match: re.Match[str], name: str) -> Optional[str]:
-            value = match.group(name).replace("\x00", "").strip()
-            if not value or "\r" in value or "\n" in value:
-                return None
-            return value
-
-        for match in re.finditer(
-            r"\bnavigate\s+(?:to\s+)?(?P<url>https://[^\s<>\"'`]+)",
-            text,
-            re.IGNORECASE,
-        ):
-            url = match.group("url").rstrip(".,;!?)]}")
-            if url != initial_url and url in AdaptiveBrain._explicit_https_urls(url):
-                positioned.append((match.start(), {"kind": "navigate", "url": url}))
-
-        for match in re.finditer(
-            r"\bclick(?:\s+on)?\s+(?P<quote>[\"'`])"
-            r"(?P<selector>.*?)(?P=quote)",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            selector = quoted_value(match, "selector")
-            if selector and len(selector) <= 2_000:
-                positioned.append(
-                    (match.start(), {"kind": "click", "selector": selector})
-                )
-
-        for match in re.finditer(
-            r"\btype\s+(?P<value_quote>[\"'`])(?P<value>.*?)"
-            r"(?P=value_quote)\s+(?:into|in)\s+"
-            r"(?P<selector_quote>[\"'`])(?P<selector>.*?)"
-            r"(?P=selector_quote)",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            value = quoted_value(match, "value")
-            selector = quoted_value(match, "selector")
-            if value and selector and len(value) <= 100_000 and len(selector) <= 2_000:
-                positioned.append(
-                    (
-                        match.start(),
-                        {
-                            "kind": "type",
-                            "selector": selector,
-                            "value": value,
-                            "clear": True,
-                        },
-                    )
-                )
-
-        for match in re.finditer(
-            r"\bpress\s+(?:(?P<quote>[\"'`])(?P<quoted_key>.*?)"
-            r"(?P=quote)|(?P<plain_key>[A-Za-z0-9_+.-]{1,32}))",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            key = (
-                match.group("quoted_key")
-                if match.group("quoted_key") is not None
-                else match.group("plain_key")
+        if operation == "screenshot":
+            return {"kind": operation}
+        if operation not in {"click", "press", "wait", "extract"}:
+            # Typing, navigation, and complex steps require explicit JSON.
+            return None
+        quoted = [
+            match.group("value")
+            for match in re.finditer(
+                r"(?<![A-Za-z0-9])(?P<quote>[\"'`])(?P<value>.*?)(?P=quote)",
+                text, re.DOTALL,
             )
-            key = key.replace("\x00", "").strip()
-            if key and "\r" not in key and "\n" not in key and len(key) <= 64:
-                positioned.append((match.start(), {"kind": "press", "key": key}))
-
-        for match in re.finditer(
-            r"\bwait\s+(?:for\s+)?(?P<quote>[\"'`])"
-            r"(?P<selector>.*?)(?P=quote)",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            selector = quoted_value(match, "selector")
-            if selector and len(selector) <= 2_000:
-                positioned.append(
-                    (match.start(), {"kind": "wait", "selector": selector})
-                )
-        for match in re.finditer(
-            r"\bwait\s+(?P<milliseconds>\d{1,8})\s*(?:ms|milliseconds?)\b",
-            text,
-            re.IGNORECASE,
-        ):
-            milliseconds = int(match.group("milliseconds"))
-            if 0 < milliseconds <= 30_000:
-                positioned.append(
-                    (match.start(), {"kind": "wait", "milliseconds": milliseconds})
-                )
-
-        for match in re.finditer(
-            r"\bextract(?:\s+(?:text|links|data))?(?:\s+from)?\s+"
-            r"(?P<quote>[\"'`])(?P<selector>.*?)(?P=quote)",
-            text,
-            re.IGNORECASE | re.DOTALL,
-        ):
-            selector = quoted_value(match, "selector")
-            if selector and len(selector) <= 2_000:
-                positioned.append(
-                    (match.start(), {"kind": "extract", "selector": selector})
-                )
-
-        for match in re.finditer(
-            r"\b(?:take\s+(?:a\s+)?)?screenshot\b",
-            text,
-            re.IGNORECASE,
-        ):
-            positioned.append((match.start(), {"kind": "screenshot"}))
-
-        positioned.sort(key=lambda item: item[0])
-        return [step for _position, step in positioned[:200]]
+            if match.group("value").strip()
+            and "\r" not in match.group("value")
+            and "\n" not in match.group("value")
+            and not match.group("value").startswith("https://")
+        ]
+        if len(quoted) != 1:
+            return None
+        value = quoted[0]
+        key = "key" if operation == "press" else "selector"
+        limit = 64 if key == "key" else 2_000
+        if "\x00" in value or len(value) > limit:
+            return None
+        return {"kind": operation, key: value}
 
     def _materialize_generic_tool_action(
         self,
@@ -4365,209 +10902,530 @@ class AdaptiveBrain:
         schemas: Sequence[Mapping[str, Any]],
         input_text: str,
         assembly_ids: Sequence[str],
+        organic_state: Mapping[str, float],
+        neural_state: Optional[torch.Tensor] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Select one enabled standard tool and build validated typed inputs.
+        """Select the trained neural route, then copy only explicit values.
 
-        The learned action head has already selected the external ``tool``
-        channel. This second stage ranks only enabled schema/action pairs using
-        explicit argument evidence plus VSA similarity to the current turn and
-        active assemblies. It never reads generated response prose.
+        The utterance is never fed to a text-route classifier here. It is
+        consulted only after a neural winner to materialize that one schema.
+        """
+        # An idle cycle has no user utterance to supply literal arguments.
+        # Never manufacture a tool request from diagnostic assembly labels.
+        if not input_text.strip():
+            self._last_tool_route_evidence = {
+                "kind": "trained-internal-schema-route",
+                "selected": None,
+                "reason": "no-explicit-action-arguments",
+            }
+            return None
+        if not isinstance(neural_state, torch.Tensor) or neural_state.ndim != 2:
+            self._last_tool_route_evidence = {
+                "kind": "trained-internal-schema-route",
+                "selected": None,
+                "reason": "missing-active-neural-state",
+            }
+            return None
+        head = getattr(self.decoder, "tool_route_head", None)
+        evidence = (
+            head.select_internal(neural_state, schemas) if head is not None else
+            {"kind": "trained-internal-schema-route", "trainingSteps": 0,
+             "selected": None, "reason": "missing-internal-route-head"}
+        )
+        self._last_tool_route_evidence = evidence
+        selected = evidence["selected"]
+        if selected is None:
+            return None
+        schema = next(
+            (
+                value for value in schemas
+                if value.get("id") == selected["toolId"]
+                and selected["action"] in value.get("actions", ())
+                and value.get("grant") != "off"
+            ),
+            None,
+        )
+        if schema is None:
+            evidence["materialization"] = "route-not-enabled"
+            return None
+        arguments = self._literal_tool_route_arguments(
+            selected["toolId"], selected["action"], input_text, schema
+        )
+        if arguments is None:
+            evidence["materialization"] = "missing-explicit-arguments"
+            return None
+        neural_browser_step = False
+        if selected["toolId"] == "browser.automation" and "steps" not in arguments:
+            operation, operation_evidence = self._neural_browser_operation(neural_state)
+            evidence["browserOperationEvidence"] = operation_evidence
+            if operation not in {None, "none"}:
+                step = self._literal_browser_operand(input_text, operation)
+                if step is not None:
+                    arguments["steps"] = [step]
+                    neural_browser_step = True
+        candidate = {**selected, "arguments": arguments, "routeEvidence": evidence}
+        if not self._materialized_tool_action_matches_schema(schemas, candidate):
+            evidence["materialization"] = "schema-rejected"
+            return None
+        evidence["materialization"] = (
+            "grounded-neural-browser-operation-literal-operands-schema-validated"
+            if neural_browser_step else "literal-arguments-schema-validated"
+        )
+        return candidate
+
+    def _materialize_internal_action(
+        self,
+        *,
+        schemas: Sequence[Mapping[str, Any]],
+        neural_state: Optional[torch.Tensor],
+        tool_id: Optional[str] = None,
+        action: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Decode one typed idle action from weights and active neural state.
+
+        No diagnostic labels, source passages, fabricated utterances, or
+        textual schema descriptions participate. The trained route head is
+        needed for generic tools; a selected agent/evolution kind fixes only
+        its structural protocol, never its objective text.
         """
 
-        enabled = {
-            str(schema.get("id", "")): {
-                str(action) for action in schema.get("actions", [])
+        if neural_state is None or neural_state.ndim != 2:
+            self._last_tool_route_evidence = {
+                "kind": "trained-internal-schema-route",
+                "selected": None,
+                "reason": "missing-active-neural-state",
             }
-            for schema in schemas
-            if str(schema.get("grant", "ask")).strip().lower() != "off"
-        }
-        lowered = input_text.lower()
-        paths = self._explicit_absolute_paths(input_text)
-        urls = self._explicit_https_urls(input_text)
-        candidates: List[
-            Tuple[float, str, str, Dict[str, Any], str]
-        ] = []
-
-        def add(
-            score: float,
-            tool_id: str,
-            action: str,
-            arguments: Dict[str, Any],
-            prototype: str,
-        ) -> None:
-            if action not in enabled.get(tool_id, set()):
-                return
-            candidates.append(
-                (float(score), tool_id, action, arguments, prototype)
-            )
-
-        run_intent = bool(
-            re.search(r"\b(?:run|execute|launch|test)\b", lowered)
-        )
-        write_intent = bool(
-            re.search(r"\b(?:write|save|replace|overwrite|update)\b", lowered)
-        )
-        read_intent = bool(
-            re.search(r"\b(?:read|inspect|view|show|display)\b", lowered)
-        )
-        list_intent = bool(
-            re.search(
-                r"\b(?:list|enumerate|folder|directory|files|contents)\b",
-                lowered,
-            )
-        )
-        powershell_arguments = self._explicit_powershell_arguments(input_text)
-        if powershell_arguments is not None:
-            add(
-                8.0,
-                "windows.powershell",
-                "run",
-                powershell_arguments,
-                "run execute powershell command in explicit working directory",
-            )
-        if len(paths) == 1:
-            path = paths[0]
-            extension = Path(path.replace("\\", "/")).suffix.lower()
-            languages = {
-                ".py": "python",
-                ".js": "javascript",
-                ".mjs": "javascript",
-                ".cjs": "javascript",
-                ".ps1": "powershell",
-            }
-            if run_intent and extension in languages:
-                add(
-                    6.0,
-                    "code.execute",
-                    "run",
-                    {
-                        "language": languages[extension],
-                        "entryPath": path,
-                    },
-                    "run execute code program script file",
-                )
-            if write_intent:
-                content = self._explicit_write_content(input_text, paths)
-                if content is not None:
-                    add(
-                        6.5,
-                        "windows.files",
-                        "write",
-                        {"path": path, "content": content},
-                        "write save replace file content",
-                    )
-            if list_intent and not run_intent and not write_intent:
-                add(
-                    5.0,
-                    "windows.files",
-                    "list",
-                    {"path": path},
-                    "list enumerate folder directory files contents",
-                )
-            if read_intent and not run_intent and not write_intent:
-                add(
-                    4.8,
-                    "windows.files",
-                    "read",
-                    {"path": path},
-                    "read inspect view show file contents",
-                )
-
-        search_match = re.search(
-            r"\b(?:search|research|look\s+up|find)\b"
-            r"(?:\s+(?:the\s+)?(?:web|internet|online))?"
-            r"(?:\s+(?:for|about|on))?\s+(?P<query>.+)",
-            input_text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if search_match is not None:
-            query = search_match.group("query").replace("\x00", "").strip()
-            query = re.sub(r"\s+(?:please|thanks?)\s*$", "", query, flags=re.I)
-            if query and not self._explicit_absolute_paths(query):
-                add(
-                    5.2,
-                    "web.search",
-                    "search",
-                    {"query": query[:4_000]},
-                    "search research find web internet information",
-                )
-
-        if len(urls) == 1:
-            url = urls[0]
-            fetch_intent = bool(
-                re.search(
-                    r"\b(?:fetch|download|get|retrieve|inspect|read|summarize)\b",
-                    lowered,
-                )
-            )
-            browser_intent = bool(
-                re.search(
-                    r"\b(?:browse|browser|open|visit|navigate|page|website)\b",
-                    lowered,
-                )
-            )
-            add(
-                5.8 if fetch_intent else 2.6,
-                "web.fetch",
-                "fetch",
-                {"url": url},
-                "fetch retrieve download read web url",
-            )
-            browser_action = (
-                "task"
-                if "task" in enabled.get("browser.automation", set())
-                else "open"
-            )
-            browser_steps = self._explicit_browser_steps(input_text, url)
-            browser_arguments: Dict[str, Any] = {"url": url}
-            if browser_steps:
-                browser_arguments["steps"] = browser_steps
-            add(
-                7.2 if browser_steps else (5.9 if browser_intent else 2.5),
-                "browser.automation",
-                browser_action,
-                browser_arguments,
-                "open visit browse navigate website page url",
-            )
-
-        if not candidates:
             return None
-
-        input_vector = self.memory.vector_for_text(input_text)
-        active_vectors = [
-            self.memory.assembly_vectors[assembly_id]
-            for assembly_id in assembly_ids
-            if assembly_id in self.memory.assembly_vectors
-        ]
-        active_vector = (
-            self.memory.space.bundle(active_vectors)
-            if active_vectors
-            else None
+        route_head = getattr(self.decoder, "tool_route_head", None)
+        argument_head = getattr(self.decoder, "action_argument_head", None)
+        if argument_head is None:
+            return None
+        if tool_id is None or action is None:
+            route_evidence = (
+                route_head.select_internal(neural_state, schemas)
+                if route_head is not None
+                else {"selected": None, "reason": "missing-internal-route-head"}
+            )
+            selected = route_evidence.get("selected")
+            if not isinstance(selected, Mapping):
+                self._last_tool_route_evidence = route_evidence
+                return None
+            tool_id = str(selected.get("toolId", ""))
+            action = str(selected.get("action", ""))
+        else:
+            route_evidence = {
+                "kind": "learned-action-kind-protocol",
+                "selected": {"toolId": tool_id, "action": action},
+                "hiddenPrompt": False,
+            }
+        schema = next(
+            (
+                value for value in schemas
+                if value.get("id") == tool_id
+                and action in value.get("actions", ())
+                and str(value.get("grant", "ask")).lower() != "off"
+            ),
+            None,
         )
-        ranked: List[
-            Tuple[float, str, str, Dict[str, Any]]
-        ] = []
-        for evidence, tool_id, action, arguments, prototype in candidates:
-            prototype_vector = self.memory.vector_for_text(prototype)
-            neural_score = 0.22 * self.memory.space.similarity(
-                input_vector, prototype_vector
+        if schema is None:
+            self._last_tool_route_evidence = {
+                **route_evidence, "materialization": "route-not-enabled"
+            }
+            return None
+        browser_operation: Optional[str] = None
+        if tool_id == "browser.automation":
+            browser_operation, operation_evidence = self._neural_browser_operation(
+                neural_state
             )
-            if active_vector is not None:
-                neural_score += 0.08 * self.memory.space.similarity(
-                    active_vector, prototype_vector
-                )
-            ranked.append(
-                (evidence + neural_score, tool_id, action, arguments)
-            )
-        _score, tool_id, action, arguments = sorted(
-            ranked,
-            key=lambda item: (-item[0], item[1], item[2]),
-        )[0]
-        return {
+            if (
+                browser_operation is None
+                or argument_head.grounded_for(
+                    "browser.operation", "full:" + browser_operation
+                ) < 1
+            ):
+                self._last_tool_route_evidence = {
+                    **route_evidence,
+                    "materialization": "ungrounded-browser-operation",
+                    "browserOperationEvidence": operation_evidence,
+                }
+                return None
+            route_evidence = {
+                **route_evidence, "browserOperationEvidence": operation_evidence
+            }
+        features = argument_head.schema_features(tool_id, action, schema)
+        if features is None:
+            self._last_tool_route_evidence = {
+                **route_evidence, "materialization": "missing-action-schema"
+            }
+            return None
+        argument_evidence = argument_head.decode(
+            neural_state.to(self.device), features[None].to(self.device),
+            tool_id=tool_id, action=action,
+            max_output_bytes=min(4096, max(128, int(self.config.max_seq_len))),
+        )
+        arguments = argument_evidence.get("arguments")
+        if not isinstance(arguments, Mapping):
+            self._last_tool_route_evidence = {
+                **route_evidence,
+                "materialization": str(argument_evidence.get("reason", "no-arguments")),
+                "argumentEvidence": argument_evidence,
+            }
+            return None
+        candidate = {
             "toolId": tool_id,
             "action": action,
-            "arguments": arguments,
+            "arguments": dict(arguments),
         }
+        if tool_id == "browser.automation" and (
+            self._browser_operation_kind(arguments) != browser_operation
+            or not isinstance(arguments.get("url"), str)
+            or self._explicit_https_urls(arguments["url"]) != [arguments["url"]]
+        ):
+            self._last_tool_route_evidence = {
+                **route_evidence,
+                "materialization": "browser-operation-argument-mismatch",
+            }
+            return None
+        required_content = (
+            "query" if tool_id == "web.search"
+            else "objective" if tool_id in {"agent.fork", "source.self-modify"}
+            else None
+        )
+        if required_content is not None and not str(
+            arguments.get(required_content, "")
+        ).strip():
+            self._last_tool_route_evidence = {
+                **route_evidence, "materialization": "empty-learned-objective",
+                "argumentEvidence": {
+                    key: value for key, value in argument_evidence.items()
+                    if key != "arguments"
+                },
+            }
+            return None
+        if (
+            tool_id == "source.self-modify"
+            and "candidateKind" in arguments
+            and (
+                not isinstance(arguments["candidateKind"], str)
+                or arguments["candidateKind"] not in {
+                    "neural", "data", "substrate", "architecture",
+                }
+            )
+        ):
+            self._last_tool_route_evidence = {
+                **route_evidence,
+                "materialization": "unsupported-learned-candidate-kind",
+            }
+            return None
+        if not self._materialized_tool_action_matches_schema(schemas, candidate):
+            self._last_tool_route_evidence = {
+                **route_evidence, "materialization": "schema-rejected",
+                "argumentEvidence": argument_evidence,
+            }
+            return None
+        evidence = {
+            **route_evidence,
+            "materialization": "trained-arguments-schema-validated",
+            "argumentEvidence": {
+                key: value for key, value in argument_evidence.items()
+                if key != "arguments"
+            },
+        }
+        self._last_tool_route_evidence = evidence
+        return {**candidate, "routeEvidence": evidence}
+
+    def _literal_tool_route_arguments(
+        self, tool_id: str, action: str, text: str, schema: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Extract values *after* neural selection; never rank another route.
+
+        Missing values fail closed. JSON fields are an explicit general
+        interface for schemas without a built-in literal-value extractor.
+        These parsers cannot promote a different capability when they fail.
+        """
+        input_schema = self._tool_action_input_schema(schema, action)
+        if input_schema is None:
+            return None
+        properties = input_schema.get("properties", {})
+        arguments: Dict[str, Any] = {}
+        json_match = re.search(r"\{[\s\S]*\}", text)
+        if json_match is not None:
+            try:
+                value = json.loads(json_match.group(0))
+                if isinstance(value, dict):
+                    arguments = {key: item for key, item in value.items() if key in properties}
+            except (ValueError, TypeError):
+                pass
+        paths = self._explicit_absolute_paths(text)
+        urls = self._explicit_https_urls(text)
+        lowered = text.casefold()
+        if tool_id in {"system.files", "windows.files"}:
+            if len(paths) == 1:
+                arguments.setdefault("path", paths[0])
+            if action == "write":
+                content = self._explicit_write_content(text, paths)
+                if content is not None:
+                    arguments.setdefault("content", content)
+            if "path" not in arguments or (action == "write" and "content" not in arguments):
+                return None
+        elif tool_id in {"system.shell", "windows.powershell"}:
+            arguments = {**(self._explicit_shell_arguments(text) or {}), **arguments}
+            if not {"command", "cwd"}.issubset(arguments):
+                return None
+        elif tool_id == "code.execute":
+            if len(paths) == 1:
+                arguments.setdefault("entryPath", paths[0])
+                # File extension denotes the literal language; it does not
+                # decide whether execute, read, or write is the selected action.
+                language = {".py": "python", ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript"}.get(Path(paths[0]).suffix.lower())
+                if language is not None:
+                    arguments.setdefault("language", language)
+            if not {"entryPath", "language"}.issubset(arguments):
+                return None
+        elif tool_id in {"web.fetch", "browser.automation"}:
+            if len(urls) == 1:
+                arguments.setdefault("url", urls[0])
+            if "url" not in arguments:
+                return None
+        elif tool_id in {"web.search", "brain.history"} and action == "search":
+            match = re.search(r"\b(?:search|research|look\s+up|find)\b(?:\s+(?:the\s+)?(?:web|internet|online))?(?:\s+(?:for|about|on))?\s+(?P<query>.+)", text, re.I | re.S)
+            if match is not None:
+                arguments.setdefault("query", match.group("query").strip())
+            if not arguments.get("query"):
+                return None
+        elif tool_id == "device.input":
+            if action == "move-pointer":
+                match = re.search(r"(?:\bx\s*=?\s*|\()(\-?\d{1,6})\s*(?:,\s*(?:y\s*=?\s*)?|\s+y\s*=?\s*)(\-?\d{1,6})", text, re.I)
+                if match:
+                    arguments.update({"x": int(match[1]), "y": int(match[2])})
+                if not {"x", "y"}.issubset(arguments):
+                    return None
+            elif action == "click":
+                match = re.search(r"\b(left|right|middle)\b", text, re.I)
+                if match:
+                    arguments.setdefault("button", match[1].lower())
+                if "button" not in arguments:
+                    return None
+            elif action == "scroll":
+                match = re.search(r"\b(up|down|left|right)\s+(\d{1,5})\b", text, re.I)
+                if match:
+                    direction, amount = match[1].lower(), int(match[2])
+                    arguments.setdefault("deltaY" if direction in {"up", "down"} else "deltaX",
+                                         amount if direction in {"up", "right"} else -amount)
+                if not ("deltaX" in arguments or "deltaY" in arguments):
+                    return None
+            elif action == "key-press":
+                match = re.search(r"\bpress\s+[`'\"]?([A-Za-z0-9_.-]+(?:\s*\+\s*[A-Za-z0-9_.-]+){0,4})", text, re.I)
+                if match:
+                    chord = [item.strip().lower() for item in match[1].split("+")]
+                    arguments.setdefault("key", chord[-1])
+                    if len(chord) > 1:
+                        arguments.setdefault("modifiers", chord[:-1])
+                if "key" not in arguments:
+                    return None
+            elif action == "text":
+                match = re.search(r"\b(?:type|enter|input)\s+(?P<q>[\"'`])(?P<text>.*?)(?P=q)", text, re.I | re.S)
+                if match:
+                    arguments.setdefault("text", match.group("text"))
+                if not arguments.get("text"):
+                    return None
+        elif tool_id == "device.observe":
+            resolution = re.search(r"(\d{2,5})\s*(?:x|×|by)\s*(\d{2,5})", lowered)
+            if resolution:
+                arguments.update({"width": int(resolution[1]), "height": int(resolution[2])})
+            if action == "snapshot":
+                match = re.search(r"\b(native|current|custom)\b", lowered)
+                if match:
+                    arguments.setdefault("resolutionMode", match[1])
+                count = re.search(r"\b(\d{1,3})\s+(?:frames?|photos?|snapshots?)\b", lowered)
+                if count:
+                    arguments.setdefault("burstCount", int(count[1]))
+                interval = re.search(r"\bevery\s+(\d+)\s*(ms|milliseconds?|s|seconds?)\b", lowered)
+                if interval:
+                    arguments.setdefault("intervalMs", int(interval[1]) * (1 if interval[2].startswith("m") else 1000))
+            else:
+                mode = re.search(r"\b(auto|motion|balanced|detail)\b", lowered)
+                if mode:
+                    arguments.setdefault("mode", mode[1])
+                fps = re.search(r"\b(\d{1,3})\s*fps\b", lowered)
+                if fps:
+                    arguments.setdefault("fps", int(fps[1]))
+                duration = re.search(r"\bfor\s+(\d+)\s*(ms|milliseconds?|s|seconds?)\b", lowered)
+                if duration:
+                    arguments.setdefault("durationMs", int(duration[1]) * (1 if duration[2].startswith("m") else 1000))
+            if not arguments:
+                return None
+        else:
+            # Generic external schemas accept only explicit JSON and literal
+            # path/URL values, never guessed free-form strings or defaults.
+            for name in properties:
+                if name.casefold() in {"url", "uri"} and len(urls) == 1:
+                    arguments.setdefault(name, urls[0])
+                elif name.casefold() in {"path", "file", "filepath", "directory"} and len(paths) == 1:
+                    arguments.setdefault(name, paths[0])
+        return arguments
+
+    @staticmethod
+    def _valid_explicit_browser_steps(value: Any) -> bool:
+        """Validate structured steps; prose must not synthesize side effects.
+
+        The neural route may select the browser, but a regex match such as
+        ``do not click`` is not evidence that the brain chose a click. A future
+        grounded argument decoder can supply the same typed structure.
+        """
+
+        if not isinstance(value, list) or len(value) > 200:
+            return False
+
+        def bounded_text(
+            step: Mapping[str, Any], key: str, limit: int,
+            *, allow_newlines: bool = False,
+        ) -> bool:
+            item = step.get(key)
+            return (
+                isinstance(item, str)
+                and 0 < len(item) <= limit
+                and "\x00" not in item
+                and (allow_newlines or ("\r" not in item and "\n" not in item))
+            )
+
+        allowed = {
+            "navigate": {"kind", "url"},
+            "click": {"kind", "selector", "timeoutMs"},
+            "type": {"kind", "selector", "value", "clear", "sensitive"},
+            "press": {"kind", "key", "timeoutMs"},
+            "wait": {"kind", "selector", "milliseconds", "timeoutMs"},
+            "extract": {"kind", "selector"},
+            "screenshot": {"kind"},
+        }
+        for step in value:
+            if not isinstance(step, Mapping):
+                return False
+            kind = step.get("kind")
+            if (
+                not isinstance(kind, str)
+                or kind not in allowed
+                or set(step) - allowed[kind]
+            ):
+                return False
+            if "timeoutMs" in step and (
+                isinstance(step["timeoutMs"], bool)
+                or not isinstance(step["timeoutMs"], (int, float))
+                or not math.isfinite(float(step["timeoutMs"]))
+                or not 0 < float(step["timeoutMs"]) <= 30_000
+            ):
+                return False
+            if kind == "navigate" and not (
+                bounded_text(step, "url", 16_000)
+                and str(step["url"]).startswith("https://")
+            ):
+                return False
+            if kind == "click" and not bounded_text(step, "selector", 2_000):
+                return False
+            if kind == "type" and not (
+                bounded_text(step, "selector", 2_000)
+                and bounded_text(step, "value", 100_000, allow_newlines=True)
+                and ("clear" not in step or isinstance(step["clear"], bool))
+                and ("sensitive" not in step or isinstance(step["sensitive"], bool))
+            ):
+                return False
+            if kind == "press" and not bounded_text(step, "key", 64):
+                return False
+            if kind == "wait":
+                selector = "selector" in step
+                milliseconds = "milliseconds" in step
+                if selector == milliseconds:
+                    return False
+                if selector and not bounded_text(step, "selector", 2_000):
+                    return False
+                if milliseconds and (
+                    isinstance(step["milliseconds"], bool)
+                    or not isinstance(step["milliseconds"], int)
+                    or not 0 < step["milliseconds"] <= 30_000
+                ):
+                    return False
+            if kind == "extract" and "selector" in step and not bounded_text(
+                step, "selector", 2_000
+            ):
+                return False
+        return True
+
+
+    @staticmethod
+    def _materialized_tool_action_matches_schema(
+        schemas: Sequence[Mapping[str, Any]],
+        materialized: Mapping[str, Any],
+    ) -> bool:
+        """Fail closed unless a materialized action exactly fits its schema."""
+
+        tool_id = materialized.get("toolId")
+        action = materialized.get("action")
+        arguments = materialized.get("arguments")
+        if (
+            not isinstance(tool_id, str)
+            or not isinstance(action, str)
+            or not isinstance(arguments, Mapping)
+        ):
+            return False
+        schema = next(
+            (
+                value
+                for value in schemas
+                if value.get("id") == tool_id
+                and str(value.get("grant", "ask")).strip().lower()
+                != "off"
+            ),
+            None,
+        )
+        if schema is None or action not in schema.get("actions", ()):
+            return False
+        input_schema = AdaptiveBrain._tool_action_input_schema(schema, action)
+        if not isinstance(input_schema, Mapping):
+            return False
+        properties = input_schema.get("properties")
+        required = input_schema.get("required", ())
+        if not isinstance(properties, Mapping) or not isinstance(
+            required, (list, tuple)
+        ):
+            return False
+        if not set(str(value) for value in required).issubset(arguments):
+            return False
+        if any(str(name) not in properties for name in arguments):
+            return False
+        if tool_id == "browser.automation" and "steps" in arguments:
+            if not AdaptiveBrain._valid_explicit_browser_steps(arguments["steps"]):
+                return False
+
+        def valid_type(value: Any, expected: str) -> bool:
+            if expected == "string":
+                return isinstance(value, str)
+            if expected == "integer":
+                return isinstance(value, int) and not isinstance(value, bool)
+            if expected == "number":
+                return (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                )
+            if expected == "boolean":
+                return isinstance(value, bool)
+            if expected == "array":
+                return isinstance(value, (list, tuple))
+            if expected == "object":
+                return isinstance(value, Mapping)
+            if expected == "null":
+                return value is None
+            return False
+
+        return all(
+            isinstance(properties.get(name), Mapping)
+            and valid_type(
+                value,
+                str(properties[name].get("type", "unknown")).lower(),
+            )
+            for name, value in arguments.items()
+        )
+
 
     def _select_structured_actions(
         self,
@@ -4577,6 +11435,8 @@ class AdaptiveBrain:
         input_text: str,
         assembly_ids: Sequence[str],
         organic_state: Mapping[str, float],
+        supporting_action_logits: Sequence[torch.Tensor] = (),
+        neural_state: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
         """Convert the learned action head into a typed, permission-gated proposal.
 
@@ -4595,6 +11455,7 @@ class AdaptiveBrain:
         kind = ACTION_KINDS[selected_index]
         confidence = scores[kind]
         actions: List[Dict[str, Any]] = []
+        self._last_tool_route_evidence = None
         available = {
             str(schema["id"]): set(
                 str(value) for value in schema.get("actions", [])
@@ -4603,14 +11464,83 @@ class AdaptiveBrain:
             if str(schema.get("grant", "ask")).strip().lower() != "off"
         }
         tension = float(organic_state.get("computeDemand", 0.0))
+        selected_tool: Optional[Dict[str, Any]] = None
+        independent_tool_confidence = 0.0
+        tool_support_evidence: Optional[Dict[str, Any]] = None
+        materialized_candidate: Optional[Dict[str, Any]] = None
 
+        def ordinary_tool_candidate(candidate: Mapping[str, Any]) -> bool:
+            return str(candidate.get("toolId", "")) not in {
+                "modality.imagine",
+                "agent.fork",
+                "source.self-modify",
+            }
+
+        if kind == "talk" and supporting_action_logits:
+            support_candidates = list(supporting_action_logits)
+            tool_index = ACTION_KINDS.index("tool")
+            for supporting_logits in support_candidates:
+                if (
+                    not isinstance(supporting_logits, torch.Tensor)
+                    or supporting_logits.ndim not in {1, 2}
+                    or int(supporting_logits.shape[-1]) != len(ACTION_KINDS)
+                ):
+                    continue
+                support_probabilities = F.softmax(
+                    supporting_logits.detach().float().reshape(
+                        -1, len(ACTION_KINDS)
+                    )[0],
+                    dim=-1,
+                )
+                support_confidence = float(
+                    support_probabilities[tool_index].item()
+                )
+                if (
+                    int(support_probabilities.argmax().item()) == tool_index
+                    and support_confidence
+                    > ACTION_INDEPENDENT_TOOL_SUPPORT_CONFIDENCE
+                ):
+                    independent_tool_confidence = max(
+                        independent_tool_confidence, support_confidence
+                    )
+            if independent_tool_confidence > 0.0:
+                materialized_candidate = self._materialize_generic_tool_action(
+                    schemas=schemas,
+                    input_text=input_text,
+                    assembly_ids=assembly_ids,
+                    organic_state=organic_state,
+                    neural_state=neural_state,
+                )
+                if (
+                    materialized_candidate is not None
+                    and ordinary_tool_candidate(materialized_candidate)
+                    and self._materialized_tool_action_matches_schema(
+                        schemas, materialized_candidate
+                    )
+                ):
+                    selected_tool = materialized_candidate
+                    kind = "tool"
+                    confidence = independent_tool_confidence
+                    tool_support_evidence = {
+                        "kind": "independent-head-majority-and-schema",
+                        "toolProbability": independent_tool_confidence,
+                        "minimumToolProbability": (
+                            ACTION_INDEPENDENT_TOOL_SUPPORT_CONFIDENCE
+                        ),
+                        "sourceTextRead": False,
+                    }
         # A blank/random brain has a nearly uniform head. It must learn a
         # decisive distribution before proposing external activity. Safe
         # internal cognition may emerge sooner when unresolved neural tension
         # is high.
         if kind == "talk":
             return scores, actions
-        if kind in {"ponder", "learn"}:
+        if kind == "learn":
+            # Transactional chat may still be decoding before its fast
+            # experience commit; idle replay has a separate durable receipt.
+            # Do not surface a card claiming a mutation that has not happened.
+            return scores, actions
+        if kind == "ponder":
             if (
                 self.config.idle_cognition
                 and confidence >= 0.30
@@ -4637,7 +11567,10 @@ class AdaptiveBrain:
                     }
                 )
             return scores, actions
-        if confidence < ACTION_PROPOSAL_CONFIDENCE:
+        if (
+            confidence < ACTION_PROPOSAL_CONFIDENCE
+            and selected_tool is None
+        ):
             return scores, actions
 
         base_arguments: Dict[str, Any] = {
@@ -4645,35 +11578,84 @@ class AdaptiveBrain:
             "organic": True,
         }
         if kind == "tool":
-            selected_tool = self._materialize_generic_tool_action(
-                schemas=schemas,
-                input_text=input_text,
-                assembly_ids=assembly_ids,
-            )
-            if selected_tool is not None:
+            if selected_tool is None:
+                selected_tool = (
+                    self._materialize_generic_tool_action(
+                        schemas=schemas,
+                        input_text=input_text,
+                        assembly_ids=assembly_ids,
+                        organic_state=organic_state,
+                        neural_state=neural_state,
+                    )
+                    if input_text.strip()
+                    else self._materialize_internal_action(
+                        schemas=schemas,
+                        neural_state=neural_state,
+                    )
+                )
+            if selected_tool is not None and ordinary_tool_candidate(selected_tool):
+                # MCP inputSchema describes the complete remote argument object.
+                # Neural routing metadata is local action context, not a tool
+                # argument; built-in tools still receive that context as before.
+                tool_arguments = (
+                    dict(selected_tool["arguments"])
+                    if selected_tool["toolId"].startswith("mcp.")
+                    else {**base_arguments, **selected_tool["arguments"]}
+                )
                 actions.append(
                     {
                         "kind": "tool",
                         "toolId": selected_tool["toolId"],
                         "action": selected_tool["action"],
-                        "arguments": {
-                            **base_arguments,
-                            **selected_tool["arguments"],
-                        },
+                        "arguments": tool_arguments,
                         "confidence": confidence,
+                        **({"routeEvidence": selected_tool["routeEvidence"]}
+                           if "routeEvidence" in selected_tool else {}),
+                        **(
+                            {"supportEvidence": tool_support_evidence}
+                            if tool_support_evidence is not None
+                            else {}
+                        ),
                     }
                 )
         elif (
             kind == "imagine"
             and "generate" in available.get("modality.imagine", set())
         ):
-            # The recurrent state selects a modality; active assemblies cue the
-            # generator without constructing a hidden text prompt.
-            modality_index = int(
-                abs(float(self.liquid_state.detach().float().sum().item()))
-                * 1000
-            ) % 3
-            modality = ("image", "audio", "video")[modality_index]
+            # The same checkpointed OmniCortex selects the medium through a
+            # learned exact-ternary projection. Active assemblies and liquid
+            # state are neural inputs; no hidden prompt or slash command exists.
+            enabled_modalities = [
+                name
+                for name, enabled in (
+                    ("image", self.config.image_enabled),
+                    ("audio", self.config.audio_enabled),
+                    ("video", self.config.video_enabled),
+                )
+                if enabled
+            ]
+            # A randomly initialized media pack is a real decoder but has not
+            # learned to express an idea. Manual generation can still expose
+            # that research baseline; an organic action must not present it as
+            # meaningful learned imagination or silently route to a disabled
+            # pack. Media training or an installed compatible pack enables it.
+            route_modalities = [
+                name for name in enabled_modalities
+                if int(self.modality_training.get(name, 0)) > 0
+                or any(
+                    name in item.get("modalities", ())
+                    for item in self.installed_modality_packs
+                )
+            ]
+            if not route_modalities:
+                return scores, actions
+            route_idea = self._modality_idea("", assembly_ids)
+            route_idea = torch.tanh(
+                0.78 * route_idea + 0.22 * self.liquid_state.detach()
+            )
+            modality, modality_scores = self.modalities.select_imagination(
+                route_idea, enabled=route_modalities
+            )
             actions.append(
                 {
                     "kind": "imagine",
@@ -4683,50 +11665,287 @@ class AdaptiveBrain:
                         **base_arguments,
                         "conceptIds": list(assembly_ids),
                         "modality": modality,
-                    },
-                    "confidence": confidence,
-                }
-            )
-        elif kind == "agent" and "start" in available.get("agent.fork", set()):
-            actions.append(
-                {
-                    "kind": "agent",
-                    "toolId": "agent.fork",
-                    "action": "start",
-                    "arguments": {
-                        **base_arguments,
-                        "objective": input_text,
+                        "localPackEnabled": True,
+                        "trainedPackAvailable": True,
+                        "neuralRoute": {
+                            "kind": "exact-ternary-same-brain-head",
+                            "scores": modality_scores,
+                            "hiddenPrompt": False,
+                        },
                     },
                     "confidence": confidence,
                 }
             )
         elif (
+            kind == "agent"
+            and "start" in available.get("agent.fork", set())
+        ):
+            organic_agent = (
+                self._materialize_internal_action(
+                    schemas=schemas, neural_state=neural_state,
+                    tool_id="agent.fork", action="start",
+                ) if not input_text.strip() else None
+            )
+            if input_text.strip() or organic_agent is not None:
+                actions.append(
+                    {
+                        "kind": "agent",
+                        "toolId": "agent.fork",
+                        "action": "start",
+                        "arguments": {
+                            **base_arguments,
+                            **(
+                                organic_agent["arguments"]
+                                if organic_agent is not None
+                                else {"objective": input_text}
+                            ),
+                        },
+                        "confidence": confidence,
+                        **(
+                            {"routeEvidence": organic_agent["routeEvidence"]}
+                            if organic_agent is not None else {}
+                        ),
+                    }
+                )
+        elif (
             kind == "evolve"
             and self.config.recursive_improvement
             and "propose" in available.get("source.self-modify", set())
         ):
-            # An organic action head cannot author a trustworthy source patch:
-            # exact paths, complete replacement text, and expected hashes must
-            # come through the typed source-edit channel.  Route an edit-free
-            # thought into the worker-owned substrate overlay instead.  The
-            # current turn has already entered latent replay, so this is a
-            # viable isolated experiment rather than an empty Git candidate.
-            actions.append(
-                {
-                    "kind": "evolve",
-                    "toolId": "source.self-modify",
-                    "action": "propose",
-                    "arguments": {
-                        **base_arguments,
-                        "objective": input_text,
-                        "recursive": True,
-                        "candidateKind": "substrate",
-                        "latentReplay": True,
-                    },
-                    "confidence": confidence,
+            # The neural action head chooses to evolve, but strategy and
+            # objective operands still need explicit typed user data or a
+            # grounded neural argument decode. Source edits are never
+            # synthesized here; an incomplete strategy emits no proposal.
+            explicit_evolution: Optional[Dict[str, Any]] = None
+            explicit_kind_supplied = False
+            if input_text.strip():
+                evolution_schema = next(
+                    (
+                        schema for schema in schemas
+                        if schema.get("id") == "source.self-modify"
+                        and "propose" in schema.get("actions", ())
+                    ),
+                    None,
+                )
+                if evolution_schema is not None:
+                    parsed = self._literal_tool_route_arguments(
+                        "source.self-modify", "propose", input_text,
+                        evolution_schema,
+                    )
+                    explicit_kind_supplied = (
+                        isinstance(parsed, Mapping)
+                        and "candidateKind" in parsed
+                    )
+                    if (
+                        isinstance(parsed, Mapping)
+                        and isinstance(parsed.get("objective"), str)
+                        and parsed["objective"].strip()
+                        and isinstance(parsed.get("candidateKind"), str)
+                        and parsed.get("candidateKind") in {
+                            "neural", "data", "substrate", "architecture",
+                        }
+                    ):
+                        explicit_evolution = {
+                            "objective": parsed["objective"].strip(),
+                            "candidateKind": parsed["candidateKind"],
+                        }
+                        add_experts = parsed.get("addExperts")
+                        if (
+                            isinstance(add_experts, int)
+                            and not isinstance(add_experts, bool)
+                            and add_experts > 0
+                        ):
+                            explicit_evolution["addExperts"] = add_experts
+            selected_evolution: Optional[Dict[str, Any]] = None
+            route_evidence: Optional[Dict[str, Any]] = None
+            if explicit_evolution is not None:
+                selected_evolution = explicit_evolution
+            elif not explicit_kind_supplied:
+                learned_evolution = self._materialize_internal_action(
+                    schemas=schemas, neural_state=neural_state,
+                    tool_id="source.self-modify", action="propose",
+                )
+                if learned_evolution is not None:
+                    selected_evolution = dict(learned_evolution["arguments"])
+                    route_evidence = learned_evolution["routeEvidence"]
+                    if input_text.strip():
+                        # The visible human request is the chat objective;
+                        # the grounded neural decoder chooses the strategy.
+                        selected_evolution["objective"] = input_text
+            else:
+                self._last_tool_route_evidence = {
+                    "kind": "evolution-argument-gate",
+                    "reason": "invalid-explicit-candidate-kind",
                 }
+            candidate_kind = (
+                selected_evolution.get("candidateKind")
+                if selected_evolution is not None else None
             )
+            if selected_evolution is not None and (
+                not isinstance(candidate_kind, str)
+                or candidate_kind not in {
+                    "neural", "data", "substrate", "architecture",
+                }
+            ):
+                selected_evolution = None
+                self._last_tool_route_evidence = {
+                    "kind": "evolution-argument-gate",
+                    "reason": "candidate-kind-unavailable",
+                }
+            if selected_evolution is not None and candidate_kind == "architecture" and not (
+                isinstance(selected_evolution.get("addExperts"), int)
+                and not isinstance(selected_evolution.get("addExperts"), bool)
+                and selected_evolution["addExperts"] > 0
+            ):
+                selected_evolution = None
+                self._last_tool_route_evidence = {
+                    "kind": "evolution-argument-gate",
+                    "reason": "architecture-mutation-arguments-missing",
+                }
+            if selected_evolution is not None and candidate_kind == "data" and not (
+                selected_evolution.get("latentReplay") is True
+                or selected_evolution.get("texts")
+                or selected_evolution.get("sourceIds")
+            ):
+                selected_evolution = None
+                self._last_tool_route_evidence = {
+                    "kind": "evolution-argument-gate",
+                    "reason": "data-evidence-missing",
+                }
+            if selected_evolution is None:
+                self._last_tool_route_evidence = (
+                    self._last_tool_route_evidence
+                    if isinstance(self._last_tool_route_evidence, Mapping)
+                    else {"kind": "evolution-argument-gate",
+                          "reason": "candidate-kind-unavailable"}
+                )
+            else:
+                actions.append(
+                    {
+                        "kind": "evolve",
+                        "toolId": "source.self-modify",
+                        "action": "propose",
+                        "arguments": {
+                            **base_arguments,
+                            **selected_evolution,
+                            "recursive": True,
+                        },
+                        "confidence": confidence,
+                        **(
+                            {"routeEvidence": route_evidence}
+                            if route_evidence is not None else {}
+                        ),
+                    }
+                )
         return scores, actions
+
+    @torch.no_grad()
+    def _native_pre_speech_ponder(
+        self,
+        combined_memory: torch.Tensor,
+        internal_memory: torch.Tensor,
+        *,
+        seed: int,
+        confidence: float,
+        pass_budget: int,
+        resource_budget_ms: int,
+        noise: float,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Refine this turn's latent memory after a learned Ponder proposal.
+
+        This is inference, not idle rehearsal or an optimizer step. Liquid/LIF
+        scratch stays private to this attempt, while the returned memory bias
+        conditions every response candidate and its deterministic replay.
+        """
+
+        started = time.perf_counter()
+        current = combined_memory.detach()
+        refined = internal_memory.detach()
+        liquid_state = self.liquid_state.detach().clone()
+        membrane = self.router.population.membrane.detach().clone()
+        spike_count = self.router.population.spike_count.detach().clone()
+        # A local CPU generator works on all deployed accelerators and never
+        # changes the global training/decode RNG. Keep the exploratory drive
+        # fixed across passes so convergence is meaningful.
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        exploration = torch.randn(
+            current.shape, generator=generator, dtype=torch.float32
+        ).to(current) * max(0.0, float(noise)) * 0.025
+        anchor = current + exploration
+        passes = 0
+        router_steps = 0
+        final_delta = 0.0
+        converged = False
+        stop_reason = "neural-budget"
+        try:
+            while passes < max(1, int(pass_budget)):
+                if cancel_check is not None and cancel_check():
+                    raise ChatGenerationCancelled("chat generation was cancelled")
+                readings = self.resource_policy.status()
+                if readings.get("diskPressure") or readings.get("memoryPressure"):
+                    stop_reason = "resource-pressure"
+                    break
+                if (time.perf_counter() - started) * 1000.0 >= max(
+                    1, int(resource_budget_ms)
+                ):
+                    stop_reason = "resource-budget"
+                    break
+                if self.config.liquid_dynamics:
+                    liquid_state, controls = self.liquid(
+                        current, state=liquid_state, elapsed=1.0
+                    )
+                    driven = 0.65 * anchor + 0.25 * current + 0.10 * liquid_state
+                    threshold = float(controls["threshold_offset"].mean().item())
+                else:
+                    driven = 0.65 * anchor + 0.35 * current
+                    threshold = 0.0
+                if self.config.spiking_dynamics:
+                    updated, _metrics = self.router.route(
+                        driven, steps=2, learn=False, threshold_offset=threshold
+                    )
+                    router_steps += 2
+                else:
+                    updated = driven
+                next_refined = self.idea_adapter(updated)
+                if not bool(torch.isfinite(next_refined).all()):
+                    raise RuntimeError("non-finite native pre-speech Ponder state")
+                final_delta = float(
+                    (next_refined.float() - refined.float())
+                    .square().mean().sqrt().item()
+                )
+                current = updated
+                refined = next_refined
+                passes += 1
+                if cancel_check is not None and cancel_check():
+                    raise ChatGenerationCancelled("chat generation was cancelled")
+                scale = float(refined.float().square().mean().sqrt().item())
+                if final_delta <= 1e-4 * (1.0 + scale):
+                    converged = True
+                    stop_reason = "converged"
+                    break
+        finally:
+            self.router.population.membrane.copy_(membrane)
+            self.router.population.spike_count.copy_(spike_count)
+        return refined, {
+            "activated": True,
+            "activated_by": "learned-action-head",
+            "passes": passes,
+            "converged": converged,
+            "stop_reason": stop_reason,
+            "initial_score": float(confidence),
+            "final_delta": final_delta,
+            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+            "seed": int(seed),
+            "router_steps": router_steps,
+            "memory_bias_delta": float(
+                (refined.float() - internal_memory.detach().float())
+                .square().mean().sqrt().item()
+            ),
+            "phase": "pre-speech",
+            "private": True,
+            "visibleMagicTags": False,
+        }
 
     @torch.no_grad()
     def _candidate_nll(
@@ -4747,6 +11966,272 @@ class AdaptiveBrain:
             return float(loss.item())
         return 100.0
 
+    @staticmethod
+    def _validated_chat_turn_id(value: str) -> str:
+        turn_id = str(value or "").strip()
+        if not turn_id:
+            return ""
+        if (
+            len(turn_id) > 128
+            or "\x00" in turn_id
+            or any(character in "\r\n" for character in turn_id)
+        ):
+            raise ValueError("chat turn id is invalid")
+        return turn_id
+
+    @staticmethod
+    def _explicit_response_length_constraint(
+        text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Parse an explicit user length instruction without prompt expansion."""
+
+        number_words = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+        segments = [
+            value.strip()
+            for value in re.split(r"(?<=[.!?])\s+|[\r\n]+", str(text))
+            if value.strip()
+        ]
+        instructions = [
+            value
+            for value in segments
+            if re.match(
+                r"^(?:please\s+)?(?:reply|respond|answer)\b",
+                value,
+                flags=re.IGNORECASE,
+            )
+        ]
+        for instruction in instructions:
+            count_match = re.match(
+                r"^(?:please\s+)?(?:reply|respond|answer)\b"
+                r"[^\r\n.!?]{0,40}?\b(?:in|with|using)\s+"
+                r"(?:(?:only|exactly|at\s+most|no\s+more\s+than)\s+)?"
+                r"(?P<count>\d{1,4}|one|two|three|four|five|six|seven|eight|nine|ten|a\s+single)\s+"
+                r"(?P<unit>words?|tokens?|sentences?|characters?)\b",
+                instruction,
+                flags=re.IGNORECASE,
+            )
+            if count_match is None:
+                continue
+            raw_count = count_match.group("count").casefold()
+            count = (
+                1
+                if raw_count == "a single"
+                else number_words.get(
+                    raw_count,
+                    int(raw_count) if raw_count.isdigit() else 0,
+                )
+            )
+            if count > 0:
+                return {
+                    "kind": "count",
+                    "unit": count_match.group("unit").casefold().rstrip("s"),
+                    "count": min(4096, count),
+                }
+        literal_match = next(
+            (
+                matched
+                for instruction in instructions
+                if (
+                    matched := re.match(
+                        r"^(?:please\s+)?(?:reply|respond|answer)\s+"
+                        r"(?:only\s+)?(?:with|using)\s+(?:only\s+)?"
+                        r"(?P<literal>[^\r\n.!?]{1,160})\s*(?:[.!?]|$)",
+                        instruction,
+                        flags=re.IGNORECASE,
+                    )
+                )
+                is not None
+            ),
+            None,
+        )
+        if literal_match is None:
+            return None
+        literal = literal_match.group("literal").strip().strip("\"'`").strip()
+        literal = re.sub(
+            r"^(?:the\s+)?(?:word|phrase)\s+",
+            "",
+            literal,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip().strip("\"'`").strip()
+        if not literal:
+            return None
+        # These are semantic references to the requested value, not literal
+        # strings the user asked the decoder to emit. Treating "the code" as
+        # a two-word literal previously capped an exact neural association at
+        # four boundary tokens and turned ORCHID-7421 into ORCH.
+        referential = re.fullmatch(
+            r"(?:it|this|that|"
+            r"(?:the|your|its|my|our)\s+"
+            r"(?:(?:exact|final|correct|requested|remembered)\s+)?"
+            r"(?:answer|code|color|value|result|name|number|fact|marker|response|call\s+sign))"
+            r"(?:\s+and\s+nothing\s+else)?",
+            re.sub(r"\s+", " ", literal).casefold(),
+        )
+        if referential is not None:
+            return None
+        return {
+            "kind": "literal",
+            "unit": "literal",
+            "count": max(1, len(re.findall(r"\S+", literal))),
+            "literal": literal,
+            "literalSha256": hashlib.sha256(
+                literal.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def _response_generation_budget(
+        self,
+        text: str,
+        *,
+        cognitive_demand: float,
+        caller_limit: Optional[int],
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Intersect state, caller, and typed user response-length bounds."""
+
+        state_ceiling = int(
+            self.config.generation_token_budget(cognitive_demand)
+        )
+        caller_ceiling = (
+            max(1, int(caller_limit))
+            if caller_limit is not None
+            else state_ceiling
+        )
+        resolved = min(state_ceiling, caller_ceiling)
+        constraint = self._explicit_response_length_constraint(text)
+        public_constraint: Optional[Dict[str, Any]] = None
+        explicit_ceiling: Optional[int] = None
+        if constraint is not None:
+            unit = str(constraint["unit"])
+            count = max(1, int(constraint["count"]))
+            if constraint["kind"] == "literal":
+                literal = str(constraint["literal"])
+                native_token_count = len(self.tokenizer.encode(literal))
+                token_count = max(
+                    1,
+                    count,
+                    native_token_count,
+                )
+                explicit_ceiling = token_count + 2
+            elif unit == "token":
+                explicit_ceiling = count + 1
+            elif unit == "word":
+                explicit_ceiling = count * 4 + 2
+            elif unit == "sentence":
+                explicit_ceiling = count * 48
+            else:
+                explicit_ceiling = math.ceil(count / 2.0) + 2
+            explicit_ceiling = max(2, int(explicit_ceiling))
+            resolved = min(resolved, explicit_ceiling)
+            public_constraint = {
+                key: value
+                for key, value in constraint.items()
+                if key != "literal"
+            }
+            public_constraint["resolvedTokenCeiling"] = explicit_ceiling
+        source = "hardware-and-organic-state"
+        if caller_limit is not None:
+            source = "caller-within-hardware-and-organic-state"
+        if explicit_ceiling is not None and explicit_ceiling <= min(
+            state_ceiling, caller_ceiling
+        ):
+            source = "explicit-user-response-length"
+        return max(1, resolved), {
+            "source": source,
+            "stateCeilingTokens": state_ceiling,
+            "callerCeilingTokens": (
+                caller_ceiling if caller_limit is not None else None
+            ),
+            "explicitConstraint": public_constraint,
+            "explicitLiteral": (
+                str(constraint["literal"])
+                if constraint is not None and constraint["kind"] == "literal"
+                else None
+            ),
+            "promptTextExpanded": False,
+            "stateLengthHead": "hardware-and-organic-state-v1",
+        }
+
+    def _completed_chat_result(
+        self, receipt: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        human_message = next(
+            (
+                dict(message)
+                for message in self.messages
+                if message.get("id") == receipt["humanMessageId"]
+                and message.get("role") == "human"
+            ),
+            None,
+        )
+        brain_message = next(
+            (
+                dict(message)
+                for message in self.messages
+                if message.get("id") == receipt["brainMessageId"]
+                and message.get("role") == "brain"
+            ),
+            None,
+        )
+        trace = next(
+            (
+                dict(value)
+                for value in self.traces
+                if value.get("id") == receipt["traceId"]
+            ),
+            None,
+        )
+        if human_message is None or brain_message is None or trace is None:
+            raise RuntimeError("committed chat receipt references missing state")
+        if (
+            human_message.get("turn_id") != receipt["turnId"]
+            or brain_message.get("turn_id") != receipt["turnId"]
+            or trace.get("turn_id") != receipt["turnId"]
+            or hashlib.sha256(
+                str(human_message.get("content", "")).encode("utf-8")
+            ).hexdigest()
+            != receipt["inputSha256"]
+            or trace.get("input_sha256") != receipt["inputSha256"]
+            or trace.get("parameter_checksum_after")
+            != receipt["parameterChecksumAfter"]
+            or int(receipt["inferenceCount"])
+            > int(self.counters.get("inference_count", 0))
+        ):
+            raise RuntimeError("committed chat receipt binding diverged")
+        runtime_card = self.runtime_card()
+        runtime_card["available_tool_ids"] = list(
+            trace.get("available_tool_ids", [])
+        )
+        return {
+            "brainId": self.brain_id,
+            "text": str(brain_message.get("content", "")),
+            "response": str(brain_message.get("content", "")),
+            "content": str(brain_message.get("content", "")),
+            "humanMessage": human_message,
+            "message": brain_message,
+            "trace": trace,
+            "metrics": self.metrics(),
+            "runtimeCard": runtime_card,
+            "availableToolIds": list(trace.get("available_tool_ids", [])),
+            # Never replay a tool/action side effect after an acknowledgement
+            # was lost. The persisted trace remains the audit record.
+            "actions": [],
+            "turnReceipt": dict(receipt),
+            "turnCommitted": True,
+            "idempotentCompletion": True,
+        }
+
     def chat(
         self,
         text: str,
@@ -4756,12 +12241,35 @@ class AdaptiveBrain:
         stream_callback: Optional[
             Callable[[str, Dict[str, Any]], None]
         ] = None,
+        turn_id: str = "",
+        defer_slow_learning: bool = False,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         clean = text.replace("\x00", "").strip()
         if not clean:
             raise ValueError("chat input cannot be empty")
         if len(clean) > 1_000_000:
             raise ValueError("chat input is too large")
+
+        def cancellation_boundary() -> None:
+            if cancel_check is not None and cancel_check():
+                raise ChatGenerationCancelled("chat generation was cancelled")
+
+        cancellation_boundary()
+        turn_id = self._validated_chat_turn_id(turn_id)
+        input_sha256 = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+        if turn_id:
+            existing_receipt = next(
+                (
+                    receipt
+                    for receipt in reversed(self.completed_chat_turns)
+                    if receipt.get("turnId") == turn_id
+                    and receipt.get("inputSha256") == input_sha256
+                ),
+                None,
+            )
+            if existing_receipt is not None:
+                return self._completed_chat_result(existing_receipt)
         requested_generation_tokens = (
             max(1, int(max_new_tokens))
             if max_new_tokens is not None
@@ -4772,24 +12280,38 @@ class AdaptiveBrain:
         normalized_tools = self._normalize_tool_schemas(tool_schemas)
 
         cue = self.memory.vector_for_text(clean)
+        # Default speech is conditioned by the shared neural substrate and
+        # transient working activity. Exact episode keys and the separate
+        # sequence-statistical field must not act as an answer database.
         if self.config.vector_symbolic_memory:
             recalled_vector, recalled = self.memory.recall_vector(
-                cue, workspace_slots=self.config.working_memory_slots
+                cue,
+                workspace_slots=self.config.working_memory_slots,
+                record_activity=False,
             )
         else:
             recalled_vector, recalled = cue, []
         recall_audit = dict(self.memory._last_recall_audit)
-        experience = self.learn_experience(
-            clean,
-            kind="question" if clean.rstrip().endswith("?") else "experience",
-            source="conversation",
-            source_label="chat",
-            # Fast substrate/STDP activity happens before the decision. Slow
-            # shared-representation learning is committed after generation so
-            # the current action uses the previously persisted calibration.
-            steps=0,
-            importance=0.7,
-        )
+        transactional_generation = cancel_check is not None
+
+        def commit_fast_experience() -> Dict[str, Any]:
+            self.memory.record_recall_activity(recalled)
+            return self.learn_experience(
+                clean,
+                kind="experience",
+                source="conversation",
+                source_label="chat",
+                steps=0,
+                importance=0.7,
+            )
+
+        if transactional_generation:
+            # A cancelled decode must not admit an incomplete turn to memory.
+            experience = self._preview_chat_experience(clean, cue, recalled)
+        else:
+            # Preserve the original organic path for mutable/associative chat:
+            # valid fast activity participates in its own action decision.
+            experience = commit_fast_experience()
         recall_model = self._idea_model_vector(recalled_vector)
         tool_model = self._tool_schema_vector(normalized_tools)
         working_model = self._working_memory_vector()
@@ -4828,7 +12350,7 @@ class AdaptiveBrain:
         prompt_token_hash = self._token_sequence_hash(
             prompt_ids[0].tolist()
         )
-        self.current_context = {
+        pending_current_context = {
             "tokenCount": int(prompt_ids.shape[1]),
             "tokenHash": prompt_token_hash,
             "recentTokenCount": len(self.recent_token_context),
@@ -4838,6 +12360,9 @@ class AdaptiveBrain:
             "sensorySlots": 0,
             "updatedAt": _iso_now(),
         }
+        if not transactional_generation:
+            self.current_context = pending_current_context
+        decoder_training_before_generation = bool(self.decoder.training)
         self.decoder.eval()
         with torch.no_grad():
             # This is the exact deployed action route: the complete bounded
@@ -4882,6 +12407,7 @@ class AdaptiveBrain:
         )
         training_loss = decision_prediction_loss
         prediction_error = training_loss / (1.0 + abs(training_loss))
+        experience["retention_prediction_error"] = prediction_error
         novelty = float(experience["novelty"])
         learning_progress = self._organic_state()["learningProgress"]
         curiosity = max(
@@ -4905,10 +12431,10 @@ class AdaptiveBrain:
                 + 0.14 * max(0.0, liquid_ponder - 1.0),
             ),
         )
-        generation_tokens = (
-            requested_generation_tokens
-            if requested_generation_tokens is not None
-            else self.config.generation_token_budget(compute_demand)
+        generation_tokens, generation_budget = self._response_generation_budget(
+            clean,
+            cognitive_demand=compute_demand,
+            caller_limit=requested_generation_tokens,
         )
         ponder_factors = {
             "liquid": liquid_ponder,
@@ -4918,7 +12444,7 @@ class AdaptiveBrain:
             "learningProgress": learning_progress,
             "curiosity": curiosity,
         }
-        ponder_steps = max(
+        ponder_pass_budget = max(
             1,
             int(
                 round(
@@ -4939,11 +12465,100 @@ class AdaptiveBrain:
                 * float(experience["liquid_controls"]["noise_scale"]),
             ),
         )
-        candidates = []
-        # Candidate computation has no fixed "parallel thoughts" or hardware
-        # branch ceiling. Neural energy is derived from the current organic
-        # state and working workspace, then spent until activity converges or
-        # the host reserve reports pressure.
+        with torch.no_grad():
+            expert_route = (
+                routing_output["expert_routing"][0].detach().cpu().tolist()
+                if "expert_routing" in routing_output
+                else []
+            )
+            action_state = {
+                "novelty": novelty,
+                "uncertainty": uncertainty,
+                "predictionError": prediction_error,
+                "learningProgress": learning_progress,
+                "curiosity": curiosity,
+                "computeDemand": compute_demand,
+                "organicNoise": organic_noise,
+                "branches": 1,
+            }
+            active_assemblies = [
+                str(experience.get("assembly_id", experience["idea_id"]))
+            ]
+            active_assemblies.extend(
+                str(item["idea_id"])
+                for item in recalled
+                if str(item.get("idea_id", "")) not in active_assemblies
+            )
+            action_scores, proposed_actions = self._select_structured_actions(
+                0.35 * language_action_logits
+                + 0.65 * internal_action_logits,
+                schemas=normalized_tools,
+                input_text=clean,
+                assembly_ids=active_assemblies,
+                organic_state=action_state,
+                supporting_action_logits=(
+                    language_action_logits,
+                    internal_action_logits,
+                ),
+                neural_state=action_cue,
+            )
+
+        # Measure only neural selection/decoding (including deterministic
+        # visible-stream replay), not learning committed after the response.
+        # The measurement is operational state and never model-facing text.
+        generation_started_at = time.perf_counter()
+        candidates: List[Dict[str, Any]] = []
+        native_ponder_trace: Dict[str, Any] = {
+            "activated": False,
+            "activated_by": "inactive",
+            "passes": 0,
+            "converged": False,
+            "stop_reason": "not-selected",
+            "initial_score": float(action_scores.get("ponder", 0.0)),
+            "final_delta": 0.0,
+            "elapsed_ms": 0.0,
+            "seed": int(seed),
+            "router_steps": 0,
+            "memory_bias_delta": 0.0,
+            "phase": "pre-speech",
+            "private": True,
+            "visibleMagicTags": False,
+        }
+        ponder_steps = 0
+
+
+
+        native_ponder_action = next(
+            (action for action in proposed_actions if action.get("kind") == "ponder"),
+            None,
+        )
+        if native_ponder_action is not None and not any(
+            action.get("kind") == "stop" for action in proposed_actions
+        ):
+            try:
+                internal_memory, native_ponder_trace = self._native_pre_speech_ponder(
+                    combined_memory,
+                    internal_memory,
+                    seed=int(seed),
+                    confidence=float(native_ponder_action.get("confidence", 0.0)),
+                    pass_budget=ponder_pass_budget,
+                    resource_budget_ms=max(
+                        250, min(10_000, int(500 + 3500 * compute_demand))
+                    ),
+                    noise=organic_noise,
+                    cancel_check=cancel_check,
+                )
+            except Exception:
+                self.decoder.train(decoder_training_before_generation)
+                raise
+            ponder_steps = int(native_ponder_trace["passes"])
+            arguments = native_ponder_action.setdefault("arguments", {})
+            arguments["completedInTurn"] = True
+            arguments["ponderTrace"] = dict(native_ponder_trace)
+        # Candidate computation has no fixed "parallel thoughts" or
+        # hardware branch ceiling. Neural energy is derived from the
+        # current organic state and working workspace, then spent until
+        # activity converges or the host reserve reports pressure.
         remaining_neural_energy = max(
             1.0,
             1.0
@@ -4954,6 +12569,7 @@ class AdaptiveBrain:
         best_score = -float("inf")
         score_change = float("inf")
         while remaining_neural_energy > 0.0:
+            cancellation_boundary()
             branch_seed = int(seed) + branch * 7919
             candidate, branch_entropies = self.decoder.generate(
                 prompt_ids,
@@ -4964,7 +12580,9 @@ class AdaptiveBrain:
                 noise=organic_noise * (1.0 + 0.04 * ponder_steps),
                 seed=branch_seed,
                 printable_only=True,
+                cancelled=cancel_check,
             )
+            cancellation_boundary()
             nll = self._candidate_nll(
                 prompt_ids, candidate, internal_memory
             )
@@ -4988,10 +12606,13 @@ class AdaptiveBrain:
                     "selfNll": nll,
                     "entropy": entropy,
                     "score": intrinsic_score,
+                    "backend": "mutable-omni-decoder",
                 }
             )
             improvement = intrinsic_score - best_score
-            score_change = abs(improvement) if math.isfinite(best_score) else float("inf")
+            score_change = (
+                abs(improvement) if math.isfinite(best_score) else float("inf")
+            )
             best_score = max(best_score, intrinsic_score)
             normalized_entropy = max(0.0, min(4.0, entropy)) / 4.0
             remaining_neural_energy -= (
@@ -5000,15 +12621,8 @@ class AdaptiveBrain:
                 + 0.20 * max(0.0, 1.0 - compute_demand)
             )
             branch += 1
-
-            # Settling is based on measured candidate change, not a count.
-            convergence_floor = 0.0025 * (
-                1.0 + abs(best_score)
-            )
-            if (
-                len(candidates) > 1
-                and score_change <= convergence_floor
-            ):
+            convergence_floor = 0.0025 * (1.0 + abs(best_score))
+            if len(candidates) > 1 and score_change <= convergence_floor:
                 break
             readings = self._resource_readings()
             disk_free = readings.get("diskFreeBytes")
@@ -5022,36 +12636,8 @@ class AdaptiveBrain:
             ):
                 break
         branch_count = len(candidates)
-        selected_branch = max(
-            range(len(candidates)), key=lambda index: candidates[index]["score"]
-        )
-        selected = candidates[selected_branch]
-        generated = selected["tensor"]
-        entropies = selected["entropies"]
+        action_state["branches"] = branch_count
         with torch.no_grad():
-            expert_route = (
-                routing_output["expert_routing"][0].detach().cpu().tolist()
-                if "expert_routing" in routing_output
-                else []
-            )
-            action_state = {
-                "novelty": novelty,
-                "uncertainty": uncertainty,
-                "predictionError": prediction_error,
-                "learningProgress": learning_progress,
-                "curiosity": curiosity,
-                "computeDemand": compute_demand,
-                "organicNoise": organic_noise,
-                "branches": branch_count,
-            }
-            active_assemblies = [
-                str(experience.get("assembly_id", experience["idea_id"]))
-            ]
-            active_assemblies.extend(
-                str(item["idea_id"])
-                for item in recalled
-                if str(item.get("idea_id", "")) not in active_assemblies
-            )
             action_scores, proposed_actions = self._select_structured_actions(
                 0.35 * language_action_logits
                 + 0.65 * internal_action_logits,
@@ -5059,7 +12645,28 @@ class AdaptiveBrain:
                 input_text=clean,
                 assembly_ids=active_assemblies,
                 organic_state=action_state,
+                supporting_action_logits=(
+                    language_action_logits,
+                    internal_action_logits,
+                ),
+                neural_state=action_cue,
             )
+        if native_ponder_action is not None and native_ponder_trace["activated"]:
+            # The final branch-aware materialization must preserve the
+            # already completed action, not schedule post-response idle
+            # rehearsal or lose evidence of this turn's actual work.
+            proposed_actions = [
+                action for action in proposed_actions
+                if action.get("kind") != "ponder"
+            ]
+            proposed_actions.append(native_ponder_action)
+        selected_branch = max(
+            range(len(candidates)),
+            key=lambda index: candidates[index]["score"],
+        )
+        selected = candidates[selected_branch]
+        generated = selected["tensor"]
+        entropies = selected["entropies"]
 
         if stream_callback is not None:
             for action in proposed_actions:
@@ -5086,9 +12693,9 @@ class AdaptiveBrain:
                         },
                     )
 
-            # Candidate selection remains private neural computation. Replay
-            # the chosen deterministic branch once so the visible stream is
-            # exactly the committed response rather than a discarded branch.
+            # Candidate selection remains private neural computation.
+            # Replay the chosen deterministic branch once so the visible
+            # stream is exactly the committed response.
             replayed, replay_entropies = self.decoder.generate(
                 prompt_ids,
                 memory_bias=internal_memory,
@@ -5099,7 +12706,9 @@ class AdaptiveBrain:
                 seed=int(selected["seed"]),
                 printable_only=True,
                 token_callback=stream_token,
+                cancelled=cancel_check,
             )
+            cancellation_boundary()
             if not torch.equal(replayed, generated):
                 raise RuntimeError(
                     "deterministic selected-branch replay diverged"
@@ -5107,15 +12716,79 @@ class AdaptiveBrain:
             generated = replayed
             entropies = replay_entropies
 
-        new_ids = generated[0, prompt_ids.shape[1] :].detach().cpu().tolist()
+        new_ids = generated[
+            0, prompt_ids.shape[1] :
+        ].detach().cpu().tolist()
+        generated_token_count = len(new_ids)
         response = self.tokenizer.decode(new_ids).strip()
         if not response:
-            # The first generated byte is constrained to visible ASCII, so this
-            # only covers a pathological tokenizer/checkpoint corruption case.
-            response = self.tokenizer.decode(new_ids, skip_special=False) or "?"
+            response = (
+                self.tokenizer.decode(new_ids, skip_special=False) or "?"
+            )
 
+        generation_stop_reason = (
+            "token-budget"
+            if generated_token_count >= generation_tokens
+            else "learned-boundary"
+        )
+        generation_budget_truncated = bool(
+            generation_stop_reason == "token-budget"
+            and generated_token_count >= generation_tokens
+        )
+
+        if stream_callback is not None:
+            cancellation_boundary()
+            # Visible decoding is finished, but the human/brain pair is not an
+            # authoritative turn until the immediate neural updates and atomic
+            # checkpoint below succeed. This phase lets the desktop stop its
+            # token cursor and accept queued input without mislabeling the turn
+            # as committed.
+            try:
+                stream_callback(
+                    "phase",
+                    {
+                        "phase": "reply-complete-learning",
+                        "replyComplete": True,
+                        "turnCommitted": False,
+                        "learning": True,
+                        "saving": True,
+                    },
+                )
+            except Exception:
+                self.decoder.train(decoder_training_before_generation)
+                raise
+
+        cancellation_boundary()
+        if transactional_generation:
+            # Generation and the visible stream have succeeded. The exact
+            # fast experience can now enter substrate/STDP/working memory;
+            # slow shared-representation learning remains transactional below.
+            experience = commit_fast_experience()
+            self.current_context = pending_current_context
+
+        generation_elapsed_seconds = max(
+            1e-9, time.perf_counter() - generation_started_at
+        )
+        generation_tokens_per_second = (
+            float(generated_token_count) / generation_elapsed_seconds
+        )
+
+        # A brain's own same-turn output is not independent teaching evidence.
+        # The full user experience always learns, while generated speech must
+        # receive later feedback/evidence before it can become a target. This
+        # prevents fluent mistakes and native-model nonsense from reinforcing
+        # themselves without imposing a behavioral preference objective.
+        generated_response_supervision_eligible = False
+        generated_response_exclusion_reason = (
+            "truncated-neural-or-token-budget-response"
+            if generation_budget_truncated
+            else "same-turn-generated-output-awaits-independent-evidence"
+        )
         own_training = None
-        if self.config.learn_from_own_messages:
+        if (
+            self.config.learn_from_own_messages
+            and generated_response_supervision_eligible
+        ):
             own_training = self.learn_experience(
                 response,
                 kind="experience",
@@ -5125,9 +12798,14 @@ class AdaptiveBrain:
                 importance=0.35,
             )
         pair_training = None
+        # The unconditional fast update above already admitted the complete
+        # experience to the shared substrate and STDP pathways. Do not create
+        # a second cue-to-token answer index from the chat turn.
         action_calibration = None
         slow_mutation_requested = bool(
-            self.config.online_learning and int(self.config.online_steps) > 0
+            not defer_slow_learning
+            and self.config.online_learning
+            and int(self.config.online_steps) > 0
         )
         slow_mutation_applied = False
         slow_mutation_rolled_back = False
@@ -5135,7 +12813,12 @@ class AdaptiveBrain:
         slow_mutation_stage = "disabled"
         slow_parameter_checksum_before = self._slow_parameter_checksum()
         slow_parameter_checksum_after = slow_parameter_checksum_before
+        cortical_parameter_checksum_before = None
+        cortical_parameter_checksum_after = None
         if slow_mutation_requested:
+            cortical_parameter_checksum_before = (
+                self._cortical_parameter_checksum()
+            )
             slow_snapshot = self._snapshot_slow_transaction_state()
             pre_slow_training = copy.deepcopy(experience["training"])
             slow_parameter_checksum_before = str(slow_snapshot["checksum"])
@@ -5147,13 +12830,14 @@ class AdaptiveBrain:
                     steps=int(self.config.online_steps),
                 )
                 slow_mutation_stage = "dialogue-learning"
-                pair_training = self._optimize_dialogue_pair(
-                    clean, response, cue, steps=1
-                )
+                if generated_response_supervision_eligible:
+                    pair_training = self._optimize_dialogue_pair(
+                        clean, response, cue, steps=1
+                    )
                 # The current turn and optional self-response entered fast
                 # neural state before action selection with steps=0. Defer
                 # topology growth until the full slow update is available for
-                # starter-policy retention to validate atomically.
+                # native action-path retention to validate atomically.
                 slow_mutation_stage = "expert-growth"
                 experience["grew_expert"] = self._maybe_grow(
                     float(experience["novelty"]),
@@ -5164,7 +12848,7 @@ class AdaptiveBrain:
                         float(own_training["novelty"]),
                         own_training["idea"][0],
                     )
-                if self._can_retain_bundled_action_policy():
+                if self._can_retain_native_action_policy():
                     # Recompute this exact runtime route once after the shared
                     # representation mutation. Retention then revalidates every
                     # bundled trajectory against current neural representations
@@ -5209,7 +12893,7 @@ class AdaptiveBrain:
                             post_routing_output["hidden"][:, -1]
                             + 0.5 * post_action_cue
                         )
-                    action_calibration = self._retain_starter_action_policy(
+                    action_calibration = self._retain_native_action_policy(
                         pre_language_logits=language_action_logits,
                         pre_internal_logits=internal_action_logits,
                         pre_action_emitted=bool(proposed_actions),
@@ -5223,7 +12907,7 @@ class AdaptiveBrain:
                         or bool(action_calibration.get("rolledBack"))
                     ):
                         raise RuntimeError(
-                            "starter action retention rejected the slow mutation"
+                            "native action retention rejected the slow mutation"
                         )
                 slow_mutation_stage = "committed"
                 slow_mutation_applied = True
@@ -5272,6 +12956,9 @@ class AdaptiveBrain:
                         "failure": str(error)[:240],
                     }
             slow_parameter_checksum_after = self._slow_parameter_checksum()
+            cortical_parameter_checksum_after = (
+                self._cortical_parameter_checksum()
+            )
 
         after_checksum = self.parameter_checksum()
         delta_norm = self._parameter_delta_norm(before_parameters)
@@ -5282,14 +12969,29 @@ class AdaptiveBrain:
             "role": "human",
             "content": clean,
             "created_at": now,
+            "attention_epoch": self._attention_epoch(),
+            **({"turn_id": turn_id} if turn_id else {}),
         }
         assistant_message = {
             "id": uuid.uuid4().hex,
             "role": "brain",
             "content": response,
             "created_at": _iso_now(),
+            "attention_epoch": self._attention_epoch(),
+            **({"turn_id": turn_id} if turn_id else {}),
         }
         self.messages.extend([user_message, assistant_message])
+        queued_slow_learning = None
+        if defer_slow_learning:
+            queued_slow_learning = self._enqueue_chat_slow_learning(
+                turn_id=turn_id or str(user_message["id"]),
+                input_sha256=input_sha256,
+                human_message_id=str(user_message["id"]),
+                experience=experience,
+            )
+            if queued_slow_learning is not None:
+                slow_mutation_requested = True
+                slow_mutation_stage = "queued-background"
         self._append_recent_dialogue(clean, response)
         self.current_context.update(
             {
@@ -5303,19 +13005,215 @@ class AdaptiveBrain:
         train_loss = float(experience["training"]["loss"])
         if pair_training is not None:
             train_loss = (train_loss + float(pair_training["loss"])) / 2.0
+
+        # A trace is a bag of measured mechanisms from this turn, not a
+        # numbered story that implies every chat traversed the same stages.
+        # Core observations are always recorded; optional mechanisms appear
+        # only when their activation, mutation, rollback, or gate was measured.
+        measured_mechanisms: List[Dict[str, str]] = [
+            {
+                "stage": "input-boundary",
+                "detail": (
+                    "Encoded the current turn plus explicit bounded recent "
+                    "dialogue at the UTF-8 token boundary."
+                ),
+                "value": "%d tokens" % prompt_ids.shape[1],
+            },
+            {
+                "stage": "recurrent-recall",
+                "detail": (
+                    "Settled signed recurrent activation using exact ternary "
+                    "synapse contributions; inhibitory pathways competed "
+                    "without using latent master magnitude, and no remembered "
+                    "source text entered the token stream."
+                ),
+                "value": (
+                    "%d active, %d inhibited signals, %d settling rounds"
+                    % (
+                        len(recalled),
+                        int(recall_audit.get("inhibitorySignals", 0)),
+                        int(recall_audit.get("settledRounds", 0)),
+                    )
+                ),
+            },
+            {
+                "stage": "active-context",
+                "detail": (
+                    "Used the explicit bounded recent-dialogue token ring "
+                    "and blended recurrent activity vectors; no long-term "
+                    "source, behavioral prompt, or tool-schema prose was "
+                    "added."
+                    if working_model is not None
+                    else (
+                        "Used only the explicit bounded recent-dialogue "
+                        "token ring; recurrent-vector injection is disabled."
+                    )
+                ),
+                "value": (
+                    "%d recent tokens, %d active vectors"
+                    % (len(recent_prompt_tokens), working_memory_used)
+                    if working_model is not None
+                    else "%d recent tokens" % len(recent_prompt_tokens)
+                ),
+            },
+        ]
+        if normalized_tools:
+            measured_mechanisms.append(
+                {
+                    "stage": "capability-conditioning",
+                    "detail": (
+                        "Encoded enabled tool IDs and actions through the "
+                        "neural capability channel; no schema text was added "
+                        "to prompt tokens."
+                    ),
+                    "value": "%d available tools" % len(normalized_tools),
+                }
+            )
+        measured_ponder_passes = int(ponder_steps)
+        measured_ponder_activated = bool(native_ponder_trace["activated"])
+        if measured_ponder_activated or measured_ponder_passes > 0:
+            measured_mechanisms.append(
+                {
+                    "stage": "recurrent-refinement",
+                    "detail": (
+                        "Ran private recurrent refinement selected by the "
+                        "learned action route or measured neural uncertainty; "
+                        "only operational convergence metrics are exposed."
+                        if measured_ponder_passes > 0
+                        else "Selected private recurrent refinement, but the "
+                        "resource gate allowed no passes; no refinement is "
+                        "claimed."
+                    ),
+                    "value": "%d native pre-speech passes; %s"
+                    % (measured_ponder_passes, native_ponder_trace["stop_reason"]),
+                }
+            )
+        generation_backend = "mutable-omni-decoder"
+        measured_mechanisms.append(
+            {
+                "stage": "response-decoding",
+                "detail": "Decoded through the mutable Omni byte cortex.",
+                "value": generation_backend,
+            }
+        )
+        stdp_update = float(experience["spiking"]["stdp_update"])
+        spike_rate = float(experience["spiking"]["spike_rate"])
+        if abs(stdp_update) > 0.0 or abs(spike_rate) > 0.0:
+            measured_mechanisms.append(
+                {
+                    "stage": "connection-learning",
+                    "detail": (
+                        "Measured local spike-timing-dependent synaptic "
+                        "activity for this turn."
+                    ),
+                    "value": "%.6f L1 update" % stdp_update,
+                }
+            )
+        if slow_mutation_requested:
+            measured_mechanisms.append(
+                {
+                    "stage": "slow-adaptation",
+                    "detail": (
+                        "Updated ternary decoder and idea-adapter master "
+                        "parameters and committed the validated transaction."
+                        if slow_mutation_applied
+                        else (
+                            "Queued this fast episode for priority-driven "
+                            "cortical replay; the atomic candidate update "
+                            "runs in preemptible background work."
+                            if slow_mutation_stage == "queued-background"
+                            else (
+                            "Attempted the slow neural update, then restored "
+                            "all slow parameters, expert topology, optimizer, "
+                            "metaplastic state, and counters after validation "
+                            "failed. Fast substrate and working-memory state "
+                            "from the turn remain active."
+                            )
+                        )
+                    ),
+                    "value": (
+                        "loss %.6f" % train_loss
+                        if slow_mutation_applied
+                        else (
+                            "priority %.6f"
+                            % float(queued_slow_learning.get("priority", 0.0))
+                            if slow_mutation_stage == "queued-background"
+                            and queued_slow_learning is not None
+                            else "rolled back at %s"
+                            % (
+                                slow_mutation_failure.get("stage", "unknown")
+                                if slow_mutation_failure is not None
+                                else "unknown"
+                            )
+                        )
+                    ),
+                }
+            )
+        if pair_training is not None or not generated_response_supervision_eligible:
+            measured_mechanisms.append(
+                {
+                    "stage": "dialogue-supervision-gate",
+                    "detail": (
+                        "Trained and committed human-to-brain role-boundary "
+                        "prediction."
+                        if pair_training is not None
+                        else (
+                            "The generated response was excluded from self and "
+                            "dialogue supervision "
+                            "until independent evidence is available."
+                        )
+                    ),
+                    "value": (
+                        "loss %.6f" % pair_training["loss"]
+                        if pair_training is not None
+                        else generated_response_exclusion_reason
+                    ),
+                }
+            )
+        measured_mechanisms.append(
+            {
+                "stage": "response-generation",
+                "detail": (
+                    "Sampled from the brain's mutable decoder with "
+                    "liquid-controlled noise."
+                ),
+                "value": (
+                    "%d generated tokens in %.1f ms (%.2f tokens/s)"
+                    % (
+                        generated_token_count,
+                        generation_elapsed_seconds * 1000.0,
+                        generation_tokens_per_second,
+                    )
+                ),
+            }
+        )
         trace = {
             "id": uuid.uuid4().hex,
             "created_at": _iso_now(),
+            "attention_epoch": self._attention_epoch(),
             "seed": int(seed),
-            "input_sha256": hashlib.sha256(clean.encode("utf-8")).hexdigest(),
+            "input_sha256": input_sha256,
+            **({"turn_id": turn_id} if turn_id else {}),
             "textual_memory_injected": False,
             "long_term_source_text_injected": False,
+            "generated_response_supervision": {
+                "eligible": generated_response_supervision_eligible,
+                "policy": "independent-evidence-required",
+                "selfExperienceApplied": own_training is not None,
+                "dialogueUpdateApplied": pair_training is not None,
+                "exclusionReason": generated_response_exclusion_reason,
+            },
             "tool_schema_text_injected": False,
             "hidden_prompt_text_expanded": False,
             "prompt_text_expanded": bool(recent_prompt_tokens),
             "prompt_token_count": int(prompt_ids.shape[1]),
             "recent_dialogue_context_injected": bool(recent_prompt_tokens),
             "recent_dialogue_token_count": len(recent_prompt_tokens),
+            "fresh_attention_boundary": (
+                None
+                if self.fresh_attention_boundary is None
+                else dict(self.fresh_attention_boundary)
+            ),
             "recent_dialogue_token_ids_sha256": self._token_sequence_hash(
                 recent_prompt_tokens
             ),
@@ -5324,11 +13222,21 @@ class AdaptiveBrain:
             ],
             "working_context_capacity_tokens": self.config.max_seq_len,
             "generation_budget_tokens": generation_tokens,
-            "generation_budget_source": (
-                "caller"
-                if requested_generation_tokens is not None
-                else "hardware-and-organic-state"
-            ),
+            "generation_budget_source": generation_budget["source"],
+            "generation_budget_state_ceiling_tokens": generation_budget[
+                "stateCeilingTokens"
+            ],
+            "generation_budget_caller_ceiling_tokens": generation_budget[
+                "callerCeilingTokens"
+            ],
+            "generation_budget_explicit_constraint": generation_budget[
+                "explicitConstraint"
+            ],
+            "generation_budget_state_length_head": generation_budget[
+                "stateLengthHead"
+            ],
+            "generation_stop_reason": generation_stop_reason,
+            "generation_budget_truncated": generation_budget_truncated,
             "prompt_token_ids_sha256": prompt_token_hash,
             "available_tool_ids": [
                 schema["id"] for schema in normalized_tools
@@ -5354,6 +13262,7 @@ class AdaptiveBrain:
             "parameter_delta_norm": delta_norm,
             "stdp_update": float(experience["spiking"]["stdp_update"]),
             "spike_rate": float(experience["spiking"]["spike_rate"]),
+            "memory_settling": dict(experience["memory_settling"]),
             "liquid_controls": experience["liquid_controls"],
             "recalled_idea_ids": [
                 item["idea_id"] for item in recalled
@@ -5379,13 +13288,45 @@ class AdaptiveBrain:
             "slow_mutation_rolled_back": slow_mutation_rolled_back,
             "slow_mutation_stage": slow_mutation_stage,
             "slow_mutation_failure": slow_mutation_failure,
+            "slow_learning_job": (
+                dict(queued_slow_learning)
+                if queued_slow_learning is not None
+                else None
+            ),
             "slow_parameter_checksum_before": (
                 slow_parameter_checksum_before
             ),
             "slow_parameter_checksum_after": slow_parameter_checksum_after,
+            "cortical_parameter_checksum_before": (
+                cortical_parameter_checksum_before
+            ),
+            "cortical_parameter_checksum_after": (
+                cortical_parameter_checksum_after
+            ),
+            "cortical_parameters_updated": (
+                cortical_parameter_checksum_before is not None
+                and cortical_parameter_checksum_after is not None
+                and
+                cortical_parameter_checksum_before
+                != cortical_parameter_checksum_after
+            ),
+            "response_mode": "neural-generation",
+            "response_quality_assessed": False,
+            "response_quality_passed": None,
             "generation_entropy": (
                 sum(entropies) / len(entropies) if entropies else 0.0
             ),
+            "generation_elapsed_ms": generation_elapsed_seconds * 1000.0,
+            "generated_token_count": int(generated_token_count),
+            "generation_tokens_per_second": generation_tokens_per_second,
+            "generation_measurement_scope": (
+                "neural-selection-decode-and-visible-stream-replay"
+            ),
+            "generation_backend": generation_backend,
+            "generation_cache_mode": str(
+                getattr(self.decoder, "last_generation_cache_mode", "unknown")
+            ),
+            "ponder": dict(native_ponder_trace),
             "ponder_steps": ponder_steps,
             "ponder_factors": ponder_factors,
             "organic_state": action_state,
@@ -5406,6 +13347,12 @@ class AdaptiveBrain:
             "action_policy_deployed_confidence": max(
                 action_scores.values()
             ),
+            "action_policy_tool_support_evidence": [
+                dict(action["supportEvidence"])
+                for action in proposed_actions
+                if isinstance(action.get("supportEvidence"), Mapping)
+            ],
+            "tool_route_evidence": getattr(self, "_last_tool_route_evidence", None),
             "action_policy_synthetic_guarantee": False,
             "proposed_action_kinds": [
                 action["kind"] for action in proposed_actions
@@ -5417,133 +13364,14 @@ class AdaptiveBrain:
                     "selfNll": candidate["selfNll"],
                     "entropy": candidate["entropy"],
                     "intrinsicScore": candidate["score"],
+                    "backend": candidate.get("backend"),
+                    "quality": candidate.get("quality"),
                 }
                 for index, candidate in enumerate(candidates)
             ],
             "selected_branch": selected_branch,
-            "steps": [
-                {
-                    "stage": "encode",
-                    "detail": (
-                        "Encoded the current turn plus explicit bounded recent "
-                        "dialogue at the UTF-8 token boundary."
-                    ),
-                    "value": "%d tokens" % prompt_ids.shape[1],
-                },
-                {
-                    "stage": "idea-memory",
-                    "detail": (
-                        "Settled signed recurrent activation using exact ternary "
-                        "synapse contributions; inhibitory pathways competed "
-                        "without using latent master magnitude, and no remembered "
-                        "source text entered the token stream."
-                    ),
-                    "value": (
-                        "%d active, %d inhibited signals, %d settling rounds"
-                        % (
-                            len(recalled),
-                            int(recall_audit.get("inhibitorySignals", 0)),
-                            int(recall_audit.get("settledRounds", 0)),
-                        )
-                    ),
-                },
-                {
-                    "stage": "working-memory",
-                    "detail": (
-                        "Used the explicit bounded recent-dialogue token ring "
-                        "and blended recurrent activity vectors; no long-term "
-                        "source, behavioral prompt, or tool-schema prose was "
-                        "added."
-                        if working_model is not None
-                        else (
-                            "Used only the explicit bounded recent-dialogue "
-                            "token ring; recurrent-vector injection is disabled."
-                        )
-                    ),
-                    "value": (
-                        "%d recent tokens, %d active vectors"
-                        % (len(recent_prompt_tokens), working_memory_used)
-                        if working_model is not None
-                        else "%d recent tokens" % len(recent_prompt_tokens)
-                    ),
-                },
-                {
-                    "stage": "tool-schema",
-                    "detail": (
-                        "Encoded enabled tool IDs and actions through the "
-                        "neural capability channel; no schema text was added to "
-                        "prompt tokens."
-                    ),
-                    "value": "%d available tools" % len(normalized_tools),
-                },
-                {
-                    "stage": "plasticity",
-                    "detail": "Applied local spike-timing-dependent synaptic updates.",
-                    "value": "%.6f L1 update" % experience["spiking"]["stdp_update"],
-                },
-                {
-                    "stage": "slow-learning",
-                    "detail": (
-                        "Updated ternary decoder and idea-consolidation master "
-                        "parameters and committed the validated transaction."
-                        if slow_mutation_applied
-                        else (
-                            "Attempted the slow neural update, then restored "
-                            "all slow parameters, expert topology, optimizer, "
-                            "metaplastic state, and counters after validation "
-                            "failed. Fast substrate and working-memory state "
-                            "from the turn remain active."
-                            if slow_mutation_rolled_back
-                            else (
-                                "Online slow learning was disabled; no slow "
-                                "decoder or consolidation parameter was updated."
-                            )
-                        )
-                    ),
-                    "value": (
-                        "loss %.6f" % train_loss
-                        if slow_mutation_applied
-                        else (
-                            "rolled back at %s"
-                            % (
-                                slow_mutation_failure.get("stage", "unknown")
-                                if slow_mutation_failure is not None
-                                else "unknown"
-                            )
-                            if slow_mutation_rolled_back
-                            else "online_steps=0; no slow parameter update"
-                        )
-                    ),
-                },
-                {
-                    "stage": "dialogue-learning",
-                    "detail": (
-                        "Learned and committed the completed human-to-brain "
-                        "role-boundary sequence."
-                        if pair_training is not None
-                        else (
-                            "The attempted dialogue update was rolled back with "
-                            "the enclosing slow-learning transaction."
-                            if slow_mutation_rolled_back
-                            else "Online slow dialogue learning was disabled."
-                        )
-                    ),
-                    "value": (
-                        "loss %.6f" % pair_training["loss"]
-                        if pair_training is not None
-                        else (
-                            "rolled back"
-                            if slow_mutation_rolled_back
-                            else "online_steps=0; no dialogue parameter update"
-                        )
-                    ),
-                },
-                {
-                    "stage": "generation",
-                    "detail": "Sampled from the brain's own decoder with liquid-controlled noise.",
-                    "value": "%d generated tokens" % len(new_ids),
-                },
-            ],
+            "mechanism_order": "event-derived-unordered",
+            "steps": measured_mechanisms,
             "note": (
                 "Operational trace of measured activations and mutations; it is "
                 "not a hidden chain-of-thought transcript."
@@ -5561,24 +13389,67 @@ class AdaptiveBrain:
                 "spikeRate": trace["spike_rate"],
                 "trainLoss": trace["train_loss"],
                 "availableToolIds": trace["available_tool_ids"],
+                **({"turnId": turn_id} if turn_id else {}),
             },
         )
-        self.save()
+        turn_receipt: Optional[Dict[str, Any]] = None
+        if turn_id:
+            turn_receipt = {
+                "format": CHAT_TURN_RECEIPT_FORMAT,
+                "formatVersion": 1,
+                "turnId": turn_id,
+                "inputSha256": input_sha256,
+                "humanMessageId": str(user_message["id"]),
+                "brainMessageId": str(assistant_message["id"]),
+                "traceId": str(trace["id"]),
+                "inferenceCount": int(self.counters["inference_count"]),
+                "parameterChecksumAfter": str(
+                    trace["parameter_checksum_after"]
+                ),
+                "committedAt": _iso_now(),
+            }
+            self.completed_chat_turns.append(turn_receipt)
+            self.completed_chat_turns = self.completed_chat_turns[
+                -COMPLETED_CHAT_TURN_RECEIPTS:
+            ]
+        try:
+            self.save()
+        except Exception:
+            if turn_receipt is not None:
+                self.completed_chat_turns = [
+                    value
+                    for value in self.completed_chat_turns
+                    if value is not turn_receipt
+                ]
+            raise
         runtime_card = self.runtime_card()
         runtime_card["available_tool_ids"] = trace["available_tool_ids"]
         runtime_card["tool_schema_channel"] = trace["tool_schema_channel"]
         runtime_card["tool_schema_text_injected"] = False
+        runtime_card["measured_generation"] = {
+            "elapsedMs": trace["generation_elapsed_ms"],
+            "generatedTokens": trace["generated_token_count"],
+            "tokensPerSecond": trace["generation_tokens_per_second"],
+            "scope": trace["generation_measurement_scope"],
+            "cacheMode": trace["generation_cache_mode"],
+        }
         return {
             "brainId": self.brain_id,
             "text": response,
             "response": response,
             "content": response,
+            "humanMessage": user_message,
             "message": assistant_message,
             "trace": trace,
             "metrics": self.metrics(),
             "runtimeCard": runtime_card,
             "availableToolIds": trace["available_tool_ids"],
             "actions": proposed_actions,
+            "turnReceipt": (
+                dict(turn_receipt) if turn_receipt is not None else None
+            ),
+            "turnCommitted": True,
+            "idempotentCompletion": False,
         }
 
     @torch.no_grad()
@@ -5602,7 +13473,10 @@ class AdaptiveBrain:
         for ids in self.tokenizer.window_tensors(
             text,
             self.device,
-            max_length=self.config.max_seq_len,
+            max_length=min(
+                self.config.max_seq_len,
+                self._runtime_training_max_seq_len,
+            ),
             add_bos=True,
             add_eos=True,
         ):
@@ -5620,6 +13494,14 @@ class AdaptiveBrain:
         _load_prefixed(self.idea_adapter, tensors, "idea_adapter.")
         _load_prefixed(self.liquid, tensors, "liquid.")
         _load_prefixed(self.modalities, tensors, "modalities.")
+        # Core candidate rollback also rolls back every checkpointed row
+        # resistance buffer. Discard pending mutation counters from the
+        # rejected branch so they cannot later be reported as accepted
+        # metaplastic learning.
+        for root in self._trainable_modules():
+            for module in root.modules():
+                if hasattr(module, "_pending_stability_events"):
+                    module._pending_stability_events = 0
 
     def train(
         self,
@@ -5632,24 +13514,73 @@ class AdaptiveBrain:
         epochs = int(epochs)
         if epochs < 1:
             raise ValueError("epochs must be positive")
-        samples = [
-            text.replace("\x00", "")
-            for text in (texts or [])
-            if isinstance(text, str) and text.strip()
-        ]
-        selected = set(source_ids or [])
+        if isinstance(texts, (str, bytes)):
+            raise ValueError("texts must be an explicit sequence of strings")
+        samples: List[str] = []
+        for text in texts or []:
+            if not isinstance(text, str):
+                raise ValueError("texts must contain only strings")
+            clean_text = text.replace("\x00", "")
+            if clean_text.strip():
+                samples.append(clean_text)
+        if isinstance(source_ids, (str, bytes)):
+            raise ValueError("source_ids must be an explicit sequence of identifiers")
+        selected: List[str] = []
+        for value in source_ids or []:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("source_ids must contain non-empty string identifiers")
+            identifier = value.strip()
+            if identifier not in selected:
+                selected.append(identifier)
+        if selected:
+            sources = {
+                str(source.get("id", "")): source
+                for source in self.training_sources
+                if isinstance(source, Mapping)
+            }
+            missing = [identifier for identifier in selected if identifier not in sources]
+            if missing:
+                raise ValueError(
+                    "unknown training source_ids: %s" % ", ".join(missing)
+                )
+            retained = {
+                identifier: str(sources[identifier].get("raw_text", "")).replace(
+                    "\x00", ""
+                )
+                for identifier in selected
+                if isinstance(sources[identifier].get("raw_text"), str)
+            }
+            unretained = [
+                identifier
+                for identifier in selected
+                if identifier not in retained or not retained[identifier].strip()
+            ]
+            if unretained:
+                raise ValueError(
+                    "training source_ids have no retained text: %s"
+                    % ", ".join(unretained)
+                )
+            samples.extend(retained[identifier] for identifier in selected)
         if not samples:
-            for source in self.training_sources:
-                if selected and source.get("id") not in selected:
-                    continue
-                retained = source.get("raw_text")
-                if isinstance(retained, str) and retained.strip():
-                    samples.append(retained)
-        if not samples:
-            return self.consolidate(steps=epochs, progress=progress)
+            raise ValueError(
+                "training requires non-empty text or explicit retained source_ids"
+            )
 
+        training_plan = self._training_resource_plan()
+        if bool(training_plan["pauseBeforeStep"]):
+            raise NeuralStateResourcePause(
+                "training paused before allocating a step outside the safe Omni RAM envelope",
+                {
+                    **self.resource_policy.status(),
+                    "paused": True,
+                    "recoverable": True,
+                    "trainingResourcePlan": training_plan,
+                },
+            )
+        self._ensure_optimizer_resident()
         before = self.parameter_checksum()
         training_steps_before = self.counters["training_steps"]
+        optimizer_backup = _clone_state_to_cpu(self._optimizer.state_dict())
         backup = {
             key: value.detach().cpu().clone()
             for key, value in self._core_tensors().items()
@@ -5662,7 +13593,8 @@ class AdaptiveBrain:
         ]
         baseline_loss = sum(baseline_losses) / len(baseline_losses)
         losses: List[float] = []
-        payload_size = max(1, self.config.max_seq_len - 2)
+        sequence_tokens = int(training_plan["windowTokens"])
+        payload_size = max(1, sequence_tokens - 2)
         windows_per_epoch = sum(
             max(
                 1,
@@ -5680,8 +13612,12 @@ class AdaptiveBrain:
             if learning_rate is not None
             else self._optimizer
         )
-        physical_batch = max(1, int(self.config.train_batch_size))
-        accumulation = max(1, int(self.config.gradient_accumulation))
+        if optimizer is self._optimizer:
+            self._ensure_optimizer_resident()
+        physical_batch = max(
+            1, int(training_plan["physicalBatchRecords"])
+        )
+        accumulation = max(1, int(training_plan["gradientAccumulation"]))
         effective_batch = physical_batch * accumulation
         candidate_id, candidate_dir = self._begin_candidate("slow-training")
         promoted = False
@@ -5698,7 +13634,7 @@ class AdaptiveBrain:
                         for window in self.tokenizer.window_tensors(
                             sample,
                             self.device,
-                            max_length=self.config.max_seq_len,
+                            max_length=sequence_tokens,
                             add_bos=True,
                             add_eos=True,
                         ):
@@ -5710,10 +13646,21 @@ class AdaptiveBrain:
                     group = list(itertools.islice(units, effective_batch))
                     if not group:
                         break
+                    next_checkpoint_bytes = int(
+                        training_plan.get("scratch", {}).get(
+                            "estimatedCheckpointBytes", 0
+                        )
+                    )
+                    self.resource_policy.require_disk(
+                        next_checkpoint_bytes,
+                        "slow training",
+                    )
                     micro_batches = [
                         group[index : index + physical_batch]
                         for index in range(0, len(group), physical_batch)
                     ]
+                    if optimizer is self._optimizer:
+                        self._ensure_optimizer_resident()
                     optimizer.zero_grad(set_to_none=True)
                     for micro_batch in micro_batches:
                         token_windows = [
@@ -5725,15 +13672,23 @@ class AdaptiveBrain:
                         )
                         (loss / float(len(micro_batches))).backward()
                         losses.append(measurements["loss"])
-                        for vector in vectors:
-                            self._append_replay(
-                                self._idea_model_vector(vector)
-                            )
+                        # The default training admission importance is 1.0,
+                        # so every vector in this existing physical microbatch
+                        # is already selected. Keep the candidate rollback and
+                        # progress/cancellation boundary at the microbatch.
+                        self._append_selected_replay_batch(
+                            self._idea_model_vector(vector) for vector in vectors
+                        )
                         completed += len(micro_batch)
                         if progress is not None:
                             progress(
                                 completed / float(total),
                                 "Training candidate",
+                                {
+                                    "resourceReadings": self.resource_policy.status(
+                                        estimated_write_bytes=next_checkpoint_bytes
+                                    )
+                                },
                             )
                     self._accumulate_slow_importance()
                     parameters = [
@@ -5748,6 +13703,8 @@ class AdaptiveBrain:
                     optimizer.step()
                     optimizer_steps += 1
                     self.counters["training_steps"] += 1
+                    if optimizer is self._optimizer:
+                        self._maintain_neural_state_resources()
             final_losses = [
                 self._evaluate_experience(
                     sample, self.memory.vector_for_text(sample)
@@ -5777,9 +13734,10 @@ class AdaptiveBrain:
         except Exception:
             self._restore_core(backup)
             self._restore_stability(stability_backup)
-            self.replay = self.replay[:replay_length]
+            self.replay.truncate(replay_length)
             self.counters["training_steps"] = training_steps_before
-            self._optimizer = self._new_optimizer()
+            self._replace_optimizer()
+            self._optimizer.load_state_dict(copy.deepcopy(optimizer_backup))
             self._restore_candidate_checkpoint(candidate_dir)
             self._record_candidate(
                 candidate_dir,
@@ -5791,9 +13749,10 @@ class AdaptiveBrain:
         if not promoted:
             self._restore_core(backup)
             self._restore_stability(stability_backup)
-            self.replay = self.replay[:replay_length]
+            self.replay.truncate(replay_length)
             self.counters["training_steps"] = training_steps_before
-            self._optimizer = self._new_optimizer()
+            self._replace_optimizer()
+            self._optimizer.load_state_dict(copy.deepcopy(optimizer_backup))
             final_loss = baseline_loss
         self._record_candidate(
             candidate_dir,
@@ -5812,6 +13771,8 @@ class AdaptiveBrain:
                 "optimizerSteps": optimizer_steps,
                 "physicalBatchSize": physical_batch,
                 "gradientAccumulation": accumulation,
+                "trainingSequenceTokens": sequence_tokens,
+                "trainingResourcePlan": training_plan,
                 "meanLoss": sum(losses) / len(losses),
                 "baselineLoss": baseline_loss,
                 "finalLoss": final_loss,
@@ -5830,6 +13791,8 @@ class AdaptiveBrain:
             "optimizerSteps": optimizer_steps,
             "physicalBatchSize": physical_batch,
             "gradientAccumulation": accumulation,
+            "trainingSequenceTokens": sequence_tokens,
+            "trainingResourcePlan": training_plan,
             "meanLoss": sum(losses) / len(losses),
             "baselineLoss": baseline_loss,
             "finalLoss": final_loss,
@@ -5841,7 +13804,7 @@ class AdaptiveBrain:
             "metrics": self.metrics(),
         }
 
-    def consolidate(
+    def _train_evolution_replay_candidate(
         self, steps: int = 4, progress: Optional[Any] = None
     ) -> Dict[str, Any]:
         if not self.config.consolidation_enabled:
@@ -5850,38 +13813,15 @@ class AdaptiveBrain:
                 "disabled": True,
                 "steps": 0,
                 "promoted": False,
-                "rejection": "consolidation is disabled by this brain recipe",
+                "rejection": "evolution replay is disabled by this configuration",
                 "metrics": self.metrics(),
             }
         steps = int(steps)
         if steps < 1:
-            raise ValueError("consolidation steps must be positive")
+            raise ValueError("evolution replay steps must be positive")
         before_checksum = self.parameter_checksum()
         if not self.replay:
-            self.memory.decay(self.config.forgetting_rate)
-            self.router.synapses.decay_unused(
-                self.config.forgetting_rate * 0.5
-            )
-            self.counters["consolidation_cycles"] += 1
-            self.save()
-            self.events.append(
-                "consolidation",
-                {
-                    "steps": 0,
-                    "replayExamples": 0,
-                    "parameterChecksumBefore": before_checksum,
-                    "parameterChecksumAfter": self.parameter_checksum(),
-                },
-            )
-            return {
-                "brainId": self.brain_id,
-                "steps": 0,
-                "meanLoss": 0.0,
-                "parameterChecksumBefore": before_checksum,
-                "parameterChecksumAfter": self.parameter_checksum(),
-                "promoted": True,
-                "metrics": self.metrics(),
-            }
+            raise ValueError("evolution replay requires retained neural replay")
 
         backup = {
             key: value.detach().cpu().clone()
@@ -5902,7 +13842,7 @@ class AdaptiveBrain:
             )
         losses: List[float] = []
         self.idea_adapter.train()
-        candidate_id, candidate_dir = self._begin_candidate("consolidation")
+        candidate_id, candidate_dir = self._begin_candidate("evolution-replay")
         promoted = False
         rejection = ""
         organic = self._organic_state()
@@ -5919,6 +13859,7 @@ class AdaptiveBrain:
         )
         try:
             for index in range(steps):
+                self.resource_policy.require_disk(0, "evolution replay")
                 target = self.replay[index % len(self.replay)].to(self.device).reshape(1, -1)
                 optimizer.zero_grad(set_to_none=True)
                 noisy = target + torch.randn_like(target) * rehearsal_noise
@@ -5929,7 +13870,7 @@ class AdaptiveBrain:
                 )
                 loss = reconstruction_loss + stability_loss
                 if not bool(torch.isfinite(loss)):
-                    raise RuntimeError("non-finite consolidation loss")
+                    raise RuntimeError("non-finite evolution replay loss")
                 loss.backward()
                 self._accumulate_slow_importance(
                     self.idea_adapter.parameters()
@@ -5943,7 +13884,8 @@ class AdaptiveBrain:
                 if progress is not None:
                     progress(
                         (index + 1) / float(steps),
-                        "Consolidating candidate latent replay",
+                        "Evaluating internal replay candidate",
+                        {"resourceReadings": self._resource_readings()},
                     )
             self.idea_adapter.eval()
             with torch.no_grad():
@@ -5981,12 +13923,12 @@ class AdaptiveBrain:
             self._restore_core(backup)
             self._restore_stability(stability_backup)
             self.counters["training_steps"] = training_steps_before
-            self._optimizer = self._new_optimizer()
+            self._replace_optimizer()
             self._restore_candidate_checkpoint(candidate_dir)
             self._record_candidate(
                 candidate_dir,
                 status="rejected",
-                reason="consolidation exception",
+                reason="evolution replay exception",
                 rejectedAt=_iso_now(),
             )
             raise
@@ -5994,7 +13936,7 @@ class AdaptiveBrain:
             self._restore_core(backup)
             self._restore_stability(stability_backup)
             self.counters["training_steps"] = training_steps_before
-            self._optimizer = self._new_optimizer()
+            self._replace_optimizer()
             final_loss = baseline_loss
         self._record_candidate(
             candidate_dir,
@@ -6005,7 +13947,7 @@ class AdaptiveBrain:
             completedAt=_iso_now(),
         )
         self.events.append(
-            "consolidation",
+            "evolution-replay",
             {
                 "steps": steps,
                 "replayExamples": len(self.replay),
@@ -6114,9 +14056,743 @@ class AdaptiveBrain:
             chunks.append(pending)
         return chunks
 
+    @staticmethod
+    def _reading_chunk_importances(chunks: Sequence[str]) -> List[float]:
+        """Derive selective attention weights without skipping any chunk.
+
+        Dataset coverage still visits and trains every valid record.  These
+        weights only control how strongly each section enters transient and
+        lasting neural memory, analogous to a reader attending differently to
+        a heading, a recurring idea, and repetitive filler.
+        """
+
+        if not chunks:
+            return []
+        token_rows = [
+            re.findall(r"[A-Za-z0-9_'-]{2,}", chunk.casefold())
+            for chunk in chunks
+        ]
+        document_frequency: Dict[str, int] = {}
+        for tokens in token_rows:
+            for token in set(tokens):
+                document_frequency[token] = document_frequency.get(token, 0) + 1
+        count = max(1, len(chunks))
+        values: List[float] = []
+        for chunk, tokens in zip(chunks, token_rows):
+            unique_ratio = len(set(tokens)) / float(max(1, len(tokens)))
+            recurrence = (
+                sum(document_frequency[token] / float(count) for token in set(tokens))
+                / float(max(1, len(set(tokens))))
+            )
+            structural = float(
+                bool(
+                    re.search(
+                        r"(^|\n)\s*(?:#{1,6}\s|[A-Z][A-Z0-9 _-]{3,}:|"
+                        r"(?:def|class|function|interface|chapter|section)\b)",
+                        chunk,
+                        re.MULTILINE,
+                    )
+                )
+            )
+            length_signal = min(1.0, len(tokens) / 160.0)
+            value = (
+                0.30
+                + 0.09 * unique_ratio
+                + 0.08 * recurrence
+                + 0.07 * structural
+                + 0.04 * length_signal
+            )
+            values.append(max(0.30, min(0.58, value)))
+        return values
+
+    def _integrate_reading_record(
+        self,
+        text: str,
+        *,
+        source_name: str,
+        child_assembly_ids: Sequence[str],
+        child_weights: Sequence[float],
+    ) -> Optional[Dict[str, Any]]:
+        """Bind all visited sections into one whole-record neural assembly."""
+
+        aligned = [
+            (assembly_id, float(weight))
+            for assembly_id, weight in zip(child_assembly_ids, child_weights)
+            if assembly_id in self.memory.assembly_vectors
+        ]
+        if not aligned:
+            return None
+        vectors = [self.memory.assembly_vectors[item[0]] for item in aligned]
+        weights = [max(0.05, item[1]) for item in aligned]
+        whole = self.memory.space.weighted_bundle(vectors, weights)
+        fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        admitted = self._admit_sensory_embedding(
+            whole,
+            kind="document",
+            source_name=source_name,
+            fingerprint="record:" + fingerprint,
+            child_ids=[item[0] for item in aligned],
+            importance=0.90,
+            substrate_space=True,
+            experience_source="reading",
+            settling_salience=0.92,
+            settling_prediction_error=0.85,
+        )
+        admitted.pop("vector", None)
+        admitted["sectionAssemblyIds"] = [item[0] for item in aligned]
+        admitted["sectionWeights"] = weights
+        admitted["wholeRecord"] = True
+        admitted["rawSourceTextStored"] = False
+        return admitted
+
     def _media_idea(self, source_name: str) -> torch.Tensor:
         vector = self.memory.vector_for_text(source_name or "media experience")
         return self._idea_model_vector(vector).detach()
+
+    def _live_image_tensor(self, payload: bytes) -> torch.Tensor:
+        try:
+            from PIL import Image
+            import numpy as np
+        except ImportError as error:
+            raise RuntimeError(
+                "live image observation requires Pillow and NumPy"
+            ) from error
+        try:
+            with Image.open(io.BytesIO(payload)) as opened:
+                image = opened.convert("RGB").resize(
+                    (self.config.image_size, self.config.image_size)
+                )
+                values = np.asarray(image, dtype="float32").copy()
+        except (OSError, ValueError) as error:
+            raise ValueError("live image packet could not be decoded") from error
+        return (
+            torch.from_numpy(values)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(self.device)
+            / 127.5
+            - 1.0
+        )
+
+    def _live_visual_embedding(
+        self,
+        payload: bytes,
+        modality: str,
+        settings: Mapping[str, Any],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Encode global shape and resource-scaled source-detail tiles.
+
+        A native/high-resolution frame is not reduced to one tiny square. The
+        global view travels through the selected modality encoder, while
+        uniformly distributed source tiles travel through the same brain's
+        ternary image encoder and are VSA-bound to their positions. Raw pixels
+        remain transient.
+        """
+
+        try:
+            from PIL import Image
+            import numpy as np
+        except ImportError as error:
+            raise RuntimeError(
+                "live multiresolution perception requires Pillow and NumPy"
+            ) from error
+        try:
+            with Image.open(io.BytesIO(payload)) as opened:
+                source = opened.convert("RGB")
+        except (OSError, ValueError) as error:
+            raise ValueError("live image packet could not be decoded") from error
+        source_width, source_height = source.size
+        declared_width = int(settings.get("width", source_width))
+        declared_height = int(settings.get("height", source_height))
+        if declared_width != source_width or declared_height != source_height:
+            raise ValueError("capture dimensions do not match the decoded frame")
+        target_size = int(self.config.image_size)
+
+        def as_tensor(image: Any) -> torch.Tensor:
+            resized = image.resize((target_size, target_size))
+            values = np.asarray(resized, dtype="float32").copy()
+            return (
+                torch.from_numpy(values)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(self.device)
+                / 127.5
+                - 1.0
+            )
+
+        global_tensor = as_tensor(source)
+        if modality == "video":
+            temporal = global_tensor.unsqueeze(2).expand(
+                -1, -1, self.config.video_frames, -1, -1
+            ).contiguous()
+            global_embedding = self.modalities.perception_embedding(
+                "video", temporal
+            )
+        else:
+            global_embedding = self.modalities.perception_embedding(
+                "image", global_tensor
+            )
+
+        columns = max(1, math.ceil(source_width / target_size))
+        rows = max(1, math.ceil(source_height / target_size))
+        tiles_available = rows * columns
+        tile_tensor_bytes = max(1, 3 * target_size * target_size * 4)
+        readings = self._resource_readings()
+        available_memory = readings.get("availableMemoryBytes")
+        memory_tile_budget = (
+            max(1, int(available_memory) // (tile_tensor_bytes * 8))
+            if isinstance(available_memory, int) and available_memory > 0
+            else max(1, int(self.config.working_memory_slots))
+        )
+        tile_budget = min(
+            tiles_available,
+            max(1, int(self.config.working_memory_slots)),
+            memory_tile_budget,
+        )
+        if tile_budget == 1:
+            selected_indices = [0]
+        elif tile_budget == tiles_available:
+            selected_indices = list(range(tiles_available))
+        else:
+            selected_indices = sorted(
+                {
+                    round(
+                        index
+                        * (tiles_available - 1)
+                        / float(tile_budget - 1)
+                    )
+                    for index in range(tile_budget)
+                }
+            )
+        bound_tiles: List[torch.Tensor] = []
+        for linear_index in selected_indices:
+            row = linear_index // columns
+            column = linear_index % columns
+            left = column * target_size
+            top = row * target_size
+            right = min(source_width, left + target_size)
+            bottom = min(source_height, top + target_size)
+            tile_tensor = as_tensor(source.crop((left, top, right, bottom)))
+            tile_embedding = self.modalities.image.encode(tile_tensor)
+            position_symbol = self.memory.space.symbol(
+                "visual-tile:%d:%d:%d:%d"
+                % (row, column, rows, columns)
+            )
+            position = self._idea_model_vector(position_symbol).detach()
+            ternary_position = torch.sign(position)
+            bound_tiles.append(
+                F.normalize(
+                    tile_embedding * ternary_position + 0.10 * position,
+                    dim=-1,
+                )
+            )
+        tile_field = torch.stack(bound_tiles, dim=0).mean(dim=0)
+        embedding = F.normalize(
+            0.40 * global_embedding + 0.60 * tile_field,
+            dim=-1,
+        )
+        return embedding, {
+            "sourceWidth": source_width,
+            "sourceHeight": source_height,
+            "globalDecodedWidth": target_size,
+            "globalDecodedHeight": target_size,
+            "tilesAvailable": tiles_available,
+            "tilesEncoded": len(selected_indices),
+            "tileCoverage": len(selected_indices) / float(tiles_available),
+            "tileInputSize": target_size,
+            "tileGridRows": rows,
+            "tileGridColumns": columns,
+            "tileSelection": "uniform-resource-scaled",
+            "tileBinding": "ternary-position-vsa",
+            "spatialTileEncoder": "same-brain-ternary-image-pack",
+            "temporalFrames": (
+                int(self.config.video_frames) if modality == "video" else 1
+            ),
+            "rawTilesStored": False,
+        }
+
+    def _live_audio_tensor(
+        self,
+        payload: bytes,
+        mime_type: str,
+        settings: Mapping[str, Any],
+    ) -> torch.Tensor:
+        channels = max(1, min(32, int(settings.get("channels", 1))))
+        if mime_type in {"audio/pcm-f32le", "audio/x-pcm-f32le"}:
+            if not payload or len(payload) % 4:
+                raise ValueError("float PCM packet has an invalid byte length")
+            samples = array.array("f")
+            samples.frombytes(payload)
+            if os.sys.byteorder != "little":
+                samples.byteswap()
+            values = torch.tensor(samples, dtype=torch.float32)
+        elif mime_type in {"audio/pcm-s16le", "audio/x-pcm-s16le"}:
+            if not payload or len(payload) % 2:
+                raise ValueError("16-bit PCM packet has an invalid byte length")
+            samples = array.array("h")
+            samples.frombytes(payload)
+            if os.sys.byteorder != "little":
+                samples.byteswap()
+            values = torch.tensor(samples, dtype=torch.float32).div_(32768.0)
+        elif mime_type in {"audio/wav", "audio/x-wav", "audio/wave"}:
+            try:
+                with wave.open(io.BytesIO(payload), "rb") as handle:
+                    channels = max(1, int(handle.getnchannels()))
+                    values = self._pcm_mono_values(
+                        handle.readframes(handle.getnframes()),
+                        int(handle.getsampwidth()),
+                        channels,
+                    )
+                    channels = 1
+            except (wave.Error, EOFError, ValueError) as error:
+                raise ValueError("live WAV packet could not be decoded") from error
+        elif mime_type in {
+            "audio/webm",
+            "audio/ogg",
+            "audio/opus",
+            "audio/mp4",
+            "audio/aac",
+        }:
+            try:
+                import imageio_ffmpeg
+
+                decoded = subprocess.run(
+                    [
+                        imageio_ffmpeg.get_ffmpeg_exe(),
+                        "-v",
+                        "error",
+                        "-i",
+                        "pipe:0",
+                        "-t",
+                        "10",
+                        "-f",
+                        "f32le",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "pipe:1",
+                    ],
+                    input=payload,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=15,
+                ).stdout
+                if not decoded or len(decoded) % 4:
+                    raise ValueError("decoded live audio has invalid PCM length")
+                samples = array.array("f")
+                samples.frombytes(decoded)
+                if os.sys.byteorder != "little":
+                    samples.byteswap()
+                values = torch.tensor(samples, dtype=torch.float32)
+                channels = 1
+            except (
+                ImportError,
+                OSError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as error:
+                raise ValueError(
+                    "live encoded audio packet needs a configured external FFmpeg decoder"
+                ) from error
+        else:
+            raise ValueError("unsupported live audio packet encoding")
+        if channels > 1:
+            usable = values.numel() - values.numel() % channels
+            if usable <= 0:
+                raise ValueError("live audio packet contains no complete frame")
+            values = values[:usable].reshape(-1, channels).mean(dim=1)
+        if not values.numel() or not bool(torch.isfinite(values).all()):
+            raise ValueError("live audio packet contains no finite samples")
+        return self._bounded_audio_target(values.clamp(-1.0, 1.0))[0]
+
+    def observe_live_packet(
+        self,
+        *,
+        modality: str,
+        mime_type: str,
+        payload: bytes,
+        session_id: str,
+        sequence: int,
+        timestamp_ms: float,
+        retention: str = "neural",
+        settings: Optional[Mapping[str, Any]] = None,
+        permission_source: str = "device",
+    ) -> Dict[str, Any]:
+        """Admit one bounded live perception without retaining its raw bytes.
+
+        ``working`` updates only recurrent/working activity. ``neural`` also
+        forms a persistent assembly, applies STDP, and trains the same ternary
+        modality route. Dataset cursors are deliberately untouched: capture
+        backpressure is not reported as completed corpus learning.
+        """
+
+        if modality not in IMAGINATION_MODALITIES:
+            raise ValueError("live modality must be image, audio, or video")
+        if retention not in {"working", "neural"}:
+            raise ValueError("live retention must be working or neural")
+        if not payload:
+            raise ValueError("live observation packet is empty")
+        normalized_mime = mime_type.strip().lower().split(";", 1)[0]
+        packet_settings = dict(settings or {})
+        visual_diagnostics: Dict[str, Any] = {}
+        if modality in {"image", "video"}:
+            if normalized_mime not in {
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+            }:
+                raise ValueError(
+                    "live image/video packets must be JPEG, PNG, or WebP frames"
+                )
+            with torch.no_grad():
+                embedding, visual_diagnostics = self._live_visual_embedding(
+                    payload, modality, packet_settings
+                )
+        else:
+            tensor = self._live_audio_tensor(
+                payload, normalized_mime, packet_settings
+            )
+            with torch.no_grad():
+                embedding = self.modalities.perception_embedding(
+                    modality, tensor
+                )
+        content_hash = hashlib.sha256(payload).hexdigest()
+        source_name = "live %s %s" % (
+            permission_source.replace("\x00", " ").strip()[:64] or "device",
+            modality,
+        )
+        if retention == "neural":
+            admitted = self._admit_sensory_embedding(
+                embedding,
+                kind="%s-perception" % modality,
+                source_name=source_name,
+                fingerprint="live:%s:%s" % (modality, content_hash),
+                importance=0.62,
+                experience_source="live-observation",
+            )
+            selector_parameters = list(
+                self.modalities.imagination_selector.parameters()
+            )
+            selector_optimizer = adamw_for_remaining_parameters(
+                selector_parameters,
+                lr=max(1e-5, min(0.01, self.config.learning_rate)),
+                weight_decay=1e-5,
+            )
+            selector_optimizer.zero_grad(set_to_none=True)
+            target = torch.full(
+                (embedding.shape[0],),
+                IMAGINATION_MODALITIES.index(modality),
+                dtype=torch.long,
+                device=self.device,
+            )
+            route_loss = F.cross_entropy(
+                self.modalities.imagination_logits(embedding.detach()), target
+            )
+            route_loss.backward()
+            self._accumulate_slow_importance(selector_parameters)
+            torch.nn.utils.clip_grad_norm_(
+                selector_parameters, self.config.grad_clip
+            )
+            selector_optimizer.step()
+            self._commit_slow_anchors(
+                rate=0.04, parameters=selector_parameters
+            )
+            self.counters["training_steps"] += 1
+            assembly_id: Optional[str] = str(admitted["assemblyId"])
+            spike_rate = float(admitted["spikeRate"])
+            novelty = float(admitted["novelty"])
+            route_loss_value = float(route_loss.detach().item())
+        else:
+            substrate = self._sensory_substrate_vector(
+                embedding, modality, content_hash
+            )
+            idea = self._idea_model_vector(substrate)
+            self.liquid_state, controls = self.liquid(
+                idea, state=self.liquid_state.detach(), elapsed=1.0
+            )
+            self.liquid_state = self.liquid_state.detach()
+            routed, spike_metrics = self.router.route(
+                idea,
+                steps=max(
+                    2,
+                    int(
+                        round(
+                            float(controls["ponder_scale"].mean().item())
+                        )
+                    ),
+                ),
+                learn=False,
+                threshold_offset=float(
+                    controls["threshold_offset"].detach().mean().item()
+                ),
+            )
+            self._append_working_memory(
+                routed,
+                source="live-%s" % modality,
+                salience=0.58,
+            )
+            assembly_id = None
+            spike_rate = float(spike_metrics["spike_rate"])
+            novelty = 0.0
+            route_loss_value = 0.0
+        self.current_context = {
+            **self.current_context,
+            "sensorySlots": min(
+                self.config.working_memory_slots,
+                max(0, int(self.current_context.get("sensorySlots", 0))) + 1,
+            ),
+            "updatedAt": _iso_now(),
+        }
+        result = {
+            "brainId": self.brain_id,
+            "sessionId": session_id,
+            "sequence": int(sequence),
+            "timestampMs": float(timestamp_ms),
+            "modality": modality,
+            "retention": retention,
+            "assemblyId": assembly_id,
+            "spikeRate": spike_rate,
+            "novelty": novelty,
+            "routeLoss": route_loss_value,
+            "packetSha256": content_hash,
+            "packetBytes": len(payload),
+            "rawPacketStored": False,
+            "datasetCoverageCommitted": False,
+            "sameBrainSharedIdeaSpace": True,
+            "hiddenBehavioralPrompt": False,
+            "perception": visual_diagnostics,
+            "observationControlId": str(
+                packet_settings.get("observationControlId", "")
+            )[:128]
+            or None,
+            "resolutionMode": (
+                str(packet_settings.get("resolutionMode"))
+                if packet_settings.get("resolutionMode")
+                in {"native", "current", "custom"}
+                else None
+            ),
+            "burstIndex": (
+                int(packet_settings["burstIndex"])
+                if "burstIndex" in packet_settings
+                else None
+            ),
+            "burstCount": (
+                int(packet_settings["burstCount"])
+                if "burstCount" in packet_settings
+                else None
+            ),
+        }
+        self.events.append(
+            "live-observation",
+            {
+                key: value
+                for key, value in result.items()
+                if key not in {"brainId"}
+            },
+        )
+        return result
+
+    def _attention_epoch(self) -> int:
+        boundary = self.fresh_attention_boundary
+        return int(boundary.get("epoch", 0)) if boundary is not None else 0
+
+
+    def record_live_observation_control(
+        self, *, session_id: str, control: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Persist an operational device-control result without prompt text."""
+
+        identifier = str(control.get("id", "")).strip()
+        kind = str(control.get("kind", "")).strip().lower()
+        state = str(control.get("state", "")).strip().lower()
+        if (
+            not session_id
+            or not identifier
+            or kind not in {"configure", "snapshot"}
+            or state
+            not in {"requested", "applied", "rejected", "cancelled", "reverted"}
+        ):
+            raise ValueError("live observation control is invalid")
+        if control.get("sessionId") != session_id:
+            raise ValueError("live observation control session does not match")
+        serialized = json.dumps(control, sort_keys=True, separators=(",", ":"))
+        if len(serialized.encode("utf-8")) > 64 * 1024:
+            raise ValueError("live observation control evidence is too large")
+        lowered_keys = {str(key).lower() for key in control}
+        if lowered_keys.intersection({"data", "bytes", "database64", "rawpacket"}):
+            raise ValueError("raw capture bytes cannot enter control evidence")
+        evidence = json.loads(serialized)
+        self.events.append(
+            "live-observation-control",
+            {
+                "sessionId": session_id,
+                "control": evidence,
+                "hiddenBehavioralPrompt": False,
+                "rawPacketStored": False,
+                "datasetCoverageCommitted": False,
+            },
+        )
+        return {
+            "brainId": self.brain_id,
+            "sessionId": session_id,
+            "controlId": identifier,
+            "state": state,
+            "recorded": True,
+            "hiddenBehavioralPrompt": False,
+            "rawPacketStored": False,
+        }
+
+    def _sensory_substrate_vector(
+        self, embedding: torch.Tensor, kind: str, fingerprint: str
+    ) -> torch.Tensor:
+        """Lift a learned modality embedding through exact ternary synapses.
+
+        The modality encoders live in the shared idea space, while persistent
+        assemblies live in the wider VSA substrate.  Reusing the transpose of
+        the cortex's mandatory ternary memory bridge keeps this a neural
+        projection instead of converting a perception into synthetic text.
+        """
+
+        value = embedding.detach().to(self.device, dtype=torch.float32)
+        if value.ndim == 1:
+            value = value.unsqueeze(0)
+        if value.shape[-1] != self.config.idea_dim:
+            raise ValueError("sensory embedding dimensions do not match idea space")
+        ternary = self.memory_bridge.effective_weight().to(
+            self.device, dtype=torch.float32
+        )
+        lifted = value.mean(dim=0, keepdim=True) @ ternary
+        lifted = lifted[0].detach().cpu()
+        if not bool(torch.isfinite(lifted).all()) or float(lifted.norm()) <= 1e-8:
+            raise RuntimeError(
+                "sensory neural projection produced no finite signal; "
+                "the input was not admitted as a learned assembly"
+            )
+        return F.normalize(lifted.reshape(1, -1), dim=-1)[0]
+
+    def _admit_sensory_embedding(
+        self,
+        embedding: torch.Tensor,
+        *,
+        kind: str,
+        source_name: str,
+        fingerprint: str,
+        child_ids: Optional[Sequence[str]] = None,
+        importance: float = 0.72,
+        substrate_space: bool = False,
+        experience_source: str = "media",
+        settling_salience: Optional[float] = None,
+        settling_prediction_error: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Create a persistent sensory assembly and activate brain dynamics."""
+
+        if substrate_space:
+            substrate_vector = embedding.detach().cpu().float().reshape(-1)
+            if substrate_vector.numel() != self.config.vsa_dim:
+                raise ValueError(
+                    "sensory substrate vector dimensions do not match VSA space"
+                )
+            substrate_vector = F.normalize(
+                substrate_vector.reshape(1, -1), dim=-1
+            )[0]
+        else:
+            substrate_vector = self._sensory_substrate_vector(
+                embedding, kind, fingerprint
+            )
+        learned = self.memory.learn_vector(
+            substrate_vector,
+            fingerprint=fingerprint,
+            kind=kind,
+            source=experience_source,
+            source_label=source_name,
+            importance=importance,
+            child_ids=child_ids,
+        )
+        idea = self._idea_model_vector(learned["vector"])
+        self.liquid_state, controls = self.liquid(
+            idea, state=self.liquid_state.detach(), elapsed=1.0
+        )
+        self.liquid_state = self.liquid_state.detach()
+        routed, spike_metrics = self.router.route(
+            idea,
+            steps=max(
+                2, int(round(float(controls["ponder_scale"].mean().item())))
+            ),
+            learn=True,
+            threshold_offset=float(
+                controls["threshold_offset"].detach().mean().item()
+            ),
+        )
+        workspace_salience = max(
+            0.0,
+            min(
+                1.0,
+                0.45 * float(learned["novelty"])
+                + 0.35 * importance
+                + 0.20 * float(spike_metrics["spike_rate"]),
+            ),
+        )
+        if settling_salience is not None:
+            workspace_salience = max(
+                0.0, min(1.0, float(settling_salience))
+            )
+        prediction_error = (
+            float(learned["novelty"])
+            if settling_prediction_error is None
+            else float(settling_prediction_error)
+        )
+        self._append_replay(
+            routed,
+            importance=importance,
+            replay_priority=self._organic_replay_priority(
+                assembly_id=str(learned["assembly_id"]),
+                salience=workspace_salience,
+                novelty=float(learned["novelty"]),
+                prediction_error=prediction_error,
+                spike_rate=float(spike_metrics["spike_rate"]),
+            ),
+            assembly_id=str(learned["assembly_id"]),
+        )
+        self._append_working_memory(
+            routed,
+            assembly_id=str(learned["assembly_id"]),
+            source=(
+                "media-%s" % kind
+                if experience_source == "media"
+                else experience_source
+            ),
+            salience=workspace_salience,
+        )
+        memory_settling = self._settle_memory_automatically(
+            routed,
+            assembly_id=str(learned["assembly_id"]),
+            source=(
+                "media-%s" % kind
+                if experience_source == "media"
+                else experience_source
+            ),
+            salience=workspace_salience,
+            novelty=float(learned["novelty"]),
+            prediction_error=prediction_error,
+            importance=importance,
+            spike_rate=float(spike_metrics["spike_rate"]),
+        )
+        self.counters["experiences"] += 1
+        self.counters["plasticity_events"] = int(
+            self.router.synapses.plasticity_events.item()
+        )
+        return {
+            "assemblyId": str(learned["assembly_id"]),
+            "neuronIds": list(learned["neuron_ids"]),
+            "novelty": float(learned["novelty"]),
+            "spikeRate": float(spike_metrics["spike_rate"]),
+            "forwardProjection": "exact-ternary-memory-bridge-transpose",
+            "rawSourceTextInjected": False,
+            "memorySettling": memory_settling,
+            "vector": substrate_vector,
+        }
 
     @staticmethod
     def _effective_media_kind(path: str, requested_kind: str) -> str:
@@ -6290,7 +14966,7 @@ class AdaptiveBrain:
                 raise RuntimeError("FFmpeg could not decode the audio stream")
         except (ImportError, OSError, subprocess.SubprocessError) as error:
             raise RuntimeError(
-                "audio format needs soundfile or the bundled FFmpeg decoder"
+                "audio format needs soundfile or a configured external FFmpeg decoder"
             ) from error
         finally:
             if process is not None:
@@ -6420,7 +15096,7 @@ class AdaptiveBrain:
                     raise RuntimeError("FFmpeg could not decode the video stream")
             except (ImportError, OSError, RuntimeError, ValueError) as error:
                 raise RuntimeError(
-                    "MP4/WebM/MOV video needs the bundled FFmpeg decoder; GIF works with Pillow"
+                    "MP4/WebM/MOV video needs a configured external FFmpeg decoder; GIF works with Pillow"
                 ) from error
             finally:
                 if process is not None:
@@ -6455,6 +15131,8 @@ class AdaptiveBrain:
         source_name: str,
         steps: int = 2,
         progress: Optional[Any] = None,
+        content_sha256: str = "",
+        _include_embedded_audio: bool = True,
     ) -> Dict[str, Any]:
         warnings: List[str] = []
         idea = self._media_idea(source_name)
@@ -6535,10 +15213,12 @@ class AdaptiveBrain:
                     "discoveredUnits": 0,
                     "processedUnits": 0,
                     "tailUnits": 0,
+                    "sensoryAssemblies": 0,
                     "complete": False,
                 },
             }
-        optimizer = torch.optim.AdamW(
+        parameters.extend(self.modalities.imagination_selector.parameters())
+        optimizer = adamw_for_remaining_parameters(
             parameters, lr=self.config.learning_rate, weight_decay=1e-5
         )
         steps_per_window = max(1, int(steps))
@@ -6549,6 +15229,11 @@ class AdaptiveBrain:
         loss_count = 0
         initial_loss = 0.0
         final_loss = 0.0
+        sensory_sum = torch.zeros(self.config.vsa_dim, dtype=torch.float32)
+        sensory_assemblies: List[str] = []
+        fingerprint_base = content_sha256 or hashlib.sha256(
+            ("%s:%s:%s" % (kind, source_name, Path(path).name)).encode("utf-8")
+        ).hexdigest()
         for target, actual_units in window_stream:
             windows += 1
             processed_units += int(actual_units)
@@ -6556,12 +15241,30 @@ class AdaptiveBrain:
                 tail_units = int(actual_units)
             for index in range(steps_per_window):
                 optimizer.zero_grad(set_to_none=True)
+                window_embedding: Optional[torch.Tensor] = None
                 if kind == "image":
                     components = []
                     if self.config.image_enabled:
-                        components.append(self.modalities.image(target, idea)["loss"])
+                        image_output = self.modalities.image(target, idea)
+                        components.append(
+                            image_output["loss"]
+                            + 0.2
+                            * (
+                                1.0
+                                - F.cosine_similarity(
+                                    image_output["embedding"],
+                                    F.normalize(idea, dim=-1),
+                                ).mean()
+                            )
+                        )
+                        window_embedding = image_output["embedding"]
                     if self.config.vision_enabled:
                         embedding = self.modalities.vision(target)
+                        window_embedding = (
+                            embedding
+                            if window_embedding is None
+                            else F.normalize(window_embedding + embedding, dim=-1)
+                        )
                         components.append(
                             0.2
                             * (
@@ -6574,6 +15277,7 @@ class AdaptiveBrain:
                     loss = torch.stack(components).sum()
                 elif kind == "audio":
                     output = self.modalities.audio(target, idea)
+                    window_embedding = output["embedding"]
                     loss = output["loss"] + 0.2 * (
                         1.0
                         - F.cosine_similarity(
@@ -6582,12 +15286,30 @@ class AdaptiveBrain:
                     )
                 else:
                     output = self.modalities.video(target, idea)
+                    window_embedding = output["embedding"]
                     loss = output["loss"] + 0.2 * (
                         1.0
                         - F.cosine_similarity(
                             output["embedding"], F.normalize(idea, dim=-1)
                         ).mean()
                     )
+                if window_embedding is None:
+                    raise RuntimeError(
+                        "modality encoder produced no sensory embedding"
+                    )
+                route_target = torch.full(
+                    (window_embedding.shape[0],),
+                    IMAGINATION_MODALITIES.index(kind),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                route_loss = F.cross_entropy(
+                    self.modalities.imagination_logits(
+                        window_embedding.detach()
+                    ),
+                    route_target,
+                )
+                loss = loss + 0.08 * route_loss
                 stability_loss = self._stability_penalty(parameters)
                 loss = loss + stability_loss
                 if not bool(torch.isfinite(loss)):
@@ -6618,6 +15340,14 @@ class AdaptiveBrain:
                         ),
                         "Training %s modality window %d" % (kind, windows),
                     )
+            sensory = self._admit_sensory_embedding(
+                window_embedding,
+                kind=kind,
+                source_name=source_name,
+                fingerprint="%s:window:%d" % (fingerprint_base, windows),
+            )
+            sensory_sum.add_(sensory.pop("vector"))
+            sensory_assemblies.append(str(sensory["assemblyId"]))
             del target
         if windows == 0:
             raise ValueError("%s contained no decodable %s" % (kind, unit))
@@ -6629,6 +15359,16 @@ class AdaptiveBrain:
                 self.modality_training["vision"] += loss_count
         else:
             self.modality_training[kind] += loss_count
+        record_sensory = self._admit_sensory_embedding(
+            sensory_sum / float(max(1, windows)),
+            kind=kind,
+            source_name=source_name,
+            fingerprint="%s:record" % fingerprint_base,
+            child_ids=sensory_assemblies,
+            importance=0.82,
+            substrate_space=True,
+        )
+        record_sensory.pop("vector", None)
         media_coverage: Dict[str, Any] = {
             "unit": unit,
             "windowSize": window_size,
@@ -6636,6 +15376,8 @@ class AdaptiveBrain:
             "discoveredUnits": processed_units,
             "processedUnits": processed_units,
             "tailUnits": tail_units,
+            "sensoryAssemblies": len(sensory_assemblies) + 1,
+            "wholeRecordAssemblyId": record_sensory["assemblyId"],
             "complete": True,
         }
         if unit == "samples":
@@ -6644,15 +15386,66 @@ class AdaptiveBrain:
         elif unit == "frames":
             media_coverage["processedFrames"] = processed_units
             media_coverage["tailFrames"] = tail_units
+        embedded_audio: Optional[Dict[str, Any]] = None
+        embedded_steps = 0
+        embedded_loss = 0.0
+        if (
+            kind == "video"
+            and _include_embedded_audio
+            and self.config.audio_enabled
+            and Path(path).suffix.lower() not in {".gif", ".webp"}
+        ):
+            try:
+                audio_result = self._train_media(
+                    path,
+                    "audio",
+                    source_name + " (embedded audio)",
+                    steps=steps_per_window,
+                    progress=progress,
+                    content_sha256=fingerprint_base + ":embedded-audio",
+                    _include_embedded_audio=False,
+                )
+                embedded_steps = int(audio_result.get("steps", 0))
+                embedded_loss = float(audio_result.get("loss", 0.0))
+                embedded_audio = {
+                    "detected": True,
+                    "trained": bool(audio_result.get("trained", False)),
+                    "steps": embedded_steps,
+                    "loss": embedded_loss,
+                    "coverage": dict(audio_result.get("coverage", {})),
+                }
+            except (RuntimeError, ValueError, OSError):
+                # A silent video is valid visual training data. The visual
+                # traversal remains complete while the audit explicitly says
+                # that no decodable audio track was admitted.
+                embedded_audio = {
+                    "detected": False,
+                    "trained": False,
+                    "steps": 0,
+                    "loss": 0.0,
+                    "coverage": self._empty_media_coverage("audio"),
+                }
+            media_coverage["embeddedAudio"] = embedded_audio
+        total_steps = loss_count + embedded_steps
+        combined_loss = (
+            loss_sum + embedded_loss * embedded_steps
+        ) / float(max(1, total_steps))
         return {
             "trained": True,
-            "loss": loss_sum / loss_count,
+            "loss": combined_loss,
             "initial_loss": initial_loss,
             "final_loss": final_loss,
-            "steps": loss_count,
+            "steps": total_steps,
+            "primarySteps": loss_count,
             "stepsPerWindow": steps_per_window,
             "windows": windows,
             "coverage": media_coverage,
+            "sensory": {
+                "windowAssemblyIds": sensory_assemblies,
+                **record_sensory,
+                "rawSourceTextInjected": False,
+            },
+            "embeddedAudio": embedded_audio,
             "warnings": warnings,
         }
 
@@ -6689,81 +15482,364 @@ class AdaptiveBrain:
         *,
         complete_when_empty: bool = False,
     ) -> Dict[str, Any]:
-        if not reports:
+        accumulator = self._empty_media_accumulator()
+        for report in reports:
+            self._accumulate_media_report(accumulator, report)
+        return self._media_result_from_accumulator(
+            accumulator, complete_when_empty=complete_when_empty
+        )
+
+    @staticmethod
+    def _empty_media_accumulator() -> Dict[str, Any]:
+        return {
+            "format": MEDIA_ACCUMULATOR_FORMAT,
+            "formatVersion": MEDIA_ACCUMULATOR_VERSION,
+            "records": 0,
+            "trainedRecords": 0,
+            "weightedLoss": 0.0,
+            "steps": 0,
+            "warnings": [],
+            "warningCount": 0,
+            "warningsTruncated": False,
+            "byModality": {},
+            "recordSamples": [],
+            "recordSamplesTruncated": False,
+        }
+
+    @staticmethod
+    def _media_counter(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return min(MEDIA_COUNTER_MAX, max(0, int(value)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _media_hash(value: Any) -> str:
+        return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+
+    @classmethod
+    def _safe_media_coverage(
+        cls, kind: str, value: Any
+    ) -> Dict[str, Any]:
+        raw = dict(value) if isinstance(value, Mapping) else {}
+        normalized_kind = kind if kind in {"image", "audio", "video"} else "unknown"
+        unit = {
+            "image": "images",
+            "audio": "samples",
+            "video": "frames",
+        }.get(normalized_kind, "unknown")
+        safe: Dict[str, Any] = {
+            "unit": unit,
+            "windowSize": cls._media_counter(raw.get("windowSize", 0)),
+            "windows": cls._media_counter(raw.get("windows", 0)),
+            "discoveredUnits": cls._media_counter(
+                raw.get("discoveredUnits", 0)
+            ),
+            "processedUnits": cls._media_counter(raw.get("processedUnits", 0)),
+            "tailUnits": cls._media_counter(raw.get("tailUnits", 0)),
+            "sensoryAssemblies": cls._media_counter(
+                raw.get("sensoryAssemblies", 0)
+            ),
+            "complete": bool(raw.get("complete", False)),
+        }
+        assembly_id = raw.get("wholeRecordAssemblyId")
+        if isinstance(assembly_id, str) and assembly_id:
+            safe["wholeRecordAssemblySha256"] = cls._media_hash(assembly_id)
+            if re.fullmatch(r"[a-f0-9]{16,64}", assembly_id):
+                safe["wholeRecordAssemblyId"] = assembly_id
+        else:
+            assembly_hash = str(raw.get("wholeRecordAssemblySha256", ""))
+            if re.fullmatch(r"[a-f0-9]{64}", assembly_hash):
+                safe["wholeRecordAssemblySha256"] = assembly_hash
+        return safe
+
+    @classmethod
+    def _safe_media_sample(
+        cls,
+        report: Mapping[str, Any],
+        *,
+        kind: str,
+        trained: bool,
+        steps: int,
+        warning_count: int,
+    ) -> Dict[str, Any]:
+        content_hash = str(report.get("contentSha256", "")).strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", content_hash):
+            content_hash = cls._media_hash(content_hash)
+        sample: Dict[str, Any] = {
+            "nameSha256": cls._media_hash(report.get("name", "")),
+            "kind": kind,
+            "contentSha256": content_hash,
+            "trained": trained,
+            "loss": _finite_number(report.get("loss"), 0.0),
+            "steps": steps,
+            "warningCount": warning_count,
+            "coverage": cls._safe_media_coverage(
+                kind, report.get("coverage", {})
+            ),
+        }
+        sensory = report.get("sensory")
+        if isinstance(sensory, Mapping):
+            assembly_id = sensory.get("assemblyId") or sensory.get("assembly_id")
+            if isinstance(assembly_id, str) and assembly_id:
+                sample["sensoryAssemblySha256"] = cls._media_hash(assembly_id)
+                if re.fullmatch(r"[a-f0-9]{16,64}", assembly_id):
+                    sample["sensory"] = {"assemblyId": assembly_id}
+            window_ids = sensory.get("windowAssemblyIds")
+            if isinstance(window_ids, (list, tuple)):
+                sample["sensoryWindowAssemblyCount"] = min(
+                    MEDIA_COUNTER_MAX, len(window_ids)
+                )
+        diagnostic = json.dumps(
+            sample,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        sample["diagnosticSha256"] = hashlib.sha256(diagnostic).hexdigest()
+        return sample
+
+    @classmethod
+    def _accumulate_media_report(
+        cls, accumulator: Dict[str, Any], report: Mapping[str, Any]
+    ) -> None:
+        """Fold media results into a fixed-schema, privacy-safe audit sample."""
+
+        kind_value = str(report.get("kind", "unknown"))
+        kind = kind_value if kind_value in {"image", "audio", "video"} else "unknown"
+        trained = bool(report.get("trained", False))
+        steps = cls._media_counter(report.get("steps", 0))
+        accumulator["format"] = MEDIA_ACCUMULATOR_FORMAT
+        accumulator["formatVersion"] = MEDIA_ACCUMULATOR_VERSION
+        accumulator["records"] = min(
+            MEDIA_COUNTER_MAX, cls._media_counter(accumulator.get("records", 0)) + 1
+        )
+        accumulator["trainedRecords"] = min(
+            MEDIA_COUNTER_MAX,
+            cls._media_counter(accumulator.get("trainedRecords", 0))
+            + (1 if trained else 0),
+        )
+        accumulator["weightedLoss"] = _finite_number(
+            accumulator.get("weightedLoss"), 0.0
+        ) + _finite_number(report.get("loss"), 0.0) * max(1, steps)
+        accumulator["steps"] = min(
+            MEDIA_COUNTER_MAX,
+            cls._media_counter(accumulator.get("steps", 0)) + steps,
+        )
+        report_warnings = [str(value) for value in report.get("warnings", [])]
+        accumulator["warningCount"] = min(
+            MEDIA_COUNTER_MAX,
+            cls._media_counter(accumulator.get("warningCount", 0))
+            + len(report_warnings),
+        )
+        warning_samples = accumulator.setdefault("warnings", [])
+        for warning in report_warnings:
+            if len(warning_samples) < MEDIA_DIAGNOSTIC_SAMPLES:
+                warning_samples.append("sha256:" + cls._media_hash(warning))
+            else:
+                accumulator["warningsTruncated"] = True
+
+        record_coverage = cls._safe_media_coverage(
+            kind, report.get("coverage", {})
+        )
+        by_modality = accumulator.setdefault("byModality", {})
+        bucket = by_modality.setdefault(
+            kind,
+            {
+                "unit": record_coverage.get("unit", "unknown"),
+                "windowSize": int(record_coverage.get("windowSize", 0)),
+                "windows": 0,
+                "discoveredUnits": 0,
+                "processedUnits": 0,
+                "tailUnits": 0,
+                "sensoryAssemblies": 0,
+                "records": 0,
+                "trainedRecords": 0,
+                "failedRecords": 0,
+                "complete": True,
+            },
+        )
+        for field in (
+            "windows",
+            "discoveredUnits",
+            "processedUnits",
+            "tailUnits",
+            "sensoryAssemblies",
+        ):
+            bucket[field] = min(
+                MEDIA_COUNTER_MAX,
+                cls._media_counter(bucket.get(field, 0))
+                + cls._media_counter(record_coverage.get(field, 0)),
+            )
+        bucket["records"] = min(
+            MEDIA_COUNTER_MAX, cls._media_counter(bucket.get("records", 0)) + 1
+        )
+        bucket["trainedRecords"] = min(
+            MEDIA_COUNTER_MAX,
+            cls._media_counter(bucket.get("trainedRecords", 0))
+            + (1 if trained else 0),
+        )
+        bucket["failedRecords"] = min(
+            MEDIA_COUNTER_MAX,
+            cls._media_counter(bucket.get("failedRecords", 0))
+            + (0 if trained else 1),
+        )
+        bucket["complete"] = bool(bucket.get("complete", True)) and bool(
+            record_coverage.get("complete", False)
+        )
+        samples = accumulator.setdefault("recordSamples", [])
+        if len(samples) < MEDIA_DIAGNOSTIC_SAMPLES:
+            samples.append(
+                cls._safe_media_sample(
+                    report,
+                    kind=kind,
+                    trained=trained,
+                    steps=steps,
+                    warning_count=len(report_warnings),
+                )
+            )
+        else:
+            accumulator["recordSamplesTruncated"] = True
+
+    @classmethod
+    def _checkpoint_media_accumulator(
+        cls, accumulator: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Rebuild the checkpoint from a strict scalar/count/hash allowlist."""
+
+        raw = dict(accumulator) if isinstance(accumulator, Mapping) else {}
+        safe = cls._empty_media_accumulator()
+        safe["records"] = cls._media_counter(raw.get("records", 0))
+        safe["trainedRecords"] = min(
+            safe["records"], cls._media_counter(raw.get("trainedRecords", 0))
+        )
+        safe["weightedLoss"] = _finite_number(raw.get("weightedLoss"), 0.0)
+        safe["steps"] = cls._media_counter(raw.get("steps", 0))
+        safe["warningCount"] = cls._media_counter(raw.get("warningCount", 0))
+        warnings = raw.get("warnings", [])
+        if isinstance(warnings, list):
+            safe["warnings"] = [
+                value
+                for value in warnings[:MEDIA_DIAGNOSTIC_SAMPLES]
+                if isinstance(value, str)
+                and re.fullmatch(r"sha256:[a-f0-9]{64}", value)
+            ]
+        safe["warningsTruncated"] = bool(raw.get("warningsTruncated", False)) or (
+            isinstance(warnings, list) and len(warnings) > MEDIA_DIAGNOSTIC_SAMPLES
+        )
+
+        raw_modalities = raw.get("byModality", {})
+        if isinstance(raw_modalities, Mapping):
+            for kind in ("audio", "image", "video", "unknown"):
+                bucket = raw_modalities.get(kind)
+                if not isinstance(bucket, Mapping):
+                    continue
+                coverage = cls._safe_media_coverage(kind, bucket)
+                safe["byModality"][kind] = {
+                    **coverage,
+                    "records": cls._media_counter(bucket.get("records", 0)),
+                    "trainedRecords": cls._media_counter(
+                        bucket.get("trainedRecords", 0)
+                    ),
+                    "failedRecords": cls._media_counter(
+                        bucket.get("failedRecords", 0)
+                    ),
+                }
+                safe["byModality"][kind].pop(
+                    "wholeRecordAssemblySha256", None
+                )
+                safe["byModality"][kind].pop("wholeRecordAssemblyId", None)
+
+        raw_samples = raw.get("recordSamples", [])
+        if isinstance(raw_samples, list):
+            for raw_sample in raw_samples[:MEDIA_DIAGNOSTIC_SAMPLES]:
+                if not isinstance(raw_sample, Mapping):
+                    continue
+                kind = str(raw_sample.get("kind", "unknown"))
+                if kind not in {"image", "audio", "video"}:
+                    kind = "unknown"
+                name_hash = str(raw_sample.get("nameSha256", ""))
+                content_hash = str(raw_sample.get("contentSha256", ""))
+                if not all(
+                    re.fullmatch(r"[a-f0-9]{64}", value)
+                    for value in (name_hash, content_hash)
+                ):
+                    continue
+                sample: Dict[str, Any] = {
+                    "nameSha256": name_hash,
+                    "kind": kind,
+                    "contentSha256": content_hash,
+                    "trained": bool(raw_sample.get("trained", False)),
+                    "loss": _finite_number(raw_sample.get("loss"), 0.0),
+                    "steps": cls._media_counter(raw_sample.get("steps", 0)),
+                    "warningCount": cls._media_counter(
+                        raw_sample.get("warningCount", 0)
+                    ),
+                    "coverage": cls._safe_media_coverage(
+                        kind, raw_sample.get("coverage", {})
+                    ),
+                }
+                sensory_hash = str(
+                    raw_sample.get("sensoryAssemblySha256", "")
+                )
+                if re.fullmatch(r"[a-f0-9]{64}", sensory_hash):
+                    sample["sensoryAssemblySha256"] = sensory_hash
+                sensory = raw_sample.get("sensory")
+                if isinstance(sensory, Mapping):
+                    assembly_id = str(sensory.get("assemblyId", ""))
+                    if re.fullmatch(r"[a-f0-9]{16,64}", assembly_id):
+                        sample["sensory"] = {"assemblyId": assembly_id}
+                if "sensoryWindowAssemblyCount" in raw_sample:
+                    sample["sensoryWindowAssemblyCount"] = cls._media_counter(
+                        raw_sample.get("sensoryWindowAssemblyCount", 0)
+                    )
+                sample["diagnosticSha256"] = hashlib.sha256(
+                    json.dumps(
+                        sample,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                safe["recordSamples"].append(sample)
+        safe["recordSamplesTruncated"] = bool(
+            raw.get("recordSamplesTruncated", False)
+        ) or (isinstance(raw_samples, list) and len(raw_samples) > MEDIA_DIAGNOSTIC_SAMPLES)
+        return safe
+
+    def _media_result_from_accumulator(
+        self,
+        accumulator: Mapping[str, Any],
+        *,
+        complete_when_empty: bool = False,
+    ) -> Dict[str, Any]:
+        # The final source record and an interrupted checkpoint use the same
+        # privacy-safe representation, so resuming cannot change its schema.
+        accumulator = self._checkpoint_media_accumulator(accumulator)
+        records = max(0, int(accumulator.get("records", 0)))
+        if records == 0:
             return {
                 "trained": False,
                 "loss": 0.0,
                 "steps": 0,
                 "warnings": [],
+                "warningCount": 0,
+                "warningsTruncated": False,
                 "coverage": self._empty_media_coverage(
                     complete=complete_when_empty
                 ),
                 "records": [],
+                "recordSamplesTruncated": False,
             }
-
-        total_loss = 0.0
-        total_steps = 0
-        warnings: List[str] = []
-        by_modality: Dict[str, Dict[str, Any]] = {}
-        trained_records = 0
-        sanitized_records: List[Dict[str, Any]] = []
-        for report in reports:
-            kind = str(report["kind"])
-            trained = bool(report.get("trained", False))
-            if trained:
-                trained_records += 1
-            steps = max(0, int(report.get("steps", 0)))
-            total_loss += float(report.get("loss", 0.0)) * max(1, steps)
-            total_steps += steps
-            report_warnings = [str(value) for value in report.get("warnings", [])]
-            warnings.extend(
-                "%s: %s" % (report["name"], warning)
-                for warning in report_warnings
-            )
-            record_coverage = dict(report.get("coverage", {}))
-            bucket = by_modality.setdefault(
-                kind,
-                {
-                    "unit": record_coverage.get("unit", "unknown"),
-                    "windowSize": int(record_coverage.get("windowSize", 0)),
-                    "windows": 0,
-                    "discoveredUnits": 0,
-                    "processedUnits": 0,
-                    "tailUnits": 0,
-                    "records": 0,
-                    "trainedRecords": 0,
-                    "failedRecords": 0,
-                    "complete": True,
-                },
-            )
-            bucket["windows"] += int(record_coverage.get("windows", 0))
-            bucket["discoveredUnits"] += int(
-                record_coverage.get("discoveredUnits", 0)
-            )
-            bucket["processedUnits"] += int(
-                record_coverage.get("processedUnits", 0)
-            )
-            bucket["tailUnits"] += int(record_coverage.get("tailUnits", 0))
-            bucket["records"] += 1
-            bucket["trainedRecords"] += 1 if trained else 0
-            bucket["failedRecords"] += 0 if trained else 1
-            bucket["complete"] = bool(bucket["complete"]) and bool(
-                record_coverage.get("complete", False)
-            )
-            sanitized_records.append(
-                {
-                    "name": str(report["name"]),
-                    "kind": kind,
-                    "contentSha256": str(report.get("contentSha256", "")),
-                    "provenance": dict(report.get("provenance", {})),
-                    "trained": trained,
-                    "loss": float(report.get("loss", 0.0)),
-                    "steps": steps,
-                    "coverage": record_coverage,
-                    "warnings": report_warnings,
-                }
-            )
-
+        by_modality = {
+            str(key): dict(value)
+            for key, value in dict(accumulator.get("byModality", {})).items()
+            if isinstance(value, Mapping)
+        }
         units = {str(value["unit"]) for value in by_modality.values()}
         window_sizes = {
             int(value["windowSize"]) for value in by_modality.values()
@@ -6783,9 +15859,16 @@ class AdaptiveBrain:
             "tailUnits": sum(
                 int(value["tailUnits"]) for value in by_modality.values()
             ),
-            "records": len(reports),
-            "trainedRecords": trained_records,
-            "failedRecords": len(reports) - trained_records,
+            "sensoryAssemblies": sum(
+                int(value["sensoryAssemblies"])
+                for value in by_modality.values()
+            ),
+            "records": records,
+            "trainedRecords": max(
+                0, int(accumulator.get("trainedRecords", 0))
+            ),
+            "failedRecords": records
+            - max(0, int(accumulator.get("trainedRecords", 0))),
             "complete": all(
                 bool(value["complete"]) for value in by_modality.values()
             ),
@@ -6798,13 +15881,48 @@ class AdaptiveBrain:
             coverage["processedFrames"] = coverage["processedUnits"]
             coverage["tailFrames"] = coverage["tailUnits"]
         return {
-            "trained": trained_records > 0,
-            "loss": total_loss / max(1, total_steps),
-            "steps": total_steps,
-            "warnings": warnings,
+            "trained": int(accumulator.get("trainedRecords", 0)) > 0,
+            "loss": _finite_number(accumulator.get("weightedLoss"), 0.0)
+            / max(1, int(accumulator.get("steps", 0))),
+            "steps": max(0, int(accumulator.get("steps", 0))),
+            "warnings": [str(value) for value in accumulator.get("warnings", [])],
+            "warningCount": max(0, int(accumulator.get("warningCount", 0))),
+            "warningsTruncated": bool(
+                accumulator.get("warningsTruncated", False)
+            ),
             "coverage": coverage,
-            "records": sanitized_records,
+            "records": [
+                dict(value)
+                for value in accumulator.get("recordSamples", [])
+                if isinstance(value, Mapping)
+            ],
+            "recordSamplesTruncated": bool(
+                accumulator.get("recordSamplesTruncated", False)
+            ),
         }
+
+    @staticmethod
+    def _require_complete_ingestion_coverage(
+        coverage: DatasetCoverage,
+        *,
+        policy: str,
+        resolved_kind: str,
+        record_count_hint: Optional[int],
+    ) -> None:
+        if coverage.as_dict()["complete"] is not True:
+            raise RuntimeError(
+                "dataset traversal stopped before every valid record was visited; "
+                "the source remains incomplete and cannot be marked trained"
+            )
+        if (
+            policy != "archive"
+            and resolved_kind == "parquet"
+            and record_count_hint is not None
+            and coverage.discovered_records != int(record_count_hint)
+        ):
+            raise RuntimeError(
+                "Parquet traversal does not match its footer-declared row count"
+            )
 
     def ingest(
         self,
@@ -6814,28 +15932,130 @@ class AdaptiveBrain:
         kind: str = "",
         policy: str = "encode",
         expected_hash: str = "",
+        committed_sqlite_snapshot: bool = False,
         allow_replay: bool = False,
         epoch: int = 0,
         progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
         if policy not in {"encode", "consolidate", "pretrain", "archive"}:
             raise ValueError("unsupported ingestion policy")
+
+        def capture_source_stat(
+            target: Path, format_name: str
+        ) -> Dict[str, int]:
+            current = target.stat()
+            snapshot = {
+                "device": int(current.st_dev),
+                "inode": int(current.st_ino),
+                "size": int(current.st_size),
+                "mtimeNs": int(current.st_mtime_ns),
+            }
+            if format_name == "sqlite":
+                # Committed rows may live only in WAL.  Sidecar identity is a
+                # cheap between-batch mutation guard; the transactional backup
+                # digest below remains the authoritative content identity.
+                for label, suffix in (("Wal", "-wal"), ("Shm", "-shm")):
+                    sidecar = Path(str(target) + suffix)
+                    try:
+                        stat = sidecar.stat()
+                    except FileNotFoundError:
+                        snapshot["sqlite%sPresent" % label] = 0
+                        snapshot["sqlite%sDevice" % label] = 0
+                        snapshot["sqlite%sInode" % label] = 0
+                        snapshot["sqlite%sSize" % label] = 0
+                        snapshot["sqlite%sMtimeNs" % label] = 0
+                    else:
+                        snapshot["sqlite%sPresent" % label] = 1
+                        snapshot["sqlite%sDevice" % label] = int(stat.st_dev)
+                        snapshot["sqlite%sInode" % label] = int(stat.st_ino)
+                        snapshot["sqlite%sSize" % label] = int(stat.st_size)
+                        snapshot["sqlite%sMtimeNs" % label] = int(
+                            stat.st_mtime_ns
+                        )
+            return snapshot
+
         source_path: Optional[Path] = None
+        source_snapshot: Optional[Dict[str, int]] = None
         raw_bytes: Optional[bytes] = None
         extracted = ""
         coverage = DatasetCoverage()
+        record_count_hint: Optional[int] = None
         if path:
             source_path = Path(path).resolve()
             if not source_path.exists() or not source_path.is_file():
                 raise FileNotFoundError(str(source_path))
             resolved_kind = dataset_format(source_path, kind)
             source_name = name or source_path.name
-            source_bytes = source_path.stat().st_size
-            digest = hashlib.sha256()
-            with source_path.open("rb") as source_stream:
-                for block in iter(lambda: source_stream.read(1024 * 1024), b""):
-                    digest.update(block)
-            content_hash = digest.hexdigest()
+            opened_stat = source_path.stat()
+            source_bytes = int(opened_stat.st_size)
+            record_count_hint = dataset_record_count_hint(
+                source_path, resolved_kind
+            )
+            if resolved_kind == "sqlite":
+                if committed_sqlite_snapshot:
+                    if not re.fullmatch(r"[a-f0-9]{64}", expected_hash.lower()):
+                        raise ValueError(
+                            "committed SQLite snapshot requires its manifest sha256"
+                        )
+                    source_snapshot = capture_source_stat(
+                        source_path, resolved_kind
+                    )
+                    committed_digest = hashlib.sha256()
+                    with source_path.open("rb") as source_stream:
+                        for block in iter(
+                            lambda: source_stream.read(1024 * 1024), b""
+                        ):
+                            committed_digest.update(block)
+                    content_hash = committed_digest.hexdigest()
+                    if source_snapshot != capture_source_stat(
+                        source_path, resolved_kind
+                    ):
+                        raise ValueError(
+                            "committed SQLite snapshot changed while it was hashed"
+                        )
+                else:
+                    # Hash the same transactionally consistent SQLite view that
+                    # record traversal uses, including committed WAL pages. Two
+                    # adjacent snapshots plus sidecar stats close the preflight
+                    # race before any neural update is allowed.
+                    first_hash = sqlite_consistent_snapshot_sha256(source_path)
+                    source_snapshot = capture_source_stat(
+                        source_path, resolved_kind
+                    )
+                    content_hash = sqlite_consistent_snapshot_sha256(source_path)
+                    if (
+                        first_hash != content_hash
+                        or source_snapshot
+                        != capture_source_stat(source_path, resolved_kind)
+                    ):
+                        raise ValueError(
+                            "ingestion SQLite source changed while it was snapshotted"
+                        )
+            else:
+                source_snapshot = capture_source_stat(
+                    source_path, resolved_kind
+                )
+                if re.fullmatch(r"[a-f0-9]{64}", expected_hash.lower()):
+                    # Electron just hashed the immutable manifest entry and
+                    # passes that identity into this transaction. Avoid a
+                    # second complete pre-training scan of 30+ GB sources; the
+                    # final verification below still proves the source did not
+                    # change while neural updates streamed.
+                    content_hash = expected_hash.lower()
+                else:
+                    digest = hashlib.sha256()
+                    with source_path.open("rb") as source_stream:
+                        for block in iter(
+                            lambda: source_stream.read(1024 * 1024), b""
+                        ):
+                            digest.update(block)
+                    content_hash = digest.hexdigest()
+                if source_snapshot != capture_source_stat(
+                    source_path, resolved_kind
+                ):
+                    raise ValueError(
+                        "ingestion source changed while it was hashed"
+                    )
         elif text is not None:
             extracted = str(text).replace("\x00", "")
             raw_bytes = extracted.encode("utf-8")
@@ -6843,10 +16063,275 @@ class AdaptiveBrain:
             source_name = name or "pasted-text"
             source_bytes = len(raw_bytes)
             content_hash = hashlib.sha256(raw_bytes).hexdigest()
+            record_count_hint = 1 if extracted.strip() else 0
         else:
             raise ValueError("ingest requires path or text")
         if expected_hash and expected_hash.lower() != content_hash:
             raise ValueError("ingestion content hash mismatch")
+
+        def verify_source_snapshot(*, full_hash: bool = False) -> None:
+            if source_path is None or source_snapshot is None:
+                return
+            observed = capture_source_stat(source_path, resolved_kind)
+            if observed != source_snapshot:
+                raise ValueError(
+                    "ingestion source changed after its immutable snapshot"
+                )
+            if full_hash:
+                if resolved_kind == "sqlite":
+                    if committed_sqlite_snapshot:
+                        current_digest = hashlib.sha256()
+                        with source_path.open("rb") as source_stream:
+                            for block in iter(
+                                lambda: source_stream.read(1024 * 1024), b""
+                            ):
+                                current_digest.update(block)
+                        observed_hash = current_digest.hexdigest()
+                    else:
+                        observed_hash = sqlite_consistent_snapshot_sha256(
+                            source_path
+                        )
+                else:
+                    current_digest = hashlib.sha256()
+                    with source_path.open("rb") as source_stream:
+                        for block in iter(
+                            lambda: source_stream.read(1024 * 1024), b""
+                        ):
+                            current_digest.update(block)
+                    observed_hash = current_digest.hexdigest()
+                if observed_hash != content_hash:
+                    raise ValueError(
+                        "ingestion source content changed during traversal"
+                    )
+                if capture_source_stat(
+                    source_path, resolved_kind
+                ) != source_snapshot:
+                    raise ValueError(
+                        "ingestion source changed during final verification"
+                    )
+        checkpoint_key = ""
+        checkpoint: Optional[Dict[str, Any]] = None
+        transaction_id = ""
+        source_name_hash = hashlib.sha256(
+            source_name.encode("utf-8")
+        ).hexdigest()
+        if source_path is not None and policy != "archive":
+            checkpoint_key = hashlib.sha256(
+                ("file\0" + str(source_path)).encode("utf-8")
+            ).hexdigest()
+            transaction_id = hashlib.sha256(
+                (
+                    "%s\0%d\0%s\0%s\0%d"
+                    % (
+                        content_hash,
+                        max(0, int(epoch)),
+                        policy,
+                        resolved_kind,
+                        source_bytes,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            stored_checkpoint = self.ingestion_checkpoints.get(checkpoint_key)
+            if stored_checkpoint is not None:
+                # Revalidate the in-memory value as rigorously as load(). A
+                # test harness or future caller must not be able to smuggle a
+                # malformed cursor past the durable-state gate.
+                checkpoint = self._validated_ingestion_checkpoints(
+                    {checkpoint_key: stored_checkpoint}
+                )[checkpoint_key]
+                if (
+                    checkpoint["transactionId"] != transaction_id
+                    or checkpoint["contentHash"] != content_hash
+                    or checkpoint["epoch"] != max(0, int(epoch))
+                    or checkpoint["policy"] != policy
+                    or checkpoint["resolvedKind"] != resolved_kind
+                    or checkpoint["sourceBytes"] != source_bytes
+                    or checkpoint["sourceNameHash"] != source_name_hash
+                    or checkpoint["sourceSnapshot"] != source_snapshot
+                ):
+                    raise ValueError(
+                        "active ingestion checkpoint does not match content hash, "
+                        "epoch, policy, kind, size, or source name"
+                    )
+        if self.ingestion_checkpoints and checkpoint is None:
+            # Neural state may only advance along the transaction named by its
+            # committed cursor. Interleaving another source would make a later
+            # rollback ambiguous, so the caller must first resume the exact
+            # hash/epoch/policy tuple already in progress.
+            raise RuntimeError(
+                "another record ingestion checkpoint is active; resume that "
+                "exact dataset transaction before starting a different source"
+            )
+        completed_transaction = next(
+            (
+                value
+                for value in reversed(self.completed_ingestions)
+                if value.get("transactionId") == transaction_id
+                and value.get("contentHash") == content_hash
+                and value.get("epoch") == max(0, int(epoch))
+                and value.get("policy") == policy
+                and value.get("sourceIdentity") == checkpoint_key
+                and value.get("sourceNameHash") == source_name_hash
+            ),
+            None,
+        )
+        if completed_transaction is None:
+            # The bounded global list is only a recent audit index. The latest
+            # receipt for every retained source is also embedded on that
+            # source, so correctness never depends on an arbitrary tombstone
+            # count when an RPC acknowledgement is lost.
+            for stored_source in self.training_sources:
+                raw_receipt = stored_source.get("completionReceipt")
+                if not isinstance(raw_receipt, Mapping):
+                    continue
+                receipt = self._validated_completed_ingestions(
+                    [raw_receipt]
+                )[0]
+                if (
+                    receipt.get("transactionId") == transaction_id
+                    and receipt.get("contentHash") == content_hash
+                    and receipt.get("epoch") == max(0, int(epoch))
+                    and receipt.get("policy") == policy
+                    and receipt.get("sourceIdentity") == checkpoint_key
+                    and receipt.get("sourceNameHash") == source_name_hash
+                ):
+                    completed_transaction = receipt
+                    break
+        if completed_transaction is not None:
+            source_id = str(completed_transaction.get("sourceId", ""))
+            completed_source = next(
+                (
+                    value
+                    for value in self.training_sources
+                    if str(value.get("id", "")) == source_id
+                ),
+                None,
+            )
+            if completed_source is None:
+                raise ValueError(
+                    "completed ingestion receipt references a missing source"
+                )
+            return {
+                "brainId": self.brain_id,
+                "duplicate": True,
+                "idempotentCompletion": True,
+                "transactionId": transaction_id,
+                "source": completed_source,
+                "coverage": dict(completed_transaction["coverage"]),
+                "recordRecovery": {
+                    "transactionId": transaction_id,
+                    "resumed": False,
+                    "resumedRecords": 0,
+                    "committedRecords": int(
+                        completed_transaction.get("committedRecords", 0)
+                    ),
+                    "visitedRecords": int(
+                        completed_transaction.get("visitedRecords", 0)
+                    ),
+                    "rejectedRecords": int(
+                        completed_transaction.get("rejectedRecords", 0)
+                    ),
+                    "batchCommits": int(
+                        completed_transaction.get("batchCommits", 0)
+                    ),
+                    "checkpointActive": False,
+                    "completionReceiptReused": True,
+                    "rawSourceTextStored": False,
+                    "rawTokenIdsStored": False,
+                },
+                "parameterChecksumAfter": str(
+                    completed_transaction["parameterChecksumAfter"]
+                ),
+                "metrics": self.metrics(),
+            }
+        neural_storage_plan = self._streaming_neural_storage_plan(source_bytes)
+        if checkpoint is None:
+            learning_schedule = self._ingestion_learning_schedule(
+                neural_storage_plan, self._ingestion_checkpoint_records
+            )
+        else:
+            # The current plan remains useful for live pause/readiness signals,
+            # but it must not rewrite choices that already produced committed
+            # neural state. Those choices are part of the transaction.
+            learning_schedule = dict(checkpoint["learningSchedule"])
+            for field in (
+                "detailedRecordAssemblies",
+                "physicalBatchRecords",
+                "gradientAccumulation",
+                "trainingSequenceTokens",
+                "corpusRepresentation",
+                "slowGradientMode",
+            ):
+                neural_storage_plan[field] = learning_schedule[field]
+            for field in ("localTypedTargetWindowPolicy",):
+                if field in learning_schedule:
+                    neural_storage_plan[field] = learning_schedule[field]
+        if policy != "archive" and bool(
+            neural_storage_plan["detailedRecordAssemblies"]
+        ):
+            estimated_detailed_bytes = max(
+                1, int(neural_storage_plan["projectedDetailedBytes"])
+            )
+            detailed_admission = self.resource_policy.status(
+                estimated_write_bytes=estimated_detailed_bytes * 2,
+                estimated_ram_bytes=estimated_detailed_bytes,
+            )
+            offload_status: Optional[Dict[str, Any]] = None
+            if bool(detailed_admission["memoryPressure"]):
+                # Free only safely spillable state, then remeasure the exact
+                # allocation. A transient watermark must never rewrite this
+                # source's frozen learning schedule to statistical-only.
+                offload_status = self._maintain_neural_state_resources()
+                detailed_admission = self.resource_policy.status(
+                    estimated_write_bytes=estimated_detailed_bytes * 2,
+                    estimated_ram_bytes=estimated_detailed_bytes,
+                )
+            neural_storage_plan["detailedAdmissionStatus"] = (
+                detailed_admission
+            )
+            if bool(detailed_admission["memoryPressure"]):
+                wait = self._memory_pressure_wait(
+                    {
+                        **detailed_admission,
+                        **(
+                            {"stateOffload": offload_status}
+                            if offload_status is not None
+                            else {}
+                        ),
+                        "detailedRepresentationPreferred": True,
+                        "detailedRepresentationDeferred": True,
+                        "representationDowngradedForTransientPressure": False,
+                        "sourceRecordsSkipped": False,
+                        "resumeFromLastCheckpoint": checkpoint is not None,
+                    },
+                    stage="detailed neural ingestion",
+                    detail=(
+                        "The small source remains scheduled for detailed "
+                        "neural sequences. Spillable state was considered, "
+                        "but the exact allocation still needs more RAM."
+                    ),
+                )
+                raise NeuralStateResourcePause(
+                    "detailed neural ingestion is waiting for memory without "
+                    "downgrading its learning schedule",
+                    wait,
+                )
+            neural_storage_plan["detailedRepresentationDeferred"] = False
+            neural_storage_plan["representationDecision"] = (
+                "detailed-admitted-after-offload"
+                if offload_status is not None
+                else "detailed-admitted"
+            )
+            neural_storage_plan["resourceStatus"] = (
+                self.resource_policy.status()
+            )
+        if policy != "archive" and bool(
+            neural_storage_plan["resourceStatus"]["diskPressure"]
+        ):
+            raise NeuralStateResourcePause(
+                "dataset learning paused before crossing the neural-state disk reserve",
+                neural_storage_plan["resourceStatus"],
+            )
         duplicate = next(
             (
                 source
@@ -6855,7 +16340,7 @@ class AdaptiveBrain:
             ),
             None,
         )
-        if duplicate is not None and not allow_replay:
+        if duplicate is not None and not allow_replay and checkpoint is None:
             return {
                 "brainId": self.brain_id,
                 "duplicate": True,
@@ -6863,25 +16348,606 @@ class AdaptiveBrain:
                 "metrics": self.metrics(),
             }
 
-        before_checksum = self.parameter_checksum()
-        before_concepts = len(self.memory.concepts)
-        before_ideas = len(self.memory.ideas)
-        before_events = int(self.router.synapses.plasticity_events.item())
-        loss_total = 0.0
-        learned_chunks = 0
-        retained_parts: Optional[List[str]] = (
-            []
-            if self.config.memory_recipe == "total-recall"
-            and self.config.retain_source_text
+        checkpoint_baseline = (
+            dict(checkpoint["baseline"]) if checkpoint is not None else None
+        )
+        before_checksum = (
+            str(checkpoint_baseline["parameterChecksum"])
+            if checkpoint_baseline is not None
+            else self.parameter_checksum()
+        )
+        before_concepts = (
+            int(checkpoint_baseline["concepts"])
+            if checkpoint_baseline is not None
+            else len(self.memory.concepts)
+        )
+        before_ideas = (
+            int(checkpoint_baseline["ideas"])
+            if checkpoint_baseline is not None
+            else len(self.memory.ideas)
+        )
+        before_events = (
+            int(checkpoint_baseline["plasticityEvents"])
+            if checkpoint_baseline is not None
+            else int(self.router.synapses.plasticity_events.item())
+        )
+        before_memory_neurons = (
+            int(checkpoint_baseline.get("memoryNeurons", len(self.memory.neurons)))
+            if checkpoint_baseline is not None
+            else len(self.memory.neurons)
+        )
+        before_memory_synapses = (
+            int(checkpoint_baseline.get("memorySynapses", len(self.memory.synapses)))
+            if checkpoint_baseline is not None
+            else len(self.memory.synapses)
+        )
+        current_memory_synaptic_uses = self.memory.synaptic_use_count()
+        before_memory_synaptic_uses = (
+            int(
+                checkpoint_baseline.get(
+                    "memorySynapticUses", current_memory_synaptic_uses
+                )
+            )
+            if checkpoint_baseline is not None
+            else current_memory_synaptic_uses
+        )
+        before_training_steps = (
+            int(
+                checkpoint_baseline.get(
+                    "trainingSteps", self.counters["training_steps"]
+                )
+            )
+            if checkpoint_baseline is not None
+            else int(self.counters["training_steps"])
+        )
+        before_statistical_experiences = (
+            int(
+                checkpoint_baseline.get(
+                    "statisticalExperiences",
+                    sum(
+                        int(value.get("statistical_experiences", 0))
+                        for value in self.memory.assemblies
+                    ),
+                )
+            )
+            if checkpoint_baseline is not None
+            else sum(
+                int(value.get("statistical_experiences", 0))
+                for value in self.memory.assemblies
+            )
+        )
+        aggregate = dict(checkpoint.get("aggregate", {})) if checkpoint else {}
+        loss_total = _finite_number(aggregate.get("lossTotal"), 0.0)
+        learned_chunks = max(0, int(aggregate.get("learnedChunks", 0)))
+        media_accumulator = (
+            self._checkpoint_media_accumulator(aggregate["mediaAccumulator"])
+            if isinstance(aggregate.get("mediaAccumulator"), Mapping)
+            else self._empty_media_accumulator()
+        )
+        reading_report_count = max(
+            0, int(aggregate.get("readingReportCount", 0))
+        )
+        streaming_gradient_records = max(
+            0, int(aggregate.get("streamingGradientRecords", 0))
+        )
+        streaming_gradient_optimizer_steps = max(
+            0, int(aggregate.get("streamingGradientOptimizerSteps", 0))
+        )
+        streaming_local_pending: List[Tuple[str, torch.Tensor]] = []
+        learning_schedule_started = checkpoint is not None
+        compact_streaming = not bool(
+            neural_storage_plan["detailedRecordAssemblies"]
+        )
+        capability_rehearsal_enabled = bool(
+            policy == "pretrain" and eligible_ground_up_rehearsal(self)
+        )
+        capability_rehearsal_policy = CapabilityRehearsalPolicy(
+            # Unknown/indefinite streams rehearse at a bounded checkpoint
+            # cadence. Finite sources use one exact midpoint below.
+            periodic_global_waves=128
+        )
+        capability_rehearsal_state = CapabilityScheduleState.from_dict(
+            (
+                checkpoint.get("capabilityRehearsal")
+                if checkpoint is not None
+                and isinstance(
+                    checkpoint.get("capabilityRehearsal"), Mapping
+                )
+                else None
+            )
+        )
+        capability_committed_waves = (
+            int(checkpoint["commitSequence"])
+            if checkpoint is not None
+            else 0
+        )
+        raw_capability_cadence = (
+            checkpoint.get("capabilityRehearsalCadence")
+            if checkpoint is not None
             else None
         )
-        media_reports: List[Dict[str, Any]] = []
+        if isinstance(raw_capability_cadence, Mapping):
+            capability_rehearsal_cadence = dict(raw_capability_cadence)
+        elif record_count_hint is not None:
+            total_checkpoint_waves = max(
+                1,
+                math.ceil(
+                    int(record_count_hint)
+                    / float(max(1, int(learning_schedule["checkpointRecords"])))
+                ),
+            )
+            capability_rehearsal_cadence = {
+                "mode": "finite-midpoint",
+                "checkpointRecords": int(
+                    learning_schedule["checkpointRecords"]
+                ),
+                "expectedCheckpointWaves": total_checkpoint_waves,
+                "middleWave": (
+                    math.ceil(total_checkpoint_waves / 2.0)
+                    if total_checkpoint_waves >= 2
+                    else None
+                ),
+            }
+        else:
+            capability_rehearsal_cadence = {
+                "mode": "indefinite-periodic",
+                "checkpointRecords": int(
+                    learning_schedule["checkpointRecords"]
+                ),
+                "periodicWaves": int(
+                    capability_rehearsal_policy.periodic_global_waves
+                ),
+            }
+        if (
+            capability_rehearsal_cadence.get("mode")
+            not in {"finite-midpoint", "indefinite-periodic"}
+            or int(
+                capability_rehearsal_cadence.get(
+                    "checkpointRecords", -1
+                )
+            )
+            != int(learning_schedule["checkpointRecords"])
+        ):
+            raise ValueError(
+                "ingestion capability rehearsal cadence is invalid"
+            )
+        if capability_rehearsal_enabled and due_rehearsal_phase(
+            capability_rehearsal_state,
+            capability_rehearsal_policy,
+            committed_global_waves=capability_committed_waves,
+        ) == "start":
+            capability_receipt = rehearse_capabilities(
+                self,
+                phase="start",
+                committed_global_waves=capability_committed_waves,
+                policy=capability_rehearsal_policy,
+            )
+            capability_rehearsal_state = advance_schedule_state(
+                capability_rehearsal_state, capability_receipt
+            )
+
+        def flush_streaming_local() -> None:
+            nonlocal loss_total
+            nonlocal streaming_gradient_records
+            nonlocal streaming_gradient_optimizer_steps
+            nonlocal learning_schedule_started
+            if not streaming_local_pending:
+                return
+            effective_batch_target = max(
+                1,
+                int(learning_schedule["physicalBatchRecords"])
+                * int(learning_schedule["gradientAccumulation"]),
+            )
+            report = self._optimize_streaming_experience_batch(
+                streaming_local_pending,
+                learning_schedule=learning_schedule,
+                schedule_locked=learning_schedule_started,
+            )
+            effective_physical = int(report["physical_batch_records"])
+            effective_tokens = int(report["training_sequence_tokens"])
+            if not learning_schedule_started:
+                # The first allocation may recover from an OOM by selecting a
+                # smaller schedule. Freeze the schedule that actually produced
+                # the first successful mutation; all later flushes are exact.
+                if effective_batch_target % effective_physical:
+                    raise RuntimeError(
+                        "allocator fallback cannot preserve the exact logical "
+                        "batch target"
+                    )
+                effective_accumulation = (
+                    effective_batch_target // effective_physical
+                )
+                learning_schedule["physicalBatchRecords"] = effective_physical
+                learning_schedule["gradientAccumulation"] = (
+                    effective_accumulation
+                )
+                learning_schedule["trainingSequenceTokens"] = effective_tokens
+                neural_storage_plan["physicalBatchRecords"] = effective_physical
+                neural_storage_plan["gradientAccumulation"] = (
+                    effective_accumulation
+                )
+                neural_storage_plan["trainingSequenceTokens"] = effective_tokens
+            elif (
+                effective_physical
+                != int(learning_schedule["physicalBatchRecords"])
+                or effective_tokens
+                != int(learning_schedule["trainingSequenceTokens"])
+            ):
+                raise RuntimeError(
+                    "committed ingestion learning schedule changed unexpectedly"
+                )
+            learning_schedule_started = True
+            loss_total += float(report["loss"]) * int(report["records"])
+            streaming_gradient_records += int(report["records"])
+            streaming_gradient_optimizer_steps += int(
+                report["optimizer_steps"]
+            )
+            streaming_local_pending.clear()
+
+        def queue_streaming_local(text_value: str) -> None:
+            if not text_value.strip():
+                return
+            streaming_local_pending.append(
+                (
+                    text_value,
+                    self.memory.vector_for_text(text_value).detach().cpu(),
+                )
+            )
+            effective_batch = max(
+                1,
+                int(learning_schedule["physicalBatchRecords"])
+                * int(learning_schedule["gradientAccumulation"]),
+            )
+            if len(streaming_local_pending) >= effective_batch:
+                flush_streaming_local()
+
+
+
+
+
+
+        committed_record_cursor = (
+            int(checkpoint["committedRecords"]) if checkpoint is not None else 0
+        )
+        last_committed_record_cursor = committed_record_cursor
+        resumed_record_count = committed_record_cursor
+        commit_sequence = (
+            int(checkpoint["commitSequence"]) if checkpoint is not None else 0
+        )
+        record_cursor = 0
+        record_prefix_sha256 = hashlib.sha256(
+            b"omni-record-prefix-v1"
+        ).hexdigest()
+        resume_boundary_validated = committed_record_cursor == 0
+
+        def record_progress_value(
+            ordinal: int, within_record: float = 0.0
+        ) -> float:
+            if record_count_hint is not None and record_count_hint > 0:
+                return min(
+                    0.99,
+                    max(
+                        0.0,
+                        (max(0, ordinal - 1) + max(0.0, within_record))
+                        / float(record_count_hint),
+                    ),
+                )
+            if resolved_kind in {"text", "json", "jsonl", "csv", "tsv"}:
+                return min(
+                    0.99,
+                    max(
+                        0.0,
+                        int(coverage.processed_bytes)
+                        / float(max(1, source_bytes)),
+                    ),
+                )
+            # Compressed/archive bytes and decoded media units are not a valid
+            # denominator. Stay honest until the entry is fully traversed.
+            return 0.0
+
+        def record_position(ordinal: int) -> str:
+            if record_count_hint is not None:
+                return "%d/%d" % (ordinal, max(0, record_count_hint))
+            return "%d (total discovered while streaming)" % ordinal
+
+        progress_resource_readings: Dict[str, Any] = {}
+        progress_resource_readings_at = 0.0
+
+        def dataset_progress_data(
+            *, checkpoint_committed: bool = False
+        ) -> Dict[str, Any]:
+            nonlocal progress_resource_readings
+            nonlocal progress_resource_readings_at
+            resource_fields = {
+                "processMemoryBytes",
+                "processPeakMemoryBytes",
+                "availableMemoryBytes",
+                "totalMemoryBytes",
+                "acceleratorFreeMemoryBytes",
+                "acceleratorTotalMemoryBytes",
+                "diskFreeBytes",
+                "diskTotalBytes",
+                "diskReserveBytes",
+                "mandatoryFreeDiskBytes",
+                "projectedDiskFreeBytes",
+                "estimatedWriteBytes",
+            }
+            measured_at = time.monotonic()
+            if (
+                progress_resource_readings_at <= 0.0
+                or measured_at - progress_resource_readings_at >= 1.0
+            ):
+                live_policy = self.resource_policy.status(
+                    estimated_write_bytes=max(
+                        0,
+                        int(
+                            neural_storage_plan
+                            .get("trainingResourcePlan", {})
+                            .get("scratch", {})
+                            .get("estimatedCheckpointBytes", 0)
+                        ),
+                    )
+                )
+                progress_resource_readings = {
+                    key: value
+                    for key, value in live_policy.items()
+                    if key in resource_fields
+                    and not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and math.isfinite(float(value))
+                    and float(value) >= 0.0
+                }
+                if isinstance(live_policy.get("diskPressure"), bool):
+                    progress_resource_readings["diskPressure"] = bool(
+                        live_policy["diskPressure"]
+                    )
+                progress_resource_readings_at = measured_at
+            if bool(progress_resource_readings.get("diskPressure")):
+                raise NeuralStateResourcePause(
+                    "dataset learning paused at the mandatory disk reserve",
+                    dict(progress_resource_readings),
+                )
+            return {
+                "datasetProgress": {
+                    "coverage": coverage.as_dict(),
+                    "currentRecord": int(record_cursor),
+                    "committedRecords": int(last_committed_record_cursor),
+                    "checkpointCommitted": bool(checkpoint_committed),
+                    "expectedRecords": (
+                        int(record_count_hint)
+                        if record_count_hint is not None
+                        else None
+                    ),
+                    "recordTotalKnown": record_count_hint is not None,
+                },
+                "resourceReadings": dict(progress_resource_readings),
+            }
+
+        def restore_committed_coverage() -> None:
+            nonlocal resume_boundary_validated
+            if checkpoint is None or resume_boundary_validated:
+                return
+            stored = checkpoint.get("coverageAtCommit")
+            if not isinstance(stored, Mapping):
+                raise ValueError("ingestion checkpoint coverage snapshot is invalid")
+            if int(coverage.discovered_records) != int(
+                checkpoint["visitedRecords"]
+            ):
+                raise ValueError(
+                    "dataset record stream no longer matches its committed checkpoint"
+                )
+            if record_prefix_sha256 != str(
+                checkpoint["recordPrefixSha256"]
+            ):
+                raise ValueError(
+                    "dataset record content no longer matches its committed checkpoint"
+                )
+            coverage.discovered_files = int(stored.get("discoveredFiles", 0))
+            coverage.completed_files = int(stored.get("completedFiles", 0))
+            coverage.rejected_files = int(stored.get("rejectedFiles", 0))
+            coverage.discovered_records = int(stored.get("discoveredRecords", 0))
+            coverage.processed_records = int(stored.get("processedRecords", 0))
+            coverage.rejected_records = int(stored.get("rejectedRecords", 0))
+            coverage.processed_bytes = int(stored.get("processedBytes", 0))
+            coverage.shards = int(stored.get("shards", 0))
+            coverage.modality_counts = {
+                str(key): int(value)
+                for key, value in dict(
+                    stored.get("modalityCounts", {})
+                ).items()
+            }
+            coverage.errors = [
+                dict(value)
+                for value in stored.get("errors", [])
+                if isinstance(value, Mapping)
+            ][: coverage._ERROR_SAMPLE_LIMIT]
+            coverage.error_count = int(stored.get("errorCount", 0))
+            coverage.errors_truncated = bool(
+                stored.get("errorsTruncated", False)
+            )
+            resume_boundary_validated = True
+
+        def commit_record_checkpoint() -> None:
+            nonlocal checkpoint
+            nonlocal commit_sequence
+            nonlocal last_committed_record_cursor
+            nonlocal capability_rehearsal_state
+            if not checkpoint_key or record_cursor <= last_committed_record_cursor:
+                return
+            verify_source_snapshot()
+            # Pending raw strings are consumed by their neural update before
+            # the cursor can move.  Only aggregate numbers/hashes survive.
+            flush_streaming_local()
+            coverage_snapshot = coverage.as_dict()
+            commit_sequence += 1
+            finite_middle = capability_rehearsal_cadence.get("middleWave")
+            middle_due = bool(
+                capability_rehearsal_enabled
+                and (
+                    (
+                        capability_rehearsal_cadence["mode"]
+                        == "finite-midpoint"
+                        and finite_middle is not None
+                        and commit_sequence == int(finite_middle)
+                        and capability_rehearsal_state.last_periodic_wave == 0
+                    )
+                    or (
+                        capability_rehearsal_cadence["mode"]
+                        == "indefinite-periodic"
+                        and due_rehearsal_phase(
+                            capability_rehearsal_state,
+                            capability_rehearsal_policy,
+                            committed_global_waves=commit_sequence,
+                        )
+                        == "middle"
+                    )
+                )
+            )
+            if middle_due:
+                capability_receipt = rehearse_capabilities(
+                    self,
+                    phase="middle",
+                    committed_global_waves=commit_sequence,
+                    policy=capability_rehearsal_policy,
+                    baseline_minimum_probability=(
+                        capability_rehearsal_state.baseline_minimum_probability
+                    ),
+                )
+                capability_rehearsal_state = advance_schedule_state(
+                    capability_rehearsal_state, capability_receipt
+                )
+            baseline = {
+                "parameterChecksum": before_checksum,
+                "concepts": before_concepts,
+                "ideas": before_ideas,
+                "plasticityEvents": before_events,
+                "memoryNeurons": before_memory_neurons,
+                "memorySynapses": before_memory_synapses,
+                "memorySynapticUses": before_memory_synaptic_uses,
+                "trainingSteps": before_training_steps,
+                "statisticalExperiences": before_statistical_experiences,
+            }
+            checkpoint = {
+                "format": INGESTION_CHECKPOINT_FORMAT,
+                "formatVersion": INGESTION_CHECKPOINT_VERSION,
+                "parserContract": INGESTION_PARSER_CONTRACT,
+                "status": "active",
+                "sourceIdentity": checkpoint_key,
+                "transactionId": transaction_id,
+                "contentHash": content_hash,
+                "sourceNameHash": source_name_hash,
+                "neuralStateChecksum": self.parameter_checksum(),
+                "recordPrefixSha256": record_prefix_sha256,
+                "sourceSnapshot": dict(source_snapshot or {}),
+                "sourceBytes": source_bytes,
+                "resolvedKind": resolved_kind,
+                "policy": policy,
+                "epoch": max(0, int(epoch)),
+                "committedRecords": record_cursor,
+                "visitedRecords": int(coverage_snapshot["discoveredRecords"]),
+                "processedRecords": int(coverage_snapshot["processedRecords"]),
+                "rejectedRecords": int(coverage_snapshot["rejectedRecords"]),
+                "processedBytes": int(coverage_snapshot["processedBytes"]),
+                "commitSequence": commit_sequence,
+                "coverageAtCommit": coverage_snapshot,
+                "learningSchedule": dict(learning_schedule),
+                "learningScheduleSha256": hashlib.sha256(
+                    json.dumps(
+                        learning_schedule,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "baseline": baseline,
+                "aggregate": {
+                    "lossTotal": float(loss_total),
+                    "learnedChunks": int(learned_chunks),
+                    "readingReportCount": int(reading_report_count),
+                    "streamingGradientRecords": int(
+                        streaming_gradient_records
+                    ),
+                    "streamingGradientOptimizerSteps": int(
+                        streaming_gradient_optimizer_steps
+                    ),
+                    "mediaAccumulator": self._checkpoint_media_accumulator(
+                        media_accumulator
+                    ),
+                },
+                "capabilityRehearsal": (
+                    capability_rehearsal_state.to_dict()
+                    if capability_rehearsal_enabled
+                    else None
+                ),
+                "capabilityRehearsalCadence": (
+                    dict(capability_rehearsal_cadence)
+                    if capability_rehearsal_enabled
+                    else None
+                ),
+                "committedAt": _iso_now(),
+            }
+            self.ingestion_checkpoints[checkpoint_key] = checkpoint
+            # save() publishes neural tensors, optimizer/replay state, and this
+            # cursor through one generation pointer plus one atomic brain.json
+            # replacement. A crash observes either the prior batch or this one.
+            self._clear_allocator_recovery_pause()
+            self.save()
+            last_committed_record_cursor = record_cursor
+            self.events.append(
+                "ingestion-batch-commit",
+                {
+                    "transactionId": transaction_id,
+                    "contentHash": content_hash,
+                    "epoch": max(0, int(epoch)),
+                    "policy": policy,
+                    "commitSequence": commit_sequence,
+                    "committedRecords": record_cursor,
+                    "visitedRecords": int(
+                        coverage_snapshot["discoveredRecords"]
+                    ),
+                    "processedRecords": int(
+                        coverage_snapshot["processedRecords"]
+                    ),
+                    "rejectedRecords": int(
+                        coverage_snapshot["rejectedRecords"]
+                    ),
+                    "parameterChecksum": self.parameter_checksum(),
+                    "rawSourceRetained": False,
+                    "rawTokenIdsRetained": False,
+                },
+            )
+            if progress is not None:
+                progress(
+                    record_progress_value(record_cursor, 1.0),
+                    "Committed %d learned records (%d visited, %d rejected)"
+                    % (
+                        record_cursor,
+                        int(coverage_snapshot["discoveredRecords"]),
+                        int(coverage_snapshot["rejectedRecords"]),
+                    ),
+                    dataset_progress_data(checkpoint_committed=True),
+                )
+
+        def maybe_commit_record_checkpoint() -> None:
+            if (
+                checkpoint_key
+                and record_cursor - last_committed_record_cursor
+                >= int(learning_schedule["checkpointRecords"])
+            ):
+                commit_record_checkpoint()
         if policy != "archive":
             if source_path is not None:
                 record_stream = iter_dataset_records(
                     source_path,
                     requested_kind=resolved_kind,
                     coverage=coverage,
+                    _committed_sqlite_snapshot_sha256=(
+                        content_hash
+                        if resolved_kind == "sqlite"
+                        and committed_sqlite_snapshot
+                        else ""
+                    ),
                 )
             else:
                 coverage.discovered_files = 1
@@ -6892,8 +16958,31 @@ class AdaptiveBrain:
                 record_stream = []
 
             for record in record_stream:
+                if resolved_kind == "sqlite":
+                    record_snapshot_hash = str(
+                        dict(getattr(record, "provenance", {})).get(
+                            "sqlite_snapshot_sha256", ""
+                        )
+                    )
+                    if record_snapshot_hash != content_hash:
+                        raise ValueError(
+                            "SQLite traversal snapshot does not match its "
+                            "ingestion transaction identity"
+                        )
+                record_cursor += 1
+                record_prefix_sha256 = self._record_prefix_digest(
+                    record_prefix_sha256, record_cursor, record
+                )
                 record_kind = str(getattr(record, "kind", "text"))
                 record_name = str(getattr(record, "name", source_name))
+                if record_cursor <= committed_record_cursor:
+                    # Parsing the prefix again validates the deterministic
+                    # record boundary, but no committed record is presented to
+                    # any neural learner a second time. Exact source bytes are
+                    # owned by the desktop CAS, never rebuilt inside the worker.
+                    if record_cursor == committed_record_cursor:
+                        restore_committed_coverage()
+                    continue
                 if record_kind in {"image", "audio", "video"}:
                     record_path = getattr(record, "local_path", None)
                     if not record_path:
@@ -6905,7 +16994,8 @@ class AdaptiveBrain:
                             failure_message,
                         )
                         failure_coverage = self._empty_media_coverage(record_kind)
-                        media_reports.append(
+                        self._accumulate_media_report(
+                            media_accumulator,
                             {
                                 "name": record_name,
                                 "kind": record_kind,
@@ -6920,8 +17010,9 @@ class AdaptiveBrain:
                                 "steps": 0,
                                 "coverage": failure_coverage,
                                 "warnings": [failure_message],
-                            }
+                            },
                         )
+                        maybe_commit_record_checkpoint()
                         continue
                     effective_kind = self._effective_media_kind(
                         str(record_path), record_kind
@@ -6948,8 +17039,18 @@ class AdaptiveBrain:
                             record_name,
                             steps=3 if policy == "pretrain" else 2,
                             progress=progress,
+                            content_sha256=str(
+                                getattr(record, "content_sha256", "")
+                            ),
                         )
                     except (RuntimeError, ValueError, OSError) as error:
+                        if is_allocator_oom_error(error):
+                            self._allocator_oom_count += 1
+                            self._release_training_allocator_cache()
+                            raise self._allocator_resource_pause(
+                                error,
+                                stage="modality-training",
+                            ) from error
                         trained_media = {
                             "trained": False,
                             "loss": 0.0,
@@ -6968,7 +17069,8 @@ class AdaptiveBrain:
                             "; ".join(training_warnings)
                             or "%s media decoding/training failed" % record_kind,
                         )
-                    media_reports.append(
+                    self._accumulate_media_report(
+                        media_accumulator,
                         {
                             "name": record_name,
                             "kind": record_kind,
@@ -6979,34 +17081,123 @@ class AdaptiveBrain:
                                 getattr(record, "provenance", {})
                             ),
                             **trained_media,
-                        }
+                        },
                     )
+                    maybe_commit_record_checkpoint()
                     continue
 
                 record_text = str(getattr(record, "text", ""))
-                if retained_parts is not None:
-                    retained_parts.append(record_text)
-                for chunk in self._experience_chunks(record_text):
+                record_ordinal = max(1, int(coverage.processed_records))
+                record_provenance = dict(
+                    getattr(record, "provenance", {}) or {}
+                )
+                dialogue_pairs = self._typed_dialogue_pairs(record_provenance)
+                record_chunks = self._experience_chunks(record_text)
+                chunk_importances = self._reading_chunk_importances(record_chunks)
+                section_assemblies: List[str] = []
+                for section_index, (chunk, chunk_importance) in enumerate(
+                    zip(record_chunks, chunk_importances), start=1
+                ):
+                    if progress is not None:
+                        progress(
+                            record_progress_value(
+                                record_ordinal,
+                                0.02
+                                + 0.78
+                                * (section_index - 1)
+                                / float(max(1, len(record_chunks))),
+                            ),
+                            "Learning %s record %s, section %d/%d"
+                            % (
+                                record_name,
+                                record_position(record_ordinal),
+                                section_index,
+                                len(record_chunks),
+                            ),
+                            dataset_progress_data(),
+                        )
                     learned = self.learn_experience(
                         chunk,
                         kind="knowledge",
                         source="document",
                         source_label=record_name,
-                        steps=2 if policy == "pretrain" else 1,
-                        importance=0.65,
+                        steps=(
+                            0
+                            if compact_streaming
+                            else (2 if policy == "pretrain" else 1)
+                        ),
+                        importance=chunk_importance,
+                        structural_detail=bool(
+                            neural_storage_plan["detailedRecordAssemblies"]
+                        ),
                     )
-                    loss_total += float(learned["training"]["loss"])
+                    section_assemblies.append(str(learned["assembly_id"]))
+                    if compact_streaming:
+                        queue_streaming_local(chunk)
+                    else:
+                        loss_total += float(learned["training"]["loss"])
                     learned_chunks += 1
+                integrated_record = (
+                    self._integrate_reading_record(
+                        record_text,
+                        source_name=record_name,
+                        child_assembly_ids=section_assemblies,
+                        child_weights=chunk_importances,
+                    )
+                    if bool(
+                        neural_storage_plan["detailedRecordAssemblies"]
+                    )
+                    else None
+                )
+                if integrated_record is not None:
+                    reading_report_count += 1
+                if dialogue_pairs:
+                    for human, response in dialogue_pairs:
+                        self._apply_supervised_dialogue(
+                            human,
+                            response,
+                            steps=2 if policy == "pretrain" else 1,
+                            train_local=not compact_streaming,
+                            local_exact_response_windows=(
+                                int(learning_schedule["formatVersion"])
+                                == INGESTION_LEARNING_SCHEDULE_VERSION
+                                and learning_schedule.get(
+                                    "localTypedTargetWindowPolicy"
+                                )
+                                == LOCAL_TYPED_TARGET_WINDOW_POLICY
+                            ),
+                            local_exact_training_sequence_tokens=(
+                                int(learning_schedule["trainingSequenceTokens"])
+                                if int(learning_schedule["formatVersion"])
+                                == INGESTION_LEARNING_SCHEDULE_VERSION
+                                else None
+                            ),
+                            local_exact_target_window_policy=(
+                                str(
+                                    learning_schedule[
+                                        "localTypedTargetWindowPolicy"
+                                    ]
+                                )
+                                if int(learning_schedule["formatVersion"])
+                                == INGESTION_LEARNING_SCHEDULE_VERSION
+                                else None
+                            ),
+                        )
+                        if compact_streaming:
+                            dialogue_text = "%s\n\n%s" % (human, response)
+                            queue_streaming_local(dialogue_text)
                 if progress is not None:
                     progress(
-                        min(
-                            0.99,
-                            coverage.processed_bytes
-                            / float(max(1, source_bytes)),
-                        ),
-                        "Encoding %s (%d records)"
-                        % (source_name, coverage.processed_records),
+                        record_progress_value(record_ordinal, 1.0),
+                        "Encoding %s (record %s)"
+                        % (source_name, record_position(record_ordinal)),
+                        dataset_progress_data(),
                     )
+                maybe_commit_record_checkpoint()
+            if record_cursor < committed_record_cursor:
+                raise ValueError(
+                    "dataset ended before its committed ingestion checkpoint"
+                )
             if source_path is None and resolved_kind in {
                 "image",
                 "audio",
@@ -7022,7 +17213,8 @@ class AdaptiveBrain:
                     )
                 else:
                     coverage.reject(source_name, missing_path_message)
-                media_reports.append(
+                self._accumulate_media_report(
+                    media_accumulator,
                     {
                         "name": source_name,
                         "kind": resolved_kind,
@@ -7033,28 +17225,81 @@ class AdaptiveBrain:
                         "steps": 0,
                         "coverage": self._empty_media_coverage(resolved_kind),
                         "warnings": [missing_path_message],
-                    }
+                    },
                 )
             elif source_path is None and extracted.strip():
-                if retained_parts is not None:
-                    retained_parts.append(extracted)
-                for chunk in self._experience_chunks(extracted):
+                extracted_chunks = self._experience_chunks(extracted)
+                extracted_importances = self._reading_chunk_importances(
+                    extracted_chunks
+                )
+                extracted_assemblies: List[str] = []
+                for section_index, (chunk, chunk_importance) in enumerate(
+                    zip(extracted_chunks, extracted_importances), start=1
+                ):
+                    if progress is not None:
+                        progress(
+                            min(
+                                0.82,
+                                0.02
+                                + 0.78
+                                * (section_index - 1)
+                                / float(max(1, len(extracted_chunks))),
+                            ),
+                            "Learning %s section %d/%d"
+                            % (source_name, section_index, len(extracted_chunks)),
+                        )
                     learned = self.learn_experience(
                         chunk,
                         kind="knowledge",
                         source="document",
                         source_label=source_name,
-                        steps=2 if policy == "pretrain" else 1,
-                        importance=0.65,
+                        steps=(
+                            0
+                            if compact_streaming
+                            else (2 if policy == "pretrain" else 1)
+                        ),
+                        importance=chunk_importance,
+                        structural_detail=bool(
+                            neural_storage_plan["detailedRecordAssemblies"]
+                        ),
                     )
-                    loss_total += float(learned["training"]["loss"])
+                    extracted_assemblies.append(str(learned["assembly_id"]))
+                    if compact_streaming:
+                        queue_streaming_local(chunk)
+                    else:
+                        loss_total += float(learned["training"]["loss"])
                     learned_chunks += 1
+                integrated_record = (
+                    self._integrate_reading_record(
+                        extracted,
+                        source_name=source_name,
+                        child_assembly_ids=extracted_assemblies,
+                        child_weights=extracted_importances,
+                    )
+                    if bool(
+                        neural_storage_plan["detailedRecordAssemblies"]
+                    )
+                    else None
+                )
+                if integrated_record is not None:
+                    reading_report_count += 1
         else:
             coverage.discovered_files = 1
             coverage.completed_files = 1
             coverage.processed_bytes = source_bytes
-        media_result = self._aggregate_media_reports(
-            media_reports,
+        self._require_complete_ingestion_coverage(
+            coverage,
+            policy=policy,
+            resolved_kind=resolved_kind,
+            record_count_hint=record_count_hint,
+        )
+        verify_source_snapshot(full_hash=True)
+        # Commit the final partial accumulation only after every visited record
+        # has entered fast substrate/statistical state. These calls retain no
+        # raw source buffers after returning.
+        flush_streaming_local()
+        media_result = self._media_result_from_accumulator(
+            media_accumulator,
             complete_when_empty=policy == "archive",
         )
         if progress is not None:
@@ -7070,10 +17315,45 @@ class AdaptiveBrain:
         effective_source_kind = resolved_kind
         if (
             resolved_kind == "image"
-            and len(media_reports) == 1
-            and str(media_reports[0].get("kind", "")) == "video"
+            and int(media_result["coverage"].get("records", 0)) == 1
+            and set(media_result["coverage"].get("byModality", {}))
+            == {"video"}
         ):
             effective_source_kind = "video"
+        semantic_neurons_created = max(
+            0, len(self.memory.neurons) - before_memory_neurons
+        )
+        sparse_synapses_created = max(
+            0, len(self.memory.synapses) - before_memory_synapses
+        )
+        memory_synapse_update_events = max(
+            0,
+            self.memory.synaptic_use_count()
+            - before_memory_synaptic_uses,
+        )
+        statistical_experience_updates = max(
+            0,
+            sum(
+                int(value.get("statistical_experiences", 0))
+                for value in self.memory.assemblies
+            )
+            - before_statistical_experiences,
+        )
+        spike_plasticity_events = max(
+            0,
+            int(self.router.synapses.plasticity_events.item()) - before_events,
+        )
+        # This is a count of observed synaptic mutation events, not a count of
+        # dense optimizer records. Sparse Hebbian reinforcements and router
+        # STDP stay independently auditable.
+        synaptic_update_events = (
+            memory_synapse_update_events
+            + spike_plasticity_events
+        )
+        parameter_update_steps = max(
+            0, int(self.counters["training_steps"]) - before_training_steps
+        )
+        neural_update_events = synaptic_update_events + parameter_update_steps
         source_record: Dict[str, Any] = {
             "id": (
                 str(duplicate.get("id"))
@@ -7097,22 +17377,44 @@ class AdaptiveBrain:
                 else 1
             ),
             "last_epoch": max(0, int(epoch)),
+            "transaction_id": transaction_id or None,
+            "transactionId": transaction_id or None,
+            "source_identity": checkpoint_key or None,
+            "source_name_hash": source_name_hash,
             "learned_ideas": len(self.memory.ideas) - before_ideas,
             "learned_concepts": len(self.memory.concepts) - before_concepts,
-            "plasticity_events": int(
-                self.router.synapses.plasticity_events.item()
-            )
-            - before_events,
+            # Compatibility field now reports all durable neural update events,
+            # not only router STDP. Large statistical corpora can reinforce an
+            # existing assembly millions of times without inventing millions
+            # of fake new ideas.
+            "plasticity_events": neural_update_events,
+            "neural_update_events": neural_update_events,
+            "synaptic_update_events": synaptic_update_events,
+            "memory_synapse_update_events": memory_synapse_update_events,
+            "parameter_update_steps": parameter_update_steps,
+            "spike_plasticity_events": spike_plasticity_events,
+            "semantic_neurons_created": semantic_neurons_created,
+            "sparse_synapses_created": sparse_synapses_created,
+            "statistical_experience_updates": statistical_experience_updates,
             "raw_text_retained": False,
             "modality_trained": bool(media_result["trained"]),
             "media_coverage": dict(media_result["coverage"]),
             "media_records": list(media_result["records"]),
             "warnings": list(media_result["warnings"]),
             "coverage": coverage.as_dict(),
+            "streaming_gradient_records": streaming_gradient_records,
+            "streaming_gradient_optimizer_steps": (
+                streaming_gradient_optimizer_steps
+            ),
+            "whole_record_assemblies": reading_report_count,
+            "record_batch_commits": commit_sequence,
+            "resumed_record_count": resumed_record_count,
+            "neural_storage_plan": {
+                key: value
+                for key, value in neural_storage_plan.items()
+                if key != "resourceStatus"
+            },
         }
-        if retained_parts:
-            source_record["raw_text"] = "\n".join(retained_parts)
-            source_record["raw_text_retained"] = True
         if duplicate is None:
             self.training_sources.append(source_record)
         else:
@@ -7122,10 +17424,134 @@ class AdaptiveBrain:
                 else source
                 for source in self.training_sources
             ]
-        if policy == "consolidate":
-            self.consolidate(max(1, min(8, learned_chunks)), progress=progress)
-        else:
-            self.save()
+        # ``consolidate`` is retained as an ingestion-policy spelling for API
+        # compatibility, but it no longer starts a separate, manually bounded
+        # post-pass here.  Every accepted experience has already gone through
+        # the continuously scheduled neural settling path.  Starting another
+        # save-owning phase between the last record checkpoint and the final
+        # completion receipt would make that phase repeatable after a crash and
+        # could publish a cursor for a different neural generation.
+        action_policy_refresh: Optional[Dict[str, Any]] = None
+        capability_rehearsal_receipt: Optional[Dict[str, Any]] = None
+        if capability_rehearsal_enabled:
+            final_phase = due_rehearsal_phase(
+                capability_rehearsal_state,
+                capability_rehearsal_policy,
+                committed_global_waves=commit_sequence,
+                final=True,
+            )
+            if final_phase != "final":
+                raise RuntimeError(
+                    "ground-up pretrain capability final gate was not scheduled"
+                )
+            capability_rehearsal_receipt = rehearse_capabilities(
+                self,
+                phase="final",
+                committed_global_waves=commit_sequence,
+                policy=capability_rehearsal_policy,
+                baseline_minimum_probability=(
+                    capability_rehearsal_state.baseline_minimum_probability
+                ),
+            )
+            capability_rehearsal_state = advance_schedule_state(
+                capability_rehearsal_state,
+                capability_rehearsal_receipt,
+            )
+            action_policy_refresh = dict(
+                capability_rehearsal_receipt["action"]
+            )
+            source_record["capability_rehearsal"] = (
+                capability_rehearsal_state.to_dict()
+            )
+        elif policy != "archive" and self._can_retain_native_action_policy():
+            # Corpus learning changes the representations feeding both action
+            # heads even when those heads receive no direct gradient. Rehearse
+            # the project-authored typed trajectories once after the complete
+            # ingestion transaction so ordinary conversation does not drift
+            # into a high-confidence Ponder/tool proposal. This is neural
+            # trajectory replay, not a runtime prompt or preference objective.
+            action_policy_refresh = self._calibrate_starter_action_policy(
+                max_steps=256,
+                minimum_steps=0,
+                strict=False,
+            )
+            if not bool(action_policy_refresh.get("calibrated", False)):
+                source_record["warnings"].append(
+                    "Typed action pathways could not be refreshed after learning; "
+                    "the prior action heads were restored."
+                )
+        elif policy == "pretrain" and self.config.origin_kind == "ground-up":
+            raise RuntimeError(
+                "ground-up pretrain cannot authenticate its capability curriculum"
+            )
+        parameter_update_steps = max(
+            0, int(self.counters["training_steps"]) - before_training_steps
+        )
+        source_record["parameter_update_steps"] = parameter_update_steps
+        source_record["action_policy_parameter_steps"] = int(
+            (action_policy_refresh or {}).get("steps", 0)
+        )
+        source_record["neural_update_events"] = (
+            synaptic_update_events + parameter_update_steps
+        )
+        # Retain the old field solely for stable callers. New callers separate
+        # synaptic mutations from slow-parameter optimizer steps.
+        source_record["plasticity_events"] = source_record[
+            "neural_update_events"
+        ]
+        completion_parameter_checksum = self.parameter_checksum()
+        source_record["parameter_checksum_before"] = before_checksum
+        source_record["parameter_checksum_after"] = (
+            completion_parameter_checksum
+        )
+        source_record["parameter_checksum_changed"] = (
+            completion_parameter_checksum != before_checksum
+        )
+        # Completion is itself atomic: the same brain generation both exposes
+        # the final source record and removes the active cursor. If promotion
+        # fails, load() sees the preceding active checkpoint and resumes.
+        if transaction_id:
+            completion_receipt = {
+                "format": "omni-completed-ingestion",
+                "formatVersion": 1,
+                "transactionId": transaction_id,
+                "contentHash": content_hash,
+                "sourceIdentity": checkpoint_key,
+                "sourceNameHash": source_name_hash,
+                "sourceId": str(source_record["id"]),
+                "resolvedKind": resolved_kind,
+                "policy": policy,
+                "epoch": max(0, int(epoch)),
+                "coverage": coverage.as_dict(),
+                "committedRecords": record_cursor,
+                "visitedRecords": int(coverage.discovered_records),
+                "rejectedRecords": int(coverage.rejected_records),
+                "batchCommits": commit_sequence,
+                "parameterChecksumAfter": completion_parameter_checksum,
+                "completedAt": _iso_now(),
+                "rawSourceTextStored": False,
+                "rawTokenIdsStored": False,
+                "capabilityRehearsal": (
+                    capability_rehearsal_state.to_dict()
+                    if capability_rehearsal_enabled
+                    else None
+                ),
+            }
+            source_record["completionReceipt"] = completion_receipt
+            self.completed_ingestions = [
+                value
+                for value in self.completed_ingestions
+                if value.get("transactionId") != transaction_id
+            ]
+            self.completed_ingestions.append(completion_receipt)
+            self.completed_ingestions = self.completed_ingestions[
+                -COMPLETED_INGESTION_TOMBSTONES:
+            ]
+        if checkpoint_key:
+            self.ingestion_checkpoints.pop(checkpoint_key, None)
+        verify_source_snapshot()
+        self._clear_allocator_recovery_pause()
+        self.save()
         after_checksum = self.parameter_checksum()
         self.events.append(
             "ingestion",
@@ -7136,16 +17562,41 @@ class AdaptiveBrain:
                 "policy": policy,
                 "learnedIdeas": source_record["learned_ideas"],
                 "learnedConcepts": source_record["learned_concepts"],
+                "synapticUpdateEvents": source_record[
+                    "synaptic_update_events"
+                ],
+                "memorySynapseUpdateEvents": source_record[
+                    "memory_synapse_update_events"
+                ],
+                "parameterUpdateSteps": source_record[
+                    "parameter_update_steps"
+                ],
                 "parameterChecksumBefore": before_checksum,
                 "parameterChecksumAfter": after_checksum,
+                "parameterChecksumChanged": before_checksum != after_checksum,
                 "rawTextRetained": source_record["raw_text_retained"],
                 "modalityTrained": source_record["modality_trained"],
                 "mediaCoverage": source_record["media_coverage"],
                 "warnings": source_record["warnings"],
+                "streamingGradientRecords": source_record[
+                    "streaming_gradient_records"
+                ],
+                "streamingGradientOptimizerSteps": source_record[
+                    "streaming_gradient_optimizer_steps"
+                ],
+                "wholeRecordAssemblies": source_record[
+                    "whole_record_assemblies"
+                ],
+                "recordBatchCommits": source_record["record_batch_commits"],
+                "resumedRecordCount": source_record["resumed_record_count"],
+                "visitedRecords": int(coverage.discovered_records),
+                "committedRecords": record_cursor,
+                "actionPolicyRefresh": action_policy_refresh,
             },
         )
         return {
             "brainId": self.brain_id,
+            "transactionId": transaction_id or None,
             "duplicate": False,
             "source": source_record,
             "meanLoss": loss_total / learned_chunks if learned_chunks else 0.0,
@@ -7153,6 +17604,45 @@ class AdaptiveBrain:
             "mediaCoverage": dict(media_result["coverage"]),
             "warnings": list(media_result["warnings"]),
             "coverage": coverage.as_dict(),
+            "streamingGradientTraining": {
+                "records": source_record["streaming_gradient_records"],
+                "optimizerSteps": source_record[
+                    "streaming_gradient_optimizer_steps"
+                ],
+                "mode": source_record["neural_storage_plan"][
+                    "slowGradientMode"
+                ],
+                "everyQueuedRecordContributed": True,
+            },
+            "readingIntegration": {
+                "wholeRecordAssemblies": source_record[
+                    "whole_record_assemblies"
+                ],
+                "everySectionVisited": True,
+                "sectionWeights": "automatic-neural-salience",
+                "rawSourceTextStored": False,
+            },
+            "neuralStoragePlan": source_record["neural_storage_plan"],
+            "recordRecovery": {
+                "transactionId": transaction_id or None,
+                "resumed": resumed_record_count > 0,
+                "resumedRecords": resumed_record_count,
+                "committedRecords": record_cursor,
+                "visitedRecords": int(coverage.discovered_records),
+                "rejectedRecords": int(coverage.rejected_records),
+                "batchCommits": commit_sequence,
+                "checkpointActive": False,
+                "rawSourceTextStored": False,
+                "rawTokenIdsStored": False,
+            },
+            "synapticUpdateEvents": source_record[
+                "synaptic_update_events"
+            ],
+            "parameterUpdateSteps": source_record[
+                "parameter_update_steps"
+            ],
+            "parameterChecksumChanged": before_checksum != after_checksum,
+            "actionPolicyRefresh": action_policy_refresh,
             "parameterChecksumBefore": before_checksum,
             "parameterChecksumAfter": after_checksum,
             "metrics": self.metrics(),
@@ -7203,6 +17693,9 @@ class AdaptiveBrain:
 
     @classmethod
     def _apng_bytes(cls, video: torch.Tensor, fps: int = 8) -> bytes:
+        if isinstance(fps, bool) or not 1 <= int(fps) <= 65_535:
+            raise ValueError("APNG FPS must fit its positive 16-bit timebase")
+        fps = int(fps)
         value = video.detach().cpu().float()
         if value.ndim == 5:
             value = value[0]
@@ -7254,14 +17747,20 @@ class AdaptiveBrain:
         output.append(cls._png_chunk(b"IEND", b""))
         return b"".join(output)
 
-    @staticmethod
-    def _mp4_bytes(video: torch.Tensor, fps: int = 8) -> bytes:
-        """Encode a generated tensor into a browser-viewable H.264 MP4."""
+    @classmethod
+    def _mp4_bytes(
+        cls,
+        video: torch.Tensor,
+        fps: int = 8,
+        audio: Optional[torch.Tensor] = None,
+        sample_rate: int = 16000,
+    ) -> bytes:
+        """Encode H.264 MP4 and, when supplied, mux same-idea audio as AAC."""
 
         try:
             import imageio_ffmpeg
         except ImportError as error:
-            raise RuntimeError("MP4 output requires the bundled FFmpeg runtime") from error
+            raise RuntimeError("MP4 output requires a configured external FFmpeg runtime") from error
         value = video.detach().cpu().float()
         if value.ndim == 5:
             value = value[0]
@@ -7270,34 +17769,67 @@ class AdaptiveBrain:
         value = ((value.clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
         frames = value.permute(1, 2, 3, 0).contiguous()
         height, width = int(frames.shape[1]), int(frames.shape[2])
-        frame_rate = max(1, min(60, int(fps)))
+        frame_rate = int(fps)
+        if not 1 <= frame_rate <= 65_535:
+            raise ValueError("video FPS must fit the portable container timebase")
         with tempfile.TemporaryDirectory(prefix="omni-video-output-") as temporary:
             output = Path(temporary) / "generated.mp4"
-            subprocess.run(
+            command = [
+                imageio_ffmpeg.get_ffmpeg_exe(),
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s:v",
+                "%dx%d" % (width, height),
+                "-r",
+                str(frame_rate),
+                "-i",
+                "-",
+            ]
+            if audio is not None:
+                audio_path = Path(temporary) / "same-brain-audio.wav"
+                audio_path.write_bytes(
+                    cls._wav_bytes(audio, sample_rate=sample_rate)
+                )
+                command.extend(
+                    [
+                        "-i",
+                        str(audio_path),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                    ]
+                )
+            else:
+                command.append("-an")
+            command.extend(
                 [
-                    imageio_ffmpeg.get_ffmpeg_exe(),
-                    "-v",
-                    "error",
-                    "-y",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    "-s:v",
-                    "%dx%d" % (width, height),
-                    "-r",
-                    str(frame_rate),
-                    "-i",
-                    "-",
-                    "-an",
                     "-c:v",
                     "libx264",
                     "-pix_fmt",
                     "yuv420p",
                     "-movflags",
                     "+faststart",
-                    str(output),
-                ],
+                ]
+            )
+            if audio is not None:
+                command.extend(
+                    [
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "96k",
+                        "-shortest",
+                    ]
+                )
+            command.append(str(output))
+            subprocess.run(
+                command,
                 input=frames.numpy().tobytes(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -7307,10 +17839,15 @@ class AdaptiveBrain:
             encoded = output.read_bytes()
         if len(encoded) < 12 or encoded[4:8] != b"ftyp":
             raise RuntimeError("FFmpeg did not produce a valid MP4 container")
+        if audio is not None and b"soun" not in encoded:
+            raise RuntimeError("FFmpeg MP4 output did not contain an audio track")
         return encoded
 
     @staticmethod
     def _wav_bytes(waveform: torch.Tensor, sample_rate: int = 16000) -> bytes:
+        if isinstance(sample_rate, bool) or not 1 <= int(sample_rate) <= 0xFFFFFFFF:
+            raise ValueError("WAV sample rate must fit its positive 32-bit field")
+        sample_rate = int(sample_rate)
         value = waveform.detach().cpu().float().reshape(-1).clamp(-1, 1)
         samples = array.array("h", (value * 32767.0).to(torch.int16).tolist())
         if os.sys.byteorder != "little":
@@ -7327,22 +17864,107 @@ class AdaptiveBrain:
         self, prompt: str = "", concept_ids: Optional[Sequence[str]] = None
     ) -> torch.Tensor:
         vectors = []
+        seen_identifiers = set()
         for concept_id in concept_ids or []:
-            vector = self.memory.concept_vectors.get(str(concept_id))
+            identifier = str(concept_id)
+            if identifier in seen_identifiers:
+                continue
+            seen_identifiers.add(identifier)
+            # Runtime action proposals carry active assembly ids. Early builds
+            # looked only in the legacy concept alias and silently fell back to
+            # an unrelated unprompted symbol. Resolve every neural inspection
+            # alias while keeping the actual vectors authoritative.
+            vector = self.memory.assembly_vectors.get(identifier)
+            if vector is None:
+                vector = self.memory.idea_vectors.get(identifier)
+            if vector is None:
+                vector = self.memory.concept_vectors.get(identifier)
             if vector is not None:
                 vectors.append(vector)
-        if prompt:
+        prompt_provided = bool(prompt.strip())
+        if prompt_provided:
             vectors.append(self.memory.vector_for_text(prompt))
-        if not vectors:
-            vectors.append(self.memory.space.symbol("unprompted-imagination"))
-        cue = self.memory.space.bundle(vectors)
-        if self.config.vector_symbolic_memory:
-            recalled, _ = self.memory.recall_vector(
-                cue, workspace_slots=self.config.working_memory_slots
+        projected: Optional[torch.Tensor] = None
+        if vectors:
+            cue = self.memory.space.bundle(vectors)
+            if self.config.vector_symbolic_memory:
+                recalled, _ = self.memory.recall_vector(
+                    cue, workspace_slots=self.config.working_memory_slots
+                )
+            else:
+                recalled = cue
+            projected = self.idea_adapter(self._idea_model_vector(recalled))
+
+        # A blank manual prompt is not converted into a hidden text prompt.
+        # It uses the same brain's currently active neural vectors: resolved
+        # assemblies above, weighted working memory, and liquid recurrent
+        # state. The intrinsic VSA symbol is only the cold-start fallback when
+        # this new identity has no measurable activity yet.
+        if not prompt_provided:
+            active_vectors: List[torch.Tensor] = []
+            working = self._active_working_memory_vector()
+            if working is not None:
+                active_vectors.append(working.detach())
+            liquid = self.liquid_state.detach().to(
+                self.device, dtype=torch.float32
             )
+            if bool(torch.isfinite(liquid).all()) and bool(
+                torch.count_nonzero(liquid).item()
+            ):
+                active_vectors.append(liquid)
+            if active_vectors:
+                internal = torch.stack(active_vectors).mean(dim=0)
+                projected = (
+                    torch.tanh(0.78 * projected + 0.22 * internal)
+                    if projected is not None
+                    else torch.tanh(internal)
+                )
+        if projected is not None:
+            return projected
+        cold_start = self.memory.space.symbol("unprompted-imagination")
+        return self.idea_adapter(self._idea_model_vector(cold_start))
+
+    def _modality_idea_evidence(
+        self, prompt: str, concept_ids: Optional[Sequence[str]]
+    ) -> Dict[str, Any]:
+        resolved = set()
+        for value in concept_ids or []:
+            identifier = str(value)
+            if (
+                identifier in self.memory.assembly_vectors
+                or identifier in self.memory.idea_vectors
+                or identifier in self.memory.concept_vectors
+            ):
+                resolved.add(identifier)
+        prompt_provided = bool(prompt.strip())
+        if prompt_provided and resolved:
+            source = "manual-prompt-and-active-assemblies"
+        elif prompt_provided:
+            source = "manual-prompt"
+        elif resolved:
+            source = "active-assemblies"
+        elif self.working_memory:
+            source = "active-working-memory"
+        elif bool(torch.count_nonzero(self.liquid_state.detach()).item()):
+            source = "active-liquid-state"
         else:
-            recalled = cue
-        return self.idea_adapter(self._idea_model_vector(recalled))
+            source = "intrinsic-neural-cold-start"
+        return {
+            "source": source,
+            "promptProvided": prompt_provided,
+            "activeAssemblyCount": len(resolved),
+            "workingMemoryVectorCount": len(self.working_memory),
+            "sameBrain": True,
+            "hiddenBehavioralPrompt": False,
+        }
+
+    def _modality_preview_budget(self, modality: str) -> int:
+        total = MODALITY_DECODER_STEPS.get(modality, 1)
+        tier_budget = MODALITY_PREVIEW_BUDGET_BY_TIER.get(
+            self.config.hardware_tier,
+            MODALITY_PREVIEW_BUDGET_BY_TIER["personal"],
+        )
+        return max(1, min(total, tier_budget))
 
     def generate_modality(
         self,
@@ -7353,9 +17975,22 @@ class AdaptiveBrain:
         settings: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
         preview_callback: Optional[
-            Callable[[float, str, bytes], None]
+            Callable[[float, str, bytes, Dict[str, Any]], None]
         ] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
+        created_artifact: Optional[Path] = None
+
+        def ensure_active() -> None:
+            if cancel_check is not None and bool(cancel_check()):
+                if created_artifact is not None:
+                    created_artifact.unlink(missing_ok=True)
+                raise ModalityGenerationCancelled(
+                    "modality generation was cancelled"
+                )
+
+        ensure_active()
+        generation_started_at = time.perf_counter()
         enabled = {
             "vision": self.config.vision_enabled,
             "image": self.config.image_enabled,
@@ -7378,6 +18013,7 @@ class AdaptiveBrain:
             ).encode("utf-8")
             seed = int.from_bytes(hashlib.sha256(material).digest()[:8], "little")
             seed &= 0x7FFFFFFF
+        idea_seed = self._modality_idea_evidence(prompt, concept_ids)
         idea = self._modality_idea(prompt, concept_ids)
         modality_steps = int(self.modality_training.get(modality, 0))
         installed_pack = next(
@@ -7391,18 +18027,76 @@ class AdaptiveBrain:
         initialization = (
             "installed-pack:%s" % installed_pack.get("id")
             if installed_pack is not None
-            else (
-                "locally-trained"
-                if modality_steps > 0
-                else (
-                    "compatible-starter"
-                    if self.config.origin_kind == "starter"
-                    else "random"
-                )
-            )
+            else ("locally-trained" if modality_steps > 0 else "random")
         )
         randomly_initialized = initialization == "random"
+        raw_settings = dict(settings or {})
+        output_mode = str(raw_settings.get("outputMode", "legacy"))
+        if output_mode not in {"legacy", "auto", "exact"}:
+            raise ValueError("outputMode must be legacy, auto, or exact")
+        scaled_output = output_mode in {"auto", "exact"} and modality != "vision"
+        if scaled_output:
+            allowed_settings = {
+                "outputMode",
+                "width",
+                "height",
+                "durationMs",
+                "sampleRate",
+                "fps",
+                "includeAudio",
+                "targetLatencyMs",
+                "previewIntervalMs",
+            }
+            unknown_settings = sorted(set(raw_settings).difference(allowed_settings))
+            if unknown_settings:
+                raise ValueError(
+                    "unsupported scaled media settings: %s"
+                    % ", ".join(unknown_settings)
+                )
+
+            def optional_output_integer(key: str) -> Optional[int]:
+                value = raw_settings.get(key)
+                if value is None:
+                    return None
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError("%s must be a positive integer" % key)
+                return value
+
+            output_width = optional_output_integer("width")
+            output_height = optional_output_integer("height")
+            output_sample_rate = optional_output_integer("sampleRate") or 16_000
+            output_fps = optional_output_integer("fps") or 8
+            duration_value = raw_settings.get("durationMs")
+            output_duration_ms = (
+                None
+                if duration_value is None
+                else _finite_number(duration_value, -1.0)
+            )
+            if output_duration_ms is not None and output_duration_ms <= 0.0:
+                raise ValueError("durationMs must be finite and positive")
+            if output_sample_rate > 0xFFFFFFFF:
+                raise ValueError("sampleRate exceeds the WAV container field")
+            if output_fps > 65_535:
+                raise ValueError("fps exceeds the portable video timebase")
+            if not isinstance(raw_settings.get("includeAudio", True), bool):
+                raise ValueError("includeAudio must be boolean")
+        else:
+            output_width = output_height = None
+            output_duration_ms = None
+            output_sample_rate = int(
+                _finite_number(raw_settings.get("sampleRate"), 16_000)
+            )
+            output_fps = max(
+                1,
+                min(60, int(_finite_number(raw_settings.get("fps"), 8))),
+            )
+        media_output_plan = None
+        media_output_metadata = None
+        native_unit_ms = 0.0
+        actual_preview_count = 0
+        first_preview_ms: Optional[float] = None
         if modality == "vision":
+            ensure_active()
             if not input_path:
                 raise ValueError("vision requires inputPath")
             try:
@@ -7419,13 +18113,93 @@ class AdaptiveBrain:
                 tensor = torch.from_numpy(
                     np.asarray(image, dtype="float32").copy()
                 ).permute(2, 0, 1)
+            ensure_active()
             tensor = (tensor / 127.5 - 1.0).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                embedding = self.modalities.vision(tensor)[0].cpu().tolist()
+                embedding_tensor = self.modalities.vision(tensor)
+                embedding = embedding_tensor[0].cpu().tolist()
+                fingerprint = hashlib.sha256(
+                    tensor.detach().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()
+                sensory_cue = self._sensory_substrate_vector(
+                    embedding_tensor,
+                    "image",
+                    fingerprint,
+                )
+                _recalled_signal, recalled = self.memory.recall_vector(
+                    sensory_cue,
+                    workspace_slots=self.config.working_memory_slots,
+                )
+            assemblies_by_id = {
+                str(item["id"]): item for item in self.memory.assemblies
+            }
+            association_summaries = []
+            association_bytes = 2
+            association_transport_limited = False
+            for association in recalled:
+                assembly_id = str(association["assembly_id"])
+                assembly = assemblies_by_id.get(assembly_id, {})
+                neuron_ids = [str(value) for value in association["neuron_ids"]]
+                labels = [
+                    str(self.memory.neurons[neuron_id].get("label", ""))
+                    for neuron_id in neuron_ids
+                    if neuron_id in self.memory.neurons
+                ]
+                summary = {
+                    "assemblyId": assembly_id,
+                    "score": float(association["score"]),
+                    "kind": str(assembly.get("kind", "")),
+                    "sourceLabel": str(assembly.get("source_label", "")),
+                    "labels": labels,
+                    "labelCount": len(labels),
+                    "relationshipsPaged": False,
+                }
+                encoded_bytes = len(
+                    json.dumps(
+                        summary,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                )
+                if encoded_bytes > SUBSTRATE_INSPECTION_TRANSPORT_BYTES:
+                    summary = {
+                        **summary,
+                        "labels": [],
+                        "relationshipsPaged": True,
+                    }
+                    encoded_bytes = len(
+                        json.dumps(
+                            summary,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode("utf-8")
+                    )
+                separator_bytes = 1 if association_summaries else 0
+                if (
+                    association_summaries
+                    and association_bytes + separator_bytes + encoded_bytes
+                    > SUBSTRATE_INSPECTION_TRANSPORT_BYTES
+                ):
+                    association_transport_limited = True
+                    break
+                association_summaries.append(summary)
+                association_bytes += separator_bytes + encoded_bytes
             result = {
                 "brainId": self.brain_id,
                 "modality": "vision",
                 "embedding": embedding,
+                "associations": association_summaries,
+                "associationCount": len(recalled),
+                "associationViewTruncated": len(recalled) > len(
+                    association_summaries
+                ),
+                "associationViewTransportLimited": association_transport_limited,
+                "associationViewBytes": association_bytes,
+                "associationMode": "exact-ternary-recurrent-spreading",
                 "inputPath": str(Path(input_path).resolve()),
                 "randomlyInitialized": randomly_initialized,
                 "initialization": initialization,
@@ -7433,31 +18207,110 @@ class AdaptiveBrain:
             }
         else:
             def encode_preview(
-                progress_value: float, tensor: torch.Tensor
+                progress_value: float,
+                tensor: torch.Tensor,
+                scaled_details: Optional[Dict[str, Any]] = None,
             ) -> None:
+                nonlocal actual_preview_count
+                nonlocal first_preview_ms
+                ensure_active()
                 if preview_callback is None:
                     return
+                actual_preview_count += 1
+                if first_preview_ms is None:
+                    first_preview_ms = (
+                        time.perf_counter() - generation_started_at
+                    ) * 1_000.0
+                total_steps = (
+                    int(media_output_plan.work_units)
+                    if media_output_plan is not None
+                    else MODALITY_DECODER_STEPS[modality]
+                )
+                completed_step = max(
+                    1,
+                    min(total_steps, int(round(progress_value * total_steps))),
+                )
+                details: Dict[str, Any] = {
+                    "schemaVersion": 1,
+                    "modality": modality,
+                    "completedUnits": completed_step,
+                    "totalUnits": total_steps,
+                    "actualDecoderOutput": True,
+                    "spatialResolutionReduced": False,
+                    "cadence": "hardware-aware-bounded-synchronous",
+                    "hardwareTier": self.config.hardware_tier,
+                    "previewCount": (
+                        int(media_output_plan.estimated_previews)
+                        if media_output_plan is not None
+                        else self._modality_preview_budget(modality)
+                    ),
+                    "ideaSource": idea_seed["source"],
+                    "activeAssemblyCount": idea_seed["activeAssemblyCount"],
+                    "promptProvided": idea_seed["promptProvided"],
+                    **(scaled_details or {}),
+                }
                 if modality == "image":
+                    details.update(
+                        {
+                            "stage": "diffusion-vq-decode",
+                            "width": int(tensor.shape[-1]),
+                            "height": int(tensor.shape[-2]),
+                        }
+                    )
                     preview_callback(
                         progress_value,
                         "image/png",
                         self._png_bytes(tensor),
+                        details,
                     )
                 elif modality == "audio":
+                    sample_rate = int(
+                        media_output_plan.sample_rate
+                        if media_output_plan is not None
+                        and media_output_plan.sample_rate is not None
+                        else output_sample_rate
+                    )
+                    sample_count = int(tensor.shape[-1])
+                    details.update(
+                        {
+                            "stage": "codec-waveform",
+                            "sampleCount": sample_count,
+                            "totalSamples": int(
+                                media_output_plan.total_samples
+                                if media_output_plan is not None
+                                and media_output_plan.total_samples is not None
+                                else self.config.audio_samples
+                            ),
+                            "durationMs": sample_count / float(sample_rate) * 1_000.0,
+                        }
+                    )
                     preview_callback(
                         progress_value,
                         "audio/wav",
                         self._wav_bytes(
                             tensor,
-                            sample_rate=int(
-                                _finite_number(
-                                    (settings or {}).get("sampleRate"),
-                                    16000,
-                                )
-                            ),
+                            sample_rate=sample_rate,
                         ),
+                        details,
                     )
                 elif modality == "video":
+                    frame_count = int(
+                        tensor.shape[2] if tensor.ndim == 5 else tensor.shape[1]
+                    )
+                    details.update(
+                        {
+                            "stage": "temporal-frame-timeline",
+                            "frameCount": frame_count,
+                            "totalFrames": int(
+                                media_output_plan.total_frames
+                                if media_output_plan is not None
+                                and media_output_plan.total_frames is not None
+                                else self.config.video_frames
+                            ),
+                            "width": int(tensor.shape[-1]),
+                            "height": int(tensor.shape[-2]),
+                        }
+                    )
                     preview_callback(
                         progress_value,
                         "image/apng",
@@ -7465,45 +18318,330 @@ class AdaptiveBrain:
                             tensor,
                             fps=int(
                                 _finite_number(
-                                    (settings or {}).get("fps"), 8
+                                    output_fps, 8
                                 )
                             ),
                         ),
+                        details,
                     )
+                ensure_active()
 
-            output = self.modalities.generate(
-                modality,
-                idea,
-                seed=seed,
-                preview_callback=(
-                    encode_preview if preview_callback is not None else None
-                ),
-            )
+            if scaled_output:
+                benchmark_started = time.perf_counter()
+                self.modalities.generate(
+                    modality,
+                    idea,
+                    seed=int(seed) ^ 0x4D454449,
+                    cancel_check=cancel_check,
+                    maximum_previews=1,
+                )
+                native_unit_ms = max(
+                    0.001,
+                    (time.perf_counter() - benchmark_started) * 1_000.0,
+                )
+                readings = self._resource_readings()
+                available_memory, available_storage = media_resource_headroom(
+                    readings
+                )
+                target_latency_ms = _finite_number(
+                    raw_settings.get("targetLatencyMs"), 30_000.0
+                )
+                preview_interval_ms = _finite_number(
+                    raw_settings.get("previewIntervalMs"), 500.0
+                )
+                if target_latency_ms <= 0.0 or preview_interval_ms <= 0.0:
+                    raise ValueError(
+                        "media latency and preview intervals must be positive"
+                    )
+                measurements = MediaGenerationMeasurements.for_modality(
+                    modality,
+                    available_memory_bytes=available_memory,
+                    available_storage_bytes=available_storage,
+                    native_unit_ms=native_unit_ms,
+                    target_latency_ms=target_latency_ms,
+                    preview_interval_ms=preview_interval_ms,
+                    source="live-native-unit-benchmark",
+                )
+                request = MediaOutputRequest(
+                    width=output_width,
+                    height=output_height,
+                    duration_ms=output_duration_ms,
+                    sample_rate=output_sample_rate,
+                    fps=output_fps,
+                )
+                if output_mode == "exact" and not request.explicit_for(modality):
+                    raise ValueError(
+                        "exact media output requires dimensions or duration"
+                    )
+                media_output_plan = plan_media_output(
+                    modality,
+                    NeuralMediaWindows.from_config(self.config),
+                    measurements,
+                    request,
+                )
+
+                def media_watermark(demand: MediaResourceDemand) -> bool:
+                    status = self.resource_policy.status(
+                        estimated_write_bytes=demand.output_bytes,
+                        estimated_ram_bytes=demand.working_bytes,
+                    )
+                    admitted = not bool(
+                        status.get("memoryPressure")
+                        or status.get("diskPressure")
+                    )
+                    if not admitted:
+                        self.resource_pause = {
+                            "reason": "media generation reached the live resource watermark",
+                            "readings": status,
+                            "mediaDemand": {
+                                "stage": demand.stage,
+                                "workingBytes": demand.working_bytes,
+                                "outputBytes": demand.output_bytes,
+                                "completedUnits": demand.completed_units,
+                                "totalUnits": demand.total_units,
+                            },
+                            "at": _iso_now(),
+                        }
+                    return admitted
+
+                scaled = self.modalities.generate_scaled(
+                    media_output_plan,
+                    idea,
+                    seed=int(seed),
+                    training_steps=modality_steps,
+                    installed_pack_id=(
+                        str(installed_pack.get("id"))
+                        if isinstance(installed_pack, Mapping)
+                        else None
+                    ),
+                    preview_callback=(
+                        encode_preview if preview_callback is not None else None
+                    ),
+                    cancel_check=cancel_check,
+                    resource_watermark=media_watermark,
+                )
+                output = scaled.tensor
+                media_output_metadata = scaled.metadata
+            else:
+                output = self.modalities.generate(
+                    modality,
+                    idea,
+                    seed=seed,
+                    preview_callback=(
+                        encode_preview if preview_callback is not None else None
+                    ),
+                    cancel_check=cancel_check,
+                    maximum_previews=self._modality_preview_budget(modality),
+                )
+            ensure_active()
             artifact_dir = self.engine_path / "artifacts"
             artifact_dir.mkdir(parents=True, exist_ok=True)
             artifact_id = uuid.uuid4().hex
             if modality == "image":
                 artifact = artifact_dir / (artifact_id + ".png")
+                created_artifact = artifact
                 artifact_bytes = self._png_bytes(output)
                 artifact.write_bytes(artifact_bytes)
                 mime_type = "image/png"
+                ensure_active()
             elif modality == "audio":
                 artifact = artifact_dir / (artifact_id + ".wav")
+                created_artifact = artifact
                 artifact_bytes = self._wav_bytes(
                     output,
                     sample_rate=int(
-                        _finite_number((settings or {}).get("sampleRate"), 16000)
+                        media_output_plan.sample_rate
+                        if media_output_plan is not None
+                        and media_output_plan.sample_rate is not None
+                        else output_sample_rate
                     ),
                 )
                 artifact.write_bytes(artifact_bytes)
                 mime_type = "audio/wav"
+                ensure_active()
             elif modality == "video":
-                fps = int(_finite_number((settings or {}).get("fps"), 8))
+                fps = int(
+                    media_output_plan.fps
+                    if media_output_plan is not None
+                    and media_output_plan.fps is not None
+                    else output_fps
+                )
+                sample_rate = int(
+                    output_sample_rate
+                )
+                include_audio_value = raw_settings.get("includeAudio", True)
+                audio_requested = (
+                    include_audio_value
+                    if isinstance(include_audio_value, bool)
+                    else True
+                )
+                audio_installed = any(
+                    isinstance(item, Mapping)
+                    and "audio" in item.get("modalities", [])
+                    for item in self.installed_modality_packs
+                )
+                audio_supported = bool(
+                    self.config.audio_enabled
+                    and (
+                        int(self.modality_training.get("audio", 0)) > 0
+                        or audio_installed
+                    )
+                )
+                synchronized_audio: Dict[str, Any] = {
+                    "requested": audio_requested,
+                    "supported": audio_supported,
+                    "decoded": False,
+                    "generated": False,
+                    "sameBrainIdea": False,
+                    "lengthAlignedToVideo": False,
+                    "speechSynthesis": False,
+                    "hiddenBehavioralPrompt": False,
+                }
+                audio_output: Optional[torch.Tensor] = None
+                if not audio_requested:
+                    synchronized_audio["reason"] = (
+                        "Synchronized neural sound was disabled for this generation."
+                    )
+                elif not audio_supported:
+                    synchronized_audio["reason"] = (
+                        "No trained same-brain audio pack is available; the video remains silent."
+                    )
+                else:
+                    audio_seed_material = (
+                        "%d:same-brain-video-audio" % int(seed)
+                    ).encode("utf-8")
+                    audio_seed = int.from_bytes(
+                        hashlib.sha256(audio_seed_material).digest()[:8],
+                        "little",
+                    ) & 0x7FFFFFFF
+                    if output.ndim == 5:
+                        frame_count = int(output.shape[2])
+                    elif output.ndim == 4:
+                        frame_count = int(output.shape[1])
+                    else:
+                        raise ValueError(
+                            "video output must have shape [3, frames, height, width]"
+                        )
+                    duration_ms = frame_count / float(fps) * 1_000.0
+                    if scaled_output:
+                        audio_benchmark_started = time.perf_counter()
+                        self.modalities.generate(
+                            "audio",
+                            idea,
+                            seed=audio_seed ^ 0x41554449,
+                            cancel_check=cancel_check,
+                            maximum_previews=1,
+                        )
+                        audio_native_ms = max(
+                            0.001,
+                            (time.perf_counter() - audio_benchmark_started)
+                            * 1_000.0,
+                        )
+                        readings = self._resource_readings()
+                        audio_memory, audio_storage = media_resource_headroom(
+                            readings
+                        )
+                        audio_measurements = (
+                            MediaGenerationMeasurements.for_modality(
+                                "audio",
+                                available_memory_bytes=audio_memory,
+                                available_storage_bytes=audio_storage,
+                                native_unit_ms=audio_native_ms,
+                                target_latency_ms=_finite_number(
+                                    raw_settings.get("targetLatencyMs"),
+                                    30_000.0,
+                                ),
+                                preview_interval_ms=_finite_number(
+                                    raw_settings.get("previewIntervalMs"),
+                                    500.0,
+                                ),
+                                source="live-native-unit-benchmark",
+                            )
+                        )
+                        audio_plan = plan_media_output(
+                            "audio",
+                            NeuralMediaWindows.from_config(self.config),
+                            audio_measurements,
+                            MediaOutputRequest(
+                                duration_ms=duration_ms,
+                                sample_rate=sample_rate,
+                            ),
+                        )
+                        audio_pack = next(
+                            (
+                                item
+                                for item in reversed(
+                                    self.installed_modality_packs
+                                )
+                                if "audio" in item.get("modalities", [])
+                            ),
+                            None,
+                        )
+                        audio_scaled = self.modalities.generate_scaled(
+                            audio_plan,
+                            idea,
+                            seed=audio_seed,
+                            training_steps=int(
+                                self.modality_training.get("audio", 0)
+                            ),
+                            installed_pack_id=(
+                                str(audio_pack.get("id"))
+                                if isinstance(audio_pack, Mapping)
+                                else None
+                            ),
+                            cancel_check=cancel_check,
+                            resource_watermark=media_watermark,
+                        )
+                        audio_output = audio_scaled.tensor.reshape(-1)
+                    else:
+                        audio_native = self.modalities.generate(
+                            "audio",
+                            idea,
+                            seed=audio_seed,
+                            cancel_check=cancel_check,
+                        )
+                        duration_samples = max(
+                            1,
+                            int(round(frame_count * sample_rate / float(fps))),
+                        )
+                        audio_output = F.interpolate(
+                            audio_native.detach().reshape(1, 1, -1),
+                            size=duration_samples,
+                            mode="linear",
+                            align_corners=False,
+                        ).reshape(-1)
+                    ensure_active()
+                    synchronized_audio.update(
+                        {
+                            "decoded": True,
+                            "sameBrainIdea": True,
+                            "audioSeed": audio_seed,
+                            "sampleRate": sample_rate,
+                            "durationMs": duration_ms,
+                            "lengthAlignedToVideo": True,
+                            **(
+                                {
+                                    "mediaOutputPlan": audio_plan.as_dict(),
+                                    "mediaOutput": audio_scaled.metadata,
+                                }
+                                if scaled_output
+                                else {}
+                            ),
+                        }
+                    )
                 container_fallback = ""
                 try:
-                    artifact_bytes = self._mp4_bytes(output, fps=fps)
+                    artifact_bytes = self._mp4_bytes(
+                        output,
+                        fps=fps,
+                        audio=audio_output,
+                        sample_rate=sample_rate,
+                    )
                     artifact = artifact_dir / (artifact_id + ".mp4")
                     mime_type = "video/mp4"
+                    if audio_output is not None:
+                        synchronized_audio["generated"] = True
+                        synchronized_audio.pop("reason", None)
                 except (
                     ImportError,
                     OSError,
@@ -7514,9 +18652,35 @@ class AdaptiveBrain:
                     artifact = artifact_dir / (artifact_id + ".png")
                     mime_type = "image/apng"
                     container_fallback = str(error)
+                    if audio_output is not None:
+                        synchronized_audio["generated"] = False
+                        synchronized_audio["reason"] = (
+                            "The MP4/AAC encoder was unavailable, so the honest "
+                            "APNG fallback cannot carry the generated neural sound: %s"
+                            % error
+                        )
+                created_artifact = artifact
                 artifact.write_bytes(artifact_bytes)
+                ensure_active()
             else:
                 raise ValueError("modality must be image, audio, video, or vision")
+            artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+            content_artifact = artifact_dir / (
+                artifact_sha256 + artifact.suffix.lower()
+            )
+            if artifact != content_artifact:
+                if content_artifact.exists():
+                    if hashlib.sha256(content_artifact.read_bytes()).hexdigest() != artifact_sha256:
+                        raise RuntimeError(
+                            "content-addressed modality artifact checksum collision"
+                        )
+                    artifact.unlink(missing_ok=True)
+                    created_artifact = None
+                else:
+                    os.replace(str(artifact), str(content_artifact))
+                    created_artifact = content_artifact
+                artifact = content_artifact
+            ensure_active()
             result = {
                 "brainId": self.brain_id,
                 "modality": modality,
@@ -7524,24 +18688,86 @@ class AdaptiveBrain:
                 "mimeType": mime_type,
                 "shape": list(output.shape),
                 "seed": int(seed),
+                "artifactSha256": artifact_sha256,
                 "randomlyInitialized": randomly_initialized,
                 "initialization": initialization,
                 "trainingSteps": modality_steps,
+                "ideaSeed": idea_seed,
                 "qualityNote": (
-                    "Generated by a tiny research baseline; output quality depends "
-                    "on the disclosed pack and local modality training."
+                    "Hardware-scaled output assembled from actual same-brain "
+                    "neural patches/windows; size and training evidence do not "
+                    "claim semantic quality."
+                    if media_output_metadata is not None
+                    else (
+                        "Generated by a tiny research baseline; output quality depends "
+                        "on the disclosed pack and local modality training."
+                    )
+                ),
+                **(
+                    {
+                        "mediaOutputPlan": media_output_plan.as_dict(),
+                        "mediaOutput": media_output_metadata,
+                    }
+                    if media_output_plan is not None
+                    and media_output_metadata is not None
+                    else {}
                 ),
             }
             if modality == "video":
                 result["containerFallback"] = container_fallback
-            if len(artifact_bytes) <= 8 * 1024 * 1024:
-                result["dataUrl"] = (
-                    "data:%s;base64,%s"
-                    % (
-                        mime_type,
-                        base64.b64encode(artifact_bytes).decode("ascii"),
-                    )
-                )
+                result["synchronizedAudio"] = synchronized_audio
+            embedded_media = inline_media_data_url(mime_type, artifact_bytes)
+            if embedded_media is not None:
+                result["dataUrl"] = embedded_media
+        generation_elapsed_seconds = max(
+            1e-9, time.perf_counter() - generation_started_at
+        )
+        decoder_steps = {
+            "vision": 1,
+            "image": 4,
+            "audio": 3,
+            "video": 3,
+        }[modality]
+        if media_output_plan is not None:
+            decoder_steps = (
+                int(media_output_plan.work_units)
+                * MODALITY_DECODER_STEPS[modality]
+                + MODALITY_DECODER_STEPS[modality]
+            )
+        if (
+            modality == "video"
+            and isinstance(result.get("synchronizedAudio"), Mapping)
+            and bool(result["synchronizedAudio"].get("decoded", False))
+        ):
+            decoder_steps += 3
+        result["generationPerformance"] = {
+            "elapsedMs": generation_elapsed_seconds * 1000.0,
+            "decoderSteps": decoder_steps,
+            "stepsPerSecond": decoder_steps / generation_elapsed_seconds,
+            "progressivePreviews": (
+                0
+                if modality == "vision" or preview_callback is None
+                else actual_preview_count
+            ),
+            "previewCadence": (
+                "measured-resource-plan"
+                if media_output_plan is not None
+                else "hardware-aware"
+            ),
+            "previewOnlyCadenceAdjusted": media_output_plan is None,
+            "generationResolutionReducedForPreview": False,
+            "measured": True,
+            "hiddenBehavioralPrompt": False,
+            **(
+                {
+                    "nativeUnitBenchmarkMs": native_unit_ms,
+                    "firstPreviewMs": first_preview_ms,
+                    "mediaOutputPlan": media_output_plan.as_dict(),
+                }
+                if media_output_plan is not None
+                else {}
+            ),
+        }
         self.events.append(
             "modality-generation",
             {
@@ -7551,6 +18777,12 @@ class AdaptiveBrain:
                 "randomlyInitialized": randomly_initialized,
                 "initialization": initialization,
                 "trainingSteps": modality_steps,
+                "generationPerformance": result["generationPerformance"],
+                **(
+                    {"synchronizedAudio": result.get("synchronizedAudio")}
+                    if modality == "video"
+                    else {}
+                ),
             },
         )
         return result
@@ -7648,7 +18880,7 @@ class AdaptiveBrain:
             key: value.detach().cpu().clone() for key, value in current.items()
         }
         previous_packs = [dict(item) for item in self.installed_modality_packs]
-        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        checksum = self._file_sha256(path)
         record = {
             "id": str(pack.get("id", "")).strip() or checksum[:16],
             "name": str(pack.get("name", "")).strip() or "Omni modality pack",
@@ -7708,6 +18940,64 @@ class AdaptiveBrain:
             "trace": trace,
         }
 
+    def checkpoint(self, operation_id: str) -> Dict[str, Any]:
+        """Commit live neural state and its packed inference manifest only.
+
+        Recovery-point materialization belongs to the desktop repository. This
+        flush deliberately creates no engine/snapshots directory, avoiding a
+        second full copy for one UI operation.
+        """
+
+        operation_id = str(operation_id).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", operation_id):
+            raise ValueError("checkpoint operation_id is invalid")
+        self.save()
+        packed = self.export_packed_ternary()
+        metadata_path = self.engine_path / "brain.json"
+        metadata_bytes = metadata_path.read_bytes()
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+        substrate = (
+            metadata.get("substrate", {}).get("persistence", {})
+        )
+        mutable_state = metadata.get("mutable_state", {})
+        packed_manifest_path = self.engine_path / "packed-ternary" / "manifest.json"
+        receipt = {
+            "format": "omni-neural-checkpoint",
+            "formatVersion": 1,
+            "brainId": self.brain_id,
+            "operationId": operation_id,
+            "committed": True,
+            "createdAt": _iso_now(),
+            "parameterChecksum": self.parameter_checksum(),
+            "metadataSha256": hashlib.sha256(metadata_bytes).hexdigest(),
+            "substrateContentSha256": str(
+                substrate.get("contentSha256", "")
+            ),
+            "mutableStateContentSha256": str(
+                mutable_state.get("contentSha256", "")
+            ),
+            "packedManifestSha256": hashlib.sha256(
+                packed_manifest_path.read_bytes()
+            ).hexdigest(),
+            "packedContentSha256": str(
+                packed["summary"].get("contentSha256", "")
+            ),
+            "snapshotCreated": False,
+        }
+        if not all(
+            re.fullmatch(r"[a-f0-9]{64}", str(receipt[field]))
+            for field in (
+                "parameterChecksum",
+                "metadataSha256",
+                "substrateContentSha256",
+                "mutableStateContentSha256",
+                "packedManifestSha256",
+                "packedContentSha256",
+            )
+        ):
+            raise RuntimeError("neural checkpoint did not commit complete hashes")
+        return receipt
+
     def snapshot(self, label: str = "snapshot") -> Dict[str, Any]:
         self.counters["snapshots"] += 1
         self.save()
@@ -7720,16 +19010,17 @@ class AdaptiveBrain:
             self.engine_path / "packed-ternary",
             destination / "packed-ternary",
         )
-        checksum = hashlib.sha256(
-            (destination / "core.safetensors").read_bytes()
-            + (destination / "plasticity.safetensors").read_bytes()
-            + str(
-                read_json(destination / "brain.json")
-                .get("substrate", {})
-                .get("persistence", {})
-                .get("contentSha256", "")
-            ).encode("ascii")
-        ).hexdigest()
+        snapshot_metadata = read_json(destination / "brain.json")
+        checksum = self._snapshot_checksum(
+            destination / "core.safetensors",
+            destination / "plasticity.safetensors",
+            snapshot_metadata.get("substrate", {})
+            .get("persistence", {})
+            .get("contentSha256", ""),
+            snapshot_metadata.get("mutable_state", {}).get(
+                "contentSha256", ""
+            ),
+        )
         result = {
             "id": snapshot_id,
             "brainId": self.brain_id,
@@ -7745,10 +19036,9 @@ class AdaptiveBrain:
         return result
 
     def metrics(self) -> Dict[str, Any]:
-        parameters = sum(
-            parameter.numel()
-            for module in self._trainable_modules()
-            for parameter in module.parameters()
+        parameter_accounting = self.parameter_accounting()
+        trainable_parameters = int(
+            parameter_accounting["mutableDenseParameters"]
         )
         files_bytes = 0
         if self.engine_path.exists():
@@ -7771,7 +19061,7 @@ class AdaptiveBrain:
             "plasticityEvents": int(
                 self.router.synapses.plasticity_events.item()
             ),
-            "messages": len(self.messages),
+            "messages": int(self.conversation.summary()["messageCount"]),
             "trainingSources": len(self.training_sources),
             "replayExamples": len(self.replay),
             "workingMemoryVectors": len(self.working_memory),
@@ -7786,7 +19076,8 @@ class AdaptiveBrain:
                 "paused": self.growth_pause is not None,
             },
             "modalityTraining": dict(self.modality_training),
-            "trainableParameters": parameters,
+            "trainableParameters": trainable_parameters,
+            "parameterAccounting": parameter_accounting,
             "estimatedBytes": files_bytes,
             "counters": dict(self.counters),
         }
@@ -7811,6 +19102,8 @@ class AdaptiveBrain:
             "core": str(self.engine_path / "core.safetensors"),
             "plasticity": str(self.engine_path / "plasticity.safetensors"),
             "substrate": str(self.engine_path / "substrate" / "manifest.json"),
+            "mutableState": str(self.engine_path / "state" / "manifest.json"),
+            "replay": str(self.engine_path / "state" / "replay.sqlite3"),
             "events": str(self.engine_path / "events.sqlite3"),
             "origin": str(self.engine_path / "origin"),
             "snapshots": str(self.engine_path / "snapshots"),
@@ -7835,6 +19128,42 @@ class AdaptiveBrain:
                 changed.append(attribute)
 
         assign("name", "name", str)
+        if "contextWindowTokens" in raw:
+            next_context_tokens = int(raw["contextWindowTokens"])
+            if next_context_tokens < 8:
+                raise ValueError("contextWindowTokens must be at least 8")
+            if next_context_tokens != self.config.max_seq_len:
+                previous_context_tokens = int(self.config.max_seq_len)
+                # Rotary tables are non-persistent derived buffers, so they can
+                # be rebuilt without changing any learned parameter or
+                # optimizer moment. They grow lazily from actual tokens rather
+                # than allocating the selected maximum window here.
+                try:
+                    for block in self.decoder.blocks:
+                        block.attention.rotary.configure_max_seq_len(
+                            next_context_tokens
+                        )
+                except Exception:
+                    raise
+                self.config.max_seq_len = next_context_tokens
+                if (
+                    self._runtime_training_max_seq_len
+                    >= previous_context_tokens
+                ):
+                    self._runtime_training_max_seq_len = (
+                        next_context_tokens
+                    )
+                else:
+                    # Preserve a measured allocator-recovery ceiling until the
+                    # worker restarts; never confuse it with saved capacity.
+                    self._runtime_training_max_seq_len = min(
+                        max(8, self._runtime_training_max_seq_len),
+                        next_context_tokens,
+                    )
+                self.recent_token_context = self.recent_token_context[
+                    -next_context_tokens:
+                ]
+                changed.append("max_seq_len")
         for attribute, key in (
             ("online_learning", "onlineLearning"),
             ("consolidation_enabled", "consolidation"),
@@ -7852,11 +19181,52 @@ class AdaptiveBrain:
                 "shortTermHalfLifeMinutes",
                 float,
             ),
-            ("long_term_threshold", "longTermThreshold", float),
             ("forgetting_rate", "forgettingRate", float),
             ("consolidation_rate", "consolidationRate", float),
+            ("memory_offload_bytes", "memoryOffloadBytes", int),
+            ("memory_resident_items", "memoryResidentItems", int),
+            (
+                "memory_offload_slowdown_percent",
+                "memoryOffloadSlowdownPercent",
+                float,
+            ),
+            (
+                "storage_bytes_per_second",
+                "storageBytesPerSecond",
+                safe_rounded_storage_bytes_per_second,
+            ),
         ):
             assign(attribute, key, transform)
+        assign("working_memory_mode", "workingMemoryMode", str)
+        if "systemRamMode" in raw or "systemRamSharePercent" in raw:
+            system_ram_mode = str(
+                raw.get(
+                    "systemRamMode",
+                    "manual"
+                    if "systemRamSharePercent" in raw
+                    else (
+                        "manual"
+                        if self.config.system_ram_share_percent > 0.0
+                        else "auto"
+                    ),
+                )
+            )
+            if system_ram_mode not in {"auto", "manual"}:
+                raise ValueError("systemRamMode must be auto or manual")
+            system_ram_share = (
+                float(raw.get("systemRamSharePercent", 0.0))
+                if system_ram_mode == "manual"
+                else 0.0
+            )
+            if system_ram_mode == "manual" and not (
+                30.0 <= system_ram_share <= 100.0
+            ):
+                raise ValueError(
+                    "manual systemRamSharePercent must be in [30, 100]"
+                )
+            if self.config.system_ram_share_percent != system_ram_share:
+                self.config.system_ram_share_percent = system_ram_share
+                changed.append("system_ram_share_percent")
         if "learningRate" in raw:
             neural_rate = max(
                 1e-5, min(0.02, float(raw["learningRate"]) * 0.02)
@@ -7864,7 +19234,15 @@ class AdaptiveBrain:
             if self.config.learning_rate != neural_rate:
                 self.config.learning_rate = neural_rate
                 changed.append("learning_rate")
-        assign("memory_recipe", "memoryRecipe", str)
+        assign(
+            "memory_recipe",
+            "memoryRecipe",
+            lambda value: (
+                "adaptive-retention"
+                if str(value) in {"human", "human-consolidation"}
+                else str(value)
+            ),
+        )
         self.config.ternary_weights = True
         self.config.spiking_dynamics = True
         self.config.stdp_plasticity = True
@@ -7883,8 +19261,31 @@ class AdaptiveBrain:
             ).to(self.device)
             changed.append("liquid_mode")
         self.config.validate()
+        if any(
+            value in changed
+            for value in {
+                "system_ram_share_percent",
+                "storage_bytes_per_second",
+                "memory_offload_bytes",
+                "memory_resident_items",
+            }
+        ):
+            self.resource_policy = ResourcePolicy(
+                self.engine_path,
+                ram_reserve_bytes=self.config.ram_reserve_bytes,
+                disk_reserve_bytes=self.config.disk_reserve_bytes,
+                system_ram_share_percent=self.config.system_ram_share_percent,
+                storage_bytes_per_second=self.config.storage_bytes_per_second,
+                hardware_tier=self.config.hardware_tier,
+            )
+            self.state_store.policy = self.resource_policy
+            self.replay.policy = self.resource_policy
+            self.paged_working_memory.policy = self.resource_policy
         self.population_controls_from_config()
-        self._optimizer = self._new_optimizer()
+        # Resource-only settings must not discard learned Adam moments. The
+        # optimizer is rebuilt only when its configured learning rate changes.
+        if "learning_rate" in changed:
+            self._replace_optimizer()
         self.save()
         self.events.append(
             "config-updated", {"changed": changed, "runtimeCard": self.runtime_card()}

@@ -157,7 +157,7 @@ def copy_substrate_snapshot(
         return None
     if (
         pointer.get("format") != "omni-substrate-shards"
-        or int(pointer.get("formatVersion", 0)) != 1
+        or int(pointer.get("formatVersion", 0)) not in {1, 2}
     ):
         raise ValueError("substrate snapshot pointer is incompatible")
     source_store = Path(source_engine) / "substrate"
@@ -198,7 +198,8 @@ def copy_substrate_snapshot(
     ).hexdigest()
     if (
         generation.get("format") != "omni-substrate-shards"
-        or int(generation.get("formatVersion", 0)) != 1
+        or int(generation.get("formatVersion", 0))
+        != int(pointer.get("formatVersion", 0))
         or content_sha != str(generation.get("contentSha256", ""))
         or content_sha != active_generation
         or content_sha != str(pointer.get("contentSha256", ""))
@@ -265,6 +266,99 @@ def copy_substrate_snapshot(
     return dict(pointer)
 
 
+def snapshot_required_bytes(
+    source: Path,
+    *,
+    include_packed_ternary: bool = False,
+) -> int:
+    """Return the declared physical bytes copied by :func:`snapshot_files`.
+
+    Only the active substrate/mutable generations named by brain.json are
+    counted. Old unreferenced generations are deliberately excluded so a
+    reserve check cannot block on bytes the operation will not write.
+    """
+
+    source = Path(source).resolve()
+    metadata = read_json(source / "brain.json")
+    total = sum(
+        (source / filename).stat().st_size
+        for filename in ("brain.json", "core.safetensors", "plasticity.safetensors")
+    )
+    substrate = metadata.get("substrate")
+    pointer = (
+        substrate.get("persistence")
+        if isinstance(substrate, dict)
+        else None
+    )
+    if isinstance(pointer, dict):
+        store = source / "substrate"
+        generation_path = _safe_relative(
+            store, str(pointer.get("generationManifest", ""))
+        )
+        generation_bytes = generation_path.read_bytes()
+        generation = json.loads(generation_bytes.decode("utf-8"))
+        if not isinstance(generation, dict):
+            raise ValueError("substrate generation manifest is invalid")
+        total += len(generation_bytes)
+        total += len(
+            json.dumps(
+                pointer,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for shard in generation.get("shards", []):
+            if not isinstance(shard, dict):
+                raise ValueError("substrate generation contains an invalid shard")
+            for role in ("records", "tensors"):
+                spec = shard.get(role)
+                if isinstance(spec, dict):
+                    total += max(0, int(spec.get("bytes", 0)))
+    mutable_pointer = metadata.get("mutable_state")
+    if isinstance(mutable_pointer, dict):
+        store = source / "state"
+        generation_path = _safe_relative(
+            store, str(mutable_pointer.get("generationManifest", ""))
+        )
+        generation_bytes = generation_path.read_bytes()
+        generation = json.loads(generation_bytes.decode("utf-8"))
+        if not isinstance(generation, dict):
+            raise ValueError("mutable-state generation manifest is invalid")
+        total += len(generation_bytes)
+        total += len(
+            json.dumps(
+                mutable_pointer,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        roles = generation.get("roles", {})
+        if not isinstance(roles, dict):
+            raise ValueError("mutable-state generation roles are invalid")
+        total += sum(
+            max(0, int(spec.get("bytes", 0)))
+            for spec in roles.values()
+            if isinstance(spec, dict)
+        )
+        replay = store / "replay.sqlite3"
+        if replay.is_file():
+            total += replay.stat().st_size
+    if include_packed_ternary:
+        packed = source / "packed-ternary"
+        if packed.is_dir():
+            total += sum(
+                path.stat().st_size
+                for path in packed.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            )
+    conversation = source / "conversation.sqlite3"
+    if conversation.is_file() and not conversation.is_symlink():
+        total += conversation.stat().st_size
+    return max(0, int(total))
+
+
 def snapshot_files(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     for filename in ("brain.json", "core.safetensors", "plasticity.safetensors"):
@@ -273,6 +367,14 @@ def snapshot_files(source: Path, destination: Path) -> None:
             raise FileNotFoundError(str(source_file))
         shutil.copy2(str(source_file), str(destination / filename))
     copy_substrate_snapshot(source, destination)
+    # Imported lazily because the offload store itself builds on the atomic
+    # persistence primitives in this module.
+    from .offload import copy_mutable_state_snapshot
+
+    copy_mutable_state_snapshot(source, destination)
+    conversation = source / "conversation.sqlite3"
+    if conversation.is_file() and not conversation.is_symlink():
+        shutil.copy2(str(conversation), str(destination / "conversation.sqlite3"))
 
 
 class EventLog:

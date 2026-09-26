@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrainRepository } from "../src/main/brainRepository";
 import { BrainService } from "../src/main/brainService";
-import type { EngineSupervisor } from "../src/main/engineSupervisor";
+import {
+  BackgroundRequestDeferredError,
+  ENGINE_REQUEST_NO_DEADLINE,
+  type EngineSupervisor
+} from "../src/main/engineSupervisor";
 import { DEFAULT_CONFIG } from "../src/shared/types";
 
 describe("organic worker cognition and neural feedback service", () => {
@@ -40,7 +44,6 @@ describe("organic worker cognition and neural feedback service", () => {
       sourceId: "a",
       targetId: "b",
       effectiveWeight: 1,
-      latentWeight: 0.8,
       stability: 0.4,
       plasticity: 1,
       uses: 2,
@@ -94,7 +97,7 @@ describe("organic worker cognition and neural feedback service", () => {
       name: "Idle brain",
       idleCognition: true
     });
-    const tryRequest = vi.fn().mockResolvedValue({
+    const requestWorker = vi.fn().mockResolvedValue({
       brainId: brain.id,
       ran: true,
       actions: [
@@ -110,7 +113,7 @@ describe("organic worker cognition and neural feedback service", () => {
     });
     const service = new BrainService(
       repository,
-      { tryRequest } as unknown as EngineSupervisor
+      { request: requestWorker } as unknown as EngineSupervisor
     );
 
     const result = await service.idleCycle(brain.id, 0);
@@ -126,7 +129,7 @@ describe("organic worker cognition and neural feedback service", () => {
         }
       ]
     });
-    const workerParams = tryRequest.mock.calls[0]?.[1] as {
+    const workerParams = requestWorker.mock.calls[0]?.[1] as {
       toolSchemas: Array<{ id: string; grant: string }>;
     };
     expect(workerParams.toolSchemas.some((schema) => schema.id === "source.self-modify")).toBe(
@@ -134,8 +137,16 @@ describe("organic worker cognition and neural feedback service", () => {
     );
     expect(workerParams.toolSchemas).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "modality.imagine", grant: "auto" })
+        expect.objectContaining({ id: "modality.imagine", grant: "auto" }),
+        expect.objectContaining({ id: "brain.history", grant: "auto" })
       ])
+    );
+    expect(requestWorker).toHaveBeenCalledWith(
+      "idle_cycle",
+      expect.objectContaining({ brainId: brain.id, minimumIdleSeconds: 0 }),
+      ENGINE_REQUEST_NO_DEADLINE,
+      undefined,
+      "background"
     );
   });
 
@@ -145,7 +156,7 @@ describe("organic worker cognition and neural feedback service", () => {
       name: "Spontaneous brain",
       idleCognition: true
     });
-    const tryRequest = vi.fn().mockResolvedValue({
+    const requestWorker = vi.fn().mockResolvedValue({
       brainId: brain.id,
       ran: true,
       trace: {
@@ -197,16 +208,19 @@ describe("organic worker cognition and neural feedback service", () => {
     });
     const service = new BrainService(
       repository,
-      { tryRequest } as unknown as EngineSupervisor
+      { request: requestWorker } as unknown as EngineSupervisor
     );
 
     const result = await service.idleCycle(brain.id, 0);
     const reloaded = await repository.get(brain.id);
+    const conversation = await repository.conversationPage(brain.id);
 
     expect(result.actions).toEqual([
       expect.objectContaining({ kind: "talk", source: "organic" })
     ]);
-    expect(reloaded.messages.at(-1)).toMatchObject({
+    expect(reloaded.messages).toEqual([]);
+    expect(reloaded.conversation).toMatchObject({ messageCount: 1 });
+    expect(conversation.entries.at(-1)?.message).toMatchObject({
       role: "brain",
       content: "I wonder whether these two memories share a pattern.",
       traceId: "idle-trace",
@@ -216,5 +230,30 @@ describe("organic worker cognition and neural feedback service", () => {
       kind: "reflection",
       summary: "Spoke from prompt-free idle cognition."
     });
+  });
+
+  it("treats foreground preemption as an expected idle yield without hiding worker errors", async () => {
+    const brain = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Yielding idle brain",
+      idleCognition: true
+    });
+    const requestWorker = vi.fn().mockRejectedValue(
+      new BackgroundRequestDeferredError("idle_cycle")
+    );
+    const service = new BrainService(
+      repository,
+      { request: requestWorker } as unknown as EngineSupervisor
+    );
+
+    await expect(service.idleCycle(brain.id, 0)).resolves.toEqual({
+      brainId: brain.id,
+      ran: false,
+      reason: "foreground-work",
+      actions: []
+    });
+
+    requestWorker.mockRejectedValueOnce(new Error("real worker crash"));
+    await expect(service.idleCycle(brain.id, 0)).rejects.toThrow("real worker crash");
   });
 });

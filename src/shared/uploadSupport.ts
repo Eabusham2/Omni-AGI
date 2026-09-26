@@ -75,7 +75,14 @@ export const IMAGE_UPLOAD_EXTENSIONS = [
   "tiff",
   "avif",
   "heic",
-  "heif"
+  "heif",
+  "jp2",
+  "j2k",
+  "jpf",
+  "jpx",
+  "jxl",
+  "raw",
+  "dng"
 ] as const;
 
 export const AUDIO_UPLOAD_EXTENSIONS = [
@@ -89,7 +96,13 @@ export const AUDIO_UPLOAD_EXTENSIONS = [
   "opus",
   "aiff",
   "aif",
-  "wma"
+  "wma",
+  "caf",
+  "alac",
+  "amr",
+  "au",
+  "snd",
+  "mka"
 ] as const;
 
 export const VIDEO_UPLOAD_EXTENSIONS = [
@@ -102,7 +115,14 @@ export const VIDEO_UPLOAD_EXTENSIONS = [
   "mpeg",
   "mpg",
   "wmv",
-  "flv"
+  "flv",
+  "3gp",
+  "3g2",
+  "ogv",
+  "ts",
+  "mts",
+  "m2ts",
+  "vob"
 ] as const;
 
 export const EXPERIENCE_UPLOADS: Record<
@@ -112,12 +132,12 @@ export const EXPERIENCE_UPLOADS: Record<
   files: {
     title: "Choose documents, datasets, code, images, audio, or video to learn",
     filterName: "Supported learning material",
-    extensions: [
+    extensions: [...new Set([
       ...DOCUMENT_AND_DATASET_EXTENSIONS,
       ...IMAGE_UPLOAD_EXTENSIONS,
       ...AUDIO_UPLOAD_EXTENSIONS,
       ...VIDEO_UPLOAD_EXTENSIONS
-    ],
+    ])],
     shortLabel: "files and media"
   },
   images: {

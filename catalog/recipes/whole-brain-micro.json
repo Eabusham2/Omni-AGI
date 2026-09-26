@@ -3,7 +3,7 @@
   "id": "whole-brain-micro",
   "name": "Whole Brain · Micro",
   "description": "The complete OmniCortex pathway at smoke-test scale.",
-  "origin": "blank",
+  "origin": "ground-up",
   "hardwareProfile": "micro",
   "architecture": {
     "preset": "whole-brain",
@@ -37,6 +37,6 @@
       "video": true
     }
   },
-  "memoryRecipe": "human-consolidation",
+  "memoryRecipe": "adaptive-retention",
   "toolPermission": "ask"
 }

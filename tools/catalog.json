@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "tools": [
     {
-      "id": "windows.files",
-      "label": "Windows files",
+      "id": "system.files",
+      "label": "System files",
       "description": "List, read, and write absolute paths. Auto reads are contained to the brain-local directory; paths outside it and all writes require one-action approval unless Full Authority is enabled.",
       "defaultGrant": "ask",
       "actions": {
         "list": {
-          "input": { "path": "string" },
-          "output": { "entries": "array" }
+          "input": { "path": "string", "cursor": "string?", "pageSize": "number?" },
+          "output": { "entries": "array", "total": "number", "hasMore": "boolean", "nextCursor": "string?" }
         },
         "read": {
           "input": { "path": "string", "maxBytes": "number?" },
@@ -22,9 +22,9 @@
       }
     },
     {
-      "id": "windows.powershell",
-      "label": "PowerShell",
-      "description": "Run a PowerShell command with an explicit working directory and timeout.",
+      "id": "system.shell",
+      "label": "System shell",
+      "description": "Run an explicitly quoted command in the host's native noninteractive shell with an explicit working directory and timeout.",
       "defaultGrant": "ask",
       "actions": {
         "run": {
@@ -82,7 +82,35 @@
       "actions": {
         "task": {
           "input": { "url": "string", "steps": "BrowserStep[]?", "visible": "boolean?", "timeoutMs": "number?" },
-          "output": { "finalUrl": "string", "title": "string", "text": "string", "links": "array", "steps": "array", "artifactPath": "string", "sessionPersistent": "boolean" }
+          "output": { "finalUrl": "string", "title": "string", "text": "string", "links": "array", "steps": "array", "artifactPath": "string?", "sessionPersistent": "boolean" }
+        }
+      }
+    },
+    {
+      "id": "device.input",
+      "label": "Device interaction",
+      "description": "Move the pointer, click, scroll, press keys, or type through the current interactive desktop. Every action uses the per-brain permission policy, remains visible in the trace, is cancellable, and depends on host OS consent.",
+      "defaultGrant": "ask",
+      "actions": {
+        "move-pointer": {
+          "input": { "x": "number", "y": "number", "timeoutMs": "number?" },
+          "output": { "state": "complete", "audit": "object" }
+        },
+        "click": {
+          "input": { "button": "left|middle|right?", "timeoutMs": "number?" },
+          "output": { "state": "complete", "audit": "object" }
+        },
+        "scroll": {
+          "input": { "deltaX": "number?", "deltaY": "number?", "timeoutMs": "number?" },
+          "output": { "state": "complete", "audit": "object" }
+        },
+        "key-press": {
+          "input": { "key": "string", "modifiers": "ctrl|alt|shift|meta[]?", "timeoutMs": "number?" },
+          "output": { "state": "complete", "audit": "object" }
+        },
+        "text": {
+          "input": { "text": "string", "timeoutMs": "number?" },
+          "output": { "state": "complete", "audit": "object" }
         }
       }
     },
@@ -110,6 +138,63 @@
       }
     },
     {
+      "id": "studio.ui",
+      "label": "Creativity workspace",
+      "description": "Open the local, reversible imagination and creativity workspace without granting filesystem, process, network, or source authority.",
+      "defaultGrant": "auto",
+      "actions": {
+        "open-creativity": {
+          "input": {},
+          "output": {
+            "workspace": "creativity",
+            "view": "imagine",
+            "local": "boolean",
+            "reversible": "boolean"
+          }
+        }
+      }
+    },
+    {
+      "id": "studio.settings",
+      "label": "Studio access settings",
+      "description": "Inspect the current tool permission matrix or open its local settings view. This capability never changes a grant by itself.",
+      "defaultGrant": "auto",
+      "actions": {
+        "inspect-access": {
+          "input": {},
+          "output": {
+            "permissions": "array",
+            "approvalTimeoutSeconds": "number",
+            "grantsChanged": "false"
+          }
+        },
+        "open-permissions": {
+          "input": {},
+          "output": {
+            "workspace": "tools",
+            "view": "permissions",
+            "grantsChanged": "false"
+          }
+        }
+      }
+    },
+    {
+      "id": "brain.history",
+      "label": "Conversation history",
+      "description": "Read or search this brain's own visible conversation and audited action summaries. It never returns private activations, hidden reasoning, or another brain's history.",
+      "defaultGrant": "auto",
+      "actions": {
+        "read": {
+          "input": { "cursor": "string?", "limit": "number?", "includeActions": "boolean?" },
+          "output": { "entries": "array", "nextCursor": "string?", "privateReasoningIncluded": "false" }
+        },
+        "search": {
+          "input": { "query": "string", "cursor": "string?", "limit": "number?", "includeActions": "boolean?" },
+          "output": { "entries": "array", "nextCursor": "string?", "privateReasoningIncluded": "false" }
+        }
+      }
+    },
+    {
       "id": "agent.fork",
       "label": "Subagent fork",
       "description": "Create up to four isolated cognitive branches, run the objective once in each copied neural state, and return inspectable merge candidates.",
@@ -128,7 +213,7 @@
       "defaultGrant": "off",
       "actions": {
         "propose": {
-          "input": { "objective": "string", "tests": "string[]?" },
+          "input": { "objective": "string", "candidateKind": "string?", "addExperts": "number?", "tests": "string[]?" },
           "output": { "worktree": "string", "diff": "string", "checks": "array" }
         },
         "diff": {

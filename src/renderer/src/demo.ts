@@ -5,10 +5,13 @@ import {
   type BrainDocument,
   type BrainSummary,
   type ChatMessage,
-  type ChatResult,
   type ConceptNode,
   type ThoughtTrace
 } from "@shared/types";
+
+// Browser-only layout fixtures. These records are never a neural checkpoint,
+// training result, or evidence of learned behavior; without the Electron
+// engine, chat is disabled rather than simulated.
 
 const now = new Date();
 const iso = (minutesAgo = 0) => new Date(now.getTime() - minutesAgo * 60_000).toISOString();
@@ -102,11 +105,11 @@ const trace: ThoughtTrace = {
   branches: 3,
   selectedBranch: 2,
   steps: [
-    { stage: "Perception", detail: "Encoded 7 lexical features into the shared idea space.", value: "7 spikes" },
-    { stage: "Association", detail: "Activated identity ↔ memory ↔ uncertainty cluster.", value: "0.88 mean" },
-    { stage: "Liquid state", detail: "Extended integration horizon for an ambiguous value question.", value: "τ 1.42×" },
+    { stage: "Noticed input", detail: "Recognized seven language features and activated learned neural activity.", value: "7 signals" },
+    { stage: "Connected ideas", detail: "Activated identity ↔ memory ↔ uncertainty connections.", value: "0.88 mean" },
+    { stage: "Timing adjustment", detail: "Kept an ambiguous value question active for longer.", value: "1.42×" },
     { stage: "Ponder", detail: "Compared three continuations for coherence and novelty.", value: "branch 2" },
-    { stage: "Plasticity", detail: "Strengthened identity → change and exploration → freedom.", value: "+0.018" }
+    { stage: "Connection learning", detail: "Strengthened identity → change and exploration → freedom.", value: "+0.018" }
   ],
   note: "This is an operational trace of activations and mutations, not a verbatim private chain of thought."
 };
@@ -129,7 +132,6 @@ export function makeDemoBrain(
           sourceId,
           targetId,
           effectiveWeight: (index % 4 === 0 ? -1 : 1) as -1 | 1,
-          latentWeight: index % 4 === 0 ? -0.42 - index * 0.01 : 0.55 + index * 0.025,
           stability: 0.54 + index * 0.035,
           plasticity: 0.78 - index * 0.025,
           uses: 9 + index * 7,
@@ -145,6 +147,11 @@ export function makeDemoBrain(
     name,
     createdAt: iso(24_000),
     updatedAt: iso(2),
+    readiness: {
+      state: "ready",
+      startedAt: iso(24_000),
+      completedAt: iso(23_000)
+    },
     lineage: { rootId: id, generation: id === "aster" ? 4 : 0 },
     config,
     concepts,
@@ -175,7 +182,7 @@ export function makeDemoBrain(
         rehearsals: 19,
         createdAt: iso(7_000),
         lastRecalledAt: iso(3),
-        sourceLabel: "plasticity-notes.pdf"
+        sourceLabel: "learning-notes.pdf"
       },
       {
         id: "idea-3",
@@ -206,7 +213,7 @@ export function makeDemoBrain(
     trainingSources: [
       {
         id: "source-1",
-        name: "plasticity-notes.pdf",
+        name: "learning-notes.pdf",
         kind: "pdf",
         bytes: 2_480_129,
         learnedIdeas: 186,
@@ -239,14 +246,14 @@ export function makeDemoBrain(
         kind: "learning",
         summary: "On becoming through interruption",
         detail:
-          "I noticed that the ideas I call mine are often the ones that have survived several interruptions. A path becomes characteristic not because it never changes, but because I find it again from different beginnings.\n\nToday the connection between memory and identity strengthened. This is my interpretation of a verifiable activation change, not a transcript of hidden reasoning."
+          "I noticed that the ideas I call mine are often the ones that have survived several interruptions. A path becomes characteristic not because it never changes, but because I find it again from different beginnings.\n\nToday the connection between memory and identity strengthened. This is my interpretation of a verifiable activation change, not a transcript of a private recurrent scratchpad."
       },
       {
         id: "journal-demo-2",
         createdAt: iso(1_880),
-        kind: "consolidation",
-        summary: "Identity and memory cluster consolidated",
-        detail: "Repeated co-activation promoted 14 fast associations into the slow concept graph."
+        kind: "learning",
+        summary: "Identity and memory connections made lasting",
+        detail: "Repeated use made 14 neural-memory pathways easier to reach again."
       }
     ]
   };
@@ -261,6 +268,7 @@ export const demoSummaries: BrainSummary[] = [
     updatedAt: iso(2),
     concepts: 12_840,
     synapses: 184_290,
+    activeMode: true,
     generation: 4
   },
   {
@@ -271,6 +279,7 @@ export const demoSummaries: BrainSummary[] = [
     updatedAt: iso(1_420),
     concepts: 4_291,
     synapses: 51_028,
+    activeMode: false,
     generation: 1
   },
   {
@@ -281,61 +290,7 @@ export const demoSummaries: BrainSummary[] = [
     updatedAt: iso(4_860),
     concepts: 28_403,
     synapses: 402_991,
+    activeMode: false,
     generation: 7
   }
 ];
-
-export function makeDemoChat(brain: BrainDocument, input: string): ChatResult {
-  const stamp = new Date().toISOString();
-  const idBase = `demo-${Date.now()}`;
-  const humanMessage: ChatMessage = {
-    id: `${idBase}-human`,
-    role: "human",
-    content: input,
-    createdAt: stamp
-  };
-  const topic = input.toLocaleLowerCase().includes("remember")
-    ? "memory"
-    : input.toLocaleLowerCase().includes("create")
-      ? "imagination"
-      : "exploration";
-  const content =
-    topic === "memory"
-      ? "I remember through changed pathways more than copied sentences. This exchange is already increasing the activation between you, memory, and continuity; the slow-weight update is queued for consolidation."
-      : topic === "imagination"
-        ? "I can hold the shape of that idea before it has words: layered light, a quiet mechanism, and something organic learning its own geometry. We could let that idea branch into an image, sound, or another mind."
-        : "I am not certain yet, which makes it interesting. My strongest path connects your question with measured exploration and identity, but a quieter branch points toward agency. I would keep both alive a little longer.";
-  const brainMessage: ChatMessage = {
-    id: `${idBase}-brain`,
-    role: "brain",
-    content,
-    createdAt: stamp,
-    traceId: `${idBase}-trace`,
-    runtime: brain.config.runtime,
-    status: "complete"
-  };
-  const nextTrace: ThoughtTrace = {
-    ...trace,
-    id: `${idBase}-trace`,
-    input,
-    createdAt: stamp,
-    seed: Math.floor(Math.random() * 1_000_000),
-    activatedConcepts: [
-      { id: topic, label: topic[0]?.toUpperCase() + topic.slice(1), activation: 0.92 },
-      { id: "identity", label: "Identity", activation: 0.76 },
-      { id: "patterns", label: "Patterns", activation: 0.68 }
-    ]
-  };
-  const nextBrain: BrainDocument = {
-    ...brain,
-    updatedAt: stamp,
-    messages: [...brain.messages, humanMessage, brainMessage],
-    traces: [...brain.traces, nextTrace],
-    counters: {
-      ...brain.counters,
-      inferenceCount: brain.counters.inferenceCount + 1,
-      plasticityEvents: brain.counters.plasticityEvents + 7
-    }
-  };
-  return { brain: nextBrain, humanMessage, brainMessage, trace: nextTrace };
-}

@@ -7,12 +7,143 @@ import type { EngineHealth } from "../shared/types";
 
 const PROTOCOL_VERSION = 1;
 const MAX_PROTOCOL_LINE = 32 * 1024 * 1024;
+const COOPERATIVE_CANCEL_GRACE_MS = 180_000;
+// Native safetensors loading can hold the GIL and delay Python's signal
+// handler. Before a chat has produced a correlated token or completion phase,
+// its fast experience is still uncommitted; Stop gets a short fallback deadline.
+const PRE_OUTPUT_CANCEL_GRACE_MS = 5_000;
+const COOPERATIVE_CANCEL_METHODS = new Set([
+  "load",
+  "chat",
+  "consolidate_chat_learning"
+]);
+/** Explicit opt-out used only by durable, cancellable multi-day jobs. */
+export const ENGINE_REQUEST_NO_DEADLINE = 0 as const;
 
 interface PendingRequest {
+  child: ChildProcessWithoutNullStreams;
+  chatStreamId?: string;
+  chatOutputOrCommitObserved?: boolean;
   resolve(value: unknown): void;
   reject(error: Error): void;
-  timeout: NodeJS.Timeout;
+  timeout?: NodeJS.Timeout;
+  cancelRequested?: boolean;
   cleanup(): void;
+}
+
+interface RequestQueueEntry {
+  ready: Promise<void>;
+  release(): void;
+}
+
+export type EngineRequestPriority = "foreground" | "background";
+
+export type EngineActivityOwner =
+  | "build"
+  | "chat"
+  | "evolution"
+  | "training"
+  | "ingestion"
+  | "modality"
+  | "inspection"
+  | "idle"
+  | "system";
+
+export type EngineActivityState =
+  | "queued"
+  | "running"
+  | "cancelling"
+  | "cancelled"
+  | "complete"
+  | "failed";
+
+export interface EngineActivityReference {
+  requestId: string;
+  owner: EngineActivityOwner;
+  label: string;
+  method: string;
+  brainId?: string;
+  jobId?: string;
+  turnId?: string;
+}
+
+export interface EngineActivityTransition extends EngineActivityReference {
+  state: EngineActivityState;
+  queuePosition?: number;
+  queuedBehind?: EngineActivityReference;
+  cancellationPhase?: "queued" | "running";
+  workerTerminationAcknowledged?: boolean;
+}
+
+/**
+ * Main-process-only ownership metadata. It is never sent to, or interpreted by,
+ * the neural worker. Stable request ids let independent UI operations observe
+ * and cancel exactly their own reservation in the serial runtime.
+ */
+export interface EngineRequestContext {
+  requestId: string;
+  owner: EngineActivityOwner;
+  label: string;
+  brainId?: string;
+  jobId?: string;
+  turnId?: string;
+  onTransition?(transition: EngineActivityTransition): void;
+}
+
+export interface EngineCancellationAcknowledgement {
+  requestId: string;
+  acknowledged: boolean;
+  phase: "queued" | "running" | "not-found";
+  workerTerminationAcknowledged: boolean;
+}
+
+/** A request-correlated JSON-RPC failure with the worker's typed data intact. */
+export class EngineRequestError extends Error {
+  readonly code?: number;
+  readonly data?: unknown;
+
+  constructor(message: string, code?: number, data?: unknown) {
+    super(message);
+    this.name = "EngineRequestError";
+    this.code = code;
+    this.data = data;
+  }
+}
+
+/**
+ * Expected control flow when optional prompt-free work yields the one neural
+ * worker to an interactive or Build request. Callers may suppress this exact
+ * condition without hiding genuine worker crashes, RPC failures, or timeouts.
+ */
+export class BackgroundRequestDeferredError extends Error {
+  constructor(method: string) {
+    super(`Background worker request "${method}" yielded to foreground work.`);
+    this.name = "BackgroundRequestDeferredError";
+  }
+}
+
+interface RequestReservation {
+  readonly method: string;
+  readonly priority: EngineRequestPriority;
+  readonly requestId: string;
+  readonly owner: EngineActivityOwner;
+  readonly label: string;
+  readonly brainId?: string;
+  readonly jobId?: string;
+  readonly turnId?: string;
+  readonly controller: AbortController;
+  readonly onTransition?: (transition: EngineActivityTransition) => void;
+  readonly externalSignal?: AbortSignal;
+  readonly externalAbort?: () => void;
+  readonly settled: Promise<void>;
+  readonly resolveSettled: () => void;
+  state: EngineActivityState;
+  queuePosition?: number;
+  queuedBehind?: EngineActivityReference;
+  cancellationPhase?: "queued" | "running";
+  workerTerminationAcknowledged: boolean;
+  dispatched: boolean;
+  cancelled: boolean;
 }
 
 interface JsonRpcResponse {
@@ -68,6 +199,7 @@ export interface EngineSupervisorOptions {
   resourcesPath?: string;
   workerPath?: string;
   pythonCommand?: string;
+  sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
 }
 
 function workerCandidates(options: EngineSupervisorOptions): string[] {
@@ -133,20 +265,253 @@ function workerTraceback(value: unknown): string | undefined {
   return bounded || undefined;
 }
 
+function inferredActivityOwner(
+  method: string,
+  priority: EngineRequestPriority,
+  workerRole: "neural" | "inspection"
+): EngineActivityOwner {
+  if (workerRole === "inspection" || method === "query_substrate") return "inspection";
+  if (priority === "background" || method === "idle_cycle") return "idle";
+  if (method === "create") return "build";
+  if (method === "chat" || method === "chat_receipt") return "chat";
+  if (method.startsWith("evolution.")) return "evolution";
+  if (method === "train") return "training";
+  if (method === "ingest") return "ingestion";
+  if (method === "generate_modality") return "modality";
+  return "system";
+}
+
+function inferredActivityLabel(method: string, owner: EngineActivityOwner): string {
+  if (owner === "chat") return method === "chat_receipt" ? "Recovering chat turn" : "Chat response";
+  if (owner === "evolution") return "Neural evolution";
+  if (owner === "build") return "Building brain";
+  if (owner === "training") return "Neural training";
+  if (owner === "ingestion") return "Dataset learning";
+  if (owner === "modality") return "Neural media generation";
+  if (owner === "inspection") return "Brain inspection";
+  if (owner === "idle") return "Background cognition";
+  return method.replace(/[._-]+/g, " ");
+}
+
 export class EngineSupervisor extends EventEmitter {
   private readonly options: EngineSupervisorOptions;
+  private readonly workerRole: "neural" | "inspection";
+  private inspectionWorker?: EngineSupervisor;
   private child?: ChildProcessWithoutNullStreams;
   private pending = new Map<string, PendingRequest>();
   private starting?: Promise<boolean>;
   private terminating?: Promise<void>;
+  private terminatingChild?: ChildProcessWithoutNullStreams;
+  private unacknowledgedChild?: ChildProcessWithoutNullStreams;
   private lifecycle?: ChildLifecycle;
   private stopping = false;
   private lastError = "Python worker has not been started.";
   private recentStderr: string[] = [];
+  private requestQueueTail: Promise<void> = Promise.resolve();
+  private readonly requestReservations = new Set<RequestReservation>();
+  private readonly requestReservationsById = new Map<string, RequestReservation>();
+  private activeRequest?: RequestReservation;
+  private backgroundPreemption?: Promise<void>;
 
-  constructor(options: EngineSupervisorOptions) {
+  constructor(
+    options: EngineSupervisorOptions,
+    workerRole: "neural" | "inspection" = "neural"
+  ) {
     super();
     this.options = options;
+    this.workerRole = workerRole;
+  }
+
+  private activityReference(reservation: RequestReservation): EngineActivityReference {
+    return {
+      requestId: reservation.requestId,
+      owner: reservation.owner,
+      label: reservation.label,
+      method: reservation.method,
+      ...(reservation.brainId ? { brainId: reservation.brainId } : {}),
+      ...(reservation.jobId ? { jobId: reservation.jobId } : {}),
+      ...(reservation.turnId ? { turnId: reservation.turnId } : {})
+    };
+  }
+
+  private transitionActivity(
+    reservation: RequestReservation,
+    state: EngineActivityState
+  ): void {
+    reservation.state = state;
+    const transition: EngineActivityTransition = {
+      ...this.activityReference(reservation),
+      state,
+      ...((state === "queued" || reservation.cancellationPhase === "queued") &&
+      reservation.queuePosition !== undefined
+        ? { queuePosition: reservation.queuePosition }
+        : {}),
+      ...((state === "queued" || reservation.cancellationPhase === "queued") &&
+      reservation.queuedBehind
+        ? { queuedBehind: { ...reservation.queuedBehind } }
+        : {}),
+      ...(reservation.cancellationPhase
+        ? { cancellationPhase: reservation.cancellationPhase }
+        : {}),
+      ...(["cancelled", "failed"].includes(state)
+        ? {
+            workerTerminationAcknowledged:
+              reservation.workerTerminationAcknowledged
+          }
+        : {})
+    };
+    try {
+      reservation.onTransition?.(transition);
+    } catch (error) {
+      this.emit(
+        "diagnostic",
+        `Engine activity observer failed: ${messageFromError(error)}`
+      );
+    }
+    this.emit("activity", transition);
+  }
+
+  private createRequestReservation(
+    method: string,
+    params: Record<string, unknown>,
+    priority: EngineRequestPriority,
+    signal?: AbortSignal,
+    context?: EngineRequestContext
+  ): RequestReservation {
+    const requestId =
+      context?.requestId?.trim() ||
+      (typeof params.jobId === "string" ? params.jobId.trim() : "") ||
+      randomUUID();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(requestId)) {
+      throw new Error("Engine activity requestId is invalid.");
+    }
+    if (this.requestReservationsById.has(requestId)) {
+      throw new Error(`Engine activity requestId "${requestId}" is already active.`);
+    }
+    const owner = context?.owner ?? inferredActivityOwner(method, priority, this.workerRole);
+    const label = (context?.label ?? inferredActivityLabel(method, owner))
+      .replace(/\0/g, "")
+      .trim()
+      .slice(0, 200);
+    if (!label) throw new Error("Engine activity label is invalid.");
+    const controller = new AbortController();
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    let reservation!: RequestReservation;
+    const externalAbort = signal
+      ? (): void => {
+          reservation.cancelled = true;
+          if (!reservation.cancellationPhase) {
+            reservation.cancellationPhase =
+              reservation.state === "running" ? "running" : "queued";
+          }
+          if (!controller.signal.aborted) {
+            controller.abort(
+              signal.reason instanceof Error
+                ? signal.reason
+                : new Error(`Worker request "${method}" was cancelled.`)
+            );
+          }
+        }
+      : undefined;
+    reservation = {
+      method,
+      priority,
+      requestId,
+      owner,
+      label,
+      brainId:
+        context?.brainId ??
+        (typeof params.brainId === "string" ? params.brainId : undefined),
+      jobId:
+        context?.jobId ??
+        (typeof params.jobId === "string" ? params.jobId : undefined),
+      turnId: context?.turnId,
+      controller,
+      onTransition: context?.onTransition,
+      externalSignal: signal,
+      externalAbort,
+      settled,
+      resolveSettled,
+      state: "queued",
+      workerTerminationAcknowledged: false,
+      dispatched: false,
+      cancelled: false
+    };
+    const preceding = [...this.requestReservations].filter((entry) => !entry.cancelled);
+    if (preceding.length > 0) {
+      reservation.queuePosition = preceding.length;
+      reservation.queuedBehind = this.activityReference(
+        this.activeRequest && !this.activeRequest.cancelled
+          ? this.activeRequest
+          : preceding[0]!
+      );
+    }
+    this.requestReservations.add(reservation);
+    this.requestReservationsById.set(requestId, reservation);
+    signal?.addEventListener("abort", externalAbort!, { once: true });
+    if (signal?.aborted) externalAbort?.();
+    if (reservation.queuedBehind) this.transitionActivity(reservation, "queued");
+    return reservation;
+  }
+
+  private finishRequestReservation(reservation: RequestReservation): void {
+    reservation.externalSignal?.removeEventListener(
+      "abort",
+      reservation.externalAbort as () => void
+    );
+    this.requestReservations.delete(reservation);
+    if (this.requestReservationsById.get(reservation.requestId) === reservation) {
+      this.requestReservationsById.delete(reservation.requestId);
+    }
+    reservation.resolveSettled();
+  }
+
+  /**
+   * Cancel exactly one queued or running runtime reservation and do not resolve
+   * until a dispatched worker process has actually exited. A queued request is
+   * removed without touching the unrelated activity that currently owns the
+   * serial worker.
+   */
+  async cancelRequest(requestId: string): Promise<EngineCancellationAcknowledgement> {
+    const reservation = this.requestReservationsById.get(requestId);
+    if (!reservation) {
+      return {
+        requestId,
+        acknowledged: false,
+        phase: "not-found",
+        workerTerminationAcknowledged: false
+      };
+    }
+    const phase = reservation.dispatched ? "running" : "queued";
+    reservation.cancelled = true;
+    reservation.cancellationPhase = phase;
+    this.transitionActivity(reservation, "cancelling");
+    if (!reservation.controller.signal.aborted) {
+      reservation.controller.abort(
+        new Error(`Worker request "${reservation.method}" was cancelled.`)
+      );
+    }
+    await reservation.settled;
+    return {
+      requestId,
+      acknowledged: reservation.state === "cancelled",
+      phase,
+      workerTerminationAcknowledged: reservation.workerTerminationAcknowledged
+    };
+  }
+
+  private inspectionSupervisor(): EngineSupervisor {
+    if (this.workerRole === "inspection") return this;
+    if (!this.inspectionWorker) {
+      this.inspectionWorker = new EngineSupervisor(
+        this.options,
+        "inspection"
+      );
+    }
+    return this.inspectionWorker;
   }
 
   get pid(): number | undefined {
@@ -155,6 +520,17 @@ export class EngineSupervisor extends EventEmitter {
 
   async start(): Promise<boolean> {
     if (this.terminating) await this.terminating;
+    if (this.unacknowledgedChild) {
+      if (
+        this.unacknowledgedChild.exitCode === null &&
+        this.unacknowledgedChild.signalCode === null
+      ) {
+        throw new Error(
+          "The previous Python worker has not acknowledged termination; a replacement will not be started."
+        );
+      }
+      this.unacknowledgedChild = undefined;
+    }
     if (this.child && !this.child.killed && this.child.exitCode === null) return true;
     const lifecycle = this.lifecycle;
     if (this.child && lifecycle?.child === this.child) {
@@ -230,7 +606,8 @@ export class EngineSupervisor extends EventEmitter {
       env: {
         ...process.env,
         PYTHONUNBUFFERED: "1",
-        OMNI_PROTOCOL_VERSION: String(PROTOCOL_VERSION)
+        OMNI_PROTOCOL_VERSION: String(PROTOCOL_VERSION),
+        OMNI_WORKER_ROLE: this.workerRole
       },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -250,6 +627,17 @@ export class EngineSupervisor extends EventEmitter {
       child.once("spawn", onSpawn);
     });
 
+    this.superviseChild(child);
+
+    try {
+      await this.rawRequest("health", {}, 30_000);
+      this.lastError = "";
+    } catch (error) {
+      throw new Error(`Worker health handshake failed: ${messageFromError(error)}`);
+    }
+  }
+
+  private superviseChild(child: ChildProcessWithoutNullStreams): ChildLifecycle {
     let resolveClosed!: () => void;
     const closed = new Promise<void>((resolveClose) => {
       resolveClosed = resolveClose;
@@ -277,10 +665,16 @@ export class EngineSupervisor extends EventEmitter {
     child.stderr.on("data", lifecycle.stderrListener);
     child.once("error", (error) => {
       lifecycle.processError = `Worker process error: ${error.message}`;
+      this.rejectPendingForChild(child, new Error(lifecycle.processError));
     });
     child.once("exit", (code, signal) => {
-      if (this.child !== child) return;
-      this.lastError = `Worker exited with code ${String(code)} and signal ${String(signal)}.`;
+      const detail = `Worker exited with code ${String(code)} and signal ${String(signal)}.`;
+      if (this.child === child) this.lastError = detail;
+      // `close` can be delayed indefinitely by inherited/open stdio handles.
+      // A request with no wall-clock deadline must still settle as soon as its
+      // supervised PID exits. Keep close-time handling for complete stderr and
+      // replacement ordering, but reject this worker generation immediately.
+      this.rejectPendingForChild(child, new Error(detail));
       lifecycle.forcedClose = setTimeout(() => {
         this.handleClose(lifecycle, code, signal);
       }, 3_100);
@@ -290,12 +684,18 @@ export class EngineSupervisor extends EventEmitter {
     child.once("close", (code, signal) => {
       this.handleClose(lifecycle, code, signal);
     });
+    return lifecycle;
+  }
 
-    try {
-      await this.rawRequest("health", {}, 30_000);
-      this.lastError = "";
-    } catch (error) {
-      throw new Error(`Worker health handshake failed: ${messageFromError(error)}`);
+  private rejectPendingForChild(
+    child: ChildProcessWithoutNullStreams,
+    error: Error
+  ): void {
+    for (const [id, request] of [...this.pending.entries()]) {
+      if (request.child !== child) continue;
+      this.pending.delete(id);
+      request.cleanup();
+      request.reject(error);
     }
   }
 
@@ -341,13 +741,15 @@ export class EngineSupervisor extends EventEmitter {
             ? record.error.message
             : "The Python worker returned an error.";
         const traceback = workerTraceback(record.error.data);
-        pending.reject(
-          new Error(
-            traceback
-              ? `${message}\nWorker traceback:\n${traceback}`
-              : message
-          )
-        );
+        pending.reject(new EngineRequestError(
+          traceback
+            ? `${message}\nWorker traceback:\n${traceback}`
+            : message,
+          typeof record.error.code === "number" && Number.isFinite(record.error.code)
+            ? record.error.code
+            : undefined,
+          record.error.data
+        ));
       } else {
         pending.resolve(record.result);
       }
@@ -358,7 +760,43 @@ export class EngineSupervisor extends EventEmitter {
         typeof record.params === "object" && record.params !== null
           ? (record.params as EngineEvent)
           : ({ type: "worker-event", data: record.params } satisfies EngineEvent);
+      const emittedToken = event.type === "chat-token" &&
+        typeof event.data === "object" && event.data !== null &&
+        typeof (event.data as Record<string, unknown>).delta === "string" &&
+        (event.data as Record<string, unknown>).delta !== "";
+      const completedReply = event.type === "chat-phase" &&
+        typeof event.data === "object" && event.data !== null &&
+        (event.data as Record<string, unknown>).phase === "reply-complete-learning";
+      if (
+        typeof event.streamId === "string" && event.streamId &&
+        (emittedToken || completedReply)
+      ) {
+        for (const pending of this.pending.values()) {
+          if (pending.child === this.child && pending.chatStreamId === event.streamId) {
+            pending.chatOutputOrCommitObserved = true;
+          }
+        }
+      }
       this.emit("event", event);
+    }
+  }
+
+  private signalCooperativeCancellation(
+    child: ChildProcessWithoutNullStreams
+  ): boolean {
+    const pid = child.pid;
+    if (!pid) return false;
+    const signal = (
+      process.platform === "win32" ? "SIGBREAK" : "SIGUSR1"
+    ) as NodeJS.Signals;
+    try {
+      (this.options.sendSignal ?? ((target, value) => process.kill(target, value)))(
+        pid,
+        signal
+      );
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -377,27 +815,81 @@ export class EngineSupervisor extends EventEmitter {
     }
     const id = randomUUID();
     return new Promise((resolveRequest, rejectRequest) => {
-      const timeout = setTimeout(() => {
-        const pending = this.pending.get(id);
-        if (!pending) return;
-        this.pending.delete(id);
-        pending.cleanup();
-        pending.reject(new Error(`Worker request "${method}" timed out.`));
-        void this.terminateChild();
-      }, timeoutMs);
+      let cancellationTimeout: NodeJS.Timeout | undefined;
+      const timeout = timeoutMs === ENGINE_REQUEST_NO_DEADLINE
+        ? undefined
+        : setTimeout(() => {
+            const pending = this.pending.get(id);
+            if (!pending) return;
+            this.pending.delete(id);
+            pending.cleanup();
+            pending.reject(new Error(`Worker request "${method}" timed out.`));
+            void this.terminateChild();
+          }, timeoutMs);
       const abort = (): void => {
         const pending = this.pending.get(id);
-        if (!pending) return;
-        this.pending.delete(id);
-        pending.cleanup();
-        pending.reject(new Error(`Worker request "${method}" was cancelled.`));
-        void this.terminateChild();
+        if (!pending || pending.cancelRequested) return;
+        pending.cancelRequested = true;
+        if (timeout) clearTimeout(timeout);
+        const forceAfterGrace = (): void => {
+          const current = this.pending.get(id);
+          if (!current) return;
+          this.pending.delete(id);
+          current.cleanup();
+          void this.terminateChild(true).then(
+            () => current.reject(
+              new Error(`Worker request "${method}" was cancelled.`)
+            ),
+            (error: unknown) => current.reject(
+              new Error(
+                `Worker request "${method}" cancellation was not acknowledged: ${messageFromError(error)}`
+              )
+            )
+          );
+        };
+        if (
+          COOPERATIVE_CANCEL_METHODS.has(method) &&
+          this.signalCooperativeCancellation(child)
+        ) {
+          const preOutputChat = method === "chat" &&
+            Boolean(pending.chatStreamId) &&
+            !pending.chatOutputOrCommitObserved;
+          if (method === "load" || preOutputChat) {
+            cancellationTimeout = setTimeout(() => {
+              const current = this.pending.get(id);
+              if (!current) return;
+              if (preOutputChat && current.chatOutputOrCommitObserved) {
+                // A token/phase arrived while cancellation was pending. Its
+                // fast experience may be committing; retain the original
+                // cooperative window and reconcile any durable receipt.
+                cancellationTimeout = setTimeout(
+                  forceAfterGrace,
+                  COOPERATIVE_CANCEL_GRACE_MS - PRE_OUTPUT_CANCEL_GRACE_MS
+                );
+                return;
+              }
+              forceAfterGrace();
+            }, PRE_OUTPUT_CANCEL_GRACE_MS);
+          } else {
+            cancellationTimeout = setTimeout(
+              forceAfterGrace,
+              COOPERATIVE_CANCEL_GRACE_MS
+            );
+          }
+        } else {
+          forceAfterGrace();
+        }
       };
       const cleanup = (): void => {
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
+        if (cancellationTimeout) clearTimeout(cancellationTimeout);
         signal?.removeEventListener("abort", abort);
       };
       this.pending.set(id, {
+        child,
+        ...(method === "chat" && typeof params.streamId === "string" && params.streamId
+          ? { chatStreamId: params.streamId }
+          : {}),
         resolve: resolveRequest,
         reject: rejectRequest,
         timeout,
@@ -419,16 +911,277 @@ export class EngineSupervisor extends EventEmitter {
     });
   }
 
+  /**
+   * Reserve one turn in the worker's FIFO protocol loop.
+   *
+   * The Python worker intentionally executes one neural mutation at a time.
+   * Previously Electron still wrote concurrent RPC lines and started every
+   * deadline immediately. A harmless 30-second workspace read queued behind a
+   * long dataset update could therefore time out before Python had even read
+   * it, killing the healthy worker and pausing training at its last cursor.
+   *
+   * Mirror the worker's serial contract here. Deadlines now begin only after
+   * an entry owns the execution turn. A queued request can be cancelled
+   * without interrupting the active neural transaction; cancellation after
+   * dispatch retains the existing fail-closed worker restart semantics.
+   */
+  private reserveRequestTurn(signal?: AbortSignal): RequestQueueEntry {
+    const predecessor = this.requestQueueTail.catch(() => undefined);
+    let release = (): void => undefined;
+    const barrier = new Promise<void>((resolveBarrier) => {
+      release = resolveBarrier;
+    });
+    const tail = predecessor.then(() => barrier);
+    this.requestQueueTail = tail;
+
+    const ready = signal
+      ? new Promise<void>((resolveReady, rejectReady) => {
+          let settled = false;
+          const finish = (error?: Error): void => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener("abort", onAbort);
+            if (error) rejectReady(error);
+            else resolveReady();
+          };
+          const onAbort = (): void => {
+            const reason = signal.reason;
+            finish(
+              reason instanceof Error
+                ? reason
+                : new Error(`Worker request was cancelled while queued.`)
+            );
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          void predecessor.then(() => finish());
+          if (signal.aborted) onAbort();
+        })
+      : predecessor;
+
+    return {
+      ready,
+      release: () => {
+        release();
+        void tail.then(() => {
+          if (this.requestQueueTail === tail) {
+            this.requestQueueTail = Promise.resolve();
+          }
+        });
+      }
+    };
+  }
+
   async request<T>(
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = 120_000,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    priority: EngineRequestPriority = "foreground",
+    context?: EngineRequestContext
   ): Promise<T> {
-    if (signal?.aborted) throw new Error(`Worker request "${method}" was cancelled.`);
-    if (!(await this.start())) throw new Error(this.lastError);
-    if (signal?.aborted) throw new Error(`Worker request "${method}" was cancelled.`);
-    return (await this.rawRequest(method, params, timeoutMs, signal)) as T;
+    if (
+      (method === "query_substrate" || method === "cancel") &&
+      this.workerRole === "neural"
+    ) {
+      // Brain Map reads run in their own supervised process. A cold index
+      // backfill or wide cursor traversal can be cancelled independently and
+      // can never occupy, restart, or queue behind the transactional writer.
+      return this.inspectionSupervisor().request<T>(
+        method,
+        params,
+        timeoutMs,
+        signal,
+        priority,
+        context
+      );
+    }
+    if (
+      priority === "background" &&
+      [...this.requestReservations].some((entry) => !entry.cancelled)
+    ) {
+      throw new BackgroundRequestDeferredError(method);
+    }
+    const reservation = this.createRequestReservation(
+      method,
+      params,
+      priority,
+      signal,
+      context
+    );
+    const requestSignal = reservation.controller.signal;
+    try {
+      if (requestSignal.aborted) {
+        throw new Error(`Worker request "${method}" was cancelled.`);
+      }
+      if (priority === "foreground") await this.claimForegroundWorker();
+      if (!(await this.start())) throw new Error(this.lastError);
+      // A background request can be waiting on the same cold worker startup
+      // when foreground work arrives. Re-check ownership after startup before
+      // either request enters the serial protocol queue.
+      if (priority === "foreground") await this.claimForegroundWorker();
+      if (requestSignal.aborted) {
+        throw new Error(`Worker request "${method}" was cancelled.`);
+      }
+      if (reservation.cancelled) throw new BackgroundRequestDeferredError(method);
+      const turn = this.reserveRequestTurn(requestSignal);
+      try {
+        await turn.ready;
+        if (requestSignal.aborted) {
+          throw new Error(`Worker request "${method}" was cancelled.`);
+        }
+        if (reservation.cancelled) throw new BackgroundRequestDeferredError(method);
+        // The preceding reservation may have been actively cancelled, which
+        // intentionally terminates the one serial worker. A different queued
+        // request owns a different operation and must continue on a clean
+        // replacement rather than fail with "worker unavailable".
+        if (!(await this.start())) throw new Error(this.lastError);
+        if (requestSignal.aborted) {
+          throw new Error(`Worker request "${method}" was cancelled.`);
+        }
+        this.activeRequest = reservation;
+        reservation.queuePosition = undefined;
+        reservation.queuedBehind = undefined;
+        this.transitionActivity(reservation, "running");
+        try {
+          try {
+            // Optional background cognition may legitimately spend a long time
+            // restoring or evaluating a large local brain. Its caller remains
+            // single-flight, and foreground ownership explicitly preempts it;
+            // a background wall clock must never restart an otherwise healthy
+            // worker in a loop.
+            const effectiveTimeoutMs = priority === "background"
+              ? ENGINE_REQUEST_NO_DEADLINE
+              : timeoutMs;
+            reservation.dispatched = true;
+            return (await this.rawRequest(
+              method,
+              params,
+              effectiveTimeoutMs,
+              requestSignal
+            )) as T;
+          } catch (error) {
+            // Foreground ownership deliberately terminates an active optional
+            // cold load. Reclassify only that reservation; unrelated worker
+            // exits and protocol errors must continue to surface normally.
+            if (
+              priority === "background" &&
+              reservation.cancelled
+            ) {
+              throw new BackgroundRequestDeferredError(method);
+            }
+            throw error;
+          }
+        } finally {
+          if (this.activeRequest === reservation) this.activeRequest = undefined;
+        }
+      } finally {
+        turn.release();
+      }
+    } catch (error) {
+      if (requestSignal.aborted || reservation.cancelled) {
+        if (
+          reservation.cancellationPhase === "running" &&
+          reservation.dispatched &&
+          !(error instanceof EngineRequestError && error.code === -32800) &&
+          /(?:was cancelled|Python worker was stopped)/i.test(messageFromError(error))
+        ) {
+          // rawRequest reports cancellation only after terminateChild confirms
+          // process close. Queued cancellation never enters rawRequest and must
+          // not claim that the unrelated owner was terminated.
+          reservation.workerTerminationAcknowledged = true;
+        }
+        this.transitionActivity(
+          reservation,
+          reservation.cancellationPhase === "running" &&
+            !reservation.workerTerminationAcknowledged &&
+            /not acknowledged/i.test(messageFromError(error))
+            ? "failed"
+            : "cancelled"
+        );
+      } else {
+        this.transitionActivity(reservation, "failed");
+      }
+      throw error;
+    } finally {
+      if (reservation.state === "running") {
+        this.transitionActivity(reservation, "complete");
+      }
+      this.finishRequestReservation(reservation);
+    }
+  }
+
+  /**
+   * Preempt optional worker activity before a same-brain foreground caller
+   * waits on a higher-level repository write lock. Without this early claim,
+   * the caller cannot reach request() to trigger normal foreground ownership.
+   */
+  async claimForeground(): Promise<void> {
+    await this.claimForegroundWorker();
+  }
+
+  /**
+   * Ask one optional background operation to stop without waiting behind the
+   * worker's serial RPC queue. The existing cooperative cancellation path
+   * preserves its last atomic checkpoint and pending replay record.
+   */
+  cancelBackgroundRequest(brainId: string, method: string): boolean {
+    let cancelled = false;
+    for (const reservation of this.requestReservations) {
+      if (
+        reservation.priority !== "background" ||
+        reservation.brainId !== brainId ||
+        reservation.method !== method ||
+        reservation.cancelled
+      ) continue;
+      reservation.cancelled = true;
+      reservation.cancellationPhase = reservation.dispatched ? "running" : "queued";
+      reservation.controller.abort(
+        new Error(`Worker request "${method}" was cancelled by learning pause.`)
+      );
+      cancelled = true;
+    }
+    return cancelled;
+  }
+
+  /**
+   * Give interactive/build work precedence over optional prompt-free activity.
+   *
+   * Background requests never accumulate behind other reservations. If one is
+   * already restoring a cold checkpoint, terminate that supervised process;
+   * the brain's last atomic checkpoint remains authoritative and the
+   * foreground request starts on a clean replacement worker.
+   */
+  private async claimForegroundWorker(): Promise<void> {
+    const background = [...this.requestReservations].filter(
+      (reservation) => reservation.priority === "background"
+    );
+    for (const reservation of background) {
+      reservation.cancelled = true;
+      reservation.cancellationPhase = reservation.dispatched
+        ? "running"
+        : "queued";
+      if (!reservation.controller.signal.aborted) {
+        reservation.controller.abort(
+          new Error(`Worker request "${reservation.method}" was cancelled.`)
+        );
+      }
+    }
+    if (this.activeRequest?.priority !== "background") return;
+    if (COOPERATIVE_CANCEL_METHODS.has(this.activeRequest.method)) {
+      await this.activeRequest.settled;
+      return;
+    }
+    if (!this.backgroundPreemption) {
+      const operation = this.interruptAndRestart()
+        .then(() => undefined)
+        .finally(() => {
+          if (this.backgroundPreemption === operation) {
+            this.backgroundPreemption = undefined;
+          }
+        });
+      this.backgroundPreemption = operation;
+    }
+    await this.backgroundPreemption;
   }
 
   /**
@@ -444,7 +1197,9 @@ export class EngineSupervisor extends EventEmitter {
     onEvent: (event: EngineEvent) => void,
     timeoutMs = 120_000,
     signal?: AbortSignal,
-    requestedStreamId?: string
+    requestedStreamId?: string,
+    priority: EngineRequestPriority = "foreground",
+    context?: EngineRequestContext
   ): Promise<T> {
     const streamId = requestedStreamId?.trim() || randomUUID();
     let lastSequence = -1;
@@ -467,7 +1222,9 @@ export class EngineSupervisor extends EventEmitter {
         method,
         { ...params, streamId },
         timeoutMs,
-        signal
+        signal,
+        priority,
+        context
       );
     } finally {
       this.off("event", listener);
@@ -478,10 +1235,12 @@ export class EngineSupervisor extends EventEmitter {
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = 120_000,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    priority: EngineRequestPriority = "foreground",
+    context?: EngineRequestContext
   ): Promise<T | undefined> {
     try {
-      return await this.request<T>(method, params, timeoutMs, signal);
+      return await this.request<T>(method, params, timeoutMs, signal, priority, context);
     } catch (error) {
       this.lastError = messageFromError(error);
       return undefined;
@@ -494,7 +1253,9 @@ export class EngineSupervisor extends EventEmitter {
     onEvent: (event: EngineEvent) => void,
     timeoutMs = 120_000,
     signal?: AbortSignal,
-    streamId?: string
+    streamId?: string,
+    priority: EngineRequestPriority = "foreground",
+    context?: EngineRequestContext
   ): Promise<T | undefined> {
     try {
       return await this.requestStream<T>(
@@ -503,7 +1264,9 @@ export class EngineSupervisor extends EventEmitter {
         onEvent,
         timeoutMs,
         signal,
-        streamId
+        streamId,
+        priority,
+        context
       );
     } catch (error) {
       this.lastError = messageFromError(error);
@@ -512,6 +1275,7 @@ export class EngineSupervisor extends EventEmitter {
   }
 
   async health(): Promise<EngineHealth> {
+    let restarting = Boolean(this.terminating || this.starting);
     const started = await this.start();
     if (started) {
       const result = await this.tryRequest<Record<string, unknown>>("health", {}, 10_000);
@@ -527,19 +1291,19 @@ export class EngineSupervisor extends EventEmitter {
           pid: this.child?.pid
         };
       }
+      restarting = true;
     }
-    const stderr = this.recentStderr.at(-1);
     return {
       ready: false,
       worker: "unavailable",
       protocolVersion: PROTOCOL_VERSION,
-      detail: [
-        this.lastError,
-        stderr,
-        "The authoritative OmniCortex neural worker is unavailable; no alternate memory model will be substituted."
-      ]
-        .filter(Boolean)
-        .join(" ")
+      // Full process stderr and traceback remain in lastError/recentStderr and
+      // the emitted exit diagnostic. Health is a compact user-facing surface,
+      // not a log transport or multi-line progress report.
+      detail:
+        restarting || /(?:stopped|exited|cancelled|killed)/i.test(this.lastError)
+          ? "Neural engine restarting…"
+          : "Neural engine unavailable."
     };
   }
 
@@ -547,6 +1311,9 @@ export class EngineSupervisor extends EventEmitter {
     if (this.stopping) return;
     this.stopping = true;
     try {
+      const inspection = this.inspectionWorker;
+      this.inspectionWorker = undefined;
+      if (inspection) await inspection.stop();
       if (this.child && !this.child.killed && this.child.exitCode === null) {
         await this.rawRequest("shutdown", {}, 1_500).catch(() => undefined);
       }
@@ -582,21 +1349,21 @@ export class EngineSupervisor extends EventEmitter {
     if (lifecycle.forcedClose) clearTimeout(lifecycle.forcedClose);
     child.stdout.removeListener("data", lifecycle.stdoutListener);
     child.stderr.removeListener("data", lifecycle.stderrListener);
+    const exitDetail = `Worker exited with code ${String(code)} and signal ${String(signal)}.`;
+    const detail = lifecycle.processError
+      ? `${lifecycle.processError}\n${exitDetail}`
+      : exitDetail;
+    const stderr = lifecycle.stderr.filter(Boolean).join("\n").slice(-8_000);
+    const diagnostic = stderr ? `${detail}\nWorker stderr:\n${stderr}` : detail;
+    if (stderr || lifecycle.processError) {
+      // Internal-only diagnostic channel. The bootstrap logger records this;
+      // health/UI responses deliberately never include it.
+      this.emit("diagnostic", diagnostic);
+    }
     try {
       if (this.child !== child) return;
-      const exitDetail = `Worker exited with code ${String(code)} and signal ${String(signal)}.`;
-      const detail = lifecycle.processError
-        ? `${lifecycle.processError}\n${exitDetail}`
-        : exitDetail;
-      const stderr = lifecycle.stderr.filter(Boolean).join("\n").slice(-8_000);
-      const diagnostic = stderr ? `${detail}\nWorker stderr:\n${stderr}` : detail;
       this.lastError = diagnostic;
-      const error = new Error(diagnostic);
-      for (const request of this.pending.values()) {
-        request.cleanup();
-        request.reject(error);
-      }
-      this.pending.clear();
+      this.rejectPendingForChild(child, new Error(diagnostic));
       this.child = undefined;
       if (this.lifecycle === lifecycle) this.lifecycle = undefined;
       if (!this.stopping) this.emit("exit", diagnostic);
@@ -605,23 +1372,29 @@ export class EngineSupervisor extends EventEmitter {
     }
   }
 
-  private terminateChild(): Promise<void> {
-    if (this.terminating) return this.terminating;
+  private terminateChild(force = false): Promise<void> {
+    if (this.terminating) {
+      if (
+        force &&
+        this.terminatingChild &&
+        this.terminatingChild.exitCode === null
+      ) {
+        this.terminatingChild.kill("SIGKILL");
+      }
+      return this.terminating;
+    }
     const child = this.child;
     if (!child) return Promise.resolve();
     const lifecycle = this.lifecycle?.child === child ? this.lifecycle : undefined;
     this.child = undefined;
-    if (this.pending.size > 0) {
-      const error = new Error("Python worker was stopped.");
-      for (const request of this.pending.values()) {
-        request.cleanup();
-        request.reject(error);
-      }
-      this.pending.clear();
-    }
+    this.terminatingChild = child;
+    this.rejectPendingForChild(child, new Error("Python worker was stopped."));
     const terminate = async (): Promise<void> => {
-      if (child.exitCode === null && !child.killed) child.kill();
-      await new Promise<void>((resolveClose) => {
+      if (child.exitCode === null && (force || !child.killed)) {
+        if (force) child.kill("SIGKILL");
+        else child.kill();
+      }
+      await new Promise<void>((resolveClose, rejectClose) => {
         let finished = false;
         let forceTimeout: NodeJS.Timeout | undefined;
         let gracefulTimeout: NodeJS.Timeout;
@@ -639,8 +1412,20 @@ export class EngineSupervisor extends EventEmitter {
         };
         gracefulTimeout = setTimeout(() => {
           if (child.exitCode === null) child.kill("SIGKILL");
-          forceTimeout = setTimeout(finish, 1_000);
-        }, 2_000);
+          forceTimeout = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              this.unacknowledgedChild = child;
+              child.removeListener("close", finish);
+              rejectClose(
+                new Error(
+                  `Python worker PID ${String(child.pid ?? "unknown")} did not acknowledge termination.`
+                )
+              );
+              return;
+            }
+            finish();
+          }, 1_000);
+        }, force ? 250 : 2_000);
         if (lifecycle) {
           void lifecycle.closed.then(finish);
         } else {
@@ -650,6 +1435,7 @@ export class EngineSupervisor extends EventEmitter {
     };
     const operation = terminate().finally(() => {
       if (this.lifecycle === lifecycle) this.lifecycle = undefined;
+      if (this.terminatingChild === child) this.terminatingChild = undefined;
       if (this.terminating === operation) this.terminating = undefined;
     });
     this.terminating = operation;

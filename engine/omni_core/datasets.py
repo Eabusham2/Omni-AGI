@@ -26,9 +26,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Optional, Set
+from typing import (
+    Any,
+    BinaryIO,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+)
 from xml.parsers import expat
 
 
@@ -96,6 +108,16 @@ IMAGE_EXTENSIONS = {
     ".bmp",
     ".tif",
     ".tiff",
+    ".avif",
+    ".heic",
+    ".heif",
+    ".jp2",
+    ".j2k",
+    ".jpf",
+    ".jpx",
+    ".jxl",
+    ".raw",
+    ".dng",
 }
 AUDIO_EXTENSIONS = {
     ".wav",
@@ -104,7 +126,17 @@ AUDIO_EXTENSIONS = {
     ".m4a",
     ".aac",
     ".ogg",
+    ".oga",
     ".opus",
+    ".aiff",
+    ".aif",
+    ".wma",
+    ".caf",
+    ".alac",
+    ".amr",
+    ".au",
+    ".snd",
+    ".mka",
 }
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -112,9 +144,54 @@ VIDEO_EXTENSIONS = {
     ".mov",
     ".mkv",
     ".avi",
+    ".m4v",
     ".mpeg",
     ".mpg",
+    ".wmv",
+    ".flv",
+    ".3gp",
+    ".3g2",
+    ".ogv",
+    ".mts",
+    ".m2ts",
+    ".vob",
 }
+_INTERNAL_DATASET_DIRECTORIES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+}
+_AUXILIARY_DATASET_FILES = {
+    ".ds_store",
+    ".gitattributes",
+    ".gitignore",
+    ".gitmodules",
+    "desktop.ini",
+    "thumbs.db",
+}
+_AUXILIARY_DATASET_SUFFIXES = (
+    ".lock",
+    ".metadata",
+    ".incomplete",
+    ".inprogress",
+    ".pending",
+    ".partial",
+    ".part",
+    ".crdownload",
+    ".download",
+    ".tmp",
+    ".temp",
+    ".swp",
+    ".swo",
+)
 _MANIFEST_REFERENCE_KEYS = {
     "url",
     "uri",
@@ -141,6 +218,46 @@ _MANIFEST_METADATA_KEYS = {
     "revision",
     "split",
 }
+
+# Common content columns used by Hugging Face, web-corpus, source-code and
+# instruction datasets. Columnar/JSON readers select these values instead of
+# teaching the model a serialization of unrelated row metadata.
+_TRAINING_TEXT_FIELDS = (
+    "text",
+    "content",
+    "document",
+    "body",
+    "article",
+    "story",
+    "code",
+    "completion",
+    "response",
+    "answer",
+)
+_METADATA_ONLY_FIELDS = frozenset(
+    {
+        "blob_id",
+        "repo_name",
+        "repository",
+        "path",
+        "file_path",
+        "filename",
+        "length",
+        "length_bytes",
+        "score",
+        "int_score",
+        "id",
+        "url",
+        "dump",
+        "language",
+        "language_score",
+        "token_count",
+        "prompt_id",
+        "sha256",
+        "license",
+        "split",
+    }
+)
 
 
 @dataclass
@@ -173,6 +290,14 @@ class _RemoteDownload:
     content_type: str
 
 
+@dataclass(frozen=True)
+class SQLiteSnapshot:
+    """A leased, immutable SQLite backup and the bytes that identify it."""
+
+    path: Path
+    sha256: str
+
+
 @dataclass
 class DatasetCoverage:
     discovered_files: int = 0
@@ -184,7 +309,36 @@ class DatasetCoverage:
     processed_bytes: int = 0
     shards: int = 0
     modality_counts: Dict[str, int] = field(default_factory=dict)
-    errors: List[Dict[str, str]] = field(default_factory=list)
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+    error_count: int = 0
+    errors_truncated: bool = False
+    # A parser that fails after yielding a prefix has not proved traversal of
+    # its unread tail. File/record rejection counts alone cannot certify it.
+    traversal_incomplete: bool = False
+
+    # Diagnostics are samples, not a traversal limit. Keeping counts separate
+    # prevents a malformed multi-million-row shard from turning its coverage
+    # report into another multi-gigabyte in-memory dataset.
+    _ERROR_SAMPLE_LIMIT = 256
+
+    def _record_error(
+        self,
+        source: str,
+        message: str,
+        *,
+        count: int = 1,
+    ) -> None:
+        occurrences = max(0, int(count))
+        if occurrences == 0:
+            return
+        self.error_count += occurrences
+        if len(self.errors) >= self._ERROR_SAMPLE_LIMIT:
+            self.errors_truncated = True
+            return
+        entry: Dict[str, Any] = {"source": source, "message": message}
+        if occurrences != 1:
+            entry["count"] = occurrences
+        self.errors.append(entry)
 
     def reject(
         self,
@@ -205,7 +359,27 @@ class DatasetCoverage:
         if not already_discovered:
             self.discovered_records += 1
         self.rejected_records += 1
-        self.errors.append({"source": source, "message": message})
+        self._record_error(source, message)
+
+    def reject_many(
+        self,
+        source: str,
+        message: str,
+        count: int,
+        *,
+        processed_bytes: int = 0,
+    ) -> None:
+        """Classify a schema-proven invalid row set without retaining each row.
+
+        This is used only when the columnar schema proves that no row can
+        contain trainable content. It does not skip a potentially valid record.
+        """
+
+        occurrences = max(0, int(count))
+        self.discovered_records += occurrences
+        self.rejected_records += occurrences
+        self.processed_bytes += max(0, int(processed_bytes))
+        self._record_error(source, message, count=occurrences)
 
     def reject_processed(self, source: str, message: str) -> None:
         """Reclassify a provisionally processed record as explicitly rejected."""
@@ -259,8 +433,16 @@ class DatasetCoverage:
             "shards": self.shards,
             "modalityCounts": dict(self.modality_counts),
             "errors": list(self.errors),
-            "complete": files_complete and records_complete,
+            "errorCount": self.error_count,
+            "errorsTruncated": self.errors_truncated,
+            "complete": (
+                files_complete and records_complete and not self.traversal_incomplete
+            ),
         }
+
+
+class DatasetTraversalIncomplete(RuntimeError):
+    """A readable source stopped before all of its records were visited."""
 
 
 def _media_kind(path: Path) -> Optional[str]:
@@ -271,6 +453,26 @@ def _media_kind(path: Path) -> Optional[str]:
         return "audio"
     if suffix in VIDEO_EXTENSIONS:
         return "video"
+    return None
+
+
+def _auxiliary_dataset_file_rejection(path: Path) -> Optional[str]:
+    """Classify filesystem/download bookkeeping before content sniffing.
+
+    A UTF-8 lock or downloader metadata file must never become a text training
+    record merely because it happens to decode cleanly. Explicitly classifying
+    it also keeps coverage exhaustive: the file is visited and rejected rather
+    than silently presented to neural learning.
+    """
+
+    name = path.name.lower()
+    if (
+        name.startswith(".")
+        or name in _AUXILIARY_DATASET_FILES
+        or name.endswith("~")
+        or any(name.endswith(suffix) for suffix in _AUXILIARY_DATASET_SUFFIXES)
+    ):
+        return "transient, operating-system, or repository metadata is not training data"
     return None
 
 
@@ -560,12 +762,33 @@ def dataset_format(path: Path, requested: str = "") -> str:
     return "unknown"
 
 
+def dataset_record_count_hint(path: Path, requested: str = "") -> Optional[int]:
+    """Return a cheap exact record total when the container exposes one.
+
+    Streaming text/JSONL/CSV totals deliberately remain unknown: pre-scanning a
+    30+ GB source just to draw a denominator would double I/O and delay actual
+    learning. Parquet stores its row count in the footer, so that value is both
+    exact and inexpensive.
+    """
+
+    format_name = dataset_format(path, requested)
+    if format_name == "parquet":
+        _require_pyarrow()
+        import pyarrow.parquet as parquet  # type: ignore
+
+        return max(0, int(parquet.ParquetFile(path).metadata.num_rows))
+    if format_name in {"image", "audio", "video"}:
+        return 1
+    return None
+
+
 def _record(
     text: str,
     name: str,
     bytes_read: int,
     coverage: DatasetCoverage,
     kind: str = "text",
+    provenance: Optional[Mapping[str, Any]] = None,
 ) -> Optional[DatasetRecord]:
     clean = text.replace("\x00", "").strip()
     coverage.discovered_records += 1
@@ -579,7 +802,176 @@ def _record(
         return None
     coverage.processed_records += 1
     coverage.modality_counts[kind] = coverage.modality_counts.get(kind, 0) + 1
-    return DatasetRecord(clean, name, max(0, int(bytes_read)), kind)
+    return DatasetRecord(
+        clean,
+        name,
+        max(0, int(bytes_read)),
+        kind,
+        provenance=dict(provenance or {}),
+    )
+
+
+def _row_provenance(
+    value: Mapping[str, Any], selected_fields: Set[str]
+) -> Dict[str, Any]:
+    """Retain attributable scalar metadata without duplicating row content."""
+
+    metadata: Dict[str, Any] = {}
+    for raw_key, entry in value.items():
+        key = str(raw_key)
+        if key in selected_fields or key == "messages":
+            continue
+        if entry is None or isinstance(entry, (bool, int, float)):
+            metadata[key] = entry
+        elif isinstance(entry, str):
+            # Identifiers and URLs are useful provenance. Very large strings
+            # are represented by a hash so ingestion remains streaming.
+            encoded = entry.encode("utf-8", errors="replace")
+            metadata[key] = (
+                entry
+                if len(encoded) <= 4_096
+                else {
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                    "bytes": len(encoded),
+                }
+            )
+    return metadata
+
+
+def _conversation_training_text(
+    messages: Any,
+) -> Tuple[str, Dict[str, Any]]:
+    """Flatten typed dialogue while recording assistant supervision spans.
+
+    System/persona messages are deliberately excluded from the clean starter
+    corpus. Human and brain boundary labels are data-format markers, not a
+    hidden runtime instruction.
+    """
+
+    if not isinstance(messages, list):
+        return "", {"invalidMessages": True}
+    pieces: List[str] = []
+    spans: List[Dict[str, Any]] = []
+    dialogue_pairs: List[Dict[str, str]] = []
+    excluded_roles: Dict[str, int] = {}
+    cursor = 0
+    latest_human = ""
+    for message in messages:
+        if not isinstance(message, Mapping):
+            excluded_roles["invalid"] = excluded_roles.get("invalid", 0) + 1
+            continue
+        role = str(message.get("role", "")).strip().lower()
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            excluded_roles[role or "invalid"] = excluded_roles.get(role or "invalid", 0) + 1
+            continue
+        if role in {"system", "developer"}:
+            excluded_roles[role] = excluded_roles.get(role, 0) + 1
+            continue
+        if role in {"user", "human"}:
+            boundary = "human: "
+            normalized_role = "human"
+            latest_human = content.strip()
+        elif role in {"assistant", "brain"}:
+            boundary = "brain: "
+            normalized_role = "brain"
+        else:
+            excluded_roles[role or "unknown"] = excluded_roles.get(role or "unknown", 0) + 1
+            continue
+        line = boundary + content.strip() + "\n"
+        start = cursor + len(boundary)
+        end = cursor + len(line.rstrip("\n"))
+        pieces.append(line)
+        if normalized_role == "brain":
+            spans.append({"start": start, "end": end, "role": "brain"})
+            if latest_human:
+                # Kept only on the streaming DatasetRecord. Ingestion consumes
+                # these typed targets and never copies them into source
+                # metadata, so Synapses Only still leaves no raw dialogue on
+                # disk after the record has been encoded.
+                dialogue_pairs.append(
+                    {"human": latest_human, "brain": content.strip()}
+                )
+        cursor += len(line)
+    provenance: Dict[str, Any] = {
+        "format": "typed-dialogue",
+        "assistantSpans": spans,
+        "dialoguePairs": dialogue_pairs,
+    }
+    if excluded_roles:
+        provenance["excludedRoles"] = excluded_roles
+    return "".join(pieces).strip(), provenance
+
+
+def _training_value(
+    value: Any,
+) -> Tuple[str, Dict[str, Any], Optional[str]]:
+    """Resolve one structured row into training content and provenance."""
+
+    if isinstance(value, str):
+        return value, {}, None
+    if isinstance(value, Mapping):
+        if "messages" in value:
+            text, dialogue = _conversation_training_text(value.get("messages"))
+            if text:
+                return (
+                    text,
+                    {
+                        **_row_provenance(value, {"messages"}),
+                        **dialogue,
+                        "selectedField": "messages",
+                    },
+                    None,
+                )
+            return (
+                "",
+                {
+                    **_row_provenance(value, {"messages"}),
+                    **dialogue,
+                    "selectedField": "messages",
+                },
+                "dialogue row has no trainable human or brain messages",
+            )
+        for field_name in _TRAINING_TEXT_FIELDS:
+            content = value.get(field_name)
+            if isinstance(content, str) and content.strip():
+                return (
+                    content,
+                    {
+                        **_row_provenance(value, {field_name}),
+                        "selectedField": field_name,
+                    },
+                    None,
+                )
+        normalized_keys = {str(key).strip().lower() for key in value}
+        if normalized_keys and normalized_keys.issubset(_METADATA_ONLY_FIELDS):
+            return "", _row_provenance(value, set()), "metadata-only row has no trainable content"
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        return "", {}, "structured row is not serializable: %s" % error
+    return text, {"selectedField": "structured-row"}, None
+
+
+def _structured_record(
+    value: Any,
+    name: str,
+    bytes_read: int,
+    coverage: DatasetCoverage,
+) -> Optional[DatasetRecord]:
+    text, provenance, rejection = _training_value(value)
+    if rejection is not None:
+        coverage.discovered_records += 1
+        coverage.processed_bytes += max(0, int(bytes_read))
+        coverage.reject(name, rejection, already_discovered=True)
+        return None
+    return _record(
+        text,
+        name,
+        bytes_read,
+        coverage,
+        provenance=provenance,
+    )
 
 
 def _iter_text_stream(
@@ -648,15 +1040,14 @@ def _iter_jsonl(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord
                 continue
             try:
                 value = json.loads(stripped)
-                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             except json.JSONDecodeError as error:
                 coverage.reject(
                     "%s#line-%d" % (path.name, index + 1),
                     "invalid JSONL: %s" % error,
                 )
                 continue
-            record = _record(
-                text,
+            record = _structured_record(
+                value,
                 "%s#line-%d" % (path.name, index + 1),
                 len(line.encode("utf-8", errors="replace")),
                 coverage,
@@ -704,11 +1095,13 @@ def _iter_json(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]
             values = [value]
     try:
         for index, entry in enumerate(values):
-            text = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-            record = _record(
-                text,
+            encoded_size = len(
+                json.dumps(entry, ensure_ascii=False, default=str).encode("utf-8")
+            )
+            record = _structured_record(
+                entry,
                 "%s#record-%d" % (path.name, index + 1),
-                len(text.encode("utf-8")),
+                encoded_size,
                 coverage,
             )
             if record is not None:
@@ -718,39 +1111,150 @@ def _iter_json(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]
             stream.close()
 
 
-def _iter_sqlite(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]:
-    connection = sqlite3.connect("file:%s?mode=ro" % path.as_posix(), uri=True)
-    try:
-        tables = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            )
-        ]
-        for table in tables:
-            escaped = table.replace('"', '""')
-            cursor = connection.execute('SELECT * FROM "%s"' % escaped)
-            columns = [str(value[0]) for value in (cursor.description or [])]
-            row_number = 0
-            while True:
-                rows = cursor.fetchmany(256)
-                if not rows:
-                    break
-                for row in rows:
-                    row_number += 1
-                    value = dict(zip(columns, row))
-                    text = json.dumps(value, ensure_ascii=False, default=str)
-                    record = _record(
-                        text,
-                        "%s#%s-%d" % (path.name, table, row_number),
-                        len(text.encode("utf-8")),
-                        coverage,
-                    )
-                    if record is not None:
-                        yield record
-    finally:
-        connection.close()
+def _sqlite_identifier(value: str) -> str:
+    return '"%s"' % value.replace('"', '""')
+
+
+@contextmanager
+def sqlite_consistent_snapshot(
+    path: Path, committed_sha256: str = ""
+) -> Iterator[SQLiteSnapshot]:
+    """Lease a single-file SQLite backup containing the committed WAL state.
+
+    Reading the main database file directly is not a snapshot when WAL mode is
+    active: recently committed rows can live only in ``-wal``. SQLite's backup
+    API takes one transactionally consistent view and folds those pages into a
+    standalone database. The digest therefore identifies the bytes actually
+    traversed, not merely the stale main file beside an ignored WAL.
+    """
+
+    source_path = path.resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(str(source_path))
+    declared = committed_sha256.strip().lower()
+    if declared:
+        if len(declared) != 64 or any(
+            value not in "0123456789abcdef" for value in declared
+        ):
+            raise ValueError("committed SQLite snapshot sha256 is invalid")
+        actual = _sha256_path(source_path)
+        if actual != declared:
+            raise ValueError("committed SQLite snapshot checksum mismatch")
+        # The desktop manifest owns and protects this immutable snapshot. Read
+        # those exact bytes so its committed identity remains authoritative.
+        yield SQLiteSnapshot(path=source_path, sha256=actual)
+        return
+    with tempfile.TemporaryDirectory(prefix="omni-sqlite-snapshot-") as root:
+        snapshot_path = Path(root) / "snapshot.sqlite3"
+        source_uri = source_path.as_uri() + "?mode=ro"
+        source = sqlite3.connect(source_uri, uri=True, isolation_level=None)
+        destination = sqlite3.connect(str(snapshot_path), isolation_level=None)
+        try:
+            source.execute("PRAGMA query_only = ON")
+            source.execute("PRAGMA busy_timeout = 30000")
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        digest = _sha256_path(snapshot_path)
+        yield SQLiteSnapshot(path=snapshot_path, sha256=digest)
+
+
+def sqlite_consistent_snapshot_sha256(path: Path) -> str:
+    """Return the identity used by deterministic SQLite traversal."""
+
+    with sqlite_consistent_snapshot(path) as snapshot:
+        return snapshot.sha256
+
+
+def _sqlite_row_order(
+    connection: sqlite3.Connection, table: str
+) -> Tuple[str, List[str]]:
+    quoted_table = _sqlite_identifier(table)
+    columns = list(connection.execute("PRAGMA table_info(%s)" % quoted_table))
+    primary_key = sorted(
+        (
+            (int(row[5]), str(row[1]))
+            for row in columns
+            if len(row) > 5 and int(row[5]) > 0
+        ),
+        key=lambda value: value[0],
+    )
+    if primary_key:
+        names = [name for _, name in primary_key]
+        return ", ".join(_sqlite_identifier(name) for name in names), names
+
+    # Ordinary SQLite tables have a hidden integer row id. A user column may
+    # shadow one alias, so choose an unshadowed spelling explicitly.
+    declared = {str(row[1]).casefold() for row in columns}
+    for alias in ("rowid", "_rowid_", "oid"):
+        if alias.casefold() not in declared:
+            return alias, ["rowid"]
+    raise ValueError(
+        "SQLite table %s has no declared primary key and shadows every rowid alias"
+        % table
+    )
+
+
+def _iter_sqlite(
+    path: Path,
+    coverage: DatasetCoverage,
+    committed_snapshot_sha256: str = "",
+) -> Iterator[DatasetRecord]:
+    with sqlite_consistent_snapshot(path, committed_snapshot_sha256) as snapshot:
+        snapshot_uri = snapshot.path.resolve().as_uri() + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(snapshot_uri, uri=True)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            tables = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE type='table' AND name NOT GLOB 'sqlite_*' "
+                    "ORDER BY name COLLATE BINARY"
+                )
+            ]
+            for table in tables:
+                quoted_table = _sqlite_identifier(table)
+                order_expression, order_columns = _sqlite_row_order(
+                    connection, table
+                )
+                cursor = connection.execute(
+                    "SELECT * FROM %s ORDER BY %s"
+                    % (quoted_table, order_expression)
+                )
+                columns = [str(value[0]) for value in (cursor.description or [])]
+                row_number = 0
+                while True:
+                    rows = cursor.fetchmany(256)
+                    if not rows:
+                        break
+                    for row in rows:
+                        row_number += 1
+                        value = dict(zip(columns, row))
+                        encoded_size = len(
+                            json.dumps(
+                                value,
+                                ensure_ascii=False,
+                                default=str,
+                            ).encode("utf-8")
+                        )
+                        record = _structured_record(
+                            value,
+                            "%s#%s-%d" % (path.name, table, row_number),
+                            encoded_size,
+                            coverage,
+                        )
+                        if record is not None:
+                            record.provenance = {
+                                "sqlite_snapshot_sha256": snapshot.sha256,
+                                "sqlite_table": table,
+                                "sqlite_order": list(order_columns),
+                                **record.provenance,
+                            }
+                            yield record
+        finally:
+            connection.close()
 
 
 def _require_pyarrow() -> Any:
@@ -764,6 +1268,11 @@ def _require_pyarrow() -> Any:
         ) from error
 
 
+def _metadata_only_columnar_schema(column_names: Iterable[Any]) -> bool:
+    normalized = {str(name).strip().lower() for name in column_names}
+    return bool(normalized) and normalized.issubset(_METADATA_ONLY_FIELDS)
+
+
 def _iter_columnar(
     path: Path, format_name: str, coverage: DatasetCoverage
 ) -> Iterator[DatasetRecord]:
@@ -771,7 +1280,24 @@ def _iter_columnar(
     if format_name == "parquet":
         import pyarrow.parquet as parquet  # type: ignore
 
-        batches = parquet.ParquetFile(path).iter_batches(batch_size=256)
+        parquet_file = parquet.ParquetFile(path)
+        if _metadata_only_columnar_schema(parquet_file.schema_arrow.names):
+            row_count = int(parquet_file.metadata.num_rows)
+            coverage.reject_many(
+                "%s#all-rows" % path.name,
+                "metadata-only Parquet schema has no trainable content; "
+                "the referenced source/blob payload is required",
+                row_count,
+                processed_bytes=path.stat().st_size,
+            )
+            return
+        expected_rows = int(parquet_file.metadata.num_rows)
+        try:
+            batches = parquet_file.iter_batches(batch_size=256)
+        except Exception as error:
+            raise DatasetTraversalIncomplete(
+                "Parquet traversal could not start despite a readable row-count footer"
+            ) from error
     else:
         import pyarrow.ipc as ipc  # type: ignore
 
@@ -785,12 +1311,14 @@ def _iter_columnar(
                 batches = ipc.open_stream(source)
             for batch_index, batch in enumerate(batches):
                 for row_index, value in enumerate(batch.to_pylist()):
-                    text = json.dumps(value, ensure_ascii=False, default=str)
-                    record = _record(
-                        text,
+                    encoded_size = len(
+                        json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+                    )
+                    record = _structured_record(
+                        value,
                         "%s#batch-%d-row-%d"
                         % (path.name, batch_index + 1, row_index + 1),
-                        len(text.encode("utf-8")),
+                        encoded_size,
                         coverage,
                     )
                     if record is not None:
@@ -798,17 +1326,31 @@ def _iter_columnar(
             return
         finally:
             source.close()
-    for batch_index, batch in enumerate(batches):
-        for row_index, value in enumerate(batch.to_pylist()):
-            text = json.dumps(value, ensure_ascii=False, default=str)
-            record = _record(
-                text,
-                "%s#batch-%d-row-%d" % (path.name, batch_index + 1, row_index + 1),
-                len(text.encode("utf-8")),
-                coverage,
-            )
-            if record is not None:
-                yield record
+    discovered_before = coverage.discovered_records
+    try:
+        for batch_index, batch in enumerate(batches):
+            for row_index, value in enumerate(batch.to_pylist()):
+                encoded_size = len(
+                    json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+                )
+                record = _structured_record(
+                    value,
+                    "%s#batch-%d-row-%d" % (path.name, batch_index + 1, row_index + 1),
+                    encoded_size,
+                    coverage,
+                )
+                if record is not None:
+                    yield record
+    except Exception as error:
+        raise DatasetTraversalIncomplete(
+            "Parquet traversal failed before its footer-declared rows were visited"
+        ) from error
+    observed_rows = coverage.discovered_records - discovered_before
+    if observed_rows != expected_rows:
+        raise DatasetTraversalIncomplete(
+            "Parquet traversal visited %d of %d footer-declared rows"
+            % (observed_rows, expected_rows)
+        )
 
 
 def _xml_local_name(name: str) -> str:
@@ -1022,6 +1564,7 @@ def _iter_office_archive(
         for member in members:
             coverage.discovered_files += 1
             display_name = "%s!%s" % (path.name, member.filename)
+            discovered_before = coverage.discovered_records
             try:
                 with archive.open(member) as source:
                     yield from _iter_streamed_xml(
@@ -1032,6 +1575,8 @@ def _iter_office_archive(
                     )
                 coverage.completed_files += 1
             except Exception as error:
+                if coverage.discovered_records > discovered_before:
+                    coverage.traversal_incomplete = True
                 coverage.reject_file(
                     display_name,
                     str(error),
@@ -1052,6 +1597,7 @@ def _iter_standalone_compressed(
         raise ValueError("unsupported standalone compression format")
     inner_name = path.name[: -len(suffix)] or (path.name + ".txt")
     coverage.discovered_files += 1
+    discovered_before = coverage.discovered_records
     try:
         with opener(
             path, mode="rt", encoding="utf-8", errors="replace", newline=""
@@ -1063,6 +1609,8 @@ def _iter_standalone_compressed(
             )
         coverage.completed_files += 1
     except Exception as error:
+        if coverage.discovered_records > discovered_before:
+            coverage.traversal_incomplete = True
         coverage.reject_file(
             "%s!%s" % (path.name, inner_name),
             str(error),
@@ -1137,6 +1685,7 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                     continue
                 coverage.discovered_files += 1
                 member_path = Path(member.filename)
+                discovered_before = coverage.discovered_records
                 try:
                     with archive.open(member) as source:
                         suffix = member_path.suffix.lower()
@@ -1191,6 +1740,8 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                             continue
                     coverage.completed_files += 1
                 except Exception as error:
+                    if coverage.discovered_records > discovered_before:
+                        coverage.traversal_incomplete = True
                     coverage.reject_file(
                         "%s!%s" % (path.name, member.filename),
                         str(error),
@@ -1203,6 +1754,7 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
             if not member.isfile():
                 continue
             coverage.discovered_files += 1
+            discovered_before = coverage.discovered_records
             source = archive.extractfile(member)
             if source is None:
                 coverage.reject_file(
@@ -1245,6 +1797,8 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                     continue
                 coverage.completed_files += 1
             except Exception as error:
+                if coverage.discovered_records > discovered_before:
+                    coverage.traversal_incomplete = True
                 coverage.reject_file(
                     "%s!%s" % (path.name, member.name),
                     str(error),
@@ -1411,6 +1965,17 @@ def _iter_huggingface_manifest(
     for shard in shards:
         raw = shard.reference
         if raw.startswith(("https://", "http://", "hf://")):
+            if not shard.sha256:
+                # A manifest file can remain byte-identical while an unpinned
+                # remote object changes. Record-level resume and completion
+                # receipts therefore require a declared content identity; the
+                # downloader still verifies it against the resolved bytes.
+                coverage.reject_file(
+                    raw,
+                    "remote manifest shard requires a declared sha256 for "
+                    "restart-safe training",
+                )
+                continue
             try:
                 with tempfile.TemporaryDirectory(
                     prefix="omni-remote-dataset-"
@@ -1506,6 +2071,7 @@ def iter_dataset_records(
     requested_kind: str = "",
     coverage: Optional[DatasetCoverage] = None,
     _seen: Optional[Set[Path]] = None,
+    _committed_sqlite_snapshot_sha256: str = "",
 ) -> Iterator[DatasetRecord]:
     """Visit every readable record in ``path`` exactly once for this traversal."""
 
@@ -1520,15 +2086,26 @@ def iter_dataset_records(
             if child.is_symlink():
                 state.reject_file(str(child), "symbolic links are not followed")
                 continue
+            if child.is_dir() and (
+                child.name.lower() in _INTERNAL_DATASET_DIRECTORIES
+                or child.name.startswith(".")
+            ):
+                continue
             yield from iter_dataset_records(child, coverage=state, _seen=seen)
         return
     if not target.is_file():
         state.reject_file(str(target), "dataset path is not a regular file")
         return
 
+    auxiliary_rejection = _auxiliary_dataset_file_rejection(target)
+    if auxiliary_rejection is not None:
+        state.reject_file(str(target), auxiliary_rejection)
+        return
+
     state.discovered_files += 1
     format_name = dataset_format(target, requested_kind)
     file_rejected = False
+    discovered_before = state.discovered_records
     try:
         if format_name == "text":
             yield from _iter_text_path(target, state)
@@ -1541,7 +2118,13 @@ def iter_dataset_records(
         elif format_name == "json":
             yield from _iter_json(target, state)
         elif format_name == "sqlite":
-            yield from _iter_sqlite(target, state)
+            yield from _iter_sqlite(
+                target,
+                state,
+                committed_snapshot_sha256=(
+                    _committed_sqlite_snapshot_sha256
+                ),
+            )
         elif format_name in {"parquet", "arrow"}:
             yield from _iter_columnar(target, format_name, state)
         elif format_name == "archive":
@@ -1578,6 +2161,18 @@ def iter_dataset_records(
                 )
                 file_rejected = True
     except Exception as error:
+        # A desktop-provided SQLite snapshot is already content-addressed by
+        # the authoritative ingestion manifest. Treat a bad declaration as a
+        # transaction-integrity failure, not as an ordinary invalid dataset
+        # row that coverage reporting may skip. Otherwise training could be
+        # recorded under bytes different from the committed generation.
+        if format_name == "sqlite" and _committed_sqlite_snapshot_sha256:
+            raise
+        if (
+            isinstance(error, DatasetTraversalIncomplete)
+            or state.discovered_records > discovered_before
+        ):
+            state.traversal_incomplete = True
         if not file_rejected:
             state.reject_file(
                 str(target),

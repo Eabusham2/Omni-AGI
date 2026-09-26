@@ -1,0 +1,100 @@
+name: iOS IPA
+
+on:
+  push:
+    branches: ["main", "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa-and-simulator:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Select an available iPhone simulator
+        id: simulator
+        run: |
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 16.4"
+          SIMULATOR_RUNTIME="com.apple.CoreSimulator.SimRuntime.iOS-18-5"
+          UDID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"].get(sys.argv[1], []); print(next((device["udid"] for device in devices if device.get("isAvailable") and device.get("name", "").startswith("iPhone")), ""))' "$SIMULATOR_RUNTIME")"
+          test -n "$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Start host-backed same-brain gateway
+        run: |
+          python3 mobile/android/ci/fake_gateway.py 41838 > "$RUNNER_TEMP/omni-ios-fake-gateway.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/omni-ios-fake-gateway.pid"
+          for attempt in {1..30}; do
+            if curl --silent --output /dev/null http://127.0.0.1:41838/v1/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:41838/v1/health >/dev/null
+
+      - name: Build and test native iOS client
+        env:
+          OMNI_IOS_SIMULATOR_ID: ${{ steps.simulator.outputs.udid }}
+          OMNI_GATEWAY_ENDPOINT: http://127.0.0.1:41838
+          OMNI_IOS_RESULT_BUNDLE: ${{ runner.temp }}/OmniCompanion.xcresult
+        run: npm run test:ios
+
+      - name: Build, verify, and record signing-ready unsigned IPA
+        run: |
+          npm run package:ios:unsigned
+          VERSION="$(node -p "require('./package.json').version")"
+          IPA="release/mobile/Omni-AGI-Companion-${VERSION}-iOS-unsigned.ipa"
+          VERIFY_ROOT="$(mktemp -d "$RUNNER_TEMP/omni-ios-verify.XXXXXX")"
+          trap 'rm -rf "$VERIFY_ROOT"' EXIT
+          unzip -tq "$IPA"
+          unzip -q "$IPA" -d "$VERIFY_ROOT"
+          APP="$(find "$VERIFY_ROOT/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$APP"
+          if codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
+            echo "The signing-ready IPA was unexpectedly signed." >&2
+            exit 1
+          fi
+          node scripts/record-mobile-release.mjs \
+            --platform ios \
+            --output release/mobile/ios-package-smoke.json \
+            --artifact "$IPA" \
+            --emulator-tested 1 \
+            --same-brain-chat-tested 1 \
+            --attachment-stream-tested 1 \
+            --unsigned-verified 1
+
+      - name: Capture simulator diagnostics on failure
+        if: failure()
+        run: |
+          xcrun simctl io "${{ steps.simulator.outputs.udid }}" screenshot "$RUNNER_TEMP/omni-ios-failure.png" || true
+          xcrun simctl spawn "${{ steps.simulator.outputs.udid }}" log show --last 10m > "$RUNNER_TEMP/omni-ios-simulator.log" || true
+
+      - name: Upload IPA and simulator reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-agi-ios-unsigned
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            release/mobile/*-iOS-unsigned.ipa
+            release/mobile/ios-package-smoke.json
+            ${{ runner.temp }}/OmniCompanion.xcresult
+            ${{ runner.temp }}/omni-ios-fake-gateway.log
+            ${{ runner.temp }}/omni-ios-failure.png
+            ${{ runner.temp }}/omni-ios-simulator.log

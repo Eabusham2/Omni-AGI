@@ -18,6 +18,28 @@ function requireValue(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function validateSourceCommit(record, expectedCommit, label) {
+  requireValue(
+    record?.sourceCommit === expectedCommit,
+    `${label} is not bound to verified source commit ${expectedCommit}.`
+  );
+}
+
+const complianceReports = [];
+function validatePackagedCompliance(report, expectedKind, label) {
+  requireValue(
+    report?.schemaVersion === 1 &&
+      report?.kind === expectedKind &&
+      Number.isInteger(report?.legalFilesVerified) &&
+      report.legalFilesVerified >= 10 &&
+      report?.ffmpegExecutableBundled === false &&
+      typeof report?.ffmpegPolicySha256 === "string" &&
+      /^[a-f0-9]{64}$/u.test(report.ffmpegPolicySha256),
+    `${label} lacks valid packaged legal and FFmpeg compliance evidence.`
+  );
+  complianceReports.push({ label, report });
+}
+
 async function sha256(path) {
   const digest = createHash("sha256");
   await new Promise((resolveHash, rejectHash) => {
@@ -61,6 +83,13 @@ function requiredNames(product, version) {
     names.push(`mac-package-smoke-${arch}.json`);
     names.push(`linux-package-smoke-${arch}.json`);
   }
+  names.push(
+    `Omni-AGI-Companion-${version}-Android-debug-signed.apk`,
+    `Omni-AGI-Companion-${version}-Android-release-unsigned.apk`,
+    "android-package-smoke.json",
+    `Omni-AGI-Companion-${version}-iOS-unsigned.ipa`,
+    "ios-package-smoke.json"
+  );
   return names;
 }
 
@@ -118,6 +147,13 @@ const directory = resolve(option("--directory") ?? "artifacts");
 const packageDocument = JSON.parse(await readFile("package.json", "utf8"));
 const product = packageDocument.build.productName;
 const version = packageDocument.version;
+const sourceCommit = String(
+  option("--source-commit") ?? process.env.OMNI_RELEASE_COMMIT ?? ""
+).trim().toLowerCase();
+requireValue(
+  /^[a-f0-9]{40}$/u.test(sourceCommit),
+  "--source-commit must be the verified full 40-hex Git commit SHA."
+);
 const packagedExpected = requiredNames(product, version);
 const expected = packagedExpected.map((name) => publicReleaseAssetName(name));
 const generatedMetadata = new Set(["SHA256SUMS.txt", "RELEASE-MANIFEST.json"]);
@@ -153,7 +189,9 @@ requireValue(files.size === expected.length, "Release set contains duplicate or 
 const platformStatus = {
   windows: {},
   macOS: {},
-  linux: {}
+  linux: {},
+  android: {},
+  iOS: {}
 };
 for (const arch of ["x64", "arm64"]) {
   const windowsName = `windows-package-smoke-${arch}.json`;
@@ -162,6 +200,19 @@ for (const arch of ["x64", "arm64"]) {
   const windows = await readJson(files.get(windowsName), windowsName);
   const mac = await readJson(files.get(macName), macName);
   const linux = await readJson(files.get(linuxName), linuxName);
+  validateSourceCommit(windows, sourceCommit, `Windows ${arch} evidence`);
+  validateSourceCommit(mac, sourceCommit, `macOS ${arch} evidence`);
+  validateSourceCommit(linux, sourceCommit, `Linux ${arch} evidence`);
+  validatePackagedCompliance(
+    windows.zip?.compliance,
+    "desktop-artifact-compliance",
+    `Windows ${arch} ZIP`
+  );
+  validatePackagedCompliance(
+    windows.nsis?.compliance,
+    "desktop-artifact-compliance",
+    `Windows ${arch} NSIS`
+  );
 
   requireValue(windows.architecture === arch, `Windows evidence reports the wrong ${arch} architecture.`);
   requireValue(
@@ -278,6 +329,11 @@ for (const arch of ["x64", "arm64"]) {
     `macOS ${arch} evidence has an unexpected artifact count.`
   );
   for (const name of expectedMacArtifacts) {
+    validatePackagedCompliance(
+      mac.artifactCompliance?.[name],
+      "desktop-artifact-compliance",
+      `macOS ${arch} ${name}`
+    );
     await validateRecordedArtifact(
       mac.artifacts.find((artifact) => artifact.name === name),
       name,
@@ -327,6 +383,11 @@ for (const arch of ["x64", "arm64"]) {
     `Linux ${arch} evidence has an unexpected artifact count.`
   );
   for (const name of expectedLinuxArtifacts) {
+    validatePackagedCompliance(
+      linux.artifactCompliance?.[name],
+      "desktop-artifact-compliance",
+      `Linux ${arch} ${name}`
+    );
     await validateRecordedArtifact(
       linux.artifacts.find((artifact) => artifact.name === name),
       name,
@@ -339,6 +400,124 @@ for (const arch of ["x64", "arm64"]) {
     signing: "not-applicable"
   };
 }
+
+const androidEvidenceName = "android-package-smoke.json";
+const android = await readJson(files.get(androidEvidenceName), androidEvidenceName);
+validateSourceCommit(android, sourceCommit, "Android package evidence");
+validatePackagedCompliance(
+  android.artifacts?.debug?.compliance,
+  "mobile-artifact-compliance",
+  "Android debug APK"
+);
+validatePackagedCompliance(
+  android.artifacts?.release?.compliance,
+  "mobile-artifact-compliance",
+  "Android release APK"
+);
+requireValue(
+  android?.schemaVersion === 1 &&
+    android.platform === "android" &&
+    android.version === version,
+  "Android package evidence has an incompatible schema, platform, or version."
+);
+requireValue(
+  android.sameBrainGateway?.protocolVersion === 1 &&
+    android.sameBrainGateway?.emulatorTested === true &&
+    android.sameBrainGateway?.streamedChat === true &&
+    android.sameBrainGateway?.attachmentStreaming === true,
+  "Android package lacks passing same-brain emulator, chat, or attachment evidence."
+);
+const expectedAndroidDebug = `Omni-AGI-Companion-${version}-Android-debug-signed.apk`;
+const expectedAndroidRelease = `Omni-AGI-Companion-${version}-Android-release-unsigned.apk`;
+requireValue(
+  android.artifacts?.debug?.variant === "debug" &&
+    android.artifacts.debug.installable === true &&
+    android.artifacts.debug.zipAligned === true &&
+    android.artifacts.debug.signing?.state === "debug-signed" &&
+    android.artifacts.debug.signing?.verified === true,
+  "Android debug APK lacks verified installable debug-signing evidence."
+);
+requireValue(
+  android.artifacts?.release?.variant === "release" &&
+    android.artifacts.release.installable === false &&
+    android.artifacts.release.zipAligned === true &&
+    android.artifacts.release.signing?.state === "unsigned-signed-ready" &&
+    android.artifacts.release.signing?.verified === true,
+  "Android release APK must be verified and explicitly labeled unsigned-signed-ready."
+);
+await validateRecordedArtifact(
+  android.artifacts.debug,
+  expectedAndroidDebug,
+  files,
+  "Android debug APK evidence"
+);
+await validateRecordedArtifact(
+  android.artifacts.release,
+  expectedAndroidRelease,
+  files,
+  "Android release APK evidence"
+);
+platformStatus.android = {
+  emulatorTested: true,
+  debugSigning: "debug-signed",
+  releaseSigning: "unsigned-signed-ready"
+};
+
+const iosEvidenceName = "ios-package-smoke.json";
+const ios = await readJson(files.get(iosEvidenceName), iosEvidenceName);
+validateSourceCommit(ios, sourceCommit, "iOS package evidence");
+validatePackagedCompliance(
+  ios.artifact?.compliance,
+  "mobile-artifact-compliance",
+  "iOS IPA"
+);
+requireValue(
+  ios?.schemaVersion === 1 && ios.platform === "ios" && ios.version === version,
+  "iOS package evidence has an incompatible schema, platform, or version."
+);
+requireValue(
+  ios.sameBrainGateway?.protocolVersion === 1 &&
+    ios.sameBrainGateway?.emulatorTested === true &&
+    ios.sameBrainGateway?.streamedChat === true &&
+    ios.sameBrainGateway?.attachmentStreaming === true,
+  "iOS package lacks passing same-brain simulator, chat, or attachment evidence."
+);
+requireValue(
+  ios.artifact?.variant === "release" &&
+    ios.artifact.installable === false &&
+    ios.artifact.signing?.state === "unsigned-signed-ready" &&
+    ios.artifact.signing?.verified === true,
+  "iOS IPA must be verified and explicitly labeled unsigned-signed-ready."
+);
+const expectedIos = `Omni-AGI-Companion-${version}-iOS-unsigned.ipa`;
+await validateRecordedArtifact(ios.artifact, expectedIos, files, "iOS IPA evidence");
+platformStatus.iOS = {
+  simulatorTested: true,
+  signing: "unsigned-signed-ready"
+};
+
+requireValue(
+  complianceReports.length === 17,
+  `Release set requires 17 packaged compliance reports; found ${complianceReports.length}.`
+);
+const ffmpegPolicyHashes = new Set(
+  complianceReports.map(({ report }) => report.ffmpegPolicySha256)
+);
+requireValue(
+  ffmpegPolicyHashes.size === 1,
+  "Every release artifact must use one identical nonempty FFmpeg policy hash."
+);
+const ffmpegPolicySha256 = [...ffmpegPolicyHashes][0];
+const minimumLegalFilesVerified = Math.min(
+  ...complianceReports.map(({ report }) => report.legalFilesVerified)
+);
+const checkedInFfmpegPolicySha256 = createHash("sha256")
+  .update(await readFile(resolve("licenses/ffmpeg-runtime-policy.json")))
+  .digest("hex");
+requireValue(
+  ffmpegPolicySha256 === checkedInFfmpegPolicySha256,
+  "Packaged FFmpeg policy hash does not match the verified release source."
+);
 
 const deliverables = [...files.values()].sort((left, right) =>
   basename(left).localeCompare(basename(right))
@@ -364,6 +543,15 @@ await writeFile(
       product,
       version,
       tag: `v${version}`,
+      sourceCommit,
+      ffmpegPolicySha256,
+      packagedCompliance: {
+        schemaVersion: 1,
+        artifactReports: complianceReports.length,
+        minimumLegalFilesVerified,
+        ffmpegExecutableBundled: false,
+        ffmpegPolicySha256
+      },
       artifactCount: artifacts.length,
       artifacts,
       platformStatus

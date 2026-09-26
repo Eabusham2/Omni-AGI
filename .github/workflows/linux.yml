@@ -35,10 +35,13 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: "3.11.16"
           architecture: ${{ matrix.python_arch }}
           cache: pip
-          cache-dependency-path: engine/requirements.txt
+          cache-dependency-path: |
+            engine/requirements.txt
+            engine/requirements-build.txt
+            engine/locks/*.lock
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -46,18 +49,27 @@ jobs:
       - name: Verify stable release metadata
         run: npm run verify:release
 
-      - name: Install CPU brain runtime
+      - name: Install hash-locked CPU brain runtime
         run: |
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0+cpu"
-          python -m pip install -r engine/requirements.txt
+          python scripts/install-engine-lock.py
+          python -m pip check
+          python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
 
       - name: Test brain
+        env:
+          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
         run: npm run test:python:portable
+
+      - name: Test two-rank distributed training
+        if: matrix.arch == 'x64'
+        run: python -m unittest engine.tests.test_distributed_torchrun -v
 
       - name: Test desktop app
         run: npm run test:node
 
       - name: Package native Linux application
+        env:
+          OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: npm run package:linux:${{ matrix.arch }}
 
       - name: Smoke packaged worker and desktop
@@ -76,6 +88,7 @@ jobs:
         with:
           name: omni-agi-studio-linux-${{ matrix.arch }}
           if-no-files-found: error
+          compression-level: 0
           path: |
             release/*-Linux-*.AppImage
             release/*-Linux-*.deb

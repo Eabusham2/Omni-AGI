@@ -63,8 +63,13 @@ class StableConfigTests(unittest.TestCase):
         self.assertTrue(config.vector_symbolic_memory)
         self.assertTrue(config.consolidation_enabled)
         self.assertTrue(config.metaplasticity)
+        self.assertTrue(config.idle_cognition)
         self.assertFalse(hasattr(config, "growth_policy"))
         self.assertTrue(RETIRED_BETA_CONTROLS.isdisjoint(config.to_dict()))
+
+    def test_legacy_false_cannot_disable_ponder_capability(self):
+        config = OmniConfig.from_external({"idleCognition": False})
+        self.assertTrue(config.idle_cognition)
 
     def test_extended_workspace_is_hardware_derived_not_a_numeric_slider(self):
         ordinary = OmniConfig.from_external(
@@ -104,6 +109,23 @@ class StableConfigTests(unittest.TestCase):
                 self.assertEqual(ordinary.working_memory_slots, slots)
                 self.assertEqual(extended.max_seq_len, tokens * 2)
                 self.assertEqual(extended.working_memory_slots, slots * 2)
+
+    def test_measured_context_window_overrides_tier_but_legacy_payloads_still_load(self):
+        measured = OmniConfig.from_external(
+            {
+                "hardwareTier": "personal",
+                "extendedWorkingMemory": True,
+                "contextWindowTokens": 12288,
+            }
+        )
+        legacy = OmniConfig.from_external(
+            {"hardwareTier": "personal", "extendedWorkingMemory": True}
+        )
+
+        self.assertEqual(measured.max_seq_len, 12288)
+        self.assertEqual(legacy.max_seq_len, 2048)
+        with self.assertRaisesRegex(ValueError, "at least 8"):
+            OmniConfig.from_external({"contextWindowTokens": 7})
 
     def test_response_budget_is_separate_and_state_scaled(self):
         config = OmniConfig.from_external(

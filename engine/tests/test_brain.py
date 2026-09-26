@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import io
 import json
 import shutil
@@ -22,12 +23,10 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core import AdaptiveBrain, OmniConfig
-from omni_core.model import ACTION_KINDS, BitLinear
-from omni_core.starter import (
-    STARTER_ACTION_EXAMPLES,
-    STARTER_CORPUS,
-    starter_manifest,
-)
+from omni_core.brain import ChatGenerationCancelled
+from omni_core.datasets import sqlite_consistent_snapshot
+from omni_core.model import ACTION_KINDS, PackedAdaptiveBitLinear
+from omni_core.offload import ResourcePolicy
 from omni_core.ternary_packing import verify_ternary_shards
 from omni_core.vsa import ConceptMemory, SubstrateResourcePause
 
@@ -48,7 +47,125 @@ class AdaptiveBrainTests(unittest.TestCase):
             learn_from_own_messages=False,
             **overrides,
         )
-        return AdaptiveBrain.create("brain-test", self.root, config)
+        # A micro fixture is not a product Build: no curriculum training or
+        # origin promotion is performed by this constructor.
+        return AdaptiveBrain("brain-test", self.root, config)
+
+
+    def test_parameter_accounting_is_shared_by_runtime_and_metrics_without_state_double_counting(
+        self,
+    ):
+        brain = self.make_brain()
+        core_parameters = brain._core_parameter_map()
+        persisted_core_parameters = sum(
+            parameter.numel()
+            for parameter in {
+                id(value): value for value in core_parameters.values()
+            }.values()
+        )
+        trainable_parameters = {
+            id(parameter): parameter
+            for module in brain._trainable_modules()
+            for parameter in module.parameters()
+        }
+        expected_mutable = sum(
+            parameter.numel() for parameter in trainable_parameters.values()
+        )
+        router_parameters = sum(
+            parameter.numel()
+            for identity, parameter in {
+                id(value): value for value in brain.router.parameters()
+            }.items()
+            if identity not in {id(value) for value in core_parameters.values()}
+        )
+        self.assertGreater(router_parameters, 0)
+        self.assertEqual(
+            expected_mutable,
+            persisted_core_parameters + router_parameters,
+        )
+
+        accounting = brain.parameter_accounting()
+        self.assertEqual(accounting["mutableDenseParameters"], expected_mutable)
+        self.assertEqual(
+            accounting["dynamicSparseSynapses"],
+            len(brain.memory.synapses),
+        )
+        self.assertEqual(
+            accounting["substrateDynamicSparseSynapses"],
+            len(brain.memory.synapses),
+        )
+        self.assertEqual(
+            accounting["totalNeuralParameters"],
+            expected_mutable + len(brain.memory.synapses),
+        )
+        self.assertEqual(brain.runtime_card()["parameterAccounting"], accounting)
+        metrics = brain.metrics()
+        self.assertEqual(metrics["parameterAccounting"], accounting)
+        self.assertEqual(
+            metrics["trainableParameters"],
+            expected_mutable,
+        )
+
+        # Neither registered buffers nor optimizer state are neural parameters.
+        brain.decoder.register_buffer(
+            "_parameter_accounting_test_buffer",
+            torch.zeros(17),
+        )
+        parameter = next(iter(core_parameters.values()))
+        brain._optimizer.state[parameter][
+            "parameter_accounting_test"
+        ] = torch.zeros(19)
+        self.assertEqual(brain.parameter_accounting(), accounting)
+        brain.events.close()
+
+    def test_gpu_profile_counts_only_native_trainable_parameters(self):
+        config = OmniConfig.micro(
+            origin_kind="ground-up",
+            hardware_tier="gpu",
+            device="cpu",
+            d_model=96,
+            n_heads=8,
+            n_layers=4,
+            d_ff=288,
+            idea_dim=96,
+            vsa_dim=384,
+            router_neurons=96,
+            working_memory_slots=65_536,
+            memory_resident_items=65_536,
+            image_size=32,
+            audio_samples=512,
+            video_frames=6,
+            modality_channels=24,
+            max_seq_len=40,
+        )
+        brain = AdaptiveBrain("gpu-parameter-count", self.root, config)
+
+        accounting = brain.parameter_accounting()
+
+        core_parameter_count = sum(
+            parameter.numel()
+            for parameter in {
+                id(value): value
+                for value in brain._core_parameter_map().values()
+            }.values()
+        )
+        router_parameter_count = sum(
+            parameter.numel()
+            for parameter in {
+                id(value): value for value in brain.router.parameters()
+            }.values()
+        )
+        self.assertGreater(core_parameter_count, 0)
+        self.assertGreater(router_parameter_count, 0)
+        self.assertEqual(
+            accounting["mutableDenseParameters"],
+            core_parameter_count + router_parameter_count,
+        )
+        persisted_core_elements = sum(
+            tensor.numel() for tensor in brain._core_tensors().values()
+        )
+        self.assertGreaterEqual(persisted_core_elements, core_parameter_count)
+        brain.events.close()
 
     def test_parameter_only_ingest_mutates_weights_without_storing_source(self):
         brain = self.make_brain(
@@ -91,976 +208,46 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertEqual(len(reloaded.training_sources), 1)
         reloaded.events.close()
 
-    def test_bundled_starter_is_trained_before_immutable_origin_snapshot(self):
-        blank_root = self.root / "blank"
-        starter_root = self.root / "starter"
-        blank = AdaptiveBrain.create(
-            "blank-brain",
-            blank_root,
-            OmniConfig.micro(
-                origin_kind="blank",
-                max_seq_len=40,
-            ),
+    def test_committed_desktop_sqlite_snapshot_trains_under_its_exact_hash(self):
+        brain = self.make_brain(
+            memory_recipe="synapses-only",
+            retain_source_text=False,
         )
-        blank_checksum = blank.parameter_checksum()
-        self.assertEqual(blank.counters["training_steps"], 0)
-        self.assertIsNone(blank.starter_training_manifest)
-        blank_heads = {
-            key: value.detach().clone()
-            for key, value in blank.decoder.action_policy.state_dict().items()
-        }
-        blank_anchors = {
-            key: value.clone()
-            for key, value in blank.slow_anchors.items()
-        }
-        blank_counters = dict(blank.counters)
-        self.assertFalse(blank._can_retain_bundled_action_policy())
-        self.assertEqual(blank.counters, blank_counters)
-        self.assertTrue(
-            all(
-                torch.equal(value, blank_heads[key])
-                for key, value in blank.decoder.action_policy.state_dict().items()
+        source = self.root / "live-source.sqlite3"
+        writer = sqlite3.connect(source)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE facts (id INTEGER PRIMARY KEY, text TEXT)")
+            writer.executemany(
+                "INSERT INTO facts VALUES (?, ?)",
+                [(2, "The second learned fact."), (1, "The first learned fact.")],
             )
-        )
-        self.assertTrue(
-            all(
-                torch.equal(value, blank_anchors[key])
-                for key, value in blank.slow_anchors.items()
-            )
-        )
-        blank.config.origin_kind = "starter"
-        blank.starter_training_manifest = starter_manifest()
-        blank.save()
-        blank.events.close()
-        spoofed = AdaptiveBrain.load(blank_root, "blank-brain")
-        self.assertFalse(spoofed._bundled_origin_verified)
-        self.assertFalse(spoofed._can_retain_bundled_action_policy())
-        spoofed.events.close()
-
-        starter = AdaptiveBrain.create(
-            "starter-brain",
-            starter_root,
-            OmniConfig.micro(
-                origin_kind="starter",
-                max_seq_len=40,
-            ),
-        )
-        manifest = starter.starter_training_manifest
-        self.assertIsNotNone(manifest)
-        assert manifest is not None
-        self.assertTrue(starter._bundled_origin_verified)
-        self.assertTrue(
-            (starter.engine_path / "origin" / "provenance.json").is_file()
-        )
-        self.assertEqual(manifest["corpusPassagesVisited"], len(STARTER_CORPUS))
-        self.assertEqual(len(manifest["corpusLossCurve"]), len(STARTER_CORPUS))
-        self.assertTrue(
-            all(loss >= 0.0 for loss in manifest["corpusLossCurve"])
-        )
-        self.assertEqual(
-            sum(entry["records"] for entry in manifest["datasetLedger"]),
-            len(STARTER_CORPUS) + manifest["actionTrajectories"],
-        )
-        self.assertTrue(
-            all(
-                len(entry["sha256"]) == 64
-                and entry["upstreamModel"] is None
-                for entry in manifest["datasetLedger"]
-            )
-        )
-        self.assertFalse(manifest["rlhf"])
-        self.assertFalse(manifest["dpo"])
-        self.assertFalse(manifest["rewardModel"])
-        self.assertFalse(manifest["hiddenBehavioralPrompt"])
-        self.assertNotEqual(blank_checksum, starter.parameter_checksum())
-        self.assertEqual(starter.counters["experiences"], len(STARTER_CORPUS))
-        self.assertGreater(starter.counters["training_steps"], len(STARTER_CORPUS))
-        self.assertEqual(
-            set(manifest["modalityTraining"]["modalities"]),
-            {"vision", "image", "audio", "video"},
-        )
-        self.assertTrue(all(starter.modality_training.values()))
-        action_training = manifest["actionTraining"]
-        self.assertEqual(
-            action_training["languageChatFraming"],
-            ["bos", "human", "text", "brain"],
-        )
-        self.assertTrue(action_training["calibrated"])
-        self.assertGreater(
-            action_training["minimumLanguageTargetConfidence"], 0.62
-        )
-        self.assertGreater(
-            action_training["minimumInternalTargetConfidence"], 0.62
-        )
-        self.assertGreater(action_training["minimumConfidenceMargin"], 0.0)
-        self.assertEqual(
-            (starter.engine_path / "core.safetensors").read_bytes(),
-            (starter.engine_path / "origin" / "core.safetensors").read_bytes(),
-        )
-        self.assertEqual(
-            (starter.engine_path / "plasticity.safetensors").read_bytes(),
-            (
-                starter.engine_path / "origin" / "plasticity.safetensors"
-            ).read_bytes(),
-        )
-        self.assertTrue(
-            (
-                starter.engine_path
-                / "origin"
-                / "substrate"
-                / "manifest.json"
-            ).is_file()
-        )
-        current_packed = verify_ternary_shards(
-            starter.engine_path / "packed-ternary"
-        )
-        origin_packed = verify_ternary_shards(
-            starter.engine_path / "origin" / "packed-ternary"
-        )
-        self.assertEqual(current_packed.manifest, origin_packed.manifest)
-        self.assertEqual(
-            starter.packed_ternary_manifest["eligibleTensorCount"],
-            len(current_packed.tensors),
-        )
-        action_text = "make an image from this internal scene"
-        action_ids = starter._action_chat_tensor(action_text)
-        action_cue = starter._idea_model_vector(
-            starter.memory.vector_for_text(action_text)
-        )
-        with torch.no_grad():
-            action_hidden = starter.decoder(
-                action_ids,
-                memory_bias=starter.idea_adapter(action_cue),
-                use_global_workspace=True,
-            )["hidden"][:, -1]
-            decoder_logits = starter.decoder.action_policy(
-                action_hidden + 0.5 * action_cue
-            )
-            internal_logits = starter.decoder.internal_action_policy(action_cue)
-            _scores, actions = starter._select_structured_actions(
-                0.35 * decoder_logits + 0.65 * internal_logits,
-                schemas=[
-                    {
-                        "id": "modality.imagine",
-                        "actions": ["generate"],
-                        "grant": "ask",
-                    }
-                ],
-                input_text=action_text,
-                assembly_ids=[],
-                organic_state={"computeDemand": 0.7},
-            )
-        self.assertEqual(actions[0]["kind"], "imagine")
-        self.assertNotIn("prompt", actions[0]["arguments"])
-        metadata = (starter.engine_path / "brain.json").read_text("utf-8")
-        self.assertNotIn(STARTER_CORPUS[0], metadata)
-        starter.events.close()
-
-        reloaded = AdaptiveBrain.load(starter_root, "starter-brain")
-        self.assertEqual(
-            reloaded.starter_training_manifest["sha256"],
-            manifest["sha256"],
-        )
-        self.assertEqual(reloaded.parameter_checksum(), starter.parameter_checksum())
-        self.assertTrue(reloaded._bundled_origin_verified)
-        reloaded.events.close()
-
-        fork_root = self.root / "starter-fork"
-        shutil.copytree(starter_root, fork_root)
-        fork_metadata_path = fork_root / "engine" / "brain.json"
-        fork_metadata = json.loads(fork_metadata_path.read_text("utf-8"))
-        fork_metadata["brain_id"] = "starter-fork"
-        fork_metadata_path.write_text(
-            json.dumps(fork_metadata),
-            encoding="utf-8",
-        )
-        forked = AdaptiveBrain.load(fork_root, "starter-fork")
-        self.assertTrue(forked._bundled_origin_verified)
-        self.assertTrue(forked._can_retain_bundled_action_policy())
-        forked.events.close()
-
-    def test_starter_action_retention_survives_online_chat_trajectory(self):
-        brain = AdaptiveBrain.create(
-            "starter-action-retention",
-            self.root / "starter-action-retention",
-            OmniConfig.micro(
-                origin_kind="starter",
-                max_seq_len=96,
-                learn_from_own_messages=False,
-                vision_enabled=False,
-                image_enabled=False,
-                audio_enabled=False,
-                video_enabled=False,
-            ),
-        )
-        schemas = [
-            {
-                "id": "modality.imagine",
-                "actions": ["generate"],
-                "grant": "ask",
-            },
-            {
-                "id": "agent.fork",
-                "actions": ["start"],
-                "grant": "ask",
-            },
-        ]
-        visible_result = "\n".join(
-            [
-                "[Visible structured action result]",
-                "kind: imagine",
-                "tool: modality.imagine",
-                "action: generate",
-                "requested-by: brain",
-                "result:",
-                '{"status":"complete","artifact":"fixture-image"}',
-            ]
-        )
-        immutable_manifest = json.loads(
-            json.dumps(brain.starter_training_manifest)
-        )
-
-        # Force two independent representation shifts outside the action
-        # heads. Retention must replay all current starter routes through one
-        # padded decoder batch, recover every margin, and preserve the exact
-        # action that was emitted before the slow mutation.
-        agent_index = next(
-            index
-            for index, (_text, kind) in enumerate(STARTER_ACTION_EXAMPLES)
-            if kind == "agent"
-        )
-        retained_head_parameter = next(
-            iter(brain.decoder.action_policy.parameters())
-        )
-        unrelated_optimizer_parameter = brain.memory_bridge.weight
-        for parameter, fill in (
-            (retained_head_parameter, 0.75),
-            (unrelated_optimizer_parameter, 0.25),
-        ):
-            brain._optimizer.state[parameter] = {
-                "step": torch.tensor(3.0),
-                "exp_avg": torch.full_like(parameter, fill),
-                "exp_avg_sq": torch.full_like(parameter, fill * fill),
-            }
-        unrelated_optimizer_state = {
-            key: value.clone()
-            for key, value in brain._optimizer.state[
-                unrelated_optimizer_parameter
-            ].items()
-        }
-        retained_head_parameters = (
-            *brain.decoder.action_policy.parameters(),
-            *brain.decoder.internal_action_policy.parameters(),
-        )
-        expected_cleared_head_states = sum(
-            parameter in brain._optimizer.state
-            for parameter in retained_head_parameters
-        )
-        drift_pattern = torch.linspace(
-            0.97,
-            1.03,
-            brain.config.d_model,
-            device=brain.device,
-        )
-        for drift_cycle in range(2):
-            before_language, before_internal, _targets = (
-                brain._starter_action_features()
-            )
-            with torch.no_grad():
-                pre_language_logits = brain.decoder.action_policy(
-                    before_language[agent_index : agent_index + 1]
-                )
-                pre_internal_logits = brain.decoder.internal_action_policy(
-                    before_internal[agent_index : agent_index + 1]
-                )
-                brain.decoder.workspace_strength.add_(0.025)
-                brain.decoder.final_norm.scale.mul_(drift_pattern)
-                brain.memory_bridge.bias.add_(
-                    (drift_cycle + 1)
-                    * torch.linspace(
-                        -0.004,
-                        0.004,
-                        brain.config.idea_dim,
-                        device=brain.device,
+            writer.commit()
+            with sqlite_consistent_snapshot(source) as snapshot:
+                with mock.patch.object(
+                    brain,
+                    "_can_retain_bundled_action_policy",
+                    return_value=False,
+                ):
+                    result = brain.ingest(
+                        path=str(snapshot.path),
+                        kind="sqlite",
+                        policy="encode",
+                        expected_hash=snapshot.sha256,
+                        committed_sqlite_snapshot=True,
                     )
-                )
-            after_language, after_internal, _targets = (
-                brain._starter_action_features()
-            )
-            self.assertFalse(
-                torch.allclose(before_language, after_language, atol=1e-7)
-            )
-            with mock.patch.object(
-                brain.decoder,
-                "forward",
-                wraps=brain.decoder.forward,
-            ) as current_route_forward:
-                drift_retention = brain._retain_starter_action_policy(
-                    pre_language_logits=pre_language_logits,
-                    pre_internal_logits=pre_internal_logits,
-                    pre_action_emitted=True,
-                    post_language_feature=after_language[
-                        agent_index : agent_index + 1
-                    ],
-                    post_internal_feature=after_internal[
-                        agent_index : agent_index + 1
-                    ],
-                    exact_route_decoder_forwards=1,
-                )
-            self.assertEqual(current_route_forward.call_count, 1)
-            self.assertIsNotNone(drift_retention)
-            assert drift_retention is not None
-            self.assertTrue(drift_retention["calibrated"])
-            self.assertEqual(drift_retention["canonicalDecoderForwards"], 1)
-            self.assertTrue(drift_retention["canonicalReplayReady"])
-            if drift_cycle == 0:
-                self.assertGreater(drift_retention["steps"], 0)
-                self.assertTrue(
-                    all(
-                        parameter not in brain._optimizer.state
-                        for parameter in retained_head_parameters
-                    )
-                )
-                self.assertEqual(
-                    drift_retention["mainOptimizerHeadStatesCleared"],
-                    expected_cleared_head_states,
-                )
-                self.assertTrue(
-                    all(
-                        torch.equal(
-                            brain._optimizer.state[
-                                unrelated_optimizer_parameter
-                            ][name],
-                            value,
-                        )
-                        for name, value in unrelated_optimizer_state.items()
-                    )
-                )
-            current_language, current_internal, current_targets = (
-                brain._starter_action_features()
-            )
-            with torch.no_grad():
-                current_reading = brain._action_calibration_reading(
-                    brain.decoder.action_policy(current_language),
-                    brain.decoder.internal_action_policy(current_internal),
-                    current_targets,
-                )
-            self.assertGreater(
-                current_reading["minimumDeployedThresholdMargin"],
-                0.0,
-            )
+                self.assertEqual(result["source"]["content_hash"], snapshot.sha256)
+                self.assertEqual(result["coverage"]["processedRecords"], 2)
+                self.assertEqual(result["coverage"]["rejectedRecords"], 0)
+                self.assertTrue(result["coverage"]["complete"])
+                self.assertFalse(result["source"]["raw_text_retained"])
+        finally:
+            writer.close()
+            brain.events.close()
 
-        for cycle in range(1):
-            seed = 1000 + cycle * 10
-            brain.chat(
-                "hello, tell me what you notice",
-                max_new_tokens=1,
-                seed=seed,
-                tool_schemas=schemas,
-            )
-            imagined = brain.chat(
-                "make an image from this internal scene",
-                max_new_tokens=1,
-                seed=seed + 1,
-                tool_schemas=schemas,
-            )
-            self.assertTrue(
-                any(action["kind"] == "imagine" for action in imagined["actions"])
-            )
-            brain.chat(
-                visible_result,
-                max_new_tokens=1,
-                seed=seed + 2,
-                tool_schemas=schemas,
-            )
-            delegated = brain.chat(
-                "fork agents to investigate these independent parts",
-                max_new_tokens=1,
-                seed=seed + 3,
-                tool_schemas=schemas,
-            )
-            self.assertTrue(
-                any(
-                    action["kind"] == "agent"
-                    and action["toolId"] == "agent.fork"
-                    and action["action"] == "start"
-                    for action in delegated["actions"]
-                )
-            )
-            self.assertIn("agent", delegated["trace"]["proposed_action_kinds"])
-            self.assertGreaterEqual(
-                delegated["trace"]["action_policy_scores"]["agent"], 0.62
-            )
-            agent_action = next(
-                action
-                for action in delegated["actions"]
-                if action["kind"] == "agent"
-            )
-            self.assertEqual(
-                agent_action["arguments"]["objective"],
-                "fork agents to investigate these independent parts",
-            )
-            self.assertNotIn("prompt", agent_action["arguments"])
-            calibration = delegated["trace"]["action_policy_calibration"]
-            self.assertTrue(calibration["calibrated"])
-            self.assertEqual(
-                calibration["mode"],
-                "exact-route-self-distillation+current-neural-replay",
-            )
-            self.assertLessEqual(calibration["steps"], 96)
-            self.assertEqual(
-                calibration["exactRouteDecoderForwards"], 1
-            )
-            self.assertEqual(calibration["canonicalDecoderForwards"], 1)
-            self.assertEqual(calibration["canonicalFeatureVectors"], 16)
-            self.assertEqual(calibration["actualPreKind"], "agent")
-            self.assertTrue(calibration["actualPreActionEmitted"])
-            self.assertTrue(calibration["actualRoutePreserved"])
-            self.assertFalse(calibration["syntheticDeployedGuarantee"])
-            self.assertEqual(
-                delegated["trace"]["action_policy_channel"],
-                "exact-runtime-prompt+internal-memory+idea-fusion",
-            )
-            self.assertGreater(
-                delegated["trace"]["action_policy_recent_dialogue_tokens"],
-                0,
-            )
-            self.assertGreater(
-                delegated["trace"]["action_policy_working_memory_vectors"],
-                0,
-            )
-            self.assertTrue(
-                delegated["trace"]["action_policy_capability_conditioned"]
-            )
-            self.assertEqual(
-                delegated["trace"]["action_policy_deployed_kind"], "agent"
-            )
-            self.assertGreaterEqual(
-                delegated["trace"]["action_policy_deployed_confidence"],
-                0.62,
-            )
-            self.assertFalse(
-                delegated["trace"]["action_policy_synthetic_guarantee"]
-            )
-            self.assertGreater(
-                delegated["trace"]["decision_prediction_loss"], 0.0
-            )
-            self.assertGreater(
-                delegated["trace"]["organic_state"]["predictionError"], 0.0
-            )
-            self.assertFalse(delegated["trace"]["hidden_prompt_text_expanded"])
 
-        self.assertEqual(brain.counters["action_retention_checks"], 6)
-        self.assertGreaterEqual(brain.counters["action_retention_replays"], 0)
-        self.assertEqual(brain.counters["action_retention_failures"], 0)
-        self.assertEqual(brain.starter_training_manifest, immutable_manifest)
-        persisted_checksum = delegated["trace"]["parameter_checksum_after"]
-        brain.events.close()
 
-        reloaded = AdaptiveBrain.load(
-            self.root / "starter-action-retention",
-            "starter-action-retention",
-        )
-        self.assertEqual(reloaded.parameter_checksum(), persisted_checksum)
-        replayed = reloaded.chat(
-            "fork agents to investigate these independent parts",
-            max_new_tokens=1,
-            seed=2024,
-            tool_schemas=schemas,
-        )
-        self.assertTrue(
-            any(
-                action["kind"] == "agent"
-                and action["toolId"] == "agent.fork"
-                for action in replayed["actions"]
-            )
-        )
-        self.assertGreaterEqual(
-            replayed["trace"]["action_policy_scores"]["agent"], 0.62
-        )
-
-        tool_index = ACTION_KINDS.index("tool")
-        subthreshold_logits = torch.zeros(
-            (1, len(ACTION_KINDS)),
-            dtype=torch.float32,
-            device=reloaded.device,
-        )
-        subthreshold_logits[0, tool_index] = 0.35
-        generator = torch.Generator(device=reloaded.device).manual_seed(44)
-        subthreshold_language_feature = torch.randn(
-            (1, reloaded.config.d_model),
-            generator=generator,
-            device=reloaded.device,
-        )
-        subthreshold_internal_feature = torch.randn(
-            (1, reloaded.config.d_model),
-            generator=generator,
-            device=reloaded.device,
-        )
-        with mock.patch.object(
-            reloaded.decoder,
-            "forward",
-            wraps=reloaded.decoder.forward,
-        ) as retention_decoder_forward:
-            subthreshold = reloaded._retain_starter_action_policy(
-                pre_language_logits=subthreshold_logits,
-                pre_internal_logits=subthreshold_logits,
-                pre_action_emitted=False,
-                post_language_feature=subthreshold_language_feature,
-                post_internal_feature=subthreshold_internal_feature,
-            )
-        self.assertEqual(retention_decoder_forward.call_count, 1)
-        self.assertIsNotNone(subthreshold)
-        assert subthreshold is not None
-        self.assertFalse(subthreshold["actualPreActionEmitted"])
-        with torch.no_grad():
-            retained_subthreshold_logits = (
-                0.35
-                * reloaded.decoder.action_policy(
-                    subthreshold_language_feature
-                )
-                + 0.65
-                * reloaded.decoder.internal_action_policy(
-                    subthreshold_internal_feature
-                )
-            )
-            retained_scores, retained_actions = (
-                reloaded._select_structured_actions(
-                    retained_subthreshold_logits,
-                    schemas=[
-                        {
-                            "id": "web.search",
-                            "actions": ["search"],
-                            "grant": "ask",
-                        }
-                    ],
-                    input_text="search the web for primary evidence",
-                    assembly_ids=[],
-                    organic_state={"computeDemand": 0.7},
-                )
-            )
-        self.assertLess(retained_scores["tool"], 0.62)
-        self.assertEqual(retained_actions, [])
-
-        reloaded.config.online_steps = 0
-        reloaded.config.growth_novelty_threshold = 0.0
-        reloaded.config.growth_patience = 1
-        reloaded.config.learn_from_own_messages = True
-        reloaded.novelty_streak = 0
-        slow_before_disabled_turn = reloaded._parameter_copy()
-        topology_before_disabled_turn = tuple(
-            (name, tuple(parameter.shape))
-            for name, parameter in reloaded.decoder.named_parameters()
-        )
-        experts_before_disabled_turn = reloaded.decoder.expert_count
-        training_steps_before_disabled_turn = reloaded.counters[
-            "training_steps"
-        ]
-        retention_before_disabled_turn = reloaded.counters[
-            "action_retention_checks"
-        ]
-        disabled_turn = reloaded.chat(
-            "hello, tell me what you notice",
-            max_new_tokens=1,
-            seed=3030,
-            tool_schemas=schemas,
-        )
-        self.assertFalse(disabled_turn["trace"]["slow_mutation_applied"])
-        disabled_slow_step = next(
-            step
-            for step in disabled_turn["trace"]["steps"]
-            if step["stage"] == "slow-learning"
-        )
-        self.assertIn("disabled", disabled_slow_step["detail"])
-        self.assertEqual(
-            disabled_slow_step["value"],
-            "online_steps=0; no slow parameter update",
-        )
-        self.assertIsNone(disabled_turn["trace"]["action_policy_calibration"])
-        self.assertFalse(disabled_turn["trace"]["expert_grew"])
-        self.assertFalse(
-            disabled_turn["trace"]["own_response_expert_grew"]
-        )
-        self.assertGreater(
-            disabled_turn["trace"]["decision_prediction_loss"], 0.0
-        )
-        self.assertEqual(
-            reloaded.counters["training_steps"],
-            training_steps_before_disabled_turn,
-        )
-        self.assertEqual(
-            reloaded.counters["action_retention_checks"],
-            retention_before_disabled_turn,
-        )
-        self.assertTrue(
-            all(
-                torch.equal(before, after)
-                for before, after in zip(
-                    slow_before_disabled_turn,
-                    reloaded._parameter_copy(),
-                )
-            )
-        )
-        self.assertEqual(
-            reloaded.decoder.expert_count,
-            experts_before_disabled_turn,
-        )
-        self.assertEqual(
-            tuple(
-                (name, tuple(parameter.shape))
-                for name, parameter in reloaded.decoder.named_parameters()
-            ),
-            topology_before_disabled_turn,
-        )
-
-        # The same forced novelty may allocate experts only once slow learning
-        # is active. Growth occurs after the deployed action decision and the
-        # current-route retention pass must cover the expanded topology.
-        reloaded.config.online_steps = 1
-        reloaded.novelty_streak = 0
-        experts_before_growth_turn = reloaded.decoder.expert_count
-        topology_before_growth_turn = tuple(
-            (name, tuple(parameter.shape))
-            for name, parameter in reloaded.decoder.named_parameters()
-        )
-        growth_turn = reloaded.chat(
-            "fork agents to investigate these independent parts",
-            max_new_tokens=1,
-            seed=3031,
-            tool_schemas=schemas,
-        )
-        self.assertTrue(growth_turn["trace"]["slow_mutation_applied"])
-        self.assertTrue(growth_turn["trace"]["expert_grew"])
-        self.assertTrue(growth_turn["trace"]["own_response_expert_grew"])
-        self.assertGreater(
-            reloaded.decoder.expert_count,
-            experts_before_growth_turn,
-        )
-        self.assertGreater(
-            len(tuple(reloaded.decoder.named_parameters())),
-            len(topology_before_growth_turn),
-        )
-        growth_calibration = growth_turn["trace"][
-            "action_policy_calibration"
-        ]
-        self.assertIsNotNone(growth_calibration)
-        assert growth_calibration is not None
-        self.assertTrue(growth_calibration["calibrated"])
-        self.assertTrue(growth_calibration["actualRoutePreserved"])
-        self.assertEqual(growth_calibration["canonicalDecoderForwards"], 1)
-        self.assertTrue(
-            any(
-                action["kind"] == "agent"
-                for action in growth_turn["actions"]
-            )
-        )
-
-        head_before_failure = {
-            "language": {
-                key: value.detach().clone()
-                for key, value in reloaded.decoder.action_policy.state_dict().items()
-            },
-            "internal": {
-                key: value.detach().clone()
-                for key, value in reloaded.decoder.internal_action_policy.state_dict().items()
-            },
-        }
-        action_names = {
-            name
-            for name, parameter in reloaded._named_slow_parameters().items()
-            if id(parameter)
-            in {
-                id(item)
-                for item in (
-                    *reloaded.decoder.action_policy.parameters(),
-                    *reloaded.decoder.internal_action_policy.parameters(),
-                )
-            }
-        }
-        anchors_before_failure = {
-            name: (
-                reloaded.slow_anchors[name].clone(),
-                reloaded.slow_importance[name].clone(),
-            )
-            for name in action_names
-        }
-        counters_before_failure = {
-            key: reloaded.counters[key]
-            for key in ("training_steps", "metaplastic_updates")
-        }
-        real_reading = reloaded._action_calibration_reading
-
-        def never_calibrated(*args):
-            reading = real_reading(*args)
-            reading["minimumLanguageThresholdMargin"] = -1.0
-            reading["minimumInternalThresholdMargin"] = -1.0
-            reading["minimumDeployedThresholdMargin"] = -1.0
-            return reading
-
-        with mock.patch.object(
-            reloaded,
-            "_action_calibration_reading",
-            side_effect=never_calibrated,
-        ):
-            failed = reloaded._calibrate_starter_action_policy(
-                max_steps=1,
-                strict=False,
-            )
-        self.assertFalse(failed["calibrated"])
-        self.assertTrue(failed["rolledBack"])
-        self.assertEqual(
-            {
-                key: reloaded.counters[key]
-                for key in ("training_steps", "metaplastic_updates")
-            },
-            counters_before_failure,
-        )
-        self.assertTrue(
-            all(
-                torch.equal(value, head_before_failure["language"][key])
-                for key, value in reloaded.decoder.action_policy.state_dict().items()
-            )
-        )
-        self.assertTrue(
-            all(
-                torch.equal(value, head_before_failure["internal"][key])
-                for key, value in reloaded.decoder.internal_action_policy.state_dict().items()
-            )
-        )
-        self.assertTrue(
-            all(
-                torch.equal(reloaded.slow_anchors[name], anchor)
-                and torch.equal(reloaded.slow_importance[name], importance)
-                for name, (anchor, importance) in anchors_before_failure.items()
-            )
-        )
-
-        # A failed retention gate rejects the entire enclosing slow mutation,
-        # not only the action heads. Force both deferred expert growth and a
-        # retention failure, then prove the valid fast turn survives while all
-        # slow tensors/topology/optimizer/stability/counters return exactly to
-        # their pre-transaction state and only that restored state is saved.
-        reloaded.config.online_steps = 1
-        reloaded.config.growth_novelty_threshold = 0.0
-        reloaded.config.growth_patience = 1
-        reloaded.config.learn_from_own_messages = True
-        reloaded.novelty_streak = 0
-        slow_parameters_before_transaction = {
-            "%s.%s" % (prefix, name): parameter.detach().cpu().clone()
-            for prefix, module in reloaded._slow_transaction_modules().items()
-            for name, parameter in module.named_parameters()
-        }
-        slow_shapes_before_transaction = {
-            name: tuple(parameter.shape)
-            for name, parameter in slow_parameters_before_transaction.items()
-        }
-        slow_checksum_before_transaction = (
-            reloaded._slow_parameter_checksum()
-        )
-        experts_before_transaction = reloaded.decoder.expert_count
-        optimizer_before_transaction = copy.deepcopy(
-            reloaded._optimizer.state_dict()
-        )
-        anchors_before_transaction = {
-            name: value.clone()
-            for name, value in reloaded.slow_anchors.items()
-        }
-        importance_before_transaction = {
-            name: value.clone()
-            for name, value in reloaded.slow_importance.items()
-        }
-        slow_counters_before_transaction = {
-            name: reloaded.counters[name]
-            for name in (
-                "training_steps",
-                "metaplastic_updates",
-                "action_retention_checks",
-                "action_retention_replays",
-                "action_retention_failures",
-            )
-        }
-        messages_before_transaction = len(reloaded.messages)
-        experiences_before_transaction = reloaded.counters["experiences"]
-        assemblies_before_transaction = len(reloaded.memory.assemblies)
-
-        def forced_retention_failure(**_kwargs):
-            # Ensure the outer transaction restores mutations performed inside
-            # retention as well as the preceding shared training and growth.
-            with torch.no_grad():
-                next(
-                    iter(reloaded.decoder.action_policy.parameters())
-                ).add_(3.0)
-                reloaded.memory_bridge.bias.add_(0.25)
-            return {
-                "mode": (
-                    "exact-route-self-distillation+current-neural-replay"
-                ),
-                "calibrated": False,
-                "rolledBack": True,
-                "failureType": "ForcedRetentionFailure",
-                "failure": "forced full-transaction regression",
-            }
-
-        with mock.patch.object(
-            reloaded,
-            "_retain_starter_action_policy",
-            side_effect=forced_retention_failure,
-        ):
-            rejected_turn = reloaded.chat(
-                "fork agents while retaining this new fast neural experience",
-                max_new_tokens=1,
-                seed=4040,
-                tool_schemas=schemas,
-            )
-
-        rejected_trace = rejected_turn["trace"]
-        self.assertTrue(rejected_trace["slow_mutation_requested"])
-        self.assertFalse(rejected_trace["slow_mutation_applied"])
-        self.assertTrue(rejected_trace["slow_mutation_rolled_back"])
-        self.assertEqual(rejected_trace["slow_mutation_stage"], "rolled-back")
-        self.assertEqual(
-            rejected_trace["slow_mutation_failure"]["stage"],
-            "action-retention",
-        )
-        self.assertTrue(
-            rejected_trace["action_policy_calibration"][
-                "transactionRolledBack"
-            ]
-        )
-        self.assertFalse(rejected_trace["expert_grew"])
-        self.assertFalse(rejected_trace["own_response_expert_grew"])
-        self.assertEqual(
-            rejected_trace["slow_parameter_checksum_before"],
-            slow_checksum_before_transaction,
-        )
-        self.assertEqual(
-            rejected_trace["slow_parameter_checksum_after"],
-            slow_checksum_before_transaction,
-        )
-        slow_step = next(
-            step
-            for step in rejected_trace["steps"]
-            if step["stage"] == "slow-learning"
-        )
-        self.assertIn("restored all slow parameters", slow_step["detail"])
-        self.assertIn("rolled back", slow_step["value"])
-
-        slow_parameters_after_transaction = {
-            "%s.%s" % (prefix, name): parameter.detach().cpu()
-            for prefix, module in reloaded._slow_transaction_modules().items()
-            for name, parameter in module.named_parameters()
-        }
-        self.assertEqual(
-            set(slow_parameters_after_transaction),
-            set(slow_parameters_before_transaction),
-        )
-        self.assertEqual(
-            {
-                name: tuple(parameter.shape)
-                for name, parameter in slow_parameters_after_transaction.items()
-            },
-            slow_shapes_before_transaction,
-        )
-        self.assertTrue(
-            all(
-                torch.equal(
-                    parameter,
-                    slow_parameters_before_transaction[name],
-                )
-                for name, parameter in slow_parameters_after_transaction.items()
-            )
-        )
-        self.assertEqual(
-            reloaded._slow_parameter_checksum(),
-            slow_checksum_before_transaction,
-        )
-        self.assertEqual(
-            reloaded.decoder.expert_count,
-            experts_before_transaction,
-        )
-        expected_slow_counters = dict(slow_counters_before_transaction)
-        expected_slow_counters["action_retention_checks"] += 1
-        expected_slow_counters["action_retention_failures"] += 1
-        self.assertEqual(
-            {
-                name: reloaded.counters[name]
-                for name in slow_counters_before_transaction
-            },
-            expected_slow_counters,
-        )
-        self.assertEqual(
-            set(reloaded.slow_anchors), set(anchors_before_transaction)
-        )
-        self.assertEqual(
-            set(reloaded.slow_importance), set(importance_before_transaction)
-        )
-        self.assertTrue(
-            all(
-                torch.equal(reloaded.slow_anchors[name], value)
-                for name, value in anchors_before_transaction.items()
-            )
-        )
-        self.assertTrue(
-            all(
-                torch.equal(reloaded.slow_importance[name], value)
-                for name, value in importance_before_transaction.items()
-            )
-        )
-
-        def assert_optimizer_tree_equal(expected, actual):
-            if isinstance(expected, torch.Tensor):
-                self.assertIsInstance(actual, torch.Tensor)
-                self.assertTrue(torch.equal(expected.cpu(), actual.cpu()))
-                return
-            if isinstance(expected, dict):
-                self.assertEqual(set(expected), set(actual))
-                for key in expected:
-                    assert_optimizer_tree_equal(expected[key], actual[key])
-                return
-            if isinstance(expected, (list, tuple)):
-                self.assertEqual(len(expected), len(actual))
-                for expected_item, actual_item in zip(expected, actual):
-                    assert_optimizer_tree_equal(expected_item, actual_item)
-                return
-            self.assertEqual(expected, actual)
-
-        assert_optimizer_tree_equal(
-            optimizer_before_transaction,
-            reloaded._optimizer.state_dict(),
-        )
-        # The rollback boundary begins after fast admission, so this valid turn
-        # still advances conversation, substrate assemblies, and experiences.
-        self.assertEqual(
-            len(reloaded.messages), messages_before_transaction + 2
-        )
-        self.assertEqual(
-            reloaded.counters["experiences"],
-            experiences_before_transaction + 2,
-        )
-        self.assertGreater(
-            len(reloaded.memory.assemblies), assemblies_before_transaction
-        )
-        self.assertTrue(rejected_turn["text"])
-
-        reloaded.events.close()
-        persisted_after_rejection = AdaptiveBrain.load(
-            self.root / "starter-action-retention",
-            "starter-action-retention",
-        )
-        self.assertEqual(
-            persisted_after_rejection._slow_parameter_checksum(),
-            slow_checksum_before_transaction,
-        )
-        self.assertEqual(
-            persisted_after_rejection.decoder.expert_count,
-            experts_before_transaction,
-        )
-        self.assertEqual(
-            len(persisted_after_rejection.messages),
-            messages_before_transaction + 2,
-        )
-        reloaded = persisted_after_rejection
-        reloaded.events.close()
 
     def test_packed_inference_shards_refresh_after_dynamic_growth(self):
         brain = self.make_brain()
@@ -1088,6 +275,38 @@ class AdaptiveBrainTests(unittest.TestCase):
             result["summary"]["parameterChecksum"],
             brain.parameter_checksum(),
         )
+        brain.events.close()
+
+    def test_complete_custom_runtime_has_no_dense_linear_or_convolution_blocker(self):
+        brain = self.make_brain()
+        audit = brain.require_complete_packed_runtime()
+        self.assertTrue(audit["complete"])
+        self.assertEqual(audit["denseConvolutionBlockers"], [])
+        self.assertGreater(audit["packedBitLinearModules"], 0)
+        self.assertGreater(audit["packedConvolutionModules"], 0)
+        self.assertFalse(audit["denseBf16LinearWeightMaterialized"])
+        brain.events.close()
+
+    def test_fractional_dynamic_synapse_fails_audit_and_packed_export(self):
+        brain = self.make_brain()
+        brain.learn_experience(
+            "Exact live synapses connect every distributed assembly.",
+            steps=0,
+        )
+        synapse_id = sorted(brain.memory.synapses)[0]
+        brain.memory.synapses[synapse_id]["effective_weight"] = 0.5
+
+        audit = brain._ternary_audit()
+        self.assertIn(
+            "substrate.dynamic_synapses.weights", audit["violations"]
+        )
+        self.assertLess(audit["coverage"], 1.0)
+        with self.assertRaisesRegex(ValueError, "exact ternary"):
+            brain._dynamic_synapse_export()
+        destination = self.root / "invalid-packed-ternary"
+        with self.assertRaisesRegex(RuntimeError, "coverage audit failed"):
+            brain.export_packed_ternary(destination)
+        self.assertFalse(destination.exists())
         brain.events.close()
 
     def test_load_verifies_packed_shards_and_refreshes_only_valid_stale_state(self):
@@ -1140,7 +359,12 @@ class AdaptiveBrainTests(unittest.TestCase):
         verified = verify_ternary_shards(
             reloaded.engine_path / "packed-ternary"
         )
-        reloaded_ids, reloaded_values = reloaded._dynamic_synapse_export()
+        (
+            reloaded_values,
+            reloaded_count,
+            reloaded_order_sha,
+            reloaded_order_basis,
+        ) = reloaded._dynamic_synapse_pack_state()
         packed_values = verified.tensors[
             "substrate.dynamic_synapses.weights"
         ]
@@ -1150,19 +374,101 @@ class AdaptiveBrainTests(unittest.TestCase):
         )
         self.assertEqual(
             verified.manifest["metadata"]["dynamicSynapseCount"],
-            len(reloaded_ids),
+            reloaded_count,
         )
         self.assertEqual(
             verified.manifest["metadata"]["dynamicSynapseOrderSha256"],
-            __import__("hashlib").sha256(
-                "\0".join(reloaded_ids).encode("utf-8")
-            ).hexdigest(),
+            reloaded_order_sha,
+        )
+        self.assertEqual(
+            verified.manifest["metadata"]["dynamicSynapseOrderBasis"],
+            reloaded_order_basis,
         )
         self.assertTrue(torch.equal(packed_values, reloaded_values))
-        self.assertNotEqual(
-            int(packed_values[0]),
-            int(expected_before[0]),
+        self.assertEqual(
+            int(reloaded.memory.synapses[target_id]["effective_weight"]),
+            replacement,
         )
+        reloaded.events.close()
+
+    def test_load_repairs_only_corrupt_master_elements_and_optimizer_moments(self):
+        brain = self.make_brain()
+        parameter = brain.decoder.action_policy.hidden.weight
+        with torch.no_grad():
+            parameter.copy_(
+                torch.linspace(
+                    -0.75,
+                    0.75,
+                    parameter.numel(),
+                    dtype=parameter.dtype,
+                ).reshape_as(parameter)
+            )
+        optimizer_state = brain._optimizer.state[parameter]
+        optimizer_state["step"] = torch.tensor(7.0)
+        optimizer_state["exp_avg"] = torch.full_like(parameter, 0.25)
+        optimizer_state["exp_avg_sq"] = torch.full_like(parameter, 0.5)
+        brain.save()
+        finite_generation = str(
+            brain.mutable_state_manifest["activeGeneration"]
+        )
+        expected_repaired_value = float(parameter[0, 0].item())
+
+        with torch.no_grad():
+            parameter[0, 0] = float("nan")
+            # This legitimate learned change exists only in the newer active
+            # generation and must not be replaced by the older fallback.
+            parameter[0, 1] = 0.6875
+            optimizer_state["exp_avg"][0, 0] = 9.0
+            optimizer_state["exp_avg"][0, 1] = 7.0
+            optimizer_state["exp_avg_sq"][0, 0] = float("inf")
+            optimizer_state["exp_avg_sq"][0, 1] = 8.0
+        brain.save()
+        corrupt_generation = str(
+            brain.mutable_state_manifest["activeGeneration"]
+        )
+        self.assertNotEqual(finite_generation, corrupt_generation)
+        brain.events.close()
+
+        # This used to reach stale-pack regeneration and raise:
+        # TernaryPackingError: decoder.action_policy.hidden.weight has an
+        # invalid scale.
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        restored = reloaded.decoder.action_policy.hidden.weight
+        self.assertTrue(torch.isfinite(restored).all())
+        self.assertEqual(
+            float(restored[0, 0].detach().item()), expected_repaired_value
+        )
+        self.assertEqual(float(restored[0, 1].detach().item()), 0.6875)
+
+        restored_state = reloaded._optimizer.state[restored]
+        self.assertEqual(float(restored_state["exp_avg"][0, 0]), 0.0)
+        self.assertEqual(float(restored_state["exp_avg_sq"][0, 0]), 0.0)
+        self.assertEqual(float(restored_state["exp_avg"][0, 1]), 7.0)
+        self.assertEqual(float(restored_state["exp_avg_sq"][0, 1]), 8.0)
+
+        event = next(
+            value
+            for value in reloaded.events.recent()
+            if value["kind"] == "checkpoint-tensor-recovered"
+        )
+        self.assertEqual(event["payload"]["repairedElements"], 1)
+        self.assertTrue(
+            event["payload"]["finiteLearnedStatePreserved"]
+        )
+        self.assertEqual(
+            event["payload"]["tensors"][0]["tensor"],
+            "decoder.action_policy.hidden.weight",
+        )
+        verified = verify_ternary_shards(
+            reloaded.engine_path / "packed-ternary"
+        )
+        self.assertEqual(
+            verified.manifest["metadata"]["parameterChecksum"],
+            reloaded.parameter_checksum(),
+        )
+        generations = reloaded.engine_path / "state" / "generations"
+        self.assertTrue((generations / finite_generation).is_dir())
+        self.assertFalse((generations / corrupt_generation).exists())
         reloaded.events.close()
 
     def test_explicit_dataset_epoch_replays_without_duplicate_source_records(self):
@@ -1191,6 +497,34 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertEqual(brain.training_sources[0]["last_epoch"], 1)
         brain.events.close()
 
+    def test_chat_cooperative_cancel_before_generation_preserves_uncommitted_state(self):
+        brain = self.make_brain()
+        before_checksum = brain.parameter_checksum()
+        before_counts = (
+            len(brain.memory.neurons),
+            len(brain.memory.assemblies),
+            len(brain.memory.synapses),
+            brain.counters["inference_count"],
+        )
+
+        with self.assertRaises(ChatGenerationCancelled):
+            brain.chat(
+                "cancel this turn before it mutates",
+                cancel_check=lambda: True,
+            )
+
+        self.assertEqual(brain.parameter_checksum(), before_checksum)
+        self.assertEqual(
+            (
+                len(brain.memory.neurons),
+                len(brain.memory.assemblies),
+                len(brain.memory.synapses),
+                brain.counters["inference_count"],
+            ),
+            before_counts,
+        )
+        brain.events.close()
+
     def test_chat_trace_proves_learning_and_no_textual_retrieval(self):
         brain = self.make_brain()
         result = brain.chat("Hello adaptive brain", max_new_tokens=4, seed=4)
@@ -1210,6 +544,9 @@ class AdaptiveBrainTests(unittest.TestCase):
             "ponder_factors",
             "branches",
             "spreading_activation",
+            "generation_elapsed_ms",
+            "generated_token_count",
+            "generation_tokens_per_second",
         ):
             self.assertIn(field, trace)
         self.assertFalse(trace["textual_memory_injected"])
@@ -1230,6 +567,349 @@ class AdaptiveBrainTests(unittest.TestCase):
             {"talk", "tool", "imagine", "agent", "ponder", "learn", "evolve", "stop"},
         )
         self.assertFalse(result["runtimeCard"]["hidden_behavioral_prompt"])
+        self.assertGreater(trace["generation_elapsed_ms"], 0)
+        self.assertGreater(trace["generated_token_count"], 0)
+        self.assertGreater(trace["generation_tokens_per_second"], 0)
+        self.assertEqual(
+            result["runtimeCard"]["measured_generation"]["generatedTokens"],
+            trace["generated_token_count"],
+        )
+        self.assertEqual(
+            trace["mechanism_order"], "event-derived-unordered"
+        )
+        first_mechanisms = [step["stage"] for step in trace["steps"]]
+        self.assertNotIn("capability-conditioning", first_mechanisms)
+        conditioned = brain.chat(
+            "Search capability is now available",
+            max_new_tokens=2,
+            seed=5,
+            tool_schemas=[
+                {
+                    "id": "web.search",
+                    "actions": ["search"],
+                    "grant": "ask",
+                }
+            ],
+        )
+        conditioned_mechanisms = [
+            step["stage"] for step in conditioned["trace"]["steps"]
+        ]
+        self.assertIn("capability-conditioning", conditioned_mechanisms)
+        self.assertNotEqual(first_mechanisms, conditioned_mechanisms)
+        brain.events.close()
+
+
+
+
+    def test_committed_chat_turn_receipt_is_persisted_and_idempotent(self):
+        brain = self.make_brain(online_learning=False)
+        turn_id = "turn-receipt-fixture"
+        input_text = "Persist this exact turn receipt."
+
+        result = brain.chat(
+            input_text,
+            max_new_tokens=2,
+            seed=29,
+            turn_id=turn_id,
+        )
+
+        receipt = result["turnReceipt"]
+        self.assertTrue(result["turnCommitted"])
+        self.assertFalse(result["idempotentCompletion"])
+        self.assertEqual(receipt["turnId"], turn_id)
+        self.assertEqual(result["humanMessage"], brain.messages[-2])
+        self.assertEqual(
+            receipt["humanMessageId"], brain.messages[-2]["id"]
+        )
+        self.assertEqual(
+            receipt["brainMessageId"], brain.messages[-1]["id"]
+        )
+        self.assertEqual(receipt["traceId"], result["trace"]["id"])
+        self.assertNotIn("content", receipt)
+        before_messages = list(brain.messages)
+        before_inferences = int(brain.counters["inference_count"])
+        brain.events.close()
+
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        repeated = reloaded.chat(
+            input_text,
+            max_new_tokens=2,
+            seed=999,
+            turn_id=turn_id,
+        )
+
+        self.assertTrue(repeated["turnCommitted"])
+        self.assertTrue(repeated["idempotentCompletion"])
+        self.assertEqual(repeated["turnReceipt"], receipt)
+        self.assertEqual(repeated["humanMessage"]["id"], receipt["humanMessageId"])
+        self.assertEqual(repeated["message"]["id"], receipt["brainMessageId"])
+        self.assertEqual(repeated["trace"]["id"], receipt["traceId"])
+        self.assertEqual(reloaded.messages, before_messages)
+        self.assertEqual(
+            reloaded.counters["inference_count"], before_inferences
+        )
+        follow_up = reloaded.chat(
+            "different input",
+            max_new_tokens=1,
+            seed=31,
+            turn_id=turn_id,
+        )
+        self.assertFalse(follow_up["idempotentCompletion"])
+        self.assertEqual(follow_up["turnReceipt"]["turnId"], turn_id)
+        self.assertNotEqual(
+            follow_up["turnReceipt"]["inputSha256"], receipt["inputSha256"]
+        )
+        self.assertEqual(
+            reloaded.counters["inference_count"], before_inferences + 1
+        )
+        repeated_follow_up = reloaded.chat(
+            "different input",
+            max_new_tokens=1,
+            seed=999,
+            turn_id=turn_id,
+        )
+        self.assertTrue(repeated_follow_up["idempotentCompletion"])
+        self.assertEqual(
+            repeated_follow_up["turnReceipt"], follow_up["turnReceipt"]
+        )
+        self.assertEqual(
+            reloaded.counters["inference_count"], before_inferences + 1
+        )
+        persisted_metadata = json.loads(
+            (self.root / "engine" / "brain.json").read_text("utf-8")
+        )
+        persisted_receipts = AdaptiveBrain._validated_completed_chat_turns(
+            persisted_metadata["completed_chat_turns"]
+        )
+        self.assertEqual(len(persisted_receipts), 2)
+        self.assertEqual(
+            {
+                (value["turnId"], value["inputSha256"])
+                for value in persisted_receipts
+            },
+            {
+                (turn_id, receipt["inputSha256"]),
+                (turn_id, follow_up["turnReceipt"]["inputSha256"]),
+            },
+        )
+        reloaded.events.close()
+
+
+
+    def test_fresh_attention_never_acknowledges_a_precommit_save_failure(self):
+        brain = self.make_brain(online_learning=False)
+        brain.messages = [
+            {
+                "id": "visible-history",
+                "role": "human",
+                "content": "Visible history remains on disk.",
+                "created_at": "2026-09-07T07:20:00Z",
+            }
+        ]
+
+        with mock.patch.object(
+            brain, "save", side_effect=RuntimeError("precommit failure")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "precommit failure"):
+                brain.start_fresh_attention("fresh-precommit-failure")
+            with self.assertRaisesRegex(
+                RuntimeError, "not atomically committed"
+            ):
+                brain.start_fresh_attention("fresh-precommit-failure")
+        persisted = json.loads(
+            (brain.engine_path / "brain.json").read_text("utf-8")
+        )
+        self.assertIsNone(persisted.get("fresh_attention_boundary"))
+        brain.close()
+
+    def test_fresh_attention_reconciles_a_postcommit_publish_failure(self):
+        brain = self.make_brain(online_learning=False)
+        brain.messages = [
+            {
+                "id": "visible-history",
+                "role": "human",
+                "content": "Keep this visible after the boundary.",
+                "created_at": "2026-09-07T07:30:00Z",
+            }
+        ]
+        brain._append_recent_dialogue(
+            "Keep this visible after the boundary.", "Acknowledged."
+        )
+
+        with mock.patch.object(
+            brain.state_store,
+            "publish",
+            side_effect=RuntimeError("lost postcommit acknowledgement"),
+        ):
+            result = brain.start_fresh_attention("fresh-postcommit-failure")
+
+        self.assertTrue(result["committed"])
+        self.assertEqual(result["boundary"]["epoch"], 1)
+        self.assertEqual(brain.recent_token_context, [])
+        brain.close()
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        self.assertEqual(
+            reloaded.fresh_attention_boundary["operationId"],
+            "fresh-postcommit-failure",
+        )
+        self.assertEqual(reloaded.messages, [])
+        self.assertEqual(
+            reloaded.conversation.payload_by_id("message", "visible-history")[
+                "content"
+            ],
+            "Keep this visible after the boundary.",
+        )
+        reloaded.close()
+
+    def test_fresh_attention_recovers_deferred_paged_scratch_cleanup_on_reload(self):
+        brain = self.make_brain(online_learning=False)
+        brain.paged_working_memory.append(
+            torch.ones(brain.config.idea_dim),
+            {"assemblyId": "temporary-page", "source": "fixture"},
+        )
+        self.assertEqual(brain.paged_working_memory.count(), 1)
+
+        with mock.patch.object(
+            brain.paged_working_memory,
+            "clear",
+            side_effect=sqlite3.OperationalError("temporary pager lock"),
+        ):
+            result = brain.start_fresh_attention(
+                "fresh-deferred-page-cleanup"
+            )
+
+        self.assertTrue(result["committed"])
+        self.assertTrue(result["pagedCleanupPending"])
+        persisted = json.loads(
+            (brain.engine_path / "brain.json").read_text("utf-8")
+        )
+        self.assertEqual(persisted["paged_working_memory"]["count"], 0)
+        self.assertEqual(brain.paged_working_memory.count(), 1)
+        brain.close()
+
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        self.assertEqual(reloaded.paged_working_memory.count(), 0)
+        self.assertEqual(
+            reloaded.fresh_attention_boundary["operationId"],
+            "fresh-deferred-page-cleanup",
+        )
+        reloaded.close()
+
+
+    def test_explicit_response_length_parser_is_typed_not_prompt_injection(self):
+        literal = AdaptiveBrain._explicit_response_length_constraint(
+            "Reply with only remembered."
+        )
+        self.assertEqual(literal["kind"], "literal")
+        self.assertEqual(literal["count"], 1)
+        self.assertEqual(literal["literal"], "remembered")
+        words = AdaptiveBrain._explicit_response_length_constraint(
+            "Answer in exactly two words."
+        )
+        self.assertEqual(words, {"kind": "count", "unit": "word", "count": 2})
+        sentences = AdaptiveBrain._explicit_response_length_constraint(
+            "Respond with no more than 3 sentences."
+        )
+        self.assertEqual(
+            sentences,
+            {"kind": "count", "unit": "sentence", "count": 3},
+        )
+        self.assertIsNone(
+            AdaptiveBrain._explicit_response_length_constraint(
+                "Explain why plants need sunlight."
+            )
+        )
+        for reference in (
+            "Reply only with the code.",
+            "Answer with the answer.",
+            "Respond using the color.",
+            "Reply only with it.",
+            "Reply only with the call sign.",
+            "Reply only with the exact answer.",
+        ):
+            with self.subTest(reference=reference):
+                self.assertIsNone(
+                    AdaptiveBrain._explicit_response_length_constraint(reference)
+                )
+        for inactive in (
+            "Do not answer in two words.",
+            'The book says "reply in two words".',
+            "If you reply in two words, the test is invalid.",
+        ):
+            with self.subTest(inactive=inactive):
+                self.assertIsNone(
+                    AdaptiveBrain._explicit_response_length_constraint(inactive)
+                )
+
+    def test_ground_up_literal_budget_uses_native_boundary_tokens(self):
+        brain = self.make_brain()
+        literal = "ORCHID-7421"
+        budget, trace = brain._response_generation_budget(
+            f"Reply only with {literal}.",
+            cognitive_demand=1.0,
+            caller_limit=64,
+        )
+        self.assertGreaterEqual(budget, len(brain.tokenizer.encode(literal)))
+        self.assertEqual(trace["explicitConstraint"]["kind"], "literal")
+        brain.events.close()
+
+
+
+
+    def test_precommit_phase_cancellation_does_not_admit_fast_experience(self):
+        brain = self.make_brain(online_learning=False)
+        prompt = "A valid provisional response must remain uncommitted."
+        brain.learn_experience(
+            prompt,
+            kind="experience",
+            source="fixture",
+            steps=0,
+        )
+        brain.current_context = {"sentinel": "precommit"}
+        brain.decoder.train(True)
+        before = {
+            "checksum": brain.parameter_checksum(),
+            "counters": copy.deepcopy(brain.counters),
+            "memoryRevision": brain.memory.state_revision,
+            "replay": brain.replay.checkpoint(),
+            "pagedWorking": brain.paged_working_memory.checkpoint(),
+            "workingMemory": [value.clone() for value in brain.working_memory],
+            "workspaceItems": copy.deepcopy(brain.workspace_items),
+            "context": copy.deepcopy(brain.current_context),
+        }
+        streamed = []
+
+        def cancel_at_phase(kind, payload):
+            streamed.append((kind, dict(payload)))
+            if kind == "phase":
+                raise RuntimeError("pre-commit cancellation")
+
+        with self.assertRaisesRegex(RuntimeError, "pre-commit cancellation"):
+            brain.chat(
+                prompt,
+                max_new_tokens=8,
+                seed=53,
+                stream_callback=cancel_at_phase,
+            )
+
+        self.assertEqual([kind for kind, _payload in streamed], ["token", "phase"])
+        self.assertEqual(brain.parameter_checksum(), before["checksum"])
+        self.assertEqual(brain.counters, before["counters"])
+        self.assertEqual(brain.memory.state_revision, before["memoryRevision"])
+        self.assertEqual(brain.replay.checkpoint(), before["replay"])
+        self.assertEqual(
+            brain.paged_working_memory.checkpoint(), before["pagedWorking"]
+        )
+        self.assertEqual(brain.workspace_items, before["workspaceItems"])
+        self.assertEqual(brain.current_context, before["context"])
+        self.assertEqual(brain.messages, [])
+        self.assertEqual(brain.traces, [])
+        self.assertEqual(len(brain.working_memory), len(before["workingMemory"]))
+        for current, expected in zip(
+            brain.working_memory, before["workingMemory"]
+        ):
+            self.assertTrue(torch.equal(current, expected))
+        self.assertTrue(brain.decoder.training)
         brain.events.close()
 
     def test_default_response_budget_is_state_scaled_not_the_context_ceiling(self):
@@ -1294,7 +974,7 @@ class AdaptiveBrainTests(unittest.TestCase):
         )
         self.assertEqual(len(first["assemblies"]), 1)
         self.assertNotIn("source_text", first["assemblies"][0])
-        self.assertTrue(first["assemblies"][0]["retainsSourceText"])
+        self.assertFalse(first["assemblies"][0]["retainsSourceText"])
         self.assertEqual(before, brain.parameter_checksum())
         self.assertTrue(first["hasMore"])
 
@@ -1449,6 +1129,141 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertFalse(result["trace"]["hiddenBehavioralPrompt"])
         brain.events.close()
 
+    def test_low_score_idle_state_does_not_force_ponder(self):
+        brain = self.make_brain()
+        brain.learn_experience("A simple settled association.", steps=0)
+        scores = {
+            "talk": 0.86,
+            "tool": 0.02,
+            "imagine": 0.02,
+            "agent": 0.02,
+            "ponder": 0.02,
+            "learn": 0.02,
+            "evolve": 0.02,
+            "stop": 0.02,
+        }
+        with mock.patch.object(
+            brain,
+            "_select_structured_actions",
+            return_value=(scores, []),
+        ), mock.patch.object(
+            brain,
+            "_organic_state",
+            return_value={
+                "tension": 0.0,
+                "curiosity": 0.0,
+                "uncertainty": 0.0,
+                "novelty": 0.0,
+                "predictionError": 0.0,
+                "learningProgress": 0.0,
+                "activeFraction": 0.1,
+            },
+        ):
+            result = brain.idle_cycle(minimum_idle_seconds=0)
+        self.assertEqual(result["actions"], [])
+        self.assertNotIn("ponder", result["trace"]["proposedActionKinds"])
+        brain.events.close()
+
+    def test_idle_ponder_is_completed_in_cycle_without_recursive_action(self):
+        brain = self.make_brain()
+        brain.learn_experience("An unresolved association remains active.", steps=0)
+        captured = {}
+        original_idea_model_vector = brain._idea_model_vector
+
+        def capture_idea_model_vector(vector):
+            result = original_idea_model_vector(vector)
+            captured["modelIdea"] = result.detach().clone()
+            return result
+
+        scores = {
+            "talk": 0.001,
+            "tool": 0.001,
+            "imagine": 0.001,
+            "agent": 0.001,
+            "ponder": 0.993,
+            "learn": 0.001,
+            "evolve": 0.001,
+            "stop": 0.001,
+        }
+        proposed = [
+            {
+                "kind": "ponder",
+                "arguments": {"organic": True},
+                "confidence": scores["ponder"],
+            }
+        ]
+        with mock.patch.object(
+            brain,
+            "_select_structured_actions",
+            return_value=(scores, proposed),
+        ), mock.patch.object(
+            brain,
+            "_idea_model_vector",
+            side_effect=capture_idea_model_vector,
+        ), mock.patch.object(
+            brain.decoder.internal_action_policy,
+            "forward",
+            wraps=brain.decoder.internal_action_policy.forward,
+        ) as action_policy_forward:
+            result = brain.idle_cycle(minimum_idle_seconds=0)
+
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["trace"]["proposedActionKinds"], [])
+        self.assertEqual(
+            result["trace"]["internallySettledActionKinds"], ["ponder"]
+        )
+        self.assertEqual(
+            result["trace"]["actionPolicyFeatureChannel"],
+            "assembly-model",
+        )
+        self.assertTrue(
+            torch.equal(
+                action_policy_forward.call_args.args[0],
+                captured["modelIdea"],
+            )
+        )
+        brain.events.close()
+
+    def test_idle_visible_actions_have_a_refractory_period(self):
+        brain = self.make_brain()
+        brain.learn_experience(
+            "An unresolved visual association remains active.",
+            steps=0,
+        )
+        scores = {
+            "talk": 0.01,
+            "tool": 0.92,
+            "imagine": 0.01,
+            "agent": 0.01,
+            "ponder": 0.01,
+            "learn": 0.01,
+            "evolve": 0.01,
+            "stop": 0.02,
+        }
+        proposed = [
+            {
+                "kind": "tool",
+                "toolId": "studio.ui",
+                "action": "open-creativity",
+                "arguments": {"organic": True},
+                "confidence": 0.92,
+            }
+        ]
+        with mock.patch.object(
+            brain,
+            "_select_structured_actions",
+            return_value=(scores, proposed),
+        ):
+            first = brain.idle_cycle(minimum_idle_seconds=0)
+            second = brain.idle_cycle(minimum_idle_seconds=0)
+
+        self.assertEqual(len(first["actions"]), 1)
+        self.assertEqual(first["actions"][0]["action"], "open-creativity")
+        self.assertEqual(second["actions"], [])
+        self.assertTrue(second["ran"])
+        self.assertGreater(second["trace"]["stdpUpdate"], 0.0)
+        brain.events.close()
+
     def test_candidate_exception_rolls_back_all_core_parameters(self):
         brain = self.make_brain()
         before = brain.parameter_checksum()
@@ -1524,15 +1339,14 @@ class AdaptiveBrainTests(unittest.TestCase):
                 module.ternary
                 for root in brain._trainable_modules()
                 for module in root.modules()
-                if isinstance(module, BitLinear)
+                if isinstance(module, PackedAdaptiveBitLinear)
             )
         )
         learned = brain.learn_experience("transient dense fixture", steps=0)
         self.assertGreaterEqual(learned["spiking"]["spikes"], 0.0)
         self.assertGreater(len(brain.memory.ideas), 0)
         self.assertEqual(learned["training"]["loss"], 0.0)
-        consolidation = brain.consolidate()
-        self.assertTrue(consolidation["disabled"])
+        self.assertFalse(hasattr(brain, "consolidate"))
         card = brain.runtime_card()
         self.assertTrue(card["active_modules"]["ternary"])
         self.assertFalse(card["active_modules"]["dense"])
@@ -1580,6 +1394,16 @@ class AdaptiveBrainTests(unittest.TestCase):
         )
         self.assertEqual(result["mediaCoverage"]["tailSamples"], tail)
         self.assertTrue(result["mediaCoverage"]["complete"])
+        self.assertEqual(result["mediaCoverage"]["sensoryAssemblies"], 4)
+        self.assertTrue(result["source"]["media_records"][0]["sensory"])
+        self.assertGreaterEqual(result["source"]["learned_ideas"], 4)
+        self.assertGreaterEqual(result["source"]["learned_concepts"], 1)
+        self.assertTrue(
+            any(
+                neuron.get("label") == "audio-perception"
+                for neuron in brain.memory.neurons.values()
+            )
+        )
         self.assertEqual(result["coverage"]["processedRecords"], 1)
         # Two learning steps see each window. The final two calls therefore
         # prove the non-full tail was admitted rather than silently discarded.
@@ -1587,7 +1411,14 @@ class AdaptiveBrainTests(unittest.TestCase):
         tail_target = observed[-1].flatten()
         self.assertTrue(torch.all(tail_target[:tail] > 0.4))
         self.assertTrue(torch.all(tail_target[tail:] == 0.0))
+        whole_assembly_id = result["source"]["media_records"][0]["coverage"][
+            "wholeRecordAssemblyId"
+        ]
         brain.events.close()
+        reloaded = AdaptiveBrain.load(self.root, "brain-test")
+        self.assertIn(whole_assembly_id, reloaded.memory.assembly_vectors)
+        self.assertGreater(reloaded.modality_training["audio"], 0)
+        reloaded.events.close()
 
     def test_failed_media_decode_is_an_explicit_rejected_record(self):
         brain = self.make_brain(image_enabled=True, vision_enabled=True)
@@ -1627,12 +1458,92 @@ class AdaptiveBrainTests(unittest.TestCase):
                         "message": "corrupt image fixture",
                     }
                 ],
+                "errorCount": 1,
+                "errorsTruncated": False,
                 "complete": True,
             },
         )
         self.assertTrue(
             any("corrupt image fixture" in warning for warning in result["warnings"])
         )
+        brain.events.close()
+
+    def test_video_ingestion_trains_visual_and_embedded_audio_tracks(self):
+        brain = self.make_brain(video_enabled=True, audio_enabled=True)
+        video = torch.linspace(
+            -1.0,
+            1.0,
+            3
+            * brain.config.video_frames
+            * brain.config.image_size
+            * brain.config.image_size,
+        ).reshape(
+            1,
+            3,
+            brain.config.video_frames,
+            brain.config.image_size,
+            brain.config.image_size,
+        )
+        audio = torch.sin(
+            torch.linspace(0.0, 6.0, brain.config.audio_samples)
+        ).reshape(1, 1, -1)
+        video_before = {
+            key: value.detach().clone()
+            for key, value in brain.modalities.video.state_dict().items()
+        }
+        audio_before = {
+            key: value.detach().clone()
+            for key, value in brain.modalities.audio.state_dict().items()
+        }
+
+        with mock.patch.object(
+            brain,
+            "_iter_video_windows",
+            return_value=iter([(video, brain.config.video_frames)]),
+        ), mock.patch.object(
+            brain,
+            "_iter_audio_windows",
+            return_value=iter([(audio, brain.config.audio_samples)]),
+        ):
+            trained = brain._train_media(
+                "movie-with-sound.mp4",
+                "video",
+                "harbor movie",
+                steps=1,
+                content_sha256="b" * 64,
+            )
+
+        self.assertTrue(trained["trained"])
+        self.assertEqual(trained["primarySteps"], 1)
+        self.assertEqual(trained["steps"], 2)
+        self.assertTrue(trained["embeddedAudio"]["detected"])
+        self.assertTrue(trained["embeddedAudio"]["trained"])
+        self.assertEqual(
+            trained["coverage"]["embeddedAudio"]["coverage"][
+                "processedSamples"
+            ],
+            brain.config.audio_samples,
+        )
+        self.assertTrue(
+            any(
+                not torch.equal(value, video_before[key])
+                for key, value in brain.modalities.video.state_dict().items()
+            )
+        )
+        self.assertTrue(
+            any(
+                not torch.equal(value, audio_before[key])
+                for key, value in brain.modalities.audio.state_dict().items()
+            )
+        )
+        self.assertGreater(brain.modality_training["video"], 0)
+        self.assertGreater(brain.modality_training["audio"], 0)
+        labels = {
+            str(neuron.get("label", ""))
+            for neuron in brain.memory.neurons.values()
+        }
+        self.assertIn("video-perception", labels)
+        self.assertIn("audio-perception", labels)
         brain.events.close()
 
     def test_archive_media_is_trained_while_temporary_record_path_is_leased(self):
@@ -1726,6 +1637,143 @@ class AdaptiveBrainTests(unittest.TestCase):
             self.assertEqual(Path(video["path"]).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
             self.assertTrue(video["dataUrl"].startswith("data:image/apng;base64,"))
             self.assertTrue(video["containerFallback"])
+        self.assertFalse(video["synchronizedAudio"]["supported"])
+        self.assertFalse(video["synchronizedAudio"]["generated"])
+        self.assertFalse(video["synchronizedAudio"]["speechSynthesis"])
+        self.assertFalse(video["synchronizedAudio"]["hiddenBehavioralPrompt"])
+        brain.events.close()
+
+    def test_video_generation_muxes_length_aligned_same_idea_audio(self):
+        brain = self.make_brain()
+        brain.modality_training["video"] = 1
+        brain.modality_training["audio"] = 1
+        generated = brain.generate_modality(
+            "video",
+            prompt="a moving shape with an abstract sound",
+            seed=31,
+            settings={"fps": 8, "sampleRate": 16_000},
+        )
+
+        synchronized = generated["synchronizedAudio"]
+        self.assertTrue(synchronized["requested"])
+        self.assertTrue(synchronized["supported"])
+        self.assertTrue(synchronized["sameBrainIdea"])
+        self.assertTrue(synchronized["lengthAlignedToVideo"])
+        self.assertFalse(synchronized["speechSynthesis"])
+        self.assertFalse(synchronized["hiddenBehavioralPrompt"])
+        if generated["mimeType"] == "video/mp4":
+            encoded = Path(generated["path"]).read_bytes()
+            self.assertTrue(synchronized["generated"])
+            self.assertIn(b"soun", encoded)
+            self.assertEqual(generated["containerFallback"], "")
+        else:
+            self.assertFalse(synchronized["generated"])
+            self.assertIn("APNG fallback", synchronized["reason"])
+            self.assertTrue(generated["containerFallback"])
+        brain.events.close()
+
+    def test_video_audio_can_be_disabled_and_apng_fallback_is_honest(self):
+        brain = self.make_brain()
+        brain.modality_training["video"] = 1
+        brain.modality_training["audio"] = 1
+        with mock.patch.object(
+            brain.modalities,
+            "generate",
+            wraps=brain.modalities.generate,
+        ) as decode:
+            silent = brain.generate_modality(
+                "video", seed=32, settings={"includeAudio": False}
+            )
+        decoded_modalities = [call.args[0] for call in decode.call_args_list]
+        self.assertEqual(decoded_modalities, ["video"])
+        self.assertFalse(silent["synchronizedAudio"]["requested"])
+        self.assertFalse(silent["synchronizedAudio"]["generated"])
+
+        with mock.patch.object(
+            brain,
+            "_mp4_bytes",
+            side_effect=RuntimeError("fixture mux unavailable"),
+        ):
+            fallback = brain.generate_modality("video", seed=33)
+        self.assertEqual(fallback["mimeType"], "image/apng")
+        self.assertTrue(fallback["synchronizedAudio"]["supported"])
+        self.assertFalse(fallback["synchronizedAudio"]["generated"])
+        self.assertIn("fixture mux unavailable", fallback["synchronizedAudio"]["reason"])
+        brain.events.close()
+
+    def test_vision_understanding_recalls_persistent_sensory_assemblies(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is required for the vision fixture")
+        brain = self.make_brain(image_enabled=True, vision_enabled=True)
+        image_path = self.root / "cobalt-harbor.png"
+        Image.new("RGB", (19, 13), color=(15, 70, 180)).save(image_path)
+        learned = brain.ingest(
+            path=str(image_path), kind="image", policy="encode"
+        )
+        whole_id = learned["source"]["media_records"][0]["coverage"][
+            "wholeRecordAssemblyId"
+        ]
+
+        understood = brain.generate_modality(
+            "vision", input_path=str(image_path)
+        )
+
+        self.assertEqual(
+            understood["associationMode"],
+            "exact-ternary-recurrent-spreading",
+        )
+        self.assertGreater(understood["associationCount"], 0)
+        self.assertIn(
+            whole_id,
+            {item["assemblyId"] for item in understood["associations"]},
+        )
+        self.assertTrue(
+            any(
+                "image-perception" in item["labels"]
+                for item in understood["associations"]
+            )
+        )
+        self.assertNotIn("source_text", json.dumps(understood))
+        brain.events.close()
+
+    def test_checkpoint_flushes_packed_state_without_creating_a_snapshot(self):
+        brain = self.make_brain()
+        brain.learn_experience(
+            "Checkpoint this exact distributed neural assembly.",
+            steps=0,
+        )
+        snapshot_root = brain.engine_path / "snapshots"
+        before = (
+            sorted(path.name for path in snapshot_root.iterdir())
+            if snapshot_root.exists()
+            else []
+        )
+        snapshot_count = brain.counters["snapshots"]
+        result = brain.checkpoint("checkpoint-operation")
+        after = (
+            sorted(path.name for path in snapshot_root.iterdir())
+            if snapshot_root.exists()
+            else []
+        )
+        metadata_bytes = (brain.engine_path / "brain.json").read_bytes()
+        packed_bytes = (
+            brain.engine_path / "packed-ternary" / "manifest.json"
+        ).read_bytes()
+        self.assertEqual(result["format"], "omni-neural-checkpoint")
+        self.assertEqual(result["operationId"], "checkpoint-operation")
+        self.assertTrue(result["committed"])
+        self.assertFalse(result["snapshotCreated"])
+        self.assertEqual(before, after)
+        self.assertEqual(brain.counters["snapshots"], snapshot_count)
+        self.assertEqual(
+            result["metadataSha256"], hashlib.sha256(metadata_bytes).hexdigest()
+        )
+        self.assertEqual(
+            result["packedManifestSha256"],
+            hashlib.sha256(packed_bytes).hexdigest(),
+        )
         brain.events.close()
 
     def test_snapshot_and_append_only_event_log(self):
@@ -1820,6 +1868,56 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertEqual(config.gradient_accumulation, 8)
         self.assertTrue(config.gradient_checkpointing)
 
+    def test_train_rejects_missing_unknown_and_unretained_inputs_before_mutation(self):
+        brain = self.make_brain()
+        brain.training_sources.append(
+            {
+                "id": "unretained-source",
+                "name": "hash-only fixture",
+                "raw_text_retained": False,
+            }
+        )
+
+        def snapshot():
+            return {
+                "parameters": brain.parameter_checksum(),
+                "counters": copy.deepcopy(brain.counters),
+                "replay": copy.deepcopy(brain.replay.status()),
+                "training_sources": copy.deepcopy(brain.training_sources),
+                "messages": copy.deepcopy(brain.messages),
+                "traces": copy.deepcopy(brain.traces),
+                "events": brain.events.recent(10_000),
+                "files": {
+                    str(path.relative_to(self.root)): hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+                    for path in self.root.rglob("*")
+                    if path.is_file()
+                },
+            }
+
+        cases = (
+            ({"texts": []}, "requires non-empty text"),
+            ({"texts": [" \x00 "]}, "requires non-empty text"),
+            ({"source_ids": ["missing-source"]}, "unknown training source_ids"),
+            (
+                {"source_ids": ["unretained-source"]},
+                "have no retained text",
+            ),
+        )
+        with mock.patch.object(
+            brain,
+            "_train_evolution_replay_candidate",
+            side_effect=AssertionError("training must not fall back to replay"),
+        ):
+            for arguments, message in cases:
+                with self.subTest(arguments=arguments):
+                    before = snapshot()
+                    with self.assertRaisesRegex(ValueError, message):
+                        brain.train(**arguments)
+                    self.assertEqual(snapshot(), before)
+        brain.events.close()
+
     def test_slow_training_uses_profile_batch_and_gradient_accumulation(self):
         brain = self.make_brain(
             train_batch_size=2,
@@ -1837,8 +1935,10 @@ class AdaptiveBrainTests(unittest.TestCase):
         )
         self.assertEqual(result["steps"], 4)
         self.assertEqual(result["optimizerSteps"], 1)
-        self.assertEqual(result["physicalBatchSize"], 2)
-        self.assertEqual(result["gradientAccumulation"], 2)
+        # Auto preserves the logical target (2 × 2 = 4) while selecting the
+        # largest safe physical divisor. On this fixture all four rows fit.
+        self.assertEqual(result["physicalBatchSize"], 4)
+        self.assertEqual(result["gradientAccumulation"], 1)
         self.assertTrue(
             brain.runtime_card()["scale"]["gradientCheckpointing"]
         )
@@ -2016,6 +2116,7 @@ class AdaptiveBrainTests(unittest.TestCase):
             snapshot["contextWindow"]["recentTokenHash"],
         )
         reloaded.events.close()
+
 
     def test_slow_metaplastic_anchors_persist_and_penalize_drift(self):
         brain = self.make_brain(metaplasticity=True)

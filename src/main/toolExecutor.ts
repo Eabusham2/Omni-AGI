@@ -26,7 +26,9 @@ import type {
   ToolExecutionResult,
   ToolInvocation,
   RuntimeJob,
-  ToolPermissionLevel
+  ToolPermissionLevel,
+  ToolRuntimePreferences,
+  ModalityGenerationSettings
 } from "../shared/types";
 import {
   assertSafeRemoteUrl,
@@ -53,7 +55,23 @@ import {
   type SourceRuntimeManifest,
   type SourceRuntimeStageResult
 } from "./sourceRuntimeContract";
+import {
+  HostDeviceInputBackend,
+  type DeviceInputCommand,
+  type DeviceInputResult
+} from "./deviceInput";
 import { withBrainWrite } from "./brainWriteCoordinator";
+import type { ToolPreferencesStore } from "./toolPreferences";
+
+export interface ExternalToolBridge {
+  hasTool(toolId: string): boolean;
+  execute(
+    toolId: string,
+    action: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal
+  ): Promise<unknown>;
+}
 
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_PROCESS_OUTPUT = 2 * 1024 * 1024;
@@ -118,7 +136,23 @@ interface Approval {
   toolId: string;
   action: string;
   argumentSha256: string;
+  permissionRevision: string;
   expiresAt: number;
+}
+
+interface PermissionDecision {
+  level: ToolPermissionLevel;
+  revision: string;
+}
+
+class ToolDispatchFailure extends Error {
+  constructor(
+    message: string,
+    readonly output: unknown
+  ) {
+    super(message);
+    this.name = "ToolDispatchFailure";
+  }
 }
 
 interface EvolutionProposalRecord {
@@ -270,13 +304,23 @@ function boundedTimeout(value: unknown, fallback = 60_000): number {
 
 function riskyInvocation(toolId: string, action: string): boolean {
   return (
-    (toolId === "windows.files" && action === "write") ||
-    toolId === "windows.powershell" ||
+    (["system.files", "windows.files"].includes(toolId) && action === "write") ||
+    ["system.shell", "windows.powershell"].includes(toolId) ||
     toolId === "code.execute" ||
     toolId === "browser.automation" ||
+    toolId === "device.input" ||
     toolId === "agent.fork" ||
     (toolId === "source.self-modify" && ["promote", "rollback"].includes(action))
   );
+}
+
+function canonicalSystemInvocation(invocation: ToolInvocation): ToolInvocation {
+  const toolId = invocation.toolId === "windows.files"
+    ? "system.files"
+    : invocation.toolId === "windows.powershell"
+      ? "system.shell"
+      : invocation.toolId;
+  return toolId === invocation.toolId ? invocation : { ...invocation, toolId };
 }
 
 function toolCancellationError(): Error {
@@ -537,23 +581,81 @@ export function buildInertBrowserDocument(
   return { title, text, links, document };
 }
 
+export interface PublicSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/** Parse Bing's public RSS representation without executing returned markup. */
+export function parsePublicSearchRss(value: string, limit = 10): PublicSearchResult[] {
+  const results: PublicSearchResult[] = [];
+  const itemPattern = /<item\b[^>]*>([\s\S]*?)<\/item\s*>/gi;
+  let item: RegExpExecArray | null;
+  while ((item = itemPattern.exec(value))) {
+    const field = (name: string): string => {
+      const match = item?.[1]?.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)<\\/${name}\\s*>`, "i"));
+      return htmlFragmentText(
+        decodeHtmlEntities(match?.[1] ?? ""),
+        name === "description" ? 4_000 : 1_000
+      );
+    };
+    const title = field("title");
+    const rawUrl = decodeHtmlEntities(field("link"));
+    try {
+      const url = new URL(rawUrl);
+      if (url.protocol !== "https:" || url.username || url.password || !title) continue;
+      url.hash = "";
+      results.push({ title, url: url.toString(), snippet: field("description") });
+    } catch {
+      continue;
+    }
+    if (results.length >= Math.max(1, limit)) break;
+  }
+  return results;
+}
+
 export class ToolExecutor {
   private readonly approvals = new Map<string, Approval>();
   private readonly activeExecutions = new Map<
     string,
-    { brainId: string; controller: AbortController }
+    {
+      brainId: string;
+      requestId: string;
+      controller: AbortController;
+      settled: Promise<void>;
+      resolveSettled(): void;
+    }
   >();
 
   constructor(
     private readonly service: BrainService,
     private readonly jobs: RuntimeJobManager,
-    private readonly sourceRuntime?: SourceRuntimeLifecycle
+    private readonly sourceRuntime?: SourceRuntimeLifecycle,
+    private readonly deviceInput: Pick<HostDeviceInputBackend, "execute"> =
+      new HostDeviceInputBackend(),
+    private readonly externalTools?: ExternalToolBridge,
+    private readonly preferencesStore?: ToolPreferencesStore
   ) {}
+
+  preferences(): ToolRuntimePreferences {
+    return this.preferencesStore?.get() ?? { approvalTimeoutSeconds: 30 };
+  }
+
+  async setPreferences(value: ToolRuntimePreferences): Promise<ToolRuntimePreferences> {
+    if (!this.preferencesStore) throw new Error("Tool preferences are unavailable.");
+    return this.preferencesStore.set(value);
+  }
 
   async execute(
     invocation: ToolInvocation,
-    onProgress?: (job: RuntimeJob) => void
+    onProgress?: (job: RuntimeJob) => void,
+    requestedRequestId?: string
   ): Promise<ToolExecutionResult> {
+    // Imported brains can still emit historical protocol IDs. Canonicalize
+    // once before permission, approval, execution, result, and learning audit
+    // so aliases cannot leak back into new visible/deep experience.
+    invocation = canonicalSystemInvocation(invocation);
     const id = randomUUID();
     const startedAt = new Date().toISOString();
     const base: ToolExecutionResult = {
@@ -563,12 +665,39 @@ export class ToolExecutor {
       state: "failed",
       startedAt
     };
+    const requestId = requestedRequestId?.trim() || id;
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(requestId)) {
+      throw new Error("Tool execution requestId is invalid.");
+    }
+    const controller = new AbortController();
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    this.activeExecutions.set(id, {
+      brainId: invocation.brainId,
+      requestId,
+      controller,
+      settled,
+      resolveSettled
+    });
     try {
-      const permission = await this.permission(invocation.brainId, invocation.toolId);
-      if (permission === "off") throw new Error("This tool is disabled for the current brain.");
+      const permissionDecision = await this.permission(
+        invocation.brainId,
+        invocation.toolId
+      );
+      controller.signal.throwIfAborted();
+      const permission = permissionDecision.level;
+      if (permission === "off") {
+        // A denied use is also an explicit revocation boundary. Otherwise an
+        // Ask token could survive Off, become valid again after Ask is
+        // restored, and resurrect authority the user already withdrew.
+        this.revokeApprovals(invocation.brainId, invocation.toolId);
+        throw new Error("This tool is disabled for the current brain.");
+      }
       const outsideAutomaticFileScope =
         permission === "auto" &&
-        invocation.toolId === "windows.files" &&
+        ["system.files", "windows.files"].includes(invocation.toolId) &&
         !(await this.insideAutomaticFileScope(invocation.brainId, invocation.arguments));
       const autonomousEvolutionExperiment =
         invocation.toolId === "source.self-modify" &&
@@ -577,32 +706,44 @@ export class ToolExecutor {
         (permission === "ask" && !autonomousEvolutionExperiment) ||
         (permission === "auto" &&
           (riskyInvocation(invocation.toolId, invocation.action) || outsideAutomaticFileScope));
-      if (needsApproval && !this.consumeApproval(invocation)) {
+      if (
+        needsApproval &&
+        !this.consumeApproval(invocation, permissionDecision.revision)
+      ) {
         const approvalToken = randomUUID();
+        const expiresAt = Date.now() + this.preferences().approvalTimeoutSeconds * 1_000;
         this.approvals.set(approvalToken, {
           brainId: invocation.brainId,
           toolId: invocation.toolId,
           action: invocation.action,
           argumentSha256: sha256(JSON.stringify(invocation.arguments)),
-          expiresAt: Date.now() + 5 * 60_000
+          permissionRevision: permissionDecision.revision,
+          expiresAt
         });
-        return { ...base, state: "approval-required", approvalToken };
+        return {
+          ...base,
+          state: "approval-required",
+          approvalToken,
+          approvalExpiresAt: new Date(expiresAt).toISOString()
+        };
       }
-      const controller = new AbortController();
-      this.activeExecutions.set(id, { brainId: invocation.brainId, controller });
+      // A token supplied to an Auto/Full action is unnecessary and must not
+      // remain dormant for later reuse if the permission returns to Ask.
+      if (!needsApproval && invocation.approvalToken) {
+        this.approvals.delete(invocation.approvalToken);
+      }
       let output: unknown;
       try {
         output = await this.dispatch(
           invocation,
           controller.signal,
           onProgress,
-          permission
+          permission,
+          id
         );
       } catch (error) {
         if (controller.signal.aborted) throw toolCancellationError();
         throw error;
-      } finally {
-        this.activeExecutions.delete(id);
       }
       const result: ToolExecutionResult = {
         ...base,
@@ -617,21 +758,45 @@ export class ToolExecutor {
         ...base,
         state: "failed",
         finishedAt: new Date().toISOString(),
+        ...(error instanceof ToolDispatchFailure ? { output: error.output } : {}),
         error: error instanceof Error ? error.message : String(error)
       };
       await this.audit(invocation, result).catch(() => undefined);
       return result;
+    } finally {
+      const execution = this.activeExecutions.get(id);
+      if (execution) {
+        this.activeExecutions.delete(id);
+        execution.resolveSettled();
+      }
     }
   }
 
-  cancel(brainId: string): number {
+  cancel(brainId: string, requestId?: string): number {
     let cancelled = 0;
     for (const execution of this.activeExecutions.values()) {
-      if (execution.brainId !== brainId || execution.controller.signal.aborted) continue;
+      if (
+        execution.brainId !== brainId ||
+        (requestId !== undefined && execution.requestId !== requestId) ||
+        execution.controller.signal.aborted
+      ) {
+        continue;
+      }
       execution.controller.abort();
       cancelled += 1;
     }
     return cancelled;
+  }
+
+  async cancelAndWait(brainId: string, requestId?: string): Promise<number> {
+    const matching = [...this.activeExecutions.values()].filter(
+      (execution) =>
+        execution.brainId === brainId &&
+        (requestId === undefined || execution.requestId === requestId)
+    );
+    this.cancel(brainId, requestId);
+    await Promise.all(matching.map((execution) => execution.settled));
+    return matching.length;
   }
 
   hasPendingOrActive(brainId: string): boolean {
@@ -650,12 +815,50 @@ export class ToolExecutor {
     );
   }
 
-  private async permission(brainId: string, toolId: string): Promise<ToolPermissionLevel> {
+  private async permission(
+    brainId: string,
+    toolId: string
+  ): Promise<PermissionDecision> {
+    // A workspace route changes only local renderer state and is immediately
+    // reversible. It must never inherit Full Authority or require an approval
+    // token intended for external side effects.
+    if (toolId === "studio.ui" || toolId === "studio.settings") {
+      return { level: "auto", revision: `local-reversible:${toolId}:1` };
+    }
     const permissions = await this.service.listToolPermissions(brainId);
-    return permissions.find((permission) => permission.toolId === toolId)?.level ?? "off";
+    const canonical = toolId === "windows.files"
+      ? "system.files"
+      : toolId === "windows.powershell"
+        ? "system.shell"
+        : toolId;
+    const permission = permissions.find((value) => value.toolId === canonical);
+    if (!permission) {
+      return { level: "off", revision: `${canonical}:off:missing` };
+    }
+    return {
+      level: permission.level,
+      revision: sha256(
+        JSON.stringify({
+          toolId: canonical,
+          level: permission.level,
+          updatedAt: permission.updatedAt
+        })
+      )
+    };
   }
 
-  private consumeApproval(invocation: ToolInvocation): boolean {
+  private revokeApprovals(brainId: string, toolId: string): void {
+    for (const [token, approval] of this.approvals) {
+      if (approval.brainId === brainId && approval.toolId === toolId) {
+        this.approvals.delete(token);
+      }
+    }
+  }
+
+  private consumeApproval(
+    invocation: ToolInvocation,
+    permissionRevision: string
+  ): boolean {
     if (!invocation.approvalToken) return false;
     const approval = this.approvals.get(invocation.approvalToken);
     this.approvals.delete(invocation.approvalToken);
@@ -665,7 +868,8 @@ export class ToolExecutor {
         approval.brainId === invocation.brainId &&
         approval.toolId === invocation.toolId &&
         approval.action === invocation.action &&
-        approval.argumentSha256 === sha256(JSON.stringify(invocation.arguments))
+        approval.argumentSha256 === sha256(JSON.stringify(invocation.arguments)) &&
+        approval.permissionRevision === permissionRevision
     );
   }
 
@@ -690,13 +894,16 @@ export class ToolExecutor {
     invocation: ToolInvocation,
     signal: AbortSignal,
     onProgress?: (job: RuntimeJob) => void,
-    permission?: ToolPermissionLevel
+    permission?: ToolPermissionLevel,
+    policyDecisionId?: string
   ): Promise<unknown> {
     switch (invocation.toolId) {
+      case "system.files":
       case "windows.files":
         return this.files(invocation.action, invocation.arguments);
+      case "system.shell":
       case "windows.powershell":
-        return this.powershell(invocation.action, invocation.arguments, signal);
+        return this.shell(invocation.action, invocation.arguments, signal);
       case "code.execute":
         return this.code(invocation.action, invocation.arguments, signal);
       case "web.fetch":
@@ -711,6 +918,13 @@ export class ToolExecutor {
           signal,
           onProgress
         );
+      case "brain.history":
+        return this.history(
+          invocation.brainId,
+          invocation.action,
+          invocation.arguments,
+          signal
+        );
       case "agent.fork":
         return this.agent(
           invocation.brainId,
@@ -720,6 +934,26 @@ export class ToolExecutor {
         );
       case "browser.automation":
         return this.browser(invocation.brainId, invocation.action, invocation.arguments, signal);
+      case "device.input":
+        return this.hostInput(
+          invocation.action,
+          invocation.arguments,
+          signal,
+          permission ?? "off",
+          policyDecisionId ?? randomUUID()
+        );
+      case "studio.ui":
+        if (invocation.action !== "open-creativity") {
+          throw new Error("Unknown studio UI action.");
+        }
+        return {
+          workspace: "creativity",
+          view: "imagine",
+          local: true,
+          reversible: true
+        };
+      case "studio.settings":
+        return this.studioSettings(invocation.brainId, invocation.action);
       case "source.self-modify":
         return this.sourceEvolution(
           invocation.brainId,
@@ -729,17 +963,109 @@ export class ToolExecutor {
           permission ?? "off"
         );
       default:
+        if (this.externalTools?.hasTool(invocation.toolId)) {
+          return this.externalTools.execute(
+            invocation.toolId,
+            invocation.action,
+            invocation.arguments,
+            signal
+          );
+        }
         throw new Error("Unknown tool protocol.");
     }
+  }
+
+  private async studioSettings(brainId: string, action: string): Promise<unknown> {
+    if (action === "inspect-access") {
+      const permissions = await this.service.listToolPermissions(brainId);
+      return {
+        permissions: permissions.map(({ toolId, label, level }) => ({ toolId, label, level })),
+        approvalTimeoutSeconds: this.preferences().approvalTimeoutSeconds,
+        canRequestChange: true,
+        grantsChanged: false,
+        local: true,
+        reversible: true
+      };
+    }
+    if (action === "open-permissions") {
+      return {
+        workspace: "tools",
+        view: "permissions",
+        grantsChanged: false,
+        local: true,
+        reversible: true
+      };
+    }
+    throw new Error("Unknown studio settings action.");
+  }
+
+  private async hostInput(
+    action: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+    permission: ToolPermissionLevel,
+    policyDecisionId: string
+  ): Promise<DeviceInputResult> {
+    if (permission === "off") {
+      throw new Error("This tool is disabled for the current brain.");
+    }
+    const command = { ...args, action } as unknown as DeviceInputCommand;
+    const result = await this.deviceInput.execute(command, {
+      authorization: {
+        granted: true,
+        policy: permission === "full" ? "full-authority" : permission,
+        decisionId: policyDecisionId
+      },
+      signal
+    });
+    if (result.state === "cancelled") throw toolCancellationError();
+    if (!result.ok) {
+      throw new ToolDispatchFailure(
+        result.error ?? "Host device input did not complete.",
+        result
+      );
+    }
+    return result;
   }
 
   private async files(action: string, args: Record<string, unknown>): Promise<unknown> {
     const path = absolutePath(argumentString(args, "path", 32_000));
     if (action === "list") {
-      const entries = await readdir(path, { withFileTypes: true });
+      const cursorValue = args.cursor ?? "0";
+      if (
+        typeof cursorValue !== "string" ||
+        !/^(0|[1-9]\d*)$/.test(cursorValue) ||
+        cursorValue.length > 16
+      ) {
+        throw new Error("cursor must be a non-negative decimal string.");
+      }
+      const offset = Number(cursorValue);
+      if (!Number.isSafeInteger(offset)) {
+        throw new Error("cursor exceeds the supported integer range.");
+      }
+      const requestedPageSize = args.pageSize ?? 512;
+      if (
+        typeof requestedPageSize !== "number" ||
+        !Number.isSafeInteger(requestedPageSize) ||
+        requestedPageSize < 1
+      ) {
+        throw new Error("pageSize must be a positive safe integer.");
+      }
+      // This is a transport-page bound, not a directory-size bound. The next
+      // cursor makes every entry addressable without constructing an enormous
+      // JSON action result or silently dropping the tail of a large folder.
+      const pageSize = Math.min(requestedPageSize, 5_000);
+      const entries = (await readdir(path, { withFileTypes: true })).sort((left, right) =>
+        left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: "base" })
+      );
+      if (offset > entries.length) {
+        throw new Error("cursor is beyond the current directory listing.");
+      }
+      const page = entries.slice(offset, offset + pageSize);
+      const nextOffset = offset + page.length;
       return {
         entries: await Promise.all(
-          entries.slice(0, 5_000).map(async (entry) => {
+          page.map(async (entry) => {
             const childPath = resolve(path, entry.name);
             const info = await lstat(childPath);
             return {
@@ -756,7 +1082,12 @@ export class ToolExecutor {
               modifiedAt: info.mtime.toISOString()
             };
           })
-        )
+        ),
+        offset,
+        returned: page.length,
+        total: entries.length,
+        hasMore: nextOffset < entries.length,
+        ...(nextOffset < entries.length ? { nextCursor: String(nextOffset) } : {})
       };
     }
     if (action === "read") {
@@ -780,21 +1111,114 @@ export class ToolExecutor {
       await atomicWrite(path, content);
       return { sha256: sha256(content), bytes: Buffer.byteLength(content) };
     }
-    throw new Error("Unknown windows.files action.");
+    throw new Error("Unknown system files action.");
   }
 
-  private async powershell(
+  private async history(
+    brainId: string,
     action: string,
     args: Record<string, unknown>,
     signal: AbortSignal
   ): Promise<unknown> {
-    if (action !== "run") throw new Error("Unknown PowerShell action.");
+    if (action !== "read" && action !== "search") {
+      throw new Error("Unknown conversation history action.");
+    }
+    assertToolActive(signal);
+    const query = action === "search"
+      ? argumentString(args, "query", 2_000).toLocaleLowerCase()
+      : "";
+    const rawCursor = args.cursor;
+    if (
+      rawCursor !== undefined &&
+      (typeof rawCursor !== "string" || !/^\d{1,12}$/.test(rawCursor))
+    ) {
+      throw new Error("Conversation history cursor is invalid.");
+    }
+    const cursor = rawCursor === undefined ? undefined : Number(rawCursor);
+    if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 1)) {
+      throw new Error("Conversation history cursor is invalid.");
+    }
+    const requestedLimit = typeof args.limit === "number" && Number.isFinite(args.limit)
+      ? Math.round(args.limit)
+      : 40;
+    const limit = Math.max(1, Math.min(100, requestedLimit));
+    const includeActions = args.includeActions !== false;
+    const page = await this.service.repository.searchConversation(
+      brainId,
+      query,
+      cursor,
+      limit
+    );
+    assertToolActive(signal);
+    const entries: Array<Record<string, unknown>> = [];
+    for (const entry of [...page.entries].reverse()) {
+      if (entry.message) {
+        if (entry.message.deliveryReceipt?.presentationOnly) continue;
+        entries.push({
+          id: entry.message.id,
+          sequence: entry.sequence,
+          kind: "message" as const,
+          role: entry.message.role,
+          content: entry.message.content,
+          contentTruncated: false,
+          createdAt: entry.message.createdAt,
+          attentionEpoch: entry.attentionEpoch,
+          runtime: entry.message.runtime
+        });
+        continue;
+      }
+      if (includeActions && entry.action) {
+        entries.push({
+          id: entry.action.id,
+          sequence: entry.sequence,
+          kind: "action" as const,
+          action: entry.action.action,
+          state: entry.action.state,
+          error: entry.action.error,
+          createdAt: entry.action.createdAt,
+          attentionEpoch: entry.attentionEpoch
+        });
+        continue;
+      }
+      if (includeActions && entry.trace) {
+        entries.push({
+          id: entry.trace.id,
+          sequence: entry.sequence,
+          kind: "action",
+          summary: entry.trace.input,
+          result: entry.trace.steps,
+          resultTruncated: false,
+          createdAt: entry.trace.createdAt,
+          attentionEpoch: entry.attentionEpoch
+        });
+      }
+    }
+    return {
+      entries,
+      nextCursor: page.nextBeforeSequence === undefined
+        ? undefined
+        : String(page.nextBeforeSequence),
+      matched: page.totalEntries,
+      scope: "this-brain-visible-history",
+      privateReasoningIncluded: false,
+      measuredTracesIncluded: false
+    };
+  }
+
+  private async shell(
+    action: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal
+  ): Promise<unknown> {
+    if (action !== "run") throw new Error("Unknown system shell action.");
     const command = argumentString(args, "command");
     const cwd = absolutePath(argumentString(args, "cwd", 32_000));
-    const executable = process.platform === "win32" ? "powershell.exe" : "pwsh";
+    const windows = process.platform === "win32";
     return runProcess(
-      executable,
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+      windows ? "powershell.exe" : "/bin/sh",
+      windows
+        ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+        : ["-c", command],
       cwd,
       boundedTimeout(args.timeoutMs),
       undefined,
@@ -886,22 +1310,29 @@ export class ToolExecutor {
     signal: AbortSignal
   ): Promise<unknown> {
     if (action !== "search") throw new Error("Unknown web.search action.");
-    const endpoint = process.env.OMNI_SEARXNG_URL;
-    if (!endpoint) throw new Error("OMNI_SEARXNG_URL is not configured.");
-    const url = new URL(endpoint);
-    url.searchParams.set("q", argumentString(args, "query", 4_000));
-    url.searchParams.set("format", "json");
+    const query = argumentString(args, "query", 4_000);
+    const endpoint = process.env.OMNI_SEARXNG_URL?.trim();
+    const url = new URL(endpoint || "https://www.bing.com/search");
+    url.searchParams.set("q", query);
+    if (endpoint) url.searchParams.set("format", "json");
+    else url.searchParams.set("format", "rss");
     const response = await safeFetch(url, {
       signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
-      headers: { Accept: "application/json" }
+      headers: { Accept: endpoint ? "application/json" : "application/rss+xml, application/xml;q=0.9" }
     });
     if (!response.ok) throw new Error(`Search provider returned HTTP ${response.status}.`);
-    const data = JSON.parse(
-      (await readResponseBounded(response, 4 * 1024 * 1024)).toString("utf8")
-    ) as { results?: unknown[] };
     const limit =
       typeof args.limit === "number" ? Math.max(1, Math.min(50, Math.round(args.limit))) : 10;
-    return { results: Array.isArray(data.results) ? data.results.slice(0, limit) : [] };
+    const raw = (await readResponseBounded(response, 4 * 1024 * 1024)).toString("utf8");
+    if (!endpoint) {
+      return { provider: "public-rss", query, results: parsePublicSearchRss(raw, limit) };
+    }
+    const data = JSON.parse(raw) as { results?: unknown[] };
+    return {
+      provider: "searxng",
+      query,
+      results: Array.isArray(data.results) ? data.results.slice(0, limit) : []
+    };
   }
 
   private async browser(
@@ -915,14 +1346,81 @@ export class ToolExecutor {
     }
     const requested = new URL(argumentString(args, "url", 16_000));
     await assertSafeRemoteUrl(requested);
-    const steps = Array.isArray(args.steps)
-      ? args.steps
-          .filter(
-            (value): value is Record<string, unknown> =>
-              typeof value === "object" && value !== null && !Array.isArray(value)
-          )
-          .slice(0, 200)
-      : [];
+    const steps: Array<Record<string, unknown>> = [];
+    if (args.steps !== undefined) {
+      if (!Array.isArray(args.steps) || args.steps.length > 200) {
+        throw new Error("Browser steps must be an array of at most 200 typed operations.");
+      }
+      const allowed = new Map<string, Set<string>>([
+        ["navigate", new Set(["kind", "url"])],
+        ["click", new Set(["kind", "selector", "timeoutMs"])],
+        ["type", new Set(["kind", "selector", "value", "clear", "sensitive"])],
+        ["press", new Set(["kind", "key", "timeoutMs"])],
+        ["wait", new Set(["kind", "selector", "milliseconds", "timeoutMs"])],
+        ["extract", new Set(["kind", "selector"])],
+        ["screenshot", new Set(["kind"])]
+      ]);
+      const textField = (
+        step: Record<string, unknown>, key: string, maximum: number,
+        allowNewlines = false
+      ): boolean => {
+        const value = step[key];
+        return typeof value === "string" && value.length > 0 &&
+          value.length <= maximum && !value.includes("\0") &&
+          (allowNewlines || (!value.includes("\r") && !value.includes("\n")));
+      };
+      for (const value of args.steps) {
+        if (
+          typeof value !== "object" || value === null || Array.isArray(value) ||
+          typeof value.kind !== "string" || !allowed.has(value.kind)
+        ) {
+          throw new Error("Browser steps contain an invalid typed operation.");
+        }
+        const step = value as Record<string, unknown>;
+        const kind = step.kind as string;
+        if (Object.keys(step).some((key) => !allowed.get(kind)!.has(key))) {
+          throw new Error("Browser step contains an unexpected field.");
+        }
+        if ("timeoutMs" in step && (
+          typeof step.timeoutMs !== "number" || !Number.isFinite(step.timeoutMs) ||
+          step.timeoutMs <= 0 || step.timeoutMs > 30_000
+        )) {
+          throw new Error("Browser step timeout is invalid.");
+        }
+        if (kind === "navigate" && (
+          !textField(step, "url", 16_000) ||
+          !String(step.url).startsWith("https://")
+        )) throw new Error("Browser navigation URL is invalid.");
+        if (kind === "click" && !textField(step, "selector", 2_000)) {
+          throw new Error("Browser click selector is invalid.");
+        }
+        if (kind === "type" && (
+          !textField(step, "selector", 2_000) ||
+          !textField(step, "value", 100_000, true) ||
+          ("clear" in step && typeof step.clear !== "boolean") ||
+          ("sensitive" in step && typeof step.sensitive !== "boolean")
+        )) throw new Error("Browser type step is invalid.");
+        if (kind === "press" && !textField(step, "key", 64)) {
+          throw new Error("Browser key step is invalid.");
+        }
+        if (kind === "wait") {
+          const bySelector = "selector" in step;
+          const byDuration = "milliseconds" in step;
+          if (bySelector === byDuration ||
+            (bySelector && !textField(step, "selector", 2_000)) ||
+            (byDuration && (
+              typeof step.milliseconds !== "number" ||
+              !Number.isSafeInteger(step.milliseconds) ||
+              step.milliseconds <= 0 || step.milliseconds > 30_000
+            ))) throw new Error("Browser wait step is invalid.");
+        }
+        if (kind === "extract" && "selector" in step &&
+          !textField(step, "selector", 2_000)) {
+          throw new Error("Browser extract selector is invalid.");
+        }
+        steps.push(step);
+      }
+    }
     const { BrowserWindow } = await import("electron");
     const browser = new BrowserWindow({
       show: args.visible === true,
@@ -1020,6 +1518,7 @@ export class ToolExecutor {
       await browser.loadURL(requested.href);
       assertToolActive(signal);
       const stepResults: unknown[] = [];
+      let finalScreenshotPath: string | undefined;
       for (const [index, step] of steps.entries()) {
         assertToolActive(signal);
         const kind = argumentString(step, "kind", 32).toLocaleLowerCase();
@@ -1072,7 +1571,7 @@ export class ToolExecutor {
             })(${JSON.stringify({
               selector: query,
               value,
-              clear: step.clear !== false
+              clear: step.clear === true
             })})`,
             true
           );
@@ -1152,6 +1651,7 @@ export class ToolExecutor {
           await mkdir(artifactDirectory, { recursive: true });
           const path = join(artifactDirectory, `${randomUUID()}.png`);
           await writeFile(path, image.toPNG(), { flag: "wx", mode: 0o600 });
+          finalScreenshotPath = path;
           stepResults.push({ index, kind, artifactPath: path });
           continue;
         }
@@ -1159,22 +1659,13 @@ export class ToolExecutor {
       }
       const page = await pageSnapshot();
       assertToolActive(signal);
-      const artifactDirectory = join(
-        this.service.repository.brainDirectory(brainId),
-        "artifacts",
-        "browser"
-      );
-      await mkdir(artifactDirectory, { recursive: true });
-      const artifactPath = join(artifactDirectory, `${randomUUID()}.png`);
-      const screenshot = await browser.webContents.capturePage();
-      await writeFile(artifactPath, screenshot.toPNG(), { flag: "wx", mode: 0o600 });
       return {
         finalUrl: browser.webContents.getURL(),
         title: page.title,
         text: page.text,
         links: page.links,
         steps: stepResults,
-        artifactPath,
+        ...(finalScreenshotPath ? { artifactPath: finalScreenshotPath } : {}),
         mode: "interactive-persistent-session",
         sessionPersistent: true,
         note:
@@ -1219,8 +1710,11 @@ export class ToolExecutor {
         : undefined,
       settings:
         typeof args.settings === "object" && args.settings !== null
-          ? (args.settings as Record<string, string | number | boolean>)
-          : undefined,
+          ? ({
+              outputMode: "auto",
+              ...(args.settings as Record<string, unknown>)
+            } as ModalityGenerationSettings)
+          : { outputMode: "auto" },
       ...(neuralActionId ? { neuralActionId } : {}),
       ...(seed !== undefined ? { seed } : {})
     });
@@ -2746,13 +3240,20 @@ export class ToolExecutor {
       typeof result.output === "object" && result.output !== null
         ? (result.output as Record<string, unknown>)
         : {};
+    const deviceAudit =
+      invocation.toolId === "device.input" &&
+      typeof outputRecord.audit === "object" &&
+      outputRecord.audit !== null
+        ? outputRecord.audit
+        : undefined;
     const detail = {
       argumentKeys: Object.keys(invocation.arguments).sort(),
       argumentSha256: sha256(JSON.stringify(invocation.arguments)),
       paths,
       url: urlValue,
       changedPath:
-        invocation.toolId === "windows.files" && invocation.action === "write"
+        ["system.files", "windows.files"].includes(invocation.toolId) &&
+        invocation.action === "write"
           ? paths.path
           : undefined,
       exitCode:
@@ -2767,6 +3268,7 @@ export class ToolExecutor {
         typeof outputRecord.worktree === "string"
           ? outputRecord.worktree.slice(0, 1_000)
           : undefined,
+      deviceAudit,
       error: result.error?.slice(0, 1_000)
     };
     brain.journal = [

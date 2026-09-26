@@ -999,6 +999,115 @@ describe("ToolExecutor complete workflows", () => {
     expect(await sha256File(process.execPath)).toEqual(currentExecutableBefore);
   }, 120_000);
 
+  it("runs an approved subagent fork from a duplicate with a legacy immutable origin", async () => {
+    const rootOriginPath = join(repository.brainDirectory(brain.id), "origin.json");
+    const legacyOrigin = JSON.parse(
+      await readFile(rootOriginPath, "utf8")
+    ) as Record<string, unknown> & { config: Record<string, unknown> };
+    // This stable-v1 alias is migrated by normalizeBrain(). The immutable
+    // checksum must still be verified against the serialized legacy state.
+    legacyOrigin.config.memoryRecipe = "human-consolidation";
+    const {
+      readiness: _readiness,
+      provenance: _provenance,
+      ...legacyOriginState
+    } = legacyOrigin;
+    const legacyOriginChecksum = sha256(
+      JSON.stringify({ ...legacyOriginState, originChecksum: undefined })
+    );
+    legacyOrigin.originChecksum = legacyOriginChecksum;
+    const legacyOriginBytes = Buffer.from(JSON.stringify(legacyOrigin, null, 2));
+    await writeFile(rootOriginPath, legacyOriginBytes);
+    const root = await repository.get(brain.id);
+    root.originChecksum = legacyOriginChecksum;
+    await repository.save(root, false);
+
+    const duplicate = await repository.duplicate(brain.id, "Legacy duplicate");
+    await expect(
+      readFile(join(repository.brainDirectory(duplicate.id), "origin.json"))
+    ).resolves.toEqual(legacyOriginBytes);
+    brain = duplicate;
+    await setPermission("agent.fork", "ask");
+
+    const chat = vi.fn(async (forkId: string, input: string): Promise<ChatResult> => {
+      const fork = await repository.get(forkId);
+      const now = new Date().toISOString();
+      const humanMessage = {
+        id: randomUUID(),
+        role: "human" as const,
+        content: input,
+        createdAt: now,
+        runtime: "adaptive-core" as const
+      };
+      const brainMessage = {
+        id: randomUUID(),
+        role: "brain" as const,
+        content: "approved legacy-origin branch completed",
+        createdAt: now,
+        runtime: "adaptive-core" as const,
+        status: "complete" as const
+      };
+      const trace = {
+        id: randomUUID(),
+        createdAt: now,
+        input,
+        seed: 1,
+        runtime: "adaptive-core" as const,
+        activatedConcepts: [],
+        recalledIdeas: [],
+        driveScores: { novelty: 1, coherence: 1, curiosity: 1 },
+        branches: 1,
+        selectedBranch: 0,
+        steps: [],
+        note: "approved duplicate-origin regression"
+      };
+      fork.messages.push(humanMessage, brainMessage);
+      fork.traces.push(trace);
+      return {
+        brain: await repository.save(fork),
+        humanMessage,
+        brainMessage,
+        trace
+      };
+    });
+    const executor = executorFor(chat);
+    const invocation = {
+      brainId: duplicate.id,
+      toolId: "agent.fork",
+      action: "start",
+      arguments: { objective: "Verify the duplicated legacy lineage", workers: 1 }
+    };
+    const approval = await executor.execute(invocation);
+    expect(approval).toMatchObject({
+      state: "approval-required",
+      approvalToken: expect.any(String)
+    });
+    if (approval.state !== "approval-required" || !approval.approvalToken) {
+      throw new Error("Expected an agent.fork approval challenge.");
+    }
+
+    const output = completeOutput<{ forkIds: string[] }>(
+      await executor.execute({
+        ...invocation,
+        approvalToken: approval.approvalToken
+      })
+    );
+    expect(output.forkIds).toHaveLength(1);
+    expect(chat).toHaveBeenCalledTimes(1);
+    const fork = await repository.get(output.forkIds[0]!);
+    expect(fork).toMatchObject({
+      originChecksum: legacyOriginChecksum,
+      lineage: {
+        parentId: duplicate.id,
+        rootId: duplicate.lineage.rootId,
+        generation: duplicate.lineage.generation + 1
+      }
+    });
+    await expect(
+      readFile(join(repository.brainDirectory(fork.id), "origin.json"))
+    ).resolves.toEqual(legacyOriginBytes);
+  });
+
   it("runs isolated subagent forks and leaves the parent's neural state unchanged", async () => {
     await setPermission("agent.fork", "full");
     const parentBefore = await repository.get(brain.id);

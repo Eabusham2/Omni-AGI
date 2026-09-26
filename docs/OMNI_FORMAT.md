@@ -15,7 +15,12 @@ An `.omni` file is a non-executable ZIP container for OmniCortex state. The curr
 
 The schema-version value above is illustrative of the current build constant; import requires an exact match with that build. The importer never loads pickle objects and never executes repository code or setup scripts from a bundle.
 
-This format is for a complete identity. Build recipes and modality-only weights deliberately use smaller, separate contracts documented in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
+This format carries a brain's neural identity and immutable origin. Its current
+sanitized export is **not** an exact conversational or training continuation:
+chat ledgers, pending chat-learning jobs, active ingestion cursors, and
+temporary cold working-memory pages are not restored. Build recipes and
+modality-only weights use smaller, separate
+contracts documented in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
 
 ## Required entries
 
@@ -131,6 +136,9 @@ Before materializing a brain, the importer:
 - compares both the manifest SHA-256 and exact byte count with the streamed
   extracted file;
 - requires the exact supported architecture, schema, export mode, redaction policy, and license-ledger shape;
+- requires both current state and immutable origin to prove native ground-up
+  OmniCortex (`origin_kind: ground-up`, no foundation model/adapter, no retired
+  Starter manifest, and no random-only Blank or legacy-hybrid marker);
 - parses every required JSON document;
 - validates all four final safe-tensor headers and data offsets without deserializing code, after resolving local references when applicable;
 - requires both complete packed-ternary packages for every materialized stable
@@ -142,6 +150,9 @@ Before materializing a brain, the importer:
   content-addressed blob name and checksum, and the effective ternary value of
   every sparse synapse;
 - verifies content-addressed object names against their bytes;
+- validates replay SQLite integrity, every tensor-row payload checksum, and
+  the declared committed count/high-water/content digest before publishing an
+  imported identity; pending rows are validated too;
 - resolves referenced tensors only from the destination repository's local object store and then validates the resolved safe tensors.
 
 If an imported brain ID already exists, the importer assigns a new ID and
@@ -153,9 +164,9 @@ before it becomes a visible brain.
 
 | API mode | Manifest mode | Selected payload | Portability |
 | --- | --- | --- | --- |
-| `current` | `current-portable` | Current evolved state | Self-contained |
+| `current` | `current-portable` | Current committed neural state; chat and cold temporary pages omitted | Self-contained |
 | `origin` | `origin-portable` | Immutable starting state | Self-contained |
-| `private-archive` | `private-archive` | Current state plus retained source blobs after confirmation | Self-contained and sensitive |
+| `private-archive` | `private-archive` | Current neural state plus retained source blobs after confirmation; chat omitted | Self-contained and sensitive |
 | `referenced` | `referenced-local` | Sanitized current state with local tensor references | Same repository only |
 
 Every mode includes an `origin/**` payload and both `packed/current/**` and
@@ -176,6 +187,10 @@ ZIP64 fields only when classic ZIP counts, offsets, or lengths overflow. It
 atomically replaces the requested destination after the complete central
 directory is durable. It never accumulates a complete tensor, packed shard,
 substrate generation, or `.omni` file in one buffer.
+Current and origin replay databases are first staged through a SQLite snapshot
+that includes committed WAL pages; the same staged file is validated, hashed,
+and streamed into ZIP. An open writer therefore cannot leave a committed or
+pending replay row behind in an omitted WAL sidecar.
 
 The importer reads central metadata with random access, rejects unsafe
 structures before extraction, and streams each payload through CRC/length
@@ -195,9 +210,37 @@ For `current-portable`, `origin-portable`, and `referenced-local`, the exporter:
 - downgrades every non-`Off` tool grant to `Ask`;
 - recursively redacts recognized credential-shaped values in application and engine JSON.
 
+Portable bundles omit both raw conversation ledgers. The exported engine copy
+therefore has an empty chat-ledger head, no prior turn receipts, no temporary
+dialogue tokens, and no queued chat replay that would need an omitted raw
+message. The model card and manifest disclose the number of omitted ledger
+rows and pending replay jobs; those jobs will **not** resume after import.
+The model card also counts omitted active ingestion cursors; their local source
+files and cold-page generation bindings cannot be resumed from this bundle.
+The current bundle also omits `state/working-memory.sqlite3`, so cold temporary
+pages do not return even if the source brain had them. Its exported checkpoint
+is set to the Python worker's empty-page checksum, and import rejects a
+nonempty page claim without that database. The export must not be
+described as a byte-exact continuation of its temporary attention state.
+Committed neural weights and substrate state remain in the bundle, but this
+privacy projection is not an exact continuation of pending learning. The live
+source brain and its queue are unchanged by export.
+
 The recursive redactor replaces values under credential-like field names and recognized private-key, AWS access-key, GitHub token, OpenAI-style key, bearer-token, password/assignment, and credential-bearing URL patterns. It runs in private-archive mode as well.
 
+Current and immutable-origin substrate JSON shards are content-addressed and
+cannot be redacted without invalidating their generation manifests. Before
+publishing any `.omni` mode, export streams every selected substrate `.json`
+file and refuses the archive if it finds a recognized credential or local
+private-path pattern, or if the shard is not valid UTF-8 text. The source
+brain and its shard graph are not rewritten; errors name only the relative
+shard path, not its contents.
+
 A private archive may retain source paths, raw text, and source blobs only after explicit desktop confirmation. Before packaging, each text-like retained blob is scanned with the same patterns; export refuses the archive if a likely credential is found. Binary blobs are sampled to determine whether they are text-like. This is a deliberate practical boundary, not a proof that arbitrary user-authored or binary data is secret-free. Users must still inspect sensitive archives before sharing them.
+
+Pattern scanning cannot certify binary tensors or arbitrary memorized
+information as secret-free. Even a passing export is not a full privacy
+guarantee for learned weights or unrecognized secret formats.
 
 The bundle does not contain the app's browser partition, operating-system credentials, or a credential vault.
 

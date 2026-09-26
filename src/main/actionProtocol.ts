@@ -33,42 +33,6 @@ function boundedText(value: unknown, maximum: number): string {
     : "";
 }
 
-function naturalToolAction(
-  kind: "imagine" | "agent" | "evolve",
-  source: ActionSource,
-  argumentsValue: Record<string, unknown>
-): StructuredAction {
-  if (kind === "imagine") {
-    return {
-      kind,
-      source,
-      toolId: "modality.imagine",
-      action: "generate",
-      arguments: argumentsValue
-    };
-  }
-  if (kind === "agent") {
-    return {
-      kind,
-      source,
-      toolId: "agent.fork",
-      action: "start",
-      arguments: argumentsValue
-    };
-  }
-  return {
-    kind,
-    source,
-    toolId: "source.self-modify",
-    action: "propose",
-    arguments: {
-      candidateKind: "substrate",
-      latentReplay: true,
-      ...argumentsValue
-    }
-  };
-}
-
 export function normalizeStructuredAction(
   value: unknown,
   source: ActionSource
@@ -78,19 +42,8 @@ export function normalizeStructuredAction(
   const rawKind = boundedText(candidate.kind, 32).toLocaleLowerCase();
   const rawToolId = boundedText(candidate.toolId ?? candidate.tool_id, 80).toLocaleLowerCase();
   const rawAction = boundedText(candidate.action, 80).toLocaleLowerCase();
-  const inferredKind =
-    rawKind ||
-    (rawToolId === "modality.imagine"
-      ? "imagine"
-      : rawToolId === "agent.fork"
-        ? "agent"
-        : rawToolId === "source.self-modify"
-          ? "evolve"
-          : rawToolId
-            ? "tool"
-            : "");
-  if (!ACTION_KINDS.has(inferredKind as ActionKind)) return undefined;
-  const kind = inferredKind as ActionKind;
+  if (!ACTION_KINDS.has(rawKind as ActionKind)) return undefined;
+  const kind = rawKind as ActionKind;
   const confidence =
     typeof candidate.confidence === "number" && Number.isFinite(candidate.confidence)
       ? Math.max(0, Math.min(1, candidate.confidence))
@@ -105,17 +58,19 @@ export function normalizeStructuredAction(
     };
   }
 
-  if (["imagine", "agent", "evolve"].includes(kind) && !rawToolId) {
-    return {
-      ...naturalToolAction(
-        kind as "imagine" | "agent" | "evolve",
-        source,
-        argumentsObject(candidate.arguments)
-      ),
-      confidence
-    };
-  }
   if (!TOOL_ID.test(rawToolId) || !TOOL_ACTION.test(rawAction)) return undefined;
+  const protocols: Partial<Record<ActionKind, readonly [string, string]>> = {
+    imagine: ["modality.imagine", "generate"],
+    agent: ["agent.fork", "start"],
+    evolve: ["source.self-modify", "propose"]
+  };
+  const protocol = protocols[kind];
+  if (protocol && (rawToolId !== protocol[0] || rawAction !== protocol[1])) {
+    return undefined;
+  }
+  if (kind === "tool" && ["modality.imagine", "agent.fork", "source.self-modify"].includes(rawToolId)) {
+    return undefined;
+  }
   return {
     kind,
     source,
@@ -136,7 +91,12 @@ export function parseModelActions(
   rawActions?: unknown
 ): StructuredAction[] {
   const values: unknown[] = [];
-  if (Array.isArray(rawActions)) values.push(...rawActions.slice(0, 8));
+  // The JSON-RPC stream already has a byte envelope, and the trusted action
+  // controller permission-checks and exposes every execution. Do not impose a
+  // second, silent action-count ceiling that makes later neural choices vanish.
+  if (Array.isArray(rawActions)) {
+    for (const value of rawActions) values.push(value);
+  }
   else if (rawActions !== undefined) values.push(rawActions);
   const actions = values
     .map((value) => normalizeStructuredAction(value, "brain"))

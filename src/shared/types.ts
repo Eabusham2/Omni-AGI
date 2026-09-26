@@ -1,3 +1,6 @@
+import type { TrainingTelemetry } from "./trainingTelemetry";
+export type { TrainingTelemetry } from "./trainingTelemetry";
+
 export const BRAIN_SCHEMA_VERSION = 1;
 
 export const APPEARANCE_SCHEMA_VERSION = 1;
@@ -37,8 +40,11 @@ export type ArchitecturePreset =
   | "custom";
 
 export type InferenceRuntime = "adaptive-core";
-export type MemoryRecipe = "human-consolidation" | "total-recall" | "synapses-only";
+export type MemoryRecipe = "adaptive-retention" | "total-recall" | "synapses-only";
 export type TraceDetail = "summary" | "standard" | "research";
+export type WorkingMemoryMode = "auto" | "extended" | "manual";
+export type SystemRamMode = "auto" | "manual";
+export type StoragePoolMode = "auto" | "manual";
 
 /**
  * Stable v1 user choices.
@@ -57,10 +63,38 @@ export interface BrainConfig {
   onlineLearning: boolean;
   extendedWorkingMemory: boolean;
   recursiveImprovement: boolean;
+  /**
+   * Per-identity Active Mode for optional prompt-free background cognition.
+   * It is an operational lease preference, not a Ponder capability or prompt.
+   */
   idleCognition: boolean;
 
   /** Hardware-resolved transient neural-workspace capacity. */
   workingMemorySlots: number;
+  /**
+   * Hardware/model-resolved active token window. This is an operational
+   * architecture value, not a behavior or personality control. Active token
+   * state remains resident; only colder recurrent neural state may page.
+   */
+  contextWindowTokens: number;
+  /** Device-planned recurrent/paged capacity policy, never a personality dial. */
+  workingMemoryMode: WorkingMemoryMode;
+  /** Estimated on-demand disk spill reserved by the last successful preflight. */
+  memoryOffloadBytes: number;
+  /** Maximum active working patterns kept resident by the last preflight. */
+  memoryResidentItems: number;
+  /** Measured, bounded estimate shown whenever storage offload is active. */
+  memoryOffloadSlowdownPercent: number;
+  /** One process-wide envelope; 100% still excludes the mandatory OS reserve. */
+  systemRamMode: SystemRamMode;
+  /** Manual percentage of the safe pool, or 0 while Auto is selected. */
+  systemRamSharePercent: number;
+  /** Device-wide pool sizing policy. Every brain shares the largest reservation. */
+  storagePoolMode: StoragePoolMode;
+  /** This brain's required shared-pool size; the app never sums it across brains. */
+  storagePoolBytes: number;
+  /** Last bounded storage probe, used only to pace emergency checkpoints. */
+  storageBytesPerSecond: number;
   /** Resolved slow-training rate; it is not a personality or motivation dial. */
   learningRate: number;
   traceDetail: TraceDetail;
@@ -92,7 +126,6 @@ export interface Synapse {
   sourceId: string;
   targetId: string;
   effectiveWeight: -1 | 0 | 1;
-  latentWeight: number;
   stability: number;
   plasticity: number;
   uses: number;
@@ -132,14 +165,47 @@ export interface LiquidState {
 
 export type MessageRole = "human" | "brain";
 
+export type ChatDeliveryReceiptState =
+  | "pending"
+  | "queued"
+  | "steered"
+  | "cancelled"
+  | "failed";
+
+/**
+ * Durable renderer history for user-authored text before a neural turn commits
+ * or after it ends without a commit. These rows are presentation-only: they
+ * may be shown by desktop/mobile history, but must not be supplied to model
+ * context, history tools, evolution evidence, or automatic queue replay.
+ */
+export interface ChatDeliveryReceipt {
+  schemaVersion: 1;
+  presentationOnly: true;
+  turnId: string;
+  state: ChatDeliveryReceiptState;
+  updatedAt: string;
+}
+
+export interface ChatDeliveryReceiptRequest {
+  schemaVersion: 1;
+  turnId: string;
+  content: string;
+  createdAt: string;
+  state: ChatDeliveryReceiptState;
+}
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
   createdAt: string;
+  /** Correlates an atomically committed worker turn with its UI receipt. */
+  turnId?: string;
   traceId?: string;
   runtime?: InferenceRuntime;
   status?: "complete" | "error";
+  attentionEpoch?: number;
+  deliveryReceipt?: ChatDeliveryReceipt;
 }
 
 export interface TraceStep {
@@ -173,6 +239,7 @@ export interface ThoughtTrace {
   selectedBranch: number;
   steps: TraceStep[];
   note: string;
+  attentionEpoch?: number;
 }
 
 export interface TrainingSource {
@@ -199,15 +266,52 @@ export interface TrainingSource {
   learnedIdeas: number;
   learnedConcepts: number;
   learnedSynapses: number;
+  /** Authoritative accepted records that contributed to this adaptation. */
+  learnedRecords?: number;
+  /** Slow neural optimizer steps, kept separate from synaptic mutation events. */
+  learnedParameterSteps?: number;
+  /** Composite neural checksum changed; this is not module-only weight proof. */
+  parametersChanged?: boolean;
   importedAt: string;
   rawTextRetained: boolean;
   rawText?: string;
   contentHash?: string;
   blobHash?: string;
-  policy?: DataIngestionPolicy;
+  policy?: PersistedDataIngestionPolicy;
   provenanceUrl?: string;
   license?: string;
   licenseUrl?: string;
+}
+
+export interface NeuralParameterAccounting {
+  mutableDenseParameters: number;
+  substrateDynamicSparseSynapses: number;
+  dynamicSparseSynapses: number;
+  totalNeuralParameters: number;
+  countingRule: string;
+}
+
+export type BrainOriginKind = "ground-up" | "legacy-hybrid" | "legacy";
+
+/**
+ * Compact origin metadata. Non-native variants exist only so stored old
+ * documents can be identified and refused; they are not loadable options.
+ */
+export interface BrainProvenance {
+  originKind: BrainOriginKind;
+  foundation?: {
+    modelId: string;
+    repository?: string;
+    frozen: true;
+  };
+  randomInitialization?: {
+    algorithm: string;
+    seed?: number;
+  };
+}
+
+export interface BrainRuntimeCard extends Record<string, unknown> {
+  parameterAccounting?: NeuralParameterAccounting;
 }
 
 export interface BrainMetrics {
@@ -221,6 +325,78 @@ export interface BrainMetrics {
   plasticityEvents: number;
   inferenceCount: number;
   estimatedBytes: number;
+  parameterAccounting?: NeuralParameterAccounting;
+}
+
+/**
+ * Durable creation handoff. `initializing` is written before a newly-created
+ * brain becomes discoverable and remains authoritative across renderer or app
+ * restarts. Only the final initial-learning handoff may change it to `ready`.
+ */
+export interface BrainReadiness {
+  state: "initializing" | "ready" | "failed";
+  startedAt: string;
+  completedAt?: string;
+  attempt?: number;
+  failure?: {
+    phase: "foundation" | "initial-learning";
+    message: string;
+    failedAt: string;
+    retryable: true;
+  };
+  /**
+   * Minimal credential-free recovery seed committed in the same atomic brain
+   * document as `initializing`. The richer local task journal is private and
+   * deleted after readiness; this seed closes the crash window before that
+   * journal's first write.
+   */
+  recovery?: {
+    foundation: {
+      hardwareTier: HardwareTier;
+      modalities: ModalityKind[];
+      origin: "ground-up";
+    };
+    resources: Array<
+      | { kind: "selection"; selectionId: string }
+      | { kind: "web"; url: string }
+    >;
+  };
+}
+
+export interface ConversationLedgerSummary {
+  format: "omni-conversation-ledger";
+  formatVersion: 1;
+  totalEntries: number;
+  messageCount: number;
+  actionCount: number;
+  traceCount: number;
+  headSequence: number;
+  headSha256: string;
+  attentionEpoch: number;
+}
+
+export interface BrainActivityLedgerSummary {
+  format: "omni-brain-activity-ledger";
+  formatVersion: 1;
+  journalCount: number;
+  journalHeadSequence: number;
+  journalHeadSha256: string;
+  trainingSourceCount: number;
+  trainingSourceVersionCount: number;
+  trainingSourceHeadSequence: number;
+  trainingSourceHeadSha256: string;
+  trainingSourceBytes: number;
+  learnedIdeas: number;
+  learnedConcepts: number;
+  learnedSynapses: number;
+  learnedRecords: number;
+  learnedParameterSteps: number;
+  parametersChangedSources: number;
+  topAdaptation?: {
+    sourceId: string;
+    sourceLabel: string;
+    learnedRecords: number;
+  };
 }
 
 export interface BrainDocument {
@@ -234,6 +410,8 @@ export interface BrainDocument {
   name: string;
   createdAt: string;
   updatedAt: string;
+  readiness: BrainReadiness;
+  provenance?: BrainProvenance;
   lineage: BrainLineage;
   config: BrainConfig;
   concepts: Record<string, ConceptNode>;
@@ -243,6 +421,8 @@ export interface BrainDocument {
   liquidState: LiquidState;
   messages: ChatMessage[];
   traces: ThoughtTrace[];
+  conversation?: ConversationLedgerSummary;
+  activity?: BrainActivityLedgerSummary;
   trainingSources: TrainingSource[];
   counters: {
     plasticityEvents: number;
@@ -254,6 +434,34 @@ export interface BrainDocument {
   originChecksum?: string;
 }
 
+export interface JournalLedgerEntry {
+  sequence: number;
+  payloadSha256: string;
+  rowSha256: string;
+  entry: JournalEntry;
+}
+
+export interface JournalLedgerPage {
+  brainId: string;
+  entries: JournalLedgerEntry[];
+  totalEntries: number;
+  nextCursor?: string;
+}
+
+export interface TrainingSourceLedgerEntry {
+  sequence: number;
+  payloadSha256: string;
+  rowSha256: string;
+  source: TrainingSource;
+}
+
+export interface TrainingSourceLedgerPage {
+  brainId: string;
+  entries: TrainingSourceLedgerEntry[];
+  totalEntries: number;
+  nextCursor?: string;
+}
+
 export interface BrainSummary {
   id: string;
   name: string;
@@ -262,7 +470,41 @@ export interface BrainSummary {
   updatedAt: string;
   concepts: number;
   synapses: number;
+  neuralUpdates?: number;
+  inferenceCount?: number;
+  trainingSources?: number;
+  /** This identity currently owns the persisted Active Mode preference. */
+  activeMode: boolean;
+  substrateTotals?: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+  };
   generation: number;
+  /**
+   * Instance-first lineage metadata. The immutable origin is a recovery
+   * checkpoint shared by a lineage, not a second running brain.
+   */
+  rootId?: string;
+  parentId?: string;
+  originChecksum?: string;
+  instanceKind?: "original" | "duplicate" | "fork" | "imported";
+  originInstanceCount?: number;
+  provenance?: BrainProvenance;
+  adaptation?: {
+    sourceLabel: string;
+    learnedRecords: number;
+  };
+}
+
+export interface BrainActiveModeResult {
+  schemaVersion: 1;
+  brain: BrainDocument;
+  enabled: boolean;
+  activeBrainId?: string;
+  /** Identities explicitly switched off to preserve the single active lease. */
+  deactivated: Array<{ id: string; name: string }>;
+  updatedAt: string;
 }
 
 export type SubstrateEntity =
@@ -278,6 +520,12 @@ export interface SubstrateQuery {
    */
   entity?: SubstrateEntity;
   cursor?: string;
+  /** Exact neuron/assembly endpoint filter for cursor-paged synapse inspection. */
+  connectedTo?: string;
+  /**
+   * Preferred records per page. This is not a substrate cardinality limit;
+   * the worker may return fewer only to stay inside the JSON-RPC byte envelope.
+   */
   pageSize?: number;
   region?: string;
   search?: string;
@@ -303,6 +551,10 @@ export interface SubstrateAssembly {
   region: "assembly";
   neuronIds: string[];
   childAssemblyIds: string[];
+  neuronCount?: number;
+  childAssemblyCount?: number;
+  /** True when relationships must be traversed with a connected synapse query. */
+  relationshipsPaged?: boolean;
   kind: string;
   source: string;
   confidence: number;
@@ -320,7 +572,6 @@ export interface SubstrateSynapse {
   targetId: string;
   kind: string;
   effectiveWeight: -1 | 0 | 1;
-  latentWeight: number;
   eligibility: number;
   plasticity: number;
   stability: number;
@@ -349,6 +600,8 @@ export interface SubstrateCluster {
 export interface SubstratePage {
   brainId: string;
   queriedAt: string;
+  /** Live substrate revision used to bind and invalidate continuation cursors. */
+  revision: string;
   entity: SubstrateEntity;
   zoom: number;
   totals: {
@@ -357,6 +610,11 @@ export interface SubstratePage {
     synapses: number;
   };
   matched: number;
+  /** Zero-based position of this page in the complete filtered traversal. */
+  offset?: number;
+  returned?: number;
+  pageBytes?: number;
+  transportLimited?: boolean;
   hasMore: boolean;
   nextCursor?: string;
   clusters: SubstrateCluster[];
@@ -365,9 +623,117 @@ export interface SubstratePage {
   synapses: SubstrateSynapse[];
 }
 
+/** Lightweight, checksum-validated totals from the last durable substrate. */
+export interface PersistedSubstrateOverview {
+  brainId: string;
+  revision: string;
+  source: "validated-persisted-substrate";
+  totals: {
+    neurons: number;
+    assemblies: number;
+    synapses: number;
+  };
+  parameterAccounting?: NeuralParameterAccounting;
+  latestCompletedCoverage?: PersistedDatasetCoverageSummary;
+}
+
+export interface PersistedDatasetCoverageSummary {
+  brainId: string;
+  manifestId: string;
+  manifestHash: string;
+  source: "validated-dataset-progress";
+  discoveredFiles: number;
+  processedFiles: number;
+  rejectedFiles: number;
+  discoveredRecords: number;
+  processedRecords: number;
+  rejectedRecords: number;
+  complete: true;
+  updatedAt: string;
+}
+
+export interface FreshAttentionBoundary {
+  format: "omni-fresh-attention-boundary";
+  formatVersion: 1;
+  operationId: string;
+  epoch: number;
+  createdAt: string;
+  messagesPreserved: number;
+  tracesPreserved: number;
+  synapsesPreserved: number;
+  replayEntries: number;
+  parameterChecksum: string;
+  fastSynapseChecksum: string;
+  substrateContentSha256: string;
+  cleared: Record<string, number>;
+}
+
+export interface FreshAttentionResult {
+  format: "omni-fresh-attention-boundary";
+  formatVersion: 1;
+  brainId: string;
+  committed: true;
+  idempotent: boolean;
+  boundary: FreshAttentionBoundary;
+  parameterChecksum: string;
+  fastSynapseChecksum: string;
+  substrateContentSha256: string;
+  messagesPreserved: number;
+  tracesPreserved: number;
+  synapsesPreserved: number;
+  replayEntries: number;
+  pagedCleanupPending: boolean;
+  rawPriorDialogueEligible: false;
+}
+
+export type BackgroundParameterLearningState =
+  | "idle"
+  | "pending"
+  | "running"
+  | "pausing"
+  | "paused"
+  | "complete"
+  | "failed";
+
+export interface WorkspaceLearningStatus {
+  /** Timestamp of the committed worker metadata used for these measurements. */
+  measuredAt: string;
+  fastNeuralMemory: {
+    state: "idle" | "learned";
+    safelyStored: boolean;
+    completedTurns: number;
+    connectionUpdatesTotal: number;
+    parameterStepsTotal: number;
+    turnId?: string;
+    committedAt?: string;
+    /** Composite checksum includes associative sequence tensors; not dense-weight proof. */
+    parameterChecksumAfter?: string;
+  };
+  backgroundParameters: {
+    state: BackgroundParameterLearningState;
+    /** A pause may come from the saved switch or a single-launch QA override. */
+    pauseReason?: "user" | "launch-override";
+    pending: number;
+    completed: number;
+    updatedAt: string;
+    startedAt?: string;
+    completedAt?: string;
+    lastJobId?: string;
+    /** Legacy composite checksum result; includes associative sequence tensors. */
+    parameterChanged?: boolean;
+    /** Module-only checksum result from a completed slow replay. */
+    corticalParametersUpdated?: boolean;
+    /** Last genuine replay failure observed in this app process. */
+    lastError?: string;
+    error?: string;
+  };
+}
+
 export interface WorkspaceSnapshot {
   brainId: string;
   queriedAt: string;
+  /** Worker-owned transparent runtime data; never reconstructed from UI config. */
+  runtimeCard?: BrainRuntimeCard;
   contextWindow: {
     capacityTokens: number;
     /** Baseline output budget; the live action state may adjust it per turn. */
@@ -386,6 +752,8 @@ export interface WorkspaceSnapshot {
   latentWorkspace: {
     capacity: number;
     occupancy: number;
+    resident?: number;
+    paged?: number;
     items: Array<{
       id?: string;
       kind?: string;
@@ -402,8 +770,76 @@ export interface WorkspaceSnapshot {
     mean: number;
     norm: number;
   };
+  /**
+   * Plain-language view over transient neural state. The authoritative memory
+   * remains the substrate; these records contain no source text or token IDs.
+   */
+  memory?: {
+    recentWords: {
+      capacity: number;
+      count: number;
+      evictions: number;
+      temporary: true;
+    };
+    activeFocus: {
+      count: number;
+      items: Array<{
+        assemblyId: string;
+        activation: number;
+        currentlyFiring: boolean;
+      }>;
+    };
+    workingThoughts: {
+      capacity: number;
+      count: number;
+      resident?: number;
+      paged?: number;
+      items: Array<{
+        id?: string;
+        kind?: string;
+        salience: number;
+        rehearsals: number;
+        enteredAt?: string;
+        lastActiveAt?: string;
+      }>;
+      evictions: number;
+      rehearsals: number;
+    };
+    afterimageTrail: {
+      count: number;
+      averageStrength: number;
+      items: Array<Record<string, unknown>>;
+      reversible: true;
+      rawTextStored: false;
+      rawTokenIdsStored: false;
+    };
+    retentionDynamics: {
+      trackedAssemblies: number;
+      averageScore: number;
+      minimumScore: number;
+      maximumScore: number;
+      reinforcedSynapses: number;
+      fixedStages: false;
+      reversible: true;
+    };
+    automaticSettling: {
+      requiredManualAction: false;
+      cycles: number;
+      experienceCycles: number;
+      restCycles: number;
+      expiredAfterimages: number;
+      reinforcementEvents: number;
+      scoresRecomputedEachCycle: true;
+      lastAt: string | null;
+      lastSource: string | null;
+      visiblePonderForced: false;
+    };
+  };
   hiddenBehavioralPrompt: boolean;
   rawLongTermTextInjected: boolean;
+  freshAttentionBoundary?: FreshAttentionBoundary | null;
+  /** Committed fast-memory facts plus main-process background-work state. */
+  learning?: WorkspaceLearningStatus;
 }
 
 export interface RecallResult {
@@ -420,6 +856,15 @@ export interface ChatResult {
   trace: ThoughtTrace;
   proposedActions?: StructuredAction[];
   actionEvents?: ActionEvent[];
+  /** Renderer-authored correlation metadata; never inserted into model input. */
+  turnMetadata?: ChatTurnMetadata;
+}
+
+export interface ChatTurnMetadata {
+  kind: "steer";
+  replacesTurnId: string;
+  source: "human";
+  createdAt: string;
 }
 
 export interface IngestResult {
@@ -439,19 +884,280 @@ export interface RuntimeHealth {
 
 export interface CreateBrainRequest {
   config: BrainConfig;
-  origin?: "blank" | "starter";
-  starterUrl?: string;
+  workingMemory?: WorkingMemoryPlanRequest;
   hardwareTier?: HardwareTier;
   modalities?: ModalityKind[];
   initialToolPermissions?: Array<{
     toolId: string;
     level: ToolPermissionLevel;
   }>;
+  /**
+   * Opaque main-process selections and credential-free web URLs that must be
+   * learned before first chat. The private recovery journal resolves local
+   * paths; renderer code never receives them.
+   */
+  initialResources?: Array<
+    | { kind: "selection"; selectionId: string }
+    | { kind: "web"; url: string }
+  >;
+}
+
+export interface WorkingMemoryPlanRequest {
+  mode: WorkingMemoryMode;
+  /** Hardware auto-detection may provide the tier before a brain exists. */
+  hardwareTier?: HardwareTier;
+  /**
+   * Decimal text intentionally avoids a UI-defined numeric ceiling. Manual
+   * values still must pass the same live RAM/storage preflight as the slider.
+   */
+  requestedItems?: string;
+  /** Manual active-context request. Decimal text avoids a renderer ceiling. */
+  requestedContextTokens?: string;
+  /** Live hardware probe result; never inferred from a user-facing mode. */
+  acceleratorAvailable?: boolean;
+  /** Independent of working-context sizing; controls the whole Omni process. */
+  systemRamMode?: SystemRamMode;
+  /** Advanced cap from 30 through 100 percent of the OS-reserved safe pool. */
+  systemRamSharePercent?: number;
+  /** One device-wide spill/growth pool; reservations use the largest brain, not a sum. */
+  storagePoolMode?: StoragePoolMode;
+  /** Manual device-wide pool size in bytes, encoded as decimal text without a UI cap. */
+  storagePoolBytes?: string;
+  /** Selected source bytes; sources stay in place while this sizes training scratch. */
+  trainingSourceBytes?: number;
+}
+
+export interface WorkingMemoryResourcePlan {
+  schemaVersion: 1;
+  diskSpace: DiskSpaceTelemetry;
+  /** Present during a new native build; an existing brain uses its saved architecture. */
+  architecture?: {
+    format: "omni-ground-up-architecture-profile";
+    formatVersion: 1;
+    architecture: "OmniCortex";
+    origin: "ground-up-random-initialization";
+    externalPretrainedWeights: false;
+    hardwareTier: HardwareTier;
+    dModel: number;
+    layers: number;
+    feedForward: number;
+    vsaDimensions: number;
+    routerNeurons: number;
+    workingMemoryItems: number;
+    workspaceLatents: number;
+    exactLogicalParameterCount: number;
+    exactPackedProjectionParameterCount: number;
+    exactPackedTableParameterCount: number;
+    exactPackedTernaryParameterCount: number;
+    packedTernaryWeightBytes: number;
+    packedWorkspaceTableBytes: number;
+    packedMetaplasticityReserveBytes: number;
+    fixedControlBufferReserveBytes: number;
+    packedUpdateScratchBytes: number;
+    residentInferenceStateBytes: number;
+    minimumTrainingStateBytes: number;
+    checkpointTensorBytes: number;
+    parameterCountBasis: "architecture-logical-neural-elements";
+    checkpointByteBasis: "packed-weights-plus-nonweight-state-reserve";
+  };
+  mode: WorkingMemoryMode;
+  allowed: boolean;
+  blockers: string[];
+  warnings: string[];
+  hardwareTier: HardwareTier;
+  selectedItems: number;
+  selectedItemsText: string;
+  sliderMaximumItems: number;
+  sliderMaximumItemsText: string;
+  suitableRange: {
+    minimumItems: number;
+    autoItems: number;
+    maximumItems: number;
+    extendedItems: number;
+  };
+  context: {
+    /** Exact active window selected for the worker configuration. */
+    selectedTokens: number;
+    /** Conservative tier baseline; the only tier-defined context target. */
+    floorTokens: number;
+    /** Live resource-derived Auto recommendation. */
+    autoTokens: number;
+    /** Higher resource-derived recommendation used by Extended. */
+    extendedTokens: number;
+    /** Live resident-memory/model-limit boundary for the slider. */
+    maximumTokens: number;
+    suitableMinimumTokens: number;
+    suitableMaximumTokens: number;
+    evidence: {
+      source: "live-device-model-measurement";
+      modelContextLimitTokens: number;
+      safeRamAfterModelBytes: number;
+      contextResidentBudgetBytes: number;
+      estimatedKvActivationBytesPerToken: number;
+      /** Model/runtime reserve uses two live context workspaces. */
+      contextWorkspaceMultiplier: 2;
+      minimumContextWorkspaceBytes: number;
+      selectedContextResidentBytes: number;
+      acceleratorAvailable: boolean;
+      storageClass: "slow-storage" | "moderate-storage" | "fast-storage";
+      measuredStorageBytesPerSecond: number;
+      autoContextRamFraction: number;
+    };
+  };
+  resources: {
+    totalMemoryBytes: number;
+    availableMemoryBytes: number;
+    diskTotalBytes: number;
+    diskFreeBytes: number;
+    ramReserveBytes: number;
+    mandatoryFreeDiskBytes: number;
+    checkpointHeadroomBytes: number;
+    usableDiskAfterReserveBytes: number;
+    modelBytes: number;
+    /** Exact trainable master-element count for a new native build. */
+    modelParameterCount?: number;
+    modelParameterCountBasis?: "architecture-logical-neural-elements";
+    modelStorageBasis?: "packed-weights-plus-nonweight-state-reserve";
+    modelWorkingSetBytes: number;
+    /** Estimated live learning state; raw checkpoint bytes are reported separately. */
+    estimatedResidentModelBytes: number;
+    /** Native model state plus Electron/worker/runtime overhead. */
+    fullFoundationRuntimeBytes: number;
+    /** Smallest complete model layer that must remain live per step. */
+    minimumLayerResidencyBytes: number;
+    /** Model/runtime bytes actually assigned to the live RAM tier. */
+    residentFoundationBytes: number;
+    runtimeOverheadBytes: number;
+    configuredMemorySpillBytes: number;
+    /** Physical capacity after the adaptive OS reserve; independent of current pressure. */
+    safeRamPoolBytes: number;
+    /** Reclaimable RAM available right now after the same OS reserve. */
+    availableSafeRamBytes: number;
+    systemRamBudgetBytes: number;
+    /** Portion of the persisted budget that is currently reclaimable. */
+    currentOmniAvailableBytes: number;
+    /** Persisted capacity that is temporarily occupied by other processes. */
+    currentOmniShortfallBytes: number;
+    systemRamMode: SystemRamMode;
+    systemRamSharePercent: number;
+    autoSystemRamSharePercent: number;
+    storagePoolMode: StoragePoolMode;
+    /** Shared ceiling used by every brain; instances do not multiply the reservation. */
+    sharedStoragePoolBytes: number;
+    requiredStoragePoolBytes: number;
+    maximumStoragePoolBytes: number;
+    trainingSourceBytes: number;
+    trainingScratchBytes: number;
+    futureGrowthHeadroomBytes: number;
+  };
+  offload: {
+    required: boolean;
+    residentMemoryItems: number;
+    pagedMemoryItems: number;
+    modelSpillBytes: number;
+    /** Regenerable safe-tensor cache space reserved for model layer offload. */
+    modelOffloadScratchBytes: number;
+    memorySpillBytes: number;
+    estimatedSlowdownPercent: number;
+    benchmark: {
+      measuredAt: string;
+      sampleBytes: number;
+      memoryBytesPerSecond: number;
+      storageBytesPerSecond: number;
+      cacheHit: boolean;
+    };
+  };
+  semantics: {
+    unit: "recurrent-paged-memory-item";
+    denseAttentionClaim: false;
+    /** Per-device conversational floor; independent of recurrent item count. */
+    contextFloorTokens: number;
+    /** Active attention state stays resident; only colder neural state pages. */
+    contextPagedToStorage: false;
+    /** The selected RAM/context capacity does not shrink when another app opens. */
+    capacityPersistsAcrossPressure: true;
+    /** A shared pool is budgeted once at the largest active-brain requirement. */
+    storagePoolShareRule: "largest-brain-not-sum";
+    hotRamPriority: string[];
+    spillOrder: string[];
+  };
+  training: {
+    policy: "ram-first-adaptive-streaming";
+    physicalBatchSize: number;
+    gradientAccumulation: number;
+    windowTokens: number;
+    allSourceBytesVisited: true;
+    scratchMode: "emergency-checkpoint-only";
+    scratchUsedAsVirtualRam: false;
+    sequentialScratchWrites: true;
+    minimumScratchIntervalSeconds: number;
+    storageClass: "slow-storage" | "moderate-storage" | "fast-storage";
+    measuredStorageBytesPerSecond: number;
+  };
+}
+
+/**
+ * Streamed, measured initialization state. A new instance is not chat-ready
+ * until the final readiness event and the create request both complete.
+ */
+export interface BuildProgressEvent {
+  brainId?: string;
+  streamId?: string;
+  sequence: number;
+  phase:
+    | "allocating"
+    | "language-foundation"
+    | "capability-curriculum"
+    | "action-policy"
+    | "modalities"
+    | "packing"
+    | "readiness"
+    | "initial-materials"
+    | "complete";
+  progress: number;
+  label: string;
+  /** The authoritative first-learning job snapshot when this is initial-materials progress. */
+  job?: RuntimeJob;
+  data?: {
+    recordsVisited?: number;
+    recordsTotal?: number;
+    neuronDelta?: number;
+    assemblyDelta?: number;
+    synapseDelta?: number;
+    /** Composite neural checksum, including associative state. */
+    parameterChecksumChanged?: boolean;
+    readinessChecks?: Record<string, boolean>;
+    diskSpace?: DiskSpaceTelemetry;
+  };
+}
+
+export interface DeleteInstanceRequest {
+  brainId: string;
+  /** Confirmation 1: the irreversible warning was explicitly accepted. */
+  acknowledgedIrreversible: true;
+  /** Confirmation 2: exact, case-sensitive instance name. */
+  typedName: string;
+  /** Confirmation 3: exact phrase `PERMANENTLY DELETE <instance name>`. */
+  finalConfirmation: string;
+}
+
+export interface DeleteInstanceResult {
+  deleted: true;
+  brainId: string;
+  name: string;
+  recoverable: false;
+  removedSharedBlobs: number;
+  reclaimedBytes: number;
 }
 
 export interface ImportUrlRequest {
   url: string;
   expectedSha256?: string;
+}
+
+export interface BrainImportFailure {
+  fileName: string;
+  message: string;
 }
 
 export interface FeedbackRequest {
@@ -468,11 +1174,83 @@ export interface BrainSnapshotSummary {
   checksum: string;
   metrics: BrainMetrics;
   engineChecksum?: string;
+  /** Ordered hashes of the durable neural, artifact, and ledger components. */
+  checkpointComponentSha256?: string[];
+  durableState?: {
+    conversationLedger: true;
+    activityLedger: true;
+    neuralConversationLedger: boolean;
+    artifactIndex: boolean;
+  };
+  storage?: {
+    files: number;
+    logicalBytes: number;
+    sharedBytes: number;
+    physicalBytesAdded: number;
+  };
 }
 
 export type BrainExportMode = "current" | "origin" | "private-archive" | "referenced";
 
-export type DataIngestionPolicy = "encode" | "consolidate" | "pretrain" | "archive";
+export interface DiskSpaceTelemetry {
+  schemaVersion: 1;
+  measuredAt: string;
+  diskTotalBytes: number;
+  diskFreeBytes: number;
+  mandatoryReserveBytes: number;
+  selectedDatasetBytes: number;
+  modelBytes: number;
+  checkpointBytes: number;
+  maximumWorkingMemorySpillBytes: number;
+  futureGrowthBytes: number;
+  operationWriteBytes: number;
+  projectedRemainingBytes: number;
+  projectedAboveReserveBytes: number;
+  paused: boolean;
+}
+
+export type BrainStorageOperationKind =
+  | "duplicate"
+  | "fork"
+  | "snapshot"
+  | "restore"
+  | "export"
+  | "import";
+export type BrainStorageOperationState =
+  | "queued"
+  | "running"
+  | "paused"
+  | "cancelling"
+  | "cancelled"
+  | "complete"
+  | "failed";
+
+export interface BrainStorageOperationEvent {
+  schemaVersion: 1;
+  operationId: string;
+  kind: BrainStorageOperationKind;
+  state: BrainStorageOperationState;
+  phase: string;
+  label: string;
+  sourceBrainId?: string;
+  targetBrainId?: string;
+  filesCompleted: number;
+  filesTotal: number;
+  logicalBytesCompleted: number;
+  logicalBytesTotal: number;
+  physicalBytesAdded: number;
+  sharedBytes: number;
+  bytesPerSecond: number;
+  elapsedMs: number;
+  etaMs?: number;
+  diskSpace?: DiskSpaceTelemetry;
+  error?: string;
+  updatedAt: string;
+}
+
+export type DataIngestionPolicy = "encode" | "pretrain" | "archive";
+/** Read-only compatibility value for already hash-bound source receipts. */
+export type PersistedDataIngestionPolicy = DataIngestionPolicy | "consolidate";
 
 export type DatasetFormat =
   | "text"
@@ -497,9 +1275,19 @@ export type DatasetFormat =
 export interface DatasetManifestEntry {
   index: number;
   path: string;
+  /** Original selected path when `path` names an app-owned immutable snapshot. */
+  sourcePath?: string;
   relativePath: string;
   format: DatasetFormat;
   bytes: number;
+  /** Stable file identity recorded when the manifest was committed. */
+  lastModifiedMs?: number;
+  /** Incrementally streamed content identity for the committed source snapshot. */
+  contentSha256?: string;
+  /** Explicit traversal rejection; these entries never reach neural training. */
+  rejection?: string;
+  /** App-owned immutable snapshot kind used to prevent live-source drift. */
+  snapshotKind?: "sqlite";
 }
 
 export interface DatasetManifest {
@@ -513,6 +1301,36 @@ export interface DatasetManifest {
   discoveredFiles: number;
   discoveredBytes: number;
   manifestHash: string;
+}
+
+export type DatasetPreviewPhase =
+  | "discovering"
+  | "hashing"
+  | "committing"
+  | "complete"
+  | "cancelled"
+  | "failed";
+
+/**
+ * Live, bounded metadata for an uncapped manifest build. Counts are
+ * observational while traversal is in progress; the committed manifest is
+ * still the sole authoritative snapshot used by training.
+ */
+export interface DatasetPreviewProgress {
+  schemaVersion: 1;
+  requestId: string;
+  brainId: string;
+  phase: DatasetPreviewPhase;
+  discoveredFiles: number;
+  discoveredBytes: number;
+  hashedFiles: number;
+  hashedBytes: number;
+  currentFile?: string;
+  currentFileBytes?: number;
+  currentFileHashedBytes?: number;
+  message: string;
+  startedAt: string;
+  updatedAt: string;
 }
 
 export interface DatasetCursor {
@@ -532,6 +1350,8 @@ export interface DatasetCursor {
 export interface TrainingCoverageError {
   source: string;
   message: string;
+  /** Number of records represented when equivalent failures are aggregated. */
+  count?: number;
 }
 
 export interface TrainingCoverage {
@@ -550,8 +1370,71 @@ export interface TrainingCoverage {
   shards: number;
   modalityCounts: Partial<Record<DatasetFormat, number>>;
   errors: TrainingCoverageError[];
+  /** Exhaustive failure count even when `errors` contains sampled summaries. */
+  errorCount?: number;
+  errorsTruncated?: boolean;
   errorLog?: string;
   complete: boolean;
+  updatedAt: string;
+}
+
+/**
+ * Bounded durable receipt for the most recently completed manifest entry.
+ * It contains only the data needed to finish Electron-side bookkeeping after
+ * a worker acknowledgement; source bytes and extracted text never enter it.
+ */
+export interface DatasetEntryReceipt {
+  schemaVersion: 1;
+  manifestId: string;
+  manifestHash: string;
+  transactionKey: string;
+  entryIndex: number;
+  epoch: number;
+  contentHash: string;
+  policy: PersistedDataIngestionPolicy;
+  outcome: "learned" | "rejected";
+  sourceId?: string;
+  journalId?: string;
+  sourceKind?: TrainingSource["kind"];
+  sourceBytes?: number;
+  learnedIdeas?: number;
+  learnedConcepts?: number;
+  learnedSynapses?: number;
+  learnedParameterSteps?: number;
+  parametersChanged?: boolean;
+  workerDuplicate?: boolean;
+  warnings?: string[];
+  coverage?: TrainingCoverage;
+  completedAt: string;
+}
+
+/**
+ * The sole authoritative manifest progress generation. `cursor.json` and
+ * `coverage.json` are compatibility materializations and are never read back.
+ */
+export interface DatasetProgressGeneration {
+  schemaVersion: 1;
+  format: "omni-dataset-progress";
+  manifestId: string;
+  manifestHash: string;
+  generation: number;
+  cursor: DatasetCursor;
+  coverage: TrainingCoverage;
+  lastEntryReceipt?: DatasetEntryReceipt;
+  updatedAt: string;
+  contentSha256: string;
+}
+
+export interface DatasetResumeCandidate {
+  brainId: string;
+  manifestId: string;
+  manifestHash: string;
+  state: "ready" | "paused" | "failed" | "interrupted";
+  discoveredFiles: number;
+  processedFiles: number;
+  rejectedFiles: number;
+  currentEpoch: number;
+  requestedEpochs: number;
   updatedAt: string;
 }
 
@@ -563,6 +1446,8 @@ export interface IngestFilesRequest {
 
 export interface DatasetPreviewRequest
   extends Omit<IngestFilesRequest, "selection"> {
+  /** Renderer-issued correlation used for progress and cooperative cancel. */
+  requestId?: string;
   selection?:
     | "folder"
     | import("./uploadSupport").ExperienceUploadKind;
@@ -579,6 +1464,10 @@ export interface BuildResourceSelection {
   kind: "files" | "folder";
   label: string;
   itemCount: number;
+  /** Main-process traversal result used only for resource planning. */
+  bytes?: number;
+  /** Regular files measured without following symbolic links. */
+  fileCount?: number;
 }
 
 export interface BuildResourceStartRequest extends IngestFilesRequest {
@@ -647,7 +1536,7 @@ export interface JournalEntry {
 
 export type RuntimeJobKind =
   | "training"
-  | "consolidation"
+  | "teacher"
   | "ingestion"
   | "crawl"
   | "image"
@@ -655,7 +1544,13 @@ export type RuntimeJobKind =
   | "video"
   | "vision"
   | "agent";
-export type RuntimeJobState = "queued" | "running" | "complete" | "failed" | "cancelled";
+export type RuntimeJobState =
+  | "queued"
+  | "running"
+  | "cancelling"
+  | "complete"
+  | "failed"
+  | "cancelled";
 
 export interface RuntimeJob {
   id: string;
@@ -664,10 +1559,18 @@ export interface RuntimeJob {
   state: RuntimeJobState;
   progress: number;
   label: string;
+  /** Operational presentation phase; never a neural or dataset authority. */
+  phase?: "preparing-neural-substrate" | "traversing-dataset";
   createdAt: string;
   updatedAt: string;
   error?: string;
   output?: unknown;
+  /** Present while this job is waiting behind the serial neural owner. */
+  queue?: ChatQueueState;
+  /** Measured ingestion telemetry. Operational only; never neural authority. */
+  telemetry?: TrainingTelemetry;
+  /** Latest live storage reading for any long write-producing job. */
+  diskSpace?: DiskSpaceTelemetry;
   /** A bounded, non-authoritative preview emitted while media is decoding. */
   preview?: ModalityPreview;
 }
@@ -676,14 +1579,93 @@ export interface RuntimeJobEvent {
   job: RuntimeJob;
 }
 
-export interface StartTrainingRequest {
+export type ApiTeacherProvider = "openai" | "anthropic" | "gemini";
+
+export interface ApiTeacherCredentialRequest {
+  provider: ApiTeacherProvider;
+  apiKey: string;
+}
+
+export interface ApiTeacherProviderStatus {
+  provider: ApiTeacherProvider;
+  configured: boolean;
+  persistence: "encrypted" | "session" | "none";
+  keyHint?: string;
+}
+
+export interface ApiTeacherTrainingRequest {
   brainId: string;
-  epochs?: number;
-  learningRate?: number;
-  sourceIds?: string[];
+  provider: ApiTeacherProvider;
+  model: string;
+  /** Explicit user-authored learning questions. They become training data, not a prompt at chat time. */
+  prompts: string[];
+  maxOutputTokens?: number;
+}
+
+export interface ApiTeacherTrainingReport {
+  provider: ApiTeacherProvider;
+  model: string;
+  requested: number;
+  learned: number;
+  failed: number;
+  requestHashes: string[];
+  responseHashes: string[];
+  rawCredentialsStoredInBrain: false;
+  hiddenBehavioralPromptUsed: false;
+}
+
+export type McpTransport = "http" | "stdio";
+
+export interface McpServerRegistrationRequest {
+  brainId: string;
+  id: string;
+  label: string;
+  transport: McpTransport;
+  url?: string;
+  command?: string;
+  args?: string[];
+  bearerToken?: string;
+}
+
+export interface McpToolSummary {
+  id: string;
+  remoteName: string;
+  actions: string[];
+  inputSchema: Record<string, unknown>;
+}
+
+export interface McpServerSummary {
+  brainId: string;
+  id: string;
+  label: string;
+  transport: McpTransport;
+  endpoint: string;
+  connected: boolean;
+  tools: McpToolSummary[];
+  credentialConfigured: boolean;
+  error?: string;
+}
+
+export interface ToolRuntimePreferences {
+  /** Ask-level approval tokens expire after this visible, user-configured interval. */
+  approvalTimeoutSeconds: number;
 }
 
 export type ModalityKind = "image" | "audio" | "video" | "vision";
+
+export interface ModalityGenerationSettings {
+  /** Legacy is accepted only for old callers; current UI/model requests use Auto or Exact. */
+  outputMode?: "auto" | "exact" | "legacy";
+  width?: number;
+  height?: number;
+  durationMs?: number;
+  sampleRate?: number;
+  fps?: number;
+  includeAudio?: boolean;
+  /** Interactive target, not a model/output ceiling. */
+  targetLatencyMs?: number;
+  previewIntervalMs?: number;
+}
 
 export interface ModalityGenerateRequest {
   brainId: string;
@@ -691,10 +1673,279 @@ export interface ModalityGenerateRequest {
   prompt?: string;
   conceptIds?: string[];
   inputPath?: string;
-  settings?: Record<string, number | string | boolean>;
+  settings?: ModalityGenerationSettings;
   /** Worker-issued correlation for media already decoding during chat. */
   neuralActionId?: string;
   seed?: number;
+}
+
+export interface GeneratedArtifact {
+  id: string;
+  brainId: string;
+  modality: Exclude<ModalityKind, "vision">;
+  mimeType: string;
+  sha256: string;
+  bytes: number;
+  createdAt: string;
+  seed?: number;
+  initialization?: string;
+  qualityNote?: string;
+  mediaUrl?: string;
+  available: boolean;
+  unavailableReason?: "missing" | "integrity-failed";
+}
+
+export interface GeneratedArtifactPage {
+  brainId: string;
+  artifacts: GeneratedArtifact[];
+  totalArtifacts: number;
+  nextCursor?: string;
+}
+
+/**
+ * Read-only, committed neural-media readiness. Generic audio perception
+ * and generation are deliberately separate from ASR/TTS: a sound decoder is
+ * not advertised as an intelligible voice model.
+ */
+export interface NeuralModalityCapabilities {
+  brainId: string;
+  hardwareTier: HardwareTier;
+  imagePerception: boolean;
+  audioPerception: boolean;
+  videoPerception: boolean;
+  imageGeneration: boolean;
+  audioGeneration: boolean;
+  videoGeneration: boolean;
+  neuralSpeechRecognition: boolean;
+  neuralSpeechSynthesis: boolean;
+  synchronizedVideoAudioGeneration: boolean;
+  sameBrainSubstrate: true;
+  hiddenBehavioralPrompt: false;
+  detail: string;
+}
+
+export type LiveObservationModality = "image" | "audio" | "video";
+export type LiveObservationCaptureMode =
+  | "auto"
+  | "motion"
+  | "balanced"
+  | "detail";
+export type LiveObservationBenchmarkClass =
+  | "fallback"
+  | "balanced"
+  | "high"
+  | "native";
+export type LiveObservationPermissionSource =
+  | "camera"
+  | "microphone"
+  | "screen"
+  | "mixed";
+
+/**
+ * Evidence supplied by the trusted Electron capture controller. This records
+ * device authority; it is never model-facing behavioral text.
+ */
+export interface LiveObservationPermission {
+  source: LiveObservationPermissionSource;
+  granted: true;
+  scope: "session";
+  grantedAt: string;
+  /** Optional one-way identifier; raw OS device ids must not cross preload. */
+  deviceIdHash?: string;
+}
+
+export interface LiveObservationSessionStartRequest {
+  brainId: string;
+  modalities: LiveObservationModality[];
+  permission: LiveObservationPermission;
+  /** working = temporary recurrent state; neural = assemblies/STDP, never raw bytes. */
+  retention?: "working" | "neural";
+  /** Bounded transport pressure only; it never limits committed dataset traversal. */
+  maxInFlight?: number;
+  /**
+   * Trusted capture negotiation. There is no product resolution/FPS ceiling:
+   * actual values are bounded by the source, current device resources, and
+   * transport backpressure. Visual fallback is 320x180 at 1 FPS.
+   */
+  capture?: {
+    mode: LiveObservationCaptureMode;
+    width?: number;
+    height?: number;
+    fps?: number;
+    sourceNativeWidth?: number;
+    sourceNativeHeight?: number;
+    sourceNativeFps?: number;
+    audioSampleRate?: number;
+    benchmarkClass: LiveObservationBenchmarkClass;
+  };
+}
+
+export interface LiveObservationPacket {
+  sessionId: string;
+  modality: LiveObservationModality;
+  sequence: number;
+  /** Monotonic capture timestamp supplied by the trusted controller. */
+  timestampMs: number;
+  mimeType: string;
+  data: Uint8Array;
+  settings?: {
+    sampleRate?: number;
+    channels?: number;
+    width?: number;
+    height?: number;
+    durationMs?: number;
+    observationControlId?: string;
+    resolutionMode?: "native" | "current" | "custom";
+    burstIndex?: number;
+    burstCount?: number;
+  };
+}
+
+export interface LiveObservationSession {
+  id: string;
+  brainId: string;
+  state: "active" | "stopping" | "stopped" | "cancelled";
+  modalities: LiveObservationModality[];
+  permission: LiveObservationPermission;
+  retention: "working" | "neural";
+  maxInFlight: number;
+  /** Resource/source-derived transport bound, never a fixed product limit. */
+  maxPacketBytes: number;
+  inFlight: number;
+  packetsReceived: number;
+  packetsAccepted: number;
+  packetsDroppedBackpressure: number;
+  bytesAccepted: number;
+  lastSequence: number;
+  createdAt: string;
+  updatedAt: string;
+  capabilities: {
+    imageNeural: boolean;
+    audioNeural: boolean;
+    videoNeural: boolean;
+  };
+  capture: {
+    mode: LiveObservationCaptureMode;
+    width?: number;
+    height?: number;
+    fps?: number;
+    sourceNativeWidth?: number;
+    sourceNativeHeight?: number;
+    sourceNativeFps?: number;
+    audioSampleRate?: number;
+    benchmarkClass: LiveObservationBenchmarkClass;
+    revision: number;
+  };
+}
+
+export interface LiveObservationControl {
+  id: string;
+  sessionId: string;
+  kind: "configure" | "snapshot";
+  source: "human" | "brain";
+  temporary: true;
+  requested: {
+    mode?: LiveObservationCaptureMode;
+    width?: number;
+    height?: number;
+    fps?: number;
+    /** Compatibility signal for a native-resolution snapshot. */
+    fullResolution?: true;
+    /** Defaults to native; custom requires width and height. */
+    resolutionMode?: "native" | "current" | "custom";
+    /** Short burst length; applied value is resource/source bounded. */
+    burstCount?: number;
+    /** Inter-frame delay; applied value is resource/source bounded. */
+    intervalMs?: number;
+    /** Temporary configure duration; applied value is resource bounded. */
+    durationMs?: number;
+  };
+  state: "requested" | "applied" | "rejected" | "cancelled" | "reverted";
+  actual?: {
+    mode: LiveObservationCaptureMode;
+    width?: number;
+    height?: number;
+    fps?: number;
+    fullResolution?: true;
+    resolutionMode?: "native" | "current" | "custom";
+    burstCount?: number;
+    intervalMs?: number;
+    durationMs?: number;
+    /** Capture revision restored after a temporary configure action. */
+    revertToRevision?: number;
+    revision: number;
+  };
+  reason?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LiveObservationControlResolution {
+  sessionId: string;
+  controlId: string;
+  state: "applied" | "rejected" | "cancelled" | "reverted";
+  actual?: LiveObservationControl["actual"];
+  reason?: string;
+}
+
+export interface LiveObservationControlRequest {
+  sessionId: string;
+  kind: LiveObservationControl["kind"];
+  requested: LiveObservationControl["requested"];
+}
+
+export interface LiveObservationPacketResult {
+  session: LiveObservationSession;
+  accepted: boolean;
+  reason?: "backpressure" | "session-stopped";
+  observation?: {
+    assemblyId?: string | null;
+    spikeRate: number;
+    novelty: number;
+    packetSha256: string;
+    rawPacketStored: false;
+    datasetCoverageCommitted: false;
+    sameBrainSharedIdeaSpace: true;
+    hiddenBehavioralPrompt: false;
+    perception?: {
+      sourceWidth: number;
+      sourceHeight: number;
+      globalDecodedWidth: number;
+      globalDecodedHeight: number;
+      tilesAvailable: number;
+      tilesEncoded: number;
+      tileCoverage: number;
+      tileInputSize: number;
+      tileGridRows: number;
+      tileGridColumns: number;
+      tileSelection: "uniform-resource-scaled";
+      tileBinding: "ternary-position-vsa";
+      spatialTileEncoder: "same-brain-ternary-image-pack";
+      temporalFrames: number;
+      rawTilesStored: false;
+    };
+    observationControlId?: string;
+    resolutionMode?: "native" | "current" | "custom";
+    burstIndex?: number;
+    burstCount?: number;
+  };
+  actions?: StructuredAction[];
+  controls?: LiveObservationControl[];
+}
+
+export interface LiveObservationEvent {
+  type:
+    | "started"
+    | "packet"
+    | "backpressure"
+    | "action"
+    | "control"
+    | "stopped"
+    | "cancelled";
+  session: LiveObservationSession;
+  packet?: LiveObservationPacketResult;
+  actions?: StructuredAction[];
+  control?: LiveObservationControl;
 }
 
 export interface TraceQuery {
@@ -721,8 +1972,7 @@ export interface BuildRecipe {
   sha256: string;
   license: string;
   provenanceUrl?: string;
-  origin: "blank" | "starter";
-  starterUrl?: string;
+  origin: "ground-up";
   hardwareTier: HardwareTier;
   modalities: ModalityKind[];
   toolPermissions: Array<{
@@ -893,6 +2143,7 @@ export interface ToolExecutionResult {
   output?: unknown;
   error?: string;
   approvalToken?: string;
+  approvalExpiresAt?: string;
 }
 
 export type ActionKind =
@@ -944,6 +2195,49 @@ export interface ActionEvent {
   /** Latest safe progressive preview for an imagination action. */
   preview?: ModalityPreview;
   error?: string;
+  attentionEpoch?: number;
+}
+
+/**
+ * Resolve one already-visible Ask action without creating another chat turn.
+ * Main owns the action arguments and completed tool output; the renderer sends
+ * only opaque correlation identifiers and the single-use approval token.
+ */
+export interface ApprovedChatActionRequest {
+  brainId: string;
+  actionEventId: string;
+  approvalToken: string;
+}
+
+export interface ApprovedChatActionResult {
+  actionEvent: ActionEvent;
+  learned: boolean;
+  brain?: BrainDocument;
+  learningError?: string;
+}
+
+export interface ConversationLedgerEntry {
+  sequence: number;
+  id: string;
+  kind: "message" | "action" | "trace";
+  createdAt: string;
+  attentionEpoch: number;
+  payloadSha256: string;
+  rowSha256: string;
+  message?: ChatMessage;
+  action?: ActionEvent;
+  trace?: ThoughtTrace;
+}
+
+export interface ConversationLedgerPage {
+  brainId: string;
+  entries: ConversationLedgerEntry[];
+  totalEntries: number;
+  hasOlder: boolean;
+  beforeSequence?: number;
+  nextBeforeSequence?: number;
+  headSequence: number;
+  headSha256: string;
 }
 
 /**
@@ -951,13 +2245,57 @@ export interface ActionEvent {
  * The main process validates and bounds every field before it crosses preload.
  */
 export interface ModalityPreview {
+  /** Versioned fields travel through the existing protocol-1 job/action stream. */
+  schemaVersion?: 1;
   revision: number;
   progress?: number;
   statusLabel?: string;
   mimeType?: string;
   dataUrl?: string;
+  /** Main-process lease; contains no filesystem path or media bytes. */
+  mediaUrl?: string;
   path?: string;
   artifactPath?: string;
+  modality?: Exclude<ModalityKind, "vision">;
+  stage?:
+    | "diffusion-vq-decode"
+    | "codec-waveform"
+    | "temporal-frame-timeline";
+  completedUnits?: number;
+  totalUnits?: number;
+  previewCount?: number;
+  width?: number;
+  height?: number;
+  sampleCount?: number;
+  totalSamples?: number;
+  durationMs?: number;
+  sampleRate?: number;
+  fps?: number;
+  frameCount?: number;
+  totalFrames?: number;
+  hardwareTier?: HardwareTier;
+  cadence?: "hardware-aware-bounded-synchronous";
+  producer?: "same-brain-decoder";
+  /** SHA-256 of the exact encoded bytes carried by dataUrl for this revision. */
+  payloadSha256?: string;
+  actualDecoderOutput?: true;
+  spatialResolutionReduced?: false;
+  hardwareScaled?: true;
+  modelDefinedMaximum?: null;
+  trained?: boolean;
+  trainingState?: "untrained-diagnostic" | "trained-unverified-quality";
+  semanticQualityClaimed?: false;
+  partialCoverage?: boolean;
+  coveredFraction?: number;
+  ideaSource?:
+    | "manual-prompt-and-active-assemblies"
+    | "manual-prompt"
+    | "active-assemblies"
+    | "active-working-memory"
+    | "active-liquid-state"
+    | "intrinsic-neural-cold-start";
+  activeAssemblyCount?: number;
+  promptProvided?: boolean;
 }
 
 interface ChatStreamEventBase {
@@ -966,6 +2304,40 @@ interface ChatStreamEventBase {
   turnId: string;
   sequence: number;
   createdAt: string;
+}
+
+export type RuntimeActivityOwner =
+  | "build"
+  | "chat"
+  | "evolution"
+  | "training"
+  | "ingestion"
+  | "modality"
+  | "inspection"
+  | "idle"
+  | "system";
+
+export interface RuntimeActivityReference {
+  requestId: string;
+  owner: RuntimeActivityOwner;
+  label: string;
+  method: string;
+  brainId?: string;
+  jobId?: string;
+  turnId?: string;
+}
+
+export interface ChatQueueState {
+  position: number;
+  queuedBehind: RuntimeActivityReference;
+}
+
+export interface ChatCancellationState {
+  phase: "pending" | "queued" | "running";
+  /** True only when the cancelled turn never owned the worker. */
+  unrelatedActivityContinues: boolean;
+  /** True only after a dispatched worker has actually exited. */
+  workerTerminationAcknowledged: boolean;
 }
 
 export interface ChatTokenStreamEvent extends ChatStreamEventBase {
@@ -984,10 +2356,29 @@ export interface ChatModalityPreviewStreamEvent extends ChatStreamEventBase {
   preview: ModalityPreview;
 }
 
+/**
+ * Generation has ended and post-reply neural work remains active. During the
+ * first phase the visible turn itself is not committed yet. During action
+ * integration the visible turn is committed and only the completed, visible
+ * action result is entering neural learning; it is never a synthetic message.
+ */
+export interface ChatPhaseStreamEvent extends ChatStreamEventBase {
+  type: "chat-phase";
+  phase: "reply-complete-learning" | "action-result-learning";
+  replyComplete: true;
+  turnCommitted: boolean;
+  learning: true;
+  saving: true;
+}
+
 export interface ChatStateStreamEvent extends ChatStreamEventBase {
   type: "chat-state";
-  state: "started" | "complete" | "cancelled" | "failed";
+  state: "started" | "queued" | "complete" | "cancelled" | "failed";
   error?: string;
+  queue?: ChatQueueState;
+  cancellation?: ChatCancellationState;
+  /** Typed operational correlation only; it is not model-facing prose. */
+  turnMetadata?: ChatTurnMetadata;
 }
 
 /**
@@ -998,6 +2389,7 @@ export type ChatStreamEvent =
   | ChatTokenStreamEvent
   | ChatActionStreamEvent
   | ChatModalityPreviewStreamEvent
+  | ChatPhaseStreamEvent
   | ChatStateStreamEvent;
 
 export interface IdleCognitionTrace {
@@ -1029,17 +2421,23 @@ export interface IdleCognitionTrace {
 export interface IdleCycleResult {
   brainId: string;
   ran: boolean;
-  reason?: "idle-cognition-disabled" | "cooldown" | "no-learned-assemblies";
+  reason?:
+    | "idle-cognition-disabled"
+    | "initial-learning"
+    | "foreground-work"
+    | "cooldown"
+    | "no-learned-assemblies";
   retryAfterSeconds?: number;
   trace?: IdleCognitionTrace;
   actions: StructuredAction[];
   actionEvents?: ActionEvent[];
   metrics?: Record<string, unknown>;
-  runtimeCard?: Record<string, unknown>;
+  runtimeCard?: BrainRuntimeCard;
 }
 
 export type EvolutionRunState =
   | "experimenting"
+  | "stopping"
   | "awaiting-review"
   | "promoted"
   | "rejected"
@@ -1165,6 +2563,41 @@ export interface EvolutionRollbackRequest {
   candidateId: string;
 }
 
+export interface MobileGatewayDevice {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastSeenAt: string;
+}
+
+export interface MobileGatewayStatus {
+  schemaVersion: 1;
+  protocolVersion: 2;
+  state: "stopped" | "listening";
+  allowLan: boolean;
+  transportSecurity: "stopped" | "loopback-http" | "certificate-pinned-tls";
+  port?: number;
+  /** HTTP loopback/emulator or HTTPS LAN addresses with an out-of-band pin fragment. */
+  baseUrls: string[];
+  /** Public SHA-256 identity displayed and encoded into LAN pairing addresses. */
+  certificateSha256?: string;
+  devices: MobileGatewayDevice[];
+}
+
+export interface MobilePairingSession extends MobileGatewayStatus {
+  state: "listening";
+  code: string;
+  expiresAt: string;
+}
+
+export interface MobileGatewayStartRequest {
+  /**
+   * False binds only to this computer. True is an explicit trusted-LAN opt-in;
+   * every advertised LAN address uses the installation's pinned TLS identity.
+   */
+  allowLan: boolean;
+}
+
 export interface OmniApi {
   window: {
     minimize(): Promise<void>;
@@ -1180,46 +2613,109 @@ export interface OmniApi {
     list(): Promise<BrainSummary[]>;
     get(id: string): Promise<BrainDocument>;
     create(request: CreateBrainRequest): Promise<BrainDocument>;
+    completeInitialization(id: string): Promise<BrainDocument>;
+    retryInitialization(id: string): Promise<BrainDocument>;
     update(id: string, config: BrainConfig): Promise<BrainDocument>;
-    duplicate(id: string, name?: string): Promise<BrainDocument>;
-    fork(id: string, name?: string): Promise<BrainDocument>;
-    remove(id: string): Promise<boolean>;
-    snapshot(id: string, label?: string): Promise<BrainSnapshotSummary>;
+    setOnlineLearning(id: string, enabled: boolean): Promise<BrainDocument>;
+    setActiveMode(id: string, enabled: boolean): Promise<BrainActiveModeResult>;
+    duplicate(id: string, name?: string, operationId?: string): Promise<BrainDocument>;
+    fork(id: string, name?: string, operationId?: string): Promise<BrainDocument>;
+    pauseStorageOperation(operationId: string): Promise<BrainStorageOperationEvent>;
+    resumeStorageOperation(operationId: string): Promise<BrainStorageOperationEvent>;
+    cancelStorageOperation(operationId: string): Promise<BrainStorageOperationEvent>;
+    onStorageOperation(listener: (event: BrainStorageOperationEvent) => void): () => void;
+    remove(request: DeleteInstanceRequest): Promise<DeleteInstanceResult>;
+    snapshot(
+      id: string,
+      label?: string,
+      operationId?: string
+    ): Promise<BrainSnapshotSummary>;
     listSnapshots(id: string): Promise<BrainSnapshotSummary[]>;
-    restoreSnapshot(id: string, snapshotId: string): Promise<BrainDocument>;
-    export(id: string, mode?: BrainExportMode): Promise<string | null>;
-    importFile(): Promise<BrainDocument | null>;
+    restoreSnapshot(
+      id: string,
+      snapshotId: string,
+      operationId?: string
+    ): Promise<BrainDocument>;
+    export(id: string, mode?: BrainExportMode, operationId?: string): Promise<string | null>;
+    importFile(operationId?: string): Promise<BrainDocument | null>;
     onImported(listener: (brain: BrainDocument) => void): () => void;
+    onImportFailed(listener: (failure: BrainImportFailure) => void): () => void;
+    onBuild(listener: (event: BuildProgressEvent) => void): () => void;
     health(id?: string): Promise<EngineHealth>;
+    persistedSubstrateOverview(id: string): Promise<PersistedSubstrateOverview | null>;
     querySubstrate(id: string, query?: SubstrateQuery): Promise<SubstratePage>;
     workspace(id: string): Promise<WorkspaceSnapshot>;
+    freshAttention(id: string): Promise<FreshAttentionResult>;
+    journalPage(
+      id: string,
+      cursor?: string,
+      limit?: number
+    ): Promise<JournalLedgerPage>;
   };
   chat: {
-    send(id: string, input: string, turnId?: string): Promise<ChatResult>;
+    send(
+      id: string,
+      input: string,
+      turnId?: string,
+      turnMetadata?: ChatTurnMetadata
+    ): Promise<ChatResult>;
     cancel(id: string, turnId?: string): Promise<number>;
+    recordDeliveryReceipt(
+      id: string,
+      receipt: ChatDeliveryReceiptRequest
+    ): Promise<void>;
+    approveAction(request: ApprovedChatActionRequest): Promise<ApprovedChatActionResult>;
     list(id: string): Promise<ChatMessage[]>;
+    listPage(
+      id: string,
+      beforeSequence?: number,
+      limit?: number
+    ): Promise<ConversationLedgerPage>;
     feedback(request: FeedbackRequest): Promise<BrainDocument>;
     onAction(listener: (event: ActionEvent) => void): () => void;
     onStream(listener: (event: ChatStreamEvent) => void): () => void;
   };
+  mobile: {
+    status(): Promise<MobileGatewayStatus>;
+    startPairing(request: MobileGatewayStartRequest): Promise<MobilePairingSession>;
+    stop(): Promise<MobileGatewayStatus>;
+    revoke(deviceId: string): Promise<MobileGatewayStatus>;
+  };
   train: {
-    start(request: StartTrainingRequest): Promise<RuntimeJob>;
-    consolidate(id: string): Promise<BrainDocument>;
     cancel(jobId: string): Promise<RuntimeJob>;
     list(id?: string): Promise<RuntimeJob[]>;
     onEvent(listener: (event: RuntimeJobEvent) => void): () => void;
+  };
+  teacher: {
+    status(): Promise<ApiTeacherProviderStatus[]>;
+    saveCredential(request: ApiTeacherCredentialRequest): Promise<ApiTeacherProviderStatus[]>;
+    removeCredential(provider: ApiTeacherProvider): Promise<ApiTeacherProviderStatus[]>;
+    start(request: ApiTeacherTrainingRequest): Promise<RuntimeJob>;
+    cancel(jobId: string): Promise<RuntimeJob>;
+    list(brainId?: string): Promise<RuntimeJob[]>;
+    onEvent(listener: (event: RuntimeJobEvent) => void): () => void;
+  };
+  mcp: {
+    list(brainId: string): Promise<McpServerSummary[]>;
+    add(request: McpServerRegistrationRequest): Promise<McpServerSummary>;
+    remove(brainId: string, serverId: string): Promise<boolean>;
+    refresh(brainId: string, serverId: string): Promise<McpServerSummary>;
   };
   data: {
     selectBuildResources(
       kind: BuildResourceSelection["kind"],
       selection?: import("./uploadSupport").ExperienceUploadKind
     ): Promise<BuildResourceSelection | null>;
+    listBuildResources(): Promise<BuildResourceSelection[]>;
     discardBuildResource(selectionId: string): Promise<boolean>;
     startBuildResource(request: BuildResourceStartRequest): Promise<RuntimeJob>;
     preview(request: DatasetPreviewRequest): Promise<DatasetManifest | null>;
+    cancelPreview(requestId: string): Promise<boolean>;
+    onPreviewProgress(listener: (event: DatasetPreviewProgress) => void): () => void;
     start(request: DatasetStartRequest): Promise<RuntimeJob>;
     pause(jobId: string): Promise<RuntimeJob>;
     resume(request: DatasetStartRequest): Promise<RuntimeJob>;
+    resumable(brainId: string): Promise<DatasetResumeCandidate | null>;
     coverage(brainId: string, manifestId: string): Promise<TrainingCoverage>;
     ingestFiles(request: IngestFilesRequest): Promise<IngestResult[]>;
     ingestFolder(request: IngestFilesRequest): Promise<IngestResult[]>;
@@ -1227,13 +2723,39 @@ export interface OmniApi {
     ingestWeb(request: IngestWebRequest): Promise<IngestResult>;
     crawlWeb(request: WebCrawlRequest): Promise<RuntimeJob>;
     cancel(jobId: string): Promise<RuntimeJob>;
+    sources(
+      brainId: string,
+      cursor?: string,
+      limit?: number
+    ): Promise<TrainingSourceLedgerPage>;
   };
   modality: {
+    capabilities(brainId: string): Promise<NeuralModalityCapabilities>;
+    artifacts(
+      brainId: string,
+      cursor?: string,
+      limit?: number
+    ): Promise<GeneratedArtifactPage>;
     generate(request: ModalityGenerateRequest): Promise<RuntimeJob>;
     selectInput(
       request: Omit<ModalityGenerateRequest, "inputPath">
     ): Promise<RuntimeJob | null>;
     cancel(jobId: string): Promise<RuntimeJob>;
+    startObservation(
+      request: LiveObservationSessionStartRequest
+    ): Promise<LiveObservationSession>;
+    pushObservation(
+      packet: LiveObservationPacket
+    ): Promise<LiveObservationPacketResult>;
+    stopObservation(sessionId: string): Promise<LiveObservationSession>;
+    cancelObservation(sessionId: string): Promise<LiveObservationSession>;
+    requestObservationControl(
+      request: LiveObservationControlRequest
+    ): Promise<LiveObservationControl>;
+    resolveObservationControl(
+      resolution: LiveObservationControlResolution
+    ): Promise<LiveObservationControl>;
+    onObservation(listener: (event: LiveObservationEvent) => void): () => void;
   };
   trace: {
     list(brainId: string, query?: TraceQuery): Promise<ThoughtTrace[]>;
@@ -1247,6 +2769,8 @@ export interface OmniApi {
     ): Promise<ToolPermissionRecord[]>;
     execute(request: ToolInvocation): Promise<ToolExecutionResult>;
     cancel(brainId: string): Promise<number>;
+    preferences(): Promise<ToolRuntimePreferences>;
+    setPreferences(value: ToolRuntimePreferences): Promise<ToolRuntimePreferences>;
   };
   agent: {
     fork(brainId: string, name?: string): Promise<BrainDocument>;
@@ -1276,6 +2800,7 @@ export interface OmniApi {
     installModalityPackFile(brainId: string): Promise<InstalledModalityPack | null>;
     listModalityPacks(brainId: string): Promise<InstalledModalityPack[]>;
     hardwareProfile(): Promise<HardwareProfile>;
+    resourcePlan(request: WorkingMemoryPlanRequest): Promise<WorkingMemoryResourcePlan>;
   };
 }
 
@@ -1291,11 +2816,21 @@ export const DEFAULT_CONFIG: BrainConfig = {
   idleCognition: true,
 
   workingMemorySlots: 256,
+  contextWindowTokens: 1024,
+  workingMemoryMode: "auto",
+  memoryOffloadBytes: 0,
+  memoryResidentItems: 256,
+  memoryOffloadSlowdownPercent: 0,
+  systemRamMode: "auto",
+  systemRamSharePercent: 0,
+  storagePoolMode: "auto",
+  storagePoolBytes: 0,
+  storageBytesPerSecond: 0,
   learningRate: 0.14,
   traceDetail: "standard",
 
   retainSourceText: false,
-  memoryRecipe: "human-consolidation"
+  memoryRecipe: "adaptive-retention"
 };
 
 const PRESET_DESCRIPTIONS: Record<ArchitecturePreset, string> = {

@@ -25,9 +25,11 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             node_arch: arm64
-            # PyTorch does not publish stable Windows ARM64 wheels. The app
-            # shell remains native ARM64 while its x64 worker runs through the
-            # Windows 11 x64-emulation layer.
+            # PyTorch and PyInstaller now publish Windows ARM64 builds, but the
+            # complete release runtime still has binary-wheel gaps (including
+            # pyarrow and imageio-ffmpeg). Keep the app shell native ARM64 and
+            # label its complete x64 worker truthfully until every dependency
+            # passes the native binary-only installation and package smoke.
             python_arch: x64
             worker_arch: x64
             package_script: package:win:arm64
@@ -42,10 +44,13 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: "3.11.9"
           architecture: ${{ matrix.python_arch }}
           cache: pip
-          cache-dependency-path: engine/requirements.txt
+          cache-dependency-path: |
+            engine/requirements.txt
+            engine/requirements-build.txt
+            engine/locks/*.lock
 
       - name: Install JavaScript dependencies
         run: npm ci
@@ -53,12 +58,15 @@ jobs:
       - name: Verify stable release metadata
         run: npm run verify:release
 
-      - name: Install CPU brain runtime
+      - name: Install hash-locked CPU brain runtime
         run: |
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0+cpu"
-          python -m pip install -r engine/requirements.txt
+          python scripts/install-engine-lock.py
+          python -m pip check
+          python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
 
       - name: Test brain
+        env:
+          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
         run: npm run test:python:portable
 
       - name: Test desktop app
@@ -71,6 +79,8 @@ jobs:
         run: npm run test:ui:built
 
       - name: Build self-contained brain worker
+        env:
+          OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: npm run build:engine:win
 
       - name: Smoke self-contained brain worker
@@ -80,16 +90,15 @@ jobs:
             -Executable ./engine-dist/omni-engine/omni-engine.exe `
             -BrainRoot "${{ runner.temp }}/omni-worker-${{ matrix.arch }}"
 
-      - name: Package signed-ready Windows installer and archive
+      - name: Package unsigned signed-ready Windows installer and archive
         env:
-          WIN_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
-          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+          OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Arch "${{ matrix.arch }}" -SkipBuild
 
       - name: Smoke ZIP, silent NSIS install, and installed worker
         env:
-          OMNI_EXPECT_SIGNED: ${{ secrets.WINDOWS_CSC_LINK != '' && '1' || '0' }}
+          OMNI_EXPECT_SIGNED: "0"
         shell: pwsh
         run: |
           ./scripts/smoke-windows-package.ps1 `
@@ -102,6 +111,9 @@ jobs:
         with:
           name: omni-agi-studio-windows-${{ matrix.arch }}
           if-no-files-found: error
+          # Installer and ZIP outputs are already compressed. Avoid spending
+          # runner CPU recompressing bytes that do not shrink meaningfully.
+          compression-level: 0
           path: |
             release/*-Windows-${{ matrix.arch }}.exe
             release/*-Windows-${{ matrix.arch }}.zip

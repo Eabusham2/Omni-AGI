@@ -11,12 +11,16 @@ import type {
   EvolutionSourceEditLineage,
   EvolutionStartRequest,
   PromotionRecord,
+  RuntimeJob,
   ToolPermissionLevel,
   ToolExecutionResult,
   ToolInvocation
 } from "../shared/types";
 import type { BrainRepository } from "./brainRepository";
-import type { EngineSupervisor } from "./engineSupervisor";
+import type {
+  EngineCancellationAcknowledgement,
+  EngineSupervisor
+} from "./engineSupervisor";
 import {
   EVOLUTION_BENCHMARK_DOMAINS,
   EVOLUTION_EVALUATOR_VERSION,
@@ -164,11 +168,20 @@ interface EvolutionArchive {
 }
 
 export interface EvolutionToolExecutor {
-  execute(invocation: ToolInvocation): Promise<ToolExecutionResult>;
-  cancel(brainId: string): number;
+  execute(
+    invocation: ToolInvocation,
+    onProgress?: (job: RuntimeJob) => void,
+    requestId?: string
+  ): Promise<ToolExecutionResult>;
+  cancel(brainId: string, requestId?: string): number;
+  cancelAndWait?(brainId: string, requestId?: string): Promise<number>;
 }
 
-type EvolutionEngine = Pick<EngineSupervisor, "request">;
+type EvolutionEngine = Pick<EngineSupervisor, "request"> & {
+  cancelRequest?(
+    requestId: string
+  ): Promise<EngineCancellationAcknowledgement>;
+};
 
 const WORKER_BENCHMARK_DOMAINS = [
   "neural-objective",
@@ -446,6 +459,9 @@ function workerState(status: string | undefined): EvolutionCandidateRecord["stat
 
 export class EvolutionController {
   private readonly archiveLocks = new Map<string, Promise<void>>();
+  private readonly activeRuns = new Map<string, string>();
+  private readonly stoppingRuns = new Set<string>();
+  private readonly stopOperations = new Map<string, Promise<EvolutionRunRecord>>();
 
   constructor(
     private readonly repository: BrainRepository,
@@ -534,22 +550,43 @@ export class EvolutionController {
       | "evolution.list"
       | "evolution.promote"
       | "evolution.reject"
-      | "evolution.rollback",
+      | "evolution.rollback"
+      | "cancel",
     brainId: string,
     params: Record<string, unknown> = {},
-    timeoutMs = 120_000
+    timeoutMs = 120_000,
+    requestId?: string
   ): Promise<T> {
     if (!this.engine) {
       throw new Error("The supervised neural evolution worker is unavailable.");
     }
+    const requestParams = {
+      brainId,
+      storagePath: this.repository.brainDirectory(brainId),
+      ...params
+    };
+    // Older embedded/test transports do not expose request-id cancellation.
+    // Preserve their three-argument request surface while the production
+    // supervisor receives explicit activity ownership.
+    if (!requestId || !this.engine.cancelRequest) {
+      return this.engine.request<T>(method, requestParams, timeoutMs);
+    }
     return this.engine.request<T>(
       method,
+      requestParams,
+      timeoutMs,
+      undefined,
+      "foreground",
       {
+        requestId,
+        owner: "evolution",
+        label:
+          method === "cancel"
+            ? "Acknowledging evolution cancellation"
+            : "Neural evolution",
         brainId,
-        storagePath: this.repository.brainDirectory(brainId),
-        ...params
-      },
-      timeoutMs
+        jobId: String(params.jobId ?? requestId)
+      }
     );
   }
 
@@ -638,6 +675,10 @@ export class EvolutionController {
 
   async detectLimitations(brainId: string): Promise<EvolutionLimitationEvidence[]> {
     const brain = await this.repository.get(brainId);
+    const conversationEvidence = await this.repository.recentConversationEvidence(
+      brainId,
+      1_000
+    );
     const evidence: EvolutionLimitationEvidence[] = [];
     const seen = new Set<string>();
     const add = (
@@ -683,7 +724,9 @@ export class EvolutionController {
       }
     };
 
-    for (const message of brain.messages.slice(-500)) {
+    for (const message of conversationEvidence.flatMap((entry) =>
+      entry.message ? [entry.message] : []
+    ).slice(-500)) {
       if (message.status === "error") {
         add(
           "failed-action",
@@ -696,7 +739,9 @@ export class EvolutionController {
         classify(message.content, message.createdAt, "brain-message");
       }
     }
-    for (const trace of brain.traces.slice(-500)) {
+    for (const trace of conversationEvidence.flatMap((entry) =>
+      entry.trace ? [entry.trace] : []
+    ).slice(-500)) {
       for (const step of trace.steps) {
         classify(`${step.stage}: ${step.detail} ${step.value ?? ""}`, trace.createdAt, "trace");
       }
@@ -877,6 +922,7 @@ export class EvolutionController {
     });
 
     let proposal: ToolExecutionResult;
+    this.activeRuns.set(ids.run, request.brainId);
     try {
       proposal = await this.tools.execute({
         brainId: request.brainId,
@@ -889,13 +935,14 @@ export class EvolutionController {
           evaluatorPolicySha256: EVOLUTION_POLICY_SHA256,
           ...(sourceEdits === undefined ? {} : { sourceEdits })
         }
-      });
+      }, undefined, ids.run);
     } catch (error) {
       const message = errorMessage(error);
       return this.mutateArchive(request.brainId, (archive) => {
         const run = archive.runs.find((entry) => entry.id === initial.id);
         const candidate = archive.candidates.find((entry) => entry.id === ids.candidate);
         if (!run || !candidate) throw new Error("The evolution archive changed unexpectedly.");
+        if (["stopping", "stopped"].includes(run.state)) return run;
         const updatedAt = new Date().toISOString();
         run.state = "failed";
         run.error = message;
@@ -905,12 +952,17 @@ export class EvolutionController {
         candidate.updatedAt = updatedAt;
         return run;
       });
+    } finally {
+      if (this.activeRuns.get(ids.run) === request.brainId) {
+        this.activeRuns.delete(ids.run);
+      }
     }
     const sourcePolicy = await this.permission(request.brainId);
     const proposedRun = await this.mutateArchive(request.brainId, (archive) => {
       const run = archive.runs.find((entry) => entry.id === initial.id);
       const candidate = archive.candidates.find((entry) => entry.id === ids.candidate);
       if (!run || !candidate) throw new Error("The evolution archive changed unexpectedly.");
+      if (["stopping", "stopped"].includes(run.state)) return run;
       const updatedAt = new Date().toISOString();
       run.updatedAt = updatedAt;
       candidate.updatedAt = updatedAt;
@@ -1125,6 +1177,7 @@ export class EvolutionController {
 
     let proposal: Record<string, unknown>;
     let policy: ToolPermissionLevel;
+    this.activeRuns.set(ids.run, request.brainId);
     try {
       policy = await this.assertWorkerPermission(request.brainId, "experiment");
       proposal = await this.workerRequest<Record<string, unknown>>(
@@ -1141,13 +1194,15 @@ export class EvolutionController {
           architectureChange,
           provenance: {
             ...provenance,
+            runtimeRequestId: ids.run,
             objective,
             hypothesis: initial.hypothesis,
             limitationEvidence: initial.limitations,
             route: kind
           }
         },
-        30 * 60_000
+        30 * 60_000,
+        ids.run
       );
     } catch (error) {
       const message = errorMessage(error);
@@ -1155,6 +1210,7 @@ export class EvolutionController {
         const run = archive.runs.find((entry) => entry.id === initial.id);
         const candidate = archive.candidates.find((entry) => entry.id === ids.candidate);
         if (!run || !candidate) throw new Error("The evolution archive changed unexpectedly.");
+        if (["stopping", "stopped"].includes(run.state)) return run;
         const updatedAt = new Date().toISOString();
         run.state = "failed";
         run.error = message;
@@ -1164,12 +1220,17 @@ export class EvolutionController {
         candidate.updatedAt = updatedAt;
         return run;
       });
+    } finally {
+      if (this.activeRuns.get(ids.run) === request.brainId) {
+        this.activeRuns.delete(ids.run);
+      }
     }
 
     const proposedRun = await this.mutateArchive(request.brainId, (archive) => {
       const run = archive.runs.find((entry) => entry.id === initial.id);
       const candidate = archive.candidates.find((entry) => entry.id === ids.candidate);
       if (!run || !candidate) throw new Error("The evolution archive changed unexpectedly.");
+      if (["stopping", "stopped"].includes(run.state)) return run;
       const updatedAt = new Date().toISOString();
       run.updatedAt = updatedAt;
       candidate.updatedAt = updatedAt;
@@ -1301,7 +1362,7 @@ export class EvolutionController {
         const synchronizedState = workerState(status);
         if (
           synchronizedState &&
-          !["stopped", "rolled-back"].includes(candidate.state)
+          !["stopping", "stopped", "rolled-back"].includes(candidate.state)
         ) {
           candidate.state = synchronizedState;
         }
@@ -1315,56 +1376,173 @@ export class EvolutionController {
   }
 
   async stop(brainId: string, runId: string): Promise<EvolutionRunRecord> {
-    this.tools.cancel(brainId);
-    const before = await this.loadArchive(brainId);
-    const workerCandidates = before.candidates.filter(
-      (candidate) =>
-        candidate.runId === runId &&
-        candidate.candidateKind !== "source" &&
-        candidate.workerCandidateId &&
-        !["promoted", "rolled-back", "rejected"].includes(candidate.state)
-    );
-    let workerError: string | undefined;
-    for (const candidate of workerCandidates) {
-      try {
-        await this.assertWorkerPermission(brainId, "reject");
-        await this.workerRequest(
-          "evolution.reject",
-          brainId,
-          {
-            candidateId: candidate.workerCandidateId,
-            reason: "Stopped by operator."
-          }
-        );
-      } catch (error) {
-        workerError = errorMessage(error);
+    const key = `${brainId}\0${runId}`;
+    const existing = this.stopOperations.get(key);
+    if (existing) return existing;
+    const operation = this.stopRun(brainId, runId).finally(() => {
+      if (this.stopOperations.get(key) === operation) {
+        this.stopOperations.delete(key);
       }
-    }
-    return this.mutateArchive(brainId, (archive) => {
+    });
+    this.stopOperations.set(key, operation);
+    return operation;
+  }
+
+  private async stopRun(brainId: string, runId: string): Promise<EvolutionRunRecord> {
+    const stopping = await this.mutateArchive(brainId, (archive) => {
       const run = archive.runs.find((entry) => entry.id === runId);
       if (!run) throw new Error("The evolution run was not found.");
       if (["promoted", "rolled-back"].includes(run.state)) {
         throw new Error("A completed evolution run cannot be stopped.");
       }
+      if (run.state === "stopped") return run;
       const now = new Date().toISOString();
-      run.state = "stopped";
-      run.error = workerError;
+      run.state = "stopping";
+      run.error = undefined;
       run.updatedAt = now;
       for (const candidate of archive.candidates) {
-        if (candidate.runId !== run.id || candidate.state === "promoted") continue;
-        candidate.state = "stopped";
-        if (workerError && candidate.candidateKind !== "source") {
-          candidate.error = workerError;
+        if (
+          candidate.runId !== run.id ||
+          ["promoted", "rolled-back"].includes(candidate.state)
+        ) {
+          continue;
         }
+        candidate.state = "stopping";
+        candidate.error = undefined;
         candidate.updatedAt = now;
       }
       return run;
     });
+    if (stopping.state === "stopped") return stopping;
+
+    this.stoppingRuns.add(runId);
+    try {
+      const archive = await this.loadArchive(brainId);
+      const candidates = archive.candidates.filter((candidate) => candidate.runId === runId);
+      const workerCandidates = candidates.filter(
+        (candidate) => candidate.candidateKind !== "source"
+      );
+      const workerCandidateIds = workerCandidates
+        .map((candidate) => candidate.workerCandidateId)
+        .filter((value): value is string => Boolean(value));
+
+      if (this.tools.cancelAndWait) {
+        await this.tools.cancelAndWait(brainId, runId);
+      } else {
+        this.tools.cancel(brainId, runId);
+      }
+
+      if (workerCandidates.length > 0 && this.engine?.cancelRequest) {
+        const termination = await this.engine.cancelRequest(runId);
+        if (termination.phase !== "not-found" && !termination.acknowledged) {
+          throw new Error(
+            `Evolution request ${runId} did not acknowledge cancellation.`
+          );
+        }
+        if (
+          termination.phase === "running" &&
+          !termination.workerTerminationAcknowledged
+        ) {
+          throw new Error(
+            `Evolution worker for ${runId} did not acknowledge process termination.`
+          );
+        }
+      }
+
+      let acknowledgedWorkerCandidateIds = workerCandidateIds;
+      if (workerCandidates.length > 0) {
+        const acknowledgement = await this.workerRequest<Record<string, unknown>>(
+          "cancel",
+          brainId,
+          {
+            jobId: runId,
+            kind: "neural-evolution-proposal",
+            reason: "Stopped by operator.",
+            candidateIds: workerCandidateIds
+          },
+          30_000,
+          `${runId}.cancel`
+        );
+        if (
+          acknowledgement.jobId !== runId ||
+          acknowledgement.cancelled !== true ||
+          acknowledgement.acknowledged !== true
+        ) {
+          throw new Error("The neural worker returned an invalid cancellation acknowledgement.");
+        }
+        acknowledgedWorkerCandidateIds = outputStringArray(
+          acknowledgement,
+          "candidateIds"
+        );
+      }
+
+      return this.mutateArchive(brainId, (current) => {
+        const run = current.runs.find((entry) => entry.id === runId);
+        if (!run) throw new Error("The evolution run was not found.");
+        const now = new Date().toISOString();
+        run.state = "stopped";
+        run.error = undefined;
+        run.updatedAt = now;
+        for (const candidate of current.candidates) {
+          if (
+            candidate.runId !== run.id ||
+            ["promoted", "rolled-back"].includes(candidate.state)
+          ) {
+            continue;
+          }
+          candidate.state = "stopped";
+          candidate.error = undefined;
+          if (
+            candidate.candidateKind !== "source" &&
+            !candidate.workerCandidateId &&
+            acknowledgedWorkerCandidateIds.length === 1
+          ) {
+            candidate.workerCandidateId = acknowledgedWorkerCandidateIds[0];
+          }
+          if (
+            candidate.workerCandidateId &&
+            acknowledgedWorkerCandidateIds.includes(candidate.workerCandidateId)
+          ) {
+            candidate.workerStatus = "rejected";
+          }
+          candidate.updatedAt = now;
+        }
+        return run;
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      await this.mutateArchive(brainId, (archive) => {
+        const run = archive.runs.find((entry) => entry.id === runId);
+        if (!run || run.state === "stopped") return false;
+        run.state = "stopping";
+        run.error = `Cancellation is still awaiting acknowledgement: ${message}`;
+        run.updatedAt = new Date().toISOString();
+        return true;
+      });
+      throw error;
+    } finally {
+      this.stoppingRuns.delete(runId);
+    }
   }
 
   async listCandidates(brainId: string, runId?: string): Promise<EvolutionCandidateRecord[]> {
-    await this.syncWorkerArchive(brainId);
-    const archive = await this.loadArchive(brainId);
+    let archive = await this.loadArchive(brainId);
+    const workerBusy = [...this.activeRuns.entries()].some(
+      ([activeRunId, activeBrainId]) =>
+        activeBrainId === brainId && (!runId || activeRunId === runId)
+    );
+    const persistentlyStopping = archive.candidates.some(
+      (candidate) =>
+        (!runId || candidate.runId === runId) && candidate.state === "stopping"
+    );
+    if (
+      !workerBusy &&
+      !persistentlyStopping &&
+      !(runId && this.stoppingRuns.has(runId))
+    ) {
+      await this.syncWorkerArchive(brainId);
+      archive = await this.loadArchive(brainId);
+    }
     return clone(
       archive.candidates
         .filter((candidate) => !runId || candidate.runId === runId)
@@ -1384,7 +1562,7 @@ export class EvolutionController {
     if (!candidate.evaluatorSha256 || !candidate.proposalParentCommit) {
       throw new Error("The evolution candidate has no immutable evaluator identity.");
     }
-    if (["stopped", "promoted", "rolled-back"].includes(candidate.state)) {
+    if (["stopping", "stopped", "promoted", "rolled-back"].includes(candidate.state)) {
       throw new Error(`The ${candidate.state} evolution candidate cannot be promoted.`);
     }
     const evaluationTests = [
@@ -1617,7 +1795,7 @@ export class EvolutionController {
     ) {
       throw new Error("The worker evolution candidate has incomplete immutable lineage.");
     }
-    if (["stopped", "promoted", "rolled-back"].includes(candidate.state)) {
+    if (["stopping", "stopped", "promoted", "rolled-back"].includes(candidate.state)) {
       throw new Error(`The ${candidate.state} evolution candidate cannot be promoted.`);
     }
     await this.assertWorkerPermission(request.brainId, "promote");

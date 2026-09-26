@@ -7,7 +7,8 @@ plugins, post-install hooks, or repository setup scripts.
 ## Build recipe JSON
 
 A version-1 recipe is a UTF-8 JSON object no larger than 1 MiB. Unknown fields,
-invalid ranges, non-HTTPS remote URLs, and undeclared starter URLs are rejected.
+invalid ranges, non-HTTPS remote URLs, every legacy origin, and every Starter
+URL are rejected.
 The desktop validates the document before applying it to the Build wizard.
 Stable v1 treats historical architecture fields as compatibility metadata:
 hardware profiling resolves tensor shapes, and the mandatory ternary,
@@ -20,7 +21,7 @@ cannot be turned into personality or capability switches by a recipe.
   "id": "whole-brain-micro",
   "name": "Whole Brain Micro",
   "description": "A small complete OmniCortex recipe.",
-  "origin": "blank",
+  "origin": "ground-up",
   "hardwareProfile": "micro",
   "architecture": {
     "preset": "whole-brain",
@@ -55,7 +56,7 @@ cannot be turned into personality or capability switches by a recipe.
       "video": true
     }
   },
-  "memoryRecipe": "human-consolidation",
+  "memoryRecipe": "adaptive-retention",
   "toolPermission": "ask",
   "license": "PolyForm Noncommercial 1.0.0",
   "provenanceUrl": "https://example.org/whole-brain-micro"
@@ -64,12 +65,13 @@ cannot be turned into personality or capability switches by a recipe.
 
 Allowed values are:
 
-- `origin`: `blank` or `starter`. A starter also requires an HTTPS
-  `starterUrl` pointing to a compatible `.omni`.
+- `origin`: `ground-up`. Recipes cannot attach a Starter URL or external
+  foundation. Whole-brain Import separately accepts only verified native
+  ground-up OmniCortex packages; it is not a legacy-checkpoint path.
 - `hardwareProfile`: `micro`, `personal`, `gpu`, or `workstation`.
 - `architecture.preset`: `whole-brain`, `ternary`, `neuromorphic`, `liquid`,
   `symbolic`, or `custom`.
-- `memoryRecipe`: `human-consolidation`, `total-recall`, or `synapses-only`.
+- `memoryRecipe`: `adaptive-retention`, `total-recall`, or `synapses-only`.
 - `toolPermission`: `off`, `ask`, `auto`, or `full`; the selected initial level
   is expanded across the known tool protocols and remains visible in Build.
 
@@ -80,6 +82,12 @@ organic-drive state live in the engine architecture/runtime manifests. A
 recipe therefore cannot allocate arbitrary shapes, impose neuron/synapse
 ceilings, set curiosity/noise/parallel-thought behavior, disable mandatory
 ternary paths, or execute code.
+
+The recipe and ingestion-policy strings are persisted compatibility identifiers,
+not a menu of fixed memory stages or manual consolidation controls. Valid
+experiences still move through overlapping working activity, fast temporal and
+episodic connections, spreading assemblies, replay into slow weights, and
+continuous salience/interference/stability/decay dynamics.
 
 Recipes may be bundled in `catalog/recipes`, opened from a local file, or
 downloaded from HTTPS. A catalog entry can pin its SHA-256 digest. Remote

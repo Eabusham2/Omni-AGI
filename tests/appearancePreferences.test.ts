@@ -6,6 +6,7 @@ import {
   APPEARANCE_PACKS,
   DEFAULT_APPEARANCE,
   activeAppearancePack,
+  defaultAppearanceForPlatform,
   loadAppearancePreferences,
   parseAppearancePreferences,
   preferencesForPack,
@@ -45,6 +46,24 @@ describe("versioned appearance preferences", () => {
         layout: "expressive"
       })
     ).toEqual(DEFAULT_APPEARANCE);
+  });
+
+  it("uses Liquid Glass only for fresh Apple installs and never replaces a saved choice", () => {
+    expect(defaultAppearanceForPlatform("MacIntel")).toEqual({
+      ...DEFAULT_APPEARANCE,
+      palette: "aqua",
+      layout: "glass"
+    });
+    expect(defaultAppearanceForPlatform("darwin arm64").layout).toBe("glass");
+    expect(defaultAppearanceForPlatform("iPhone").layout).toBe("glass");
+    expect(defaultAppearanceForPlatform("Win32")).toEqual(DEFAULT_APPEARANCE);
+    expect(defaultAppearanceForPlatform("Linux x86_64")).toEqual(DEFAULT_APPEARANCE);
+
+    const freshApple = new MemoryStorage();
+    expect(loadAppearancePreferences(freshApple, "MacIntel").layout).toBe("glass");
+    const savedStandard = { ...DEFAULT_APPEARANCE, mode: "system" as const };
+    saveAppearancePreferences(freshApple, savedStandard);
+    expect(loadAppearancePreferences(freshApple, "MacIntel")).toEqual(savedStandard);
   });
 
   it("persists a validated v1 document and repairs invalid individual choices", () => {

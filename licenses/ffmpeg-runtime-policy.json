@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "component": "FFmpeg",
+  "wrapper": {
+    "name": "imageio-ffmpeg",
+    "version": "0.6.0",
+    "bundled": true,
+    "license": "BSD-2-Clause",
+    "licenseFile": "imageio-ffmpeg-BSD-2-Clause.txt"
+  },
+  "executable": {
+    "bundled": false,
+    "distributionMode": "external-runtime-only",
+    "resolution": [
+      "IMAGEIO_FFMPEG_EXE selected by the user or administrator",
+      "an FFmpeg executable already installed on the host PATH"
+    ],
+    "fallbacks": {
+      "generatedVideo": "APNG",
+      "generatedAudio": "PCM WAV"
+    }
+  },
+  "verification": {
+    "forbidPackagedWheelBinaries": "**/imageio_ffmpeg/binaries/ffmpeg*",
+    "forbidExecutableBasenames": [
+      "ffmpeg",
+      "ffmpeg.exe"
+    ],
+    "correspondingSourceRequiredForThisDistribution": false
+  },
+  "policyChange": {
+    "requireExactBinaryHash": true,
+    "requireCompleteCorrespondingSource": true,
+    "requireBuildAndInstallScripts": true,
+    "requireLinkedNonSystemLibrarySources": true,
+    "requireArtifactVerifierUpdate": true
+  }
+}

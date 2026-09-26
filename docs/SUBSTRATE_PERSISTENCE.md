@@ -10,6 +10,7 @@ authoritative neural state; sharding is only its bounded persistence format.
 engine/substrate/
   manifest.json
   generations/<content-sha256>/manifest.json
+  forward-index/generations/<content-sha256>.json
   blobs/<sha256>.json
   blobs/<sha256>.safetensors
 ```
@@ -23,6 +24,18 @@ bucket, part, record count, byte count, and SHA-256. JSON shards hold neuron,
 assembly, and synapse structure. Safe-tensor shards hold neuron/assembly
 hypervectors and the higher-precision learning state for sparse synapses.
 Effective sparse weights reload only when they are exactly `-1`, `0`, or `+1`.
+
+Large generations also publish an atomic, internally checksummed forward index
+bound to the exact generation content hash, generation-manifest checksum, shard
+checksums, counts, and assembly set. It contains no source text: only exact
+nonzero endpoint structures, canonical two-bit ternary levels, per-shard ID
+ranges, and adjacency locators for connected assembly records. A valid index
+lets cold startup avoid opening every synapse JSON/safe-tensor pair. Any record
+page-in still verifies its content-addressed shard before use, and
+`scrub_persisted_shards()` performs an uncapped full verification plus
+source-shard/index parity proof for explicit or background maintenance. Legacy
+generations can build the same index once with
+`scripts/build-substrate-forward-index.py`.
 
 Shards use deterministic hash buckets and content-addressed names. An unchanged
 save reuses every shard. A local growth update normally replaces only the
@@ -53,8 +66,9 @@ edge contribution = source activation * {-1, +1}
 settled target = seed + 0.52 * mean(incoming edge contributions)
 ```
 
-The floating latent master weight is updated by learning but never scales the
-live edge contribution. Negative edges and negative recurrent signals enter the
+The exact ternary edge is the learned weight; short-lived eligibility and
+timing state can influence when it changes but are not a second stored weight.
+Negative edges and negative recurrent signals enter the
 same settled state as competing inhibition. Fan-in normalization makes the
 recurrent operator contractive, so it settles without a fixed hop limit.
 Operational traces report ternary coverage, inhibitory signals, suppressed
@@ -62,13 +76,13 @@ assemblies, convergence delta, and settling rounds.
 
 ## Stable-v1 limitations
 
-- The active substrate is currently materialized in host memory while a brain
-  is running. Persistence is bounded and streaming by shard, but out-of-core
-  live inference is future work.
+- Neurons, assemblies, vectors, the exact nonzero recurrent graph, and touched
+  synapse records are resident while a brain runs. Untouched synapse records
+  remain shard-backed and are paged exactly on demand.
 - Content-addressed generations are retained for rollback. Automatic
   mark-and-sweep garbage collection is not part of v1.
 - Hash-bucket updates bound rewrite scope; an especially hot bucket may still
   rewrite one or more bounded parts.
-- Early internal stable-v1 checkpoints with substrate tensors inside
-  `plasticity.safetensors` remain loadable and are rewritten into shards on the
-  next save. Public beta formats remain intentionally incompatible.
+- Early monolithic-substrate and public beta checkpoints are intentionally
+  incompatible with the current whole-brain importer. They are not rewritten
+  or relabeled as native sharded OmniCortex state.

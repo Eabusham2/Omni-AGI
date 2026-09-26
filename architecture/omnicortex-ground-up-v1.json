@@ -1,0 +1,77 @@
+{
+  "format": "omni-ground-up-architecture-profile",
+  "formatVersion": 1,
+  "architecture": "OmniCortex",
+  "origin": "ground-up-random-initialization",
+  "externalPretrainedWeights": false,
+  "workspaceLatentRule": {
+    "minimumLatents": 8,
+    "workingMemoryItemsPerLatent": 4
+  },
+  "storageAccounting": {
+    "packedTernaryBitsPerWeight": 2,
+    "routerEligibilityBytesPerSynapse": 2,
+    "routerStabilityAndUsageBytesPerSynapse": 8,
+    "fixedControlBufferReserveBytes": 16384,
+    "packedProjectionUpdateRowBlock": 64,
+    "packedProjectionScratchBytesPerBlockElement": 12
+  },
+  "profiles": {
+    "micro": {
+      "dModel": 32,
+      "layers": 1,
+      "feedForward": 96,
+      "vsaDimensions": 128,
+      "routerNeurons": 24,
+      "autoWorkingMemoryItems": 8192,
+      "baseParametersExcludingWorkspaceLatents": 338359,
+      "exactPackedProjectionParameters": 320151,
+      "exactPackedTableParametersExcludingWorkspaceLatents": 17632,
+      "packedControlParameters": 224,
+      "packedControlBytes": 56,
+      "packedBytesExcludingWorkspaceLatents": 84606
+    },
+    "personal": {
+      "dModel": 64,
+      "layers": 2,
+      "feedForward": 192,
+      "vsaDimensions": 256,
+      "routerNeurons": 64,
+      "autoWorkingMemoryItems": 32768,
+      "baseParametersExcludingWorkspaceLatents": 777407,
+      "exactPackedProjectionParameters": 736991,
+      "exactPackedTableParametersExcludingWorkspaceLatents": 36320,
+      "packedControlParameters": 544,
+      "packedControlBytes": 136,
+      "packedBytesExcludingWorkspaceLatents": 194382
+    },
+    "gpu": {
+      "dModel": 96,
+      "layers": 4,
+      "feedForward": 288,
+      "vsaDimensions": 384,
+      "routerNeurons": 96,
+      "autoWorkingMemoryItems": 65536,
+      "baseParametersExcludingWorkspaceLatents": 2524063,
+      "exactPackedProjectionParameters": 2457311,
+      "exactPackedTableParametersExcludingWorkspaceLatents": 57536,
+      "packedControlParameters": 1184,
+      "packedControlBytes": 296,
+      "packedBytesExcludingWorkspaceLatents": 631060
+    },
+    "workstation": {
+      "dModel": 128,
+      "layers": 6,
+      "feedForward": 384,
+      "vsaDimensions": 512,
+      "routerNeurons": 128,
+      "autoWorkingMemoryItems": 131072,
+      "baseParametersExcludingWorkspaceLatents": 5713279,
+      "exactPackedProjectionParameters": 5615583,
+      "exactPackedTableParametersExcludingWorkspaceLatents": 81312,
+      "packedControlParameters": 2080,
+      "packedControlBytes": 520,
+      "packedBytesExcludingWorkspaceLatents": 1428378
+    }
+  }
+}

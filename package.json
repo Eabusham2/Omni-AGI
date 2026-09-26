@@ -1,6 +1,6 @@
 {
   "name": "omni-agi-studio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A cross-platform studio for building persistent, adaptive OmniCortex research models.",
   "main": "out/main/index.js",
   "author": "Omni-AGI contributors",
@@ -15,6 +15,8 @@
     "test:node": "vitest run",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:python:portable": "python -m unittest discover -s engine/tests -p \"test_*.py\" -v",
+    "train:distributed": "python3 -m torch.distributed.run --standalone --nproc-per-node=gpu engine/distributed_train.py train",
+    "train:distributed:windows": "python -m torch.distributed.run --standalone --nproc-per-node=gpu engine/distributed_train.py train",
     "test:ui": "npm run build && npm run test:ui:built",
     "test:ui:built": "playwright test --config playwright.config.ts",
     "test:watch": "vitest",
@@ -27,9 +29,16 @@
     "package:mac:arm64": "bash scripts/package-posix.sh mac arm64",
     "package:linux:x64": "bash scripts/package-posix.sh linux x64",
     "package:linux:arm64": "bash scripts/package-posix.sh linux arm64",
+    "package:android:debug": "cd mobile/android && ./gradlew --no-daemon :app:assembleDebug",
+    "test:android": "cd mobile/android && ./gradlew --no-daemon :app:testDebugUnitTest",
+    "package:ios:simulator": "bash scripts/package-ios.sh simulator",
+    "package:ios:unsigned": "bash scripts/package-ios.sh unsigned",
+    "package:ios:signed": "bash scripts/package-ios.sh signed",
+    "test:ios": "bash scripts/test-ios.sh",
     "verify:release": "node scripts/verify-release.mjs"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
     "fflate": "^0.8.2",
     "pdf-parse": "^1.1.1",
     "react": "^19.1.1",
@@ -71,7 +80,12 @@
         "filter": [
           "**/*",
           "!tests{,/**/*}",
-          "!**/__pycache__{,/**/*}"
+          "!**/__pycache__{,/**/*}",
+          "!**/.pytest_cache{,/**/*}",
+          "!**/.mypy_cache{,/**/*}",
+          "!**/.ruff_cache{,/**/*}",
+          "!**/*.pyc",
+          "!**/*.pyo"
         ]
       },
       {
@@ -82,13 +96,29 @@
         "from": "tools",
         "to": "tools"
       },
-      {
-        "from": "engine-dist/omni-engine",
-        "to": "engine-runtime"
-      },
-      {
-        "from": "licenses/BitNet-MIT.txt",
-        "to": "licenses/BitNet-MIT.txt"
+    {
+      "from": "engine-dist/omni-engine",
+      "to": "engine-runtime"
+    },
+    {
+      "from": "LICENSE.md",
+      "to": "licenses/LICENSE.md"
+    },
+    {
+      "from": "COMMERCIAL_LICENSE.md",
+      "to": "licenses/COMMERCIAL_LICENSE.md"
+    },
+    {
+      "from": "licenses/REQUIRED_NOTICE.txt",
+      "to": "licenses/REQUIRED_NOTICE.txt"
+    },
+    {
+      "from": "licenses/ffmpeg-runtime-policy.json",
+      "to": "licenses/ffmpeg-runtime-policy.json"
+    },
+    {
+      "from": "licenses/BitNet-MIT.txt",
+      "to": "licenses/BitNet-MIT.txt"
       },
       {
         "from": "licenses/snnTorch-MIT.txt",
@@ -121,6 +151,13 @@
     },
     "mac": {
       "category": "public.app-category.developer-tools",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Omni AGI Studio uses the microphone only after you start Live Voice, for continuous speech recognition and barge-in.",
+        "NSCameraUsageDescription": "Omni AGI Studio uses the camera only after you start Live Perception, for visible and cancellable neural observation.",
+        "NSScreenCaptureUsageDescription": "Omni AGI Studio captures a screen only after you select it for visible and cancellable neural observation.",
+        "NSAppleEventsUsageDescription": "Omni AGI Studio sends keyboard input only when a brain action is permitted and visible in the action trace.",
+        "NSSpeechRecognitionUsageDescription": "Omni AGI Studio uses system speech recognition only while Live Voice is active; unavailable recognizers are never simulated."
+      },
       "target": [
         "dmg",
         "zip"

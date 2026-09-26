@@ -113,12 +113,12 @@ describe("declarative catalog installers", () => {
     );
     expect(micro).toMatchObject({
       id: "whole-brain-micro",
-      origin: "blank",
+      origin: "ground-up",
       hardwareTier: "micro",
       modalities: ["vision", "image", "audio", "video"],
       config: {
         preset: "whole-brain",
-        memoryRecipe: "human-consolidation"
+        memoryRecipe: "adaptive-retention"
       }
     });
     expect(micro.config).not.toHaveProperty("ternaryWeights");
@@ -139,18 +139,21 @@ describe("declarative catalog installers", () => {
     expect(plastic.modalities).toEqual([]);
   });
 
-  it("rejects executable hooks, unknown fields, insecure starters, and oversized JSON", () => {
+  it("rejects executable hooks, legacy origins, Starter URLs, and oversized JSON", () => {
     const base = {
       schemaVersion: 1,
       id: "unsafe",
       name: "Unsafe",
       description: "Must not load",
-      origin: "blank",
+      origin: "ground-up",
       hardwareProfile: "micro",
       architecture: { preset: "whole-brain" },
       memoryRecipe: "human-consolidation",
       toolPermission: "ask"
     };
+    expect(
+      validateBuildRecipe(Buffer.from(JSON.stringify(base))).config.memoryRecipe
+    ).toBe("adaptive-retention");
     expect(() =>
       validateBuildRecipe(Buffer.from(JSON.stringify({ ...base, setup: "powershell evil.ps1" })))
     ).toThrow(/unsupported field setup/i);
@@ -160,11 +163,20 @@ describe("declarative catalog installers", () => {
           JSON.stringify({
             ...base,
             origin: "starter",
-            starterUrl: "http://example.com/brain.omni"
           })
         )
       )
-    ).toThrow(/must use HTTPS/i);
+    ).toThrow(/initialize OmniCortex locally/i);
+    expect(() =>
+      validateBuildRecipe(
+        Buffer.from(
+          JSON.stringify({
+            ...base,
+            starterUrl: "https://example.com/brain.omni"
+          })
+        )
+      )
+    ).toThrow(/unsupported field starterUrl/i);
     expect(() => validateBuildRecipe(Buffer.alloc(1024 * 1024 + 1, 0x20))).toThrow(
       /no larger than 1 MB/i
     );

@@ -15,6 +15,7 @@ function blankPresentation(): BrainDocument {
     name: "Presentation test",
     createdAt: now,
     updatedAt: now,
+    readiness: { state: "ready", startedAt: now, completedAt: now },
     lineage: { rootId: "presentation-test", generation: 0 },
     config: { ...DEFAULT_CONFIG, name: "Presentation test" },
     concepts: {},

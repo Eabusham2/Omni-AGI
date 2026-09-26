@@ -58,6 +58,5 @@ export function recordNeuralChat(
       "The authoritative neural worker supplies measured trace data; Electron stores only this presentation record."
   };
   brain.traces.push(trace);
-  brain.traces = brain.traces.slice(-2_000);
   return { brain, humanMessage, brainMessage, trace };
 }

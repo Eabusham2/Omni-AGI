@@ -254,8 +254,110 @@ describe("EvolutionController", () => {
     ]);
     const stopped = await reloaded.stop(brain.id, run.id);
     expect(stopped.state).toBe("stopped");
-    expect(tools.cancel).toHaveBeenCalledWith(brain.id);
+    expect(tools.cancel).toHaveBeenCalledWith(brain.id, run.id);
     expect((await reloaded.listCandidates(brain.id, run.id))[0]?.state).toBe("stopped");
+  });
+
+  it("keeps evolution stopping until exact process and worker-ledger acknowledgements", async () => {
+    await setEvolutionPermission("ask");
+    let proposalRunId = "";
+    let rejectProposal!: (error: Error) => void;
+    let announceProposal!: () => void;
+    const proposalStarted = new Promise<void>((resolve) => {
+      announceProposal = resolve;
+    });
+    let releaseTermination!: () => void;
+    const terminationGate = new Promise<void>((resolve) => {
+      releaseTermination = resolve;
+    });
+    const request = vi.fn(
+      (
+        method: string,
+        params: Record<string, unknown>
+      ): Promise<Record<string, unknown>> => {
+        if (method === "evolution.propose") {
+          proposalRunId = String(params.jobId);
+          announceProposal();
+          return new Promise((_resolve, reject) => {
+            rejectProposal = reject;
+          });
+        }
+        if (method === "cancel") {
+          return Promise.resolve({
+            jobId: params.jobId,
+            cancelled: true,
+            acknowledged: true,
+            candidateIds: ["worker-candidate-after-cancel"]
+          });
+        }
+        throw new Error(`Unexpected method ${method}.`);
+      }
+    );
+    const cancelRequest = vi.fn(async (requestId: string) => {
+      await terminationGate;
+      rejectProposal(new Error("Worker request was cancelled."));
+      return {
+        requestId,
+        acknowledged: true,
+        phase: "running" as const,
+        workerTerminationAcknowledged: true
+      };
+    });
+    const cancelAndWait = vi.fn(async () => 0);
+    const controller = new EvolutionController(
+      repository,
+      {
+        execute: vi.fn(),
+        cancel: vi.fn(() => 0),
+        cancelAndWait
+      },
+      { request, cancelRequest } as unknown as EngineSupervisor
+    );
+
+    const starting = controller.start({
+      brainId: brain.id,
+      objective: "Cancel this isolated substrate proposal",
+      candidateKind: "substrate",
+      latentReplay: true
+    });
+    await proposalStarted;
+    const stopping = controller.stop(brain.id, proposalRunId);
+    await vi.waitFor(() => expect(cancelRequest).toHaveBeenCalledWith(proposalRunId));
+
+    expect(
+      (await controller.listCandidates(brain.id, proposalRunId))[0]?.state
+    ).toBe("stopping");
+    let stopSettled = false;
+    void stopping.finally(() => {
+      stopSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopSettled).toBe(false);
+
+    releaseTermination();
+    const stopped = await stopping;
+    await starting;
+    expect(stopped.state).toBe("stopped");
+    expect(cancelAndWait).toHaveBeenCalledWith(brain.id, proposalRunId);
+    expect(request).toHaveBeenCalledWith(
+      "cancel",
+      expect.objectContaining({
+        brainId: brain.id,
+        jobId: proposalRunId,
+        candidateIds: []
+      }),
+      30_000,
+      undefined,
+      "foreground",
+      expect.objectContaining({
+        requestId: `${proposalRunId}.cancel`,
+        owner: "evolution",
+        jobId: proposalRunId
+      })
+    );
+    expect(
+      (await controller.listCandidates(brain.id, proposalRunId))[0]
+    ).toMatchObject({ state: "stopped", workerStatus: "rejected" });
   });
 
   it("forwards typed source edits and archives their authored hash lineage", async () => {
@@ -309,7 +411,9 @@ describe("EvolutionController", () => {
         toolId: "source.self-modify",
         action: "propose",
         arguments: expect.objectContaining({ sourceEdits })
-      })
+      }),
+      undefined,
+      expect.any(String)
     );
     expect((await controller.listCandidates(brain.id, run.id))[0]).toMatchObject({
       state: "experimenting",
@@ -423,8 +527,15 @@ describe("EvolutionController", () => {
             : []
       };
     });
+    const learnStructuredExperience = vi.fn(async (
+      _brainId: string,
+      _experience: { content: string },
+      _signal?: AbortSignal
+    ) => ({
+      brain: await repository.get(brain.id)
+    }));
     const controller = new ChatActionController(
-      { chat },
+      { chat, learnStructuredExperience },
       {
         execute: vi.fn(),
         cancel: vi.fn(() => 0)
@@ -454,7 +565,14 @@ describe("EvolutionController", () => {
       }),
       30 * 60_000
     );
-    expect(chat).toHaveBeenCalledTimes(2);
+    expect(chat).toHaveBeenCalledOnce();
+    expect(learnStructuredExperience).toHaveBeenCalledOnce();
+    expect(learnStructuredExperience.mock.calls[0]?.[1].content).toContain(
+      "kind: evolve"
+    );
+    expect(learnStructuredExperience.mock.calls[0]?.[1].content).toContain(
+      "tool: source.self-modify"
+    );
   });
 
   it("rejects an evaluator result that claims an empty source candidate passed", async () => {

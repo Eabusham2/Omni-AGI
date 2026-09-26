@@ -3,7 +3,7 @@
   "id": "plastic-synapse-lab",
   "name": "Plastic Synapse Lab",
   "description": "A research-first spiking associative system that can be studied without a fluent language cortex.",
-  "origin": "blank",
+  "origin": "ground-up",
   "hardwareProfile": "micro",
   "architecture": {
     "preset": "neuromorphic",

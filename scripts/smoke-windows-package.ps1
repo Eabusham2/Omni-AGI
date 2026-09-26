@@ -5,6 +5,7 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidateSet("x64", "arm64")]
   [string]$ExpectedWorkerArch,
+  [string]$SourceCommit = "",
   [string]$ReleaseRoot = ""
 )
 
@@ -19,6 +20,25 @@ if ($ExpectedSigningText -notin @("0", "1")) {
 }
 $ExpectedSigned = $ExpectedSigningText -eq "1"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+$ActualSourceCommit = (& git -C $RepoRoot rev-parse --verify "HEAD^{commit}" | Out-String).Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $ActualSourceCommit -notmatch '^[a-f0-9]{40}$') {
+  throw "Could not resolve the checked-out package source commit."
+}
+$VerifiedSourceCommit = if (-not [string]::IsNullOrWhiteSpace($SourceCommit)) {
+  $SourceCommit.Trim().ToLowerInvariant()
+} elseif (-not [string]::IsNullOrWhiteSpace($env:OMNI_RELEASE_COMMIT)) {
+  $env:OMNI_RELEASE_COMMIT.Trim().ToLowerInvariant()
+} elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) {
+  $env:GITHUB_SHA.Trim().ToLowerInvariant()
+} else {
+  $ActualSourceCommit
+}
+if ($VerifiedSourceCommit -notmatch '^[a-f0-9]{40}$') {
+  throw "-SourceCommit must be a full 40-hex Git commit SHA."
+}
+if ($VerifiedSourceCommit -ne $ActualSourceCommit) {
+  throw "Package source commit $ActualSourceCommit does not match verified commit $VerifiedSourceCommit."
+}
 if (-not $ReleaseRoot) {
   $ReleaseRoot = Join-Path $RepoRoot "release"
 }
@@ -102,6 +122,34 @@ function Get-SignatureRecord {
       ""
     }
   }
+}
+
+function Get-DesktopCompliance {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$PackageRoot,
+    [Parameter(Mandatory = $true)]
+    [string]$Label
+  )
+  $Serialized = @(
+    & node (Join-Path $RepoRoot "scripts\verify-packaged-compliance.mjs") `
+      --repo-root $RepoRoot `
+      --desktop-dir $PackageRoot
+  ) -join [Environment]::NewLine
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Label packaged compliance verification failed with exit code $LASTEXITCODE."
+  }
+  $Report = $Serialized | ConvertFrom-Json
+  if (
+    $Report.schemaVersion -ne 1 -or
+    $Report.kind -ne "desktop-artifact-compliance" -or
+    [int64]$Report.legalFilesVerified -lt 10 -or
+    $Report.ffmpegExecutableBundled -ne $false -or
+    [string]$Report.ffmpegPolicySha256 -notmatch '^[a-f0-9]{64}$'
+  ) {
+    throw "$Label did not pass packaged desktop legal and FFmpeg compliance."
+  }
+  return $Report
 }
 
 function Remove-TreeWithRetry {
@@ -270,6 +318,18 @@ try {
   if ($AppArch -ne $Arch) {
     throw "Installed app architecture $AppArch does not match package architecture $Arch."
   }
+  $ZipCompliance = Get-DesktopCompliance `
+    -PackageRoot $ZipRoot `
+    -Label "Windows ZIP"
+  $InstalledCompliance = Get-DesktopCompliance `
+    -PackageRoot $InstallRoot `
+    -Label "Windows NSIS install"
+  if (
+    $ZipCompliance.ffmpegPolicySha256 -ne
+    $InstalledCompliance.ffmpegPolicySha256
+  ) {
+    throw "Windows package formats were verified against different FFmpeg policies."
+  }
   $InstallerSignature = Get-SignatureRecord -Path $Installer.FullName
   $ZipAppSignature = Get-SignatureRecord -Path $ZipApps[0].FullName
   $InstalledAppSignature = Get-SignatureRecord -Path $AppExecutable.FullName
@@ -345,6 +405,7 @@ try {
     "Package architecture $Arch does not match runner architecture $HostArch."
   }
   @{
+    sourceCommit = $VerifiedSourceCommit
     architecture = $Arch
     zip = @{
       name = $Zip.Name
@@ -354,6 +415,7 @@ try {
       desktopArchitecture = $ZipAppArch
       desktopSignature = $ZipAppSignature
       rpcSmoke = $ZipSmoke | ConvertFrom-Json
+      compliance = $ZipCompliance
     }
     nsis = @{
       name = $Installer.Name
@@ -371,6 +433,7 @@ try {
       accessibilityNavigation = $DesktopE2E
       modalityGeneration = $DesktopE2E
       desktopLaunchSkippedReason = $LaunchSkipReason
+      compliance = $InstalledCompliance
     }
     signing = @{
       expectedSigned = $ExpectedSigned

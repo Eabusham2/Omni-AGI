@@ -6,10 +6,13 @@ can safely parse one JSON response/notification per line.
 """
 
 import base64
+import binascii
 import copy
+import hashlib
 import json
 import os
 import platform
+import signal
 import shutil
 import sys
 import threading
@@ -19,7 +22,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 
 WORKER_DIR = Path(__file__).resolve().parent
@@ -29,14 +32,133 @@ if str(WORKER_DIR) not in sys.path:
 import torch
 
 from omni_core import AdaptiveBrain, OmniConfig, __version__
+from omni_core.brain import ChatGenerationCancelled, is_allocator_oom_error
+from omni_core.modalities import ModalityGenerationCancelled, ModalityHub
+from omni_core.media_planning import MediaResourcePause, inline_media_data_url
+from omni_core.conversation_ledger import NeuralConversationLedger
 from omni_core.evolution import NeuralEvolutionManager
-from omni_core.persistence import copy_substrate_snapshot
+from omni_core.offload import (
+    NeuralStateResourcePause,
+    copy_mutable_state_snapshot,
+)
+from omni_core.persistence import (
+    EventLog,
+    atomic_write_json,
+    copy_substrate_snapshot,
+    read_json,
+)
+from omni_core.substrate_inspection import query_persisted_substrate
 
 
 PROTOCOL_VERSION = 1
-MAX_LINE_BYTES = 32 * 1024 * 1024
 INLINE_GENERATION_TTL_SECONDS = 5 * 60
+PREVIEW_CACHE_DIRECTORY = ".preview-cache"
+BACKGROUND_IDLE_RETRY_SECONDS = 15 * 60
+BACKGROUND_IDLE_MAX_SUBSTRATE_ENTITIES = 50_000
+BACKGROUND_IDLE_MAX_SUBSTRATE_SHARDS = 128
+BACKGROUND_IDLE_MAX_DENSE_CHECKPOINT_BYTES = 64 * 1024 * 1024
+BACKGROUND_IDLE_MAX_METADATA_BYTES = 16 * 1024 * 1024
 _STDOUT_LOCK = threading.Lock()
+
+# ``AdaptiveBrain.create`` is idempotent: when a checkpoint already exists it
+# loads that persisted config instead of applying the supplied config.  The
+# public Build boundary must therefore authenticate both sides of that handoff
+# or an old/custom snake-case checkpoint could replace the versioned profile.
+_BUILD_CONFIG_IDENTITY_FIELDS = (
+    "seed",
+    "vocab_size",
+    "max_seq_len",
+    "d_model",
+    "n_heads",
+    "n_layers",
+    "d_ff",
+    "dropout",
+    "idea_dim",
+    "vsa_dim",
+    "router_neurons",
+    "hardware_tier",
+    "origin_kind",
+    "ternary_weights",
+    "spiking_dynamics",
+    "stdp_plasticity",
+    "liquid_dynamics",
+    "liquid_mode",
+    "liquid_steps",
+    "vector_symbolic_memory",
+    "working_memory_slots",
+    "image_size",
+    "audio_samples",
+    "video_frames",
+    "modality_channels",
+    "vision_enabled",
+    "image_enabled",
+    "audio_enabled",
+    "video_enabled",
+)
+
+
+def _preview_extension(mime_type: str) -> str:
+    return {
+        "image/png": ".png",
+        "image/apng": ".apng",
+        "audio/wav": ".wav",
+        "video/mp4": ".mp4",
+    }.get(str(mime_type).lower(), ".media")
+
+
+def _write_content_addressed_preview(
+    directory: Path,
+    mime_type: str,
+    payload: bytes,
+) -> Tuple[str, Path]:
+    """Synchronously persist one immutable preview before publishing it.
+
+    The synchronous write is intentional transport backpressure: the decoder
+    cannot enqueue another revision while this one is being committed. The
+    renderer receives only a main-process lease URL, never this filesystem
+    path or the potentially large JSON/base64 payload.
+    """
+
+    digest = hashlib.sha256(payload).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    artifact = directory / (digest + _preview_extension(mime_type))
+    if artifact.is_file():
+        if artifact.stat().st_size != len(payload):
+            raise RuntimeError("content-addressed preview collision")
+        return digest, artifact.resolve()
+    temporary = directory / (".%s.%s.tmp" % (digest, uuid.uuid4().hex))
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(artifact))
+    finally:
+        temporary.unlink(missing_ok=True)
+    return digest, artifact.resolve()
+
+
+def _preview_status(details: Dict[str, Any]) -> str:
+    stage = str(details.get("stage", ""))
+    completed = max(0, int(details.get("completedUnits", 0)))
+    total = max(completed, int(details.get("totalUnits", 0)))
+    if stage == "diffusion-vq-decode":
+        return "Diffusion/VQ decoder revision %d/%d" % (completed, total)
+    if stage == "codec-waveform":
+        samples = max(0, int(details.get("sampleCount", 0)))
+        total_samples = max(samples, int(details.get("totalSamples", 0)))
+        return "Neural codec waveform %d/%d samples" % (
+            samples,
+            total_samples,
+        )
+    if stage == "temporal-frame-timeline":
+        frames = max(0, int(details.get("frameCount", 0)))
+        total_frames = max(frames, int(details.get("totalFrames", 0)))
+        return "Temporal decoder timeline %d/%d frames" % (
+            frames,
+            total_frames,
+        )
+    return "Decoding the current neural latent"
 
 
 class RpcFault(Exception):
@@ -79,13 +201,25 @@ class DeferredEventLog:
         return events
 
 
-class IsolatedModalityDecoder:
-    """A private copy of exactly one selected modality generator."""
+class IsolatedModalityDecoder(ModalityHub):
+    """Private decoder copies for one output and an optional linked medium."""
 
-    def __init__(self, modality: str, module: torch.nn.Module):
+    def __init__(
+        self,
+        modality: str,
+        module: torch.nn.Module,
+        companion_modules: Optional[Dict[str, torch.nn.Module]] = None,
+    ):
+        # Deliberately skip ModalityHub.__init__: inline generation must copy
+        # only the selected trained decoder (and optional audio companion),
+        # while inheriting its parameter-free scaled composition routines.
+        torch.nn.Module.__init__(self)
         self.modality = modality
-        self.module = module
-        self.module.eval()
+        selected_modules = {modality: module, **(companion_modules or {})}
+        self._available_modalities = frozenset(selected_modules)
+        for name, selected in selected_modules.items():
+            setattr(self, name, selected)
+            selected.eval()
 
     @torch.no_grad()
     def generate(
@@ -94,15 +228,20 @@ class IsolatedModalityDecoder:
         idea: torch.Tensor,
         seed: int = 0,
         preview_callback: Optional[Callable[[float, torch.Tensor], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        maximum_previews: Optional[int] = None,
     ) -> torch.Tensor:
-        if modality != self.modality:
+        if modality not in self._available_modalities:
             raise ValueError("isolated modality snapshot does not match request")
+        module = getattr(self, modality)
         generator = torch.Generator(device=idea.device)
         generator.manual_seed(int(seed))
-        return self.module.generate(
+        return module.generate(
             idea,
             generator,
             preview_callback=preview_callback,
+            cancel_check=cancel_check,
+            maximum_previews=maximum_previews,
         )
 
 
@@ -122,12 +261,39 @@ class InlineGeneration:
     preview_revision: int = 0
     latest_preview: Optional[Dict[str, Any]] = None
     cancelled: bool = False
+    execution_device: str = "unknown"
+    authoritative_accelerator_isolated: bool = False
+
+
+@dataclass
+class LiveObservationSessionState:
+    session_id: str
+    brain_id: str
+    modalities: Tuple[str, ...]
+    permission: Dict[str, Any]
+    retention: str
+    tool_schemas: List[Dict[str, Any]]
+    capabilities: Dict[str, bool]
+    created_at: str
+    max_packet_bytes: int
+    packets_accepted: int = 0
+    bytes_accepted: int = 0
+    last_sequence: int = -1
+    last_timestamp_ms: float = -1.0
 
 
 class Worker:
     def __init__(self):
+        self.worker_role = str(
+            os.environ.get("OMNI_WORKER_ROLE", "neural")
+        ).strip().lower()
+        if self.worker_role not in {"neural", "inspection"}:
+            raise RuntimeError("OMNI_WORKER_ROLE must be neural or inspection")
         self.brains: Dict[str, AdaptiveBrain] = {}
         self.cancelled_jobs = set()
+        self._cooperative_cancel = threading.Event()
+        self._active_request_lock = threading.Lock()
+        self._active_request: Optional[Tuple[str, str]] = None
         self.running = True
         self._inline_lock = threading.RLock()
         self._inline_generations: Dict[Tuple[str, str], InlineGeneration] = {}
@@ -136,6 +302,8 @@ class Worker:
             thread_name_prefix="omni-inline-imagination",
         )
         self._inline_executor_closed = False
+        self._observation_lock = threading.RLock()
+        self._observation_sessions: Dict[str, LiveObservationSessionState] = {}
         self.methods: Dict[str, Callable[[Dict[str, Any], Optional[str]], Any]] = {
             "health": self.health,
             "create": self.create,
@@ -152,13 +320,23 @@ class Worker:
             "export_state": self.state,
             "query_substrate": self.query_substrate,
             "workspace": self.workspace,
+            "fresh_attention": self.fresh_attention,
             "feedback": self.feedback,
             "idle_cycle": self.idle_cycle,
             "chat": self.chat,
+            "consolidate_chat_learning": self.consolidate_chat_learning,
+            "learn_tool_route_outcome": self.learn_tool_route_outcome,
+            "chat_receipt": self.chat_receipt,
+            "conversation_page": self.conversation_page,
             "train": self.train,
             "ingest": self.ingest,
-            "consolidate": self.consolidate,
+            "modality_capabilities": self.modality_capabilities,
             "generate_modality": self.generate_modality,
+            "start_observation": self.start_observation,
+            "observe_packet": self.observe_packet,
+            "stop_observation": self.stop_observation,
+            "cancel_observation": self.cancel_observation,
+            "resolve_observation_control": self.resolve_observation_control,
             "evolution.propose": self.evolution_propose,
             "evolution.evaluate": self.evolution_evaluate,
             "evolution.list": self.evolution_list,
@@ -173,12 +351,20 @@ class Worker:
             "evolution_reject": self.evolution_reject,
             "evolution_rollback": self.evolution_rollback,
             "export_ternary": self.export_ternary,
+            "checkpoint": self.checkpoint,
             "snapshot": self.snapshot,
             "trace": self.trace,
             "events": self.events,
             "cancel": self.cancel,
             "shutdown": self.shutdown,
         }
+        if self.worker_role == "inspection":
+            self.methods = {
+                "health": self.health,
+                "query_substrate": self.query_substrate,
+                "cancel": self.cancel,
+                "shutdown": self.shutdown,
+            }
 
     @staticmethod
     def _default_root() -> Path:
@@ -198,12 +384,22 @@ class Worker:
             separators=(",", ":"),
             allow_nan=False,
         )
+        payload = (serialized + "\n").encode("utf-8")
         # Chat tokens and background media previews can be emitted by separate
         # threads. Keep each protocol line atomic so Electron never receives
-        # interleaved JSON fragments.
+        # interleaved JSON fragments.  A PyInstaller console-less Windows
+        # process can expose a cp1252 TextIOWrapper even though its pipe is the
+        # UTF-8 JSON-RPC transport.  Write protocol bytes directly whenever the
+        # stream exposes its binary buffer; text-only test/embedding streams
+        # retain the exact same UTF-8 string semantics through the fallback.
         with _STDOUT_LOCK:
-            sys.stdout.write(serialized + "\n")
-            sys.stdout.flush()
+            binary = getattr(sys.stdout, "buffer", None)
+            if binary is not None:
+                binary.write(payload)
+                binary.flush()
+            else:
+                sys.stdout.write(payload.decode("utf-8"))
+                sys.stdout.flush()
 
     def notify(
         self,
@@ -236,6 +432,18 @@ class Worker:
             params["data"] = data
         self._send({"jsonrpc": "2.0", "method": "event", "params": params})
 
+    def request_cooperative_cancel(self) -> bool:
+        with self._active_request_lock:
+            active = self._active_request
+        if active is None or active[0] not in {
+            "load",
+            "chat",
+            "consolidate_chat_learning",
+        }:
+            return False
+        self._cooperative_cancel.set()
+        return True
+
     @staticmethod
     def _inline_request(value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         modality = str(value.get("modality", "")).strip().lower()
@@ -259,6 +467,8 @@ class Worker:
             raw_settings = {}
         if not isinstance(raw_settings, dict):
             return None
+        raw_settings = copy.deepcopy(raw_settings)
+        raw_settings.setdefault("outputMode", "auto")
         input_path = value.get("inputPath", "")
         if input_path is None:
             input_path = ""
@@ -276,7 +486,7 @@ class Worker:
             "prompt": prompt,
             "conceptIds": list(raw_concepts),
             "inputPath": input_path,
-            "settings": copy.deepcopy(raw_settings),
+            "settings": raw_settings,
             "seed": seed,
         }
 
@@ -312,6 +522,14 @@ class Worker:
             staging.unlink(missing_ok=True)
         elif staging.is_dir():
             shutil.rmtree(staging)
+
+    @staticmethod
+    def _clear_preview_cache(engine_path: Path) -> None:
+        cache = Path(engine_path) / PREVIEW_CACHE_DIRECTORY
+        if cache.is_symlink() or cache.is_file():
+            cache.unlink(missing_ok=True)
+        elif cache.is_dir():
+            shutil.rmtree(cache)
 
     @staticmethod
     def _remove_inline_root(record: InlineGeneration) -> None:
@@ -410,8 +628,11 @@ class Worker:
                 return existing
 
         # Capture the idea and a private copy of the modality parameters on the
-        # chat thread. Subsequent slow-weight learning may safely continue on
-        # the authoritative brain while the snapshot decodes in parallel.
+        # chat thread. PyTorch's MPSGraph/cache lifetime is not safe across the
+        # authoritative chat thread and an inline decoder thread, even when
+        # the modules are distinct Python objects. Move every tensor the
+        # background decoder can reach to CPU before submitting its future.
+        # CUDA and CPU retain their existing device/concurrency behavior.
         staging_root = (
             brain.engine_path / ".inline-imagination" / action_id
         ).resolve()
@@ -420,13 +641,36 @@ class Worker:
             staging_root.relative_to(staging_parent)
             staging_root.mkdir(parents=True, exist_ok=False)
             with torch.no_grad():
+                source_device = torch.device(brain.device)
+                isolate_mps = source_device.type == "mps"
+                inline_device = (
+                    torch.device("cpu") if isolate_mps else source_device
+                )
                 idea = brain._modality_idea(
                     request["prompt"], request["conceptIds"]
-                ).detach().clone()
+                ).detach().to(inline_device).clone()
+                idea_evidence = brain._modality_idea_evidence(
+                    request["prompt"], request["conceptIds"]
+                )
+
+                def decoder_snapshot(name: str) -> torch.nn.Module:
+                    selected = copy.deepcopy(getattr(brain.modalities, name))
+                    if isolate_mps:
+                        selected = selected.to(torch.device("cpu"))
+                    return selected
+
                 modality_snapshot = IsolatedModalityDecoder(
                     request["modality"],
-                    copy.deepcopy(
-                        getattr(brain.modalities, request["modality"])
+                    decoder_snapshot(request["modality"]),
+                    companion_modules=(
+                        {
+                            "audio": decoder_snapshot("audio"),
+                        }
+                        if request["modality"] == "video"
+                        and self._trained_modality_capabilities(brain)[
+                            "audioGeneration"
+                        ]
+                        else None
                     ),
                 )
         except Exception:
@@ -444,8 +688,19 @@ class Worker:
         snapshot.installed_modality_packs = copy.deepcopy(
             brain.installed_modality_packs
         )
+        if isolate_mps:
+            snapshot.device = inline_device
+            snapshot.device_backend = "cpu"
+            snapshot.liquid_state = (
+                brain.liquid_state.detach().to(inline_device).clone()
+            )
+            snapshot.resource_policy = copy.copy(brain.resource_policy)
+            snapshot.resource_policy.include_accelerator_memory = False
         snapshot._modality_idea = (
             lambda _prompt="", _concept_ids=None: idea.detach().clone()
+        )
+        snapshot._modality_idea_evidence = (
+            lambda _prompt="", _concept_ids=None: copy.deepcopy(idea_evidence)
         )
         record = InlineGeneration(
             brain_id=brain.brain_id,
@@ -454,29 +709,42 @@ class Worker:
             signature=signature,
             staging_root=staging_root,
             events=deferred_events,
+            execution_device=str(inline_device),
+            authoritative_accelerator_isolated=isolate_mps,
         )
 
         def preview(
             generation_progress: float,
             mime_type: str,
             payload: bytes,
+            details: Dict[str, Any],
         ) -> None:
+            digest, artifact_path = _write_content_addressed_preview(
+                record.staging_root / "previews",
+                mime_type,
+                payload,
+            )
             bounded_progress = 0.2 + 0.75 * max(
                 0.0, min(float(generation_progress), 1.0)
             )
+            status_label = _preview_status(details)
             preview_value: Dict[str, Any] = {
+                **copy.deepcopy(details),
+                "schemaVersion": 1,
+                "producer": "same-brain-decoder",
+                "payloadSha256": digest,
+                "artifactPath": str(artifact_path),
                 "progress": bounded_progress,
-                "statusLabel": "Decoding the current neural latent",
+                "statusLabel": status_label,
                 "mimeType": str(mime_type),
+                "executionDevice": record.execution_device,
+                "authoritativeAcceleratorIsolated": (
+                    record.authoritative_accelerator_isolated
+                ),
             }
-            if len(payload) <= 12 * 1024 * 1024:
-                preview_value["dataUrl"] = (
-                    "data:%s;base64,%s"
-                    % (
-                        mime_type,
-                        base64.b64encode(payload).decode("ascii"),
-                    )
-                )
+            embedded_media = inline_media_data_url(mime_type, payload)
+            if embedded_media is not None:
+                preview_value["dataUrl"] = embedded_media
             # Serialize job binding/replay with new revisions. This preserves
             # monotonic previews when the queued tool request claims a decode
             # at the exact moment a new frame/sample is emitted.
@@ -501,12 +769,17 @@ class Worker:
                     settings=request["settings"],
                     seed=request["seed"],
                     preview_callback=preview,
+                    cancel_check=lambda: record.cancelled,
                 )
                 with self._inline_lock:
                     cancelled = record.cancelled
                 if cancelled:
                     self._remove_inline_root(record)
                     raise RuntimeError("inline imagination was cancelled")
+                result["inlineExecutionDevice"] = record.execution_device
+                result["authoritativeAcceleratorIsolated"] = (
+                    record.authoritative_accelerator_isolated
+                )
                 return result
             except Exception:
                 self._remove_inline_root(record)
@@ -633,20 +906,22 @@ class Worker:
         # staging behind. It is never an authoritative brain artifact and is
         # removed before the persistent checkpoint is opened again.
         self._clear_inline_staging(storage / "engine")
-        if (storage / "engine" / "brain.json").exists():
-            brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
-        else:
-            raw_config = params.get("config")
-            if not isinstance(raw_config, dict):
-                raise RpcFault(
-                    -32004,
-                    "brain is not initialized; params.config is required",
-                )
-            brain = AdaptiveBrain.create(
-                brain_id,
-                storage,
-                OmniConfig.from_external(self._builder_config(params, raw_config)),
+        self._clear_preview_cache(storage / "engine")
+        # Runtime requests are deliberately load-only.  The desktop repository
+        # document becomes visible before neural initialization has
+        # finished verification/materialization, so idle cognition (or any
+        # other eager runtime caller) can legitimately arrive in that window.
+        # Treating its public config as permission to create used to let that
+        # request win the race and persist a blank/default cortex before the
+        # authoritative builder request arrived.  Only the explicit ``create``
+        # RPC below may initialize neural state.
+        if not (storage / "engine" / "brain.json").is_file():
+            raise RpcFault(
+                -32004,
+                "brain is not initialized; an explicit create request must "
+                "complete before load or runtime operations",
             )
+        brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
         self.brains[brain_id] = brain
         return brain
 
@@ -669,9 +944,101 @@ class Worker:
         if "device" not in merged and tier in {"gpu", "workstation"}:
             if torch.cuda.is_available():
                 merged["device"] = "cuda"
+            elif self._mps_available():
+                merged["device"] = "mps"
             elif self._directml_available():
                 merged["device"] = "directml"
         return merged
+
+    @staticmethod
+    def _build_config_identity(config: OmniConfig) -> Dict[str, Any]:
+        return {
+            field_name: getattr(config, field_name)
+            for field_name in _BUILD_CONFIG_IDENTITY_FIELDS
+        }
+
+    @classmethod
+    def _build_config_mismatches(
+        cls,
+        actual: OmniConfig,
+        expected: OmniConfig,
+    ) -> List[str]:
+        actual_identity = cls._build_config_identity(actual)
+        expected_identity = cls._build_config_identity(expected)
+        return [
+            field_name
+            for field_name in _BUILD_CONFIG_IDENTITY_FIELDS
+            if actual_identity[field_name] != expected_identity[field_name]
+        ]
+
+    @classmethod
+    def _preflight_existing_build_config(
+        cls,
+        storage: Path,
+        expected: OmniConfig,
+    ) -> None:
+        """Reject a valid but non-matching checkpoint before create finalizes it.
+
+        Corrupt/incomplete metadata is left to ``AdaptiveBrain.load`` so its
+        existing recovery and validation remain authoritative.  This bounded
+        read exists only to keep a valid custom profile from reaching the
+        idempotent finalize path.
+        """
+
+        metadata_path = storage / "engine" / "brain.json"
+        if not metadata_path.is_file():
+            return
+        try:
+            metadata_bytes = int(metadata_path.stat().st_size)
+        except OSError:
+            return
+        if metadata_bytes > BACKGROUND_IDLE_MAX_METADATA_BYTES:
+            raise RpcFault(
+                -32602,
+                "existing brain metadata exceeds the bounded Build preflight",
+            )
+        try:
+            payload = metadata_path.read_bytes()
+        except OSError:
+            return
+        if len(payload) > BACKGROUND_IDLE_MAX_METADATA_BYTES:
+            raise RpcFault(
+                -32602,
+                "existing brain metadata exceeds the bounded Build preflight",
+            )
+        try:
+            metadata = json.loads(payload.decode("utf-8"))
+            raw_config = (
+                metadata.get("config") if isinstance(metadata, dict) else None
+            )
+            if not isinstance(raw_config, dict):
+                return
+            actual = OmniConfig.from_dict(raw_config)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            return
+        mismatches = cls._build_config_mismatches(actual, expected)
+        if mismatches:
+            raise RpcFault(
+                -32602,
+                "existing brain architecture does not match the requested "
+                "versioned hardwareTier profile: %s" % ", ".join(mismatches),
+            )
+
+    @staticmethod
+    def _mps_available() -> bool:
+        backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if backend is None:
+            return False
+        try:
+            return bool(backend.is_built() and backend.is_available())
+        except (AttributeError, RuntimeError):
+            return False
 
     @staticmethod
     def _directml_available() -> bool:
@@ -685,7 +1052,24 @@ class Worker:
 
     def health(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del params, request_id
+        if self.worker_role == "inspection":
+            return {
+                "ready": True,
+                "worker": "python-inspection",
+                "engineVersion": __version__,
+                "protocolVersion": PROTOCOL_VERSION,
+                "detail": "Read-only persisted substrate inspection worker is ready.",
+                "pythonVersion": platform.python_version(),
+                "platform": platform.platform(),
+                "operatingSystem": sys.platform,
+                "capabilities": {
+                    "persistedSubstrateInspection": True,
+                    "neuralMutation": False,
+                },
+                "loadedBrains": 0,
+            }
         cuda = torch.cuda.is_available()
+        mps = self._mps_available()
         return {
             "ready": True,
             "worker": "python",
@@ -700,6 +1084,7 @@ class Worker:
                 "cpu": True,
                 "cuda": cuda,
                 "cudaDevices": torch.cuda.device_count() if cuda else 0,
+                "mps": mps,
                 "directml": self._directml_available(),
                 "distributed": bool(torch.distributed.is_available()),
                 "safetensors": True,
@@ -717,24 +1102,167 @@ class Worker:
         raw_config = params.get("config") or {}
         if not isinstance(raw_config, dict):
             raise RpcFault(-32602, "params.config must be an object")
+        # A new Build selects one versioned architecture through hardwareTier.
+        # Snake-case tensor-shape fields belong only to persisted checkpoints
+        # and explicit research constructors.  Reject them here instead of
+        # silently accepting a caller-authored model behind the Studio UI.
+        private_architecture_fields = {
+            "vocab_size",
+            "max_seq_len",
+            "d_model",
+            "n_heads",
+            "n_layers",
+            "d_ff",
+            "dropout",
+            "idea_dim",
+            "vsa_dim",
+            "router_neurons",
+            "hardware_tier",
+        }
+        supplied_private_fields = sorted(
+            private_architecture_fields.intersection(raw_config)
+        )
+        if supplied_private_fields:
+            raise RpcFault(
+                -32602,
+                "new brain architecture is resolved from the versioned "
+                "hardwareTier profile; private fields are not accepted: %s"
+                % ", ".join(supplied_private_fields),
+            )
+        declared_tiers = [
+            str(value)
+            for value in (
+                params.get("hardwareTier"),
+                raw_config.get("hardwareTier"),
+            )
+            if value is not None
+        ]
+        if any(
+            value not in {"micro", "personal", "gpu", "workstation"}
+            for value in declared_tiers
+        ):
+            raise RpcFault(-32602, "new brain hardwareTier is invalid")
+        if len(set(declared_tiers)) > 1:
+            raise RpcFault(
+                -32602,
+                "new brain hardwareTier declarations do not match",
+            )
+        declared_modalities = params.get("modalities")
+        if declared_modalities is not None and (
+            not isinstance(declared_modalities, list)
+            or any(
+                not isinstance(value, str)
+                or value not in {"vision", "image", "audio", "video"}
+                for value in declared_modalities
+            )
+        ):
+            raise RpcFault(-32602, "new brain modalities are invalid")
+        # Validate the caller's declared origin before from_external applies
+        # its safe new-build defaults.
+        declared_origins = [
+            value
+            for value in (
+                params.get("origin"),
+                raw_config.get("origin"),
+                raw_config.get("origin_kind"),
+            )
+            if value is not None
+        ]
+        if any(str(value) != "ground-up" for value in declared_origins):
+            raise RpcFault(
+                -32602,
+                "Build requires the locally initialized OmniCortex configuration",
+            )
+        if any(
+            key in container
+            for container in (params, raw_config)
+            for key in ("foundationModelId", "foundation_model_id")
+        ):
+            raise RpcFault(
+                -32602,
+                "Build does not accept a foundation model",
+            )
         config = OmniConfig.from_external(self._builder_config(params, raw_config))
-        brain = AdaptiveBrain.create(brain_id, storage, config)
+        if config.origin_kind != "ground-up":
+            raise RpcFault(
+                -32602,
+                "Build requires a locally initialized OmniCortex native core",
+            )
+        self._preflight_existing_build_config(storage, config)
+        stream_id = str(params.get("streamId", "")).strip()
+        build_sequence = 0
+
+        def build_progress(
+            phase: str,
+            value: float,
+            message: str,
+            metrics: Dict[str, Any],
+        ) -> None:
+            nonlocal build_sequence
+            payload_metrics = dict(metrics)
+            initial_checksum = getattr(build_progress, "initial_checksum", "")
+            current_checksum = str(payload_metrics.pop("parameterChecksum", ""))
+            if not initial_checksum and current_checksum:
+                setattr(build_progress, "initial_checksum", current_checksum)
+                initial_checksum = current_checksum
+            payload_metrics["parameterChecksumChanged"] = bool(
+                initial_checksum
+                and current_checksum
+                and current_checksum != initial_checksum
+            )
+            self.notify(
+                "build-progress",
+                brain_id=brain_id,
+                stream_id=stream_id,
+                sequence=build_sequence,
+                progress=value,
+                message=message,
+                data={"phase": phase, "metrics": payload_metrics},
+            )
+            build_sequence += 1
+
+        brain = AdaptiveBrain.create(
+            brain_id,
+            storage,
+            config,
+            progress=build_progress if stream_id else None,
+            # Only the public worker Build boundary runs the production local
+            # curriculum. Low-level test/research construction remains fast.
+            initialize_ground_up=True,
+        )
+        mismatches = self._build_config_mismatches(brain.config, config)
+        if mismatches:
+            try:
+                brain.close()
+            except Exception:
+                # The identity violation remains the authoritative failure;
+                # cleanup cannot make the loaded checkpoint acceptable.
+                pass
+            if self.brains.get(brain_id) is brain:
+                self.brains.pop(brain_id, None)
+            raise RpcFault(
+                -32602,
+                "created brain architecture does not match the requested "
+                "versioned hardwareTier profile: %s" % ", ".join(mismatches),
+            )
         self.brains[brain_id] = brain
         self.notify(
             "brain-created",
             brain_id=brain_id,
             progress=1.0,
-            message=(
-                "Bundled trained Omni Starter created."
-                if config.origin_kind == "starter"
-                else "Blank randomly initialized OmniCortex brain created."
-            ),
+            message="OmniCortex native core initialized and locally trained.",
         )
         return brain.summary()
 
     def load(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
         brain = self._get(params)
+        if self._cooperative_cancel.is_set():
+            raise RpcFault(
+                -32800,
+                "brain load was cancelled after reaching a safe boundary",
+                {"cancelled": True, "safeBoundary": True, "warm": True},
+            )
         return brain.summary()
 
     def reload(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
@@ -743,7 +1271,7 @@ class Worker:
         self._discard_inline_generations(brain_id)
         previous = self.brains.pop(brain_id, None)
         if previous is not None:
-            previous.events.close()
+            previous.close()
         self._clear_inline_staging(self._storage(params, brain_id) / "engine")
         brain = AdaptiveBrain.load(
             self._storage(params, brain_id), expected_brain_id=brain_id
@@ -757,7 +1285,7 @@ class Worker:
         self._discard_inline_generations(brain_id)
         previous = self.brains.pop(brain_id, None)
         if previous is not None:
-            previous.events.close()
+            previous.close()
         return {"brainId": brain_id, "unloaded": previous is not None}
 
     def restore_snapshot(
@@ -788,10 +1316,11 @@ class Worker:
                 # Validate and materialize every blob referenced by the
                 # immutable shard graph before brain.json can commit it.
                 copy_substrate_snapshot(snapshot, engine)
+                copy_mutable_state_snapshot(snapshot, engine)
             except (OSError, ValueError) as error:
                 raise RpcFault(
                     -32602,
-                    "snapshot neural substrate failed validation: %s" % error,
+                    "snapshot neural state failed validation: %s" % error,
                 ) from error
             for filename in ("core.safetensors", "plasticity.safetensors"):
                 source = snapshot / filename
@@ -905,24 +1434,161 @@ class Worker:
         brain = self._get(params)
         return brain.state(include_events=int(params.get("eventLimit", 20)))
 
-    def query_substrate(
+    @staticmethod
+    def _trained_modality_capabilities(brain: AdaptiveBrain) -> Dict[str, bool]:
+        installed = {
+            str(modality)
+            for pack in brain.installed_modality_packs
+            if isinstance(pack, dict)
+            for modality in pack.get("modalities", [])
+        }
+
+        def trained(modality: str) -> bool:
+            return bool(
+                int(brain.modality_training.get(modality, 0)) > 0
+                or modality in installed
+            )
+
+        visual_input = bool(
+            (brain.config.vision_enabled and trained("vision"))
+            or (brain.config.image_enabled and trained("image"))
+        )
+        return {
+            "imageNeural": visual_input,
+            "audioNeural": bool(
+                brain.config.audio_enabled and trained("audio")
+            ),
+            "videoNeural": bool(
+                brain.config.video_enabled and trained("video")
+            ),
+            "imageGeneration": bool(
+                brain.config.image_enabled and trained("image")
+            ),
+            "audioGeneration": bool(
+                brain.config.audio_enabled and trained("audio")
+            ),
+            "videoGeneration": bool(
+                brain.config.video_enabled and trained("video")
+            ),
+        }
+
+    def modality_capabilities(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
         del request_id
         brain = self._get(params)
+        capabilities = self._trained_modality_capabilities(brain)
+        # The built-in audio decoder makes general sound. It is not trained as
+        # ASR or intelligible TTS, so those capabilities must remain false.
+        return {
+            "brainId": brain.brain_id,
+            "hardwareTier": str(brain.config.hardware_tier),
+            "imagePerception": capabilities["imageNeural"],
+            "audioPerception": capabilities["audioNeural"],
+            "videoPerception": capabilities["videoNeural"],
+            "imageGeneration": capabilities["imageGeneration"],
+            "audioGeneration": capabilities["audioGeneration"],
+            "videoGeneration": capabilities["videoGeneration"],
+            "neuralSpeechRecognition": False,
+            "neuralSpeechSynthesis": False,
+            "synchronizedVideoAudioGeneration": bool(
+                capabilities["videoGeneration"]
+                and capabilities["audioGeneration"]
+            ),
+            "sameBrainSubstrate": True,
+            "hiddenBehavioralPrompt": False,
+            "detail": (
+                "Direct audio perception enters the same neural substrate; "
+                "platform STT/TTS remain separate until a verified speech pack exists."
+            ),
+        }
+
+    def query_substrate(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        brain_id = self._brain_id(params)
         query = params.get("query", {})
         if not isinstance(query, dict):
             raise RpcFault(-32602, "params.query must be an object")
         try:
-            return brain.query_substrate(query)
-        except (TypeError, ValueError) as error:
+            # Inspection is a generation-bound read path. Never call `_get`
+            # here: materializing millions of synapses would inflate immutable
+            # shards into gigabytes of Python objects and serialize chat behind
+            # a read-only map request.
+            return query_persisted_substrate(
+                self._storage(params, brain_id) / "engine",
+                brain_id,
+                query,
+            )
+        except (OSError, TypeError, ValueError) as error:
             raise RpcFault(-32602, str(error)) from error
 
     def workspace(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
         del request_id
-        return self._get(params).workspace_snapshot()
+        brain = self._get(params)
+        # The renderer's transparent Runtime Card must describe the worker's
+        # measured placement, not reconstruct it from desktop configuration.
+        return {
+            **brain.workspace_snapshot(),
+            "runtimeCard": brain.runtime_card(),
+        }
+
+    def fresh_attention(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        brain_id = self._brain_id(params)
+        with self._inline_lock:
+            inline_count = sum(
+                1
+                for record in self._inline_generations.values()
+                if record.brain_id == brain_id
+            )
+        self._discard_inline_generations(brain_id)
+        with self._observation_lock:
+            observation_ids = [
+                session_id
+                for session_id, session in self._observation_sessions.items()
+                if session.brain_id == brain_id
+            ]
+            for session_id in observation_ids:
+                self._observation_sessions.pop(session_id, None)
+        brain = self._get(params)
+        operation_id = str(params.get("operationId") or request_id or "")
+        try:
+            result = brain.start_fresh_attention(operation_id)
+        except Exception:
+            # A pre-commit failure may have cleared transient RAM in this
+            # object. Drop it so the next request reloads the last atomic disk
+            # generation rather than treating partial in-memory state as live.
+            previous = self.brains.pop(brain_id, None)
+            if previous is not None:
+                previous.close()
+            raise
+        if bool(result.get("pagedCleanupPending")):
+            # brain.json already commits an empty page checkpoint. Reload will
+            # transactionally remove unreachable rows before any new scratch
+            # page can be admitted by this process.
+            previous = self.brains.pop(brain_id, None)
+            if previous is not None:
+                previous.close()
+        self.notify(
+            "brain-mutated",
+            brain_id=brain_id,
+            progress=1.0,
+            message="Fresh attention boundary committed.",
+            data={
+                "operationId": operation_id,
+                "attentionEpoch": result["boundary"]["epoch"],
+            },
+        )
+        return {
+            **result,
+            "inlineGenerationsCancelled": inline_count,
+            "observationSessionsCancelled": len(observation_ids),
+        }
 
     def feedback(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -934,15 +1600,35 @@ class Worker:
             raise RpcFault(-32602, "params.text must be a string")
         if direction not in {"up", "down"}:
             raise RpcFault(-32602, "params.direction must be up or down")
+        brain = self._get(params)
         try:
-            return self._get(params).feedback(
+            return brain.feedback(
                 text,
                 str(direction),
                 trace_id=str(params.get("traceId", "")),
                 message_id=str(params.get("messageId", "")),
             )
-        except ValueError as error:
-            raise RpcFault(-32602, str(error)) from error
+        except Exception as error:
+            # STDP, optional cortical learning and working state may have
+            # changed before a checkpoint write fails. Keep only the last
+            # brain.json-authoritative generation in this worker.
+            brain_id = str(brain.brain_id)
+            if self.brains.get(brain_id) is brain:
+                self.brains.pop(brain_id, None)
+                try:
+                    brain.close()
+                except Exception:
+                    pass
+                try:
+                    self.brains[brain_id] = AdaptiveBrain.load(
+                        brain.storage_path, expected_brain_id=brain_id
+                    )
+                except Exception:
+                    # Fail closed: never reinsert the unacknowledged object.
+                    pass
+            if isinstance(error, ValueError):
+                raise RpcFault(-32602, str(error)) from error
+            raise
 
     def idle_cycle(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -957,12 +1643,140 @@ class Worker:
                 raise ValueError(
                     "minimumIdleSeconds must be between 0 and 86400"
                 )
+            deferred = self._background_idle_admission(params)
+            if deferred is not None:
+                return deferred
             return self._get(params).idle_cycle(
                 tool_schemas=schemas,
                 minimum_idle_seconds=minimum_idle,
             )
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
+
+    def _background_idle_admission(
+        self, params: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Defer optional work that cannot finish inside a bounded envelope.
+
+        This check reads only the last committed scalar/count metadata and runs
+        before ``_get``. A cold multi-gigabyte brain therefore cannot occupy
+        the serial worker merely because the prompt-free scheduler woke first.
+        Foreground load/chat remains authoritative and sees the untouched
+        checkpoint.
+        """
+
+        brain_id = self._brain_id(params)
+        engine_path = self._storage(params, brain_id) / "engine"
+        metadata_path = engine_path / "brain.json"
+        try:
+            metadata_bytes = int(metadata_path.stat().st_size)
+            if metadata_bytes > BACKGROUND_IDLE_MAX_METADATA_BYTES:
+                return self._deferred_idle_result(
+                    brain_id,
+                    metadata_bytes=metadata_bytes,
+                    substrate_entities=0,
+                    substrate_shards=0,
+                    dense_checkpoint_bytes=0,
+                )
+            metadata = json.loads(metadata_path.read_text("utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # Let the authoritative load path report missing/corrupt state.
+            return None
+        if (
+            not isinstance(metadata, dict)
+            or str(metadata.get("brain_id", "")) != brain_id
+        ):
+            return None
+        substrate = metadata.get("substrate", {})
+        persistence = (
+            substrate.get("persistence", {})
+            if isinstance(substrate, dict)
+            else {}
+        )
+        counts = (
+            persistence.get("counts", {})
+            if isinstance(persistence, dict)
+            else {}
+        )
+
+        def nonnegative_integer(value: Any) -> int:
+            return (
+                int(value)
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                else 0
+            )
+
+        substrate_entities = sum(
+            nonnegative_integer(counts.get(name))
+            for name in ("assemblies", "neurons", "synapses")
+        )
+        substrate_shards = nonnegative_integer(
+            persistence.get("shardCount")
+            if isinstance(persistence, dict)
+            else None
+        )
+        dense_checkpoint_bytes = 0
+        for name in ("core.safetensors", "plasticity.safetensors"):
+            try:
+                dense_checkpoint_bytes += int(
+                    (engine_path / name).stat().st_size
+                )
+            except OSError:
+                pass
+        if (
+            substrate_entities <= BACKGROUND_IDLE_MAX_SUBSTRATE_ENTITIES
+            and substrate_shards <= BACKGROUND_IDLE_MAX_SUBSTRATE_SHARDS
+            and dense_checkpoint_bytes
+            <= BACKGROUND_IDLE_MAX_DENSE_CHECKPOINT_BYTES
+        ):
+            return None
+        return self._deferred_idle_result(
+            brain_id,
+            metadata_bytes=metadata_bytes,
+            substrate_entities=substrate_entities,
+            substrate_shards=substrate_shards,
+            dense_checkpoint_bytes=dense_checkpoint_bytes,
+        )
+
+    @staticmethod
+    def _deferred_idle_result(
+        brain_id: str,
+        *,
+        metadata_bytes: int,
+        substrate_entities: int,
+        substrate_shards: int,
+        dense_checkpoint_bytes: int,
+    ) -> Dict[str, Any]:
+        return {
+            "brainId": str(brain_id),
+            "ran": False,
+            "reason": "resource-envelope",
+            "retryAfterSeconds": BACKGROUND_IDLE_RETRY_SECONDS,
+            "actions": [],
+            "admission": {
+                "policy": "bounded-persisted-idle-v1",
+                "metadataBytes": max(0, int(metadata_bytes)),
+                "substrateEntities": max(0, int(substrate_entities)),
+                "substrateShards": max(0, int(substrate_shards)),
+                "denseCheckpointBytes": max(
+                    0, int(dense_checkpoint_bytes)
+                ),
+                "limits": {
+                    "metadataBytes": BACKGROUND_IDLE_MAX_METADATA_BYTES,
+                    "substrateEntities": (
+                        BACKGROUND_IDLE_MAX_SUBSTRATE_ENTITIES
+                    ),
+                    "substrateShards": BACKGROUND_IDLE_MAX_SUBSTRATE_SHARDS,
+                    "denseCheckpointBytes": (
+                        BACKGROUND_IDLE_MAX_DENSE_CHECKPOINT_BYTES
+                    ),
+                },
+                "checkpointMutated": False,
+                "brainLoadedByRequest": False,
+            },
+        }
 
     def _job(
         self,
@@ -986,7 +1800,11 @@ class Worker:
             message="%s started" % kind,
         )
 
-        def progress(value: float, message: str) -> None:
+        def progress(
+            value: float,
+            message: str,
+            data: Optional[Dict[str, Any]] = None,
+        ) -> None:
             if job_id and job_id in self.cancelled_jobs:
                 raise RpcFault(-32800, "job was cancelled")
             self.notify(
@@ -995,6 +1813,7 @@ class Worker:
                 job_id=job_id,
                 progress=value,
                 message=message,
+                data=data,
             )
 
         return brain, job_id, progress
@@ -1021,8 +1840,82 @@ class Worker:
                 job_id=job_id,
             )
 
+    def _restore_committed_brain_after_failed_chat(
+        self,
+        brain: AdaptiveBrain,
+        *,
+        prior_ledger_head: Optional[Mapping[str, Any]],
+        turn_id: str,
+        input_sha256: str,
+    ) -> bool:
+        """Never retain a failed turn's uncommitted fast state in RAM.
+
+        The authoritative brain.json may represent either the prior turn or a
+        just-committed turn whose post-save acknowledgement failed. Reloading
+        that checkpoint preserves whichever state was actually committed,
+        while dropping every in-memory mutation that never reached it.
+        """
+
+        brain_id = str(brain.brain_id)
+        self._discard_inline_generations(brain_id)
+        if self.brains.get(brain_id) is not brain:
+            return False
+        self.brains.pop(brain_id, None)
+        storage = Path(brain.storage_path)
+        try:
+            brain.close()
+        except Exception:
+            # The stale object must stay unloaded even if its diagnostics
+            # handles cannot be closed cleanly.
+            pass
+        try:
+            committed = read_json(storage / "engine" / "brain.json")
+            receipts = committed.get("completed_chat_turns", [])
+            turn_committed = bool(
+                isinstance(receipts, list)
+                and any(
+                    isinstance(receipt, Mapping)
+                    and receipt.get("turnId") == turn_id
+                    and receipt.get("inputSha256") == input_sha256
+                    for receipt in receipts
+                )
+            )
+            if not turn_committed and isinstance(prior_ledger_head, Mapping):
+                ledger = NeuralConversationLedger(
+                    storage / "engine" / "conversation.sqlite3", brain_id
+                )
+                try:
+                    ledger.truncate_after_head(
+                        int(prior_ledger_head["headSequence"]),
+                        str(prior_ledger_head["headSha256"]),
+                    )
+                finally:
+                    ledger.close()
+        except Exception:
+            # If the committed state or pre-turn ledger boundary cannot be
+            # verified, leave the brain unloaded rather than admitting a
+            # potentially orphaned turn into the next request.
+            return False
+        try:
+            restored = AdaptiveBrain.load(
+                storage, expected_brain_id=brain_id
+            )
+        except Exception:
+            # A corrupt/unavailable checkpoint is a hard load failure, never
+            # permission to continue from an unacknowledged mutable object.
+            return False
+        self.brains[brain_id] = restored
+        return True
+
     def chat(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain = self._get(params)
+        # The desktop's small, atomic switch is authoritative even when this
+        # warm worker still holds a checkpoint from before Pause was pressed.
+        # The next chat save persists this setting alongside the neural turn.
+        if "onlineLearning" in params:
+            if not isinstance(params["onlineLearning"], bool):
+                raise RpcFault(-32602, "params.onlineLearning must be a boolean")
+            brain.config.online_learning = params["onlineLearning"]
         value = params.get("input", params.get("message", params.get("text")))
         if not isinstance(value, str):
             raise RpcFault(-32602, "params.input must be a string")
@@ -1042,6 +1935,14 @@ class Worker:
         sequence = 0
         sequence_lock = threading.Lock()
         inline_records: List[InlineGeneration] = []
+        turn_id = stream_id or str(request_id or uuid.uuid4().hex)
+        input_sha256 = hashlib.sha256(
+            value.replace("\x00", "").strip().encode("utf-8")
+        ).hexdigest()
+        ledger_head = brain.conversation.summary()
+        prior_ledger_head = (
+            dict(ledger_head) if isinstance(ledger_head, Mapping) else None
+        )
         imagination_grant = next(
             (
                 str(schema.get("grant", "ask")).strip().lower()
@@ -1054,6 +1955,8 @@ class Worker:
 
         def stream(kind: str, payload: Dict[str, Any]) -> None:
             nonlocal sequence
+            if self._cooperative_cancel.is_set():
+                raise ChatGenerationCancelled("chat generation was cancelled")
             if not stream_id:
                 return
             action: Optional[Dict[str, Any]] = None
@@ -1093,6 +1996,24 @@ class Worker:
                         progress=float(preview_value.get("progress", 0.0)),
                         message=str(preview_value.get("statusLabel", "")),
                         data={"preview": preview_value},
+                    )
+                elif kind == "phase":
+                    if payload != {
+                        "phase": "reply-complete-learning",
+                        "replyComplete": True,
+                        "turnCommitted": False,
+                        "learning": True,
+                        "saving": True,
+                    }:
+                        raise RuntimeError(
+                            "neural chat phase event is invalid"
+                        )
+                    self.notify(
+                        "chat-phase",
+                        brain_id=brain.brain_id,
+                        stream_id=stream_id,
+                        sequence=sequence,
+                        data=dict(payload),
                     )
                 else:
                     raise RuntimeError("unsupported neural chat stream event")
@@ -1138,13 +2059,31 @@ class Worker:
                 ),
                 tool_schemas=tool_schemas,
                 stream_callback=stream if stream_id else None,
+                turn_id=turn_id,
+                defer_slow_learning=True,
+                cancel_check=self._cooperative_cancel.is_set,
             )
-        except Exception:
+        except ChatGenerationCancelled as error:
+            # The model raises this only at a pre-commit boundary. Preserve
+            # the warm brain for Steer; restarting a large loaded model here
+            # would repeat the cold-load memory spike.
             for record in inline_records:
                 with self._inline_lock:
                     record.cancelled = True
                     if record.future is not None:
                         record.future.cancel()
+            raise RpcFault(
+                -32800,
+                str(error),
+                {"cancelled": True, "safeBoundary": True},
+            ) from error
+        except Exception:
+            self._restore_committed_brain_after_failed_chat(
+                brain,
+                prior_ledger_head=prior_ledger_head,
+                turn_id=turn_id,
+                input_sha256=input_sha256,
+            )
             raise
 
         # A streamed Auto/Full imagination action always publishes at least one
@@ -1159,13 +2098,397 @@ class Worker:
             "brain-mutated",
             brain_id=brain.brain_id,
             progress=1.0,
-            message="Turn learned into fast synapses and slow parameters.",
-            data={"traceId": result["trace"]["id"]},
+            message=(
+                "Turn committed to fast episodic neural state; slow replay "
+                "is queued in the background."
+                if result.get("trace", {}).get("slow_learning_job")
+                else "Turn committed to fast episodic neural state."
+            ),
+            data={
+                "traceId": result["trace"]["id"],
+                "slowLearningJob": result.get("trace", {}).get(
+                    "slow_learning_job"
+                ),
+            },
         )
         return result
 
+    def consolidate_chat_learning(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        brain = self._get(params)
+        if "onlineLearning" in params:
+            if not isinstance(params["onlineLearning"], bool):
+                raise RpcFault(-32602, "params.onlineLearning must be a boolean")
+            brain.config.online_learning = params["onlineLearning"]
+        job_id = str(params.get("jobId", "")).strip()
+        self.notify(
+            "job-progress",
+            brain_id=brain.brain_id,
+            job_id=job_id or str(request_id or ""),
+            progress=0.0,
+            message="Replaying retained chat activity into slow parameters.",
+        )
+        try:
+            result = brain.consolidate_pending_chat_learning(
+                job_id,
+                cancel_check=self._cooperative_cancel.is_set,
+            )
+        except ChatGenerationCancelled as error:
+            raise RpcFault(
+                -32800,
+                str(error),
+                {"cancelled": True, "safeBoundary": True},
+            ) from error
+        self.notify(
+            "brain-mutated",
+            brain_id=brain.brain_id,
+            job_id=str(result.get("jobId", job_id)),
+            progress=1.0,
+            message=(
+                "Background cortical replay committed."
+                if result.get("processed")
+                else "No pending cortical replay was available."
+            ),
+            data=result,
+        )
+        return result
+
+    def learn_tool_route_outcome(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Commit one host-observed typed tool outcome to the route head.
+
+        The original user utterance and the actual successful host invocation
+        are supplied as separate typed fields. Generated assistant prose is
+        never used as a route target. The brain owns event-id idempotency.
+        """
+
+        del request_id
+        brain = self._get(params)
+        try:
+            result = brain.learn_tool_route_experience(
+                utterance=str(params.get("utterance", "")),
+                tool_id=str(params.get("toolId", "")),
+                action=str(params.get("action", "")),
+                outcome=str(params.get("outcome", "")),
+                source="host-tool-outcome",
+                event_id=str(params.get("eventId", "")),
+                arguments=(
+                    params.get("arguments")
+                    if isinstance(params.get("arguments"), dict)
+                    else None
+                ),
+            )
+            if bool(result.get("applied")):
+                brain.save()
+        except Exception:
+            # A failed checkpoint must not leave a trained-but-unsaved route
+            # head resident. Reload the last atomic state before a retry.
+            brain_id = brain.brain_id
+            storage = brain.storage_path
+            previous = self.brains.pop(brain_id, None)
+            if previous is not None:
+                previous.close()
+            self.brains[brain_id] = AdaptiveBrain.load(
+                storage, expected_brain_id=brain_id
+            )
+            raise
+        if bool(result.get("applied")):
+            self.notify(
+                "brain-mutated",
+                brain_id=brain.brain_id,
+                progress=1.0,
+                message="A confirmed tool outcome trained the neural route head.",
+                data={"eventId": str(params.get("eventId", "")), **result},
+            )
+        return {
+            "brainId": brain.brain_id,
+            "routeLearning": result,
+            "metrics": brain.metrics(),
+        }
+
+    def chat_receipt(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Read one atomically committed turn without loading neural tensors."""
+
+        del request_id
+        brain_id = self._brain_id(params)
+        turn_id = AdaptiveBrain._validated_chat_turn_id(
+            str(params.get("turnId", ""))
+        )
+        if not turn_id:
+            raise RpcFault(-32602, "params.turnId is required")
+        input_sha256 = str(params.get("inputSha256", ""))
+        if not AdaptiveBrain._sha256_identifier(input_sha256):
+            raise RpcFault(-32602, "params.inputSha256 is invalid")
+        minimum_inference = params.get("minimumInferenceCount", 0)
+        if (
+            isinstance(minimum_inference, bool)
+            or not isinstance(minimum_inference, int)
+            or minimum_inference < 0
+        ):
+            raise RpcFault(
+                -32602, "params.minimumInferenceCount is invalid"
+            )
+        metadata_path = self._storage(params, brain_id) / "engine" / "brain.json"
+        try:
+            if metadata_path.stat().st_size > 32 * 1024 * 1024:
+                raise ValueError("engine metadata exceeds receipt query bound")
+            metadata = json.loads(metadata_path.read_text("utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise RpcFault(
+                -32004, "committed chat state is unavailable"
+            ) from error
+        if (
+            not isinstance(metadata, dict)
+            or str(metadata.get("brain_id", "")) != brain_id
+        ):
+            raise RpcFault(-32004, "committed chat state identity is invalid")
+        messages = metadata.get("messages", [])
+        traces = metadata.get("traces", [])
+        counters = metadata.get("counters", {})
+        if (
+            not isinstance(messages, list)
+            or not isinstance(traces, list)
+            or not isinstance(counters, dict)
+        ):
+            raise RpcFault(-32004, "committed chat state is invalid")
+        inference_count = counters.get("inference_count", 0)
+        plasticity_events = counters.get("plasticity_events", 0)
+        consolidation_cycles = counters.get("consolidation_cycles", 0)
+        if (
+            isinstance(inference_count, bool)
+            or not isinstance(inference_count, int)
+            or inference_count < 0
+            or isinstance(plasticity_events, bool)
+            or not isinstance(plasticity_events, int)
+            or plasticity_events < 0
+            or isinstance(consolidation_cycles, bool)
+            or not isinstance(consolidation_cycles, int)
+            or consolidation_cycles < 0
+        ):
+            raise RpcFault(-32004, "committed chat counters are invalid")
+        try:
+            receipts = AdaptiveBrain._validated_completed_chat_turns(
+                metadata.get("completed_chat_turns")
+            )
+        except ValueError as error:
+            raise RpcFault(
+                -32004, "committed chat receipts are invalid"
+            ) from error
+        receipt = next(
+            (
+                value
+                for value in reversed(receipts)
+                if value.get("turnId") == turn_id
+                and value.get("inputSha256") == input_sha256
+            ),
+            None,
+        )
+        legacy_matched = False
+        if receipt is not None:
+            if (
+                int(receipt["inferenceCount"]) != minimum_inference + 1
+                or int(receipt["inferenceCount"]) != inference_count
+            ):
+                return self._missing_chat_receipt(
+                    brain_id, turn_id, input_sha256, inference_count
+                )
+            human_id = str(receipt["humanMessageId"])
+            brain_message_id = str(receipt["brainMessageId"])
+            trace_id = str(receipt["traceId"])
+            committed_inference = int(receipt["inferenceCount"])
+            parameter_checksum = str(receipt["parameterChecksumAfter"])
+        else:
+            # One-way reconciliation for a turn committed just before this
+            # receipt format shipped. Accept only the latest atomic pair and
+            # exactly one inference beyond the caller's pre-turn baseline.
+            # Once any receipt exists, never reinterpret a current-format
+            # commit under another caller-provided turn id.
+            if (
+                receipts
+                or inference_count != minimum_inference + 1
+                or len(messages) < 2
+            ):
+                return self._missing_chat_receipt(
+                    brain_id, turn_id, input_sha256, inference_count
+                )
+            human_candidate = messages[-2]
+            brain_candidate = messages[-1]
+            trace_candidate = traces[-1] if traces else None
+            if (
+                not isinstance(human_candidate, dict)
+                or not isinstance(brain_candidate, dict)
+                or not isinstance(trace_candidate, dict)
+                or human_candidate.get("role") != "human"
+                or brain_candidate.get("role") != "brain"
+                or hashlib.sha256(
+                    str(human_candidate.get("content", "")).encode("utf-8")
+                ).hexdigest()
+                != input_sha256
+                or trace_candidate.get("input_sha256") != input_sha256
+                or str(trace_candidate.get("created_at", ""))
+                != str(brain_candidate.get("created_at", ""))
+                or "turn_id" in human_candidate
+                or "turn_id" in brain_candidate
+                or "turn_id" in trace_candidate
+            ):
+                return self._missing_chat_receipt(
+                    brain_id, turn_id, input_sha256, inference_count
+                )
+            human_id = str(human_candidate.get("id", ""))
+            brain_message_id = str(brain_candidate.get("id", ""))
+            trace_id = str(trace_candidate.get("id", ""))
+            parameter_checksum = str(
+                trace_candidate.get("parameter_checksum_after", "")
+            )
+            committed_inference = inference_count
+            legacy_matched = True
+
+        human_message = next(
+            (
+                value
+                for value in messages
+                if isinstance(value, dict) and value.get("id") == human_id
+            ),
+            None,
+        )
+        brain_message = next(
+            (
+                value
+                for value in messages
+                if isinstance(value, dict)
+                and value.get("id") == brain_message_id
+            ),
+            None,
+        )
+        trace = next(
+            (
+                value
+                for value in traces
+                if isinstance(value, dict) and value.get("id") == trace_id
+            ),
+            None,
+        )
+        if receipt is not None and (
+            human_message is None or brain_message is None or trace is None
+        ):
+            ledger = NeuralConversationLedger(
+                metadata_path.parent / "conversation.sqlite3",
+                brain_id,
+            )
+            try:
+                human_message = ledger.payload_by_id("message", human_id)
+                brain_message = ledger.payload_by_id(
+                    "message", brain_message_id
+                )
+                trace = ledger.payload_by_id("trace", trace_id)
+            finally:
+                ledger.close()
+        if (
+            not isinstance(human_message, dict)
+            or not isinstance(brain_message, dict)
+            or not isinstance(trace, dict)
+            or human_message.get("role") != "human"
+            or brain_message.get("role") != "brain"
+            or not human_id
+            or not brain_message_id
+            or not trace_id
+            or not AdaptiveBrain._sha256_identifier(parameter_checksum)
+            or trace.get("parameter_checksum_after") != parameter_checksum
+            or hashlib.sha256(
+                str(human_message.get("content", "")).encode("utf-8")
+            ).hexdigest()
+            != input_sha256
+        ):
+            raise RpcFault(-32004, "committed chat receipt references invalid state")
+        if not legacy_matched and (
+            human_message.get("turn_id") != turn_id
+            or brain_message.get("turn_id") != turn_id
+            or trace.get("turn_id") != turn_id
+        ):
+            raise RpcFault(-32004, "committed chat turn binding is invalid")
+
+        def external_message(
+            value: Dict[str, Any], *, trace_value: str = ""
+        ) -> Dict[str, Any]:
+            created_at = str(
+                value.get("created_at", value.get("createdAt", ""))
+            )
+            result = {
+                "id": str(value.get("id", "")),
+                "role": str(value.get("role", "")),
+                "content": str(value.get("content", "")),
+                "createdAt": created_at,
+            }
+            runtime = value.get("runtime")
+            if isinstance(runtime, str) and runtime:
+                result["runtime"] = runtime
+            if trace_value:
+                result["traceId"] = trace_value
+            epoch = value.get("attention_epoch", value.get("attentionEpoch"))
+            if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0:
+                result["attentionEpoch"] = epoch
+            return result
+
+        substrate = metadata.get("substrate", {})
+        substrate_persistence = (
+            substrate.get("persistence", {})
+            if isinstance(substrate, dict)
+            else {}
+        )
+        mutable_state = metadata.get("mutable_state", {})
+        return {
+            "format": "omni-chat-turn-receipt-query",
+            "formatVersion": 1,
+            "brainId": brain_id,
+            "turnId": turn_id,
+            "committed": True,
+            "turnCommitted": True,
+            "legacyMatched": legacy_matched,
+            "inputSha256": input_sha256,
+            "humanMessage": external_message(human_message),
+            "brainMessage": external_message(
+                brain_message, trace_value=trace_id
+            ),
+            "trace": dict(trace),
+            "inferenceCount": committed_inference,
+            "plasticityEvents": int(plasticity_events),
+            "consolidationCycles": int(consolidation_cycles),
+            "parameterChecksumAfter": parameter_checksum,
+            "engineUpdatedAt": str(metadata.get("updated_at", "")),
+            "substrateGeneration": str(
+                substrate_persistence.get("activeGeneration", "")
+            ),
+            "mutableStateGeneration": str(
+                mutable_state.get("activeGeneration", "")
+                if isinstance(mutable_state, dict)
+                else ""
+            ),
+            "idempotentCompletion": True,
+        }
+
+    @staticmethod
+    def _missing_chat_receipt(
+        brain_id: str,
+        turn_id: str,
+        input_sha256: str,
+        inference_count: int,
+    ) -> Dict[str, Any]:
+        return {
+            "format": "omni-chat-turn-receipt-query",
+            "formatVersion": 1,
+            "brainId": brain_id,
+            "turnId": turn_id,
+            "committed": False,
+            "turnCommitted": False,
+            "inputSha256": input_sha256,
+            "inferenceCount": max(0, int(inference_count)),
+        }
+
     def train(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
-        brain, job_id, progress = self._job(params, request_id, "training")
         texts = params.get("texts")
         if texts is None and isinstance(params.get("text"), str):
             texts = [params["text"]]
@@ -1174,6 +2497,24 @@ class Worker:
             and all(isinstance(value, str) for value in texts)
         ):
             raise RpcFault(-32602, "params.texts must be a string array")
+        source_ids = params.get("sourceIds")
+        if source_ids is not None and not (
+            isinstance(source_ids, list)
+            and all(isinstance(value, str) for value in source_ids)
+        ):
+            raise RpcFault(-32602, "params.sourceIds must be a string array")
+        if not any(
+            isinstance(value, str) and value.replace("\x00", "").strip()
+            for value in (texts or [])
+        ) and not any(
+            isinstance(value, str) and value.strip()
+            for value in (source_ids or [])
+        ):
+            raise RpcFault(
+                -32602,
+                "training requires non-empty text or explicit retained sourceIds",
+            )
+        brain, job_id, progress = self._job(params, request_id, "training")
         result = brain.train(
             texts=texts,
             epochs=int(params.get("epochs", params.get("steps", 1))),
@@ -1182,11 +2523,46 @@ class Worker:
                 if params.get("learningRate") is not None
                 else None
             ),
-            source_ids=params.get("sourceIds"),
+            source_ids=source_ids,
             progress=progress,
         )
         self._job_complete(brain, job_id, "training", result)
         return result
+
+    def conversation_page(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        brain = self._get(params)
+        before_value = params.get("beforeSequence")
+        before = None if before_value is None else int(before_value)
+        limit = max(1, min(1000, int(params.get("limit", 100))))
+        if before is not None and before < 1:
+            raise RpcFault(-32602, "conversation cursor is invalid")
+        kinds_value = params.get("kinds", ["message", "action", "trace"])
+        if not isinstance(kinds_value, list) or any(
+            item not in {"message", "action", "trace"}
+            for item in kinds_value
+        ):
+            raise RpcFault(-32602, "conversation kinds are invalid")
+        entries = brain.conversation.page(
+            before_sequence=before,
+            limit=limit,
+            kinds=tuple(str(item) for item in kinds_value),
+        )
+        summary = brain.conversation.summary()
+        first = entries[0]["sequence"] if entries else None
+        return {
+            "brainId": brain.brain_id,
+            "entries": entries,
+            "summary": summary,
+            "hasOlder": bool(first is not None and first > 1),
+            **(
+                {"nextBeforeSequence": int(first)}
+                if first is not None and first > 1
+                else {}
+            ),
+        }
 
     def ingest(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain, job_id, progress = self._job(params, request_id, "ingestion")
@@ -1206,49 +2582,447 @@ class Worker:
                         "contentHash", params.get("expectedSha256", "")
                     )
                 ),
+                committed_sqlite_snapshot=bool(
+                    params.get("committedSqliteSnapshot", False)
+                ),
                 allow_replay=bool(params.get("allowReplay", False)),
                 epoch=int(params.get("epoch", 0)),
                 progress=progress,
             )
-        except Exception:
+        except Exception as error:
             # Ingestion mutates fast weights and assemblies as records stream,
             # but the durable cursor is committed only after the whole worker
             # call succeeds. Drop that in-memory object and reload the last
             # atomic checkpoint so retrying the same manifest record cannot
             # inherit a partial application.
+            recovered_error: Exception = error
+            if (
+                not isinstance(
+                    error,
+                    (NeuralStateResourcePause,),
+                )
+                and is_allocator_oom_error(error)
+            ):
+                brain._allocator_oom_count += 1
+                brain._release_training_allocator_cache()
+                recovered_error = brain._allocator_resource_pause(
+                    error,
+                    stage="ingestion",
+                )
             brain_id = brain.brain_id
             storage = brain.storage_path
             previous = self.brains.pop(brain_id, None)
             if previous is not None:
-                previous.events.close()
+                previous.close()
             restored = AdaptiveBrain.load(
                 storage, expected_brain_id=brain_id
             )
             self.brains[brain_id] = restored
+            resource_status: Optional[Dict[str, Any]] = None
+            if isinstance(
+                recovered_error,
+                (NeuralStateResourcePause,),
+            ):
+                resource_status = dict(recovered_error.status)
+                resource_status.setdefault("recoverable", True)
+            runtime_downgrade: Optional[Dict[str, int]] = None
+            if resource_status is not None and bool(
+                resource_status.get("allocatorOutOfMemory", False)
+            ):
+                runtime_downgrade = restored.apply_allocator_oom_downgrade(
+                    resource_status
+                )
+            active_checkpoints = [
+                {
+                    "transactionId": str(value.get("transactionId", "")),
+                    "contentHash": str(value.get("contentHash", "")),
+                    "epoch": int(value.get("epoch", 0)),
+                    "policy": str(value.get("policy", "")),
+                    "committedRecords": int(value.get("committedRecords", 0)),
+                    "visitedRecords": int(value.get("visitedRecords", 0)),
+                    "commitSequence": int(value.get("commitSequence", 0)),
+                }
+                for value in restored.ingestion_checkpoints.values()
+            ]
+            restored.events.append(
+                "ingestion-rollback",
+                {
+                    "jobId": job_id,
+                    "reason": (
+                        "allocator pause; uncommitted record batch discarded"
+                        if resource_status is not None
+                        and bool(resource_status.get("allocatorOutOfMemory", False))
+                        else "uncommitted record batch discarded"
+                    ),
+                    "activeCheckpoints": active_checkpoints,
+                    "uncommittedLearningRepresentedAsCommitted": False,
+                    "resourcePause": resource_status,
+                    "runtimeDowngrade": runtime_downgrade,
+                },
+                job_id=job_id or None,
+            )
             self.notify(
                 "ingestion-rolled-back",
                 brain_id=brain_id,
                 job_id=job_id,
                 progress=0.0,
                 message=(
-                    "Partial ingestion was discarded; the last atomic "
+                    "Training paused and the last atomic checkpoint was restored; "
+                    "resume will retry only the uncommitted dataset suffix."
+                    if resource_status is not None
+                    else "Partial ingestion was discarded; the last atomic "
                     "checkpoint was restored."
                 ),
+                data=(
+                    {
+                        "resourcePause": resource_status,
+                        "runtimeDowngrade": runtime_downgrade,
+                        "activeCheckpoints": active_checkpoints,
+                    }
+                    if resource_status is not None
+                    else None
+                ),
             )
+            if resource_status is not None:
+                if job_id:
+                    restored.events.append(
+                        "job-paused",
+                        {
+                            "kind": "ingestion",
+                            "resourcePause": resource_status,
+                            "runtimeDowngrade": runtime_downgrade,
+                        },
+                        job_id=job_id,
+                    )
+                raise RpcFault(
+                    -32020,
+                    str(recovered_error),
+                    {
+                        "recoverable": True,
+                        "resourcePause": resource_status,
+                        "runtimeDowngrade": runtime_downgrade,
+                        "activeCheckpoints": active_checkpoints,
+                    },
+                ) from error
             raise
         self._job_complete(brain, job_id, "ingestion", result)
         return result
 
-    def consolidate(
+    @staticmethod
+    def _observation_session_payload(
+        session: LiveObservationSessionState,
+    ) -> Dict[str, Any]:
+        return {
+            "id": session.session_id,
+            "brainId": session.brain_id,
+            "modalities": list(session.modalities),
+            "permission": copy.deepcopy(session.permission),
+            "retention": session.retention,
+            "capabilities": dict(session.capabilities),
+            "packetsAccepted": int(session.packets_accepted),
+            "bytesAccepted": int(session.bytes_accepted),
+            "lastSequence": int(session.last_sequence),
+            "maxPacketBytes": int(session.max_packet_bytes),
+            "createdAt": session.created_at,
+            "rawPacketsStored": False,
+            "datasetCoverageCommitted": False,
+        }
+
+    def start_observation(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
-        brain, job_id, progress = self._job(params, request_id, "consolidation")
-        result = brain.consolidate(
-            steps=int(params.get("steps", params.get("epochs", 4))),
-            progress=progress,
+        del request_id
+        brain = self._get(params)
+        session_id = str(params.get("sessionId", "")).strip()
+        if not session_id or len(session_id) > 128 or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for character in session_id
+        ):
+            raise RpcFault(-32602, "params.sessionId is invalid")
+        raw_modalities = params.get("modalities")
+        if (
+            not isinstance(raw_modalities, list)
+            or not raw_modalities
+            or len(raw_modalities) > 3
+        ):
+            raise RpcFault(-32602, "params.modalities must be a non-empty array")
+        modalities = tuple(str(value).strip().lower() for value in raw_modalities)
+        if len(set(modalities)) != len(modalities) or any(
+            value not in {"image", "audio", "video"} for value in modalities
+        ):
+            raise RpcFault(-32602, "params.modalities contains an invalid value")
+        permission = params.get("permission")
+        if not isinstance(permission, dict):
+            raise RpcFault(-32602, "params.permission is required")
+        source = str(permission.get("source", "")).strip().lower()
+        granted_at = str(permission.get("grantedAt", "")).strip()
+        device_hash = str(permission.get("deviceIdHash", "")).strip().lower()
+        if (
+            permission.get("granted") is not True
+            or permission.get("scope") != "session"
+            or source not in {"camera", "microphone", "screen", "mixed"}
+            or not granted_at
+            or len(granted_at) > 64
+            or (device_hash and (
+                len(device_hash) != 64
+                or any(character not in "0123456789abcdef" for character in device_hash)
+            ))
+        ):
+            raise RpcFault(-32602, "params.permission is invalid")
+        permitted_modalities = {
+            "camera": {"image", "video"},
+            "microphone": {"audio"},
+            "screen": {"image", "video"},
+            "mixed": {"image", "audio", "video"},
+        }[source]
+        if set(modalities).difference(permitted_modalities):
+            raise RpcFault(
+                -32602,
+                "capture permission source does not cover every requested modality",
+            )
+        retention = str(params.get("retention", "neural")).strip().lower()
+        if retention not in {"working", "neural"}:
+            raise RpcFault(-32602, "params.retention must be working or neural")
+        max_packet_bytes = params.get("maxPacketBytes")
+        if (
+            isinstance(max_packet_bytes, bool)
+            or not isinstance(max_packet_bytes, int)
+            or max_packet_bytes < 1
+        ):
+            raise RpcFault(
+                -32602,
+                "params.maxPacketBytes must be a positive resource-derived integer",
+            )
+        available_memory = _available_memory_bytes()
+        worker_resource_bound = (
+            max(1, available_memory // 12)
+            if available_memory is not None
+            else max_packet_bytes
         )
-        self._job_complete(brain, job_id, "consolidation", result)
-        return result
+        if max_packet_bytes > worker_resource_bound:
+            raise RpcFault(
+                -32020,
+                "live observation packet envelope exceeds current worker resources",
+                {
+                    "recoverable": True,
+                    "requestedPacketBytes": max_packet_bytes,
+                    "resourceDerivedPacketBytes": worker_resource_bound,
+                },
+            )
+        try:
+            tool_schemas = AdaptiveBrain._normalize_tool_schemas(
+                params.get("toolSchemas", [])
+            )
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+        readiness = self._trained_modality_capabilities(brain)
+        capabilities = {
+            "imageNeural": readiness["imageNeural"],
+            "audioNeural": readiness["audioNeural"],
+            "videoNeural": readiness["videoNeural"],
+        }
+        unavailable = [
+            modality
+            for modality in modalities
+            if not capabilities[modality + "Neural"]
+        ]
+        if unavailable:
+            raise RpcFault(
+                -32021,
+                "live neural path is not trained for: %s" % ", ".join(unavailable),
+                {"capabilities": capabilities, "unavailableModalities": unavailable},
+            )
+        session = LiveObservationSessionState(
+            session_id=session_id,
+            brain_id=brain.brain_id,
+            modalities=modalities,
+            permission={
+                "source": source,
+                "granted": True,
+                "scope": "session",
+                "grantedAt": granted_at,
+                **({"deviceIdHash": device_hash} if device_hash else {}),
+            },
+            retention=retention,
+            tool_schemas=[dict(value) for value in tool_schemas],
+            capabilities=capabilities,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            max_packet_bytes=max_packet_bytes,
+        )
+        with self._observation_lock:
+            if session_id in self._observation_sessions:
+                raise RpcFault(-32602, "observation session already exists")
+            self._observation_sessions[session_id] = session
+        return self._observation_session_payload(session)
+
+    def observe_packet(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        session_id = str(params.get("sessionId", "")).strip()
+        with self._observation_lock:
+            session = self._observation_sessions.get(session_id)
+        if session is None:
+            raise RpcFault(-32004, "live observation session was not found")
+        modality = str(params.get("modality", "")).strip().lower()
+        if modality not in session.modalities:
+            raise RpcFault(-32602, "packet modality is not enabled for this session")
+        sequence = params.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise RpcFault(-32602, "packet sequence must be a non-negative integer")
+        timestamp_ms = _number(params.get("timestampMs"))
+        if timestamp_ms < 0:
+            raise RpcFault(-32602, "packet timestampMs must be non-negative")
+        mime_type = str(params.get("mimeType", "")).strip().lower()
+        encoded = params.get("dataBase64")
+        if not isinstance(encoded, str):
+            raise RpcFault(-32602, "packet dataBase64 must be a string")
+        maximum_encoded = ((session.max_packet_bytes + 2) // 3) * 4
+        if len(encoded) > maximum_encoded:
+            raise RpcFault(
+                -32602,
+                "live packet exceeds the %d-byte maximum"
+                % session.max_packet_bytes,
+            )
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError, TypeError) as error:
+            raise RpcFault(-32602, "packet dataBase64 is invalid") from error
+        if not payload or len(payload) > session.max_packet_bytes:
+            raise RpcFault(
+                -32602,
+                "live packet must contain 1 to %d bytes"
+                % session.max_packet_bytes,
+            )
+        settings = params.get("settings", {})
+        if not isinstance(settings, dict):
+            raise RpcFault(-32602, "packet settings must be an object")
+        with self._observation_lock:
+            current = self._observation_sessions.get(session_id)
+            if current is None:
+                raise RpcFault(-32004, "live observation session was stopped")
+            if sequence <= current.last_sequence:
+                raise RpcFault(-32602, "packet sequence must increase monotonically")
+            if timestamp_ms < current.last_timestamp_ms:
+                raise RpcFault(-32602, "packet timestamp must not move backwards")
+        brain = self.brains.get(session.brain_id)
+        if brain is None:
+            raise RpcFault(-32004, "live observation brain is no longer loaded")
+        try:
+            observation = brain.observe_live_packet(
+                modality=modality,
+                mime_type=mime_type,
+                payload=payload,
+                session_id=session_id,
+                sequence=sequence,
+                timestamp_ms=timestamp_ms,
+                retention=session.retention,
+                settings=settings,
+                permission_source=str(session.permission["source"]),
+            )
+            organic = (
+                brain.idle_cycle(
+                    tool_schemas=session.tool_schemas,
+                    minimum_idle_seconds=0.0,
+                )
+                if session.retention == "neural"
+                else {"ran": False, "actions": []}
+            )
+            if session.retention == "neural" and not bool(organic.get("ran")):
+                brain.save()
+        except Exception as error:
+            if is_allocator_oom_error(error):
+                brain._allocator_oom_count += 1
+                brain._release_training_allocator_cache()
+            brain_id = brain.brain_id
+            storage = brain.storage_path
+            previous = self.brains.pop(brain_id, None)
+            if previous is not None:
+                previous.close()
+            self.brains[brain_id] = AdaptiveBrain.load(
+                storage, expected_brain_id=brain_id
+            )
+            if is_allocator_oom_error(error):
+                status = self.brains[brain_id].resource_policy.status()
+                status.update(
+                    {
+                        "recoverable": True,
+                        "allocatorOutOfMemory": True,
+                        "failureStage": "live-%s-observation" % modality,
+                        "packetCommitted": False,
+                        "datasetCoverageCommitted": False,
+                    }
+                )
+                raise RpcFault(
+                    -32020,
+                    "live neural observation paused after allocator exhaustion",
+                    {"resourcePause": status},
+                ) from error
+            raise
+        with self._observation_lock:
+            current = self._observation_sessions.get(session_id)
+            if current is None:
+                raise RpcFault(-32004, "live observation session was stopped")
+            current.last_sequence = sequence
+            current.last_timestamp_ms = timestamp_ms
+            current.packets_accepted += 1
+            current.bytes_accepted += len(payload)
+            session_payload = self._observation_session_payload(current)
+        return {
+            "session": session_payload,
+            "observation": observation,
+            "actions": list(organic.get("actions", [])),
+            "trace": organic.get("trace"),
+        }
+
+    def _finish_observation(
+        self, params: Dict[str, Any], *, cancelled: bool
+    ) -> Dict[str, Any]:
+        session_id = str(params.get("sessionId", "")).strip()
+        with self._observation_lock:
+            session = self._observation_sessions.pop(session_id, None)
+        if session is None:
+            raise RpcFault(-32004, "live observation session was not found")
+        payload = self._observation_session_payload(session)
+        payload["state"] = "cancelled" if cancelled else "stopped"
+        payload["rawPacketsStored"] = False
+        return payload
+
+    def stop_observation(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        return self._finish_observation(params, cancelled=False)
+
+    def cancel_observation(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        return self._finish_observation(params, cancelled=True)
+
+    def resolve_observation_control(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        session_id = str(params.get("sessionId", "")).strip()
+        with self._observation_lock:
+            session = self._observation_sessions.get(session_id)
+        if session is None:
+            raise RpcFault(-32004, "live observation session was not found")
+        brain = self._get(params)
+        if session.brain_id != brain.brain_id:
+            raise RpcFault(-32602, "live observation control brain does not match")
+        control = params.get("control")
+        if not isinstance(control, dict):
+            raise RpcFault(-32602, "params.control is required")
+        try:
+            result = brain.record_live_observation_control(
+                session_id=session_id, control=control
+            )
+            brain.save()
+            return result
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def generate_modality(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -1256,7 +3030,51 @@ class Worker:
         brain, job_id, progress = self._job(
             params, request_id, "modality-generation"
         )
-        inline_result = self._claim_inline_generation(brain, params, job_id)
+        try:
+            inline_result = self._claim_inline_generation(brain, params, job_id)
+        except ModalityGenerationCancelled as error:
+            raise RpcFault(-32800, "job was cancelled") from error
+        except MediaResourcePause as error:
+            demand = error.demand
+            status = brain.resource_policy.status(
+                estimated_write_bytes=demand.output_bytes,
+                estimated_ram_bytes=demand.working_bytes,
+            )
+            raise RpcFault(
+                -32020,
+                "modality generation paused at the live resource watermark",
+                {
+                    "resourcePause": status,
+                    "mediaDemand": {
+                        "stage": demand.stage,
+                        "completedUnits": demand.completed_units,
+                        "totalUnits": demand.total_units,
+                        "workingBytes": demand.working_bytes,
+                        "outputBytes": demand.output_bytes,
+                    },
+                },
+            ) from error
+        except Exception as error:
+            if not is_allocator_oom_error(error):
+                raise
+            brain._allocator_oom_count += 1
+            brain._release_training_allocator_cache()
+            status = brain.resource_policy.status()
+            status.update(
+                {
+                    "recoverable": True,
+                    "allocatorOutOfMemory": True,
+                    "failureStage": "inline-modality-generation",
+                    "artifactCommitted": False,
+                    "neuralStateRollbackRequired": False,
+                    "retryWithSmallerMediaProfile": True,
+                }
+            )
+            raise RpcFault(
+                -32020,
+                "modality generation paused after allocator exhaustion",
+                {"resourcePause": status},
+            ) from error
         if inline_result is not None:
             progress(0.98, "Committing the imagination formed during chat")
             self._job_complete(
@@ -1273,49 +3091,111 @@ class Worker:
             generation_progress: float,
             mime_type: str,
             payload: bytes,
+            details: Dict[str, Any],
         ) -> None:
             nonlocal preview_revision
+            cache_key = hashlib.sha256(
+                (job_id or str(request_id or "unbound-preview")).encode("utf-8")
+            ).hexdigest()[:32]
+            digest, artifact_path = _write_content_addressed_preview(
+                brain.engine_path / PREVIEW_CACHE_DIRECTORY / cache_key,
+                mime_type,
+                payload,
+            )
             bounded_progress = 0.2 + 0.75 * max(
                 0.0, min(float(generation_progress), 1.0)
             )
+            status_label = _preview_status(details)
             preview_value: Dict[str, Any] = {
+                **copy.deepcopy(details),
+                "schemaVersion": 1,
+                "producer": "same-brain-decoder",
+                "payloadSha256": digest,
+                "artifactPath": str(artifact_path),
                 "revision": preview_revision,
                 "progress": bounded_progress,
-                "statusLabel": "Decoding the current neural latent",
+                "statusLabel": status_label,
                 "mimeType": mime_type,
             }
-            if len(payload) <= 12 * 1024 * 1024:
-                preview_value["dataUrl"] = (
-                    "data:%s;base64,%s"
-                    % (
-                        mime_type,
-                        base64.b64encode(payload).decode("ascii"),
-                    )
-                )
+            embedded_media = inline_media_data_url(mime_type, payload)
+            if embedded_media is not None:
+                preview_value["dataUrl"] = embedded_media
             self.notify(
                 "modality-preview",
                 brain_id=brain.brain_id,
                 job_id=job_id,
                 sequence=preview_revision,
                 progress=bounded_progress,
-                message="Decoding the current neural latent",
+                message=status_label,
                 data={"preview": preview_value},
             )
             preview_revision += 1
 
-        result = brain.generate_modality(
-            modality=str(params.get("modality", "")),
-            prompt=str(params.get("prompt", "")),
-            concept_ids=params.get("conceptIds"),
-            input_path=str(params.get("inputPath", "")),
-            settings=(
-                params.get("settings")
-                if isinstance(params.get("settings"), dict)
-                else {}
-            ),
-            seed=int(params["seed"]) if params.get("seed") is not None else None,
-            preview_callback=preview,
-        )
+        modality = str(params.get("modality", ""))
+        try:
+            result = brain.generate_modality(
+                modality=modality,
+                prompt=str(params.get("prompt", "")),
+                concept_ids=params.get("conceptIds"),
+                input_path=str(params.get("inputPath", "")),
+                settings=(
+                    params.get("settings")
+                    if isinstance(params.get("settings"), dict)
+                    else {}
+                ),
+                seed=(
+                    int(params["seed"])
+                    if params.get("seed") is not None
+                    else None
+                ),
+                preview_callback=preview,
+                cancel_check=lambda: bool(
+                    job_id and job_id in self.cancelled_jobs
+                ),
+            )
+        except ModalityGenerationCancelled as error:
+            raise RpcFault(-32800, "job was cancelled") from error
+        except MediaResourcePause as error:
+            demand = error.demand
+            status = brain.resource_policy.status(
+                estimated_write_bytes=demand.output_bytes,
+                estimated_ram_bytes=demand.working_bytes,
+            )
+            raise RpcFault(
+                -32020,
+                "modality generation paused at the live resource watermark",
+                {
+                    "resourcePause": status,
+                    "mediaDemand": {
+                        "stage": demand.stage,
+                        "completedUnits": demand.completed_units,
+                        "totalUnits": demand.total_units,
+                        "workingBytes": demand.working_bytes,
+                        "outputBytes": demand.output_bytes,
+                    },
+                },
+            ) from error
+        except Exception as error:
+            if not is_allocator_oom_error(error):
+                raise
+            brain._allocator_oom_count += 1
+            brain._release_training_allocator_cache()
+            status = brain.resource_policy.status()
+            status.update(
+                {
+                    "recoverable": True,
+                    "allocatorOutOfMemory": True,
+                    "failureStage": "%s-generation" % (modality or "modality"),
+                    "artifactCommitted": False,
+                    "neuralStateRollbackRequired": False,
+                    "retryWithSmallerMediaProfile": True,
+                }
+            )
+            raise RpcFault(
+                -32020,
+                "modality generation paused after allocator exhaustion",
+                {"resourcePause": status},
+            ) from error
         self._job_complete(brain, job_id, "modality-generation", result)
         return result
 
@@ -1408,7 +3288,7 @@ class Worker:
             raise RpcFault(-32602, str(error)) from error
         previous = self.brains.pop(brain.brain_id, None)
         if previous is not None:
-            previous.events.close()
+            previous.close()
         reloaded = AdaptiveBrain.load(
             brain.storage_path, expected_brain_id=brain.brain_id
         )
@@ -1446,7 +3326,7 @@ class Worker:
             raise RpcFault(-32602, str(error)) from error
         previous = self.brains.pop(brain.brain_id, None)
         if previous is not None:
-            previous.events.close()
+            previous.close()
         reloaded = AdaptiveBrain.load(
             brain.storage_path, expected_brain_id=brain.brain_id
         )
@@ -1467,6 +3347,18 @@ class Worker:
         del request_id
         brain = self._get(params)
         return brain.snapshot(str(params.get("label", "snapshot")))
+
+    def checkpoint(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        operation_id = str(params.get("operationId", "")).strip()
+        if not operation_id:
+            raise RpcFault(-32602, "params.operationId is required")
+        try:
+            return self._get(params).checkpoint(operation_id)
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def trace(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
@@ -1489,6 +3381,78 @@ class Worker:
         if not job_id:
             raise RpcFault(-32602, "params.jobId is required")
         self.cancelled_jobs.add(job_id)
+        reason = str(params.get("reason", "")).strip() or "Cancelled by operator."
+        requested_candidates = params.get("candidateIds", [])
+        if not (
+            isinstance(requested_candidates, list)
+            and all(
+                isinstance(value, str)
+                and len(value) == 32
+                and all(character in "0123456789abcdef" for character in value)
+                for value in requested_candidates
+            )
+        ):
+            raise RpcFault(-32602, "params.candidateIds must contain hex identifiers")
+        requested_candidate_ids = set(requested_candidates)
+        acknowledged_candidate_ids: List[str] = []
+        brain_id = self._brain_id(params, required=False)
+        storage = self._storage(params, brain_id) if brain_id else None
+        if storage is not None:
+            candidates_root = storage / "engine" / "candidates"
+            if candidates_root.is_dir():
+                for directory in candidates_root.iterdir():
+                    record_path = directory / "candidate.json"
+                    if (
+                        directory.is_symlink()
+                        or not directory.is_dir()
+                        or not record_path.is_file()
+                    ):
+                        continue
+                    try:
+                        record = read_json(record_path)
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
+                    candidate_id = str(record.get("id", ""))
+                    if (
+                        directory.name != candidate_id
+                        or len(candidate_id) != 32
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in candidate_id
+                        )
+                    ):
+                        continue
+                    provenance = record.get("provenance", {})
+                    provenance_request_id = (
+                        str(provenance.get("runtimeRequestId", ""))
+                        if isinstance(provenance, dict)
+                        else ""
+                    )
+                    if not (
+                        candidate_id in requested_candidate_ids
+                        or provenance_request_id == job_id
+                    ):
+                        continue
+                    if record.get("kind") != "neural-evolution":
+                        continue
+                    if record.get("status") not in {
+                        "promoted",
+                        "rolled-back",
+                    }:
+                        atomic_write_json(
+                            record_path,
+                            {
+                                **record,
+                                "status": "rejected",
+                                "reason": reason,
+                                "rejectedAt": time.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                ),
+                                "cancelledJobId": job_id,
+                                "cancellationAcknowledged": True,
+                            },
+                        )
+                    acknowledged_candidate_ids.append(candidate_id)
         inline_cancelled = 0
         cleanup: List[InlineGeneration] = []
         with self._inline_lock:
@@ -1504,9 +3468,60 @@ class Worker:
         for record in cleanup:
             if record.future is None or record.future.done():
                 self._remove_inline_root(record)
+        event_id = ""
+        if storage is not None:
+            loaded = self.brains.get(brain_id)
+            owns_log = loaded is None
+            events = (
+                EventLog(storage / "engine" / "events.sqlite3", brain_id)
+                if owns_log
+                else loaded.events
+            )
+            try:
+                existing = next(
+                    (
+                        event
+                        for event in events.recent(10_000)
+                        if event.get("kind") == "job-cancelled"
+                        and event.get("jobId") == job_id
+                    ),
+                    None,
+                )
+                event_id = (
+                    str(existing.get("eventId", ""))
+                    if isinstance(existing, dict)
+                    else events.append(
+                        "job-cancelled",
+                        {
+                            "kind": str(params.get("kind", "runtime-job")),
+                            "reason": reason,
+                            "candidateIds": sorted(acknowledged_candidate_ids),
+                            "workerPid": os.getpid(),
+                            "terminationPrecededAcknowledgement": True,
+                        },
+                        job_id=job_id,
+                    )
+                )
+            finally:
+                if owns_log:
+                    events.close()
+            self.notify(
+                "job-cancelled",
+                brain_id=brain_id,
+                job_id=job_id,
+                progress=0.0,
+                message="%s cancelled" % str(params.get("kind", "runtime-job")),
+                data={
+                    "acknowledged": True,
+                    "candidateIds": sorted(acknowledged_candidate_ids),
+                },
+            )
         return {
             "jobId": job_id,
             "cancelled": True,
+            "acknowledged": True,
+            "eventId": event_id,
+            "candidateIds": sorted(acknowledged_candidate_ids),
             "inlineGenerationsCancelled": inline_cancelled,
         }
 
@@ -1516,6 +3531,8 @@ class Worker:
         del params, request_id
         self.running = False
         self._shutdown_inline_generations()
+        with self._observation_lock:
+            self._observation_sessions.clear()
         return {"stopping": True}
 
     def dispatch(self, request: Any) -> Optional[Dict[str, Any]]:
@@ -1536,7 +3553,24 @@ class Worker:
         handler = self.methods.get(method)
         if handler is None:
             raise RpcFault(-32601, "method not found: %s" % method)
-        result = handler(params, str(request_id) if request_id is not None else None)
+        correlated_id = str(request_id) if request_id is not None else ""
+        cooperatively_cancellable = method in {
+            "load",
+            "chat",
+            "consolidate_chat_learning",
+        }
+        if cooperatively_cancellable:
+            self._cooperative_cancel.clear()
+            with self._active_request_lock:
+                self._active_request = (method, correlated_id)
+        try:
+            result = handler(params, correlated_id or None)
+        finally:
+            if cooperatively_cancellable:
+                with self._active_request_lock:
+                    if self._active_request == (method, correlated_id):
+                        self._active_request = None
+                self._cooperative_cancel.clear()
         if request_id is None:
             return None
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -1552,21 +3586,84 @@ def _number(value: Any) -> float:
     return number
 
 
+def _available_memory_bytes() -> Optional[int]:
+    """Best-effort live physical-memory probe without a product byte limit."""
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_physical", ctypes.c_ulonglong),
+                    ("available_physical", ctypes.c_ulonglong),
+                    ("total_page_file", ctypes.c_ulonglong),
+                    ("available_page_file", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("available_virtual", ctypes.c_ulonglong),
+                    ("available_extended_virtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return max(1, int(status.available_physical))
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        if page_size > 0 and available_pages > 0:
+            return page_size * available_pages
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return None
+
+
 def main() -> int:
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
     worker = Worker()
+    cooperative_signal = (
+        getattr(signal, "SIGBREAK", None)
+        if os.name == "nt"
+        else getattr(signal, "SIGUSR1", None)
+    )
+    if cooperative_signal is not None:
+        signal.signal(
+            cooperative_signal,
+            lambda _signum, _frame: worker.request_cooperative_cancel(),
+        )
     while worker.running:
-        raw = sys.stdin.buffer.readline(MAX_LINE_BYTES + 1)
+        available_memory = _available_memory_bytes()
+        line_limit = (
+            max(1, available_memory // 8)
+            if available_memory is not None
+            else None
+        )
+        raw = (
+            sys.stdin.buffer.readline(line_limit + 1)
+            if line_limit is not None
+            else sys.stdin.buffer.readline()
+        )
         if not raw:
             break
-        if len(raw) > MAX_LINE_BYTES and not raw.endswith(b"\n"):
+        if (
+            line_limit is not None
+            and len(raw) > line_limit
+            and not raw.endswith(b"\n")
+        ):
             Worker._send(
                 {
                     "jsonrpc": "2.0",
                     "id": None,
                     "error": {
                         "code": -32600,
-                        "message": "request line exceeds protocol limit",
+                        "message": (
+                            "request line exceeds the current resource-derived "
+                            "protocol envelope"
+                        ),
                     },
                 }
             )
@@ -1615,7 +3712,7 @@ def main() -> int:
             )
     for brain in worker.brains.values():
         try:
-            brain.events.close()
+            brain.close()
         except Exception:
             pass
     worker._shutdown_inline_generations()

@@ -1,5 +1,6 @@
 """Configuration and hardware-aware tiny defaults for OmniCortex."""
 
+import math
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict
 
@@ -33,6 +34,18 @@ _DEPRECATED_BETA_CONTROL_FIELDS = frozenset(
 )
 
 
+def safe_rounded_storage_bytes_per_second(value: Any) -> int:
+    """Match the desktop's safe rounding for measured byte rates."""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(numeric) or numeric <= 0.0:
+        return 0
+    return max(1, min((1 << 53) - 1, math.floor(numeric + 0.5)))
+
+
 @dataclass
 class OmniConfig:
     """Serializable architecture and learning configuration.
@@ -58,10 +71,23 @@ class OmniConfig:
     vsa_dim: int = 256
     router_neurons: int = 64
     hardware_tier: str = "personal"
-    origin_kind: str = "blank"
+    # Every OmniCortex starts from this process's seeded random initialization.
+    origin_kind: str = "ground-up"
     train_batch_size: int = 2
     gradient_accumulation: int = 2
     gradient_checkpointing: bool = False
+    # Auto is RAM-first and continuously clamps the physical batch/window to
+    # live RAM/accelerator headroom. Manual budgets are optional operational
+    # ceilings; they never permit crossing the live safety watermark.
+    training_resource_mode: str = "auto"
+    # One process-wide envelope shared by model, training, working memory,
+    # modalities, caches, and agents. Zero means hardware-derived Auto; a
+    # manual value is a percentage of memory left after the OS reserve.
+    system_ram_share_percent: float = 0.0
+    training_ram_budget_bytes: int = 0
+    training_accelerator_budget_bytes: int = 0
+    training_scratch_budget_bytes: int = 0
+    storage_bytes_per_second: int = 0
 
     ternary_weights: bool = True
     spiking_dynamics: bool = True
@@ -96,16 +122,21 @@ class OmniConfig:
 
     liquid_mode: str = "cfc"
     liquid_steps: int = 3
-    memory_recipe: str = "human-consolidation"
+    memory_recipe: str = "adaptive-retention"
     memory_injection: str = "working-memory"
     learn_from_own_messages: bool = True
     retain_source_text: bool = False
     extended_working_memory: bool = False
     recursive_improvement: bool = True
     idle_cognition: bool = True
-    replay_capacity: int = 2048
     working_memory_slots: int = 256
+    working_memory_mode: str = "auto"
+    memory_offload_bytes: int = 0
+    memory_resident_items: int = 256
+    memory_offload_slowdown_percent: float = 0.0
     short_term_half_life_minutes: float = 45.0
+    # Legacy checkpoint input only. Replay admission is now continuously
+    # weighted; this value is not a live memory threshold or public control.
     long_term_threshold: float = 0.62
     forgetting_rate: float = 0.002
     consolidation_rate: float = 0.06
@@ -118,8 +149,28 @@ class OmniConfig:
     video_frames: int = 4
     modality_channels: int = 16
     device: str = "cpu"
+    # Zero selects an adaptive hardware-derived reserve. These are operational
+    # safety boundaries, not neural-size or memory-cardinality caps.
+    ram_reserve_bytes: int = 0
+    disk_reserve_bytes: int = 0
+    disk_state_offload: bool = True
 
     def validate(self) -> None:
+        # Stable v1 treats prompt-free recurrence/Ponder as a permanent
+        # architectural pathway. Learned neural state can select zero passes,
+        # but neither a legacy import nor a direct research constructor may
+        # remove the pathway itself.
+        self.idle_cognition = True
+        self.storage_bytes_per_second = safe_rounded_storage_bytes_per_second(
+            self.storage_bytes_per_second
+        )
+        # Direct research/test constructors may override only the total
+        # workspace. The resident portion is a subset, so normalize it before
+        # validation; public builds supply a measured value from preflight.
+        self.memory_resident_items = max(
+            1,
+            min(int(self.memory_resident_items), int(self.working_memory_slots)),
+        )
         if self.vocab_size < 261:
             raise ValueError("vocab_size must fit bytes and role boundaries (at least 261)")
         if self.d_model <= 0 or self.n_heads <= 0:
@@ -136,6 +187,7 @@ class OmniConfig:
         if self.router_neurons <= 1 or self.vsa_dim <= 8:
             raise ValueError("router_neurons and vsa_dim are too small")
         if self.memory_recipe not in {
+            "adaptive-retention",
             "human-consolidation",
             "total-recall",
             "synapses-only",
@@ -147,29 +199,58 @@ class OmniConfig:
             raise ValueError("liquid_mode must be cfc or ltc")
         if self.hardware_tier not in {"micro", "personal", "gpu", "workstation"}:
             raise ValueError("unsupported hardware_tier")
-        if self.origin_kind not in {"blank", "starter"}:
-            raise ValueError("origin_kind must be blank or starter")
+        if self.origin_kind != "ground-up":
+            raise ValueError("origin_kind must be ground-up")
         if self.image_size < 8 or self.image_size % 4:
             raise ValueError("image_size must be a multiple of four and at least 8")
         if self.video_frames < 2:
             raise ValueError("video_frames must be at least 2")
         if self.working_memory_slots < 1:
             raise ValueError("working-memory slots must be positive")
+        if self.working_memory_mode not in {"auto", "extended", "manual"}:
+            raise ValueError("working_memory_mode must be auto, extended, or manual")
+        if self.memory_offload_bytes < 0:
+            raise ValueError("memory_offload_bytes cannot be negative")
+        if self.memory_resident_items < 1:
+            raise ValueError("memory_resident_items must be positive")
+        if not 0.0 <= self.memory_offload_slowdown_percent <= 95.0:
+            raise ValueError("memory_offload_slowdown_percent must be in [0, 95]")
         if self.train_batch_size < 1 or self.gradient_accumulation < 1:
             raise ValueError("training batch size and accumulation must be positive")
+        if self.training_resource_mode not in {"auto", "manual"}:
+            raise ValueError("training_resource_mode must be auto or manual")
+        if self.system_ram_share_percent != 0.0 and not (
+            30.0 <= self.system_ram_share_percent <= 100.0
+        ):
+            raise ValueError(
+                "system_ram_share_percent must be auto (0) or in [30, 100]"
+            )
+        if min(
+            self.training_ram_budget_bytes,
+            self.training_accelerator_budget_bytes,
+            self.training_scratch_budget_bytes,
+            self.storage_bytes_per_second,
+        ) < 0:
+            raise ValueError("training resource budgets cannot be negative")
         if self.short_term_half_life_minutes <= 0:
             raise ValueError("short-term half-life must be positive")
         if self.slow_stability_strength < 0:
             raise ValueError("slow_stability_strength cannot be negative")
         if not 0.0 <= self.slow_importance_decay < 1.0:
             raise ValueError("slow_importance_decay must be in [0, 1)")
+        if self.ram_reserve_bytes < 0 or self.disk_reserve_bytes < 0:
+            raise ValueError("resource reserve bytes cannot be negative")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             key: value
             for key, value in asdict(self).items()
             if key not in _DEPRECATED_BETA_CONTROL_FIELDS
+            and key != "long_term_threshold"
         }
+        if payload.get("memory_recipe") in {"human", "human-consolidation"}:
+            payload["memory_recipe"] = "adaptive-retention"
+        return payload
 
     def generation_token_budget(self, cognitive_demand: float = 0.5) -> int:
         """Return a context-independent, state-scaled response budget.
@@ -200,7 +281,15 @@ class OmniConfig:
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "OmniConfig":
         allowed = {field.name for field in fields(cls)}
-        config = cls(**{key: value for key, value in raw.items() if key in allowed})
+        values = {key: value for key, value in raw.items() if key in allowed}
+        if values.get("memory_recipe") in {"human", "human-consolidation"}:
+            values["memory_recipe"] = "adaptive-retention"
+        if "memory_resident_items" not in values:
+            values["memory_resident_items"] = min(
+                int(values.get("working_memory_slots", cls.working_memory_slots)),
+                int(cls.memory_resident_items),
+            )
+        config = cls(**values)
         config.validate()
         return config
 
@@ -211,10 +300,13 @@ class OmniConfig:
         Stable v1 ignores beta personality sliders and cardinality ceilings.
         Hardware profiling determines the physical recurrent population and
         working workspace; structural assemblies remain resource-governed.
-        """
 
-        if any(key in raw for key in ("d_model", "n_layers", "vsa_dim")):
-            return cls.from_dict(raw)
+        Persisted/research snake-case dictionaries must use :meth:`from_dict`.
+        Treating one of those dictionaries as a public Build request used to
+        bypass the versioned hardware profile and could make the worker create
+        an undisclosed architecture.  The public boundary therefore never
+        switches parsers based on caller-controlled keys.
+        """
         tier = str(raw.get("hardwareTier", "personal"))
         profiles = {
             "micro": {
@@ -281,13 +373,42 @@ class OmniConfig:
         heads = 4 if dimensions <= 64 else 8
         physical_neurons = int(profile["router"])
         external_rate = float(raw.get("learningRate", 0.14))
-        extended_working = bool(raw.get("extendedWorkingMemory", False))
+        system_ram_mode = str(raw.get("systemRamMode", "auto"))
+        if system_ram_mode not in {"auto", "manual"}:
+            raise ValueError("systemRamMode must be auto or manual")
+        system_ram_share_percent = (
+            float(raw.get("systemRamSharePercent", 0.0))
+            if system_ram_mode == "manual"
+            else 0.0
+        )
+        if system_ram_mode == "manual" and not (
+            30.0 <= system_ram_share_percent <= 100.0
+        ):
+            raise ValueError(
+                "manual systemRamSharePercent must be in [30, 100]"
+            )
+        working_memory_mode = str(
+            raw.get(
+                "workingMemoryMode",
+                "extended" if raw.get("extendedWorkingMemory", False) else "auto",
+            )
+        )
+        extended_working = working_memory_mode == "extended"
         context_tokens = int(profile["sequence"]) * (
             2 if extended_working else 1
         )
-        workspace_slots = int(profile["workspace"]) * (
-            2 if extended_working else 1
-        )
+        # Stable v1 resource planning may provide the exact live/model-derived
+        # active window. Older checkpoints omit it and retain the historical
+        # tier/Extended behavior above.
+        if "contextWindowTokens" in raw:
+            context_tokens = int(raw["contextWindowTokens"])
+        workspace_slots = int(profile["workspace"]) * (2 if extended_working else 1)
+        # Stable-v1's resource planner is the only public source of a numeric
+        # capacity. Old beta sliders lacked workingMemoryMode and remain
+        # ignored. Large values are recurrent/paged items, not a dense
+        # attention allocation.
+        if "workingMemoryMode" in raw:
+            workspace_slots = max(1, int(raw.get("workingMemorySlots", workspace_slots)))
         values: Dict[str, Any] = {
             "name": str(raw.get("name", "New OmniCortex")),
             "d_model": dimensions,
@@ -299,10 +420,27 @@ class OmniConfig:
             "router_neurons": physical_neurons,
             "vsa_dim": max(128, dimensions * 4),
             "hardware_tier": tier,
-            "origin_kind": str(raw.get("origin_kind", raw.get("origin", "blank"))),
+            # Build always creates the native OmniCortex architecture.
+            "origin_kind": "ground-up",
             "train_batch_size": int(profile["batch"]),
             "gradient_accumulation": int(profile["accumulation"]),
             "gradient_checkpointing": bool(profile["checkpointing"]),
+            "training_resource_mode": str(
+                raw.get("trainingResourceMode", "auto")
+            ),
+            "system_ram_share_percent": system_ram_share_percent,
+            "training_ram_budget_bytes": max(
+                0, int(raw.get("trainingRamBudgetBytes", 0))
+            ),
+            "training_accelerator_budget_bytes": max(
+                0, int(raw.get("trainingAcceleratorBudgetBytes", 0))
+            ),
+            "training_scratch_budget_bytes": max(
+                0, int(raw.get("trainingScratchBudgetBytes", 0))
+            ),
+            "storage_bytes_per_second": safe_rounded_storage_bytes_per_second(
+                raw.get("storageBytesPerSecond", 0)
+            ),
             "image_size": int(profile["image"]),
             "audio_samples": int(profile["audio"]),
             "video_frames": int(profile["frames"]),
@@ -328,7 +466,7 @@ class OmniConfig:
                 0.0, min(0.9999, float(raw.get("slowImportanceDecay", 0.97)))
             ),
             "memory_recipe": str(
-                raw.get("memoryRecipe", "human-consolidation")
+                raw.get("memoryRecipe", "adaptive-retention")
             ),
             "memory_injection": "working-memory",
             "learn_from_own_messages": True,
@@ -337,18 +475,40 @@ class OmniConfig:
             "recursive_improvement": bool(
                 raw.get("recursiveImprovement", True)
             ),
-            "idle_cognition": bool(raw.get("idleCognition", True)),
+            # Stable v1 always has the recurrent Ponder capability. Neural
+            # state may select zero passes; config cannot remove the pathway.
+            "idle_cognition": True,
             "working_memory_slots": workspace_slots,
+            "working_memory_mode": working_memory_mode,
+            "memory_offload_bytes": max(0, int(raw.get("memoryOffloadBytes", 0))),
+            "memory_resident_items": max(
+                1,
+                min(
+                    workspace_slots,
+                    int(raw.get("memoryResidentItems", workspace_slots)),
+                ),
+            ),
+            "memory_offload_slowdown_percent": max(
+                0.0,
+                min(95.0, float(raw.get("memoryOffloadSlowdownPercent", 0.0))),
+            ),
             "device": str(raw.get("device", "cpu")),
+            "ram_reserve_bytes": max(0, int(raw.get("ramReserveBytes", 0))),
+            "disk_reserve_bytes": max(
+                0, int(raw.get("diskReserveBytes", 0))
+            ),
+            "disk_state_offload": True,
         }
-        if values["memory_recipe"] == "human":
-            values["memory_recipe"] = "human-consolidation"
+        if values["memory_recipe"] in {"human", "human-consolidation"}:
+            values["memory_recipe"] = "adaptive-retention"
         config = cls(**values)
         config.validate()
         return config
 
     @classmethod
     def micro(cls, name: str = "Micro OmniCortex", **overrides: Any) -> "OmniConfig":
+        # This low-level constructor exists for unit tests and constrained
+        # research fixtures. Studio builds use ``from_external``.
         values: Dict[str, Any] = {
             "name": name,
             "max_seq_len": 256,
@@ -360,6 +520,7 @@ class OmniConfig:
             "vsa_dim": 64,
             "router_neurons": 24,
             "working_memory_slots": 128,
+            "memory_resident_items": 128,
             "image_size": 8,
             "audio_samples": 64,
             "video_frames": 2,
@@ -368,6 +529,7 @@ class OmniConfig:
             "train_batch_size": 1,
             "gradient_accumulation": 8,
             "gradient_checkpointing": True,
+            "origin_kind": "ground-up",
         }
         values.update(overrides)
         config = cls(**values)

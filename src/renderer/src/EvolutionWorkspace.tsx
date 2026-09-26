@@ -33,13 +33,13 @@ const candidateKinds: Array<{
 }> = [
   {
     id: "substrate",
-    label: "Neural substrate",
-    description: "Assemblies, fast synapses, slow weights, and latent replay"
+    label: "Connections and memory",
+    description: "Neural memory, learned pathways, and memory rehearsal"
   },
   {
     id: "neural",
-    label: "Neural weights",
-    description: "Isolated safe-tensor overlay and retention evaluation"
+    label: "Learned connections",
+    description: "Test a safe isolated copy and check that important knowledge remains"
   },
   {
     id: "data",
@@ -48,8 +48,8 @@ const candidateKinds: Array<{
   },
   {
     id: "architecture",
-    label: "Compatible growth",
-    description: "Add one ternary residual expert without changing tensor shapes"
+    label: "Brain growth",
+    description: "Add capacity without replacing the existing mind"
   }
 ];
 
@@ -80,7 +80,7 @@ function candidateKind(candidate: EvolutionCandidate): string {
 
 function policyCopy(permission: ToolPermissionLevel): string {
   if (permission === "ask") {
-    return "Isolated experiments may run. Evaluation and promotion wait for your explicit review here.";
+    return "Isolated improvement runs may proceed. Evaluation and promotion wait for your explicit review here.";
   }
   if (permission === "auto") {
     return "Passing neural, data, and substrate candidates may promote automatically. Source and architecture promotion still wait for review.";
@@ -88,7 +88,7 @@ function policyCopy(permission: ToolPermissionLevel): string {
   if (permission === "full") {
     return "Passing candidates may promote under the immutable evaluator, with exact rollback retained.";
   }
-  return "Recursive experiments are disabled. Enable their tool permission to start a candidate.";
+  return "Recursive improvement is disabled. Enable its tool permission to start a candidate.";
 }
 
 function EvolutionCandidateCard({
@@ -224,7 +224,8 @@ export function EvolutionWorkspace({
     )?.level ?? "off";
   const configured = brain.config.recursiveImprovement !== false;
   const enabled = configured && permission !== "off";
-  const dataAvailable = brain.trainingSources.length > 0;
+  const dataAvailable =
+    (brain.activity?.trainingSourceCount ?? brain.trainingSources.length) > 0;
   const runs = useMemo(
     () => groupEvolutionRuns(candidates, knownRuns),
     [candidates, knownRuns]
@@ -277,7 +278,9 @@ export function EvolutionWorkspace({
           objective,
           recursive,
           candidateKind: kind,
-          sourceIds: brain.trainingSources.map((source) => source.id)
+          // Keep the Run view bounded. An empty explicit selection routes the
+          // data candidate through worker-owned memory rehearsal.
+          sourceIds: []
         })
       );
       setKnownRuns((current) => [
@@ -288,14 +291,14 @@ export function EvolutionWorkspace({
       await reload(true);
       onToast(
         run.state === "failed"
-          ? run.error ?? "The improvement experiment failed to start."
+          ? run.error ?? "The improvement run failed to start."
           : `Started ${kind} improvement run ${shortId(run.id)} in an isolated overlay.`
       );
     } catch (error) {
       onToast(
         error instanceof Error
           ? error.message
-          : "The improvement experiment could not start."
+          : "The improvement run could not start."
       );
     } finally {
       setStarting(false);
@@ -314,6 +317,7 @@ export function EvolutionWorkspace({
       await reload(true);
       onToast(`Stopped evolution run ${shortId(run.id)}; its archive remains inspectable.`);
     } catch (error) {
+      await reload(true);
       onToast(error instanceof Error ? error.message : "The evolution run could not be stopped.");
     } finally {
       setBusyRun("");
@@ -402,7 +406,7 @@ export function EvolutionWorkspace({
             />
           </label>
           <fieldset className="evolution-routes">
-            <legend>Candidate substrate</legend>
+            <legend>What may change</legend>
             {candidateKinds.map((candidate) => {
               const unavailable = candidate.id === "data" && !dataAvailable;
               return (
@@ -459,7 +463,7 @@ export function EvolutionWorkspace({
               <small>
                 {configured
                   ? policyCopy(permission)
-                  : "The brain configuration must allow recursive experiments before a candidate can start."}
+                  : "The brain configuration must allow recursive improvement before a candidate can start."}
               </small>
             </span>
           </div>
@@ -469,7 +473,7 @@ export function EvolutionWorkspace({
             onClick={() => void start()}
           >
             <Icon name={starting ? "activity" : "play"} size={16} />
-            <span>{starting ? "Creating isolated overlay…" : "Start experiment"}</span>
+            <span>{starting ? "Creating isolated overlay…" : "Start improvement run"}</span>
           </button>
         </aside>
 
@@ -512,20 +516,25 @@ export function EvolutionWorkspace({
             </div>
           ) : (
             <div className="evolution-run-list">
-              {runs.map((run) => (
-                <section className="evolution-run" key={run.id}>
+              {runs.map((run) => {
+                const displayedState = busyRun === run.id ? "stopping" : run.state;
+                return (
+                <section className="evolution-run" key={run.id} aria-busy={busyRun === run.id || undefined}>
                   <header>
                     <span>
                       <small>RUN {shortId(run.id)} · GENERATION {run.generation}</small>
                       <strong>{run.objective}</strong>
                       <em>
-                        {run.recursive ? "recursive lineage" : "single experiment"} ·{" "}
+                        {run.recursive ? "recursive lineage" : "single run"} ·{" "}
                         updated {relativeTime(run.updatedAt)}
                       </em>
                     </span>
                     <span>
-                      <em className={`evolution-state evolution-state--${run.state}`}>
-                        <i /> {stateLabel(run.state)}
+                      <em
+                        className={`evolution-state evolution-state--${displayedState}`}
+                        aria-live="polite"
+                      >
+                        <i /> {stateLabel(displayedState)}
                       </em>
                       {canStopEvolution(run.state) ? (
                         <button
@@ -533,8 +542,17 @@ export function EvolutionWorkspace({
                           disabled={Boolean(busyRun)}
                           onClick={() => void stop(run.id)}
                         >
-                          <Icon name={busyRun === run.id ? "activity" : "close"} size={14} />
-                          <span>{busyRun === run.id ? "Stopping…" : "Stop"}</span>
+                          <Icon
+                            name={busyRun === run.id || run.state === "stopping" ? "activity" : "close"}
+                            size={14}
+                          />
+                          <span>
+                            {busyRun === run.id
+                              ? "Stopping…"
+                              : run.state === "stopping"
+                                ? "Retry stop"
+                                : "Stop"}
+                          </span>
                         </button>
                       ) : null}
                     </span>
@@ -557,7 +575,8 @@ export function EvolutionWorkspace({
                     ) : null}
                   </div>
                 </section>
-              ))}
+                );
+              })}
             </div>
           )}
         </section>

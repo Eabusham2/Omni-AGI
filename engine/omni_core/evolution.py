@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import torch
 from torch.nn import functional as F
 
+from .offload import copy_mutable_state_snapshot
 from .persistence import (
     atomic_save_tensors,
     atomic_write_json,
@@ -609,13 +610,20 @@ class NeuralEvolutionManager:
             if architecture_mutation is not None:
                 additions = int(architecture_mutation["addExperts"])
                 hidden = max(16, int(candidate.config.d_ff) // 2)
-                # Master weights, optimizer moments, and checkpoint copies all
-                # consume space even though inference forwards are ternary.
+                # Expert projections are authoritative packed ternary
+                # synapses. Reserve room for their live codes, an isolated
+                # candidate, a rollback checkpoint, and bounded update
+                # scratch, without charging for nonexistent FP32 masters or
+                # full-sized Adam moments.
                 estimated_parameters = additions * (
                     2 * int(candidate.config.d_model)
                     + 3 * int(candidate.config.d_model) * hidden
                 )
-                estimated_bytes = estimated_parameters * 12
+                packed_bytes = (estimated_parameters + 3) // 4
+                estimated_bytes = packed_bytes * 3 + max(
+                    1_048_576,
+                    4 * int(candidate.config.d_model) * hidden,
+                )
                 if not candidate._allow_substrate_growth(estimated_bytes):
                     raise ValueError(
                         "architecture growth paused at the host resource reserve"
@@ -626,10 +634,8 @@ class NeuralEvolutionManager:
                     # A newly inserted architecture is function-preserving
                     # before isolated training. Its residual path begins at
                     # zero and can then learn inside the candidate overlay.
-                    candidate.decoder.experts[index].network.down.weight.data.zero_()
-                candidate._optimizer = candidate._new_optimizer(
-                    learning_rate
-                )
+                    candidate.decoder.experts[index].network.down.fill_ternary_(0)
+                candidate._replace_optimizer(learning_rate)
                 candidate._sync_stability_state()
                 architecture_result = {
                     **architecture_mutation,
@@ -644,28 +650,48 @@ class NeuralEvolutionManager:
                         "Compatible ternary residual expert architecture created",
                     )
             if clean_texts:
+                def scaled_progress(
+                    value: float,
+                    message: str,
+                    data: Optional[Dict[str, Any]] = None,
+                ) -> None:
+                    assert progress is not None
+                    progress(
+                        0.15 + 0.7 * float(value),
+                        message,
+                        dict(data) if isinstance(data, Mapping) else None,
+                    )
+
                 training = candidate.train(
                     texts=clean_texts,
                     epochs=epochs,
                     learning_rate=learning_rate,
                     progress=(
                         (
-                            lambda value, message: progress(
-                                0.15 + 0.7 * float(value), message
-                            )
+                            scaled_progress
                         )
                         if progress is not None
                         else None
                     ),
                 )
             elif latent_replay and anchors.numel() > 0:
-                training = candidate.consolidate(
+                def scaled_replay_progress(
+                    value: float,
+                    message: str,
+                    data: Optional[Dict[str, Any]] = None,
+                ) -> None:
+                    assert progress is not None
+                    progress(
+                        0.15 + 0.7 * float(value),
+                        message,
+                        dict(data) if isinstance(data, Mapping) else None,
+                    )
+
+                training = candidate._train_evolution_replay_candidate(
                     steps=epochs,
                     progress=(
                         (
-                            lambda value, message: progress(
-                                0.15 + 0.7 * float(value), message
-                            )
+                            scaled_replay_progress
                         )
                         if progress is not None
                         else None
@@ -1012,6 +1038,7 @@ class NeuralEvolutionManager:
             for filename in ("core.safetensors", "plasticity.safetensors"):
                 _copy_atomic(model_engine / filename, self.engine_path / filename)
             copy_substrate_snapshot(model_engine, self.engine_path)
+            copy_mutable_state_snapshot(model_engine, self.engine_path)
             _copy_atomic(
                 model_engine / "brain.json",
                 self.engine_path / "brain.json",

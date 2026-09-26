@@ -38,6 +38,38 @@ RETIRED_BETA_FIELDS = {
 
 
 class StableConfigTests(unittest.TestCase):
+    def test_adaptive_retention_is_canonical_and_legacy_aliases_still_load(self):
+        self.assertEqual(OmniConfig().memory_recipe, "adaptive-retention")
+        self.assertEqual(
+            OmniConfig.from_external(
+                {"memoryRecipe": "human-consolidation"}
+            ).memory_recipe,
+            "adaptive-retention",
+        )
+        legacy = OmniConfig.from_dict(
+            {
+                **OmniConfig.micro().to_dict(),
+                "memory_recipe": "human-consolidation",
+            }
+        )
+        self.assertEqual(legacy.memory_recipe, "adaptive-retention")
+
+    def test_legacy_and_direct_config_cannot_disable_ponder_pathway(self):
+        self.assertTrue(OmniConfig.micro(idle_cognition=False).idle_cognition)
+        self.assertTrue(
+            OmniConfig.from_dict(
+                {**OmniConfig.micro().to_dict(), "idle_cognition": False}
+            ).idle_cognition
+        )
+        self.assertTrue(
+            OmniConfig.from_external({"idleCognition": False}).idle_cognition
+        )
+
+    def test_direct_micro_override_clamps_resident_subset_to_workspace(self):
+        config = OmniConfig.micro(working_memory_slots=7)
+        self.assertEqual(config.working_memory_slots, 7)
+        self.assertEqual(config.memory_resident_items, 7)
+
     def setUp(self):
         torch.set_num_threads(1)
 

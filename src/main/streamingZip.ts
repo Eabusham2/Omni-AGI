@@ -36,6 +36,19 @@ export interface StreamingZipSource {
   sourcePath?: string;
 }
 
+export interface StreamingZipProgress {
+  filesCompleted: number;
+  filesTotal: number;
+  bytesCompleted: number;
+  bytesTotal: number;
+}
+
+export interface StreamingZipOperationOptions {
+  signal?: AbortSignal;
+  checkpoint?: (progress: StreamingZipProgress) => Promise<void>;
+  checkDisk?: (path: string, operationWriteBytes: number) => Promise<unknown>;
+}
+
 export interface ExtractedZipEntry {
   name: string;
   path: string;
@@ -229,12 +242,14 @@ async function replaceAtomically(temporary: string, destination: string): Promis
  */
 export async function writeStreamingZip(
   destination: string,
-  sources: StreamingZipSource[]
+  sources: StreamingZipSource[],
+  options: StreamingZipOperationOptions = {}
 ): Promise<void> {
   const seen = new Set<string>();
   const prepared: Array<StreamingZipSource & { size: number }> = [];
   let payloadBytes = 0n;
   for (const source of sources) {
+    options.signal?.throwIfAborted();
     assertSafeArchivePath(source.name);
     if (seen.has(source.name)) throw new Error(`Duplicate path in .omni bundle: ${source.name}`);
     seen.add(source.name);
@@ -250,14 +265,45 @@ export async function writeStreamingZip(
   }
 
   const parent = dirname(resolve(destination));
+  await options.checkDisk?.(
+    parent,
+    checkedNumber(
+      payloadBytes + BigInt(prepared.length * 256 + 4096),
+      "projected export bytes"
+    )
+  );
   await ensureDiskReserve(parent, payloadBytes + BigInt(prepared.length * 256 + 4096));
   const temporaryRoot = await mkdtemp(join(parent, ".omni-export-"));
   const temporary = join(temporaryRoot, basename(destination));
   const handle = await open(temporary, "wx", 0o600);
   let offset = 0;
+  let filesCompleted = 0;
+  let bytesCompleted = 0;
+  let nextCheckpointBytes = 0;
+  const checkpoint = async (force = false): Promise<void> => {
+    options.signal?.throwIfAborted();
+    if (!force && bytesCompleted < nextCheckpointBytes) return;
+    nextCheckpointBytes = bytesCompleted + 8 * 1024 * 1024;
+    await options.checkDisk?.(
+      parent,
+      Math.max(
+        0,
+        checkedNumber(payloadBytes, "export payload bytes") - bytesCompleted
+      ) + prepared.length * 256 + 4096
+    );
+    await options.checkpoint?.({
+      filesCompleted,
+      filesTotal: prepared.length,
+      bytesCompleted,
+      bytesTotal: checkedNumber(payloadBytes, "export payload bytes")
+    });
+    options.signal?.throwIfAborted();
+  };
   const central: CentralEntry[] = [];
   try {
+    await checkpoint(true);
     for (const source of prepared) {
+      await checkpoint(true);
       const name = Buffer.from(source.name, "utf8");
       const entryOffset = offset;
       const largeEntry = source.size >= UINT32_MAX;
@@ -283,9 +329,12 @@ export async function writeStreamingZip(
       const crc = new Crc32();
       let observed = 0;
       const writeChunk = async (chunk: Uint8Array): Promise<void> => {
+        options.signal?.throwIfAborted();
         crc.update(chunk);
         observed += chunk.byteLength;
+        bytesCompleted += chunk.byteLength;
         offset = await writeAll(handle, chunk, offset);
+        await checkpoint();
       };
       if (source.contents) {
         await writeChunk(source.contents);
@@ -315,6 +364,8 @@ export async function writeStreamingZip(
         size: observed,
         offset: entryOffset
       });
+      filesCompleted += 1;
+      await checkpoint(true);
     }
 
     const centralOffset = offset;
@@ -387,6 +438,7 @@ export async function writeStreamingZip(
     offset = await writeAll(handle, end, offset);
     await handle.sync();
     await handle.close();
+    options.signal?.throwIfAborted();
     await replaceAtomically(temporary, resolve(destination));
   } catch (error) {
     await handle.close().catch(() => undefined);
@@ -646,19 +698,44 @@ async function entryDataOffset(
  */
 export async function extractStreamingZip(
   archivePath: string,
-  temporaryParent = tmpdir()
+  temporaryParent = tmpdir(),
+  options: StreamingZipOperationOptions = {}
 ): Promise<ExtractedZipArchive> {
+  options.signal?.throwIfAborted();
   const parsed = await parseCentralDirectory(archivePath);
   const total = parsed.entries.reduce(
     (sum, entry) => sum + BigInt(entry.uncompressedSize),
     0n
   );
+  const totalBytes = checkedNumber(total, "import payload bytes");
+  await options.checkDisk?.(temporaryParent, totalBytes);
   await ensureDiskReserve(temporaryParent, total);
   const root = await mkdtemp(join(temporaryParent, ".omni-import-"));
   const archive = await open(archivePath, "r");
   const extracted = new Map<string, ExtractedZipEntry>();
+  let filesCompleted = 0;
+  let bytesCompleted = 0;
+  let nextCheckpointBytes = 0;
+  const checkpoint = async (force = false): Promise<void> => {
+    options.signal?.throwIfAborted();
+    if (!force && bytesCompleted < nextCheckpointBytes) return;
+    nextCheckpointBytes = bytesCompleted + 8 * 1024 * 1024;
+    await options.checkDisk?.(
+      temporaryParent,
+      Math.max(0, totalBytes - bytesCompleted)
+    );
+    await options.checkpoint?.({
+      filesCompleted,
+      filesTotal: parsed.entries.length,
+      bytesCompleted,
+      bytesTotal: totalBytes
+    });
+    options.signal?.throwIfAborted();
+  };
   try {
+    await checkpoint(true);
     for (const entry of parsed.entries) {
+      await checkpoint(true);
       const dataOffset = await entryDataOffset(archive, entry, parsed.centralOffset);
       const destination = resolve(root, ...entry.name.split("/"));
       const relativeDestination = relative(resolve(root), destination);
@@ -676,12 +753,16 @@ export async function extractStreamingZip(
       const meter = new Transform({
         transform(chunk: Buffer, _encoding, callback) {
           bytes += chunk.byteLength;
+          bytesCompleted += chunk.byteLength;
           if (bytes > entry.uncompressedSize) {
             callback(new Error(`ZIP entry ${entry.name} expands beyond its declared size.`));
             return;
           }
           crc.update(chunk);
-          callback(null, chunk);
+          void checkpoint().then(
+            () => callback(null, chunk),
+            (error: Error) => callback(error)
+          );
         }
       });
       if (entry.compressedSize === 0) {
@@ -714,6 +795,8 @@ export async function extractStreamingZip(
         uncompressedBytes: entry.uncompressedSize,
         crc32: entry.crc32
       });
+      filesCompleted += 1;
+      await checkpoint(true);
     }
     return { root, entries: extracted };
   } catch (error) {

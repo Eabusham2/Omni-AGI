@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { cpus, freemem, totalmem } from "node:os";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import {
   app,
@@ -14,12 +14,18 @@ import {
 import type {
   BrainConfig,
   BrainExportMode,
+  BrainStorageOperationEvent,
+  BuildProgressEvent,
   BuildResourceSelection,
   BuildResourceStartRequest,
   CatalogEntry,
+  ChatDeliveryReceiptRequest,
+  ChatTurnMetadata,
   CreateBrainRequest,
+  DatasetPreviewProgress,
   DatasetPreviewRequest,
   DatasetStartRequest,
+  DeleteInstanceRequest,
   FeedbackRequest,
   HardwareProfile,
   EvolutionApprovalRequest,
@@ -29,14 +35,24 @@ import type {
   ImportUrlRequest,
   IngestFilesRequest,
   IngestWebRequest,
+  LiveObservationControlResolution,
+  LiveObservationControlRequest,
+  LiveObservationPacket,
+  LiveObservationSessionStartRequest,
+  MobileGatewayStartRequest,
   ModalityGenerateRequest,
   NativeAppearanceRequest,
-  StartTrainingRequest,
   SubstrateQuery,
   ToolInvocation,
   ToolPermissionLevel,
   TraceQuery,
-  WebCrawlRequest
+  WebCrawlRequest,
+  WorkingMemoryPlanRequest,
+  ApiTeacherCredentialRequest,
+  ApiTeacherProvider,
+  ApiTeacherTrainingRequest,
+  McpServerRegistrationRequest,
+  ToolRuntimePreferences
 } from "../shared/types";
 import { IPC } from "../shared/ipc";
 import {
@@ -47,12 +63,24 @@ import {
 import type { BrainRepository } from "./brainRepository";
 import {
   BrainService,
+  requireNewDataIngestionPolicy,
   type RuntimeJobManager
 } from "./brainService";
 import type { EngineSupervisor } from "./engineSupervisor";
 import type { ToolExecutor } from "./toolExecutor";
 import type { ChatActionController } from "./chatActionController";
 import type { EvolutionController } from "./evolutionController";
+import type { BuildResourceSelectionStore } from "./buildResourceSelections";
+import type {
+  BuildInitializationCoordinator,
+  InitialLearningProgress
+} from "./buildInitializationCoordinator";
+import type { MobileGateway } from "./mobileGateway";
+import type { ApiTeacherTrainingService } from "./teacherTraining";
+import type { McpClientService } from "./mcpClient";
+import { requireWorkingMemoryPlanRequest } from "./resourcePlanRequest";
+import { BrainStorageOperationManager } from "./brainStorageOperations";
+import type { IdleCognitionScheduler } from "./idleCognitionScheduler";
 
 export interface IpcDependencies {
   repository: BrainRepository;
@@ -62,6 +90,12 @@ export interface IpcDependencies {
   tools: ToolExecutor;
   actions: ChatActionController;
   evolution: EvolutionController;
+  buildSelections: BuildResourceSelectionStore;
+  initialization: BuildInitializationCoordinator;
+  mobile: MobileGateway;
+  teacher: ApiTeacherTrainingService;
+  mcp: McpClientService;
+  idleCognition?: Pick<IdleCognitionScheduler, "cancelActive">;
   appPath: string;
 }
 
@@ -78,6 +112,39 @@ function safeName(value: string): string {
     .slice(0, 100) || "OmniCortex";
 }
 
+async function measureSelectedPaths(paths: readonly string[]): Promise<{
+  bytes: number;
+  fileCount: number;
+}> {
+  const queue = [...paths.map((value) => resolve(value))];
+  let bytes = 0;
+  let fileCount = 0;
+  while (queue.length > 0) {
+    const path = queue.pop();
+    if (!path) continue;
+    let info;
+    try {
+      info = await lstat(path);
+    } catch {
+      continue;
+    }
+    if (info.isSymbolicLink()) continue;
+    if (info.isFile()) {
+      bytes = Math.min(Number.MAX_SAFE_INTEGER, bytes + info.size);
+      fileCount += 1;
+      continue;
+    }
+    if (!info.isDirectory()) continue;
+    try {
+      for (const name of await readdir(path)) queue.push(join(path, name));
+    } catch {
+      // Manifest creation reports inaccessible entries precisely. This early
+      // measurement remains a conservative planning hint rather than coverage.
+    }
+  }
+  return { bytes, fileCount };
+}
+
 function requireId(value: unknown, label = "id"): string {
   if (typeof value !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value)) {
     throw new Error(`Invalid ${label}.`);
@@ -87,6 +154,71 @@ function requireId(value: unknown, label = "id"): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireNewLearningRequestPolicy(value: { policy?: unknown }): void {
+  if (value.policy !== undefined) requireNewDataIngestionPolicy(value.policy);
+}
+
+export function initialLearningBuildProgressEvent(
+  event: InitialLearningProgress,
+  sequence: number
+): BuildProgressEvent {
+  const output = isRecord(event.job.output)
+    ? event.job.output as BuildProgressEvent["data"]
+    : undefined;
+  return {
+    brainId: event.job.brainId,
+    sequence,
+    phase: "initial-materials",
+    progress: 0.9 + Math.max(0, Math.min(1, event.progress)) * 0.1,
+    label: event.label,
+    job: event.job,
+    ...(output ? { data: output } : {})
+  };
+}
+
+function requireChatTurnMetadata(value: unknown): ChatTurnMetadata | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    value.kind !== "steer" ||
+    value.source !== "human" ||
+    typeof value.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(value.createdAt))
+  ) {
+    throw new Error("Invalid chat turn metadata.");
+  }
+  return {
+    kind: "steer",
+    source: "human",
+    replacesTurnId: requireId(value.replacesTurnId, "replaced turn id"),
+    createdAt: new Date(value.createdAt).toISOString()
+  };
+}
+
+function requireChatDeliveryReceipt(value: unknown): ChatDeliveryReceiptRequest {
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    !["pending", "queued", "steered", "cancelled", "failed"].includes(String(value.state)) ||
+    typeof value.content !== "string" ||
+    typeof value.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(value.createdAt))
+  ) {
+    throw new Error("Invalid chat delivery receipt.");
+  }
+  const content = value.content.replace(/\0/g, "").trim();
+  if (!content || content.length > 100_000) {
+    throw new Error("Invalid chat delivery receipt content.");
+  }
+  return {
+    schemaVersion: 1,
+    turnId: requireId(value.turnId, "delivery receipt turn id"),
+    content,
+    createdAt: new Date(value.createdAt).toISOString(),
+    state: value.state as ChatDeliveryReceiptRequest["state"]
+  };
 }
 
 function requireNativeAppearance(value: unknown): NativeAppearanceRequest {
@@ -184,8 +316,8 @@ async function hardwareProfile(): Promise<HardwareProfile> {
           : "micro";
   const recommendations = {
     micro: "Use the Micro architecture, small batches, gradient accumulation, and disk offload.",
-    personal: "Use the Personal architecture with background consolidation and compact modalities.",
-    gpu: "Use the GPU architecture with CUDA or DirectML acceleration and checkpointing.",
+    personal: "Use the Personal architecture with adaptive retention and compact modalities.",
+    gpu: "Use the GPU architecture with CUDA, Metal/MPS, or DirectML acceleration and checkpointing.",
     workstation: "Use the Workstation architecture with larger experts and concurrent modality training."
   } as const;
   return {
@@ -207,12 +339,29 @@ async function hardwareProfile(): Promise<HardwareProfile> {
 }
 
 export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
-  const { repository, service, jobs, engine, tools, actions, evolution, appPath } = dependencies;
+  const {
+    repository,
+    service,
+    jobs,
+    engine,
+    tools,
+    actions,
+    evolution,
+    buildSelections,
+    initialization,
+    mobile,
+    teacher,
+    mcp,
+    idleCognition,
+    appPath
+  } = dependencies;
   const channels: string[] = [];
-  const buildSelections = new Map<
+  const previewControllers = new Map<
     string,
-    BuildResourceSelection & { paths: string[] }
+    { brainId: string; controller: AbortController }
   >();
+  const substrateQueryControllers = new Map<string, AbortController>();
+  const storageOperations = new BrainStorageOperationManager();
   const handle = <T extends unknown[]>(
     channel: string,
     listener: (event: IpcMainInvokeEvent, ...args: T) => unknown
@@ -265,69 +414,269 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   });
 
   handle(IPC.brain.list, () => repository.list());
-  handle(IPC.brain.get, (_event, id: string) => repository.get(requireId(id)));
-  handle(IPC.brain.create, (_event, request: CreateBrainRequest) => {
+  handle(IPC.brain.get, (_event, id: string) =>
+    service.getReconciledBrain(requireId(id))
+  );
+  handle(IPC.brain.create, async (event, request: CreateBrainRequest) => {
     if (!isRecord(request) || !isRecord(request.config)) throw new Error("Invalid build request.");
-    return service.create(request);
+    if (
+      request.initialResources !== undefined &&
+      (!Array.isArray(request.initialResources) ||
+        request.initialResources.some((resource) =>
+          !isRecord(resource) ||
+          (resource.kind !== "selection" && resource.kind !== "web") ||
+          (resource.kind === "selection" &&
+            (typeof resource.selectionId !== "string" ||
+              !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(resource.selectionId))) ||
+          (resource.kind === "web" && typeof resource.url !== "string")
+        ))
+    ) {
+      throw new Error("Invalid initial learning resources.");
+    }
+    const window = senderWindow(event);
+    let buildSequence = 0;
+    const brain = await initialization.create(request, (engineEvent) => {
+      if (window.isDestroyed() || engineEvent.type !== "build-progress") return;
+      window.webContents.send(IPC.brain.buildEvent, {
+        brainId: engineEvent.brainId,
+        streamId: engineEvent.streamId,
+        sequence: engineEvent.sequence ?? 0,
+        phase:
+          typeof (engineEvent.data as { phase?: unknown } | undefined)?.phase === "string"
+            ? (engineEvent.data as { phase: string }).phase
+            : "allocating",
+        progress: engineEvent.progress ?? 0,
+        label: engineEvent.message ?? "Building OmniCortex native core",
+        data: (engineEvent.data as { metrics?: unknown } | undefined)?.metrics
+      });
+    }, (progressEvent) => {
+      if (window.isDestroyed()) return;
+      window.webContents.send(
+        IPC.brain.buildEvent,
+        initialLearningBuildProgressEvent(progressEvent, buildSequence++)
+      );
+    });
+    return brain;
+  });
+  handle(IPC.brain.completeInitialization, async (_event, id: string) => {
+    return initialization.complete(requireId(id));
+  });
+  handle(IPC.brain.retryInitialization, async (event, id: string) => {
+    const brainId = requireId(id);
+    const window = senderWindow(event);
+    let sequence = 0;
+    return initialization.retry(
+      brainId,
+      (engineEvent) => {
+        if (window.isDestroyed() || engineEvent.type !== "build-progress") return;
+        window.webContents.send(IPC.brain.buildEvent, {
+          brainId,
+          streamId: engineEvent.streamId,
+          sequence: engineEvent.sequence ?? sequence++,
+          phase:
+            typeof (engineEvent.data as { phase?: unknown } | undefined)?.phase === "string"
+              ? (engineEvent.data as { phase: string }).phase
+              : "allocating",
+          progress: engineEvent.progress ?? 0,
+          label: engineEvent.message ?? "Recovering OmniCortex native core",
+          data: (engineEvent.data as { metrics?: unknown } | undefined)?.metrics
+        });
+      },
+      (progressEvent) => {
+        if (window.isDestroyed()) return;
+        window.webContents.send(
+          IPC.brain.buildEvent,
+          initialLearningBuildProgressEvent(progressEvent, sequence++)
+        );
+      }
+    );
   });
   handle(IPC.brain.update, async (_event, id: string, config: BrainConfig) => {
     const brainId = requireId(id);
-    const brain = await repository.updateConfig(brainId, config);
-    await engine.tryRequest(
-      "update_config",
-      {
-        brainId,
-        config: brain.config,
-        storagePath: repository.brainDirectory(brainId)
-      },
-      300_000
-    );
-    return brain;
+    return service.updateConfig(brainId, config);
   });
-  handle(IPC.brain.duplicate, (_event, id: string, name?: string) =>
-    repository.duplicate(requireId(id), typeof name === "string" ? name : undefined)
-  );
-  handle(IPC.brain.fork, (_event, id: string, name?: string) =>
-    repository.fork(requireId(id), typeof name === "string" ? name : undefined)
-  );
-  handle(IPC.brain.remove, async (_event, id: string) => {
+  handle(IPC.brain.setOnlineLearning, async (_event, id: string, enabled: boolean) => {
     const brainId = requireId(id);
+    return service.setOnlineLearning(brainId, enabled);
+  });
+  handle(IPC.brain.setActiveMode, async (
+    _event,
+    id: string,
+    enabled: boolean
+  ) => {
+    const brainId = requireId(id);
+    if (typeof enabled !== "boolean") {
+      throw new Error("Active Mode must be enabled or disabled.");
+    }
+    const current = await repository.get(brainId);
+    if (current.config.idleCognition !== enabled) {
+      // A visible switch waits until the prior optional cycle has relinquished
+      // the one neural worker before persisting the new owner.
+      await idleCognition?.cancelActive();
+    }
+    return repository.setActiveMode(brainId, enabled);
+  });
+  handle(IPC.brain.duplicate, async (
+    _event,
+    id: string,
+    name?: string,
+    requestedOperationId?: string
+  ) => {
+    const brainId = requireId(id);
+    const operationId = requestedOperationId
+      ? requireId(requestedOperationId, "storage operation id")
+      : randomUUID();
+    const session = storageOperations.create(operationId, "duplicate", brainId);
+    try {
+      const brain = await repository.duplicate(
+        brainId,
+        typeof name === "string" ? name : undefined,
+        session.hooks
+      );
+      session.complete({ targetBrainId: brain.id });
+      return brain;
+    } catch (error) {
+      session.fail(error);
+      throw error;
+    } finally {
+      storageOperations.finish(operationId);
+    }
+  });
+  handle(IPC.brain.fork, async (
+    _event,
+    id: string,
+    name?: string,
+    requestedOperationId?: string
+  ) => {
+    const brainId = requireId(id);
+    const operationId = requestedOperationId
+      ? requireId(requestedOperationId, "storage operation id")
+      : randomUUID();
+    const session = storageOperations.create(operationId, "fork", brainId);
+    try {
+      const brain = await repository.fork(
+        brainId,
+        typeof name === "string" ? name : undefined,
+        session.hooks
+      );
+      session.complete({ targetBrainId: brain.id });
+      return brain;
+    } catch (error) {
+      session.fail(error);
+      throw error;
+    } finally {
+      storageOperations.finish(operationId);
+    }
+  });
+  handle(IPC.brain.pauseStorageOperation, (_event, operationId: string) =>
+    storageOperations.pause(requireId(operationId, "storage operation id"))
+  );
+  handle(IPC.brain.resumeStorageOperation, (_event, operationId: string) =>
+    storageOperations.resume(requireId(operationId, "storage operation id"))
+  );
+  handle(IPC.brain.cancelStorageOperation, (_event, operationId: string) =>
+    storageOperations.cancel(requireId(operationId, "storage operation id"))
+  );
+  handle(IPC.brain.remove, async (_event, value: DeleteInstanceRequest) => {
+    if (
+      !isRecord(value) ||
+      value.acknowledgedIrreversible !== true ||
+      typeof value.typedName !== "string" ||
+      typeof value.finalConfirmation !== "string"
+    ) {
+      throw new Error("Invalid permanent instance deletion request.");
+    }
+    const brainId = requireId(value.brainId);
+    const current = await repository.get(brainId);
+    if (
+      value.typedName !== current.name ||
+      value.finalConfirmation !== `PERMANENTLY DELETE ${current.name}`
+    ) {
+      throw new Error("Permanent deletion confirmations do not match this instance.");
+    }
     await engine.tryRequest("unload", { brainId }, 30_000);
-    return repository.remove(brainId);
+    return repository.permanentlyDeleteInstance({
+      brainId,
+      acknowledgedIrreversible: true,
+      typedName: value.typedName,
+      finalConfirmation: value.finalConfirmation
+    });
   });
-  handle(IPC.brain.snapshot, async (_event, id: string, label?: string) => {
+  handle(IPC.brain.snapshot, async (
+    _event,
+    id: string,
+    label?: string,
+    requestedOperationId?: string
+  ) => {
     const brainId = requireId(id);
-    await engine.tryRequest(
-      "snapshot",
-      {
+    const operationId = requestedOperationId
+      ? requireId(requestedOperationId, "storage operation id")
+      : randomUUID();
+    const session = storageOperations.create(operationId, "snapshot", brainId);
+    try {
+      const snapshot = await service.createRecoveryPoint(
         brainId,
-        label,
-        storagePath: repository.brainDirectory(brainId)
-      },
-      300_000
-    );
-    return repository.snapshot(brainId, typeof label === "string" ? label : undefined);
+        typeof label === "string" ? label : undefined,
+        operationId,
+        session.hooks
+      );
+      const storage = snapshot.storage;
+      session.complete(storage
+        ? {
+            targetBrainId: brainId,
+            filesCompleted: storage.files,
+            filesTotal: storage.files,
+            logicalBytesCompleted: storage.logicalBytes,
+            logicalBytesTotal: storage.logicalBytes,
+            physicalBytesAdded: storage.physicalBytesAdded,
+            sharedBytes: storage.sharedBytes
+          }
+        : { targetBrainId: brainId });
+      return snapshot;
+    } catch (error) {
+      session.fail(error);
+      throw error;
+    } finally {
+      storageOperations.finish(operationId);
+    }
   });
   handle(IPC.brain.listSnapshots, (_event, id: string) =>
     repository.listSnapshots(requireId(id))
   );
-  handle(IPC.brain.restoreSnapshot, async (_event, id: string, snapshotId: string) => {
+  handle(IPC.brain.restoreSnapshot, async (
+    _event,
+    id: string,
+    snapshotId: string,
+    requestedOperationId?: string
+  ) => {
     const brainId = requireId(id);
-    const restored = await repository.restoreSnapshot(
-      brainId,
-      requireId(snapshotId, "snapshot id")
-    );
-    await engine.tryRequest(
-      "reload",
-      {
+    const recoveryId = requireId(snapshotId, "snapshot id");
+    const operationId = requestedOperationId
+      ? requireId(requestedOperationId, "storage operation id")
+      : randomUUID();
+    const session = storageOperations.create(operationId, "restore", brainId);
+    try {
+      const restored = await service.restoreRecoveryPoint(
         brainId,
-        storagePath: repository.brainDirectory(brainId)
-      },
-      300_000
-    );
-    return restored;
+        recoveryId,
+        operationId,
+        session.hooks
+      );
+      session.complete({ targetBrainId: brainId });
+      return restored;
+    } catch (error) {
+      session.fail(error);
+      throw error;
+    } finally {
+      storageOperations.finish(operationId);
+    }
   });
-  handle(IPC.brain.export, async (event, id: string, mode: BrainExportMode = "current") => {
+  handle(IPC.brain.export, async (
+    event,
+    id: string,
+    mode: BrainExportMode = "current",
+    requestedOperationId?: string
+  ) => {
     const brain = await repository.get(requireId(id));
     if (!["current", "origin", "private-archive", "referenced"].includes(mode)) {
       throw new Error("Invalid export mode.");
@@ -346,18 +695,6 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       });
       if (confirmation.response !== 1) return null;
     }
-    if (mode !== "origin") {
-      await engine.tryRequest(
-        "snapshot",
-        {
-          brainId: brain.id,
-          label: "export-candidate",
-          config: brain.config,
-          storagePath: repository.brainDirectory(brain.id)
-        },
-        300_000
-      );
-    }
     const suffix =
       mode === "origin"
         ? "-Origin"
@@ -375,17 +712,59 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     const destination = choice.filePath.toLocaleLowerCase().endsWith(".omni")
       ? choice.filePath
       : `${choice.filePath}.omni`;
-    await repository.exportBundle(brain.id, destination, mode);
-    return destination;
+    const operationId = requestedOperationId
+      ? requireId(requestedOperationId, "storage operation id")
+      : randomUUID();
+    const session = storageOperations.create(operationId, "export", brain.id);
+    try {
+      if (mode !== "origin") {
+        await service.flushNeuralCheckpoint(
+          brain.id,
+          operationId,
+          session.hooks
+        );
+      }
+      await repository.exportBundle(
+        brain.id,
+        destination,
+        mode,
+        session.hooks
+      );
+      session.complete();
+      return destination;
+    } catch (error) {
+      session.fail(error);
+      throw error;
+    } finally {
+      storageOperations.finish(operationId);
+    }
   });
-  handle(IPC.brain.importFile, async (event) => {
+  handle(IPC.brain.importFile, async (event, requestedOperationId?: string) => {
     const choice = await dialog.showOpenDialog(senderWindow(event), {
       title: "Import an OmniCortex brain",
       properties: ["openFile"],
       filters: [{ name: "Omni brain", extensions: ["omni"] }]
     });
     if (choice.canceled || !choice.filePaths[0]) return null;
-    const brain = await repository.importBundle(choice.filePaths[0]);
+    const operationId = requestedOperationId
+      ? requireId(requestedOperationId, "storage operation id")
+      : randomUUID();
+    const session = storageOperations.create(operationId, "import");
+    let brain: Awaited<ReturnType<BrainRepository["importBundle"]>>;
+    try {
+      brain = await repository.importBundle(
+        choice.filePaths[0],
+        {},
+        session.hooks
+      );
+      session.complete({ targetBrainId: brain.id });
+    } catch (error) {
+      session.fail(error);
+      throw error;
+    } finally {
+      storageOperations.finish(operationId);
+    }
+    await service.preflightStart(brain.id);
     await engine.tryRequest("unload", { brainId: brain.id }, 30_000);
     await engine.tryRequest(
       "load",
@@ -399,18 +778,62 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     return brain;
   });
   handle(IPC.brain.health, () => engine.health());
-  handle(IPC.brain.querySubstrate, (_event, id: string, query?: SubstrateQuery) => {
+  handle(IPC.brain.persistedSubstrateOverview, (_event, id: string) =>
+    service.persistedSubstrateOverview(requireId(id))
+  );
+  handle(IPC.brain.querySubstrate, async (event, id: string, query?: SubstrateQuery) => {
     const brainId = requireId(id);
     if (query !== undefined && !isRecord(query)) {
       throw new Error("Invalid substrate query.");
     }
-    return service.querySubstrate(brainId, query);
+    const key = `${event.sender.id}:${brainId}`;
+    substrateQueryControllers.get(key)?.abort();
+    const controller = new AbortController();
+    substrateQueryControllers.set(key, controller);
+    const abortOnDestroyed = (): void => controller.abort();
+    event.sender.once("destroyed", abortOnDestroyed);
+    try {
+      return await service.querySubstrate(brainId, query, controller.signal);
+    } finally {
+      event.sender.removeListener("destroyed", abortOnDestroyed);
+      if (substrateQueryControllers.get(key) === controller) {
+        substrateQueryControllers.delete(key);
+      }
+    }
   });
   handle(IPC.brain.workspace, (_event, id: string) =>
     service.workspace(requireId(id))
   );
+  handle(IPC.brain.freshAttention, (_event, id: string) =>
+    service.startFreshAttention(requireId(id))
+  );
+  handle(
+    IPC.brain.journalPage,
+    (_event, id: string, cursor?: string, limit?: number) =>
+      repository.journalPage(
+        requireId(id),
+        typeof cursor === "string" ? cursor : undefined,
+        typeof limit === "number" ? limit : undefined
+      )
+  );
 
-  handle(IPC.chat.send, async (_event, id: string, input: string, turnId?: string) => {
+  handle(IPC.chat.send, async (
+    _event,
+    id: string,
+    input: string,
+    turnId?: string,
+    turnMetadata?: unknown
+  ) => {
+    const brainId = requireId(id);
+    const persistedBrain = await repository.get(brainId);
+    if (
+      persistedBrain.readiness.state !== "ready" ||
+      jobs.isInitializing(brainId)
+    ) {
+      throw new Error(
+        "This mind is still completing its initial learning and cannot chat yet."
+      );
+    }
     // Deterministic test latency proves the renderer shows a pending human turn
     // before the worker reply. It is ignored outside the test environment.
     const requestedTestDelay = process.env.NODE_ENV === "test"
@@ -423,30 +846,90 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, testDelay));
     }
     return actions.send(
-      requireId(id),
+      brainId,
       input,
       undefined,
-      typeof turnId === "string" ? requireId(turnId, "turn id") : undefined
+      typeof turnId === "string" ? requireId(turnId, "turn id") : undefined,
+      requireChatTurnMetadata(turnMetadata)
     );
   });
   handle(IPC.chat.cancel, (_event, id: string, turnId?: string) =>
-    actions.cancel(
+    actions.cancelAndWait(
       requireId(id),
       typeof turnId === "string" ? requireId(turnId, "turn id") : undefined
     )
   );
-  handle(IPC.chat.list, async (_event, id: string) => (await repository.get(requireId(id))).messages);
+  handle(IPC.chat.recordDeliveryReceipt, async (
+    _event,
+    id: string,
+    receipt: unknown
+  ) => {
+    await repository.appendChatDeliveryReceipt(
+      requireId(id),
+      requireChatDeliveryReceipt(receipt)
+    );
+  });
+  handle(IPC.chat.approveAction, (_event, value: unknown) => {
+    if (!isRecord(value)) throw new Error("Invalid approved chat action request.");
+    return actions.approveAction({
+      brainId: requireId(value.brainId, "brain id"),
+      actionEventId: requireId(value.actionEventId, "action event id"),
+      approvalToken: requireId(value.approvalToken, "approval token")
+    });
+  });
+  handle(IPC.chat.list, async (_event, id: string) => {
+    const brainId = requireId(id);
+    await service.getReconciledBrain(brainId);
+    return (await repository.conversationPage(brainId, undefined, 200)).entries
+      .flatMap((entry) => entry.message ? [entry.message] : []);
+  });
+  handle(IPC.chat.listPage, async (
+    _event,
+    id: string,
+    beforeSequence?: number,
+    limit?: number
+  ) => {
+    const brainId = requireId(id);
+    await service.getReconciledBrain(brainId);
+    return repository.conversationPage(brainId, beforeSequence, limit);
+  });
   handle(IPC.chat.feedback, (_event, request: FeedbackRequest) => service.feedback(request));
 
-  handle(IPC.train.start, (_event, request: StartTrainingRequest) => {
-    if (!isRecord(request)) throw new Error("Invalid training request.");
-    requireId(request.brainId);
-    return jobs.startTraining(request);
+  handle(IPC.mobile.status, () => mobile.status());
+  handle(IPC.mobile.startPairing, (_event, value: MobileGatewayStartRequest) => {
+    if (!isRecord(value) || typeof value.allowLan !== "boolean") {
+      throw new Error("Invalid mobile pairing request.");
+    }
+    return mobile.startPairing({ allowLan: value.allowLan });
   });
-  handle(IPC.train.consolidate, (_event, id: string) => service.consolidate(requireId(id)));
+  handle(IPC.mobile.stop, () => mobile.stop());
+  handle(IPC.mobile.revoke, (_event, deviceId: string) =>
+    mobile.revoke(requireId(deviceId, "mobile device id"))
+  );
+
   handle(IPC.train.cancel, (_event, jobId: string) => jobs.cancel(requireId(jobId, "job id")));
   handle(IPC.train.list, (_event, id?: string) =>
     jobs.list(typeof id === "string" ? requireId(id) : undefined)
+  );
+
+  handle(IPC.teacher.status, () => teacher.status());
+  handle(IPC.teacher.saveCredential, (_event, request: ApiTeacherCredentialRequest) => teacher.saveCredential(request));
+  handle(IPC.teacher.removeCredential, (_event, provider: ApiTeacherProvider) => teacher.removeCredential(provider));
+  handle(IPC.teacher.start, (_event, request: ApiTeacherTrainingRequest) => teacher.start(request));
+  handle(IPC.teacher.cancel, (_event, jobId: string) =>
+    teacher.cancel(requireId(jobId, "teacher job id"))
+  );
+  handle(IPC.teacher.list, (_event, brainId?: string) =>
+    teacher.list(typeof brainId === "string" ? requireId(brainId) : undefined)
+  );
+
+  handle(IPC.mcp.list, (_event, brainId: string) => mcp.list(requireId(brainId)));
+  handle(IPC.mcp.add, (_event, request: McpServerRegistrationRequest) => mcp.add(request));
+  handle(IPC.mcp.remove, (_event, brainId: string, serverId: string) =>
+    mcp.remove(requireId(brainId), requireId(serverId, "MCP server id"))
+  );
+  handle(IPC.mcp.refresh, (_event, brainId: string, serverId: string) =>
+    mcp.refresh(requireId(brainId), requireId(serverId, "MCP server id"))
   );
 
   handle(
@@ -479,7 +962,8 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       if (choice.canceled || choice.filePaths.length === 0) return null;
       const id = randomUUID();
       const paths = choice.filePaths.map((path) => resolve(path));
-      const selection: BuildResourceSelection & { paths: string[] } = {
+      const measured = await measureSelectedPaths(paths);
+      const selection = {
         id,
         kind,
         label:
@@ -489,13 +973,19 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
               ? basename(paths[0]!)
               : `${paths.length} selected ${descriptor.shortLabel}`,
         itemCount: paths.length,
-        paths
+        bytes: measured.bytes,
+        fileCount: measured.fileCount,
+        paths,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        state: "selected" as const
       };
-      buildSelections.set(id, selection);
-      const { paths: _paths, ...publicSelection } = selection;
+      await buildSelections.put(selection);
+      const { paths: _paths, createdAt: _createdAt, ...publicSelection } = selection;
       return publicSelection;
     }
   );
+  handle(IPC.data.listBuildResources, () => buildSelections.list());
   handle(IPC.data.discardBuildResource, (_event, selectionId: string) =>
     buildSelections.delete(requireId(selectionId, "build resource selection id"))
   );
@@ -503,30 +993,38 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     IPC.data.startBuildResource,
     async (_event, request: BuildResourceStartRequest) => {
       if (!isRecord(request)) throw new Error("Invalid build resource request.");
+      requireNewLearningRequestPolicy(request);
       const brainId = requireId(request.brainId);
       const selectionId = requireId(
         request.selectionId,
         "build resource selection id"
       );
-      const selection = buildSelections.get(selectionId);
+      const selection = await buildSelections.get(selectionId);
       if (!selection) {
         throw new Error("The selected build resource is no longer available.");
       }
-      const manifest = await service.previewDataset(brainId, selection.paths);
-      buildSelections.delete(selectionId);
-      return jobs.startIngestion({
-        brainId,
-        manifestId: manifest.id,
-        policy: request.policy ?? "pretrain",
-        epochs: request.epochs ?? 1,
-        resume: true
-      });
+      await buildSelections.claim(selectionId, brainId);
+      const job = jobs.startBuildResource(
+        { ...request, brainId, selectionId },
+        selection.paths,
+        (manifestId) => buildSelections.commitManifest(selectionId, manifestId),
+        () => buildSelections.complete(selectionId)
+      );
+      await buildSelections.attachRuntimeJob(selectionId, job.id);
+      return job;
     }
   );
 
   handle(IPC.data.preview, async (event, request: DatasetPreviewRequest) => {
     if (!isRecord(request)) throw new Error("Invalid dataset preview request.");
+    requireNewLearningRequestPolicy(request);
     const brainId = requireId(request.brainId);
+    const requestId = request.requestId === undefined
+      ? randomUUID()
+      : requireId(request.requestId, "dataset preview request id");
+    if (previewControllers.has(requestId)) {
+      throw new Error("That dataset preview is already running.");
+    }
     const folder = request.selection === "folder";
     const { descriptor } = uploadDescriptor(
       folder ? undefined : request.selection
@@ -545,10 +1043,93 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
           ]
     });
     if (choice.canceled || choice.filePaths.length === 0) return null;
-    return service.previewDataset(brainId, choice.filePaths);
+    const controller = new AbortController();
+    previewControllers.set(requestId, { brainId, controller });
+    const startedAt = new Date().toISOString();
+    let latestCounts = {
+      discoveredFiles: 0,
+      discoveredBytes: 0,
+      hashedFiles: 0,
+      hashedBytes: 0
+    };
+    const publish = (
+      value: Omit<DatasetPreviewProgress, "schemaVersion" | "requestId" | "brainId" | "startedAt" | "updatedAt">
+    ): void => {
+      if (event.sender.isDestroyed()) return;
+      latestCounts = {
+        discoveredFiles: value.discoveredFiles,
+        discoveredBytes: value.discoveredBytes,
+        hashedFiles: value.hashedFiles,
+        hashedBytes: value.hashedBytes
+      };
+      event.sender.send(IPC.data.previewEvent, {
+        schemaVersion: 1,
+        requestId,
+        brainId,
+        startedAt,
+        updatedAt: new Date().toISOString(),
+        ...value
+      } satisfies DatasetPreviewProgress);
+    };
+    publish({
+      phase: "discovering",
+      discoveredFiles: 0,
+      discoveredBytes: 0,
+      hashedFiles: 0,
+      hashedBytes: 0,
+      message: "Discovering files and committing their content hashes…"
+    });
+    try {
+      const manifest = await service.previewDataset(brainId, choice.filePaths, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          const current = progress.currentFile ? ` · ${progress.currentFile}` : "";
+          publish({
+            ...progress,
+            message:
+              progress.phase === "committing"
+                ? "Committing the deterministic dataset snapshot…"
+                : progress.phase === "hashing"
+                  ? `Hashing source ${progress.hashedFiles + 1}${current}`
+                  : `Discovered ${progress.discoveredFiles} source${progress.discoveredFiles === 1 ? "" : "s"}${current}`
+          });
+        }
+      });
+      publish({
+        phase: "complete",
+        discoveredFiles: manifest.discoveredFiles,
+        discoveredBytes: manifest.discoveredBytes,
+        hashedFiles: latestCounts.hashedFiles,
+        hashedBytes: latestCounts.hashedBytes,
+        message: `Committed ${manifest.discoveredFiles} source${manifest.discoveredFiles === 1 ? "" : "s"} to a resumable manifest.`
+      });
+      return manifest;
+    } catch (error) {
+      const cancelled = controller.signal.aborted ||
+        (error instanceof Error && error.name === "AbortError");
+      publish({
+        phase: cancelled ? "cancelled" : "failed",
+        ...latestCounts,
+        message: cancelled
+          ? "Dataset discovery and hashing were cancelled; no partial manifest was kept."
+          : error instanceof Error
+            ? error.message
+            : "Dataset preview failed."
+      });
+      throw error;
+    } finally {
+      previewControllers.delete(requestId);
+    }
+  });
+  handle(IPC.data.cancelPreview, (_event, requestId: string) => {
+    const preview = previewControllers.get(requireId(requestId, "dataset preview request id"));
+    if (!preview) return false;
+    preview.controller.abort();
+    return true;
   });
   handle(IPC.data.start, (_event, request: DatasetStartRequest) => {
     if (!isRecord(request)) throw new Error("Invalid dataset start request.");
+    requireNewLearningRequestPolicy(request);
     requireId(request.brainId);
     requireId(request.manifestId, "dataset manifest id");
     return jobs.startIngestion({ ...request, resume: request.resume ?? true });
@@ -558,10 +1139,14 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   );
   handle(IPC.data.resume, (_event, request: DatasetStartRequest) => {
     if (!isRecord(request)) throw new Error("Invalid dataset resume request.");
+    requireNewLearningRequestPolicy(request);
     requireId(request.brainId);
     requireId(request.manifestId, "dataset manifest id");
-    return jobs.startIngestion({ ...request, resume: true });
+    return jobs.resumeIngestion({ ...request, resume: true });
   });
+  handle(IPC.data.resumable, async (_event, brainId: string) =>
+    (await service.datasets.latestResumable(requireId(brainId))) ?? null
+  );
   handle(IPC.data.coverage, (_event, brainId: string, manifestId: string) =>
     service.datasets.coverage(
       requireId(brainId),
@@ -570,6 +1155,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   );
 
   handle(IPC.data.ingestFiles, async (event, request: IngestFilesRequest) => {
+    requireNewLearningRequestPolicy(request);
     const brainId = requireId(request.brainId);
     const { descriptor } = uploadDescriptor(request.selection);
     const choice = await dialog.showOpenDialog(senderWindow(event), {
@@ -587,6 +1173,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     return service.ingestPaths(brainId, choice.filePaths, request.policy);
   });
   handle(IPC.data.ingestFolder, async (event, request: IngestFilesRequest) => {
+    requireNewLearningRequestPolicy(request);
     const brainId = requireId(request.brainId);
     const choice = await dialog.showOpenDialog(senderWindow(event), {
       title: "Choose a folder to learn",
@@ -598,6 +1185,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   handle(
     IPC.data.ingestDropped,
     (_event, request: IngestFilesRequest, rawPaths: unknown) => {
+      requireNewLearningRequestPolicy(request);
       const brainId = requireId(request.brainId);
       if (!Array.isArray(rawPaths)) {
         throw new Error("Invalid dropped-file selection.");
@@ -616,15 +1204,39 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       return service.ingestPaths(brainId, paths, request.policy);
     }
   );
-  handle(IPC.data.ingestWeb, (_event, request: IngestWebRequest) => service.ingestWeb(request));
+  handle(IPC.data.ingestWeb, (_event, request: IngestWebRequest) => {
+    requireNewLearningRequestPolicy(request);
+    return service.ingestWeb(request);
+  });
   handle(IPC.data.crawlWeb, (_event, request: WebCrawlRequest) => {
+    requireNewLearningRequestPolicy(request);
     requireId(request.brainId);
     return jobs.startCrawl(request);
   });
   handle(IPC.data.cancel, (_event, jobId: string) =>
     jobs.cancel(requireId(jobId, "job id"))
   );
+  handle(
+    IPC.data.sources,
+    (_event, brainId: string, cursor?: string, limit?: number) =>
+      repository.trainingSourcePage(
+        requireId(brainId),
+        typeof cursor === "string" ? cursor : undefined,
+        typeof limit === "number" ? limit : undefined
+      )
+  );
 
+  handle(IPC.modality.capabilities, (_event, brainId: string) =>
+    service.modalityCapabilities(requireId(brainId, "brain id"))
+  );
+  handle(IPC.modality.artifacts, (
+    _event,
+    brainId: string,
+    cursor?: string,
+    limit?: number
+  ) =>
+    jobs.listArtifacts(requireId(brainId, "brain id"), cursor, limit)
+  );
   handle(IPC.modality.generate, (_event, request: ModalityGenerateRequest) => {
     requireId(request.brainId);
     return jobs.generate(request);
@@ -638,14 +1250,14 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       requireId(request.brainId);
       const extensions =
         request.modality === "audio"
-          ? ["wav", "mp3", "flac", "m4a", "ogg"]
+          ? EXPERIENCE_UPLOADS.audio.extensions
           : request.modality === "video"
-            ? ["mp4", "webm", "mov", "mkv"]
-            : ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+            ? EXPERIENCE_UPLOADS.video.extensions
+            : EXPERIENCE_UPLOADS.images.extensions;
       const choice = await dialog.showOpenDialog(senderWindow(event), {
         title: `Choose ${request.modality} input`,
         properties: ["openFile"],
-        filters: [{ name: `${request.modality} input`, extensions }]
+        filters: [{ name: `${request.modality} input`, extensions: [...extensions] }]
       });
       if (choice.canceled || !choice.filePaths[0]) return null;
       return jobs.generate({ ...request, inputPath: choice.filePaths[0] });
@@ -654,9 +1266,52 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   handle(IPC.modality.cancel, (_event, jobId: string) =>
     jobs.cancel(requireId(jobId, "job id"))
   );
+  handle(
+    IPC.modality.startObservation,
+    (_event, request: LiveObservationSessionStartRequest) => {
+      if (!isRecord(request)) throw new Error("Invalid live observation request.");
+      requireId(request.brainId, "brain id");
+      return jobs.startObservation(request);
+    }
+  );
+  handle(
+    IPC.modality.pushObservation,
+    (_event, packet: LiveObservationPacket) => {
+      if (!isRecord(packet)) throw new Error("Invalid live observation packet.");
+      requireId(packet.sessionId, "observation session id");
+      return jobs.pushObservation(packet);
+    }
+  );
+  handle(IPC.modality.stopObservation, (_event, sessionId: string) =>
+    jobs.stopObservation(requireId(sessionId, "observation session id"))
+  );
+  handle(IPC.modality.cancelObservation, (_event, sessionId: string) =>
+    jobs.cancelObservation(requireId(sessionId, "observation session id"))
+  );
+  handle(
+    IPC.modality.requestObservationControl,
+    (_event, request: LiveObservationControlRequest) => {
+      if (!isRecord(request)) {
+        throw new Error("Invalid live observation control request.");
+      }
+      requireId(request.sessionId, "observation session id");
+      return jobs.requestObservationControl(request);
+    }
+  );
+  handle(
+    IPC.modality.resolveObservationControl,
+    (_event, resolution: LiveObservationControlResolution) => {
+      if (!isRecord(resolution)) {
+        throw new Error("Invalid live observation control resolution.");
+      }
+      requireId(resolution.sessionId, "observation session id");
+      requireId(resolution.controlId, "observation control id");
+      return jobs.resolveObservationControl(resolution);
+    }
+  );
 
   handle(IPC.trace.list, async (_event, brainId: string, query?: TraceQuery) => {
-    const traces = (await repository.get(requireId(brainId))).traces;
+    const traces = (await service.getReconciledBrain(requireId(brainId))).traces;
     const before = query?.before ? Date.parse(query.before) : Number.POSITIVE_INFINITY;
     const limit = Math.max(1, Math.min(1_000, Math.round(query?.limit ?? 100)));
     return traces
@@ -675,6 +1330,8 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   );
   handle(IPC.tool.execute, (_event, invocation: ToolInvocation) => tools.execute(invocation));
   handle(IPC.tool.cancel, (_event, brainId: string) => tools.cancel(requireId(brainId)));
+  handle(IPC.tool.preferences, () => tools.preferences());
+  handle(IPC.tool.setPreferences, (_event, value: ToolRuntimePreferences) => tools.setPreferences(value));
 
   handle(IPC.agent.fork, (_event, brainId: string, name?: string) =>
     repository.fork(requireId(brainId), typeof name === "string" ? name : undefined)
@@ -731,6 +1388,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   handle(IPC.catalog.list, () => loadCatalog(appPath));
   handle(IPC.catalog.importUrl, async (_event, request: ImportUrlRequest) => {
     const brain = await service.importUrl(request);
+    await service.preflightStart(brain.id);
     await engine.tryRequest("unload", { brainId: brain.id }, 30_000);
     await engine.tryRequest(
       "load",
@@ -797,6 +1455,12 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     service.listModalityPacks(requireId(brainId, "brain id"))
   );
   handle(IPC.catalog.hardwareProfile, () => hardwareProfile());
+  handle(IPC.catalog.resourcePlan, async (_event, value: WorkingMemoryPlanRequest) => {
+    const request = requireWorkingMemoryPlanRequest(value);
+    return service.planWorkingMemory(request, {
+      hardwareTier: request.hardwareTier
+    });
+  });
 
   const jobListener = (event: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) {
@@ -804,6 +1468,28 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     }
   };
   jobs.on("event", jobListener);
+  const storageOperationListener = (event: BrainStorageOperationEvent): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) {
+        window.webContents.send(IPC.brain.storageOperationEvent, event);
+      }
+    }
+  };
+  storageOperations.on("event", storageOperationListener);
+  const teacherListener = (event: unknown): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send(IPC.teacher.event, event);
+    }
+  };
+  teacher.on("event", teacherListener);
+  const observationListener = (event: unknown): void => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) {
+        window.webContents.send(IPC.modality.observationEvent, event);
+      }
+    }
+  };
+  jobs.on("observation", observationListener);
   const actionListener = (event: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send(IPC.chat.actionEvent, event);
@@ -818,8 +1504,15 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   actions.on("stream", streamListener);
 
   return () => {
-    buildSelections.clear();
+    for (const preview of previewControllers.values()) preview.controller.abort();
+    previewControllers.clear();
+    for (const controller of substrateQueryControllers.values()) controller.abort();
+    substrateQueryControllers.clear();
+    storageOperations.cancelAll();
     jobs.off("event", jobListener);
+    storageOperations.off("event", storageOperationListener);
+    teacher.off("event", teacherListener);
+    jobs.off("observation", observationListener);
     actions.off("event", actionListener);
     actions.off("stream", streamListener);
     for (const channel of channels) ipcMain.removeHandler(channel);

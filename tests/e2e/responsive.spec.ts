@@ -12,10 +12,16 @@ const viewports = [
 ] as const;
 
 test("workspace remains reachable, overflow-safe, and keyboard-accessible at supported viewports", async () => {
+  const inheritedEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] =>
+        typeof entry[1] === "string" && entry[0] !== "ELECTRON_RUN_AS_NODE"
+    )
+  );
   const application = await electron.launch({
     args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
     env: {
-      ...process.env,
+      ...inheritedEnvironment,
       NODE_ENV: "test",
       OMNI_RESPONSIVE_REPOSITORY: repository
     }
@@ -44,14 +50,15 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
           )
         ).toBe(0);
         await page.getByRole("button", { name: "Build a new brain" }).click();
-        await expect(page.getByText("Step 1 of 4")).toBeVisible();
+        await expect(page.getByText("Step 1 of 4", { exact: true })).toBeVisible();
+        await expect(page.getByRole("button", { name: "Brain Library", exact: true })).toBeVisible();
         await expect(page.getByRole("button", { name: /Continue/ })).toBeVisible();
         expect(
           await page.evaluate(
             () => document.documentElement.scrollWidth - document.documentElement.clientWidth
           )
         ).toBe(0);
-        await page.getByLabel("Open brain library").click();
+        await page.getByRole("button", { name: "Brain Library", exact: true }).click();
       });
     }
 
@@ -69,6 +76,11 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
         await expect(page.getByLabel("Workspace")).toBeVisible();
         await expect(page.getByLabel("Message Aster")).toBeVisible();
         await expect(page.getByLabel("Send message")).toBeVisible();
+        const liveVoice = page.getByLabel("Start live voice");
+        await expect(liveVoice).toBeVisible();
+        await expect(liveVoice).toHaveAttribute("aria-pressed", "false");
+        await expect(page.getByLabel("Live voice settings")).toHaveCount(0);
+        await expect(page.getByRole("group", { name: "Delivery" })).toHaveCount(0);
 
         const overflow = await page.evaluate(() => ({
           document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -84,9 +96,16 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
           shell: 0
         });
 
+        const liveVoiceBounds = await liveVoice.boundingBox();
+        expect(liveVoiceBounds, `${viewport.name} live voice must stay reachable`).not.toBeNull();
+        expect(liveVoiceBounds!.x).toBeGreaterThanOrEqual(0);
+        expect(liveVoiceBounds!.x + liveVoiceBounds!.width).toBeLessThanOrEqual(
+          viewport.width + 1
+        );
+
         const workspaceButtons = page.getByLabel("Workspace").getByRole("button");
-        await expect(workspaceButtons).toHaveCount(8);
-        for (let index = 0; index < 8; index += 1) {
+        await expect(workspaceButtons).toHaveCount(9);
+        for (let index = 0; index < 9; index += 1) {
           const button = workspaceButtons.nth(index);
           await button.evaluate((element) =>
             element.scrollIntoView({ block: "nearest", inline: "nearest" })
@@ -98,6 +117,25 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
           expect(bounds!.y).toBeGreaterThanOrEqual(0);
           expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height + 1);
         }
+
+        await page.getByLabel("Device & runtime").click();
+        await expect(
+          page.getByRole("heading", { name: "Memory & shared storage", level: 1 })
+        ).toBeVisible();
+        const ramPolicy = page.getByRole("group", { name: "Omni-wide RAM policy" });
+        await expect(ramPolicy.getByRole("button", { name: /^Auto/ })).toBeVisible();
+        const advancedCap = ramPolicy.getByRole("button", { name: /^Advanced cap/ });
+        await expect(advancedCap).toBeVisible();
+        await advancedCap.click();
+        await expect(page.getByLabel(/Omni share of safe pool/)).toBeVisible();
+        expect(
+          await page.evaluate(
+            () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+          ),
+          `${viewport.name} device settings must not create root horizontal overflow`
+        ).toBe(0);
+        await page.getByRole("button", { name: "Conversation", exact: true }).click();
+        await expect(page.getByLabel("Message Aster")).toBeVisible();
 
         const unlabeledVisibleButtons = await page.locator("button").evaluateAll((buttons) =>
           buttons

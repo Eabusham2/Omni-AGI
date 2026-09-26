@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.OmniCompanion" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:navigationBarColor">@color/omni_surface</item>
+        <item name="android:statusBarColor">@color/omni_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:colorAccent">@color/omni_accent</item>
+        <item name="android:windowBackground">@color/omni_background</item>
+    </style>
+</resources>

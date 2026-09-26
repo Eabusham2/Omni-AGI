@@ -38,7 +38,10 @@ describe("streaming ZIP/ZIP64 container", () => {
     await expect(
       readFile(extracted.entries.get("shards/04104.json")!.path, "utf8")
     ).resolves.toBe("4104\n");
-  }, 30_000);
+  // This deliberately performs 8,210 small-file operations. It completes in a
+  // few seconds in isolation, but the full suite runs other filesystem-heavy
+  // coverage tests concurrently on shared CI disks.
+  }, 90_000);
 
   it("streams file payloads and rejects duplicate or symbolic-link-style paths", async () => {
     const root = await mkdtemp(join(tmpdir(), "omni-streaming-file-"));

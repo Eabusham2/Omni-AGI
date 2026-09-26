@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,10 +41,12 @@ jobs:
         run: |
           [[ "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          test "$(git describe --tags --exact-match HEAD)" = "$REQUESTED_TAG"
-          git merge-base --is-ancestor HEAD origin/main
+          VERIFIED_COMMIT="$(git rev-parse --verify "HEAD^{commit}")"
+          test "$(git rev-parse --verify "$REQUESTED_TAG^{commit}")" = "$VERIFIED_COMMIT"
+          git merge-base --is-ancestor "$VERIFIED_COMMIT" origin/main
           npm run verify:release -- --tag "$REQUESTED_TAG"
           echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$VERIFIED_COMMIT" >> "$GITHUB_OUTPUT"
 
   windows:
     needs: verify
@@ -61,13 +64,16 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             node_arch: arm64
+            # The complete worker dependency set is not yet available as
+            # Windows ARM64 binary wheels. Package a native Electron shell with
+            # an explicitly verified/labeled x64 worker under Windows emulation.
             python_arch: x64
             worker_arch: x64
             package_script: package:win:arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.verify.outputs.tag }}
+          ref: ${{ needs.verify.outputs.commit }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -77,23 +83,31 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: "3.11.9"
           architecture: ${{ matrix.python_arch }}
           cache: pip
-          cache-dependency-path: engine/requirements.txt
+          cache-dependency-path: |
+            engine/requirements.txt
+            engine/requirements-build.txt
+            engine/locks/*.lock
 
       - run: npm ci
-      - name: Install CPU brain runtime
+      - name: Install hash-locked CPU brain runtime
         run: |
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0+cpu"
-          python -m pip install -r engine/requirements.txt
-      - run: npm run test:python:portable
+          python scripts/install-engine-lock.py
+          python -m pip check
+          python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
+      - name: Test brain
+        env:
+          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
+        run: npm run test:python:portable
       - run: npm run test:node
 
       - name: Package Windows
         env:
           WIN_CSC_LINK: ${{ secrets.WINDOWS_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
+          OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: npm run ${{ matrix.package_script }}
 
       - name: Smoke Windows package
@@ -104,12 +118,14 @@ jobs:
           ./scripts/smoke-windows-package.ps1 `
             -Arch "${{ matrix.arch }}" `
             -ExpectedWorkerArch "${{ matrix.worker_arch }}" `
+            -SourceCommit "${{ needs.verify.outputs.commit }}" `
             -ReleaseRoot ./release
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omni-v1-windows-${{ matrix.arch }}
           if-no-files-found: error
+          compression-level: 0
           path: |
             release/*-Windows-${{ matrix.arch }}.exe
             release/*-Windows-${{ matrix.arch }}.zip
@@ -126,18 +142,14 @@ jobs:
             runner: macos-15-intel
             node_arch: x64
             python_arch: x64
-            torch_version: 2.2.2
-            numpy_constraint: numpy<2
           - arch: arm64
             runner: macos-15
             node_arch: arm64
             python_arch: arm64
-            torch_version: 2.10.0
-            numpy_constraint: numpy<3
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.verify.outputs.tag }}
+          ref: ${{ needs.verify.outputs.commit }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -147,17 +159,24 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: "3.11.9"
           architecture: ${{ matrix.python_arch }}
           cache: pip
-          cache-dependency-path: engine/requirements.txt
+          cache-dependency-path: |
+            engine/requirements.txt
+            engine/requirements-build.txt
+            engine/locks/*.lock
 
       - run: npm ci
-      - name: Install CPU brain runtime
+      - name: Install hash-locked CPU brain runtime
         run: |
-          python -m pip install "${{ matrix.numpy_constraint }}" "torch==${{ matrix.torch_version }}"
-          python -m pip install -r engine/requirements.txt
-      - run: npm run test:python:portable
+          python scripts/install-engine-lock.py
+          python -m pip check
+          python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
+      - name: Test brain
+        env:
+          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
+        run: npm run test:python:portable
       - run: npm run test:node
 
       - name: Package, sign, and notarize macOS when credentials exist
@@ -167,16 +186,46 @@ jobs:
           OMNI_RELEASE_APPLE_ID: ${{ secrets.APPLE_ID }}
           OMNI_RELEASE_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           OMNI_RELEASE_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          OMNI_RELEASE_APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          # APPLE_API_KEY is a filesystem path for electron-builder/notarytool,
+          # while GitHub secrets hold the actual .p8 text (raw PEM or base64).
+          # Keep the secret under a non-standard name until this step writes a
+          # private temporary file and exports its path.
+          OMNI_RELEASE_APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY }}
           OMNI_RELEASE_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           OMNI_RELEASE_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: |
           if [[ -n "${OMNI_RELEASE_CSC_LINK:-}" ]]; then export CSC_LINK="$OMNI_RELEASE_CSC_LINK"; fi
           if [[ -n "${OMNI_RELEASE_CSC_KEY_PASSWORD:-}" ]]; then export CSC_KEY_PASSWORD="$OMNI_RELEASE_CSC_KEY_PASSWORD"; fi
           if [[ -n "${OMNI_RELEASE_APPLE_ID:-}" ]]; then export APPLE_ID="$OMNI_RELEASE_APPLE_ID"; fi
           if [[ -n "${OMNI_RELEASE_APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then export APPLE_APP_SPECIFIC_PASSWORD="$OMNI_RELEASE_APPLE_APP_SPECIFIC_PASSWORD"; fi
           if [[ -n "${OMNI_RELEASE_APPLE_TEAM_ID:-}" ]]; then export APPLE_TEAM_ID="$OMNI_RELEASE_APPLE_TEAM_ID"; fi
-          if [[ -n "${OMNI_RELEASE_APPLE_API_KEY:-}" ]]; then export APPLE_API_KEY="$OMNI_RELEASE_APPLE_API_KEY"; fi
+          if [[ -n "${OMNI_RELEASE_APPLE_API_KEY_P8:-}" ]]; then
+            export OMNI_NOTARY_KEY_FILE="$RUNNER_TEMP/omni-notary-api-key.p8"
+            python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          secret = os.environ["OMNI_RELEASE_APPLE_API_KEY_P8"].strip()
+          if secret.startswith("-----BEGIN PRIVATE KEY-----"):
+              payload = secret.encode("utf-8")
+          else:
+              try:
+                  payload = base64.b64decode("".join(secret.split()), validate=True)
+              except Exception as error:
+                  raise SystemExit("APPLE_API_KEY must contain raw PEM or base64-encoded .p8 data") from error
+          if not payload.startswith(b"-----BEGIN PRIVATE KEY-----") or b"-----END PRIVATE KEY-----" not in payload:
+              raise SystemExit("APPLE_API_KEY did not decode to an App Store Connect .p8 private key")
+          destination = Path(os.environ["OMNI_NOTARY_KEY_FILE"])
+          with destination.open("xb") as handle:
+              handle.write(payload)
+          destination.chmod(0o600)
+          PY
+            unset OMNI_RELEASE_APPLE_API_KEY_P8
+            export APPLE_API_KEY="$OMNI_NOTARY_KEY_FILE"
+            trap 'rm -f -- "$OMNI_NOTARY_KEY_FILE"' EXIT
+          fi
           if [[ -n "${OMNI_RELEASE_APPLE_API_KEY_ID:-}" ]]; then export APPLE_API_KEY_ID="$OMNI_RELEASE_APPLE_API_KEY_ID"; fi
           if [[ -n "${OMNI_RELEASE_APPLE_API_ISSUER:-}" ]]; then export APPLE_API_ISSUER="$OMNI_RELEASE_APPLE_API_ISSUER"; fi
           npm run package:mac:${{ matrix.arch }}
@@ -190,12 +239,14 @@ jobs:
           --platform mac
           --arch ${{ matrix.arch }}
           --release-root release
+          --source-commit ${{ needs.verify.outputs.commit }}
           --desktop-e2e
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omni-v1-macos-${{ matrix.arch }}
           if-no-files-found: error
+          compression-level: 0
           path: |
             release/*-macOS-${{ matrix.arch }}.dmg
             release/*-macOS-${{ matrix.arch }}.zip
@@ -219,7 +270,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.verify.outputs.tag }}
+          ref: ${{ needs.verify.outputs.commit }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -229,19 +280,33 @@ jobs:
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: "3.11.16"
           architecture: ${{ matrix.python_arch }}
           cache: pip
-          cache-dependency-path: engine/requirements.txt
+          cache-dependency-path: |
+            engine/requirements.txt
+            engine/requirements-build.txt
+            engine/locks/*.lock
 
       - run: npm ci
-      - name: Install CPU brain runtime
+      - name: Install hash-locked CPU brain runtime
         run: |
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.10.0+cpu"
-          python -m pip install -r engine/requirements.txt
-      - run: npm run test:python:portable
+          python scripts/install-engine-lock.py
+          python -m pip check
+          python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
+      - name: Test brain
+        env:
+          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
+        run: npm run test:python:portable
+
+      - name: Test two-rank distributed training
+        if: matrix.arch == 'x64'
+        run: python -m unittest engine.tests.test_distributed_torchrun -v
       - run: npm run test:node
-      - run: npm run package:linux:${{ matrix.arch }}
+      - name: Package Linux
+        env:
+          OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
+        run: npm run package:linux:${{ matrix.arch }}
 
       - name: Smoke Linux package
         env:
@@ -252,27 +317,225 @@ jobs:
           --platform linux
           --arch ${{ matrix.arch }}
           --release-root release
+          --source-commit ${{ needs.verify.outputs.commit }}
           --desktop-e2e
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omni-v1-linux-${{ matrix.arch }}
           if-no-files-found: error
+          compression-level: 0
           path: |
             release/*-Linux-*.AppImage
             release/*-Linux-*.deb
             release/*-Linux-*.tar.gz
             release/linux-package-smoke-${{ matrix.arch }}.json
 
+  android:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+          verify-signature: true
+          cache: gradle
+          cache-dependency-path: |
+            mobile/android/*.gradle.kts
+            mobile/android/app/*.gradle.kts
+            mobile/android/gradle.properties
+            mobile/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: "14742923"
+          packages: ""
+
+      - name: Install pinned Android SDK and emulator image
+        run: >-
+          sdkmanager
+          "platform-tools"
+          "platforms;android-35"
+          "build-tools;35.0.0"
+          "emulator"
+          "system-images;android-35;google_apis;x86_64"
+
+      - name: Build unit-tested debug and unsigned release APKs
+        working-directory: mobile/android
+        run: |
+          test "$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d' ' -f1)" = "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+
+      - name: Start host-backed Android emulator
+        run: |
+          sudo chmod 666 /dev/kvm
+          echo no | avdmanager create avd --force --name omni-api35 --package "system-images;android-35;google_apis;x86_64" --device pixel_6
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" \
+            -avd omni-api35 \
+            -no-window \
+            -no-audio \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -camera-back none \
+            -camera-front none \
+            > "$RUNNER_TEMP/omni-emulator.log" 2>&1 &
+          timeout 240 adb wait-for-device
+          timeout 240 bash -c 'until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do sleep 2; done'
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell input keyevent 82
+
+      - name: Run same-brain gateway emulator smoke
+        run: |
+          python3 mobile/android/ci/fake_gateway.py 41837 > "$RUNNER_TEMP/omni-fake-gateway.log" 2>&1 &
+          for attempt in {1..30}; do
+            if curl --silent --output /dev/null http://127.0.0.1:41837/v1/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:41837/v1/health >/dev/null
+          adb shell pm clear ai.omniagi.companion.debug || true
+          cd mobile/android
+          ./gradlew --no-daemon :app:connectedDebugAndroidTest \
+            -Pandroid.testInstrumentationRunnerArguments.omniGatewayPort=41837
+
+      - name: Verify, label, and record both APK variants
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          DEBUG_SOURCE="mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_SOURCE="mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          DEBUG_APK="release/mobile/Omni-AGI-Companion-${VERSION}-Android-debug-signed.apk"
+          RELEASE_APK="release/mobile/Omni-AGI-Companion-${VERSION}-Android-release-unsigned.apk"
+          mkdir -p release/mobile
+          cp "$DEBUG_SOURCE" "$DEBUG_APK"
+          cp "$RELEASE_SOURCE" "$RELEASE_APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign" -c -v 4 "$DEBUG_APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign" -c -v 4 "$RELEASE_APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify --verbose "$DEBUG_APK"
+          if "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify "$RELEASE_APK" >/dev/null 2>&1; then
+            echo "The signing-ready release APK was unexpectedly signed." >&2
+            exit 1
+          fi
+          node scripts/record-mobile-release.mjs \
+            --platform android \
+            --output release/mobile/android-package-smoke.json \
+            --source-commit "${{ needs.verify.outputs.commit }}" \
+            --debug-artifact "$DEBUG_APK" \
+            --release-artifact "$RELEASE_APK" \
+            --emulator-tested 1 \
+            --same-brain-chat-tested 1 \
+            --attachment-stream-tested 1 \
+            --debug-signature-verified 1 \
+            --release-unsigned-verified 1 \
+            --zipalign-verified 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-v1-android
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            release/mobile/*-Android-debug-signed.apk
+            release/mobile/*-Android-release-unsigned.apk
+            release/mobile/android-package-smoke.json
+
+  ios:
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Select an available iPhone simulator
+        id: simulator
+        run: |
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 16.4"
+          SIMULATOR_RUNTIME="com.apple.CoreSimulator.SimRuntime.iOS-18-5"
+          UDID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"].get(sys.argv[1], []); print(next((device["udid"] for device in devices if device.get("isAvailable") and device.get("name", "").startswith("iPhone")), ""))' "$SIMULATOR_RUNTIME")"
+          test -n "$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Start host-backed same-brain gateway
+        run: |
+          python3 mobile/android/ci/fake_gateway.py 41838 > "$RUNNER_TEMP/omni-ios-fake-gateway.log" 2>&1 &
+          for attempt in {1..30}; do
+            if curl --silent --output /dev/null http://127.0.0.1:41838/v1/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:41838/v1/health >/dev/null
+
+      - name: Build and test native iOS client
+        env:
+          OMNI_IOS_SIMULATOR_ID: ${{ steps.simulator.outputs.udid }}
+          OMNI_GATEWAY_ENDPOINT: http://127.0.0.1:41838
+          OMNI_IOS_RESULT_BUNDLE: ${{ runner.temp }}/OmniCompanion.xcresult
+        run: npm run test:ios
+
+      - name: Build, verify, and record signing-ready unsigned IPA
+        run: |
+          npm run package:ios:unsigned
+          VERSION="$(node -p "require('./package.json').version")"
+          IPA="release/mobile/Omni-AGI-Companion-${VERSION}-iOS-unsigned.ipa"
+          VERIFY_ROOT="$(mktemp -d "$RUNNER_TEMP/omni-ios-verify.XXXXXX")"
+          trap 'rm -rf "$VERIFY_ROOT"' EXIT
+          unzip -tq "$IPA"
+          unzip -q "$IPA" -d "$VERIFY_ROOT"
+          APP="$(find "$VERIFY_ROOT/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$APP"
+          if codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
+            echo "The signing-ready IPA was unexpectedly signed." >&2
+            exit 1
+          fi
+          node scripts/record-mobile-release.mjs \
+            --platform ios \
+            --output release/mobile/ios-package-smoke.json \
+            --source-commit "${{ needs.verify.outputs.commit }}" \
+            --artifact "$IPA" \
+            --emulator-tested 1 \
+            --same-brain-chat-tested 1 \
+            --attachment-stream-tested 1 \
+            --unsigned-verified 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-v1-ios
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            release/mobile/*-iOS-unsigned.ipa
+            release/mobile/ios-package-smoke.json
+
   publish:
-    needs: [verify, windows, macos, linux]
+    needs: [verify, windows, macos, linux, android, ios]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.verify.outputs.tag }}
+          ref: ${{ needs.verify.outputs.commit }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -285,15 +548,22 @@ jobs:
           merge-multiple: true
 
       - name: Canonicalize public names, verify release set, and write checksums
+        env:
+          OMNI_RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
         run: |
-          node scripts/verify-release-artifacts.mjs --directory artifacts
+          node scripts/verify-release-artifacts.mjs \
+            --directory artifacts \
+            --source-commit "$OMNI_RELEASE_COMMIT"
           (cd artifacts && sha256sum --check SHA256SUMS.txt)
 
       - name: Publish immutable GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
         run: |
+          git fetch --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse --verify "$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
           mapfile -d '' assets < <(find artifacts -maxdepth 1 -type f -print0 | sort -z)
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; refusing to replace immutable assets." >&2

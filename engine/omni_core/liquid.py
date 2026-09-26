@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .model import BitLinear
+from .model import PackedAdaptiveBitLinear as BitLinear
 
 
 class CfCCell(nn.Module):
@@ -61,8 +61,14 @@ class LTCCell(nn.Module):
         self.conductance = BitLinear(joined, hidden_size, bias=True)
         self.reversal = BitLinear(joined, hidden_size, bias=True)
         self.input_drive = BitLinear(input_size, hidden_size, bias=True)
-        self.leak_logit = nn.Parameter(torch.full((hidden_size,), -0.25))
-        self.capacitance_logit = nn.Parameter(torch.zeros(hidden_size))
+        # These two per-neuron controls are learned, too. Keep their
+        # authoritative values in the same packed ternary substrate as the
+        # conductances; softplus still makes the physical coefficients
+        # strictly positive. A constant input supplies their shared gain.
+        self.leak_logit = BitLinear(1, hidden_size, bias=False, scale=0.25)
+        self.leak_logit.fill_ternary_(-1)
+        self.capacitance_logit = BitLinear(1, hidden_size, bias=False, scale=0.25)
+        self.capacitance_logit.fill_ternary_(0)
 
     def forward(
         self,
@@ -78,8 +84,9 @@ class LTCCell(nn.Module):
                 device=inputs.device,
             )
         dt = float(elapsed) / float(self.solver_steps)
-        leak = F.softplus(self.leak_logit) + 0.05
-        capacitance = F.softplus(self.capacitance_logit) + 0.25
+        tonic = torch.ones((1, 1), dtype=inputs.dtype, device=inputs.device)
+        leak = F.softplus(self.leak_logit(tonic)) + 0.05
+        capacitance = F.softplus(self.capacitance_logit(tonic)) + 0.25
         drive = self.input_drive(inputs)
         hidden = state
         for _ in range(self.solver_steps):

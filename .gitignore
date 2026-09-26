@@ -15,3 +15,9 @@ __pycache__/
 *.omni
 *.log
 .DS_Store
+.resource-benchmark-v2.json
+mobile/**/build/
+mobile/android/.gradle/
+mobile/ios/DerivedData/
+mobile/ios/*.xcresult/
+mobile/ios/*.xcarchive/

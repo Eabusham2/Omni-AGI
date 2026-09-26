@@ -127,10 +127,22 @@ function integerValue(
 function recipeMemory(
   value: unknown
 ): Pick<BrainConfig, "memoryRecipe" | "retainSourceText"> {
-  if (!["human-consolidation", "total-recall", "synapses-only"].includes(String(value))) {
+  const imported = String(value);
+  if (
+    ![
+      "adaptive-retention",
+      "human",
+      "human-consolidation",
+      "total-recall",
+      "synapses-only"
+    ].includes(imported)
+  ) {
     throw new Error("Recipe memoryRecipe is invalid.");
   }
-  const memoryRecipe = value as BrainConfig["memoryRecipe"];
+  const memoryRecipe: BrainConfig["memoryRecipe"] =
+    imported === "human" || imported === "human-consolidation"
+      ? "adaptive-retention"
+      : imported as BrainConfig["memoryRecipe"];
   return {
     memoryRecipe,
     retainSourceText: memoryRecipe === "total-recall"
@@ -151,13 +163,14 @@ function recipeModalities(value: unknown): ModalityKind[] {
 
 function allToolPermissions(level: ToolPermissionLevel): BuildRecipe["toolPermissions"] {
   return [
-    "windows.files",
-    "windows.powershell",
+    "system.files",
+    "system.shell",
     "code.execute",
     "web.search",
     "web.fetch",
     "browser.automation",
     "modality.imagine",
+    "brain.history",
     "agent.fork",
     "source.self-modify"
   ].map((toolId) => ({ toolId, level }));
@@ -185,7 +198,6 @@ export function validateBuildRecipe(
       "name",
       "description",
       "origin",
-      "starterUrl",
       "hardwareProfile",
       "architecture",
       "memoryRecipe",
@@ -312,10 +324,10 @@ export function validateBuildRecipe(
   };
   const modalities = recipeModalities(architecture.modalities);
   const origin = document.origin;
-  if (!["blank", "starter"].includes(String(origin))) throw new Error("Recipe origin is invalid.");
-  const starterUrl = optionalHttpsUrl(document.starterUrl, "Recipe starterUrl");
-  if (origin === "starter" && !starterUrl) {
-    throw new Error("A starter recipe must declare an HTTPS starterUrl.");
+  if (origin !== "ground-up") {
+    throw new Error(
+      "Build recipes must initialize OmniCortex locally; only portable native OmniCortex instances use Import."
+    );
   }
   if (
     !["micro", "personal", "gpu", "workstation"].includes(String(document.hardwareProfile))
@@ -338,8 +350,7 @@ export function validateBuildRecipe(
     sha256: sha256(contents),
     license,
     provenanceUrl: optionalHttpsUrl(document.provenanceUrl, "Recipe provenanceUrl"),
-    origin: origin as BuildRecipe["origin"],
-    starterUrl,
+    origin,
     hardwareTier: document.hardwareProfile as HardwareTier,
     modalities,
     toolPermissions: allToolPermissions(document.toolPermission as ToolPermissionLevel),

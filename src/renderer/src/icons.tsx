@@ -23,6 +23,7 @@ export type IconName =
   | "library"
   | "maximize"
   | "memory"
+  | "microphone"
   | "minimize"
   | "more"
   | "pause"
@@ -135,6 +136,12 @@ const paths: Record<IconName, React.ReactNode> = {
     <>
       <rect x="6" y="6" width="12" height="12" rx="2" />
       <path d="M9 1v5M15 1v5M9 18v5M15 18v5M1 9h5M1 15h5M18 9h5M18 15h5M10 10h4v4h-4z" />
+    </>
+  ),
+  microphone: (
+    <>
+      <rect x="9" y="3" width="6" height="12" rx="3" />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7" />
     </>
   ),
   minimize: <path d="M6 12h12" />,

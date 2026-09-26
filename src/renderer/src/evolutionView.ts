@@ -39,7 +39,8 @@ export function buildEvolutionStartRequest(
   };
 
   if (options.candidateKind === "data") {
-    request.sourceIds = [...options.sourceIds];
+    if (options.sourceIds.length > 0) request.sourceIds = [...options.sourceIds];
+    else request.latentReplay = true;
   } else if (
     options.candidateKind === "neural" ||
     options.candidateKind === "substrate"
@@ -107,7 +108,7 @@ export function groupEvolutionRuns(
 }
 
 export function canStopEvolution(state: EvolutionRunState): boolean {
-  return state === "experimenting" || state === "awaiting-review";
+  return state === "experimenting" || state === "awaiting-review" || state === "stopping";
 }
 
 export function canApproveEvolution(state: EvolutionRunState): boolean {

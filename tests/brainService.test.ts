@@ -4,6 +4,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  stat,
   writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,14 +12,16 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BrainService,
+  normalizeChatEngineEvent,
+  normalizeModalityGenerateRequest,
   normalizeModalityPreview
 } from "../src/main/brainService";
 import { BrainRepository } from "../src/main/brainRepository";
 import type { EngineSupervisor } from "../src/main/engineSupervisor";
+import { GIB, ResourcePlanner } from "../src/main/resourcePlanner";
 import {
   DEFAULT_CONFIG,
-  type BrainConfig,
-  type BrainDocument
+  type TrainingSource
 } from "../src/shared/types";
 
 function emptySafetensors(label: string): Buffer {
@@ -33,6 +36,24 @@ function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function testResourcePlanner(root: string): ResourcePlanner {
+  return new ResourcePlanner(root, {
+    readResources: async () => ({
+      totalMemoryBytes: 16 * GIB,
+      availableMemoryBytes: 13 * GIB,
+      diskTotalBytes: 500 * GIB,
+      diskFreeBytes: 240 * GIB
+    }),
+    benchmark: async () => ({
+      measuredAt: "2026-09-07T00:00:00.000Z",
+      sampleBytes: 16 * 1024 * 1024,
+      memoryBytesPerSecond: 12 * GIB,
+      storageBytesPerSecond: 734_003_201,
+      cacheHit: false
+    })
+  });
+}
+
 describe("streaming media preview validation", () => {
   it("accepts bounded media previews and rejects executable or mismatched data URLs", () => {
     expect(normalizeModalityPreview({
@@ -43,6 +64,7 @@ describe("streaming media preview validation", () => {
       dataUrl: "data:image/png;base64,cHJldmlldw==",
       artifactPath: "artifacts/\0preview.png"
     })).toEqual({
+      schemaVersion: 1,
       revision: 3,
       progress: 1,
       statusLabel: "Decoding now",
@@ -51,6 +73,63 @@ describe("streaming media preview validation", () => {
       path: undefined,
       artifactPath: "artifacts/preview.png"
     });
+    expect(normalizeModalityPreview({
+      schemaVersion: 1,
+      revision: 6,
+      progress: 0.6,
+      statusLabel: "Neural codec waveform 128/256 samples",
+      mimeType: "audio/wav",
+      dataUrl: "data:audio/wav;base64,UklGRg==",
+      modality: "audio",
+      stage: "codec-waveform",
+      completedUnits: 2,
+      totalUnits: 3,
+      sampleCount: 128,
+      totalSamples: 256,
+      durationMs: 8,
+      sampleRate: 32000,
+      hardwareTier: "micro",
+      cadence: "hardware-aware-bounded-synchronous",
+      producer: "same-brain-decoder",
+      payloadSha256: "a".repeat(64),
+      actualDecoderOutput: true,
+      spatialResolutionReduced: false,
+      ideaSource: "active-working-memory",
+      activeAssemblyCount: 2,
+      promptProvided: false,
+      hardwareScaled: true,
+      modelDefinedMaximum: null,
+      trained: false,
+      trainingState: "untrained-diagnostic",
+      semanticQualityClaimed: false,
+      partialCoverage: true,
+      coveredFraction: 0.5
+    })).toMatchObject({
+      schemaVersion: 1,
+      revision: 6,
+      modality: "audio",
+      stage: "codec-waveform",
+      sampleCount: 128,
+      totalSamples: 256,
+      sampleRate: 32000,
+      producer: "same-brain-decoder",
+      payloadSha256: "a".repeat(64),
+      actualDecoderOutput: true,
+      spatialResolutionReduced: false,
+      ideaSource: "active-working-memory",
+      hardwareScaled: true,
+      modelDefinedMaximum: null,
+      trained: false,
+      trainingState: "untrained-diagnostic",
+      semanticQualityClaimed: false,
+      partialCoverage: true,
+      coveredFraction: 0.5
+    });
+    expect(normalizeModalityPreview({
+      schemaVersion: 2,
+      revision: 7,
+      statusLabel: "future schema"
+    })).toBeUndefined();
     expect(normalizeModalityPreview({
       revision: 4,
       mimeType: "image/png",
@@ -62,9 +141,106 @@ describe("streaming media preview validation", () => {
       dataUrl: "data:image/png;base64,cHJldmlldw=="
     })).toBeUndefined();
   });
+
+  it("retains a bounded six-second WAV preview above the old 64 KiB ceiling", () => {
+    const dataUrl = `data:audio/wav;base64,${Buffer.alloc(183_852).toString("base64")}`;
+    const normalized = normalizeModalityPreview({
+      revision: 2,
+      mimeType: "audio/wav",
+      dataUrl,
+      statusLabel: "Neural codec waveform 91904/91904 samples"
+    });
+    expect(dataUrl.length).toBeGreaterThan(96 * 1024);
+    expect(normalized?.dataUrl).toBe(dataUrl);
+  });
 });
 
-describe("BrainService starter checkpoints", () => {
+describe("hardware-scaled media request validation", () => {
+  it("preserves exact requested fields without an arbitrary model-size clamp", () => {
+    expect(normalizeModalityGenerateRequest({
+      brainId: "brain-media",
+      modality: "video",
+      prompt: "wide exact timeline",
+      settings: {
+        outputMode: "exact",
+        width: 12_001,
+        height: 7_003,
+        durationMs: 90_000.5,
+        sampleRate: 96_000,
+        fps: 240,
+        includeAudio: true
+      }
+    })).toMatchObject({
+      settings: {
+        outputMode: "exact",
+        width: 12_001,
+        height: 7_003,
+        durationMs: 90_000.5,
+        sampleRate: 96_000,
+        fps: 240,
+        includeAudio: true
+      }
+    });
+  });
+
+  it("defaults provided settings to Auto and rejects malformed exact/container fields", () => {
+    expect(normalizeModalityGenerateRequest({
+      brainId: "brain-media",
+      modality: "audio",
+      settings: { durationMs: 2_500 }
+    }).settings).toEqual({ outputMode: "auto", durationMs: 2_500 });
+    expect(() => normalizeModalityGenerateRequest({
+      brainId: "brain-media",
+      modality: "audio",
+      settings: { outputMode: "exact", sampleRate: 16_000 }
+    })).toThrow(/dimensions or duration/i);
+    expect(() => normalizeModalityGenerateRequest({
+      brainId: "brain-media",
+      modality: "video",
+      settings: { outputMode: "exact", durationMs: 1_000, fps: 65_536 }
+    })).toThrow(/video fps/i);
+  });
+});
+
+describe("post-reply chat phase validation", () => {
+  const validPhase = {
+    type: "chat-phase",
+    brainId: "brain-phase",
+    streamId: "turn-phase",
+    sequence: 7,
+    data: {
+      phase: "reply-complete-learning",
+      replyComplete: true,
+      turnCommitted: false,
+      learning: true,
+      saving: true
+    }
+  } as const;
+
+  it("flattens only the exact provisional learning-and-save event", () => {
+    expect(normalizeChatEngineEvent(validPhase, "brain-phase")).toEqual({
+      type: "chat-phase",
+      sequence: 7,
+      phase: "reply-complete-learning",
+      replyComplete: true,
+      turnCommitted: false,
+      learning: true,
+      saving: true
+    });
+
+    expect(normalizeChatEngineEvent({
+      ...validPhase,
+      data: { ...validPhase.data, turnCommitted: true }
+    }, "brain-phase")).toBeUndefined();
+    expect(normalizeChatEngineEvent({
+      ...validPhase,
+      data: { ...validPhase.data, saving: false }
+    }, "brain-phase")).toBeUndefined();
+    expect(normalizeChatEngineEvent(validPhase, "another-brain")).toBeUndefined();
+  });
+});
+
+describe("BrainService ground-up creation", () => {
   let temporaryRoot: string;
   let repository: BrainRepository;
   let tryRequest: ReturnType<typeof vi.fn>;
@@ -78,8 +254,8 @@ describe("BrainService starter checkpoints", () => {
     tryRequest = vi.fn(async () => undefined);
     request = vi.fn(async () => ({
       runtimeCard: {
-        origin_kind: "starter",
-        pretrained: true,
+        origin_kind: "ground-up",
+        pretrained: false,
         hidden_behavioral_prompt: false,
         reward_model: false,
         rlhf: false
@@ -87,7 +263,8 @@ describe("BrainService starter checkpoints", () => {
     }));
     service = new BrainService(
       repository,
-      { tryRequest, request } as unknown as EngineSupervisor
+      { tryRequest, request } as unknown as EngineSupervisor,
+      testResourcePlanner(repository.root)
     );
   });
 
@@ -95,176 +272,371 @@ describe("BrainService starter checkpoints", () => {
     await rm(temporaryRoot, { recursive: true, force: true });
   });
 
-  async function importedBrain(
-    config: BrainConfig = { ...DEFAULT_CONFIG, name: "Imported starter" }
-  ): Promise<BrainDocument> {
-    return repository.create(config);
-  }
-
-  it("builds the bundled trained starter when no catalog URL is supplied", async () => {
+  it("builds a ground-up OmniCortex with no external foundation", async () => {
     const built = await service.create({
-      origin: "starter",
-      starterUrl: "",
       hardwareTier: "micro",
       modalities: ["vision", "image", "audio", "video"],
-      config: { ...DEFAULT_CONFIG, name: "Bundled starter" }
+      config: { ...DEFAULT_CONFIG, name: "Ground-up mind" }
     });
 
     expect(request).toHaveBeenCalledTimes(1);
-    expect(built.config.workingMemorySlots).toBe(128);
+    expect(built.config.workingMemorySlots).toBe(8_192);
     expect(request).toHaveBeenCalledWith(
       "create",
       expect.objectContaining({
         brainId: built.id,
-        origin: "starter",
+        origin: "ground-up",
         hardwareTier: "micro",
-        config: expect.objectContaining({ workingMemorySlots: 128 }),
+        config: expect.objectContaining({ workingMemorySlots: 8_192 }),
         modalities: ["vision", "image", "audio", "video"],
         storagePath: repository.brainDirectory(built.id)
       }),
       300_000
     );
+    expect(built.provenance).toEqual({ originKind: "ground-up" });
+    expect(built.toolPermissions?.map(({ toolId }) => toolId)).toEqual(
+      expect.arrayContaining(["system.files", "system.shell"])
+    );
+    expect(built.toolPermissions?.some(({ toolId }) => toolId.startsWith("windows.")))
+      .toBe(false);
+    expect(built.journal?.at(-1)?.summary).toContain("native core: locally initialized");
+    expect(built.journal?.at(-1)?.summary).not.toContain("external foundation");
     expect(tryRequest).not.toHaveBeenCalled();
   });
 
-  it("defaults the stable public API to Starter while preserving explicit Blank Brain", async () => {
-    const starter = await service.create({
-      hardwareTier: "micro",
-      config: { ...DEFAULT_CONFIG, name: "Implicit starter" }
-    });
-    expect(request).toHaveBeenLastCalledWith(
-      "create",
-      expect.objectContaining({
-        brainId: starter.id,
-        origin: "starter"
-      }),
-      300_000
-    );
-
-    const blank = await service.create({
-      origin: "blank",
-      hardwareTier: "micro",
-      config: { ...DEFAULT_CONFIG, name: "Explicit blank" }
-    });
-    expect(request).toHaveBeenLastCalledWith(
-      "create",
-      expect.objectContaining({
-        brainId: blank.id,
-        origin: "blank"
-      }),
-      60_000
-    );
-  });
-
-  it("loads and shape-safely updates a materialized starter without randomizing it", async () => {
-    const imported = await importedBrain({
+  it("learns visible action evidence without adding a synthetic conversation turn", async () => {
+    const createdAt = "2026-09-13T12:00:00.000Z";
+    let brain = await repository.create({
       ...DEFAULT_CONFIG,
-      name: "Pretrained checkpoint",
-      workingMemorySlots: 320,
-      extendedWorkingMemory: false
+      name: "Structured action learner"
     });
-    const engineDirectory = join(repository.brainDirectory(imported.id), "engine");
-    const core = emptySafetensors("pretrained-core");
-    const plasticity = emptySafetensors("pretrained-plasticity");
-    await mkdir(engineDirectory, { recursive: true });
-    await Promise.all([
-      writeFile(
-        join(engineDirectory, "brain.json"),
-        JSON.stringify({
-          schema_version: 1,
-          format: "omni-cortex-engine",
-          release_format: "stable-1.0",
-          brain_id: imported.id,
-          name: imported.name,
-          config: {
-            d_model: 64,
-            n_layers: 2,
-            max_seq_len: 1536,
-            working_memory_slots: 320,
-            initial_neuron_budget: 4_096
-          }
-        })
-      ),
-      writeFile(join(engineDirectory, "core.safetensors"), core),
-      writeFile(join(engineDirectory, "plasticity.safetensors"), plasticity)
-    ]);
-    vi.spyOn(service, "importUrl").mockResolvedValue(imported);
-
-    const built = await service.create({
-      origin: "starter",
-      starterUrl: "https://catalog.example/pretrained.omni",
-      hardwareTier: "workstation",
-      modalities: ["vision", "image"],
-      config: {
-        ...DEFAULT_CONFIG,
-        name: "Adapted checkpoint",
-        // Builder shape requests cannot resize an imported checkpoint.
-        workingMemorySlots: 48,
-        extendedWorkingMemory: true,
-        // Simulate a pre-v1 caller. Stable normalization must discard these
-        // beta behavior and architecture controls.
-        initialNeuronBudget: 98_304,
-        noise: 0.23
-      } as BrainConfig & { initialNeuronBudget: number; noise: number }
-    });
-
-    expect(built.id).toBe(imported.id);
-    expect(built.config).toMatchObject({
-      name: "Adapted checkpoint",
-      workingMemorySlots: 320,
-      extendedWorkingMemory: false
-    });
-    expect(built.config).not.toHaveProperty("initialNeuronBudget");
-    expect(built.config).not.toHaveProperty("noise");
-    expect(tryRequest.mock.calls.map(([method]) => method)).toEqual([
-      "unload",
-      "load",
-      "update_config"
-    ]);
-    expect(tryRequest.mock.calls.some(([method]) => method === "create")).toBe(false);
-
-    const storagePath = repository.brainDirectory(imported.id);
-    expect(tryRequest.mock.calls[1]).toEqual([
-      "load",
+    brain.messages = [
       {
-        brainId: imported.id,
-        config: built.config,
-        storagePath
+        id: "human-visible",
+        role: "human",
+        content: "Inspect the project files.",
+        createdAt
       },
-      300_000
-    ]);
-    expect(tryRequest.mock.calls[2]).toEqual([
-      "update_config",
       {
-        brainId: imported.id,
-        config: built.config,
-        storagePath
-      },
-      300_000
-    ]);
+        id: "brain-visible",
+        role: "brain",
+        content: "I inspected the visible files.",
+        createdAt
+      }
+    ];
+    brain.traces = [{
+      id: "trace-visible",
+      createdAt,
+      input: "Inspect the project files.",
+      seed: 7,
+      runtime: "adaptive-core",
+      activatedConcepts: [],
+      recalledIdeas: [],
+      driveScores: { novelty: 0, coherence: 1, curiosity: 0 },
+      branches: 1,
+      selectedBranch: 1,
+      steps: [],
+      note: "Visible committed turn"
+    }];
+    await repository.save(brain);
+    brain = await repository.get(brain.id);
+    const messagesBefore = structuredClone(brain.messages);
+    const tracesBefore = structuredClone(brain.traces);
 
-    const [savedCore, savedPlasticity] = await Promise.all([
-      readFile(join(engineDirectory, "core.safetensors")),
-      readFile(join(engineDirectory, "plasticity.safetensors"))
-    ]);
-    expect(sha256(savedCore)).toBe(sha256(core));
-    expect(sha256(savedPlasticity)).toBe(sha256(plasticity));
+    const learned = await service.learnStructuredExperience(brain.id, {
+      content:
+        "[Visible structured action result]\ntool: system.files\naction: list\nresult:\n{\"entries\":[\"README.md\"]}",
+      name: "Chat system.files result",
+      sourceLabel: "chat visible action evidence",
+      license: "Locally observed tool result"
+    });
+
+    expect(request).toHaveBeenLastCalledWith(
+      "ingest",
+      expect.objectContaining({
+        brainId: brain.id,
+        kind: "text",
+        policy: "pretrain",
+        text: expect.stringContaining("[Visible structured action result]")
+      }),
+      86_400_000,
+      undefined
+    );
+    expect(learned.brain.messages).toEqual(messagesBefore);
+    expect(learned.source).toMatchObject({
+      name: "Chat system.files result",
+      rawTextRetained: false,
+      policy: "pretrain",
+      license: "Locally observed tool result"
+    });
+    expect(learned.brain.journal?.at(-1)).toMatchObject({
+      kind: "learning",
+      summary: "Learned chat visible action evidence into neural state."
+    });
+    expect(learned.brain.journal?.at(-1)?.detail).toContain("hiddenPrompt=false");
+
+    const reloaded = await repository.get(brain.id);
+    expect(reloaded.messages).toEqual(messagesBefore);
+    expect(reloaded.traces).toEqual(tracesBefore);
   });
 
-  it("rejects and removes a starter import with no materialized engine state", async () => {
-    const imported = await importedBrain();
-    vi.spyOn(service, "importUrl").mockResolvedValue(imported);
+  it("requires a hash-bound neural checkpoint before publishing one recovery point", async () => {
+    const brain = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Recovery checkpoint gate"
+    });
+    const failedOperation = randomUUID();
+    request.mockRejectedValueOnce(new Error("checkpoint flush failed"));
+    await expect(
+      service.createRecoveryPoint(
+        brain.id,
+        "must not publish",
+        failedOperation
+      )
+    ).rejects.toThrow(/checkpoint flush failed/i);
+    await expect(repository.listSnapshots(brain.id)).resolves.toEqual([]);
 
+    const operationId = randomUUID();
+    const parameterChecksum = "a".repeat(64);
+    const substrateContentSha256 = "b".repeat(64);
+    const mutableStateContentSha256 = "c".repeat(64);
+    const packedContentSha256 = "d".repeat(64);
+    const engineDirectory = join(repository.brainDirectory(brain.id), "engine");
+    await mkdir(join(engineDirectory, "packed-ternary"), { recursive: true });
+    const packedBytes = Buffer.from(JSON.stringify({
+      contentSha256: packedContentSha256
+    }));
+    const metadataBytes = Buffer.from(JSON.stringify({
+      brain_id: brain.id,
+      substrate: { persistence: { contentSha256: substrateContentSha256 } },
+      mutable_state: { contentSha256: mutableStateContentSha256 },
+      packed_ternary_manifest: {
+        contentSha256: packedContentSha256,
+        parameterChecksum
+      }
+    }));
+    await Promise.all([
+      writeFile(join(engineDirectory, "brain.json"), metadataBytes),
+      writeFile(join(engineDirectory, "packed-ternary", "manifest.json"), packedBytes)
+    ]);
+    const mismatchedOperation = randomUUID();
+    request.mockResolvedValueOnce({
+      format: "omni-neural-checkpoint",
+      formatVersion: 1,
+      brainId: brain.id,
+      operationId: mismatchedOperation,
+      committed: true,
+      createdAt: "2026-09-12T00:00:00.000Z",
+      parameterChecksum,
+      metadataSha256: "f".repeat(64),
+      substrateContentSha256,
+      mutableStateContentSha256,
+      packedManifestSha256: sha256(packedBytes),
+      packedContentSha256,
+      snapshotCreated: false
+    });
+    await expect(
+      service.createRecoveryPoint(
+        brain.id,
+        "mismatched files",
+        mismatchedOperation
+      )
+    ).rejects.toThrow(/does not match its committed files/i);
+    await expect(repository.listSnapshots(brain.id)).resolves.toEqual([]);
+
+    request.mockResolvedValueOnce({
+      format: "omni-neural-checkpoint",
+      formatVersion: 1,
+      brainId: brain.id,
+      operationId,
+      committed: true,
+      createdAt: "2026-09-12T00:00:00.000Z",
+      parameterChecksum,
+      metadataSha256: sha256(metadataBytes),
+      substrateContentSha256,
+      mutableStateContentSha256,
+      packedManifestSha256: sha256(packedBytes),
+      packedContentSha256,
+      snapshotCreated: false
+    });
+    const repositorySnapshot = vi.spyOn(repository, "snapshot").mockImplementation(
+      async (brainId, label, _operation, prepare) => {
+        await prepare?.();
+        return {
+          id: "host-recovery-point",
+          brainId,
+          label: label ?? "Recovery point",
+          createdAt: "2026-09-12T00:00:01.000Z",
+          checksum: "e".repeat(64),
+          metrics: {
+            concepts: 0,
+            synapses: 0,
+            activeSynapses: 0,
+            ideas: 0,
+            messages: 0,
+            trainingSources: 0,
+            averageStability: 0,
+            plasticityEvents: 0,
+            inferenceCount: 0,
+            estimatedBytes: 1
+          }
+        };
+      }
+    );
+    const snapshot = await service.createRecoveryPoint(
+      brain.id,
+      "single host recovery point",
+      operationId
+    );
+    expect(snapshot.label).toBe("single host recovery point");
+    expect(repositorySnapshot).toHaveBeenCalledOnce();
+    await expect(
+      stat(join(repository.brainDirectory(brain.id), "engine", "snapshots"))
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(request).toHaveBeenLastCalledWith(
+      "checkpoint",
+      expect.objectContaining({ brainId: brain.id, operationId }),
+      0,
+      undefined,
+      "foreground",
+      expect.objectContaining({ requestId: operationId, brainId: brain.id })
+    );
+    expect(tryRequest).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before persistence when live resource preflight is unavailable", async () => {
+    const unplanned = new BrainService(
+      repository,
+      { tryRequest, request } as unknown as EngineSupervisor
+    );
+
+    await expect(unplanned.create({
+      hardwareTier: "micro",
+      config: { ...DEFAULT_CONFIG, name: "Missing resource preflight" }
+    })).rejects.toThrow(/requires live resource preflight/i);
+
+    expect(request).not.toHaveBeenCalled();
+    await expect(repository.list()).resolves.toEqual([]);
+  });
+
+  it("routes existing-instance selectors away from new creation", async () => {
     await expect(
       service.create({
         origin: "starter",
-        starterUrl: "https://catalog.example/unmaterialized.omni",
-        config: { ...DEFAULT_CONFIG, name: "Must not build" }
-      })
-    ).rejects.toThrow(/no materialized OmniCortex checkpoint/i);
+        foundationModelId: "falcon-e-1b-base-f4001b8",
+        foundationRiskAcknowledged: false,
+        config: { ...DEFAULT_CONFIG, name: "Unacknowledged research base" }
+      } as unknown as Parameters<typeof service.create>[0])
+    ).rejects.toThrow(/native OmniCortex origin/i);
 
-    expect(tryRequest).not.toHaveBeenCalled();
-    await expect(repository.get(imported.id)).rejects.toThrow();
+    await expect(service.create({
+      origin: "ground-up",
+      foundationModelId: "falcon-e-1b-base-f4001b8",
+      foundationRiskAcknowledged: true,
+      config: { ...DEFAULT_CONFIG, name: "No attached foundation" }
+    } as unknown as Parameters<typeof service.create>[0])).rejects.toThrow(/native OmniCortex origin/i);
+
+    await expect(service.create({
+      starterUrl: "https://catalog.example/legacy.omni",
+      config: { ...DEFAULT_CONFIG, name: "Use import" }
+    } as unknown as Parameters<typeof service.create>[0])).rejects.toThrow(/native OmniCortex origin/i);
+
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("ignores the legacy foundation environment override for new Build", async () => {
+    vi.stubEnv("OMNI_FOUNDATION_MODEL_ID", "falcon-e-3b-base-ad18b07");
+    try {
+      const built = await service.create({
+        config: { ...DEFAULT_CONFIG, name: "Environment-safe ground-up mind" }
+      });
+      expect(request).toHaveBeenLastCalledWith(
+        "create",
+        expect.objectContaining({
+          brainId: built.id,
+          origin: "ground-up"
+        }),
+        300_000
+      );
+      expect(request.mock.calls.some(([method]) => method === "foundation.list"))
+        .toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("defaults the stable public API to mandatory ground-up creation", async () => {
+    const groundUp = await service.create({
+      hardwareTier: "micro",
+      config: { ...DEFAULT_CONFIG, name: "Implicit ground-up" }
+    });
+    expect(request).toHaveBeenLastCalledWith(
+      "create",
+      expect.objectContaining({
+        brainId: groundUp.id,
+        origin: "ground-up"
+      }),
+      300_000
+    );
+
+    await expect(service.create({
+      origin: "blank",
+      hardwareTier: "micro",
+      config: { ...DEFAULT_CONFIG, name: "Rejected legacy blank" }
+    } as unknown as Parameters<typeof service.create>[0])).rejects.toThrow(/native OmniCortex origin/i);
+  });
+
+  it("projects legacy Windows grants onto platform-neutral system capabilities", async () => {
+    let legacy = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Imported legacy permissions"
+    });
+    legacy.toolPermissions = [
+      {
+        toolId: "windows.files",
+        label: "Windows files",
+        level: "full",
+        updatedAt: legacy.createdAt
+      },
+      {
+        toolId: "windows.powershell",
+        label: "PowerShell",
+        level: "off",
+        updatedAt: legacy.createdAt
+      }
+    ];
+    legacy = await repository.save(legacy);
+
+    const projected = await service.listToolPermissions(legacy.id);
+    expect(projected).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ toolId: "system.files", level: "full" }),
+        expect.objectContaining({ toolId: "system.shell", level: "off" })
+      ])
+    );
+    expect(projected.some(({ toolId }) => toolId.startsWith("windows."))).toBe(false);
+    const updated = await service.setToolPermission(
+      legacy.id,
+      "windows.powershell",
+      "ask"
+    );
+    expect(updated).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ toolId: "system.shell", level: "ask" })
+      ])
+    );
+    expect(updated.some(({ toolId }) => toolId.startsWith("windows."))).toBe(false);
+  });
+
+  it("keeps legacy checkpoint handling on the explicit import path", async () => {
+    const importSpy = vi.spyOn(service, "importUrl");
+    await expect(service.create({
+      origin: "starter",
+      starterUrl: "https://catalog.example/pretrained.omni",
+      config: { ...DEFAULT_CONFIG, name: "Must import instead" }
+    } as unknown as Parameters<typeof service.create>[0])).rejects.toThrow(/native OmniCortex origin/i);
+    expect(importSpy).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 });
 
@@ -587,6 +959,49 @@ describe("BrainService reviewed subagent overlay merges", () => {
       duplicateFiles: 2
     });
   });
+
+  it("streams all 10k+ novel evidence rows through the resumable merge plan", async () => {
+    const target = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Large merge target"
+    });
+    const source = await repository.fork(target.id, "Large merge source");
+    const branch = await repository.get(source.id);
+    const count = 10_050;
+    branch.trainingSources = Array.from({ length: count }, (_, index): TrainingSource => ({
+      id: `large-source-${String(index).padStart(6, "0")}`,
+      name: `source ${index}`,
+      kind: "text",
+      bytes: index + 1,
+      learnedIdeas: index % 5,
+      learnedConcepts: index % 7,
+      learnedSynapses: index % 11,
+      importedAt: new Date(1_700_000_000_000 + index).toISOString(),
+      rawTextRetained: false,
+      contentHash: sha256(`large-source-${index}`),
+      policy: "pretrain"
+    }));
+    await repository.save(branch);
+
+    const preview = await service.previewMerge(source.id, target.id);
+    expect(preview).toMatchObject({ newEvidence: count, duplicateEvidence: 0 });
+    const merged = await service.merge(source.id, target.id, preview.reviewToken);
+    expect(merged.activity).toMatchObject({ trainingSourceCount: count });
+    expect(merged.trainingSources).toHaveLength(100);
+
+    const hashes = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const page = await repository.trainingSourcePage(target.id, cursor, 100);
+      page.entries.forEach((entry) => hashes.add(entry.source.contentHash!));
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(hashes.size).toBe(count);
+    expect(await service.previewMerge(source.id, target.id)).toMatchObject({
+      newEvidence: 0,
+      duplicateEvidence: count
+    });
+  }, 30_000);
 
   it("keeps Synapses Only evidence metadata but does not copy source bytes", async () => {
     const target = await repository.create({

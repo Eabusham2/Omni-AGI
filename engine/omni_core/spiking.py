@@ -6,7 +6,11 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch import nn
 
-from .model import BitLinear
+from .model import (
+    PackedAdaptiveBitLinear as BitLinear,
+    pack_ternary_weight,
+    unpack_ternary_weight_rows,
+)
 
 
 class LIFPopulation(nn.Module):
@@ -51,8 +55,10 @@ class LIFPopulation(nn.Module):
 class STDPSynapses(nn.Module):
     """Pair-based causal/anti-causal STDP with metaplastic stability.
 
-    ``weights[post, pre]`` is potentiated when a presynaptic spike precedes a
-    postsynaptic spike and depressed when the order is reversed.
+    The durable connection strength is a packed exact ternary code, never a
+    floating shadow weight. Spike timing accumulates only bounded int16
+    eligibility before moving a connection by one ternary level. The decoded
+    ``weights`` property is an inspection copy, not mutable neural storage.
     """
 
     def __init__(
@@ -78,12 +84,112 @@ class STDPSynapses(nn.Module):
         self.metaplasticity_rate = float(metaplasticity_rate)
         self.weight_limit = float(weight_limit)
         self.ternary = True
-        self.register_buffer("weights", torch.zeros(post_neurons, pre_neurons))
+        if pre_neurons <= 0 or post_neurons <= 0:
+            raise ValueError("synapse population dimensions must be positive")
+        if not math.isfinite(self.learning_rate) or self.learning_rate < 0:
+            raise ValueError("STDP learning rate must be finite and nonnegative")
+        self.register_buffer(
+            "_packed_weights",
+            torch.full(
+                (post_neurons, (pre_neurons + 3) // 4),
+                0x55,
+                dtype=torch.uint8,
+            ),
+        )
+        # Eligibility is subthreshold timing pressure, not a second weight.
+        # Its fixed-point range is [-255, 255] after each update.
+        self.register_buffer(
+            "eligibility_accumulator",
+            torch.zeros(post_neurons, pre_neurons, dtype=torch.int16),
+        )
         self.register_buffer("stability", torch.zeros(post_neurons, pre_neurons))
         self.register_buffer("pre_trace", torch.zeros(pre_neurons))
         self.register_buffer("post_trace", torch.zeros(post_neurons))
         self.register_buffer("uses", torch.zeros(post_neurons, pre_neurons))
         self.register_buffer("plasticity_events", torch.zeros((), dtype=torch.long))
+        self.register_buffer("decay_cycles", torch.zeros((), dtype=torch.long))
+
+    @property
+    def weights(self) -> torch.Tensor:
+        """Read-only decoded inspection copy for existing trace consumers."""
+
+        return self.effective_weight()
+
+    def authoritative_packed_tensors(self) -> Tuple[torch.Tensor, ...]:
+        """The sole persistent synaptic weight bytes for checksum/accounting."""
+
+        self.effective_weight()  # Validate reserved and padding codes.
+        return (self._packed_weights,)
+
+    @property
+    def logical_ternary_parameter_count(self) -> int:
+        return int(self.pre_neurons * self.post_neurons)
+
+    @torch.no_grad()
+    def set_effective_weights(self, levels: torch.Tensor) -> None:
+        """Replace exact levels for controlled initialization or inspection."""
+
+        if levels.shape != (self.post_neurons, self.pre_neurons):
+            raise ValueError("ternary synapse shape is invalid")
+        if levels.dtype != torch.int8 or not bool(
+            ((levels >= -1) & (levels <= 1)).all()
+        ):
+            raise ValueError("synapse levels must be exact int8 ternary values")
+        self._packed_weights.copy_(
+            pack_ternary_weight(levels.to(self._packed_weights.device))
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys,
+        unexpected_keys, error_msgs,
+    ):
+        legacy_name = prefix + "weights"
+        packed_name = prefix + "_packed_weights"
+        if legacy_name in state_dict and packed_name in state_dict:
+            error_msgs.append(
+                prefix + "synapse checkpoint has both packed and floating weights"
+            )
+        elif legacy_name in state_dict:
+            legacy = state_dict.pop(legacy_name)
+            if (
+                not isinstance(legacy, torch.Tensor)
+                or legacy.shape != (self.post_neurons, self.pre_neurons)
+                or not legacy.is_floating_point()
+                or not bool(torch.isfinite(legacy).all())
+            ):
+                error_msgs.append(prefix + "legacy STDP weights are invalid")
+            else:
+                # Native pre-packed checkpoints used this threshold for their
+                # effective recurrent synapses. Preserve those exact levels;
+                # discard the former dense float master after migration.
+                threshold = max(1e-6, self.weight_limit * 0.25)
+                levels = torch.where(
+                    legacy >= threshold,
+                    torch.ones_like(legacy, dtype=torch.int8),
+                    torch.where(
+                        legacy <= -threshold,
+                        -torch.ones_like(legacy, dtype=torch.int8),
+                        torch.zeros_like(legacy, dtype=torch.int8),
+                    ),
+                )
+                state_dict[packed_name] = pack_ternary_weight(levels)
+                state_dict[prefix + "eligibility_accumulator"] = (
+                    torch.zeros_like(self.eligibility_accumulator)
+                )
+                state_dict[prefix + "decay_cycles"] = torch.zeros_like(
+                    self.decay_cycles
+                )
+        if packed_name not in state_dict:
+            error_msgs.append(packed_name + " is required")
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs,
+        )
+        if packed_name in state_dict:
+            try:
+                self.effective_weight()
+            except (ValueError, RuntimeError) as error:
+                error_msgs.append(str(error))
 
     def reset_activity(self) -> None:
         self.pre_trace.zero_()
@@ -92,22 +198,26 @@ class STDPSynapses(nn.Module):
     def effective_weight(self) -> torch.Tensor:
         """Return the exact ternary synapses used by recurrent computation."""
 
-        threshold = max(1e-6, self.weight_limit * 0.25)
-        return torch.where(
-            self.weights >= threshold,
-            torch.ones_like(self.weights, dtype=torch.int8),
-            torch.where(
-                self.weights <= -threshold,
-                -torch.ones_like(self.weights, dtype=torch.int8),
-                torch.zeros_like(self.weights, dtype=torch.int8),
-            ),
-        )
+        packed = self._packed_weights
+        if packed.dtype != torch.uint8 or packed.shape != (
+            self.post_neurons, (self.pre_neurons + 3) // 4
+        ):
+            raise ValueError("packed STDP synapse shape or dtype is invalid")
+        decoded = unpack_ternary_weight_rows(packed, self.pre_neurons)
+        # The generic decoder verifies active codes. Enforce canonical zero
+        # padding too, so a malformed checkpoint never enters recurrent use.
+        if self.pre_neurons % 4:
+            last = packed[:, -1]
+            for lane in range(self.pre_neurons % 4, 4):
+                if bool((((last >> (2 * lane)) & 0x03) != 1).any()):
+                    raise ValueError("packed STDP synapse has nonzero row padding")
+        return decoded
 
     def step(
         self, pre_spikes: torch.Tensor, post_spikes: torch.Tensor
     ) -> torch.Tensor:
-        pre = pre_spikes.detach().reshape(-1).to(self.weights)
-        post = post_spikes.detach().reshape(-1).to(self.weights)
+        pre = pre_spikes.detach().reshape(-1).to(self.pre_trace)
+        post = post_spikes.detach().reshape(-1).to(self.post_trace)
         if pre.numel() != self.pre_neurons or post.numel() != self.post_neurons:
             raise ValueError("spike vector dimensions do not match synapses")
 
@@ -119,7 +229,8 @@ class STDPSynapses(nn.Module):
 
         active = timing_signal.ne(0)
         if bool(active.any()):
-            previous_direction = torch.sign(self.weights)
+            previous = self.effective_weight()
+            previous_direction = torch.sign(previous)
             update_direction = torch.sign(delta)
             agreement = (previous_direction == update_direction) | (
                 previous_direction == 0
@@ -131,7 +242,38 @@ class STDPSynapses(nn.Module):
             )
             self.stability.add_(stability_delta * active).clamp_(0.0, 20.0)
             self.uses.add_(active.to(self.uses))
-            self.weights.add_(delta).clamp_(-self.weight_limit, self.weight_limit)
+            # Normalize to one transition per ordinary causal/anti-causal
+            # event. We retain fractional timing pressure in a bounded int16
+            # trace instead of retaining a full floating synaptic master.
+            quantum = max(self.learning_rate, 1e-6)
+            increments = (
+                (delta / quantum * 256.0)
+                .round()
+                .clamp(-256, 256)
+                .to(torch.int32)
+            )
+            pressure = (
+                self.eligibility_accumulator.to(torch.int32) + increments
+            ).clamp(-256, 256)
+            transition = torch.where(
+                pressure >= 256,
+                torch.ones_like(pressure),
+                torch.where(
+                    pressure <= -256,
+                    -torch.ones_like(pressure),
+                    torch.zeros_like(pressure),
+                ),
+            )
+            next_levels = (previous.to(torch.int32) + transition).clamp(-1, 1)
+            pressure = pressure - transition * 256
+            pressure = torch.where(
+                next_levels == previous.to(torch.int32),
+                torch.zeros_like(pressure),
+                pressure,
+            )
+            self.eligibility_accumulator.copy_(pressure.to(torch.int16))
+            if bool((next_levels != previous.to(torch.int32)).any()):
+                self.set_effective_weights(next_levels.to(torch.int8))
             self.plasticity_events.add_(int(active.sum().item()))
 
         self.pre_trace.mul_(self.pre_decay).add_(pre)
@@ -140,8 +282,30 @@ class STDPSynapses(nn.Module):
 
     def decay_unused(self, amount: float = 1e-4) -> None:
         amount = max(0.0, min(float(amount), 1.0))
-        use_scale = 1.0 / (1.0 + self.uses)
-        self.weights.mul_(1.0 - amount * use_scale)
+        self.decay_cycles.add_(1)
+        if amount:
+            # Persistent cycle count gives reproducible, rare discrete decay
+            # without a dense floating weight or decay residual. Frequently
+            # used links decay more slowly, as in the former continuous rule.
+            levels = self.effective_weight()
+            positions = torch.arange(
+                levels.numel(), device=levels.device, dtype=torch.int64
+            ).reshape_as(levels)
+            tick = int(self.decay_cycles.item())
+            random_codes = (
+                positions * 1664525 + tick * 1013904223
+            ) & 0xFFFFFFFF
+            # MPS has no float64 arithmetic; float32 still resolves the small
+            # per-cycle probabilities used for gradual pathway decay.
+            draw = random_codes.to(torch.float32) / 4294967296.0
+            decay = (levels != 0) & (
+                draw < (amount / (1.0 + self.uses)).to(draw)
+            )
+            if bool(decay.any()):
+                next_levels = torch.where(
+                    decay, torch.zeros_like(levels), levels
+                )
+                self.set_effective_weights(next_levels)
         self.stability.mul_(1.0 - amount * 0.1)
 
 

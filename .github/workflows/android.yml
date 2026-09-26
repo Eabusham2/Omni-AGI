@@ -1,0 +1,147 @@
+name: Android APK
+
+on:
+  push:
+    branches: ["main", "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk-and-emulator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+          verify-signature: true
+          cache: gradle
+          cache-dependency-path: |
+            mobile/android/*.gradle.kts
+            mobile/android/app/*.gradle.kts
+            mobile/android/gradle.properties
+            mobile/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: "14742923"
+          packages: ""
+
+      - name: Install pinned Android SDK and emulator image
+        run: >-
+          sdkmanager
+          "platform-tools"
+          "platforms;android-35"
+          "build-tools;35.0.0"
+          "emulator"
+          "system-images;android-35;google_apis;x86_64"
+
+      - name: Verify wrapper, unit tests, and both APK variants
+        working-directory: mobile/android
+        run: |
+          test "$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d' ' -f1)" = "2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046"
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+
+      - name: Start host-backed Android emulator
+        run: |
+          sudo chmod 666 /dev/kvm
+          echo no | avdmanager create avd --force --name omni-api35 --package "system-images;android-35;google_apis;x86_64" --device pixel_6
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" \
+            -avd omni-api35 \
+            -no-window \
+            -no-audio \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -camera-back none \
+            -camera-front none \
+            > "$RUNNER_TEMP/omni-emulator.log" 2>&1 &
+          timeout 240 adb wait-for-device
+          timeout 240 bash -c 'until [[ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" == "1" ]]; do sleep 2; done'
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell input keyevent 82
+
+      - name: Run same-brain gateway emulator smoke
+        run: |
+          python3 mobile/android/ci/fake_gateway.py 41837 > "$RUNNER_TEMP/omni-fake-gateway.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/omni-fake-gateway.pid"
+          for attempt in {1..30}; do
+            if curl --silent --output /dev/null http://127.0.0.1:41837/v1/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:41837/v1/health >/dev/null
+          adb shell pm clear ai.omniagi.companion.debug || true
+          cd mobile/android
+          ./gradlew --no-daemon :app:connectedDebugAndroidTest \
+            -Pandroid.testInstrumentationRunnerArguments.omniGatewayPort=41837
+
+      - name: Verify, label, and record both APK variants
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          DEBUG_SOURCE="mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_SOURCE="mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          DEBUG_APK="release/mobile/Omni-AGI-Companion-${VERSION}-Android-debug-signed.apk"
+          RELEASE_APK="release/mobile/Omni-AGI-Companion-${VERSION}-Android-release-unsigned.apk"
+          mkdir -p release/mobile
+          cp "$DEBUG_SOURCE" "$DEBUG_APK"
+          cp "$RELEASE_SOURCE" "$RELEASE_APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign" -c -v 4 "$DEBUG_APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/zipalign" -c -v 4 "$RELEASE_APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify --verbose "$DEBUG_APK"
+          if "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify "$RELEASE_APK" >/dev/null 2>&1; then
+            echo "The signing-ready release APK was unexpectedly signed." >&2
+            exit 1
+          fi
+          node scripts/record-mobile-release.mjs \
+            --platform android \
+            --output release/mobile/android-package-smoke.json \
+            --debug-artifact "$DEBUG_APK" \
+            --release-artifact "$RELEASE_APK" \
+            --emulator-tested 1 \
+            --same-brain-chat-tested 1 \
+            --attachment-stream-tested 1 \
+            --debug-signature-verified 1 \
+            --release-unsigned-verified 1 \
+            --zipalign-verified 1
+
+      - name: Capture emulator diagnostics on failure
+        if: failure()
+        run: |
+          adb exec-out screencap -p > "$RUNNER_TEMP/omni-emulator-failure.png" || true
+          adb logcat -d > "$RUNNER_TEMP/omni-emulator-logcat.txt" || true
+
+      - name: Upload APK and emulator reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-agi-android-apks
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            release/mobile/*-Android-debug-signed.apk
+            release/mobile/*-Android-release-unsigned.apk
+            release/mobile/android-package-smoke.json
+            mobile/android/app/build/reports/tests/
+            mobile/android/app/build/reports/androidTests/
+            mobile/android/app/build/outputs/androidTest-results/
+            ${{ runner.temp }}/omni-emulator.log
+            ${{ runner.temp }}/omni-fake-gateway.log
+            ${{ runner.temp }}/omni-emulator-failure.png
+            ${{ runner.temp }}/omni-emulator-logcat.txt

@@ -105,4 +105,32 @@ describe("renderer chat streaming state", () => {
     expect(commits).toHaveBeenLastCalledWith(" terminal");
     expect(callbacks).toHaveLength(0);
   });
+
+  it("paces a large decoder burst across frames for smooth visible typing", () => {
+    const commits: string[] = [];
+    const callbacks = new Map<number, () => void>();
+    let nextHandle = 0;
+    const batcher = createTextFrameBatcher(
+      (delta) => commits.push(delta),
+      (callback) => {
+        const handle = ++nextHandle;
+        callbacks.set(handle, () => {
+          callbacks.delete(handle);
+          callback();
+        });
+        return handle;
+      },
+      (handle) => callbacks.delete(handle),
+      4
+    );
+
+    batcher.push("abcdefghijkl");
+    callbacks.get(1)?.();
+    expect(commits).toEqual(["abcd"]);
+    expect(callbacks).toHaveLength(1);
+    callbacks.get(2)?.();
+    callbacks.get(3)?.();
+    expect(commits.join("")).toBe("abcdefghijkl");
+    expect(callbacks).toHaveLength(0);
+  });
 });

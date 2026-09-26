@@ -38,8 +38,8 @@ export const APPEARANCE_LAYOUTS: ReadonlyArray<AppearanceLayout> = [
 export const APPEARANCE_PACKS: ReadonlyArray<AppearancePack> = [
   {
     id: "standard",
-    name: "Standard",
-    description: "Balanced spacing and familiar violet surfaces.",
+    name: "Default",
+    description: "Balanced spacing, crisp surfaces, and familiar violet accents.",
     palette: "violet",
     layout: "standard"
   },
@@ -73,6 +73,22 @@ export const DEFAULT_APPEARANCE: AppearancePreferences = {
   layout: "standard"
 };
 
+const APPLE_PLATFORM_PATTERN = /(?:darwin|mac|iphone|ipad|ipod)/i;
+
+/**
+ * Fresh Apple installs use the native-feeling Liquid Glass pack. Existing
+ * stored preferences always win; other platforms retain the balanced Default.
+ */
+export function defaultAppearanceForPlatform(platform: string): AppearancePreferences {
+  return APPLE_PLATFORM_PATTERN.test(platform)
+    ? {
+        ...DEFAULT_APPEARANCE,
+        palette: "aqua",
+        layout: "glass"
+      }
+    : { ...DEFAULT_APPEARANCE };
+}
+
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
@@ -104,14 +120,17 @@ export function parseAppearancePreferences(value: unknown): AppearancePreference
   };
 }
 
-export function loadAppearancePreferences(storage: StorageLike): AppearancePreferences {
+export function loadAppearancePreferences(
+  storage: StorageLike,
+  platform = ""
+): AppearancePreferences {
   try {
     const raw = storage.getItem(APPEARANCE_STORAGE_KEY);
     return raw
       ? parseAppearancePreferences(JSON.parse(raw) as unknown)
-      : { ...DEFAULT_APPEARANCE };
+      : defaultAppearanceForPlatform(platform);
   } catch {
-    return { ...DEFAULT_APPEARANCE };
+    return defaultAppearanceForPlatform(platform);
   }
 }
 

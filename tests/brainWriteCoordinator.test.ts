@@ -223,8 +223,9 @@ describe("per-brain writer coordination", () => {
 
     releaseFirst.resolve();
     await Promise.all([first, second]);
-    const saved = await repository.get(brain.id);
-    expect(saved.messages.map((message) => message.content)).toEqual([
+    expect((await repository.conversationPage(brain.id)).entries.flatMap(
+      (entry) => entry.message ? [entry.message.content] : []
+    )).toEqual([
       "first turn",
       "answer:first turn",
       "second turn",
@@ -256,7 +257,7 @@ describe("per-brain writer coordination", () => {
     await chatStarted.promise;
     let permissionFinished = false;
     const permission = service
-      .setToolPermission(brain.id, "windows.files", "off")
+      .setToolPermission(brain.id, "system.files", "off")
       .then((records) => {
         permissionFinished = true;
         return records;
@@ -267,15 +268,17 @@ describe("per-brain writer coordination", () => {
     releaseChat.resolve();
     await chat;
     await expect(permission).resolves.toEqual(
-      expect.arrayContaining([expect.objectContaining({ toolId: "windows.files", level: "off" })])
+      expect.arrayContaining([expect.objectContaining({ toolId: "system.files", level: "off" })])
     );
     const saved = await repository.get(brain.id);
-    expect(saved.messages.map((message) => message.content)).toEqual([
+    expect((await repository.conversationPage(brain.id)).entries.flatMap(
+      (entry) => entry.message ? [entry.message.content] : []
+    )).toEqual([
       "keep this turn",
       "permission-safe response"
     ]);
     expect(
-      saved.toolPermissions?.find((record) => record.toolId === "windows.files")?.level
+      saved.toolPermissions?.find((record) => record.toolId === "system.files")?.level
     ).toBe("off");
   });
 
@@ -307,7 +310,7 @@ describe("per-brain writer coordination", () => {
     const repository = new BrainRepository(join(root, "brains"));
     await repository.initialize();
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Cold load" });
-    const request = vi.fn(async () => {
+    const request = vi.fn(async (..._args: unknown[]) => {
       throw new Error("sentinel cold-load failure");
     });
     const requestStream = vi.fn();
@@ -323,8 +326,21 @@ describe("per-brain writer coordination", () => {
       "load",
       expect.any(Object),
       300_000,
-      undefined
+      undefined,
+      "foreground",
+      expect.objectContaining({
+        brainId: brain.id,
+        label: "Chat response",
+        owner: "chat",
+        requestId: expect.any(String),
+        turnId: expect.any(String),
+        onTransition: expect.any(Function)
+      })
     );
+    const requestContext = request.mock.calls[0]?.[5] as
+      | { requestId?: string; turnId?: string }
+      | undefined;
+    expect(requestContext?.requestId).toBe(requestContext?.turnId);
     expect(requestStream).not.toHaveBeenCalled();
     expect((await repository.get(brain.id)).messages).toEqual([]);
   });
@@ -377,7 +393,7 @@ describe("per-brain writer coordination", () => {
 
     const permissions: ToolPermissionRecord[] = [
       {
-        toolId: "windows.files",
+        toolId: "system.files",
         label: "Windows Files",
         level: "full",
         updatedAt: new Date().toISOString()
@@ -391,7 +407,7 @@ describe("per-brain writer coordination", () => {
     const publicGet = vi.spyOn(repository, "get");
     const execution = executor.execute({
       brainId: brain.id,
-      toolId: "windows.files",
+      toolId: "system.files",
       action: "read",
       arguments: { path: target }
     });
@@ -402,10 +418,12 @@ describe("per-brain writer coordination", () => {
     const [, result] = await Promise.all([writer, execution]);
     expect(result.state).toBe("complete");
     const saved = await originalGet(brain.id);
-    expect(saved.messages.map((message) => message.content)).toContain(
+    expect((await repository.conversationPage(brain.id)).entries.flatMap(
+      (entry) => entry.message ? [entry.message.content] : []
+    )).toContain(
       "committed while tool ran"
     );
-    expect(saved.journal?.some((entry) => entry.summary === "windows.files.read: complete.")).toBe(
+    expect(saved.journal?.some((entry) => entry.summary === "system.files.read: complete.")).toBe(
       true
     );
   });

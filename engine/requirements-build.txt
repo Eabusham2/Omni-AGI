@@ -1,0 +1,3 @@
+# Build-only input. Release builds install this exact pin (and its reviewed
+# transitive helpers) from the target-specific SHA-256 lock in engine/locks.
+pyinstaller==6.21.0

@@ -68,6 +68,9 @@ describe("experience upload support", () => {
     const preload = read("src/preload/index.ts");
     const ipc = read("src/main/ipc.ts");
     const service = read("src/main/brainService.ts");
+    const chatAttachmentFlow = read(
+      "src/renderer/src/chatAttachmentLearning.ts"
+    );
 
     for (const label of [
       "Files & datasets",
@@ -83,14 +86,39 @@ describe("experience upload support", () => {
     expect(renderer).toContain('attachExperience("video")');
     expect(renderer).toContain('attachExperience("folder")');
     expect(renderer).toContain("attachDroppedExperience");
-    expect(renderer).toContain("Learned chat attachments");
+    expect(renderer).toContain("CHAT ATTACHMENT · NEURAL LEARNING");
     expect(renderer).toContain("encoded into neural state");
     expect(renderer).toContain("learnedSynapses");
     expect(renderer).toContain("window.omni.data.preview");
     expect(renderer).toContain("window.omni.data.start");
+    const chatAttachmentStart = renderer.indexOf("const attachExperience");
+    const chatAttachmentEnd = renderer.indexOf(
+      "const attachDroppedExperience",
+      chatAttachmentStart
+    );
+    const chatAttachment = renderer.slice(chatAttachmentStart, chatAttachmentEnd);
+    expect(chatAttachment).not.toContain("data.ingestFolder");
+    expect(chatAttachment).not.toContain("data.ingestFiles");
+    expect(chatAttachment).toContain("queueChatAttachmentLearning");
+    expect(chatAttachment).toContain("attachmentOperationGateRef.current.begin()");
+    expect(chatAttachment).toContain("attachmentOperationGateRef.current.finish(operationLease)");
+    expect(chatAttachment).toContain("setDatasetPreview({");
+    expect(chatAttachmentFlow.indexOf("data.preview(request)")).toBeGreaterThan(-1);
+    expect(chatAttachmentFlow.indexOf("data.start({")).toBeGreaterThan(
+      chatAttachmentFlow.indexOf("data.preview(request)")
+    );
+    expect(renderer).toContain("DatasetActivityCard");
+    expect(renderer).toContain("Cancel safely");
+    expect(renderer).toContain("window.omni.data.cancelPreview");
+    expect(renderer).toContain("window.omni.data.onPreviewProgress");
     expect(preload).toContain("webUtils.getPathForFile");
+    expect(preload).toContain("IPC.data.previewEvent");
+    expect(preload).toContain("IPC.data.cancelPreview");
+    expect(preload).toContain("start: (request) => invoke(IPC.data.start, request)");
     expect(preload).toContain("IPC.data.ingestDropped");
     expect(ipc).toContain("EXPERIENCE_UPLOADS");
+    expect(ipc).toContain("if (choice.canceled || choice.filePaths.length === 0) return null;");
+    expect(ipc).toContain("previewControllers.delete(requestId)");
     expect(ipc).toContain("service.ingestPaths");
     expect(service).toContain('"ingest"');
     expect(service).toContain("learnedSynapses");

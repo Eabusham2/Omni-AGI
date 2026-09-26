@@ -19,6 +19,7 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core import AdaptiveBrain, OmniConfig
+from omni_core.evolution import NeuralEvolutionManager
 
 
 def write_text_pdf(path: Path, text: str) -> None:
@@ -226,14 +227,14 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(result["mediaCoverage"]["tailFrames"], 1)
         brain.events.close()
 
-    def test_memory_recipes_have_distinct_source_retention(self):
+    def test_engine_never_duplicates_exact_sources_owned_by_the_desktop_cas(self):
         text = "RetentionSentinel links amber concepts into one durable idea."
         cases = (
-            ("human", "human-consolidation", True, False),
-            ("total", "total-recall", True, True),
-            ("synapses", "synapses-only", True, False),
+            ("adaptive", "adaptive-retention", True),
+            ("total", "total-recall", True),
+            ("synapses", "synapses-only", True),
         )
-        for brain_id, recipe, retain_flag, expected_raw in cases:
+        for brain_id, recipe, retain_flag in cases:
             with self.subTest(recipe=recipe):
                 brain = self.make_brain(
                     brain_id,
@@ -244,14 +245,14 @@ class ReleaseGateTests(unittest.TestCase):
                     text=text, name=brain_id + ".txt", policy="encode"
                 )
                 source = result["source"]
-                self.assertEqual(source["raw_text_retained"], expected_raw)
-                self.assertEqual("raw_text" in source, expected_raw)
+                self.assertFalse(source["raw_text_retained"])
+                self.assertNotIn("raw_text", source)
                 idea_has_text = any(
                     idea.get("source_text") == text for idea in brain.memory.ideas
                 )
-                self.assertEqual(idea_has_text, expected_raw)
+                self.assertFalse(idea_has_text)
                 metadata = (brain.engine_path / "brain.json").read_text("utf-8")
-                self.assertEqual(text in metadata, expected_raw)
+                self.assertNotIn(text, metadata)
                 brain.events.close()
 
     def test_expert_growth_is_persisted_and_reloadable(self):
@@ -277,23 +278,36 @@ class ReleaseGateTests(unittest.TestCase):
         )
         reloaded.events.close()
 
-    def test_replay_threshold_decay_and_seeded_trace_are_deterministic(self):
+    def test_weighted_replay_decay_and_seeded_trace_are_deterministic(self):
         brain = self.make_brain(
             "memory-brain",
-            long_term_threshold=0.8,
             forgetting_rate=0.25,
         )
         brain.learn_experience("A low salience transient.", importance=0.2)
-        self.assertEqual(len(brain.replay), 0)
+        weak_replay = len(brain.replay)
+        self.assertGreater(brain._replay_admission_probability(0.2), 0.0)
         brain.learn_experience(
-            "A durable high salience memory.", importance=0.95
+            "A durable high salience memory.", importance=1.0
         )
-        self.assertEqual(len(brain.replay), 1)
+        self.assertEqual(len(brain.replay), weak_replay + 1)
         concept_id = next(iter(brain.memory.concepts))
         brain.memory.concepts[concept_id]["activation"] = 1.0
-        result = brain.consolidate(steps=1)
-        self.assertTrue(result["promoted"])
-        self.assertLess(brain.memory.concepts[concept_id]["activation"], 1.0)
+        manager = NeuralEvolutionManager(brain)
+        proposal = manager.propose(
+            epochs=1,
+            latent_replay=True,
+            objectives=["latent-replay", "retention", "capability"],
+            provenance={"reason": "focused evaluated replay gate"},
+        )
+        self.assertTrue(manager.evaluate(proposal["id"])["passed"])
+        candidate = AdaptiveBrain.load(
+            brain.engine_path / "candidates" / proposal["id"] / "model",
+            expected_brain_id=brain.brain_id,
+        )
+        self.assertLess(
+            candidate.memory.concepts[concept_id]["activation"], 1.0
+        )
+        candidate.events.close()
         brain.events.close()
 
         first = self.make_brain("deterministic-a")

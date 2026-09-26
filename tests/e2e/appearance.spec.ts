@@ -1,19 +1,31 @@
-import { resolve } from "node:path";
-import { _electron as electron, expect, test } from "@playwright/test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import {
+  _electron as electron,
+  expect,
+  test,
+  type ElectronApplication
+} from "@playwright/test";
 
 const repository = resolve(process.cwd());
 
 test("appearance follows the OS, persists, and keeps palette and layout independent", async () => {
-  const application = await electron.launch({
-    args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
-    env: {
-      ...process.env,
-      NODE_ENV: "test",
-      OMNI_RESPONSIVE_REPOSITORY: repository
-    }
-  });
+  const userDataDirectory = await mkdtemp(join(tmpdir(), "omni-appearance-e2e-"));
+  let application: ElectronApplication | undefined;
 
   try {
+    application = await electron.launch({
+      args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(([key]) => key !== "ELECTRON_RUN_AS_NODE")
+        ),
+        NODE_ENV: "test",
+        OMNI_RESPONSIVE_REPOSITORY: repository,
+        OMNI_RESPONSIVE_USER_DATA_DIR: userDataDirectory
+      }
+    });
     const page = await application.firstWindow();
     await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
     await page.waitForLoadState("domcontentloaded");
@@ -25,6 +37,10 @@ test("appearance follows the OS, persists, and keeps palette and layout independ
     await page.getByRole("button", { name: "Appearance settings" }).click();
     const dialog = page.getByRole("dialog", { name: "Appearance settings" });
     await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Auto", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
 
     await dialog.getByRole("button", { name: "Light", exact: true }).click();
     await expect(root).toHaveAttribute("data-appearance-mode", "light");
@@ -40,7 +56,7 @@ test("appearance follows the OS, persists, and keeps palette and layout independ
     await expect(root).toHaveAttribute("data-layout", "expressive");
     await expect(root).toHaveAttribute("data-appearance-pack", "colorful");
 
-    const layoutGroup = dialog.getByRole("group", { name: "Layout" });
+    const layoutGroup = dialog.getByRole("group", { name: "Shape and density" });
     await layoutGroup.getByRole("button", { name: "Blocky", exact: true }).click();
     await expect(root).toHaveAttribute("data-palette", "spectrum");
     await expect(root).toHaveAttribute("data-layout", "classic");
@@ -72,6 +88,7 @@ test("appearance follows the OS, persists, and keeps palette and layout independ
     });
     expect(contrast).toBeGreaterThanOrEqual(7);
   } finally {
-    await application.close();
+    await application?.close().catch(() => undefined);
+    await rm(userDataDirectory, { recursive: true, force: true });
   }
 });

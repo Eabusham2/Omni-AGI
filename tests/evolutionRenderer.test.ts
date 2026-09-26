@@ -119,6 +119,7 @@ describe("evolution renderer model", () => {
 
   it("offers only state-valid stop, approval, and rollback controls", () => {
     expect(canStopEvolution("experimenting")).toBe(true);
+    expect(canStopEvolution("stopping")).toBe(true);
     expect(canStopEvolution("promoted")).toBe(false);
     expect(canApproveEvolution("awaiting-review")).toBe(true);
     expect(canApproveEvolution("rejected")).toBe(false);
@@ -144,6 +145,9 @@ describe("evolution renderer model", () => {
     expect(workspace).toContain("window.omni.evolution.listCandidates");
     expect(workspace).toContain("window.omni.evolution.approve");
     expect(workspace).toContain("window.omni.evolution.rollback");
+    expect(workspace).toContain('busyRun === run.id ? "stopping" : run.state');
+    expect(workspace).toContain('aria-busy={busyRun === run.id || undefined}');
+    expect(workspace).toContain('? "Retry stop"');
     expect(workspace).not.toContain('type="range"');
     expect(workspace).not.toContain("system prompt");
   });

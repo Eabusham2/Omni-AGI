@@ -1,16 +1,50 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, stat, statfs, writeFile } from "node:fs/promises";
 import { freemem, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { releaseArtifactName } from "./release-artifact-names.mjs";
+import { verifyDesktopCompliance } from "./verify-packaged-compliance.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
   if (inline) return inline.slice(name.length + 1);
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+function checkedOutCommit() {
+  const result = spawnSync(
+    "git",
+    ["rev-parse", "--verify", "HEAD^{commit}"],
+    { cwd: resolve("."), encoding: "utf8", shell: false }
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `Could not resolve the package source commit: ${result.stderr || result.stdout}`
+    );
+  }
+  const commit = result.stdout.trim().toLowerCase();
+  if (!/^[a-f0-9]{40}$/u.test(commit)) {
+    throw new Error("The checked-out package source commit is invalid.");
+  }
+  return commit;
+}
+
+function validatedDesktopCompliance(report, label) {
+  if (
+    report?.schemaVersion !== 1 ||
+    report?.kind !== "desktop-artifact-compliance" ||
+    !Number.isInteger(report?.legalFilesVerified) ||
+    report.legalFilesVerified < 10 ||
+    report?.ffmpegExecutableBundled !== false ||
+    typeof report?.ffmpegPolicySha256 !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(report.ffmpegPolicySha256)
+  ) {
+    throw new Error(`${label} did not pass packaged desktop legal and FFmpeg compliance.`);
+  }
+  return report;
 }
 
 function run(command, args, options = {}) {
@@ -91,6 +125,21 @@ const platform = option("--platform");
 const arch = option("--arch");
 const releaseRoot = resolve(option("--release-root") ?? "release");
 const desktopE2e = process.argv.includes("--desktop-e2e");
+const actualSourceCommit = checkedOutCommit();
+const sourceCommit = String(
+  option("--source-commit") ??
+    process.env.OMNI_RELEASE_COMMIT ??
+    process.env.GITHUB_SHA ??
+    actualSourceCommit
+).trim().toLowerCase();
+if (!/^[a-f0-9]{40}$/u.test(sourceCommit)) {
+  throw new Error("--source-commit must be a full 40-hex Git commit SHA.");
+}
+if (sourceCommit !== actualSourceCommit) {
+  throw new Error(
+    `Package source commit ${actualSourceCommit} does not match verified commit ${sourceCommit}.`
+  );
+}
 if (!["mac", "linux"].includes(platform) || !["x64", "arm64"].includes(arch)) {
   throw new Error(
     "Usage: node scripts/smoke-posix-package.mjs --platform <mac|linux> --arch <x64|arm64> [--desktop-e2e]"
@@ -157,6 +206,12 @@ if (platform === "mac") {
 } else {
   await run("tar", ["-xzf", sourceArchive, "-C", payloadRoot]);
 }
+const artifactCompliance = {
+  [basename(sourceArchive)]: validatedDesktopCompliance(
+    await verifyDesktopCompliance(payloadRoot, resolve(".")),
+    `${basename(sourceArchive)} compliance`
+  )
+};
 const payloadFiles = await walk(payloadRoot);
 
 const workers = payloadFiles.filter(
@@ -206,6 +261,23 @@ let signing = {
   state: "not-applicable"
 };
 if (platform === "mac") {
+  const dmg = artifacts.find((path) => path.endsWith(".dmg"));
+  if (!dmg) throw new Error("No macOS DMG was produced.");
+  const dmgRoot = join(scratch, "dmg");
+  await mkdir(dmgRoot, { recursive: true });
+  await run(
+    "hdiutil",
+    ["attach", "-readonly", "-nobrowse", "-mountpoint", dmgRoot, dmg],
+    { capture: true }
+  );
+  try {
+    artifactCompliance[basename(dmg)] = validatedDesktopCompliance(
+      await verifyDesktopCompliance(dmgRoot, resolve(".")),
+      `${basename(dmg)} compliance`
+    );
+  } finally {
+    await run("hdiutil", ["detach", dmgRoot], { capture: true });
+  }
   const signatureCheck = await probe(
     "codesign",
     ["--verify", "--deep", "--strict", "--verbose=2", desktopExecutable]
@@ -277,6 +349,10 @@ if (platform === "mac") {
   const debRoot = join(scratch, "deb");
   await mkdir(debRoot, { recursive: true });
   await run("dpkg-deb", ["--extract", deb, debRoot], { capture: true });
+  artifactCompliance[basename(deb)] = validatedDesktopCompliance(
+    await verifyDesktopCompliance(debRoot, resolve(".")),
+    `${basename(deb)} compliance`
+  );
   const debFiles = await walk(debRoot);
   const debWorkers = debFiles.filter(
     (path) =>
@@ -303,7 +379,12 @@ if (platform === "mac") {
     capture: true,
     cwd: appImageRoot
   });
-  const appImageFiles = await walk(join(appImageRoot, "squashfs-root"));
+  const extractedAppImageRoot = join(appImageRoot, "squashfs-root");
+  artifactCompliance[basename(appImage)] = validatedDesktopCompliance(
+    await verifyDesktopCompliance(extractedAppImageRoot, resolve(".")),
+    `${basename(appImage)} compliance`
+  );
+  const appImageFiles = await walk(extractedAppImageRoot);
   const appImageWorkers = appImageFiles.filter(
     (path) =>
       basename(path) === "omni-engine" &&
@@ -346,6 +427,18 @@ if (platform === "mac") {
     architecture: debArchitecture
   };
   formatValidation.AppImage = { extracted: true };
+}
+
+const compliancePolicyHashes = new Set(
+  Object.values(artifactCompliance).map((report) => report.ffmpegPolicySha256)
+);
+if (
+  Object.keys(artifactCompliance).length !== artifacts.length ||
+  compliancePolicyHashes.size !== 1
+) {
+  throw new Error(
+    `Every ${platform}-${arch} artifact must pass the identical packaged FFmpeg policy.`
+  );
 }
 
 const workerSmoke = await run(
@@ -404,9 +497,11 @@ for (const artifact of artifacts) {
   });
 }
 const evidence = {
+  sourceCommit,
   platform,
   architecture: arch,
   artifacts: artifactEvidence,
+  artifactCompliance,
   verifiedArchive: basename(sourceArchive),
   packagedWorker: relative(payloadRoot, worker),
   desktopExecutable: relative(payloadRoot, desktopExecutable),

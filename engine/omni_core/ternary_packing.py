@@ -1,8 +1,8 @@
-"""Safe, deterministic packed-ternary inference shards.
+"""Safe, deterministic packed-ternary synapse shards.
 
-The stable OmniCortex checkpoint keeps floating master weights for learning,
-but deployment should not need to infer which values were used by a ternary
-forward pass.  This module writes the *effective* ``{-1, 0, +1}`` tensors in a
+The native OmniCortex path stores eligible learned weights as packed ternary
+codes and mutates them directly. This module writes their exact
+``{-1, 0, +1}`` values in a
 small, non-executable format:
 
 * ``manifest.json`` is canonical JSON and describes every eligible tensor.
@@ -29,7 +29,7 @@ complete set of names expected by the architecture audit::
         expected_names=architecture_ternary_names,
     )
 
-The exporter discovers every built-in BitLinear/BitConv and STDP module.  A
+The exporter discovers packed-adaptive projections and STDP synapses. A
 custom module may declare ``ternary_eligible = True`` only to make omission
 fail closed; it must be converted to a supported exact-ternary projection
 before export.  Supplying ``expected_names`` is how the caller makes an
@@ -55,7 +55,10 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Unio
 import torch
 from torch import nn
 
-from .model import TERNARY_PROJECTION_TYPES
+from .model import (
+    PACKED_AUTHORITATIVE_PROJECTION_TYPES,
+    TERNARY_PROJECTION_TYPES,
+)
 from .spiking import STDPSynapses
 
 
@@ -280,14 +283,14 @@ def _module_spec(root_name: str, module_name: str, module: nn.Module) -> Ternary
             source_dtype=str(source.dtype).replace("torch.", ""),
         )
 
-    source = getattr(module, "weight")
-    scale = float(source.detach().abs().mean().clamp_min(1e-6).item())
+    if not isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+        raise TernaryCoverageError("projection lacks authoritative packed storage")
     return TernaryTensorSpec(
         name=_qualified_name(root_name, module_name, "weight"),
         values=effective_weight(),
-        scale=scale,
+        scale=float(module._packed_forward_scale.item()),
         kind="projection",
-        source_dtype=str(source.dtype).replace("torch.", ""),
+        source_dtype="packed-2bit",
     )
 
 
@@ -334,6 +337,22 @@ def collect_module_ternary_tensors(
                     "duplicate eligible tensor name: %s" % spec.name
                 )
             collected[spec.name] = spec
+            if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES) and module.has_bias:
+                bias_name = _qualified_name(root_name, module_name, "bias")
+                if bias_name in collected:
+                    raise TernaryCoverageError(
+                        "duplicate eligible tensor name: %s" % bias_name
+                    )
+                bias_levels = module.effective_bias()
+                if bias_levels is None:
+                    raise TernaryCoverageError("%s has no packed bias" % bias_name)
+                collected[bias_name] = TernaryTensorSpec(
+                    name=bias_name,
+                    values=bias_levels,
+                    scale=float(module._packed_forward_scale.item()),
+                    kind="projection",
+                    source_dtype="packed-2bit",
+                )
 
     for name, source in sorted((dynamic_synapses or {}).items()):
         if not isinstance(name, str) or not name or "\0" in name:
@@ -374,6 +393,68 @@ def collect_module_ternary_tensors(
         collected[spec.name] = spec
 
     return tuple(collected[name] for name in sorted(collected))
+
+
+def inspect_module_ternary_layout(
+    roots: ModuleRoots,
+    *,
+    dynamic_synapses: Mapping[str, torch.Tensor],
+) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+    """Inspect eligible names and shapes without evaluating accelerator weights.
+
+    A cold checkpoint load only needs to establish that its authenticated pack
+    still describes the current architecture. Computing every effective MPS
+    projection just to obtain names causes a synchronous GPU scalar read per
+    module even when the saved parameter checksum has not changed.
+    """
+
+    layout: Dict[str, Tuple[Tuple[int, ...], str]] = {}
+    for root_name, root in _root_items(roots):
+        for module_name, module in root.named_modules():
+            supported_projection = isinstance(module, TERNARY_PROJECTION_TYPES)
+            supported_synapse = isinstance(module, STDPSynapses)
+            claimed = bool(getattr(module, "ternary_eligible", False)) or hasattr(
+                module, "ternary"
+            )
+            if not (supported_projection or supported_synapse):
+                if claimed:
+                    raise TernaryCoverageError(
+                        "%s claims ternary eligibility but uses an unsupported/dense "
+                        "projection"
+                        % _qualified_name(root_name, module_name, "weight")
+                    )
+                continue
+            field = "weights" if supported_synapse else "weight"
+            name = _qualified_name(root_name, module_name, field)
+            if getattr(module, "ternary", False) is not True:
+                raise TernaryCoverageError("%s is eligible but not marked ternary" % name)
+            if not callable(getattr(module, "effective_weight", None)):
+                raise TernaryCoverageError("%s has no effective ternary weight" % name)
+            if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+                source_shape = module.ternary_weight_shape
+            else:
+                source = getattr(module, field)
+                if not isinstance(source, torch.Tensor):
+                    raise TernaryCoverageError("%s has an invalid weight" % name)
+                source_shape = tuple(int(value) for value in source.shape)
+            if name in layout:
+                raise TernaryCoverageError("%s has a duplicate weight" % name)
+            layout[name] = (
+                source_shape,
+                "dynamic-synapse" if supported_synapse else "projection",
+            )
+            if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES) and module.has_bias:
+                bias_name = _qualified_name(root_name, module_name, "bias")
+                if bias_name in layout:
+                    raise TernaryCoverageError("%s has a duplicate bias" % bias_name)
+                layout[bias_name] = (module.ternary_bias_shape, "projection")
+    for name, source in dynamic_synapses.items():
+        if not isinstance(name, str) or not name or "\0" in name:
+            raise TernaryCoverageError("dynamic synapse names must be non-empty strings")
+        if not isinstance(source, torch.Tensor) or name in layout:
+            raise TernaryCoverageError("%s is not a unique dynamic tensor" % name)
+        layout[name] = (tuple(int(value) for value in source.shape), "dynamic-synapse")
+    return dict(sorted(layout.items()))
 
 
 def _normalize_expected_names(
@@ -508,7 +589,7 @@ def export_ternary_shards(
     )
     # Verify what reached disk instead of trusting the in-memory tensors.
     return verify_ternary_shards(
-        destination, expected_names=contract
+        destination, expected_names=contract, retain_names=()
     ).manifest
 
 
@@ -554,8 +635,15 @@ def verify_ternary_shards(
     destination: Path,
     *,
     expected_names: Optional[Iterable[str]] = None,
+    retain_names: Optional[Iterable[str]] = None,
 ) -> VerifiedTernaryBundle:
-    """Verify and decode a packed generation without executing stored code."""
+    """Verify every shard; optionally retain only selected decoded tensors.
+
+    The default retains all tensors for existing callers. An empty selection
+    still decodes and checks every shard, but releases each decoded tensor
+    before reading the next one. This bounds cold-load verification memory
+    without relaxing packed, decoded, manifest, or coverage checks.
+    """
 
     destination = Path(destination)
     manifest_path = destination / MANIFEST_NAME
@@ -613,13 +701,26 @@ def verify_ternary_shards(
             raise TernaryIntegrityError("manifest contains duplicate shard entries")
         shard_table[filename] = shard
 
+    retained = None
+    if retain_names is not None:
+        if isinstance(retain_names, (str, bytes)):
+            raise ValueError("retained tensor names must be an iterable of strings")
+        requested = tuple(retain_names)
+        if any(
+            not isinstance(name, str) or not name or "\0" in name
+            for name in requested
+        ):
+            raise ValueError("retained tensor names must be non-empty strings")
+        retained = set(requested)
     names = []
+    seen_names = set()
     tensors: Dict[str, torch.Tensor] = {}
     used_shards = set()
     for entry in tensor_entries:
         name = entry.get("name")
-        if not isinstance(name, str) or not name or name in tensors:
+        if not isinstance(name, str) or not name or name in seen_names:
             raise TernaryIntegrityError("manifest contains duplicate tensor names")
+        seen_names.add(name)
         if entry.get("kind") not in _ALLOWED_KINDS or entry.get("dtype") != "int8":
             raise TernaryIntegrityError("%s has unsupported tensor metadata" % name)
         shape_value = entry.get("shape")
@@ -664,7 +765,8 @@ def verify_ternary_shards(
         decoded = decode_ternary_2bit(payload, shape)
         if entry.get("tensorSha256") != _tensor_sha256(decoded):
             raise TernaryIntegrityError("%s decoded tensor checksum mismatch" % name)
-        tensors[name] = decoded
+        if retained is None or name in retained:
+            tensors[name] = decoded
         names.append(name)
         used_shards.add(filename)
 

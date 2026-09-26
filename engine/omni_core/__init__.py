@@ -1,23 +1,20 @@
-"""OmniCortex: a small, local-first adaptive neural research engine.
+"""OmniCortex: a local-first adaptive neural research engine.
 
-The package intentionally ships without pretrained weights.  A new brain is
-randomly initialized and only changes through explicit experience, training,
-or consolidation calls.
+Every brain begins from native random OmniCortex weights. Model weights are not
+hidden inside this Python package.
 """
 
 from .brain import AdaptiveBrain
 from .config import OmniConfig
-from .model import BitLinear, OmniDecoder, RMSNorm, ternary_quantize
+from .model import OmniDecoder, RMSNorm
 from .tokenizer import ByteTokenizer
 
 __all__ = [
     "AdaptiveBrain",
-    "BitLinear",
     "ByteTokenizer",
     "OmniConfig",
     "OmniDecoder",
     "RMSNorm",
-    "ternary_quantize",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
