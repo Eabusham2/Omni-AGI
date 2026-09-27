@@ -402,10 +402,12 @@ describe("atomic neural chat commit reconciliation", () => {
   });
 
   it("runs receipt reconciliation from open/history reads and app restart", async () => {
-    const [ipcSource, startupSource] = await Promise.all([
+    const [rawIpcSource, rawStartupSource] = await Promise.all([
       readFile(join(process.cwd(), "src/main/ipc.ts"), "utf8"),
       readFile(join(process.cwd(), "src/main/index.ts"), "utf8")
     ]);
+    const ipcSource = rawIpcSource.replace(/\r\n/g, "\n");
+    const startupSource = rawStartupSource.replace(/\r\n/g, "\n");
     expect(ipcSource).toContain(
       "handle(IPC.brain.get, (_event, id: string) =>\n    service.getReconciledBrain"
     );

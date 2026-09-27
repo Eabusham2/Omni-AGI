@@ -9,7 +9,7 @@ const panel = readFileSync(
 const app = readFileSync(
   resolve(process.cwd(), "src/renderer/src/App.tsx"),
   "utf8"
-);
+).replace(/\r\n?/g, "\n");
 const styles = readFileSync(
   resolve(process.cwd(), "src/renderer/src/styles.css"),
   "utf8"

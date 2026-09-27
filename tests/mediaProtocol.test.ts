@@ -1,6 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   authorizedNativeMediaResponse,
@@ -100,6 +101,7 @@ describe("native generated-media protocol", () => {
   });
 
   it("delegates authorized playback to Electron's native file loader", async () => {
+    const path = join(tmpdir(), "Omni media", "generated audio.wav");
     const calls: Array<{ url: string; init: RequestInit & { bypassCustomProtocolHandlers: true } }> = [];
     const native = new Response(Buffer.from("native file response"), {
       status: 206,
@@ -108,7 +110,7 @@ describe("native generated-media protocol", () => {
     const response = await authorizedNativeMediaResponse(
       new Request(leasedMediaUrl, { headers: { Range: "bytes=12-47" } }),
       {
-        path: "/tmp/Omni media/generated audio.wav",
+        path,
         mimeType: "audio/wav",
         size: 100,
         sha256: "e".repeat(64)
@@ -121,7 +123,7 @@ describe("native generated-media protocol", () => {
 
     expect(response).toBe(native);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.url).toBe("file:///tmp/Omni%20media/generated%20audio.wav");
+    expect(calls[0]?.url).toBe(pathToFileURL(path).href);
     expect(calls[0]?.init.method).toBe("GET");
     expect(calls[0]?.init.bypassCustomProtocolHandlers).toBe(true);
     expect(new Headers(calls[0]?.init.headers).get("range")).toBe("bytes=12-47");

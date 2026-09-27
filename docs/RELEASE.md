@@ -41,6 +41,13 @@ types. The Windows job expands the ZIP and silently installs NSIS before
 checking both layouts. A workflow file or locally produced archive is not
 release evidence by itself.
 
+The 10k-row merge and disk-paging stress fixtures remain in the full local
+Node suite and macOS/Linux CI. Within that Node suite, Windows package CI
+omits those two prolonged stress fixtures; Windows functional and security
+tests still run. This is a
+documented coverage boundary, not a claim that Windows large-scale training
+or retention has passed live acceptance.
+
 The Android release job runs unit tests and a host-backed API 35 emulator test
 that pairs, streams a visible chat turn, and streams a 2 MiB attachment. It
 publishes the verified installable debug-signed APK and a separately named

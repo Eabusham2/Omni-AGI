@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import {
   X509Certificate,
   createPrivateKey,
@@ -6,11 +7,49 @@ import {
   randomUUID,
   sign
 } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 const IDENTITY_FILE = "mobile-tls-identity.json";
 const SIGNATURE_ALGORITHM_OID = "1.2.840.10045.4.3.2";
+const execFileAsync = promisify(execFile);
+
+// A Windows chmod(0600) does not remove inherited ACL grants. Keep the key
+// under a protected, current-user-only DACL, including while it is staged.
+const RESTRICT_WINDOWS_ACL = `
+$ErrorActionPreference = 'Stop'
+$path = $env:OMNI_MOBILE_TLS_IDENTITY_PATH
+$item = Get-Item -LiteralPath $path -Force
+if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'TLS identity path cannot be a reparse point.' }
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = Get-Acl -LiteralPath $path
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) | Out-Null }
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+if ($item.PSIsContainer) {
+  $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+}
+$grant = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+$acl.AddAccessRule($grant)
+$acl.SetOwner($sid)
+Set-Acl -LiteralPath $path -AclObject $acl
+$verified = Get-Acl -LiteralPath $path
+$rules = @($verified.Access)
+if (-not $verified.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or $verified.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) {
+  throw 'TLS identity ACL verification failed.'
+}
+`;
+
+async function restrictWindowsIdentityAcl(path: string): Promise<void> {
+  await execFileAsync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command", RESTRICT_WINDOWS_ACL
+  ], {
+    windowsHide: true,
+    timeout: 30_000,
+    env: { ...process.env, OMNI_MOBILE_TLS_IDENTITY_PATH: path }
+  });
+}
 
 export interface MobileTlsIdentity {
   certificatePem: string;
@@ -193,12 +232,19 @@ export async function loadOrCreateMobileTlsIdentity(
   ipAddresses: string[]
 ): Promise<MobileTlsIdentity> {
   const path = join(root, IDENTITY_FILE);
+  let exists = false;
   try {
-    const identity = validatedIdentity(JSON.parse(await readFile(path, "utf8")));
-    await chmod(path, 0o600);
-    return identity;
+    const entry = await lstat(path);
+    if (!entry.isFile()) throw new Error("The mobile TLS identity path is not a regular file.");
+    exists = true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (exists) {
+    if (process.platform === "win32") await restrictWindowsIdentityAcl(path);
+    const identity = validatedIdentity(JSON.parse(await readFile(path, "utf8")));
+    if (process.platform !== "win32") await chmod(path, 0o600);
+    return identity;
   }
   const identity = createMobileTlsIdentity(ipAddresses);
   const stored: StoredMobileTlsIdentity = {
@@ -207,6 +253,25 @@ export async function loadOrCreateMobileTlsIdentity(
     ...identity
   };
   await mkdir(root, { recursive: true });
+  if (process.platform === "win32") {
+    const stagingRoot = join(root, `.${IDENTITY_FILE}.${randomUUID()}.private`);
+    await mkdir(stagingRoot);
+    try {
+      await restrictWindowsIdentityAcl(stagingRoot);
+      const temporary = join(stagingRoot, IDENTITY_FILE);
+      await writeFile(temporary, JSON.stringify(stored, null, 2), {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx"
+      });
+      await restrictWindowsIdentityAcl(temporary);
+      await rename(temporary, path);
+      await restrictWindowsIdentityAcl(path);
+    } finally {
+      await rm(stagingRoot, { recursive: true, force: true });
+    }
+    return identity;
+  }
   const temporary = `${path}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(stored, null, 2), {
     encoding: "utf8",

@@ -13,6 +13,8 @@ import {
   packagedEnginePath
 } from "../src/main/engineSupervisor";
 
+const interruptSignal = process.platform === "win32" ? "SIGBREAK" : "SIGUSR1";
+
 class FakeWorker extends EventEmitter {
   readonly pid = 4242;
   killed = false;
@@ -1112,7 +1114,7 @@ describe("EngineSupervisor interruption", () => {
 
       const cancellation = supervisor.cancelRequest("cold-load");
       await vi.advanceTimersByTimeAsync(4_999);
-      expect(sendSignal).toHaveBeenCalledWith(4242, "SIGUSR1");
+      expect(sendSignal).toHaveBeenCalledWith(4242, interruptSignal);
       expect(coldWorker.kill).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       await expect(cancellation).resolves.toEqual({
@@ -1196,7 +1198,7 @@ describe("EngineSupervisor interruption", () => {
           }));
         }
         await vi.advanceTimersByTimeAsync(4_999);
-        expect(sendSignal).toHaveBeenCalledWith(4242, "SIGUSR1");
+        expect(sendSignal).toHaveBeenCalledWith(4242, interruptSignal);
         expect(worker.kill).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
         await expect(cancellation).resolves.toEqual({
@@ -1271,7 +1273,7 @@ describe("EngineSupervisor interruption", () => {
           }
         }));
         await vi.advanceTimersByTimeAsync(5_000);
-        expect(sendSignal).toHaveBeenCalledWith(4242, "SIGUSR1");
+        expect(sendSignal).toHaveBeenCalledWith(4242, interruptSignal);
         expect(worker.kill).not.toHaveBeenCalled();
 
         internal.consumeLine(JSON.stringify({
@@ -1328,7 +1330,7 @@ describe("EngineSupervisor interruption", () => {
     ) as { id: string };
 
     const cancellation = supervisor.cancelRequest("warm-turn");
-    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledWith(4242, "SIGUSR1"));
+    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledWith(4242, interruptSignal));
     expect(worker.kill).not.toHaveBeenCalled();
     (
       supervisor as unknown as { consumeLine(line: string): void }
@@ -1397,7 +1399,7 @@ describe("EngineSupervisor interruption", () => {
       { brainId: "warm-brain" },
       60_000
     );
-    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledWith(4242, "SIGUSR1"));
+    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledWith(4242, interruptSignal));
     expect(worker.kill).not.toHaveBeenCalled();
     (
       supervisor as unknown as { consumeLine(line: string): void }
@@ -1449,7 +1451,7 @@ describe("EngineSupervisor interruption", () => {
       .toBe(false);
     expect(supervisor.cancelBackgroundRequest("selected-brain", "consolidate_chat_learning"))
       .toBe(true);
-    expect(sendSignal).toHaveBeenCalledWith(4242, "SIGUSR1");
+    expect(sendSignal).toHaveBeenCalledWith(4242, interruptSignal);
     expect(worker.kill).not.toHaveBeenCalled();
     const request = JSON.parse(String(worker.stdin.write.mock.calls[0]?.[0])) as { id: string };
     (

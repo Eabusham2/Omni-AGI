@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -31,19 +33,23 @@ describe("distributed training launch configuration", () => {
   });
 
   it("builds an argument array without a shell and preserves paths as values", () => {
+    const projectRoot = join(tmpdir(), "Omni AGI");
+    const datasetPath = join(tmpdir(), "datasets", "full folder");
+    const outputPath = join(tmpdir(), "brains", "rented run");
     const launch = buildDistributedTrainingInvocation({
       python: "python",
-      projectRoot: "/workspace/Omni AGI",
-      datasetPath: "/datasets/full folder",
-      outputPath: "/brains/rented run",
+      projectRoot,
+      datasetPath,
+      outputPath,
       processes: 8,
       epochs: 3,
       strategy: "auto",
       amp: "bf16",
     });
     expect(launch.command).toBe("python");
-    expect(launch.args).toContain("/datasets/full folder");
-    expect(launch.args).toContain("/brains/rented run");
+    expect(launch.cwd).toBe(projectRoot);
+    expect(launch.args).toContain(datasetPath);
+    expect(launch.args).toContain(outputPath);
     expect(launch.args).toContain("8");
     expect(launch.args).not.toContain("pretrained");
     expect(launch.args).not.toContain("rlhf");

@@ -186,7 +186,7 @@ describe("progressive imagination presentation", () => {
     const app = readFileSync(
       resolve(import.meta.dirname, "../src/renderer/src/App.tsx"),
       "utf8"
-    );
+    ).replace(/\r\n?/g, "\n");
     expect(app).toContain('const [galleryOpen, setGalleryOpen] = useState(false)');
     expect(app).toContain('onClick={() => {\n              setGalleryOpen(true);');
     expect(app).toContain('role="dialog"');

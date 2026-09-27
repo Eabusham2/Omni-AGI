@@ -71,7 +71,6 @@ interface Harness {
 }
 
 async function makeHarness(options: {
-  previewDelayMs?: number;
   foundationDelayMs?: number;
   failIngestionOnce?: boolean;
   pauseIngestionOnce?: boolean;
@@ -109,9 +108,6 @@ async function makeHarness(options: {
       return repository.get(brainId);
     }),
     previewDataset: vi.fn(async (brainId: string) => {
-      if (options.previewDelayMs) {
-        await new Promise((resolve) => setTimeout(resolve, options.previewDelayMs));
-      }
       return manifest(brainId);
     }),
     ingestManifest: vi.fn(async () => {
@@ -170,8 +166,16 @@ describe("main-authoritative initialization recovery", () => {
   });
 
   it("waits beyond one second for first-learning work without timing out or opening chat", async () => {
-    const harness = await makeHarness({ previewDelayMs: 1_100 });
+    const harness = await makeHarness();
     roots.push(harness.root);
+    let releasePreview!: () => void;
+    const previewGate = new Promise<void>((resolve) => {
+      releasePreview = resolve;
+    });
+    harness.service.previewDataset.mockImplementation(async (brainId: string) => {
+      await previewGate;
+      return manifest(brainId);
+    });
     await harness.selections.put({
       id: "slow-selection",
       kind: "files",
@@ -186,17 +190,18 @@ describe("main-authoritative initialization recovery", () => {
     const started = performance.now();
     const creating = harness.coordinator.create(request("slow-selection"));
     try {
-      const visibilityDeadline = performance.now() + 1_000;
-      let summaries = await harness.repository.list();
-      while (summaries.length === 0 && performance.now() < visibilityDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        summaries = await harness.repository.list();
-      }
+      await vi.waitFor(
+        () => expect(harness.service.previewDataset).toHaveBeenCalledTimes(1),
+        { timeout: 10_000 }
+      );
+      const summaries = await harness.repository.list();
       expect(summaries).toHaveLength(1);
       expect(
         (await harness.repository.get(summaries[0]!.id)).readiness.state
       ).toBe("initializing");
 
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      releasePreview();
       const brain = await creating;
       expect(performance.now() - started).toBeGreaterThan(1_000);
       expect(brain.readiness.state).toBe("ready");
@@ -205,9 +210,10 @@ describe("main-authoritative initialization recovery", () => {
     } finally {
       // Do not let an early assertion leave background initialization running
       // while Vitest tears down the repository fixture.
+      releasePreview();
       await creating.catch(() => undefined);
     }
-  });
+  }, 15_000);
 
   it("recovers interrupted foundations sequentially instead of loading them in parallel", async () => {
     const harness = await makeHarness();

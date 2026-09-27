@@ -14,7 +14,7 @@ import {
 } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -597,7 +597,7 @@ describe("whole-dataset persistence", { timeout: 30_000 }, () => {
     const result = await service.ingestManifest(brain.id, manifest.id);
 
     expect(
-      workerPaths.map((path) => path.slice(path.lastIndexOf("/") + 1)),
+      workerPaths.map((path) => basename(path)),
     ).toEqual(["records.txt"]);
     expect(result.coverage).toMatchObject({
       discoveredFiles: 4,
