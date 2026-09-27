@@ -113,7 +113,11 @@ from .offload import (
     ResourcePolicy,
     copy_mutable_state_snapshot,
 )
-from .optimizers import PackedOnlyOptimizer, adamw_for_remaining_parameters
+from .optimizers import (
+    PackedMutationSnapshot,
+    PackedOnlyOptimizer,
+    adamw_for_remaining_parameters,
+)
 from .persistence import (
     EventLog,
     atomic_save_tensors,
@@ -1817,12 +1821,12 @@ class AdaptiveBrain:
         storage_path: Path,
         config: OmniConfig,
         progress: Optional[Callable[[str, float, str, Dict[str, Any]], None]] = None,
-        initialize_ground_up: bool = False,
+        initialize_ground_up: bool = True,
     ) -> "AdaptiveBrain":
         engine_path = Path(storage_path).resolve() / "engine"
         if not initialize_ground_up:
             raise RuntimeError(
-                "durable ground-up creation requires explicit local curriculum initialization"
+                "durable ground-up creation cannot disable native initial curriculum"
             )
         if (engine_path / "brain.json").exists():
             brain = cls.load(storage_path, expected_brain_id=brain_id)
@@ -9623,7 +9627,10 @@ class AdaptiveBrain:
         physical microbatches, then one optimizer step commits the group. A
         resumable ingestion supplies its frozen, source-free schedule so a RAM
         reading cannot silently change the parameter trajectory. No source
-        text is retained after this call.
+        text is retained after this call. One CPU uint8 rollback image of the
+        connected packed modules is held for the entire logical batch, not
+        each microbatch; this costs O(packed model bytes) RAM and device-copy
+        I/O per batch. The live resource reserve can pause before that copy.
         """
 
         if not experiences:
@@ -9697,6 +9704,36 @@ class AdaptiveBrain:
             if learning_schedule is not None
             else None
         )
+        def reserve_packed_rollback(byte_count: int) -> None:
+            status = self.resource_policy.status(estimated_ram_bytes=byte_count)
+            if status["memoryPressure"]:
+                raise NeuralStateResourcePause(
+                    "training paused before packed rollback state crossed the RAM reserve",
+                    {
+                        **status,
+                        "paused": True,
+                        "recoverable": True,
+                        "trainingResourcePlan": training_plan,
+                        "packedRollbackBytes": byte_count,
+                        "resumeFromLastCheckpoint": True,
+                        "sourceRecordsSkipped": False,
+                    },
+                )
+
+        try:
+            packed_snapshot = PackedMutationSnapshot.capture(
+                self._slow_transaction_modules().values(),
+                reserve=reserve_packed_rollback,
+            )
+        except BaseException as error:
+            if not is_allocator_oom_error(error):
+                raise
+            self._allocator_oom_count += 1
+            self._release_training_allocator_cache()
+            raise self._allocator_resource_pause(
+                error, stage="packed-rollback-snapshot",
+                physical_batch=physical, sequence_tokens=sequence_tokens,
+            ) from error
         measurements: List[Tuple[Dict[str, float], int]] = []
         canonicalization_max_delta = 0.0
         while True:
@@ -9823,15 +9860,22 @@ class AdaptiveBrain:
                 )
                 break
             except BaseException as error:
+                if is_allocator_oom_error(error):
+                    self._release_training_allocator_cache()
+                try:
+                    packed_snapshot.restore()
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        "packed logical-batch rollback failed; refusing retry"
+                    ) from rollback_error
                 self._optimizer.zero_grad(set_to_none=True)
                 if not is_allocator_oom_error(error):
                     raise
                 self._allocator_oom_count += 1
-                self._release_training_allocator_cache()
-                # Forward/backward has not changed persistent neural state, so
-                # it is safe to retry the complete logical batch. Once slow
-                # importance or an optimizer step begins, only the worker's
-                # atomic-generation rollback is allowed to recover it.
+                # Backward may have changed packed synapses; exact uint8
+                # rollback above is required before replaying this batch.
+                # Once slow importance or an optimizer step begins, only the
+                # worker's atomic-generation rollback may recover float state.
                 if mutation_stage == "forward-backward":
                     torch.set_rng_state(cpu_rng_state)
                     if accelerator_rng_state is not None:

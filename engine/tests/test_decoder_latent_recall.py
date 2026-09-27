@@ -67,7 +67,9 @@ class DecoderLatentRecallTests(unittest.TestCase):
                 labels[:, : token_ids.index(tokenizer.brain_id) + 1] = 0
                 examples.append((ids, labels, memory[index : index + 1]))
 
-        initial_workspace = model.global_workspace.query.weight.detach().clone()
+        initial_workspace = (
+            model.global_workspace.query.packed_forward_weight().detach().clone()
+        )
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.0)
         early_losses = None
         for step in range(80):
@@ -102,7 +104,10 @@ class DecoderLatentRecallTests(unittest.TestCase):
         self.assertIsNotNone(early_losses)
         self.assertLess(early_losses[0], early_losses[1])
         self.assertFalse(
-            torch.equal(model.global_workspace.query.weight, initial_workspace)
+            torch.equal(
+                model.global_workspace.query.packed_forward_weight(),
+                initial_workspace,
+            )
         )
         self.assertTrue(packed_runtime_status(model)["complete"])
         for index, answer in enumerate(answers):

@@ -13,7 +13,10 @@ from omni_core.ground_up import (
     GROUND_UP_TOOL_TRAJECTORIES,
     ground_up_curriculum_manifest,
 )
-from omni_core.model import TERNARY_PROJECTION_TYPES
+from omni_core.model import (
+    PackedAdaptiveTernaryEmbedding,
+    TERNARY_PROJECTION_TYPES,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -85,13 +88,12 @@ class GroundUpArchitectureContractTests(unittest.TestCase):
         self.assertEqual(
             brain.parameter_accounting()["totalNeuralParameters"], expected
         )
-        self.assertEqual(expected, 339_768)
-        self.assertTrue(
-            all(
-                parameter.requires_grad
-                for module in brain._trainable_modules()
-                for parameter in module.parameters()
-            )
+        self.assertEqual(expected, 403_895)
+        self.assertEqual(
+            brain.parameter_accounting()["floatingTrainableParameters"], 0
+        )
+        self.assertEqual(
+            brain.parameter_accounting()["packedTernaryParameters"], expected
         )
 
     def test_every_hardware_tier_matches_the_versioned_counting_contract(self):
@@ -133,19 +135,29 @@ class GroundUpArchitectureContractTests(unittest.TestCase):
                         expected,
                     )
                     seen = set()
-                    ternary_parameters = 0
+                    projection_parameters = 0
+                    table_parameters = 0
                     for root_module in brain._ternary_export_roots().values():
                         for module in root_module.modules():
                             if not isinstance(module, TERNARY_PROJECTION_TYPES):
                                 continue
-                            identity = id(module.weight)
+                            identity = id(module)
                             if identity in seen:
                                 continue
                             seen.add(identity)
-                            ternary_parameters += int(module.weight.numel())
+                            count = int(module.logical_ternary_parameter_count)
+                            if isinstance(module, PackedAdaptiveTernaryEmbedding):
+                                table_parameters += count
+                            else:
+                                projection_parameters += count
                     self.assertEqual(
-                        ternary_parameters,
-                        int(profile["exactTernaryProjectionParameters"]),
+                        projection_parameters,
+                        int(profile["exactPackedProjectionParameters"]),
+                    )
+                    self.assertEqual(
+                        table_parameters,
+                        int(profile["exactPackedTableParametersExcludingWorkspaceLatents"])
+                        + workspace_latents * int(profile["dModel"]),
                     )
                 finally:
                     brain.events.close()
@@ -169,7 +181,7 @@ class GroundUpArchitectureContractTests(unittest.TestCase):
         self.assertNotIn("foundationModelId", runtime)
         self.assertEqual(runtime["origin_kind"], "ground-up")
 
-    def test_seeded_master_weights_are_reproducible_but_not_imported(self):
+    def test_seeded_packed_weights_are_reproducible_but_not_imported(self):
         first = self.make_brain(
             "first",
             OmniConfig.micro(
@@ -199,12 +211,12 @@ class GroundUpArchitectureContractTests(unittest.TestCase):
         self.assertEqual(audit["violations"], [])
         self.assertEqual(audit["forwardPrecision"], "exact ternary {-1,0,+1}")
         self.assertTrue(set(audit["observedLevels"]).issubset({-1, 0, 1}))
-        self.assertTrue(
-            all(
-                torch.isfinite(parameter).all().item()
-                for module in first._trainable_modules()
-                for parameter in module.parameters()
-            )
+        self.assertEqual(
+            first.parameter_accounting()["floatingTrainableParameters"], 0
+        )
+        self.assertEqual(
+            first.parameter_accounting()["packedTernaryParameters"],
+            first.parameter_accounting()["mutableDenseParameters"],
         )
 
     def test_built_in_curriculum_is_transparent_local_data_not_model_output(self):

@@ -94,17 +94,21 @@ class OrganicActionArgumentTests(unittest.TestCase):
             "web.search", "search", {**base, "grant": "off"}
         ))
 
-    def test_argument_projection_has_trainable_gradients_but_no_answer_table(self):
+    def test_argument_projection_backpropagates_into_input_with_packed_synapses(self):
         head = ActionArgumentHead(8)
-        condition = torch.randn(1, 8)
+        condition = torch.randn(1, 8, requires_grad=True)
         features = ActionArgumentHead.schema_features(
             "web.search", "search", web_schema()[0]
         )[None]
         loss = head.supervised_loss(condition, features, {"query": "x"})
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
-        self.assertGreater(float(head.condition.weight.grad.abs().sum()), 0.0)
-        self.assertGreater(float(head.output.weight.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(condition.grad)
+        self.assertTrue(bool(torch.isfinite(condition.grad).all()))
+        self.assertGreater(float(condition.grad.abs().sum()), 0.0)
+        for projection in (head.condition, head.output):
+            self.assertFalse(hasattr(projection, "weight"))
+            self.assertTrue(projection.packed_forward_status()["authoritativePackedWeight"])
         self.assertFalse(hasattr(head, "responses"))
 
     def test_browser_operation_target_is_weight_trained_without_operands(self):
@@ -114,12 +118,14 @@ class OrganicActionArgumentTests(unittest.TestCase):
             AdaptiveBrain._browser_operation_schema(),
         )
         self.assertIsNotNone(features)
+        neural_state = torch.randn(1, 8, requires_grad=True)
         loss = head.supervised_loss(
-            torch.randn(1, 8), features[None], {"operation": "click"},
+            neural_state, features[None], {"operation": "click"},
         )
         loss.backward()
-        self.assertGreater(float(head.condition.weight.grad.abs().sum()), 0.0)
-        self.assertGreater(float(head.output.weight.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(neural_state.grad)
+        self.assertGreater(float(neural_state.grad.abs().sum()), 0.0)
+        self.assertEqual(head.output.packed_forward_weight().dtype, torch.uint8)
 
     def test_grounded_browser_operation_changes_checkpointed_neural_parameters(self):
         brain = object.__new__(AdaptiveBrain)
@@ -128,7 +134,12 @@ class OrganicActionArgumentTests(unittest.TestCase):
         brain.memory = SimpleNamespace(vector_for_text=lambda _text: torch.zeros(8))
         head = ActionArgumentHead(8)
         brain.decoder = SimpleNamespace(action_argument_head=head)
-        before = head.output.weight.detach().clone()
+        before = {
+            key: value.detach().clone()
+            for key, value in head.state_dict().items()
+            if key.endswith("_packed_forward_weight")
+            or key.endswith("_packed_forward_bias")
+        }
         with patch.object(brain, "_idea_model_vector", return_value=torch.ones(1, 8)):
             result = brain._train_action_argument_head(
                 [{
@@ -142,11 +153,17 @@ class OrganicActionArgumentTests(unittest.TestCase):
             )
         self.assertTrue(result["ready"])
         self.assertEqual(result["steps"], 3)
-        self.assertFalse(torch.equal(before, head.output.weight.detach()))
+        after = head.state_dict()
+        self.assertTrue(any(
+            not torch.equal(value, after[key]) for key, value in before.items()
+        ))
         self.assertEqual(head.grounded_for("browser.operation", "select"), 1)
         restored = ActionArgumentHead(8)
         restored.load_state_dict(head.state_dict())
-        self.assertTrue(torch.equal(restored.output.weight, head.output.weight))
+        self.assertTrue(all(
+            torch.equal(restored.state_dict()[key], value)
+            for key, value in head.state_dict().items()
+        ))
         self.assertEqual(restored.grounded_for("browser.operation", "select"), 1)
 
     def test_untrained_decoder_and_route_fail_closed(self):

@@ -40,6 +40,7 @@ class PackedAdaptiveLinearTests(unittest.TestCase):
                 "_packed_forward_weight",
                 "_packed_forward_scale",
                 "_online_learning_rate",
+                "_row_stability",
             },
         )
         self.assertTrue(

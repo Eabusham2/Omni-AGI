@@ -890,17 +890,6 @@ class RecordCheckpointResumeTests(unittest.TestCase):
                 )
         self.assertGreater(source.stat().st_size, 16 * 1024 * 1024)
 
-        original_plan = brain._streaming_neural_storage_plan
-
-        def bounded_streaming_plan(self, source_bytes):
-            plan = original_plan(source_bytes)
-            # This fixture verifies that a large retained source is streamed
-            # without copying its private text into brain.json. Detailed
-            # detailed structural growth for 4,096 x 4,100-byte records is a
-            # separate, legitimately resource-bounded behavior.
-            plan["detailedRecordAssemblies"] = False
-            return plan
-
         def fast_learn(self, text, **kwargs):
             del kwargs
             return {
@@ -942,9 +931,6 @@ class RecordCheckpointResumeTests(unittest.TestCase):
                 "statisticalUpdates": 0,
             }
 
-        brain._streaming_neural_storage_plan = MethodType(
-            bounded_streaming_plan, brain
-        )
         brain.learn_experience = MethodType(fast_learn, brain)
         brain._optimize_streaming_experience_batch = MethodType(
             fast_streaming_batch, brain
@@ -955,7 +941,9 @@ class RecordCheckpointResumeTests(unittest.TestCase):
         brain._integrate_reading_record = MethodType(
             lambda self, *args, **kwargs: None, brain
         )
-        brain._ingestion_checkpoint_records = 1_000_000
+        # One bounded v3 checkpoint window covers this synthetic source;
+        # source size no longer changes its neural representation.
+        brain._ingestion_checkpoint_records = 4096
         result = brain.ingest(path=str(source), policy="encode")
 
         metadata_path = brain.engine_path / "brain.json"

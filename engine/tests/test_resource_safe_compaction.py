@@ -10,7 +10,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import MethodType
 
 import torch
 
@@ -65,7 +64,7 @@ class ResourceSafeNeuralCompactionTests(unittest.TestCase):
         self.assertFalse(memory.assemblies)
         self.assertFalse(memory.synapses)
 
-    def test_large_source_plan_is_headroom_derived_not_a_record_cap(self):
+    def test_large_source_keeps_detailed_learning_with_window_admission(self):
         with tempfile.TemporaryDirectory(prefix="omni-compaction-plan-") as folder:
             brain = AdaptiveBrain(
                 "resource-plan", Path(folder) / "brain", OmniConfig.micro()
@@ -87,9 +86,15 @@ class ResourceSafeNeuralCompactionTests(unittest.TestCase):
                 self.assertEqual(
                     small["representationDecision"], "detailed-admitted"
                 )
-                self.assertFalse(large["detailedRecordAssemblies"])
+                self.assertTrue(large["detailedRecordAssemblies"])
                 self.assertEqual(
-                    large["representationDecision"], "statistical-source-scale"
+                    large["representationDecision"], "detailed-admitted"
+                )
+                self.assertEqual(
+                    large["projectedDetailedBytes"], small["projectedDetailedBytes"]
+                )
+                self.assertEqual(
+                    large["projectionScope"], "next-checkpoint-window-not-whole-source"
                 )
                 self.assertIsNone(large["recordCardinalityLimit"])
                 self.assertFalse(large["silentRecordSkipping"])
@@ -137,7 +142,7 @@ class ResourceSafeNeuralCompactionTests(unittest.TestCase):
             finally:
                 brain.close()
 
-    def test_compact_ingest_visits_every_typed_row_without_answer_table(self):
+    def test_detailed_ingest_visits_every_typed_row_without_answer_table(self):
         with tempfile.TemporaryDirectory(prefix="omni-compact-ingest-") as folder:
             root = Path(folder)
             brain = AdaptiveBrain("compact-ingest", root / "brain", OmniConfig.micro())
@@ -162,15 +167,6 @@ class ResourceSafeNeuralCompactionTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                original_plan = brain._streaming_neural_storage_plan
-
-                def compact_plan(self, source_bytes):
-                    plan = original_plan(source_bytes)
-                    plan["detailedRecordAssemblies"] = False
-                    plan["corpusRepresentation"] = "shared-semantic-neural-field"
-                    return plan
-
-                brain._streaming_neural_storage_plan = MethodType(compact_plan, brain)
                 result = brain.ingest(path=str(dataset), policy="encode")
                 coverage = result["coverage"]
                 self.assertEqual(coverage["processedRecords"], rows)

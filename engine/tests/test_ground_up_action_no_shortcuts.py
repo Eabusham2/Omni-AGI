@@ -330,6 +330,10 @@ class GroundUpActionNoShortcutsTests(unittest.TestCase):
                     input_text="Investigate the renderer crash",
                     assembly_ids=["assembly"], organic_state={"computeDemand": 0.9},
                 )
+                if kind == "evolve":
+                    # Objective prose alone must not invent a mutation kind.
+                    self.assertEqual(explicit, [])
+                    continue
                 self.assertEqual(len(explicit), 1)
                 self.assertEqual(explicit[0]["arguments"]["objective"],
                                  "Investigate the renderer crash")
@@ -342,12 +346,13 @@ class GroundUpActionNoShortcutsTests(unittest.TestCase):
                 "type": "object", "properties": {
                     "objective": {"type": "string"},
                     "candidateKind": {"type": "string"},
+                    "addExperts": {"type": "integer"},
                 }, "required": ["objective"],
             }},
         }])
         _scores, actions = brain._select_structured_actions(
             winning_logits("evolve"), schemas=schema,
-            input_text='{"objective":"Improve recurrent memory","candidateKind":"architecture"}',
+            input_text='{"objective":"Improve recurrent memory","candidateKind":"architecture","addExperts":1}',
             assembly_ids=[], organic_state={"computeDemand": 0.8},
         )
         self.assertEqual(len(actions), 1)
@@ -355,6 +360,7 @@ class GroundUpActionNoShortcutsTests(unittest.TestCase):
                          "Improve recurrent memory")
         self.assertEqual(actions[0]["arguments"]["candidateKind"],
                          "architecture")
+        self.assertEqual(actions[0]["arguments"]["addExperts"], 1)
 
     def test_tool_kind_cannot_bypass_imagination_agent_or_evolution_gates(self):
         brain = self.make_brain()

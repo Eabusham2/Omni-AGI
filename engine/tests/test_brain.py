@@ -57,32 +57,28 @@ class AdaptiveBrainTests(unittest.TestCase):
     ):
         brain = self.make_brain()
         core_parameters = brain._core_parameter_map()
-        persisted_core_parameters = sum(
-            parameter.numel()
-            for parameter in {
-                id(value): value for value in core_parameters.values()
-            }.values()
-        )
+        self.assertEqual(core_parameters, {})
         trainable_parameters = {
             id(parameter): parameter
             for module in brain._trainable_modules()
             for parameter in module.parameters()
         }
-        expected_mutable = sum(
-            parameter.numel() for parameter in trainable_parameters.values()
+        self.assertEqual(trainable_parameters, {})
+        expected_mutable = brain._packed_logical_parameter_count(
+            brain._trainable_modules()
         )
-        router_parameters = sum(
-            parameter.numel()
-            for identity, parameter in {
-                id(value): value for value in brain.router.parameters()
-            }.items()
-            if identity not in {id(value) for value in core_parameters.values()}
+        core_packed = brain._packed_logical_parameter_count(
+            (
+                brain.decoder,
+                brain.memory_bridge,
+                brain.idea_adapter,
+                brain.liquid,
+                brain.modalities,
+            )
         )
+        router_parameters = brain._packed_logical_parameter_count((brain.router,))
         self.assertGreater(router_parameters, 0)
-        self.assertEqual(
-            expected_mutable,
-            persisted_core_parameters + router_parameters,
-        )
+        self.assertEqual(expected_mutable, core_packed + router_parameters)
 
         accounting = brain.parameter_accounting()
         self.assertEqual(accounting["mutableDenseParameters"], expected_mutable)
@@ -106,15 +102,11 @@ class AdaptiveBrainTests(unittest.TestCase):
             expected_mutable,
         )
 
-        # Neither registered buffers nor optimizer state are neural parameters.
+        # Non-weight buffers are never counted as extra learned parameters.
         brain.decoder.register_buffer(
             "_parameter_accounting_test_buffer",
             torch.zeros(17),
         )
-        parameter = next(iter(core_parameters.values()))
-        brain._optimizer.state[parameter][
-            "parameter_accounting_test"
-        ] = torch.zeros(19)
         self.assertEqual(brain.parameter_accounting(), accounting)
         brain.events.close()
 
@@ -142,29 +134,26 @@ class AdaptiveBrainTests(unittest.TestCase):
 
         accounting = brain.parameter_accounting()
 
-        core_parameter_count = sum(
-            parameter.numel()
-            for parameter in {
-                id(value): value
-                for value in brain._core_parameter_map().values()
-            }.values()
+        core_parameter_count = brain._packed_logical_parameter_count(
+            (
+                brain.decoder,
+                brain.memory_bridge,
+                brain.idea_adapter,
+                brain.liquid,
+                brain.modalities,
+            )
         )
-        router_parameter_count = sum(
-            parameter.numel()
-            for parameter in {
-                id(value): value for value in brain.router.parameters()
-            }.values()
-        )
+        router_parameter_count = brain._packed_logical_parameter_count((brain.router,))
         self.assertGreater(core_parameter_count, 0)
         self.assertGreater(router_parameter_count, 0)
         self.assertEqual(
             accounting["mutableDenseParameters"],
             core_parameter_count + router_parameter_count,
         )
-        persisted_core_elements = sum(
-            tensor.numel() for tensor in brain._core_tensors().values()
+        self.assertEqual(accounting["floatingTrainableParameters"], 0)
+        self.assertGreater(
+            sum(tensor.numel() for tensor in brain._core_tensors().values()), 0
         )
-        self.assertGreaterEqual(persisted_core_elements, core_parameter_count)
         brain.events.close()
 
     def test_parameter_only_ingest_mutates_weights_without_storing_source(self):
@@ -391,84 +380,30 @@ class AdaptiveBrainTests(unittest.TestCase):
         )
         reloaded.events.close()
 
-    def test_load_repairs_only_corrupt_master_elements_and_optimizer_moments(self):
+    def test_packed_core_checkpoint_reloads_without_floating_master(self):
         brain = self.make_brain()
-        parameter = brain.decoder.action_policy.hidden.weight
-        with torch.no_grad():
-            parameter.copy_(
-                torch.linspace(
-                    -0.75,
-                    0.75,
-                    parameter.numel(),
-                    dtype=parameter.dtype,
-                ).reshape_as(parameter)
-            )
-        optimizer_state = brain._optimizer.state[parameter]
-        optimizer_state["step"] = torch.tensor(7.0)
-        optimizer_state["exp_avg"] = torch.full_like(parameter, 0.25)
-        optimizer_state["exp_avg_sq"] = torch.full_like(parameter, 0.5)
+        projection = brain.decoder.action_policy.hidden
+        levels = projection.effective_weight().clone()
+        levels[0, 0] = 1 if int(levels[0, 0]) != 1 else -1
+        projection.set_ternary_weight_(levels)
         brain.save()
-        finite_generation = str(
-            brain.mutable_state_manifest["activeGeneration"]
-        )
-        expected_repaired_value = float(parameter[0, 0].item())
-
-        with torch.no_grad():
-            parameter[0, 0] = float("nan")
-            # This legitimate learned change exists only in the newer active
-            # generation and must not be replaced by the older fallback.
-            parameter[0, 1] = 0.6875
-            optimizer_state["exp_avg"][0, 0] = 9.0
-            optimizer_state["exp_avg"][0, 1] = 7.0
-            optimizer_state["exp_avg_sq"][0, 0] = float("inf")
-            optimizer_state["exp_avg_sq"][0, 1] = 8.0
-        brain.save()
-        corrupt_generation = str(
-            brain.mutable_state_manifest["activeGeneration"]
-        )
-        self.assertNotEqual(finite_generation, corrupt_generation)
+        checksum = brain.parameter_checksum()
         brain.events.close()
 
-        # This used to reach stale-pack regeneration and raise:
-        # TernaryPackingError: decoder.action_policy.hidden.weight has an
-        # invalid scale.
         reloaded = AdaptiveBrain.load(self.root, "brain-test")
-        restored = reloaded.decoder.action_policy.hidden.weight
-        self.assertTrue(torch.isfinite(restored).all())
+        self.assertTrue(torch.equal(
+            reloaded.decoder.action_policy.hidden.effective_weight(), levels
+        ))
+        self.assertEqual(reloaded.parameter_checksum(), checksum)
         self.assertEqual(
-            float(restored[0, 0].detach().item()), expected_repaired_value
-        )
-        self.assertEqual(float(restored[0, 1].detach().item()), 0.6875)
-
-        restored_state = reloaded._optimizer.state[restored]
-        self.assertEqual(float(restored_state["exp_avg"][0, 0]), 0.0)
-        self.assertEqual(float(restored_state["exp_avg_sq"][0, 0]), 0.0)
-        self.assertEqual(float(restored_state["exp_avg"][0, 1]), 7.0)
-        self.assertEqual(float(restored_state["exp_avg_sq"][0, 1]), 8.0)
-
-        event = next(
-            value
-            for value in reloaded.events.recent()
-            if value["kind"] == "checkpoint-tensor-recovered"
-        )
-        self.assertEqual(event["payload"]["repairedElements"], 1)
-        self.assertTrue(
-            event["payload"]["finiteLearnedStatePreserved"]
-        )
-        self.assertEqual(
-            event["payload"]["tensors"][0]["tensor"],
-            "decoder.action_policy.hidden.weight",
+            reloaded.parameter_accounting()["floatingTrainableParameters"], 0
         )
         verified = verify_ternary_shards(
             reloaded.engine_path / "packed-ternary"
         )
         self.assertEqual(
-            verified.manifest["metadata"]["parameterChecksum"],
-            reloaded.parameter_checksum(),
+            verified.manifest["metadata"]["parameterChecksum"], checksum
         )
-        generations = reloaded.engine_path / "state" / "generations"
-        self.assertTrue((generations / finite_generation).is_dir())
-        self.assertFalse((generations / corrupt_generation).exists())
         reloaded.events.close()
 
     def test_explicit_dataset_epoch_replays_without_duplicate_source_records(self):
@@ -1270,8 +1205,10 @@ class AdaptiveBrainTests(unittest.TestCase):
 
         def explode(*args, **kwargs):
             del args, kwargs
-            with torch.no_grad():
-                next(brain.decoder.parameters()).add_(100.0)
+            projection = brain.decoder.action_policy.hidden
+            levels = projection.effective_weight().clone()
+            levels[0, 0] = 1 if int(levels[0, 0]) != 1 else -1
+            projection.set_ternary_weight_(levels)
             raise RuntimeError("deliberate candidate failure")
 
         brain._experience_ids_batch_loss = explode
@@ -2118,29 +2055,21 @@ class AdaptiveBrainTests(unittest.TestCase):
         reloaded.events.close()
 
 
-    def test_slow_metaplastic_anchors_persist_and_penalize_drift(self):
+    def test_packed_metaplastic_resistance_persists_without_float_anchors(self):
         brain = self.make_brain(metaplasticity=True)
-        brain.learn_experience("Stable amber knowledge should resist drift.")
-        self.assertGreater(brain.counters["metaplastic_updates"], 0)
-        nonzero = sum(
-            int(value.gt(0).sum().item())
-            for value in brain.slow_importance.values()
-        )
-        self.assertGreater(nonzero, 0)
+        projection = brain.decoder.action_policy.hidden
+        self.assertTrue(projection.packed_stability_status()["metaplasticityEnabled"])
         with torch.no_grad():
-            parameter = next(brain.decoder.parameters())
-            parameter.add_(0.25)
-        penalty = float(brain._stability_penalty().item())
-        self.assertGreater(penalty, 0.0)
-        expected_importance = {
-            key: value.clone() for key, value in brain.slow_importance.items()
-        }
+            projection._row_stability[0] = 3
+        self.assertEqual(float(brain._stability_penalty().item()), 0.0)
+        self.assertEqual(brain.slow_importance, {})
         brain.save()
         brain.events.close()
         reloaded = AdaptiveBrain.load(self.root, "brain-test")
-        self.assertEqual(set(reloaded.slow_importance), set(expected_importance))
-        for key, expected in expected_importance.items():
-            self.assertTrue(torch.equal(reloaded.slow_importance[key], expected))
+        self.assertEqual(
+            int(reloaded.decoder.action_policy.hidden._row_stability[0]), 3
+        )
+        self.assertEqual(reloaded.slow_importance, {})
         reloaded.events.close()
 
     def test_unbounded_sparse_memory_expands_until_resource_guard(self):

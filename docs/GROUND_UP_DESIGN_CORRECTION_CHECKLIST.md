@@ -170,8 +170,9 @@ release instructions *for this goal*; it does not erase the product vision.
   schedule, and cold-load metadata path still need end-to-end integration.
 - Paged packed vectors, assembly metadata, exact paged similarity, and a
   bounded v3 substrate writer have source-level storage checks. The new-file
-  ingestion path is being connected to detailed paged learning and a joint
-  `brain.json` checkpoint. This is not yet a completed large-dataset path:
+  ingestion path now selects detailed learning with a joint `brain.json`
+  checkpoint and checks source and shard identity on resume. This is not yet
+  a completed large-dataset acceptance result:
   neuron metadata still resides in RAM, and the writer scans all neuron and
   assembly records at each checkpoint even though its buffers are bounded.
   Source-only storage checks do not establish full-corpus throughput or

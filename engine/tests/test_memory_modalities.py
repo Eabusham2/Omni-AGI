@@ -298,8 +298,10 @@ class MemoryAndModalityTests(unittest.TestCase):
         source = torch.zeros(16)
         source[0] = 1.0
         target = torch.zeros(16)
-        target[0] = 0.5
-        target[1] = 0.8660254
+        # Four positive ternary synapses give a packed target cosine of 0.5
+        # with the one-hot source; a float-only 0.5/0.866 row is no longer a
+        # representable persistent neural vector.
+        target[:4] = 1.0
         self._add_test_assembly(memory, "source", source)
         self._add_test_assembly(memory, "target", target)
         memory.synapses["source>target:inhibits"] = {

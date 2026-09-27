@@ -17,7 +17,11 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core import model as model_module
-from omni_core.model import GlobalWorkspace, packed_online_step
+from omni_core.model import (
+    GlobalWorkspace,
+    PACKED_AUTHORITATIVE_PROJECTION_TYPES,
+    packed_online_step,
+)
 
 
 def original_workspace_forward(
@@ -56,6 +60,10 @@ class GlobalWorkspaceChunkingTests(unittest.TestCase):
         reference = GlobalWorkspace(dimensions=8, slots=9, iterations=3).train()
         chunked = GlobalWorkspace(dimensions=8, slots=9, iterations=3).train()
         chunked.load_state_dict(reference.state_dict(), strict=True)
+        for workspace in (reference, chunked):
+            for module in workspace.modules():
+                if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+                    module.online_learning_rate = 0.0
         chunked.query_chunk_slots = 2
 
         base_inputs = torch.randn(2, 6, 8)
@@ -91,9 +99,7 @@ class GlobalWorkspaceChunkingTests(unittest.TestCase):
 
         reference_loss = (reference_summary * summary_probe).sum()
         chunked_loss = (chunked_summary * summary_probe).sum()
-        # Direct packed weights otherwise change between repeated uses of the
-        # reference graph during backward, which is not the fixed-weight
-        # derivative the chunked checkpoint is designed to reproduce.
+        # Exact derivative parity is defined at one fixed packed state.
         with packed_online_step((reference,)):
             reference_loss.backward()
         chunked_loss.backward()
@@ -107,22 +113,22 @@ class GlobalWorkspaceChunkingTests(unittest.TestCase):
             rtol=1e-5,
             atol=1e-6,
         )
-        for name, reference_parameter in reference.named_parameters():
-            chunked_parameter = dict(chunked.named_parameters())[name]
-            self.assertIsNotNone(reference_parameter.grad, name)
-            self.assertIsNotNone(chunked_parameter.grad, name)
-            torch.testing.assert_close(
-                chunked_parameter.grad,
-                reference_parameter.grad,
-                rtol=1e-4,
-                atol=3e-5,
-                msg=lambda message, parameter_name=name: "%s: %s"
-                % (parameter_name, message),
-            )
+        self.assertEqual(tuple(reference.named_parameters()), ())
+        self.assertEqual(tuple(chunked.named_parameters()), ())
+        self.assertIn("query._packed_forward_weight", chunked.state_dict())
 
         repeated = GlobalWorkspace(dimensions=8, slots=9, iterations=3).train()
         repeated.load_state_dict(chunked.state_dict(), strict=True)
         repeated.query_chunk_slots = chunked.query_chunk_slots
+        for workspace in (chunked, repeated):
+            for module in workspace.modules():
+                if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+                    module.online_learning_rate = 100.0
+        before_learning = {
+            name: value.clone()
+            for name, value in chunked.state_dict().items()
+            if name.endswith("._packed_forward_weight")
+        }
         chunked.zero_grad(set_to_none=True)
         continued_inputs = base_inputs.clone().requires_grad_(True)
         repeated_inputs = base_inputs.clone().requires_grad_(True)
@@ -136,8 +142,7 @@ class GlobalWorkspaceChunkingTests(unittest.TestCase):
             repeated_inputs,
             attention_mask=mask,
         )
-        # The first backward directly changed packed synapses. Compare a
-        # reloaded copy against the *current* model, not its old output.
+        # The reloaded copy starts with the same authoritative packed state.
         self.assertTrue(torch.equal(repeated_summary, continued_summary))
         torch.manual_seed(1703)
         (continued_summary * summary_probe).sum().backward()
@@ -152,6 +157,13 @@ class GlobalWorkspaceChunkingTests(unittest.TestCase):
             )
         for name, current in chunked.state_dict().items():
             self.assertTrue(torch.equal(current, repeated.state_dict()[name]), name)
+        self.assertTrue(
+            any(
+                not torch.equal(before, chunked.state_dict()[name])
+                for name, before in before_learning.items()
+            ),
+            "online backward must change packed workspace synapses",
+        )
 
     def test_sequential_execution_visits_every_slot_in_order_and_is_bounded(
         self,
@@ -434,12 +446,13 @@ class GlobalWorkspaceChunkingTests(unittest.TestCase):
             self.assertIn(f"{part}._packed_forward_weight", state)
             self.assertIn(f"{part}._packed_forward_scale", state)
             self.assertIn(f"{part}._online_learning_rate", state)
-        self.assertEqual(
+        self.assertGreaterEqual(
             sum(name.endswith("._packed_forward_weight") for name in state), 6
         )
         self.assertNotIn("latents", state)
         self.assertNotIn("query.weight", state)
-        self.assertIn("norm.scale", state)
+        self.assertIn("norm.scale_delta._packed_forward_weight", state)
+        self.assertNotIn("norm.scale", state)
         self.assertFalse(
             any("query_chunk_slots" in key for key in state)
         )

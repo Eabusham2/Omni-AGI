@@ -14,7 +14,10 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core import AdaptiveBrain, OmniConfig
-from omni_core.model import GlobalWorkspace
+from omni_core.model import (
+    GlobalWorkspace,
+    PACKED_AUTHORITATIVE_PROJECTION_TYPES,
+)
 
 
 class StreamingBatchNumericPathTests(unittest.TestCase):
@@ -49,23 +52,25 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
             dimensions=12, slots=11, iterations=3
         ).train()
         chunked.load_state_dict(reference.state_dict(), strict=True)
+        # Compare exact input derivatives at a fixed packed synaptic state.
+        # Online packed plasticity is verified separately from this numerical
+        # chunking equivalence test.
+        for workspace in (reference, chunked):
+            for module in workspace.modules():
+                if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+                    module.online_learning_rate = 0.0
         reference.query_chunk_slots = reference.slots
         chunked.query_chunk_slots = 3
         self.assertEqual(
             tuple(reference.state_dict()), tuple(chunked.state_dict())
         )
-        self.assertEqual(
-            tuple(chunked.state_dict()),
-            (
-                "latents",
-                "query.weight",
-                "key.weight",
-                "value.weight",
-                "update.weight",
-                "broadcast.weight",
-                "norm.scale",
-            ),
-        )
+        state = chunked.state_dict()
+        for name in ("latent_table", "query", "key", "value", "update", "broadcast"):
+            self.assertEqual(state[f"{name}._packed_forward_weight"].dtype, torch.uint8)
+            self.assertNotIn(f"{name}.weight", state)
+        self.assertIn("norm.scale_delta._packed_forward_weight", state)
+        self.assertNotIn("norm.scale", state)
+        self.assertEqual(tuple(chunked.named_parameters()), ())
 
         base_inputs = torch.randn(2, 7, 12)
         reference_inputs = base_inputs.clone().requires_grad_(True)
@@ -99,21 +104,8 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
             rtol=1e-5,
             atol=1e-6,
         )
-        for (reference_name, reference_parameter), (
-            chunked_name,
-            chunked_parameter,
-        ) in zip(reference.named_parameters(), chunked.named_parameters()):
-            self.assertEqual(chunked_name, reference_name)
-            self.assertIsNotNone(reference_parameter.grad)
-            self.assertIsNotNone(chunked_parameter.grad)
-            torch.testing.assert_close(
-                chunked_parameter.grad,
-                reference_parameter.grad,
-                rtol=1e-4,
-                atol=3e-5,
-                msg=lambda message, name=reference_name: "%s: %s"
-                % (name, message),
-            )
+        for name, value in reference.state_dict().items():
+            self.assertTrue(torch.equal(value, chunked.state_dict()[name]), name)
 
     def test_workspace_sequential_backward_is_none_safe_and_side_effect_free(
         self,
@@ -122,8 +114,15 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
             dimensions=8, slots=10, iterations=2
         ).train()
         workspace.query_chunk_slots = 3
-        workspace.query.weight.requires_grad_(False)
-        inputs = torch.randn(2, 6, 8)
+        for module in workspace.modules():
+            if isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+                module.online_learning_rate = 0.0
+        packed_before = {
+            name: value.clone()
+            for name, value in workspace.state_dict().items()
+            if name.endswith("._packed_forward_weight")
+        }
+        inputs = torch.randn(2, 6, 8, requires_grad=True)
         mask = torch.tensor(
             [
                 [True, True, True, True, True, True],
@@ -132,28 +131,12 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
         )
 
         summary = workspace.summarize(inputs, attention_mask=mask)
-        active_parameters = tuple(
-            parameter
-            for parameter in workspace.parameters()
-            if parameter.requires_grad
-        )
-        gradients = torch.autograd.grad(
-            summary.square().mean(),
-            active_parameters,
-            allow_unused=True,
-        )
-        self.assertTrue(gradients)
-        self.assertTrue(
-            all(
-                gradient is not None
-                and bool(torch.isfinite(gradient).all())
-                for gradient in gradients
-            )
-        )
-        self.assertIsNone(workspace.query.weight.grad)
-        self.assertTrue(
-            all(parameter.grad is None for parameter in active_parameters)
-        )
+        (input_gradient,) = torch.autograd.grad(summary.square().mean(), inputs)
+        self.assertTrue(bool(torch.isfinite(input_gradient).all()))
+        self.assertIsNone(inputs.grad)
+        self.assertEqual(tuple(workspace.named_parameters()), ())
+        for name, before in packed_before.items():
+            self.assertTrue(torch.equal(before, workspace.state_dict()[name]), name)
 
     def test_padded_batch_trains_every_non_padding_target(self):
         brain = self.make_brain()
@@ -180,6 +163,9 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
             torch.linspace(1.0, -1.0, brain.config.vsa_dim),
         ]
         captured = {}
+        padding_before = brain.decoder.embedding.effective_weight()[
+            brain.tokenizer.pad_id
+        ].clone()
 
         def capture_logits(_module, _inputs, output):
             output.retain_grad()
@@ -222,10 +208,11 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
                 int(active_predictions.sum()),
                 sum(int(row.numel()) - 1 for row in rows),
             )
-            self.assertEqual(
-                int(brain.decoder.embedding.weight.grad[brain.tokenizer.pad_id]
-                    .count_nonzero()),
-                0,
+            self.assertTrue(
+                torch.equal(
+                    brain.decoder.embedding.effective_weight()[brain.tokenizer.pad_id],
+                    padding_before,
+                )
             )
         finally:
             handle.remove()
@@ -235,12 +222,10 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
         brain = self.make_brain()
         brain._runtime_train_batch_size = 1
         brain.config.grad_clip = 100.0
-        parameter = next(
-            value
-            for value in brain.decoder.parameters()
-            if value.requires_grad
-        )
-        initial = parameter.detach().clone()
+        # A test-only scalar probes allocator/cache ordering; it is not an
+        # FP32 shadow of any production packed synapse.
+        probe = torch.nn.Parameter(torch.tensor(1.0))
+        initial = probe.detach().clone()
         experiences = [
             ("first", torch.full((brain.config.vsa_dim,), 2.0)),
             ("second", torch.full((brain.config.vsa_dim,), 4.0)),
@@ -249,14 +234,14 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
         def run(backend):
             events = []
             with torch.no_grad():
-                parameter.copy_(initial)
-            brain._optimizer = torch.optim.SGD([parameter], lr=0.01)
+                probe.copy_(initial)
+            brain._optimizer = torch.optim.SGD([probe], lr=0.01)
             brain.device_backend = backend
 
             def synthetic_loss(_encoded, vectors):
                 value = float(vectors[0][0])
                 events.append("forward:%d" % value)
-                loss = parameter.reshape(-1)[0] * value
+                loss = probe * value
                 loss.register_hook(
                     lambda _gradient, label=value: events.append(
                         "backward:%d" % label
@@ -296,7 +281,7 @@ class StreamingBatchNumericPathTests(unittest.TestCase):
                 report = brain._optimize_streaming_experience_batch(
                     experiences
                 )
-            return parameter.detach().clone(), report, events
+            return probe.detach().clone(), report, events
 
         try:
             cpu_parameter, cpu_report, cpu_events = run("cpu")

@@ -1,5 +1,6 @@
 """Cross-process lease tests without loading or training a model."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -7,6 +8,9 @@ import unittest
 from pathlib import Path
 
 from omni_core.brain_lease import BrainOwnerLease
+
+
+ENGINE = Path(__file__).resolve().parents[1]
 
 
 _CHILD = """
@@ -31,6 +35,13 @@ class BrainLeaseTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-c", _CHILD, str(storage)],
             check=False, capture_output=True, text=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(
+                    part for part in (str(ENGINE), os.environ.get("PYTHONPATH", ""))
+                    if part
+                ),
+            },
         )
         self.assertEqual(result.stderr, "")
         return result.returncode

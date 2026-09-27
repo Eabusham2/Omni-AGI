@@ -26,6 +26,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install hash-locked JavaScript dependencies
+        run: npm ci
+
       - name: Select an available iPhone simulator
         id: simulator
         run: |

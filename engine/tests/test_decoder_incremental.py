@@ -13,7 +13,7 @@ if str(ENGINE) not in sys.path:
     sys.path.insert(0, str(ENGINE))
 
 from omni_core.config import OmniConfig
-from omni_core.model import OmniDecoder, RotaryEmbedding
+from omni_core.model import OmniDecoder, RotaryEmbedding, pack_ternary_weight
 
 
 class IncrementalDecoderTests(unittest.TestCase):
@@ -191,12 +191,15 @@ class IncrementalDecoderTests(unittest.TestCase):
                 with torch.no_grad():
                     _, cache = model._generation_step(ids[:, :5], memory, None)
                     if changed == "embedding":
-                        model.embedding.weight.add_(0.01)
+                        model.embedding.fill_ternary_(1)
                     elif changed == "linear":
-                        model.blocks[0].attention.qkv.weight.mul_(-1)
+                        projection = model.blocks[0].attention.qkv
+                        projection.set_ternary_weight_(-projection.effective_weight())
                     elif changed == "load":
                         state = {name: value.clone() for name, value in model.state_dict().items()}
-                        state["embedding.weight"].mul_(-1)
+                        state["embedding._packed_forward_weight"] = pack_ternary_weight(
+                            -model.embedding.effective_weight()
+                        )
                         model.load_state_dict(state)
                     elif changed == "memory":
                         memory.mul_(-1)

@@ -217,7 +217,9 @@ class AsyncChatSlowLearningTests(unittest.TestCase):
         job_id = brain.pending_chat_slow_learning[0]["jobId"]
         slow_before = brain._slow_parameter_checksum()
         cortical_before = brain._cortical_parameter_checksum()
-        embedding_before = brain.decoder.embedding.weight.detach().cpu().clone()
+        embedding_before = (
+            brain.decoder.embedding.packed_forward_weight().detach().cpu().clone()
+        )
         steps_before = brain.counters["training_steps"]
 
         committed = brain.consolidate_pending_chat_learning(job_id)
@@ -242,7 +244,8 @@ class AsyncChatSlowLearningTests(unittest.TestCase):
         )
         self.assertFalse(
             torch.equal(
-                brain.decoder.embedding.weight.detach().cpu(), embedding_before
+                brain.decoder.embedding.packed_forward_weight().detach().cpu(),
+                embedding_before,
             )
         )
         self.assertGreater(brain.counters["training_steps"], steps_before)

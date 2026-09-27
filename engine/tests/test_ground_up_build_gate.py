@@ -31,8 +31,14 @@ class GroundUpBuildGateTests(unittest.TestCase):
             + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES),
         )
 
-    def test_creation_requires_explicit_local_curriculum(self):
+    def test_durable_creation_defaults_to_real_local_curriculum(self):
         source = inspect.getsource(AdaptiveBrain.create)
+        self.assertIs(
+            inspect.signature(AdaptiveBrain.create).parameters[
+                "initialize_ground_up"
+            ].default,
+            True,
+        )
         self.assertIn("if not initialize_ground_up:", source)
         self.assertIn("brain._train_ground_up_curriculum(", source)
         self.assertIn("brain._finalize_ground_up_creation(", source)

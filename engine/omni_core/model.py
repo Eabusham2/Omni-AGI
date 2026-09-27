@@ -53,6 +53,20 @@ class _PackedRowMetaplasticity:
         )
         self._packed_stability_strength = 0.0
         self._pending_stability_events = 0
+        self._row_stability_validated_version = -1
+        self._bias_row_stability_validated_version = -1
+
+    def _packed_stability_changed(self) -> bool:
+        bias = self._bias_row_stability
+        return (
+            self._row_stability_validated_version
+            != int(self._row_stability._version)
+            or (
+                bias is not None
+                and self._bias_row_stability_validated_version
+                != int(bias._version)
+            )
+        )
 
     def configure_packed_stability(self, *, enabled: bool, strength: float) -> None:
         value = float(strength)
@@ -100,6 +114,10 @@ class _PackedRowMetaplasticity:
             or bool((bias > PACKED_STABILITY_MAX).any())
         ):
             raise ValueError("packed bias-row stability state is invalid")
+        self._row_stability_validated_version = int(resistance._version)
+        self._bias_row_stability_validated_version = (
+            int(bias._version) if bias is not None else -1
+        )
 
 
 def pack_ternary_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -246,6 +264,82 @@ def _quantize_activation_int8(
     return quantized, scale
 
 
+PACKED_INTEGER_INPUT_BLOCK = 256
+
+
+def _unsupported_integer_kernel(error: BaseException) -> bool:
+    if isinstance(error, NotImplementedError):
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "not implemented", "not supported", "unsupported",
+            "not compiled", "could not run 'aten::",
+        )
+    )
+
+
+def _bounded_cpu_integer_mm(
+    inputs: torch.Tensor, weight_block: torch.Tensor
+) -> torch.Tensor:
+    """Fallback one packed output block at a time, never a full weight mirror."""
+
+    weights = weight_block.to(device="cpu", dtype=torch.int32).t().contiguous()
+    chunks = []
+    for start in range(0, int(inputs.shape[0]), PACKED_INTEGER_INPUT_BLOCK):
+        end = min(int(inputs.shape[0]), start + PACKED_INTEGER_INPUT_BLOCK)
+        activity = inputs[start:end].to(device="cpu", dtype=torch.int32)
+        try:
+            chunks.append(activity @ weights)
+        except (NotImplementedError, RuntimeError) as error:
+            if not _unsupported_integer_kernel(error):
+                raise
+            # A few CPU builds lack even int32 matmul. Elementwise products
+            # and int64 reductions remain exact without a dense float weight.
+            rows = weights.t().to(torch.int64)
+            chunks.append(
+                torch.stack(
+                    [
+                        (activity.to(torch.int64) * row).sum(dim=1)
+                        for row in rows
+                    ],
+                    dim=1,
+                )
+            )
+    if not chunks:
+        return torch.empty(
+            (0, int(weight_block.shape[0])),
+            dtype=torch.int32,
+            device=inputs.device,
+        )
+    return torch.cat(chunks, dim=0).to(inputs.device)
+
+
+def _packed_integer_mm(
+    inputs: torch.Tensor, weight_block: torch.Tensor
+) -> torch.Tensor:
+    # CPU _int_mm is present in some PyTorch builds but has no CPU kernel on
+    # macOS Intel. Only request it on CUDA; ordinary int32 matmul is exact for
+    # the bounded projection widths used by OmniCortex.
+    if inputs.device.type == "cuda" and hasattr(torch, "_int_mm"):
+        try:
+            return torch._int_mm(  # type: ignore[attr-defined]
+                inputs, weight_block.t().contiguous()
+            )
+        except (NotImplementedError, RuntimeError) as error:
+            if not _unsupported_integer_kernel(error):
+                raise
+    try:
+        return inputs.to(torch.int32) @ weight_block.to(torch.int32).t()
+    except (NotImplementedError, RuntimeError) as error:
+        if not _unsupported_integer_kernel(error):
+            raise
+        # MPS/DirectML builds may lack integer matmul. Transfer only this
+        # bounded output block and row chunks, then return to the live device.
+        return _bounded_cpu_integer_mm(inputs, weight_block)
+
+
 def _packed_ternary_forward(
     inputs: torch.Tensor,
     packed: torch.Tensor,
@@ -258,8 +352,6 @@ def _packed_ternary_forward(
     quantized, activation_scale = _quantize_activation_int8(inputs)
     flat = quantized.reshape(-1, int(in_features)).contiguous()
     blocks: List[torch.Tensor] = []
-    use_int_mm = flat.device.type in {"cpu", "cuda"} and hasattr(torch, "_int_mm")
-    integer_inputs = flat if use_int_mm else flat.to(torch.int32)
     for start in range(0, int(out_features), PACKED_TERNARY_OUTPUT_BLOCK):
         end = min(int(out_features), start + PACKED_TERNARY_OUTPUT_BLOCK)
         weight_block = unpack_ternary_weight_rows(
@@ -269,14 +361,7 @@ def _packed_ternary_forward(
             end,
             validate_reserved=False,
         )
-        if use_int_mm:
-            projected = torch._int_mm(  # type: ignore[attr-defined]
-                integer_inputs,
-                weight_block.t().contiguous(),
-            )
-        else:
-            projected = integer_inputs @ weight_block.to(torch.int32).t()
-        blocks.append(projected)
+        blocks.append(_packed_integer_mm(flat, weight_block))
     integer_output = torch.cat(blocks, dim=-1).reshape(
         *inputs.shape[:-1], int(out_features)
     )
@@ -550,6 +635,7 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
                 != int(self._packed_forward_bias._version)
             )
             or self._scale_validated_version != int(self._packed_forward_scale._version)
+            or self._packed_stability_changed()
             or self._validated_device != self._packed_forward_weight.device
         ):
             self._validate_packed()
@@ -1128,6 +1214,7 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
         if (
             self._packed_validated_version != int(self._packed_forward_weight._version)
             or self._scale_validated_version != int(self._packed_forward_scale._version)
+            or self._packed_stability_changed()
             or self._validated_device != self._packed_forward_weight.device
         ):
             self._validate_packed()
@@ -2106,6 +2193,7 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
         if (
             self._packed_validated_version != int(self._packed_forward_weight._version)
             or self._scale_validated_version != int(self._packed_forward_scale._version)
+            or self._packed_stability_changed()
             or self._validated_device != self._packed_forward_weight.device
             or (
                 self._packed_forward_bias is not None

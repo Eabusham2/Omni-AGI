@@ -43,8 +43,12 @@ class LiveObservationTests(unittest.TestCase):
     def test_imagination_selector_is_learned_ternary_and_generation_cancels(self):
         hub = ModalityHub(self.config())
         with torch.no_grad():
-            hub.imagination_selector.weight.zero_()
-            hub.imagination_selector.weight[2].fill_(1.0)
+            levels = torch.zeros(
+                hub.imagination_selector.ternary_weight_shape,
+                dtype=torch.int8,
+            )
+            levels[2].fill_(1)
+            hub.imagination_selector.set_ternary_weight_(levels)
         idea = torch.ones(1, hub.config.idea_dim)
         selected, scores = hub.select_imagination(
             idea, enabled=("image", "audio", "video")
@@ -309,8 +313,9 @@ class LiveObservationTests(unittest.TestCase):
             ],
         )
         before_assemblies = len(brain.memory.assemblies)
-        before_selector = (
-            brain.modalities.imagination_selector.weight.detach().clone()
+        before_selector = tuple(
+            tensor.detach().clone()
+            for tensor in brain.modalities.imagination_selector.authoritative_packed_tensors()
         )
         observed = brain.observe_live_packet(
             modality="audio",
@@ -328,12 +333,13 @@ class LiveObservationTests(unittest.TestCase):
         self.assertTrue(observed["sameBrainSharedIdeaSpace"])
         self.assertFalse(observed["rawPacketStored"])
         self.assertFalse(observed["datasetCoverageCommitted"])
-        self.assertFalse(
-            torch.equal(
+        self.assertTrue(any(
+            not torch.equal(before, after)
+            for before, after in zip(
                 before_selector,
-                brain.modalities.imagination_selector.weight.detach(),
+                brain.modalities.imagination_selector.authoritative_packed_tensors(),
             )
-        )
+        ))
 
         generated = brain.generate_modality(
             "audio",

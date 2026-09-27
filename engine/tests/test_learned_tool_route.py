@@ -16,7 +16,7 @@ from omni_core.brain import AdaptiveBrain
 from omni_core.capability_rehearsal import structural_capability_schemas
 from omni_core.config import OmniConfig
 from omni_core.ground_up import GROUND_UP_TOOL_NEGATIVE_EXAMPLES, GROUND_UP_TOOL_TRAJECTORIES
-from omni_core.model import OmniDecoder, ToolRouteHead
+from omni_core.model import OmniDecoder, ToolRouteHead, pack_ternary_weight
 from omni_core.persistence import atomic_save_tensors, load_tensors
 from omni_core.ternary_packing import collect_module_ternary_tensors
 
@@ -51,6 +51,19 @@ def tiny_brain(*, with_memory=True):
 
 def neural_state(brain, text):
     return brain._idea_model_vector(brain.memory.vector_for_text(text))
+
+
+@torch.no_grad()
+def bias_packed_internal_query_toward(head: ToolRouteHead, route_index: int) -> None:
+    """Change only authoritative ternary bytes to favor one learned route."""
+
+    candidate = head.candidate(head.route_features[route_index][None])
+    levels = torch.sign(candidate).to(torch.int8)
+    head.internal_query.fill_ternary_(0)
+    packed_bias = head.internal_query._packed_forward_bias
+    assert packed_bias is not None
+    packed_bias.copy_(pack_ternary_weight(levels))
+    head.internal_query.packed_forward_weight()  # Validate the exact codes.
 
 
 class ActionInputSchemaBoundaryTests(unittest.TestCase):
@@ -169,7 +182,7 @@ class LearnedToolRouteTests(unittest.TestCase):
         def uniform_internal(state):
             return (
                 torch.zeros((state.shape[0], 2), device=state.device)
-                + head.internal_query.weight.sum() * 0
+                + head.internal_query._autograd_trigger * 0
             )
         with patch.object(head, "forward_internal", side_effect=uniform_internal):
             result = brain._train_tool_route_head([example], maximum_steps=2)
@@ -212,10 +225,8 @@ class LearnedToolRouteTests(unittest.TestCase):
         text = "read /tmp/explicit.txt"
         state = neural_state(brain, text)
         index = head.route_index("system.files", "list")
-        with torch.no_grad():
-            direction = torch.nn.functional.normalize(head.candidate(head.route_features[index]), dim=-1)
-            head.internal_query.weight.zero_()
-            head.internal_query.bias.copy_(torch.atanh(0.8 * direction))
+        self.assertIsNotNone(index)
+        bias_packed_internal_query_toward(head, index)
         self.assertFalse(hasattr(brain, "_materialize_legacy_tool_action"))
         after = brain._materialize_generic_tool_action(
             schemas=SCHEMAS, input_text=text, assembly_ids=(), organic_state={},
@@ -227,11 +238,9 @@ class LearnedToolRouteTests(unittest.TestCase):
 
     def test_missing_arguments_do_not_fall_back_or_get_fabricated(self):
         head = self.brain.decoder.tool_route_head
-        with torch.no_grad():
-            index = head.route_index("system.files", "write")
-            direction = torch.nn.functional.normalize(head.candidate(head.route_features[index]), dim=-1)
-            head.internal_query.weight.zero_()
-            head.internal_query.bias.copy_(torch.atanh(0.8 * direction))
+        index = head.route_index("system.files", "write")
+        self.assertIsNotNone(index)
+        bias_packed_internal_query_toward(head, index)
         actual = self.brain._materialize_generic_tool_action(
             schemas=SCHEMAS, input_text="read /tmp/file.txt", assembly_ids=(), organic_state={},
             neural_state=neural_state(self.brain, "read /tmp/file.txt"),
@@ -283,10 +292,11 @@ class LearnedToolRouteTests(unittest.TestCase):
     def test_default_native_route_and_argument_heads_are_ternary_checkpointed(self):
         native = OmniDecoder(OmniConfig.micro())
         state = native.state_dict()
-        self.assertIn("tool_route_head.query.weight", state)
-        self.assertIn("tool_route_head.internal_query.weight", state)
-        self.assertIn("action_argument_head.condition.weight", state)
-        self.assertIn("action_argument_head.output.weight", state)
+        self.assertIn("tool_route_head.query._packed_forward_weight", state)
+        self.assertIn("tool_route_head.internal_query._packed_forward_weight", state)
+        self.assertIn("action_argument_head.condition._packed_forward_weight", state)
+        self.assertIn("action_argument_head.output._packed_forward_weight", state)
+        self.assertFalse(any(key.endswith(".weight") for key in state))
         tensors = collect_module_ternary_tensors(native)
         self.assertTrue(any("tool_route_head.query" in spec.name for spec in tensors))
         self.assertTrue(any("tool_route_head.candidate" in spec.name for spec in tensors))
