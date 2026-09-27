@@ -13319,8 +13319,7 @@ textarea:focus-visible,
     min-width: 40px;
   }
 
-  .composer__key-hint,
-  .composer-disclaimer {
+  .composer__key-hint {
     display: none;
   }
 
