@@ -82,22 +82,14 @@ function legalArchive(prefix: string): Record<string, Uint8Array> {
   return entries;
 }
 
-function workerSmoke(comprehensive = false): Record<string, unknown> {
+function workerSmoke(): Record<string, unknown> {
   return {
     engineVersion: "1.1.0",
     protocolVersion: 1,
-    persistedBrain: true,
-    safeTensorCheckpoint: true,
-    sqliteEventLog: true,
-    comprehensive,
-    ...(comprehensive
-      ? {
-          trainingLossDecreased: true,
-          pdfIngested: true,
-          chatParameterMutation: true,
-          generatedModalities: ["image", "audio", "video"]
-        }
-      : {})
+    healthOnly: true,
+    persistedBrain: false,
+    safeTensorCheckpoint: false,
+    sqliteEventLog: false
   };
 }
 
@@ -146,13 +138,11 @@ function writeReleaseFixture(): string {
           packagedWorkerArchitecture: "x64",
           desktopArchitecture: arch,
           silentInstall: true,
-          desktopEndToEnd: true,
-          desktopRestart: true,
-          accessibilityNavigation: true,
-          modalityGeneration: true,
+          desktopShellLaunched: true,
+          neuralAcceptanceTested: false,
           installerSignature: { valid: false },
           desktopSignature: { valid: false },
-          rpcSmoke: workerSmoke(true)
+          rpcSmoke: workerSmoke()
         },
         signing: {
           expectedSigned: false,
@@ -172,7 +162,8 @@ function writeReleaseFixture(): string {
           [macDmg.name]: packagedCompliance("desktop-artifact-compliance"),
           [macZip.name]: packagedCompliance("desktop-artifact-compliance")
         },
-        desktopEndToEnd: true,
+        desktopShellLaunched: true,
+        neuralAcceptanceTested: false,
         formatValidation: {
           dmg: { verified: true },
           zip: { extracted: true }
@@ -200,7 +191,8 @@ function writeReleaseFixture(): string {
           [linuxDeb.name]: packagedCompliance("desktop-artifact-compliance"),
           [linuxTar.name]: packagedCompliance("desktop-artifact-compliance")
         },
-        desktopEndToEnd: true,
+        desktopShellLaunched: true,
+        neuralAcceptanceTested: false,
         formatValidation: {
           "tar.gz": { extracted: true },
           deb: {

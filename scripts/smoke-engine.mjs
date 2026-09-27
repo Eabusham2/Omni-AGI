@@ -14,14 +14,15 @@ function option(name) {
 
 const executableArgument = option("--executable");
 if (!executableArgument) {
-  throw new Error("Usage: node scripts/smoke-engine.mjs --executable <path> [--brain-root <path>]");
+  throw new Error("Usage: node scripts/smoke-engine.mjs --executable <path> [--brain-root <path>] [--health-only]");
 }
 
 const executable = resolve(executableArgument);
-const brainRoot = resolve(
-  option("--brain-root") ?? mkdtempSync(join(tmpdir(), "omni-engine-smoke-"))
-);
-mkdirSync(brainRoot, { recursive: true });
+const healthOnly = process.argv.includes("--health-only");
+const brainRoot = healthOnly
+  ? undefined
+  : resolve(option("--brain-root") ?? mkdtempSync(join(tmpdir(), "omni-engine-smoke-")));
+if (brainRoot) mkdirSync(brainRoot, { recursive: true });
 
 const worker = spawn(executable, [], {
   cwd: dirname(executable),
@@ -97,56 +98,62 @@ try {
     health?.ready !== true ||
     health?.worker !== "python" ||
     health?.protocolVersion !== 1 ||
-    typeof health?.operatingSystem !== "string"
+    health?.operatingSystem !== process.platform ||
+    typeof health?.engineVersion !== "string" || !health.engineVersion ||
+    typeof health?.pythonVersion !== "string" || !health.pythonVersion ||
+    typeof health?.torchVersion !== "string" || !health.torchVersion ||
+    typeof health?.platform !== "string" || !health.platform
   ) {
     throw new Error("Packaged worker returned an invalid health response.");
   }
 
-  const storagePath = join(brainRoot, "packaged-smoke-brain");
-  const created = await rpc("create", "create", {
-    brainId: "packaged-smoke-brain",
-    storagePath,
-    hardwareTier: "micro",
-    config: {
-      name: "Packaged worker smoke",
-      hardwareTier: "micro"
+  if (!healthOnly) {
+    const storagePath = join(brainRoot, "packaged-smoke-brain");
+    const created = await rpc("create", "create", {
+      brainId: "packaged-smoke-brain",
+      storagePath,
+      hardwareTier: "micro",
+      config: {
+        name: "Packaged worker smoke",
+        hardwareTier: "micro"
+      }
+    });
+    if (created?.brainId !== "packaged-smoke-brain") {
+      throw new Error("Packaged worker did not create the requested brain identity.");
     }
-  });
-  if (created?.brainId !== "packaged-smoke-brain") {
-    throw new Error("Packaged worker did not create the requested brain identity.");
-  }
 
-  const unloaded = await rpc("unload", "unload", {
-    brainId: "packaged-smoke-brain",
-    storagePath
-  });
-  if (unloaded?.unloaded !== true) {
-    throw new Error("Packaged worker did not unload its created brain.");
-  }
+    const unloaded = await rpc("unload", "unload", {
+      brainId: "packaged-smoke-brain",
+      storagePath
+    });
+    if (unloaded?.unloaded !== true) {
+      throw new Error("Packaged worker did not unload its created brain.");
+    }
 
-  const loaded = await rpc("load", "load", {
-    brainId: "packaged-smoke-brain",
-    storagePath
-  });
-  if (loaded?.brainId !== "packaged-smoke-brain") {
-    throw new Error("Packaged worker could not reload its safe-tensor checkpoint.");
-  }
-  const state = await rpc("state", "state", {
-    brainId: "packaged-smoke-brain",
-    storagePath
-  });
-  if (state?.brainId !== "packaged-smoke-brain") {
-    throw new Error("Packaged worker could not inspect its reloaded brain.");
-  }
+    const loaded = await rpc("load", "load", {
+      brainId: "packaged-smoke-brain",
+      storagePath
+    });
+    if (loaded?.brainId !== "packaged-smoke-brain") {
+      throw new Error("Packaged worker could not reload its safe-tensor checkpoint.");
+    }
+    const state = await rpc("state", "state", {
+      brainId: "packaged-smoke-brain",
+      storagePath
+    });
+    if (state?.brainId !== "packaged-smoke-brain") {
+      throw new Error("Packaged worker could not inspect its reloaded brain.");
+    }
 
-  for (const name of [
-    "brain.json",
-    "core.safetensors",
-    "plasticity.safetensors",
-    "events.sqlite3"
-  ]) {
-    if (!existsSync(join(storagePath, "engine", name))) {
-      throw new Error(`Packaged worker smoke is missing engine/${name}`);
+    for (const name of [
+      "brain.json",
+      "core.safetensors",
+      "plasticity.safetensors",
+      "events.sqlite3"
+    ]) {
+      if (!existsSync(join(storagePath, "engine", name))) {
+        throw new Error(`Packaged worker smoke is missing engine/${name}`);
+      }
     }
   }
 
@@ -155,6 +162,9 @@ try {
     throw new Error("Packaged worker did not acknowledge shutdown.");
   }
   await waitForExit();
+  if (worker.exitCode !== 0) {
+    throw new Error(`Packaged worker exited with code ${worker.exitCode}.\n${stderr}`);
+  }
   stopped = true;
 
   process.stdout.write(
@@ -168,9 +178,10 @@ try {
         torchVersion: health.torchVersion,
         platform: health.platform,
         operatingSystem: health.operatingSystem,
-        persistedBrain: true,
-        safeTensorCheckpoint: true,
-        sqliteEventLog: true
+        healthOnly,
+        persistedBrain: !healthOnly,
+        safeTensorCheckpoint: !healthOnly,
+        sqliteEventLog: !healthOnly
       },
       null,
       2

@@ -29,10 +29,12 @@ writing release metadata or uploading assets. This matches GitHub's public
 asset-name rules, so every entry in `SHA256SUMS.txt` and
 `RELEASE-MANIFEST.json` is the exact downloadable filename.
 
-Each native-host job runs the Python and Node suites, builds the Electron
-application and PyInstaller brain worker, verifies their machine
-architectures, creates and reloads a safe-tensor/SQLite brain through the
-packaged worker, and runs the packaged desktop restart test. The macOS job
+Each native-host job checks Python syntax and the Node/UI contract suites,
+builds the Electron application and PyInstaller brain worker, verifies their
+machine architectures, checks packaged-worker health without creating a brain,
+and opens the packaged desktop shell without training. Neural learning,
+retention, generated media, and installed-app restart remain separate live
+acceptance gates; CI packaging success does not prove them. The macOS job
 validates the DMG and extracts the ZIP. The Linux job independently extracts
 the AppImage, DEB, and tarball and checks their desktop and worker machine
 types. The Windows job expands the ZIP and silently installs NSIS before
@@ -64,7 +66,7 @@ The Intel macOS runtime remains on PyTorch 2.2.2, the last native Intel wheel.
 Transformers, Accelerate, Tokenizers, and the retired external-foundation loader
 are not worker dependencies. Every desktop job runs `pip check`, imports the
 native OmniCortex runtime against its pinned PyTorch/NumPy/safetensors stack,
-and exercises that worker before packaging.
+and checks the packaged worker's health response without neural training.
 
 Desktop worker packages use a reviewed CPython 3.11 patch and one target lock
 from `engine/locks`. Linux x64/ARM64 uses 3.11.16; macOS Intel/Apple Silicon

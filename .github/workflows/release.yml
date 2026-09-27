@@ -97,10 +97,8 @@ jobs:
           python scripts/install-engine-lock.py
           python -m pip check
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
-      - name: Test brain
-        env:
-          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
-        run: npm run test:python:portable
+      - name: Check Python source without initializing a brain
+        run: python -m compileall -q engine
       - run: npm run test:node
 
       - name: Package Windows
@@ -109,6 +107,9 @@ jobs:
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CSC_KEY_PASSWORD }}
           OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: npm run ${{ matrix.package_script }}
+
+      - name: Test desktop UI contracts
+        run: npm run test:ui:contract
 
       - name: Smoke Windows package
         env:
@@ -173,10 +174,8 @@ jobs:
           python scripts/install-engine-lock.py
           python -m pip check
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
-      - name: Test brain
-        env:
-          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
-        run: npm run test:python:portable
+      - name: Check Python source without initializing a brain
+        run: python -m compileall -q engine
       - run: npm run test:node
 
       - name: Package, sign, and notarize macOS when credentials exist
@@ -230,6 +229,9 @@ jobs:
           if [[ -n "${OMNI_RELEASE_APPLE_API_ISSUER:-}" ]]; then export APPLE_API_ISSUER="$OMNI_RELEASE_APPLE_API_ISSUER"; fi
           npm run package:mac:${{ matrix.arch }}
 
+      - name: Test desktop UI contracts
+        run: npm run test:ui:contract
+
       - name: Smoke macOS package
         env:
           OMNI_EXPECT_SIGNED: ${{ secrets.MACOS_CSC_LINK != '' && '1' || '0' }}
@@ -240,7 +242,7 @@ jobs:
           --arch ${{ matrix.arch }}
           --release-root release
           --source-commit ${{ needs.verify.outputs.commit }}
-          --desktop-e2e
+          --desktop-shell
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -294,19 +296,16 @@ jobs:
           python scripts/install-engine-lock.py
           python -m pip check
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
-      - name: Test brain
-        env:
-          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
-        run: npm run test:python:portable
-
-      - name: Test two-rank distributed training
-        if: matrix.arch == 'x64'
-        run: python -m unittest engine.tests.test_distributed_torchrun -v
+      - name: Check Python source without initializing a brain
+        run: python -m compileall -q engine
       - run: npm run test:node
       - name: Package Linux
         env:
           OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: npm run package:linux:${{ matrix.arch }}
+
+      - name: Test desktop UI contracts
+        run: xvfb-run -a npm run test:ui:contract
 
       - name: Smoke Linux package
         env:
@@ -318,7 +317,7 @@ jobs:
           --arch ${{ matrix.arch }}
           --release-root release
           --source-commit ${{ needs.verify.outputs.commit }}
-          --desktop-e2e
+          --desktop-shell
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

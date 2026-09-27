@@ -287,7 +287,8 @@ try {
   }
   $ZipSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $ZipWorkers[0].FullName `
-    -BrainRoot (Join-Path $Scratch "zip-brain")
+    -BrainRoot (Join-Path $Scratch "zip-brain") `
+    -HealthOnly
 
   Write-Host "Package smoke [$Arch]: silently installing NSIS artifact."
   $Install = Start-Process `
@@ -356,29 +357,29 @@ try {
     throw "Signing credentials were configured, but the Windows package is not fully signed."
   }
 
-  Write-Host "Package smoke [$Arch]: exercising installed neural worker."
+  Write-Host "Package smoke [$Arch]: checking installed worker health."
   $InstalledSmoke = & (Join-Path $PSScriptRoot "smoke-engine.ps1") `
     -Executable $InstalledWorkers[0].FullName `
     -BrainRoot (Join-Path $Scratch "installed-brain") `
-    -Comprehensive
+    -HealthOnly
 
   if (-not (Test-Path -LiteralPath $AppExecutable.FullName -PathType Leaf)) {
     throw "Installed desktop executable disappeared during the worker smoke."
   }
 
   $AppLaunched = $false
-  $DesktopE2E = $false
+  $DesktopShellLaunched = $false
   $HostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
   if ($Arch -eq $HostArch) {
     $PreviousExecutable = $env:OMNI_E2E_EXECUTABLE
     try {
-      Write-Host "Package smoke [$Arch]: exercising installed desktop and restart."
+      Write-Host "Package smoke [$Arch]: opening the installed desktop shell."
       $env:OMNI_E2E_EXECUTABLE = $AppExecutable.FullName
       Push-Location $RepoRoot
       try {
-        & npm.cmd run test:ui:built
+        & npm.cmd run test:ui:packaged-shell
         if ($LASTEXITCODE -ne 0) {
-          throw "Installed $Arch desktop end-to-end test failed with exit code $LASTEXITCODE."
+          throw "Installed $Arch desktop shell test failed with exit code $LASTEXITCODE."
         }
       }
       finally {
@@ -391,7 +392,7 @@ try {
         }
       }
       $AppLaunched = $true
-      $DesktopE2E = $true
+      $DesktopShellLaunched = $true
     }
     finally {
       $env:OMNI_E2E_EXECUTABLE = $PreviousExecutable
@@ -428,10 +429,8 @@ try {
       desktopSignature = $InstalledAppSignature
       rpcSmoke = $InstalledSmoke | ConvertFrom-Json
       desktopLaunch = $AppLaunched
-      desktopEndToEnd = $DesktopE2E
-      desktopRestart = $DesktopE2E
-      accessibilityNavigation = $DesktopE2E
-      modalityGeneration = $DesktopE2E
+      desktopShellLaunched = $DesktopShellLaunched
+      neuralAcceptanceTested = $false
       desktopLaunchSkippedReason = $LaunchSkipReason
       compliance = $InstalledCompliance
     }

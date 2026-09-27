@@ -335,9 +335,11 @@ describe("project integrity", () => {
     expect(workflow.match(/OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"/gu)).toHaveLength(2);
     expect(workflow).not.toContain("python -m pip install -r engine/requirements.txt");
     expect(workflow).not.toContain("--index-url https://download.pytorch.org");
-    expect(workflow).toContain("npm run test:python:portable");
+    expect(workflow).toContain("python -m compileall -q engine");
+    expect(workflow).not.toContain("npm run test:python:portable");
     expect(workflow).toContain("npm run build:engine:win");
     expect(workflow).toContain("smoke-engine.ps1");
+    expect(workflow).toContain("-HealthOnly");
     expect(workflow).toContain("smoke-windows-package.ps1");
     expect(workflow).not.toContain("secrets.");
     expect(workflow).toContain('OMNI_EXPECT_SIGNED: "0"');
@@ -347,6 +349,7 @@ describe("project integrity", () => {
     expect(read("scripts/smoke-engine.ps1")).toContain(
       'Invoke-WorkerRpc -Id "health" -Method "health"'
     );
+    expect(read("scripts/smoke-engine.ps1")).toContain("if (-not $HealthOnly) {");
     expect(read("scripts/smoke-engine.ps1")).toContain(
       'Invoke-WorkerRpc -Id "create" -Method "create"'
     );
@@ -485,7 +488,9 @@ describe("project integrity", () => {
     expect(macos).not.toContain("matrix.torch_version");
     expect(macos).not.toContain("matrix.numpy_constraint");
     expect(macos).toContain("package:mac:${{ matrix.arch }}");
-    expect(macos).toContain("--desktop-e2e");
+    expect(macos).toContain("--desktop-shell");
+    expect(macos).toContain("npm run test:ui:contract");
+    expect(macos).toContain("python -m compileall -q engine");
     expect(linux).toContain("runner: ubuntu-24.04");
     expect(linux).toContain("runner: ubuntu-24.04-arm");
     expect(linux).toContain('python-version: "3.11.16"');
@@ -494,6 +499,8 @@ describe("project integrity", () => {
     expect(linux).toContain("engine/locks/*.lock");
     expect(linux).toContain('OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"');
     expect(linux).toContain("package:linux:${{ matrix.arch }}");
+    expect(linux).toContain("--desktop-shell");
+    expect(linux).toContain("python -m compileall -q engine");
     const posixSmoke = read("scripts/smoke-posix-package.mjs");
     expect(posixSmoke).toContain("xvfb-run");
     expect(posixSmoke).toContain('rm(debRoot, { recursive: true, force: true })');

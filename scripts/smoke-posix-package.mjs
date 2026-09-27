@@ -124,7 +124,7 @@ async function sha256(path) {
 const platform = option("--platform");
 const arch = option("--arch");
 const releaseRoot = resolve(option("--release-root") ?? "release");
-const desktopE2e = process.argv.includes("--desktop-e2e");
+const desktopShell = process.argv.includes("--desktop-shell");
 const actualSourceCommit = checkedOutCommit();
 const sourceCommit = String(
   option("--source-commit") ??
@@ -142,7 +142,7 @@ if (sourceCommit !== actualSourceCommit) {
 }
 if (!["mac", "linux"].includes(platform) || !["x64", "arm64"].includes(arch)) {
   throw new Error(
-    "Usage: node scripts/smoke-posix-package.mjs --platform <mac|linux> --arch <x64|arm64> [--desktop-e2e]"
+    "Usage: node scripts/smoke-posix-package.mjs --platform <mac|linux> --arch <x64|arm64> [--desktop-shell]"
   );
 }
 
@@ -406,9 +406,8 @@ if (platform === "mac") {
     }
   }
   // All three distributable formats are now structurally verified. Keep the
-  // portable payload used by desktop E2E, but release the other full Torch
-  // runtime copies before neural chat performs online learning and atomic
-  // checkpoint writes on a resource-constrained hosted runner.
+  // portable payload used by packaged-shell verification, but release the
+  // other full Torch runtime copies on a resource-constrained hosted runner.
   await Promise.all([
     rm(debRoot, { recursive: true, force: true }),
     rm(appImageRoot, { recursive: true, force: true }),
@@ -448,7 +447,8 @@ const workerSmoke = await run(
     "--executable",
     worker,
     "--brain-root",
-    join(scratch, "brain")
+    join(scratch, "brain"),
+    "--health-only"
   ],
   { capture: true, cwd: resolve(".") }
 );
@@ -469,19 +469,19 @@ process.stdout.write(
   `Desktop smoke resources: ${JSON.stringify(resourcesBeforeDesktop)}\n`
 );
 
-if (desktopE2e) {
+if (desktopShell) {
   const environment = {
     ...process.env,
     CI: process.env.CI ?? "1",
     OMNI_E2E_EXECUTABLE: desktopExecutable
   };
   if (platform === "linux") {
-    await run("xvfb-run", ["-a", "npm", "run", "test:ui:built"], {
+    await run("xvfb-run", ["-a", "npm", "run", "test:ui:packaged-shell"], {
       cwd: resolve("."),
       env: environment
     });
   } else {
-    await run("npm", ["run", "test:ui:built"], {
+    await run("npm", ["run", "test:ui:packaged-shell"], {
       cwd: resolve("."),
       env: environment
     });
@@ -506,7 +506,8 @@ const evidence = {
   packagedWorker: relative(payloadRoot, worker),
   desktopExecutable: relative(payloadRoot, desktopExecutable),
   workerSmoke: workerEvidence,
-  desktopEndToEnd: desktopE2e,
+  desktopShellLaunched: desktopShell,
+  neuralAcceptanceTested: false,
   resourcesBeforeDesktop,
   formatValidation,
   signing

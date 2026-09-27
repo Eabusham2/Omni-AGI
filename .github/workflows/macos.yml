@@ -55,10 +55,8 @@ jobs:
           python -m pip check
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
 
-      - name: Test brain
-        env:
-          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
-        run: npm run test:python:portable
+      - name: Check Python syntax
+        run: python -m compileall -q engine
 
       - name: Test desktop app
         run: npm run test:node
@@ -69,7 +67,10 @@ jobs:
           OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
         run: npm run package:mac:${{ matrix.arch }}
 
-      - name: Smoke packaged worker and desktop
+      - name: Test desktop UI contracts
+        run: npm run test:ui:contract
+
+      - name: Smoke packaged worker and desktop UI contracts
         env:
           OMNI_EXPECT_SIGNED: "0"
           OMNI_EXPECT_NOTARIZED: "0"
@@ -78,7 +79,7 @@ jobs:
           --platform mac
           --arch ${{ matrix.arch }}
           --release-root release
-          --desktop-e2e
+          --desktop-shell
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

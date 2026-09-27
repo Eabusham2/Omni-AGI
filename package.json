@@ -19,6 +19,8 @@
     "train:distributed:windows": "python -m torch.distributed.run --standalone --nproc-per-node=gpu engine/distributed_train.py train",
     "test:ui": "npm run build && npm run test:ui:built",
     "test:ui:built": "playwright test --config playwright.config.ts",
+    "test:ui:contract": "playwright test tests/e2e/appearance.spec.ts tests/e2e/chat-ui-contract.spec.ts tests/e2e/imagination-gallery.spec.ts tests/e2e/responsive.spec.ts tests/e2e/theme-matrix.spec.ts tests/e2e/ui-audit.spec.ts --config playwright.config.ts",
+    "test:ui:packaged-shell": "playwright test tests/e2e/packaged-shell.spec.ts --config playwright.config.ts",
     "test:watch": "vitest",
     "build:engine:win": "powershell -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
     "build:engine:mac": "bash scripts/build-engine-posix.sh mac",

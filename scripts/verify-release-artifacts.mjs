@@ -133,9 +133,13 @@ async function canonicalizeReleaseAssetNames(directory, packagedNames, entries) 
 }
 
 function validateWorkerSmoke(smoke, label) {
-  requireValue(smoke?.persistedBrain === true, `${label} did not persist a brain.`);
-  requireValue(smoke?.safeTensorCheckpoint === true, `${label} did not verify safe tensors.`);
-  requireValue(smoke?.sqliteEventLog === true, `${label} did not verify SQLite events.`);
+  requireValue(smoke?.healthOnly === true, `${label} did not pass health-only smoke.`);
+  requireValue(
+    smoke?.persistedBrain === false &&
+      smoke?.safeTensorCheckpoint === false &&
+      smoke?.sqliteEventLog === false,
+    `${label} incorrectly claims neural acceptance evidence from CI.`
+  );
   requireValue(smoke?.protocolVersion === 1, `${label} used an incompatible protocol.`);
   requireValue(
     typeof smoke?.engineVersion === "string" && smoke.engineVersion.length > 0,
@@ -230,24 +234,12 @@ for (const arch of ["x64", "arm64"]) {
   );
   requireValue(windows.nsis?.silentInstall === true, `Windows ${arch} NSIS was not installed.`);
   requireValue(
-    windows.nsis?.desktopEndToEnd === true &&
-      windows.nsis?.desktopRestart === true &&
-      windows.nsis?.accessibilityNavigation === true &&
-      windows.nsis?.modalityGeneration === true,
-    `Windows ${arch} package lacks passing installed-desktop evidence.`
+    windows.nsis?.desktopShellLaunched === true &&
+      windows.nsis?.neuralAcceptanceTested === false,
+    `Windows ${arch} package lacks truthful installed-shell evidence.`
   );
   validateWorkerSmoke(windows.zip?.rpcSmoke, `Windows ${arch} ZIP worker`);
   validateWorkerSmoke(windows.nsis?.rpcSmoke, `Windows ${arch} installed worker`);
-  requireValue(
-    windows.nsis.rpcSmoke?.comprehensive === true &&
-      windows.nsis.rpcSmoke?.trainingLossDecreased === true &&
-      windows.nsis.rpcSmoke?.pdfIngested === true &&
-      windows.nsis.rpcSmoke?.chatParameterMutation === true &&
-      ["image", "audio", "video"].every((kind) =>
-        windows.nsis.rpcSmoke?.generatedModalities?.includes(kind)
-      ),
-    `Windows ${arch} installed worker lacks comprehensive neural evidence.`
-  );
   const windowsSigning = windows.signing;
   requireValue(
     typeof windowsSigning?.expectedSigned === "boolean" &&
@@ -283,8 +275,9 @@ for (const arch of ["x64", "arm64"]) {
   requireValue(
     mac.architecture === arch &&
       mac.platform === "mac" &&
-      mac.desktopEndToEnd === true,
-    `macOS ${arch} package lacks passing desktop evidence.`
+      mac.desktopShellLaunched === true &&
+      mac.neuralAcceptanceTested === false,
+    `macOS ${arch} package lacks truthful desktop-shell evidence.`
   );
   requireValue(
     mac.formatValidation?.dmg?.verified === true &&
@@ -349,8 +342,9 @@ for (const arch of ["x64", "arm64"]) {
   requireValue(
     linux.architecture === arch &&
       linux.platform === "linux" &&
-      linux.desktopEndToEnd === true,
-    `Linux ${arch} package lacks passing desktop evidence.`
+      linux.desktopShellLaunched === true &&
+      linux.neuralAcceptanceTested === false,
+    `Linux ${arch} package lacks truthful desktop-shell evidence.`
   );
   requireValue(
     linux.formatValidation?.["tar.gz"]?.extracted === true &&

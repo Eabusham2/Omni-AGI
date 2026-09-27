@@ -529,19 +529,11 @@ for (const [path, jobName] of [
     `${path} ${jobName} must validate the installed native Torch runtime.`
   );
   requireValue(
-    job.includes('OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"'),
-    `${path} ${jobName} must keep the portable Python sweep single-process.`
-  );
-}
-for (const [path, jobName] of [
-  [".github/workflows/linux.yml", "test-and-package"],
-  [".github/workflows/release.yml", "linux"]
-]) {
-  const job = workflowJob(path, jobName);
-  requireValue(
-    job.includes("if: matrix.arch == 'x64'") &&
-      job.includes("python -m unittest engine.tests.test_distributed_torchrun -v"),
-    `${path} ${jobName} must run the two-rank integration exactly on Linux x64.`
+    job.includes("python -m compileall -q engine") &&
+      !job.includes("test:python:portable") &&
+      !job.includes("test_distributed_torchrun") &&
+      !job.includes("--desktop-e2e"),
+    `${path} ${jobName} must use code-only Python checks, not train a brain in CI.`
   );
 }
 

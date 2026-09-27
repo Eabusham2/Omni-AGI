@@ -2,17 +2,23 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$Executable,
   [string]$BrainRoot = "",
+  [switch]$HealthOnly,
   [switch]$Comprehensive
 )
 
 $ErrorActionPreference = "Stop"
-$Executable = (Resolve-Path $Executable).Path
-if (-not $BrainRoot) {
-  $BrainRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
-    "omni-engine-smoke-" + [System.Guid]::NewGuid().ToString("N")
-  )
+if ($HealthOnly -and $Comprehensive) {
+  throw "-HealthOnly and -Comprehensive cannot be used together."
 }
-[System.IO.Directory]::CreateDirectory($BrainRoot) | Out-Null
+$Executable = (Resolve-Path $Executable).Path
+if (-not $HealthOnly) {
+  if (-not $BrainRoot) {
+    $BrainRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+      "omni-engine-smoke-" + [System.Guid]::NewGuid().ToString("N")
+    )
+  }
+  [System.IO.Directory]::CreateDirectory($BrainRoot) | Out-Null
+}
 
 $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $StartInfo.FileName = $Executable
@@ -76,11 +82,20 @@ try {
     -not $Health.ready -or
     $Health.worker -ne "python" -or
     $Health.protocolVersion -ne 1 -or
-    $Health.operatingSystem -ne "win32"
+    $Health.operatingSystem -ne "win32" -or
+    [string]::IsNullOrWhiteSpace([string]$Health.engineVersion) -or
+    [string]::IsNullOrWhiteSpace([string]$Health.pythonVersion) -or
+    [string]::IsNullOrWhiteSpace([string]$Health.torchVersion) -or
+    [string]::IsNullOrWhiteSpace([string]$Health.platform)
   ) {
     throw "Packaged worker returned an invalid health response."
   }
 
+  $TrainingLossDecreased = $false
+  $PdfIngested = $false
+  $ChatParameterMutation = $false
+  $GeneratedModalities = @()
+  if (-not $HealthOnly) {
   $Storage = Join-Path $BrainRoot "packaged-smoke-brain"
   $EnableModalities = $Comprehensive.IsPresent
   $Created = Invoke-WorkerRpc -Id "create" -Method "create" -Params @{
@@ -100,10 +115,6 @@ try {
     throw "Packaged worker did not create the requested brain identity."
   }
 
-  $TrainingLossDecreased = $false
-  $PdfIngested = $false
-  $ChatParameterMutation = $false
-  $GeneratedModalities = @()
   if ($Comprehensive) {
     $Training = Invoke-WorkerRpc -Id "train" -Method "train" -Params @{
       brainId = "packaged-smoke-brain"
@@ -232,6 +243,7 @@ try {
       throw "Packaged worker smoke is missing engine/$File"
     }
   }
+  }
 
   $Shutdown = Invoke-WorkerRpc -Id "shutdown" -Method "shutdown" -Params @{}
   if (-not $Shutdown.stopping) {
@@ -239,6 +251,9 @@ try {
   }
   if (-not $Worker.WaitForExit(30000)) {
     throw "Packaged worker did not exit after shutdown."
+  }
+  if ($Worker.ExitCode -ne 0) {
+    throw "Packaged worker exited with code $($Worker.ExitCode)."
   }
 
   @{
@@ -249,9 +264,10 @@ try {
     torchVersion = $Health.torchVersion
     platform = $Health.platform
     operatingSystem = $Health.operatingSystem
-    persistedBrain = $true
-    safeTensorCheckpoint = $true
-    sqliteEventLog = $true
+    healthOnly = $HealthOnly.IsPresent
+    persistedBrain = (-not $HealthOnly.IsPresent)
+    safeTensorCheckpoint = (-not $HealthOnly.IsPresent)
+    sqliteEventLog = (-not $HealthOnly.IsPresent)
     comprehensive = $Comprehensive.IsPresent
     trainingLossDecreased = $TrainingLossDecreased
     pdfIngested = $PdfIngested

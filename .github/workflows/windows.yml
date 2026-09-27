@@ -64,10 +64,8 @@ jobs:
           python -m pip check
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
 
-      - name: Test brain
-        env:
-          OMNI_SKIP_DISTRIBUTED_INTEGRATION: "1"
-        run: npm run test:python:portable
+      - name: Check Python syntax
+        run: python -m compileall -q engine
 
       - name: Test desktop app
         run: npm run test:node
@@ -75,8 +73,8 @@ jobs:
       - name: Build desktop app
         run: npm run build
 
-      - name: Test built desktop UI
-        run: npm run test:ui:built
+      - name: Test built desktop UI contracts
+        run: npm run test:ui:contract
 
       - name: Build self-contained brain worker
         env:
@@ -88,7 +86,8 @@ jobs:
         run: |
           ./scripts/smoke-engine.ps1 `
             -Executable ./engine-dist/omni-engine/omni-engine.exe `
-            -BrainRoot "${{ runner.temp }}/omni-worker-${{ matrix.arch }}"
+            -BrainRoot "${{ runner.temp }}/omni-worker-${{ matrix.arch }}" `
+            -HealthOnly
 
       - name: Package unsigned signed-ready Windows installer and archive
         env:

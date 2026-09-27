@@ -106,7 +106,7 @@ npm run package:linux:arm64
 
 Windows produces NSIS and ZIP files, macOS produces DMG and ZIP files, and Linux produces AppImage, DEB, and tar.gz files. Each package embeds a self-contained PyInstaller worker built on the matching OS and architecture. The Windows ARM64 shell intentionally carries an x64 worker for Windows 11 emulation because stable PyTorch Windows ARM64 wheels are not available.
 
-The app uses Windows 11 Mica where supported and the same Fluent-inspired surfaces on other systems. Native-host workflows run source tests, package the worker and desktop, verify architecture, exercise the packaged worker, launch the packaged desktop through Playwright, restart it, and upload checksum-bearing evidence. See [docs/RELEASE.md](docs/RELEASE.md) for the stable release contract.
+The app uses Windows 11 Mica where supported and the same Fluent-inspired surfaces on other systems. Native-host CI checks source, UI contracts, package structure, worker health, and packaged desktop startup without creating or training a brain. A trained ground-up brain and its capabilities require separate live acceptance. See [docs/RELEASE.md](docs/RELEASE.md) for the release contract.
 
 ## Mobile companions
 
