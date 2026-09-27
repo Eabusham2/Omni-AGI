@@ -195,14 +195,7 @@ describe("packaged license and FFmpeg compliance", () => {
       expect.arrayContaining([
         { from: "LICENSE.md", to: "licenses/LICENSE.md" },
         { from: "COMMERCIAL_LICENSE.md", to: "licenses/COMMERCIAL_LICENSE.md" },
-        {
-          from: "licenses/REQUIRED_NOTICE.txt",
-          to: "licenses/REQUIRED_NOTICE.txt",
-        },
-        {
-          from: "licenses/ffmpeg-runtime-policy.json",
-          to: "licenses/ffmpeg-runtime-policy.json",
-        },
+        { from: "licenses", to: "licenses" },
       ]),
     );
   });

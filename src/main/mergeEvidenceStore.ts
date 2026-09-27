@@ -439,7 +439,7 @@ export class MergeEvidencePlanBuilder {
     const built = readSummary(this.database);
     this.database.close();
     this.closed = true;
-    const handle = await openFile(this.path, "r");
+    const handle = await openFile(this.path, "r+");
     try {
       await handle.sync();
     } finally {

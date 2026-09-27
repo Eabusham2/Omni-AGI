@@ -92,37 +92,48 @@ describe("initial learning gate", () => {
       () => undefined
     );
 
-    await foundationStarted.promise;
-    const [summary] = await repository.list();
-    expect(summary).toBeDefined();
-    const whileBuilding = await repository.get(summary!.id);
-    expect(whileBuilding.readiness).toMatchObject({ state: "initializing" });
+    try {
+      // A failed filesystem write can reject create before requestStream runs.
+      // Surface that failure instead of waiting forever for the mock signal.
+      await Promise.race([
+        foundationStarted.promise,
+        creating.then(() => {
+          throw new Error("Build completed before foundation work began.");
+        })
+      ]);
+      const [summary] = await repository.list();
+      expect(summary).toBeDefined();
+      const whileBuilding = await repository.get(summary!.id);
+      expect(whileBuilding.readiness).toMatchObject({ state: "initializing" });
 
-    // A fresh repository represents a full main-process restart: no in-memory
-    // RuntimeJobManager state survives, but the authoritative gate does.
-    const afterRestart = new BrainRepository(join(root, "brains"));
-    await afterRestart.initialize();
-    expect((await afterRestart.get(summary!.id)).readiness.state).toBe("initializing");
+      // A fresh repository represents a full main-process restart: no in-memory
+      // RuntimeJobManager state survives, but the authoritative gate does.
+      const afterRestart = new BrainRepository(join(root, "brains"));
+      await afterRestart.initialize();
+      expect((await afterRestart.get(summary!.id)).readiness.state).toBe("initializing");
 
-    const actions = {
-      idle: vi.fn<() => Promise<IdleCycleResult>>()
-    };
-    const scheduler = new IdleCognitionScheduler(afterRestart, actions, {
-      isLearning: () => false
-    });
-    await expect(scheduler.tick()).resolves.toBeUndefined();
-    expect(actions.idle).not.toHaveBeenCalled();
-    await expect(service.chat(summary!.id, "hello")).rejects.toThrow(/initial learning/i);
-    await expect(service.idleCycle(summary!.id, 0)).resolves.toMatchObject({
-      ran: false,
-      reason: "initial-learning"
-    });
-
-    releaseFoundation.resolve();
+      const actions = {
+        idle: vi.fn<() => Promise<IdleCycleResult>>()
+      };
+      const scheduler = new IdleCognitionScheduler(afterRestart, actions, {
+        isLearning: () => false
+      });
+      await expect(scheduler.tick()).resolves.toBeUndefined();
+      expect(actions.idle).not.toHaveBeenCalled();
+      await expect(service.chat(summary!.id, "hello")).rejects.toThrow(/initial learning/i);
+      await expect(service.idleCycle(summary!.id, 0)).resolves.toMatchObject({
+        ran: false,
+        reason: "initial-learning"
+      });
+    } finally {
+      releaseFoundation.resolve();
+      // Do not delete the temporary brain while its build is still writing.
+      await creating.catch(() => undefined);
+    }
     await expect(creating).resolves.toMatchObject({
       readiness: { state: "initializing" }
     });
-  });
+  }, 30_000);
 
   it("atomically unlocks a persisted build once and remains ready after restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "omni-initialization-ready-"));

@@ -742,7 +742,8 @@ export class BrainActivityLedger {
         } finally {
           database.close();
         }
-        const handle = await openFile(temporary, "r");
+        // Windows FlushFileBuffers requires a writable handle for fsync.
+        const handle = await openFile(temporary, "r+");
         try {
           await handle.sync();
         } finally {
@@ -837,7 +838,7 @@ export class BrainActivityLedger {
       ledger.integrity();
       ledger.close();
       database = undefined;
-      const handle = await openFile(temporary, "r");
+      const handle = await openFile(temporary, "r+");
       try {
         await handle.sync();
       } finally {

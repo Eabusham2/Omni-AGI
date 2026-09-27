@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -97,12 +97,13 @@ describe("renderer-safe media artifact registry", () => {
 
     expect(completed.mimeType).toBe("audio/wav");
     expect(completed.mediaUrl).toMatch(/^omni-media:\/\/artifact\//);
-    await expect(registry.authorize(String(completed.mediaUrl))).resolves.toMatchObject({
-      path: await realpath(path),
+    const authorized = await registry.authorize(String(completed.mediaUrl));
+    expect(authorized).toMatchObject({
       mimeType: "audio/wav",
       size: 1_068,
       sha256
     });
+    expect(await realpath(authorized!.path)).toBe(await realpath(path));
   });
 
   it("keeps a six-second PCM WAV embedded through final-output sanitization", async () => {
@@ -157,10 +158,10 @@ describe("renderer-safe media artifact registry", () => {
     expect(leased?.artifactPath).toBeUndefined();
     const authorized = await registry.authorize(leased!.mediaUrl!);
     expect(authorized).toMatchObject({
-      path: await realpath(previewPath),
       sha256,
       mimeType: "image/png"
     });
+    expect(await realpath(authorized!.path)).toBe(await realpath(previewPath));
   });
 
   it("rejects cross-brain paths, traversal-shaped URLs, and bad checksums", async () => {
@@ -208,10 +209,9 @@ describe("renderer-safe media artifact registry", () => {
     expect(final.dataUrl).toBeUndefined();
     expect(final.mediaUrl).toMatch(/^omni-media:\/\/artifact\//);
     expect(await registry.authorize(second.mediaUrl!)).toBeUndefined();
-    expect(await registry.authorize(String(final.mediaUrl))).toMatchObject({
-      path: await realpath(finalPath),
-      sha256
-    });
+    const authorized = await registry.authorize(String(final.mediaUrl));
+    expect(authorized).toMatchObject({ sha256 });
+    expect(await realpath(authorized!.path)).toBe(await realpath(finalPath));
   });
 
   it("rejects a file changed after lease registration", async () => {
@@ -275,7 +275,7 @@ describe("renderer-safe media artifact registry", () => {
       mimeType: "image/png",
       sha256,
       bytes: bytes.length,
-      relativePath: `artifacts/${finalPath.split("/").at(-1)}`,
+      relativePath: `artifacts/${basename(finalPath)}`,
       createdAt: new Date(1_700_000_000_000 + index).toISOString()
     }));
     await ArtifactIndexStore.replace(directory, "brain-a", artifacts);
@@ -311,7 +311,7 @@ describe("renderer-safe media artifact registry", () => {
         mimeType: "image/png",
         sha256,
         bytes: bytes.length,
-        relativePath: `artifacts/${finalPath.split("/").at(-1)}`,
+        relativePath: `artifacts/${basename(finalPath)}`,
         createdAt: new Date(1_700_000_000_000 + index).toISOString()
       })
     );

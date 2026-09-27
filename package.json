@@ -111,37 +111,13 @@
       "to": "licenses/COMMERCIAL_LICENSE.md"
     },
     {
-      "from": "licenses/REQUIRED_NOTICE.txt",
-      "to": "licenses/REQUIRED_NOTICE.txt"
+      "from": "licenses",
+      "to": "licenses"
     },
     {
-      "from": "licenses/ffmpeg-runtime-policy.json",
-      "to": "licenses/ffmpeg-runtime-policy.json"
-    },
-    {
-      "from": "licenses/BitNet-MIT.txt",
-      "to": "licenses/BitNet-MIT.txt"
-      },
-      {
-        "from": "licenses/snnTorch-MIT.txt",
-        "to": "licenses/snnTorch-MIT.txt"
-      },
-      {
-        "from": "licenses/NCPS-Apache-2.0.txt",
-        "to": "licenses/NCPS-Apache-2.0.txt"
-      },
-      {
-        "from": "THIRD_PARTY_NOTICES.md",
-        "to": "licenses/THIRD_PARTY_NOTICES.md"
-      },
-      {
-        "from": "licenses/imageio-ffmpeg-BSD-2-Clause.txt",
-        "to": "licenses/imageio-ffmpeg-BSD-2-Clause.txt"
-      },
-      {
-        "from": "licenses/GPL-2.0.txt",
-        "to": "licenses/GPL-2.0.txt"
-      }
+      "from": "THIRD_PARTY_NOTICES.md",
+      "to": "licenses/THIRD_PARTY_NOTICES.md"
+    }
     ],
     "win": {
       "icon": "build/icon.svg",

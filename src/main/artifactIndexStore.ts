@@ -400,7 +400,7 @@ export class ArtifactIndexStore {
       store.integrity();
       store.close();
       database = undefined;
-      const handle = await openFile(temporary, "r");
+      const handle = await openFile(temporary, "r+");
       try {
         await handle.sync();
       } finally {

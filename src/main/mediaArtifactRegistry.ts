@@ -267,9 +267,12 @@ export class MediaArtifactRegistry {
     if (!rawPath || !isAbsolute(rawPath) || rawPath.includes("\0")) {
       throw new Error("Media artifact path must be absolute.");
     }
-    const brainRoot = realpathSync(this.brainDirectory(brainId));
-    const engineRoot = realpathSync(join(brainRoot, "engine"));
-    const actual = realpathSync(resolve(rawPath));
+    // Use one native canonicalization for both sides of the containment check.
+    // On Windows the JS realpath and the OS-native realpath can disagree about
+    // 8.3 short names (such as RUNNER~1) even for the same directory.
+    const brainRoot = realpathSync.native(this.brainDirectory(brainId));
+    const engineRoot = realpathSync.native(join(brainRoot, "engine"));
+    const actual = realpathSync.native(resolve(rawPath));
     if (!inside(actual, engineRoot)) {
       throw new Error("Media artifact escaped the selected brain.");
     }

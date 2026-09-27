@@ -85,13 +85,10 @@ describe("project integrity", () => {
       to: "licenses/THIRD_PARTY_NOTICES.md"
     });
     expect(packageDocument.build.extraResources).toContainEqual({
-      from: "licenses/imageio-ffmpeg-BSD-2-Clause.txt",
-      to: "licenses/imageio-ffmpeg-BSD-2-Clause.txt"
+      from: "licenses",
+      to: "licenses"
     });
-    expect(packageDocument.build.extraResources).toContainEqual({
-      from: "licenses/GPL-2.0.txt",
-      to: "licenses/GPL-2.0.txt"
-    });
+    expect(read("licenses/Ajv-MIT.txt")).toContain("MIT License");
   });
 
   it("keeps portable application resources free of local Python test caches", () => {
