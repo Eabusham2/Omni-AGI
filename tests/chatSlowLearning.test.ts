@@ -136,7 +136,10 @@ describe("background chat slow learning", () => {
       );
       vi.spyOn(service, "preflightStart").mockResolvedValue(undefined);
       service.resumePendingChatLearning(brain.id);
-      await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1));
+      // Repository hydration can take several seconds on the Windows runner.
+      await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1), {
+        timeout: 20_000
+      });
 
       const paused = await service.setOnlineLearning(brain.id, false);
       expect(paused.config.onlineLearning).toBe(false);
@@ -148,11 +151,13 @@ describe("background chat slow learning", () => {
       )).pending_chat_slow_learning).toEqual([{ jobId }]);
 
       await service.setOnlineLearning(brain.id, true);
-      await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(2), {
+        timeout: 20_000
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("keeps a durable replay queued through a storage pause and resumes when space recovers", async () => {
     const root = await mkdtemp(join(tmpdir(), "omni-slow-storage-retry-"));
