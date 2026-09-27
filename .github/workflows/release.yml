@@ -99,7 +99,7 @@ jobs:
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
       - name: Check Python source without initializing a brain
         run: python -m compileall -q engine
-      - run: npm run test:node -- --maxWorkers=2 --testTimeout=30000
+      - run: npm run test:node:ci
 
       - name: Package Windows
         env:
@@ -176,7 +176,7 @@ jobs:
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
       - name: Check Python source without initializing a brain
         run: python -m compileall -q engine
-      - run: npm run test:node
+      - run: npm run test:node:ci
 
       - name: Package, sign, and notarize macOS when credentials exist
         env:
@@ -298,7 +298,7 @@ jobs:
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
       - name: Check Python source without initializing a brain
         run: python -m compileall -q engine
-      - run: npm run test:node
+      - run: npm run test:node:ci
       - name: Package Linux
         env:
           OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"

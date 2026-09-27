@@ -333,6 +333,7 @@ describe("project integrity", () => {
     expect(workflow).not.toContain("python -m pip install -r engine/requirements.txt");
     expect(workflow).not.toContain("--index-url https://download.pytorch.org");
     expect(workflow).toContain("python -m compileall -q engine");
+    expect(workflow).toContain("npm run test:node:ci");
     expect(workflow).not.toContain("npm run test:python:portable");
     expect(workflow).toContain("npm run build:engine:win");
     expect(workflow).toContain("smoke-engine.ps1");
@@ -470,6 +471,7 @@ describe("project integrity", () => {
       "package:mac:arm64",
       "package:linux:x64",
       "package:linux:arm64",
+      "test:node:ci",
       "verify:release"
     ]) {
       expect(packageDocument.scripts[script]).toBeTypeOf("string");
@@ -487,6 +489,7 @@ describe("project integrity", () => {
     expect(macos).toContain("package:mac:${{ matrix.arch }}");
     expect(macos).toContain("--desktop-shell");
     expect(macos).toContain("npm run test:ui:contract");
+    expect(macos).toContain("npm run test:node:ci");
     expect(macos).toContain("python -m compileall -q engine");
     expect(linux).toContain("runner: ubuntu-24.04");
     expect(linux).toContain("runner: ubuntu-24.04-arm");
@@ -497,6 +500,7 @@ describe("project integrity", () => {
     expect(linux).toContain('OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"');
     expect(linux).toContain("package:linux:${{ matrix.arch }}");
     expect(linux).toContain("--desktop-shell");
+    expect(linux).toContain("npm run test:node:ci");
     expect(linux).toContain("python -m compileall -q engine");
     const posixSmoke = read("scripts/smoke-posix-package.mjs");
     expect(posixSmoke).toContain("xvfb-run");

@@ -68,7 +68,7 @@ jobs:
         run: python -m compileall -q engine
 
       - name: Test desktop app
-        run: npm run test:node -- --maxWorkers=2 --testTimeout=30000
+        run: npm run test:node:ci
 
       - name: Build desktop app
         run: npm run build

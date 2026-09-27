@@ -29,7 +29,7 @@ writing release metadata or uploading assets. This matches GitHub's public
 asset-name rules, so every entry in `SHA256SUMS.txt` and
 `RELEASE-MANIFEST.json` is the exact downloadable filename.
 
-Each native-host job checks Python syntax and the Node/UI contract suites,
+Each native-host job checks Python syntax and focused Node/UI contract suites,
 builds the Electron application and PyInstaller brain worker, verifies their
 machine architectures, checks packaged-worker health without creating a brain,
 and opens the packaged desktop shell without training. Neural learning,
@@ -41,12 +41,12 @@ types. The Windows job expands the ZIP and silently installs NSIS before
 checking both layouts. A workflow file or locally produced archive is not
 release evidence by itself.
 
-The 10k-row merge and disk-paging stress fixtures remain in the full local
-Node suite and macOS/Linux CI. Within that Node suite, Windows package CI
-omits those two prolonged stress fixtures; Windows functional and security
-tests still run. This is a
-documented coverage boundary, not a claim that Windows large-scale training
-or retention has passed live acceptance.
+The full Node suite, Python neural suite, and 10k-row stress fixtures
+remain available for manual or dedicated acceptance runs, but are not hosted
+package-CI prerequisites. Package CI runs an explicit fast code, security,
+release-integrity, and UI-contract selection on each desktop platform. This
+is a documented coverage boundary, not a claim that large-scale training,
+retention, or every application feature has passed live acceptance.
 
 The Android release job runs unit tests and a host-backed API 35 emulator test
 that pairs, streams a visible chat turn, and streams a 2 MiB attachment. It

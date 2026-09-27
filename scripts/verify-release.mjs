@@ -530,6 +530,7 @@ for (const [path, jobName] of [
   );
   requireValue(
     job.includes("python -m compileall -q engine") &&
+      job.includes("npm run test:node:ci") &&
       !job.includes("test:python:portable") &&
       !job.includes("test_distributed_torchrun") &&
       !job.includes("--desktop-e2e"),

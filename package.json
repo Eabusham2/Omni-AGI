@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "npm run test:node && npm run test:python",
     "test:node": "vitest run",
+    "test:node:ci": "vitest run tests/actionProtocol.test.ts tests/brainProvenancePresentation.test.ts tests/buildResourceSelections.test.ts tests/chatLoadingPresentation.test.ts tests/engineSupervisor.test.ts tests/mediaProtocol.test.ts tests/mobileTlsIdentity.test.ts tests/mobileTransportSecurity.test.ts tests/packagedCompliance.test.ts tests/platformChrome.test.ts tests/projectIntegrity.test.ts tests/releasePackaging.test.ts tests/releaseRuntimeCompatibility.test.ts tests/resourcePlanRequest.test.ts tests/resourcePlanner.test.ts tests/shutdownIpcLifecycle.test.ts tests/uiDefectRegression.test.ts tests/uiVisualIntegrity.test.ts --maxWorkers=2 --testTimeout=30000",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:python:portable": "python -m unittest discover -s engine/tests -p \"test_*.py\" -v",
     "train:distributed": "python3 -m torch.distributed.run --standalone --nproc-per-node=gpu engine/distributed_train.py train",
