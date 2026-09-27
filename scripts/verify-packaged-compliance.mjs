@@ -171,7 +171,13 @@ export async function verifyDesktopCompliance(appDirectory, repoRoot = resolve("
       `Desktop package contains a stale or modified ${packagedPath}.`
     );
   }
-  const prohibited = relativeFiles.filter(isBundledFfmpegExecutable).sort();
+  // Electron's root ffmpeg.dll is Chromium's codec runtime library, not the
+  // standalone FFmpeg executable from the imageio wheel. Keep the exception
+  // exact: nested or worker FFmpeg binaries remain prohibited.
+  const prohibited = relativeFiles
+    .filter((path) => normalizedArchivePath(path).toLowerCase() !== "ffmpeg.dll")
+    .filter(isBundledFfmpegExecutable)
+    .sort();
   requireValue(
     prohibited.length === 0,
     `Desktop package contains a prohibited FFmpeg executable: ${prohibited.join(", ")}`

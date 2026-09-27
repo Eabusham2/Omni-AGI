@@ -138,6 +138,10 @@ describe("packaged license and FFmpeg compliance", () => {
       ffmpegExecutableBundled: false,
     });
 
+    await writeFile(join(root, "ffmpeg.dll"), "Electron codec runtime fixture");
+    const electronRuntime = runVerifier(["--desktop-dir", root]);
+    expect(electronRuntime.status, electronRuntime.stderr).toBe(0);
+
     const wheel = join(
       root,
       "Omni AGI Studio.app",
