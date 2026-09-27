@@ -19,7 +19,7 @@ function windowsAllowedSids(path: string): string[] {
     "-NoProfile",
     "-NonInteractive",
     "-Command",
-    "$ErrorActionPreference = 'Stop'; (Get-Acl -LiteralPath $env:OMNI_TEST_IDENTITY_PATH).Access | Where-Object { $_.AccessControlType -eq 'Allow' } | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }"
+    "$ErrorActionPreference = 'Stop'; foreach ($rule in [System.IO.File]::GetAccessControl($env:OMNI_TEST_IDENTITY_PATH).Access) { if ($rule.AccessControlType -eq 'Allow') { [Console]::Out.WriteLine($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value) } }"
   ], {
     encoding: "utf8",
     windowsHide: true,

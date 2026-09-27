@@ -20,21 +20,22 @@ const execFileAsync = promisify(execFile);
 const RESTRICT_WINDOWS_ACL = `
 $ErrorActionPreference = 'Stop'
 $path = $env:OMNI_MOBILE_TLS_IDENTITY_PATH
-$item = Get-Item -LiteralPath $path -Force
-if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'TLS identity path cannot be a reparse point.' }
+$attributes = [System.IO.File]::GetAttributes($path)
+if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw 'TLS identity path cannot be a reparse point.' }
+$isDirectory = [bool]($attributes -band [System.IO.FileAttributes]::Directory)
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$acl = Get-Acl -LiteralPath $path
+$acl = if ($isDirectory) { [System.IO.Directory]::GetAccessControl($path) } else { [System.IO.File]::GetAccessControl($path) }
 $acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleAll($rule) | Out-Null }
+foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
-if ($item.PSIsContainer) {
+if ($isDirectory) {
   $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
 }
 $grant = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
 $acl.AddAccessRule($grant)
 $acl.SetOwner($sid)
-Set-Acl -LiteralPath $path -AclObject $acl
-$verified = Get-Acl -LiteralPath $path
+if ($isDirectory) { [System.IO.Directory]::SetAccessControl($path, $acl) } else { [System.IO.File]::SetAccessControl($path, $acl) }
+$verified = if ($isDirectory) { [System.IO.Directory]::GetAccessControl($path) } else { [System.IO.File]::GetAccessControl($path) }
 $rules = @($verified.Access)
 if (-not $verified.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or $verified.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) {
   throw 'TLS identity ACL verification failed.'
