@@ -33,6 +33,7 @@ import torch
 
 from omni_core import AdaptiveBrain, OmniConfig, __version__
 from omni_core.brain import ChatGenerationCancelled, is_allocator_oom_error
+from omni_core.brain_lease import BrainLeaseBusy, BrainOwnerLease
 from omni_core.modalities import ModalityGenerationCancelled, ModalityHub
 from omni_core.media_planning import MediaResourcePause, inline_media_data_url
 from omni_core.conversation_ledger import NeuralConversationLedger
@@ -290,6 +291,9 @@ class Worker:
         if self.worker_role not in {"neural", "inspection"}:
             raise RuntimeError("OMNI_WORKER_ROLE must be neural or inspection")
         self.brains: Dict[str, AdaptiveBrain] = {}
+        self._brain_leases: Dict[str, BrainOwnerLease] = {}
+        self._brain_lease_guard = threading.RLock()
+        self._ever_loaded_brains: set[str] = set()
         self.cancelled_jobs = set()
         self._cooperative_cancel = threading.Event()
         self._active_request_lock = threading.Lock()
@@ -891,6 +895,116 @@ class Worker:
             return Path(str(raw)).expanduser().resolve()
         return self._default_root() / brain_id
 
+    def _owner_lease(
+        self, brain_id: str, storage: Path
+    ) -> Tuple[BrainOwnerLease, bool]:
+        if self.worker_role != "neural":
+            raise RpcFault(-32601, "inspection workers cannot own neural state")
+        with self._brain_lease_guard:
+            current = self._brain_leases.get(brain_id)
+            if current is not None:
+                if current.storage_path != storage.resolve():
+                    raise RpcFault(-32602, "brainId is already leased at another storagePath")
+                current.assert_exclusive()
+                return current, False
+            try:
+                lease = BrainOwnerLease(storage).acquire()
+            except BrainLeaseBusy as error:
+                raise RpcFault(-32009, str(error)) from error
+            self._brain_leases[brain_id] = lease
+            return lease, True
+
+    def _release_owner_lease(self, brain_id: str) -> None:
+        with self._brain_lease_guard:
+            lease = self._brain_leases.pop(brain_id, None)
+        if lease is not None:
+            lease.release()
+
+    def _release_all_owner_leases(self) -> None:
+        with self._brain_lease_guard:
+            brain_ids = list(self._brain_leases)
+        for brain_id in brain_ids:
+            self._release_owner_lease(brain_id)
+
+    def _prune_verified_abandoned_live_caches(
+        self, brain_id: str, brain: AdaptiveBrain, lease: BrainOwnerLease
+    ) -> None:
+        """Clean only exact owned derived paths after verified reconstruction.
+
+        This is called only for this worker's first load of the brain, before
+        publishing the new object in ``self.brains``. The exclusive lease
+        excludes other neural workers; the local checks exclude old objects
+        and inline jobs. A missing proof leaves cache bytes untouched.
+        """
+
+        rebuilt = getattr(brain, "_verified_paged_rebuild", None)
+        if rebuilt is None:
+            return
+        from omni_core.live_paging_migration import (
+            prune_abandoned_live_paging_cache,
+        )
+
+        cache_parent = brain.engine_path / "state" / "live-substrate-cache"
+        if not cache_parent.is_dir() or cache_parent.is_symlink():
+            return
+        def candidate_paths():
+            yield cache_parent
+            for child in cache_parent.iterdir():
+                if (
+                    child.is_dir() and not child.is_symlink()
+                    and len(child.name) == 32
+                    and all(character in "0123456789abcdef" for character in child.name)
+                ):
+                    yield child
+        outcomes: List[Dict[str, Any]] = []
+        for candidate in candidate_paths():
+            for target in ("staging", "live"):
+                def no_consumers(path: Path, owned_child: Path = candidate) -> bool:
+                    try:
+                        lease.assert_exclusive()
+                    except (OSError, RuntimeError):
+                        return False
+                    if (
+                        self.brains.get(brain_id) is not None
+                        or brain_id in self._ever_loaded_brains
+                        or path.parent.resolve() != owned_child.resolve()
+                    ):
+                        return False
+                    with self._inline_lock:
+                        if any(
+                            item.brain_id == brain_id
+                            for item in self._inline_generations.values()
+                        ):
+                            return False
+                    current_cache = getattr(
+                        brain, "_live_paging_cache_directory", None
+                    )
+                    if current_cache is not None and path.is_relative_to(
+                        Path(current_cache).resolve()
+                    ):
+                        return False
+                    return True
+
+                try:
+                    result = prune_abandoned_live_paging_cache(
+                        candidate,
+                        brain.engine_path,
+                        verified_rebuild=rebuilt,
+                        target=target,
+                        no_consumers=no_consumers,
+                    )
+                    if result.get("removed"):
+                        outcomes.append({"target": target, "removed": True})
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    # A derived cache is never recovery authority. A failed
+                    # exact proof must not block loading the verified brain or
+                    # become permission to delete an unrecognized directory.
+                    outcomes.append({
+                        "target": target, "removed": False,
+                        "reason": type(error).__name__,
+                    })
+        brain._derived_cache_prune_outcomes = outcomes
+
     def _get(self, params: Dict[str, Any]) -> AdaptiveBrain:
         brain_id = self._brain_id(params)
         storage = self._storage(params, brain_id)
@@ -901,12 +1015,11 @@ class Worker:
                     -32602,
                     "brainId is already loaded from a different storagePath",
                 )
+            self._owner_lease(brain_id, storage)
             return existing
         # A hard process interruption can leave only disposable inline media
         # staging behind. It is never an authoritative brain artifact and is
         # removed before the persistent checkpoint is opened again.
-        self._clear_inline_staging(storage / "engine")
-        self._clear_preview_cache(storage / "engine")
         # Runtime requests are deliberately load-only.  The desktop repository
         # document becomes visible before neural initialization has
         # finished verification/materialization, so idle cognition (or any
@@ -921,8 +1034,27 @@ class Worker:
                 "brain is not initialized; an explicit create request must "
                 "complete before load or runtime operations",
             )
-        brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
+        lease, newly_acquired = self._owner_lease(brain_id, storage)
+        try:
+            self._clear_inline_staging(storage / "engine")
+            self._clear_preview_cache(storage / "engine")
+            brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
+            if newly_acquired and brain_id not in self._ever_loaded_brains:
+                self._prune_verified_abandoned_live_caches(
+                    brain_id, brain, lease
+                )
+            lease.assert_exclusive()
+        except BaseException:
+            if "brain" in locals():
+                try:
+                    brain.close()
+                except Exception:
+                    pass
+            if newly_acquired:
+                self._release_owner_lease(brain_id)
+            raise
         self.brains[brain_id] = brain
+        self._ever_loaded_brains.add(brain_id)
         return brain
 
     def _builder_config(
@@ -1097,8 +1229,6 @@ class Worker:
     def create(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain_id = self._brain_id(params, required=False) or uuid.uuid4().hex
         storage = self._storage(params, brain_id)
-        self._discard_inline_generations(brain_id)
-        self._clear_inline_staging(storage / "engine")
         raw_config = params.get("config") or {}
         if not isinstance(raw_config, dict):
             raise RpcFault(-32602, "params.config must be an object")
@@ -1189,6 +1319,7 @@ class Worker:
                 "Build requires a locally initialized OmniCortex native core",
             )
         self._preflight_existing_build_config(storage, config)
+        _lease, newly_acquired = self._owner_lease(brain_id, storage)
         stream_id = str(params.get("streamId", "")).strip()
         build_sequence = 0
 
@@ -1221,15 +1352,22 @@ class Worker:
             )
             build_sequence += 1
 
-        brain = AdaptiveBrain.create(
-            brain_id,
-            storage,
-            config,
-            progress=build_progress if stream_id else None,
-            # Only the public worker Build boundary runs the production local
-            # curriculum. Low-level test/research construction remains fast.
-            initialize_ground_up=True,
-        )
+        try:
+            self._discard_inline_generations(brain_id)
+            self._clear_inline_staging(storage / "engine")
+            brain = AdaptiveBrain.create(
+                brain_id,
+                storage,
+                config,
+                progress=build_progress if stream_id else None,
+                # Only the public worker Build boundary runs the production local
+                # curriculum. Low-level test/research construction remains fast.
+                initialize_ground_up=True,
+            )
+        except BaseException:
+            if newly_acquired:
+                self._release_owner_lease(brain_id)
+            raise
         mismatches = self._build_config_mismatches(brain.config, config)
         if mismatches:
             try:
@@ -1240,12 +1378,15 @@ class Worker:
                 pass
             if self.brains.get(brain_id) is brain:
                 self.brains.pop(brain_id, None)
+            if newly_acquired:
+                self._release_owner_lease(brain_id)
             raise RpcFault(
                 -32602,
                 "created brain architecture does not match the requested "
                 "versioned hardwareTier profile: %s" % ", ".join(mismatches),
             )
         self.brains[brain_id] = brain
+        self._ever_loaded_brains.add(brain_id)
         self.notify(
             "brain-created",
             brain_id=brain_id,
@@ -1268,15 +1409,21 @@ class Worker:
     def reload(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
         brain_id = self._brain_id(params)
-        self._discard_inline_generations(brain_id)
-        previous = self.brains.pop(brain_id, None)
-        if previous is not None:
-            previous.close()
-        self._clear_inline_staging(self._storage(params, brain_id) / "engine")
-        brain = AdaptiveBrain.load(
-            self._storage(params, brain_id), expected_brain_id=brain_id
-        )
+        storage = self._storage(params, brain_id)
+        _lease, _newly_acquired = self._owner_lease(brain_id, storage)
+        try:
+            self._discard_inline_generations(brain_id)
+            previous = self.brains.pop(brain_id, None)
+            if previous is not None:
+                previous.close()
+            self._clear_inline_staging(storage / "engine")
+            brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
+        except BaseException:
+            if self.brains.get(brain_id) is None:
+                self._release_owner_lease(brain_id)
+            raise
         self.brains[brain_id] = brain
+        self._ever_loaded_brains.add(brain_id)
         return brain.summary()
 
     def unload(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
@@ -1286,6 +1433,7 @@ class Worker:
         previous = self.brains.pop(brain_id, None)
         if previous is not None:
             previous.close()
+        self._release_owner_lease(brain_id)
         return {"brainId": brain_id, "unloaded": previous is not None}
 
     def restore_snapshot(
@@ -1311,6 +1459,7 @@ class Worker:
                 source = snapshot / filename
                 if not source.is_file():
                     raise RpcFault(-32602, "snapshot is missing %s" % filename)
+            self._owner_lease(brain_id, storage)
             engine = storage / "engine"
             try:
                 # Validate and materialize every blob referenced by the
@@ -1512,6 +1661,29 @@ class Worker:
         if not isinstance(query, dict):
             raise RpcFault(-32602, "params.query must be an object")
         try:
+            loaded = self.brains.get(brain_id)
+            expected_live = None
+            if loaded is not None:
+                if self._storage(params, brain_id) != loaded.storage_path:
+                    raise RpcFault(
+                        -32602,
+                        "brainId is already loaded from a different storagePath",
+                    )
+                self._owner_lease(brain_id, loaded.storage_path)
+                expected_live = {
+                    "activeGeneration": str(
+                        (loaded.memory.persistence_manifest or {}).get(
+                            "activeGeneration", ""
+                        )
+                    ),
+                    "stateRevision": int(loaded.memory.state_revision),
+                    "counts": {
+                        "neurons": len(loaded.memory.neurons),
+                        "assemblies": len(loaded.memory.assemblies),
+                        "synapses": len(loaded.memory.synapses),
+                    },
+                    "attentionOverlay": loaded.memory.attention_overlay_metadata(),
+                }
             # Inspection is a generation-bound read path. Never call `_get`
             # here: materializing millions of synapses would inflate immutable
             # shards into gigabytes of Python objects and serialize chat behind
@@ -1520,6 +1692,7 @@ class Worker:
                 self._storage(params, brain_id) / "engine",
                 brain_id,
                 query,
+                expected_live=expected_live,
             )
         except (OSError, TypeError, ValueError) as error:
             raise RpcFault(-32602, str(error)) from error
@@ -3533,6 +3706,10 @@ class Worker:
         self._shutdown_inline_generations()
         with self._observation_lock:
             self._observation_sessions.clear()
+        for brain in list(self.brains.values()):
+            brain.close()
+        self.brains.clear()
+        self._release_all_owner_leases()
         return {"stopping": True}
 
     def dispatch(self, request: Any) -> Optional[Dict[str, Any]]:
@@ -3716,6 +3893,7 @@ def main() -> int:
         except Exception:
             pass
     worker._shutdown_inline_generations()
+    worker._release_all_owner_leases()
     return 0
 
 

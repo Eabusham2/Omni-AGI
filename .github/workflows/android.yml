@@ -124,8 +124,8 @@ jobs:
       - name: Capture emulator diagnostics on failure
         if: failure()
         run: |
-          adb exec-out screencap -p > "$RUNNER_TEMP/omni-emulator-failure.png" || true
-          adb logcat -d > "$RUNNER_TEMP/omni-emulator-logcat.txt" || true
+          timeout 15s adb exec-out screencap -p > "$RUNNER_TEMP/omni-emulator-failure.png" || true
+          timeout 15s adb logcat -d > "$RUNNER_TEMP/omni-emulator-logcat.txt" || true
 
       - name: Upload APK and emulator reports
         if: always()

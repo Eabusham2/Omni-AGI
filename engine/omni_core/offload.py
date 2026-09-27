@@ -1140,6 +1140,151 @@ class HotStateResidencyPlanner:
             + 2.25 * max(0.0, float(access_heat))
         )
 
+    def _update_paged(
+        self,
+        *,
+        neurons: Mapping[str, Mapping[str, Any]],
+        assemblies: Sequence[Mapping[str, Any]],
+        synapses: Mapping[str, Mapping[str, Any]],
+        unfinished_ids: Iterable[str],
+        attention_active_ids: Iterable[str],
+        attention_legacy_raw_active: bool,
+        resident_budget: Optional[int],
+        paged_assembly_ids: Iterable[str],
+    ) -> Dict[str, Any]:
+        """Rank only addressable live candidates, never the paged population."""
+
+        previous_hot = self.hot_ids
+        for record_id in tuple(self._access_heat):
+            cooled = self._access_heat[record_id] * 0.72
+            if cooled < 0.025:
+                self._access_heat.pop(record_id, None)
+            else:
+                self._access_heat[record_id] = cooled
+        unfinished = frozenset(str(value) for value in unfinished_ids if value)
+        attention_active = frozenset(
+            str(value) for value in attention_active_ids if value
+        )
+        paged = frozenset(str(value) for value in paged_assembly_ids if value)
+        resident_items = getattr(synapses, "resident_items", None)
+        resident_synapses = dict(
+            resident_items() if callable(resident_items) else synapses.items()
+        )
+        accessed_ids = set(self._access_heat)
+        tracked_ids = set(unfinished) | set(attention_active) | set(previous_hot) | accessed_ids
+        # Every native assembly has a neuron row with the same ID. A cold
+        # synapse is a distinct address; neither population needs an ID scan.
+        neuron_count = int(neurons.status()["rowCount"])  # type: ignore[attr-defined]
+        if len(assemblies) > neuron_count:
+            raise ValueError("paged assembly count exceeds neuron count")
+        synapse_count = len(synapses)
+        total = neuron_count + synapse_count
+        candidates = (
+            tracked_ids | set(paged) | set(resident_synapses)
+        )
+        record_map: Dict[str, Dict[str, Any]] = {}
+        for record_id in candidates:
+            record: Dict[str, Any] = {}
+            neuron = neurons.get(record_id)
+            if neuron is not None:
+                record.update(neuron)
+            assembly = assemblies.get_by_id(record_id)  # type: ignore[attr-defined]
+            if assembly is not None:
+                record.update(assembly)
+            resident = resident_synapses.get(record_id)
+            if resident is not None:
+                if neuron is not None:
+                    raise ValueError("paged neuron and synapse IDs overlap")
+                record.update(resident)
+            if record or (record_id in tracked_ids and record_id in synapses):
+                record_map[record_id] = record
+        if attention_legacy_raw_active:
+            attention_active = frozenset(
+                set(attention_active)
+                | {
+                    record_id for record_id, record in record_map.items()
+                    if float(record.get("activation", 0.0) or 0.0) > 0.0
+                    or abs(float(record.get("eligibility", 0.0) or 0.0)) > 0.0
+                }
+            )
+        protected_ids = {
+            record_id for record_id, record in record_map.items()
+            if record_id in unfinished
+            or bool(record.get("rooted") or record.get("root"))
+            or str(record.get("source", "")) in {"origin", "starter", "tool-curriculum"}
+            or record_id in attention_active
+        }
+        budget = len(record_map) if resident_budget is None else max(
+            0, min(total, int(resident_budget))
+        )
+        budget = max(budget, len(protected_ids))
+        if budget >= len(record_map):
+            hot_ids = set(record_map)
+        else:
+            hot_ids = set(protected_ids)
+            hot_ids.update(
+                record_id for _, record_id in heapq.nlargest(
+                    max(0, budget - len(hot_ids)),
+                    (
+                        (
+                            self._score(record, record_id, unfinished, attention_active,
+                                        self._access_heat.get(record_id, 0.0)),
+                            record_id,
+                        )
+                        for record_id, record in record_map.items()
+                        if record_id not in hot_ids
+                    ),
+                )
+            )
+        self.hot_ids = frozenset(hot_ids)
+        # The full cold ID set is intentionally not materialized. Counts are
+        # exact for the selected hot set; transitions/candidates are exact for
+        # tracked active, accessed, page-addressed, and resident records.
+        self.cold_ids = frozenset(record_map.keys() - hot_ids)
+        self.became_hot_ids = self.hot_ids.difference(previous_hot)
+        self.became_cold_ids = previous_hot.difference(self.hot_ids)
+        self.page_in_candidate_ids = self.hot_ids.intersection(paged)
+        self.page_out_candidate_ids = (
+            frozenset() if attention_legacy_raw_active
+            else self.cold_ids.difference(paged)
+        )
+        self.revision += 1
+        self.last_status = {
+            "revision": self.revision,
+            "policy": "continuous-activity-access-retention-rooted-unfinished",
+            "updatedContinuously": True,
+            "dynamicTransitions": True,
+            "totalEntities": total,
+            "hotEntities": len(self.hot_ids),
+            "coldEntities": total - len(self.hot_ids),
+            "becameHotEntities": len(self.became_hot_ids),
+            "becameColdEntities": len(self.became_cold_ids),
+            "protectedHotEntities": len(protected_ids),
+            "activeCortexPriorityStable": not attention_legacy_raw_active,
+            "unfinishedEntities": len(unfinished),
+            "hotUnfinishedEntities": len(self.hot_ids.intersection(unfinished)),
+            "recentlyAccessedEntities": len(self._access_heat),
+            "pageInCandidates": len(self.page_in_candidate_ids),
+            "pageOutCandidates": len(self.page_out_candidate_ids),
+            "observedPageIns": self._observed_page_ins,
+            "physicalSubstratePaging": True,
+            "classificationOnly": False,
+            "persistedColdSynapses": (
+                max(0, int(getattr(synapses, "persisted_cold_count", 0)))
+                if callable(resident_items) else 0
+            ),
+            "coldIdSetComplete": False,
+            "candidateScope": "active-accessed-resident-page-addressed",
+            "protectedEntityScope": "tracked-candidates",
+            "legacyRawActivationUnscanned": bool(attention_legacy_raw_active),
+            "priority": ["currently firing", "recently read or paged in", "frequently used",
+                         "continuous retention score or rooted", "unfinished activity"],
+            "spillOrder": ["cold scratch trail", "replay batches", "optimizer moments",
+                           "inactive working patterns"],
+            "noCardinalityLimit": True,
+        }
+        return dict(self.last_status)
+
     def update(
         self,
         *,
@@ -1152,6 +1297,21 @@ class HotStateResidencyPlanner:
         resident_budget: Optional[int] = None,
         paged_assembly_ids: Iterable[str] = (),
     ) -> Dict[str, Any]:
+        if (
+            callable(getattr(neurons, "status", None))
+            and callable(getattr(neurons, "iter_pages", None))
+            and callable(getattr(assemblies, "get_by_id", None))
+        ):
+            return self._update_paged(
+                neurons=neurons,
+                assemblies=assemblies,
+                synapses=synapses,
+                unfinished_ids=unfinished_ids,
+                attention_active_ids=attention_active_ids,
+                attention_legacy_raw_active=attention_legacy_raw_active,
+                resident_budget=resident_budget,
+                paged_assembly_ids=paged_assembly_ids,
+            )
         previous_hot = self.hot_ids
         resident_items = getattr(synapses, "resident_items", None)
         physically_paged = callable(resident_items)

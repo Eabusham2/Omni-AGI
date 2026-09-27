@@ -92,8 +92,12 @@ val verifyReleaseOmniCompliance = registerComplianceVerification(
     "release",
     "app-release-unsigned.apk",
 )
-tasks.named("assembleDebug").configure { finalizedBy(verifyDebugOmniCompliance) }
-tasks.named("assembleRelease").configure { finalizedBy(verifyReleaseOmniCompliance) }
+tasks.matching { it.name == "assembleDebug" }.configureEach {
+    finalizedBy(verifyDebugOmniCompliance)
+}
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy(verifyReleaseOmniCompliance)
+}
 
 kotlin {
     compilerOptions {

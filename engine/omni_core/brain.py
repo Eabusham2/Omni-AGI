@@ -6,6 +6,7 @@ import binascii
 import copy
 import errno
 import hashlib
+import importlib.metadata
 import io
 import itertools
 import json
@@ -16,6 +17,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -37,8 +39,11 @@ from .capability_rehearsal import (
     due_rehearsal_phase,
     eligible_ground_up_rehearsal,
     rehearse_capabilities,
-    rehearse_public_capability_routes,
     structural_capability_schemas,
+)
+from .committed_paged_cache import (
+    finish_verified_index_from_loaded_vectors,
+    prepare_committed_paged_cache,
 )
 from .config import OmniConfig, safe_rounded_storage_bytes_per_second
 from .conversation_ledger import NeuralConversationLedger
@@ -61,6 +66,20 @@ from .ground_up import (
     seal_ground_up_v3_training_receipt,
     validate_ground_up_v3_training_manifest,
     validate_ground_up_v3_training_receipt,
+)
+from .ingestion_schedule_v3 import (
+    checkpoint_binding_sha256,
+    make_checkpoint_binding_v3,
+    make_ingestion_schedule_v3,
+    schedule_sha256,
+    validate_checkpoint_binding_v3,
+    validate_ingestion_schedule_v3,
+    validate_unobserved_checkpoint_binding_v3,
+)
+from .joint_generation import (
+    VerifiedArtifactCache,
+    recover_joint_generation,
+    stage_joint_generation,
 )
 from .liquid import LiquidController
 from .memory_lifecycle import OrganicMemoryLifecycle
@@ -299,6 +318,12 @@ class AdaptiveBrain:
         self.brain_id = str(brain_id)
         self.storage_path = Path(storage_path).resolve()
         self.engine_path = self.storage_path / "engine"
+        # A live paging cache is expendable, not checkpoint authority. A new
+        # process gets a new child so a crash before the first brain.json
+        # commit cannot make the next retry adopt or overwrite stale pages.
+        self._live_paging_cache_directory = (
+            self.engine_path / "state" / "live-substrate-cache" / uuid.uuid4().hex
+        )
         self.config = config
         self.resource_policy = ResourcePolicy(
             self.engine_path,
@@ -406,6 +431,7 @@ class AdaptiveBrain:
             seed=config.seed,
             growth_guard=self._allow_substrate_growth,
         )
+        self._paged_vector_cache: Optional[Dict[str, Any]] = None
         self.liquid_state = torch.zeros(1, config.idea_dim, device=self.device)
         self.working_memory: List[torch.Tensor] = []
         self.workspace_items: List[Dict[str, Any]] = []
@@ -450,6 +476,14 @@ class AdaptiveBrain:
         # The checkpoint contains counts, hashes, and neural audit summaries;
         # it never contains source text or token ids.
         self.ingestion_checkpoints: Dict[str, Dict[str, Any]] = {}
+        # A staged joint generation is authoritative only when this exact
+        # reference is atomically included in brain.json with the v3 cursor.
+        # The SQLite assembly/vector cache is derived and never referenced as
+        # an independent recovery authority.
+        self.ingestion_joint_generation: Optional[Dict[str, Any]] = None
+        self._joint_artifact_cache = VerifiedArtifactCache()
+        self._paged_substrate_required = False
+        self._verified_paged_rebuild: Optional[Any] = None
         self.completed_ingestions: List[Dict[str, Any]] = []
         self.completed_chat_turns: List[Dict[str, Any]] = []
         # Every accepted turn enters fast episodic neural state. Slow replay
@@ -699,6 +733,15 @@ class AdaptiveBrain:
                 "at": _iso_now(),
             }
             return self._state_offload_status(status)
+        if status["memoryPressure"] and self.config.disk_state_offload:
+            from .paged_assembly_view import PagedAssemblyView
+
+            if not isinstance(self.memory.assemblies, PagedAssemblyView):
+                self._ensure_paged_ingestion_substrate(0, force=True)
+                status = self.resource_policy.status()
+                if not status["memoryPressure"]:
+                    self.resource_pause = None
+                    return self._state_offload_status(status)
         if (
             status["memoryPressure"]
             and self.config.disk_state_offload
@@ -875,6 +918,27 @@ class AdaptiveBrain:
         paged_status = self.paged_working_memory.status()
         if self._fresh_attention_paged_clear_pending:
             paged_status = {**paged_status, "count": 0}
+        orphan_count = 0
+        orphan_database_bytes = 0
+        cache_parent = self._live_paging_cache_directory.parent
+        if cache_parent.is_dir() and not cache_parent.is_symlink():
+            for child in cache_parent.iterdir():
+                if (
+                    child == self._live_paging_cache_directory
+                    or not re.fullmatch(r"[0-9a-f]{32}", child.name)
+                    or not child.is_dir()
+                    or child.is_symlink()
+                ):
+                    continue
+                orphan_count += 1
+                database = child / "live-paged" / "working.sqlite3"
+                try:
+                    if database.is_file() and not database.is_symlink():
+                        orphan_database_bytes += database.stat().st_size
+                except OSError:
+                    # Another process may still be changing a derived cache.
+                    # Telemetry must not interrupt neural checkpointing.
+                    pass
         return {
             "mode": "transactional-disk-backed",
             "enabled": self.config.disk_state_offload,
@@ -896,6 +960,12 @@ class AdaptiveBrain:
                 ],
             },
             "workingMemoryPaging": paged_status,
+            "derivedLiveCacheOrphans": {
+                "count": orphan_count,
+                "knownDatabaseBytes": orphan_database_bytes,
+                "authoritative": False,
+                "autoDeletedWithoutLease": False,
+            },
             "hotStateResidency": residency,
             "pagingSemantics": {
                 "contextPagedToStorage": False,
@@ -1484,32 +1554,19 @@ class AdaptiveBrain:
             raise RuntimeError(
                 "OmniCortex v3 modality or transient-state provenance is invalid"
             )
-        all_trajectories = (
-            public.get("probe", {}).get("allToolTrajectories")
-            if isinstance(public, Mapping)
-            and isinstance(public.get("probe"), Mapping)
-            else None
-        )
         if (
             not isinstance(tool_curriculum, Mapping)
-            or tool_curriculum.get("ready") is not True
             or tool_curriculum.get("recordsVisited")
             != len(GROUND_UP_TOOL_TRAJECTORIES)
             + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES)
             or tool_curriculum.get("perActionCoverage") is not True
             or not isinstance(action_training, Mapping)
-            or action_training.get("calibrated") is not True
             or action_training.get("examples")
             != len(GROUND_UP_ACTION_EXAMPLES)
             or not isinstance(public, Mapping)
             or public.get("curriculumVersion") != 3
             or public.get("readinessProbesAreOptimizerInputs") is not False
-            or not self._public_capability_readiness_ready(public)
-            or not isinstance(all_trajectories, Mapping)
-            or all_trajectories.get("routeCount")
-            != len(GROUND_UP_TOOL_TRAJECTORIES)
-            or all_trajectories.get("negativeCount")
-            != len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES)
+            or not self._public_capability_origin_receipt_valid(public)
         ):
             raise RuntimeError(
                 "OmniCortex v3 tool/action capability receipt is invalid"
@@ -1695,7 +1752,7 @@ class AdaptiveBrain:
         checks = {
             "nativeCoreInitialized": True,
             "capabilityCurriculum": True,
-            "publicCapabilityRoutes": self._public_capability_readiness_ready(
+            "toolTrainingRecorded": self._public_capability_origin_receipt_valid(
                 (self.ground_up_training_manifest or {}).get(
                     "publicCapabilityReadiness"
                 )
@@ -1736,7 +1793,7 @@ class AdaptiveBrain:
             progress(
                 "readiness",
                 0.98,
-                "Verifying core integrity and learned tool routes before chat",
+                "Verifying neural checkpoint integrity before chat",
                 {
                     **self._build_progress_metrics(),
                     "readinessChecks": readiness,
@@ -2393,6 +2450,27 @@ class AdaptiveBrain:
 
 
     @staticmethod
+    def _public_capability_origin_receipt_valid(value: Any) -> bool:
+        """Authenticate initial training without claiming tool competence."""
+
+        return bool(
+            isinstance(value, Mapping)
+            and value.get("phase") == "initial-neural-tool-curriculum"
+            and value.get("curriculumVersion") == 3
+            and value.get("toolTrajectoriesTrained")
+            == len(GROUND_UP_TOOL_TRAJECTORIES)
+            and value.get("negativeExamplesTrained")
+            == len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES)
+            and value.get("capabilityOutcomeVerified") is False
+            and value.get("readinessProbeExecuted") is False
+            and value.get("readinessProbesAreOptimizerInputs") is False
+            and value.get("systemPrompt") is False
+            and value.get("toolDescriptionProse") is False
+            and value.get("rewardModel") is False
+            and value.get("rlhf") is False
+        )
+
+    @staticmethod
     def _public_capability_readiness_ready(value: Any) -> bool:
         if not isinstance(value, Mapping):
             return False
@@ -2541,11 +2619,10 @@ class AdaptiveBrain:
                     == dict(manifest)
                 )
                 and isinstance(tool, Mapping)
-                and tool.get("ready") is True
                 and tool.get("perActionCoverage") is True
                 and isinstance(action, Mapping)
-                and action.get("calibrated") is True
-                and self._public_capability_readiness_ready(public)
+                and action.get("examples") == len(GROUND_UP_ACTION_EXAMPLES)
+                and self._public_capability_origin_receipt_valid(public)
             )
         except (OSError, ValueError, KeyError, TypeError):
             return False
@@ -2788,7 +2865,7 @@ class AdaptiveBrain:
             # trains only the remaining floating normalization scales.
             self.decoder.action_policy.train()
             self.decoder.internal_action_policy.train()
-            if strict and self._starter_action_language_cache is None:
+            if self._starter_action_language_cache is None:
                 self._starter_action_language_cache = (
                     language_batch.detach().cpu().clone()
                 )
@@ -2860,7 +2937,7 @@ class AdaptiveBrain:
                         and readings["minimumDeployedThresholdMargin"] > 0.0
                     )
                 self.counters["training_steps"] += 1
-            if not calibrated:
+            if not calibrated and strict:
                 raise RuntimeError(
                     "native action policy did not retain its neural "
                     "confidence margin "
@@ -3268,11 +3345,11 @@ class AdaptiveBrain:
         return self._calibrate_starter_action_policy(
             # The capability curriculum intentionally shifts the shared
             # language representation before this head is calibrated. The
-            # Direct discrete ternary updates need a longer bounded window
-            # than the former floating-master optimizer. The strict measured
-            # confidence gate remains unchanged and can stop this early.
-            max_steps=256,
+            # Teach the neural action head from the declared examples. Do not
+            # quiz it into a perfect route margin before its first user turn.
+            max_steps=32,
             minimum_steps=16,
+            strict=False,
         )
 
 
@@ -3389,12 +3466,22 @@ class AdaptiveBrain:
                 "Training native action routes from the same local examples",
                 self._build_progress_metrics(),
             )
-        public_capability_readiness = rehearse_public_capability_routes(
-            self,
-            maximum_steps=256,
-            minimum_steps=1,
-            curriculum_version=3,
-        )
+        # Training coverage is recorded; capability remains unverified until
+        # the user's actual interactions. No build-time tool quiz or hidden
+        # behavioral prompt is part of the first conversation.
+        public_capability_readiness = {
+            "phase": "initial-neural-tool-curriculum",
+            "curriculumVersion": 3,
+            "toolTrajectoriesTrained": len(GROUND_UP_TOOL_TRAJECTORIES),
+            "negativeExamplesTrained": len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES),
+            "capabilityOutcomeVerified": False,
+            "readinessProbeExecuted": False,
+            "readinessProbesAreOptimizerInputs": False,
+            "systemPrompt": False,
+            "toolDescriptionProse": False,
+            "rewardModel": False,
+            "rlhf": False,
+        }
         transient_reset = self._clear_ground_up_transient_state()
         parameter_checksums_after = {
             name: tensor_checksum([parameter])
@@ -3855,23 +3942,77 @@ class AdaptiveBrain:
                 and 0 <= int(token) < brain.config.vocab_size
             ]
         substrate_metadata = metadata.get("substrate", {})
+        if not (
+            isinstance(substrate_metadata, dict)
+            and isinstance(substrate_metadata.get("persistence"), dict)
+            and substrate_metadata["persistence"].get("formatVersion") == 3
+        ):
+            raise ValueError(
+                "native OmniCortex requires a committed packed v3 substrate"
+            )
         if isinstance(substrate_metadata, dict) and isinstance(
             substrate_metadata.get("persistence"), dict
         ):
-            brain.memory = NeuralSubstrate.load_sharded(
-                engine_path / "substrate",
-                substrate_metadata,
-                growth_guard=brain._allow_substrate_growth,
-                lazy_synapses=True,
+            counts = substrate_metadata["persistence"].get("counts", {})
+            neuron_count = (
+                counts.get("neurons", 0)
+                if isinstance(counts, Mapping)
+                else 0
             )
-        else:
-            # Backward-safe internal stable-v1 loading. The public beta format
-            # remains rejected above; early stable checkpoints stored these
-            # vectors in plasticity.safetensors.
-            brain.memory = NeuralSubstrate.from_state(
-                substrate_metadata, plastic, prefix="substrate."
+            resource_status = brain.resource_policy.status()
+            ram_budget = resource_status.get("systemRamBudgetBytes")
+            if not isinstance(ram_budget, int) or ram_budget <= 0:
+                ram_budget = resource_status.get("availableMemoryBytes")
+            vector_bytes = (
+                max(0, neuron_count) * ((brain.config.vsa_dim + 3) // 4 + 8)
+                if type(neuron_count) is int else 0
             )
-            brain.memory.growth_guard = brain._allow_substrate_growth
+            page_vectors = bool(
+                brain.config.disk_state_offload
+                and (vector_bytes > 0 or metadata.get("paged_substrate_required") is True)
+                and (
+                    metadata.get("paged_substrate_required") is True
+                    or
+                    resource_status.get("memoryPressure")
+                    or (
+                        isinstance(ram_budget, int)
+                        and ram_budget > 0
+                        and vector_bytes > max(8 * 1024 * 1024, ram_budget // 64)
+                    )
+                )
+            )
+            if page_vectors:
+                with prepare_committed_paged_cache(
+                    engine_path,
+                    engine_path / "state" / "paged-substrate-cache",
+                    resource_policy=brain.resource_policy,
+                ) as prepared:
+                    brain.memory = NeuralSubstrate.load_sharded(
+                        engine_path / "substrate",
+                        substrate_metadata,
+                        growth_guard=brain._allow_substrate_growth,
+                        lazy_synapses=True,
+                        paged_vectors=prepared.vectors,
+                        paged_neurons=prepared.neurons,
+                        defer_paged_assemblies=True,
+                    )
+                    rebuilt = finish_verified_index_from_loaded_vectors(
+                        prepared, brain.memory
+                    )
+                    brain._verified_paged_rebuild = rebuilt
+                    brain._paged_vector_cache = {
+                        "generationSha256": rebuilt.generation_sha256,
+                        "vectorCount": rebuilt.neurons,
+                        "assemblyCount": rebuilt.assemblies,
+                    }
+                    brain._paged_substrate_required = True
+            else:
+                brain.memory = NeuralSubstrate.load_sharded(
+                    engine_path / "substrate",
+                    substrate_metadata,
+                    growth_guard=brain._allow_substrate_growth,
+                    lazy_synapses=True,
+                )
         if any(str(name).startswith("sequence_memory.") for name in plastic):
             raise ValueError("native OmniCortex cannot load cue-to-answer weights")
         replay = plastic.get("state.replay")
@@ -3922,6 +4063,46 @@ class AdaptiveBrain:
         brain.ingestion_checkpoints = cls._validated_ingestion_checkpoints(
             metadata.get("ingestion_checkpoints")
         )
+        paging_marker = metadata.get("paged_substrate_required")
+        if paging_marker is not None and type(paging_marker) is not bool:
+            raise ValueError("paged substrate persistence marker is invalid")
+        brain._paged_substrate_required = bool(
+            paging_marker
+        )
+        v3_checkpoints = [
+            item for item in brain.ingestion_checkpoints.values()
+            if item.get("formatVersion") == 3
+        ]
+        committed_joint_reference = metadata.get("ingestion_joint_generation")
+        if v3_checkpoints:
+            if len(v3_checkpoints) != 1 or len(brain.ingestion_checkpoints) != 1:
+                raise ValueError("v3 ingestion has more than one active cursor")
+            if not isinstance(committed_joint_reference, Mapping):
+                raise ValueError("v3 ingestion has no brain.json joint generation")
+            active_v3 = v3_checkpoints[0]
+            joint = recover_joint_generation(
+                engine_path / "state" / "ingestion-joint",
+                committed_joint_reference,
+                neural_store_root=engine_path / "state",
+                substrate_store_root=engine_path / "substrate",
+                source_manifest_sha256=active_v3["sourceManifestSha256"],
+                parser_manifest_sha256=active_v3["parserManifestSha256"],
+                source_content_sha256=active_v3["contentHash"],
+            )
+            if joint is None or (
+                joint.manifest["neuralState"]["generationId"]
+                != (brain.mutable_state_manifest or {}).get("activeGeneration")
+                or joint.manifest["substrateState"]["generationId"]
+                != (brain.memory.persistence_manifest or {}).get("activeGeneration")
+                or joint.manifest["checkpointSequence"]
+                != active_v3["commitSequence"]
+                or joint.manifest["cursor"]["committedRecords"]
+                != active_v3["committedRecords"]
+            ):
+                raise ValueError("v3 cursor is not the brain.json-committed neural generation")
+            brain.ingestion_joint_generation = dict(committed_joint_reference)
+        elif committed_joint_reference is not None:
+            raise ValueError("ingestion joint reference has no active v3 cursor")
         brain.completed_ingestions = cls._validated_completed_ingestions(
             metadata.get("completed_ingestions")
         )
@@ -4082,6 +4263,36 @@ class AdaptiveBrain:
         )
         loaded_parameter_checksum = brain.parameter_checksum()
         for active_checkpoint in brain.ingestion_checkpoints.values():
+            if active_checkpoint.get("formatVersion") == 3:
+                if core_recovery_records:
+                    raise ValueError(
+                        "v3 cursor cannot be replayed after neural core repair"
+                    )
+                vector_generation, index_generation = (
+                    cls._v3_committed_substrate_generations(
+                        brain.memory.persistence_manifest or {}
+                    )
+                )
+                observed = validate_checkpoint_binding_v3(
+                    active_checkpoint["pagedCheckpointBinding"],
+                    active_checkpoint["pagedCheckpointBindingSha256"],
+                    schedule=active_checkpoint["learningSchedule"],
+                    schedule_sha256_value=active_checkpoint["learningScheduleSha256"],
+                    source_manifest_sha256=active_checkpoint["sourceManifestSha256"],
+                    parser_manifest_sha256=active_checkpoint["parserManifestSha256"],
+                    source_content_sha256=active_checkpoint["contentHash"],
+                    neural_state_sha256=loaded_parameter_checksum,
+                    vector_generation=vector_generation,
+                    index_generation=index_generation,
+                )
+                if (
+                    observed["cursor"] != joint.manifest["cursor"]
+                    or observed["coverage"] != joint.manifest["coverage"]
+                ):
+                    raise ValueError(
+                        "v3 cursor diverges from its committed joint generation"
+                    )
+                continue
             if core_recovery_records:
                 # The record cursor and every finite neural value remain
                 # authoritative. The repaired generation is committed below
@@ -4520,6 +4731,97 @@ class AdaptiveBrain:
         )
 
     @staticmethod
+    def _ingestion_v3_manifest_hashes(
+        *, content_hash: str, source_bytes: int, resolved_kind: str,
+        source_name_hash: str, record_count_hint: Optional[int],
+    ) -> Tuple[str, str]:
+        """Hash the actual source identity and parser implementation contract.
+
+        The source hash is observed from bytes before learning; neither this
+        manifest nor the cursor stores a path, passage, token, or answer.
+        A parser-code/dependency change refuses resume rather than silently
+        changing the unvisited suffix of a committed training stream.
+        """
+
+        if not AdaptiveBrain._sha256_identifier(content_hash) or not AdaptiveBrain._sha256_identifier(source_name_hash):
+            raise ValueError("v3 source manifest lacks a verified content/name hash")
+        if type(source_bytes) is not int or source_bytes < 0:
+            raise ValueError("v3 source size is invalid")
+        if record_count_hint is not None and (
+            type(record_count_hint) is not int or record_count_hint < 0
+        ):
+            raise ValueError("v3 source row-count hint is invalid")
+        if not isinstance(resolved_kind, str) or not resolved_kind:
+            raise ValueError("v3 parser kind is invalid")
+        source_manifest = {
+            "format": "omni-observed-source-manifest",
+            "formatVersion": 1,
+            "contentSha256": content_hash,
+            "sourceBytes": source_bytes,
+            "resolvedKind": resolved_kind,
+            "sourceNameSha256": source_name_hash,
+            "recordCountHint": record_count_hint,
+        }
+        parser_path = Path(__file__).with_name("datasets.py")
+        parser_digest = hashlib.sha256()
+        with parser_path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                parser_digest.update(block)
+        dependencies: Dict[str, str] = {}
+        for package in (
+            ("pyarrow",) if resolved_kind in {"parquet", "arrow"}
+            else (("pypdf",) if resolved_kind == "pdf" else ())
+        ):
+            try:
+                dependencies[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                dependencies[package] = "unavailable"
+        parser_manifest = {
+            "format": "omni-observed-parser-manifest",
+            "formatVersion": 1,
+            "contract": INGESTION_PARSER_CONTRACT,
+            "resolvedKind": resolved_kind,
+            "datasetsCodeSha256": parser_digest.hexdigest(),
+            "pythonMajorMinor": "%d.%d" % sys.version_info[:2],
+            "dependencies": dependencies,
+        }
+        return (
+            hashlib.sha256(NeuralSubstrate._canonical_json(source_manifest)).hexdigest(),
+            hashlib.sha256(NeuralSubstrate._canonical_json(parser_manifest)).hexdigest(),
+        )
+
+    @staticmethod
+    def _v3_committed_substrate_generations(
+        pointer: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Bind both logical paged regions to one immutable v3 shard generation."""
+
+        generation_id = pointer.get("activeGeneration")
+        counts = pointer.get("counts")
+        if (
+            pointer.get("format") != "omni-substrate-shards"
+            or pointer.get("formatVersion") != 3
+            or not AdaptiveBrain._sha256_identifier(generation_id)
+            or pointer.get("contentSha256") != generation_id
+            or not isinstance(counts, Mapping)
+            or set(counts) != {"neurons", "assemblies", "synapses"}
+            or any(type(value) is not int or value < 0 for value in counts.values())
+        ):
+            raise ValueError("v3 cursor requires a committed packed substrate generation")
+        vector = {
+            "generationId": generation_id,
+            "contentSha256": generation_id,
+            "recordCount": counts["neurons"],
+        }
+        assembly_index = {
+            "generationId": generation_id,
+            "contentSha256": generation_id,
+            "recordCount": counts["assemblies"],
+            "highWaterSequence": counts["assemblies"],
+        }
+        return vector, assembly_index
+
+    @staticmethod
     def _ingestion_learning_schedule(
         neural_storage_plan: Mapping[str, Any], checkpoint_records: int
     ) -> Dict[str, Any]:
@@ -4644,6 +4946,176 @@ class AdaptiveBrain:
             )
         return schedule
 
+    @classmethod
+    def _validated_paged_ingestion_checkpoint_v3(
+        cls, source_identity: str, checkpoint: Mapping[str, Any]
+    ) -> None:
+        """Parse an explicit v3 header without authorizing paged resume.
+
+        The v3 schema can validate its own hashes and coverage now.  A resume
+        additionally needs independently observed, jointly committed paged
+        vector/index generations.  This method must not use persisted values
+        as their own observation or reinterpret a v2 cursor as v3.
+        """
+
+        if set(checkpoint) != {
+            "format", "formatVersion", "parserContract", "status",
+            "sourceIdentity", "transactionId", "contentHash",
+            "sourceNameHash", "neuralStateChecksum", "recordPrefixSha256",
+            "sourceSnapshot", "sourceBytes", "resolvedKind", "policy",
+            "epoch", "committedRecords", "visitedRecords",
+            "processedRecords", "rejectedRecords", "processedBytes",
+            "commitSequence", "coverageAtCommit", "learningSchedule",
+            "learningScheduleSha256", "baseline", "aggregate",
+            "capabilityRehearsal", "capabilityRehearsalCadence",
+            "committedAt", "sourceManifestSha256",
+            "parserManifestSha256", "expectedRecords",
+            "pagedCheckpointBinding", "pagedCheckpointBindingSha256",
+        }:
+            raise ValueError("v3 paged checkpoint contains unsupported fields")
+        if (
+            checkpoint.get("format") != INGESTION_CHECKPOINT_FORMAT
+            or type(checkpoint.get("formatVersion")) is not int
+            or checkpoint.get("formatVersion") != 3
+            or checkpoint.get("parserContract") != INGESTION_PARSER_CONTRACT
+            or checkpoint.get("status") != "active"
+            or checkpoint.get("sourceIdentity") != source_identity
+            or checkpoint.get("policy")
+            not in {"encode", "consolidate", "pretrain"}
+            or not isinstance(checkpoint.get("resolvedKind"), str)
+            or not checkpoint.get("resolvedKind")
+        ):
+            raise ValueError("v3 paged ingestion checkpoint header is invalid")
+        for field in (
+            "transactionId", "contentHash", "sourceNameHash",
+            "neuralStateChecksum", "recordPrefixSha256",
+            "sourceManifestSha256", "parserManifestSha256",
+        ):
+            if not cls._sha256_identifier(checkpoint.get(field)):
+                raise ValueError("v3 paged ingestion checkpoint %s is invalid" % field)
+        for field, minimum in (
+            ("epoch", 0), ("sourceBytes", 0),
+            ("committedRecords", 0), ("visitedRecords", 0),
+            ("processedRecords", 0), ("rejectedRecords", 0),
+            ("processedBytes", 0), ("commitSequence", 1),
+        ):
+            count = checkpoint.get(field)
+            if (
+                type(count) is not int
+                or not minimum <= count <= (1 << 63) - 1
+            ):
+                raise ValueError("v3 paged ingestion checkpoint %s is invalid" % field)
+        expected_records = checkpoint.get("expectedRecords")
+        if expected_records is not None and (
+            type(expected_records) is not int or expected_records < 0
+        ):
+            raise ValueError("v3 paged checkpoint expected row count is invalid")
+        snapshot = checkpoint.get("sourceSnapshot")
+        snapshot_base = {"device", "inode", "size", "mtimeNs"}
+        sqlite_extra = {
+            "sqlite%s%s" % (sidecar, suffix)
+            for sidecar in ("Wal", "Shm")
+            for suffix in ("Present", "Device", "Inode", "Size", "MtimeNs")
+        }
+        if (
+            not isinstance(snapshot, Mapping)
+            or not snapshot_base <= set(snapshot)
+            or set(snapshot) - snapshot_base not in (set(), sqlite_extra)
+            or any(type(value) is not int or value < 0 for value in snapshot.values())
+        ):
+            raise ValueError("v3 paged checkpoint source snapshot is invalid")
+        baseline = checkpoint.get("baseline")
+        baseline_counts = {
+            "concepts", "ideas", "plasticityEvents", "memoryNeurons",
+            "memorySynapses", "memorySynapticUses", "trainingSteps",
+            "statisticalExperiences",
+        }
+        if (
+            not isinstance(baseline, Mapping)
+            or set(baseline) != baseline_counts | {"parameterChecksum"}
+            or not cls._sha256_identifier(baseline.get("parameterChecksum"))
+            or any(type(baseline[field]) is not int or baseline[field] < 0
+                   for field in baseline_counts)
+        ):
+            raise ValueError("v3 paged checkpoint baseline is invalid")
+        aggregate = checkpoint.get("aggregate")
+        aggregate_counts = {
+            "learnedChunks", "readingReportCount", "streamingGradientRecords",
+            "streamingGradientOptimizerSteps",
+        }
+        if (
+            not isinstance(aggregate, Mapping)
+            or set(aggregate) != aggregate_counts | {"lossTotal", "mediaAccumulator"}
+            or any(type(aggregate[field]) is not int or aggregate[field] < 0
+                   for field in aggregate_counts)
+            or isinstance(aggregate.get("lossTotal"), bool)
+            or not isinstance(aggregate.get("lossTotal"), (int, float))
+            or not math.isfinite(float(aggregate["lossTotal"]))
+            or not isinstance(aggregate.get("mediaAccumulator"), Mapping)
+            or dict(aggregate["mediaAccumulator"])
+            != cls._checkpoint_media_accumulator(aggregate["mediaAccumulator"])
+        ):
+            raise ValueError("v3 paged checkpoint aggregate is invalid")
+        covered = checkpoint.get("coverageAtCommit")
+        coverage_counts = {
+            "discoveredFiles", "completedFiles", "processedFiles",
+            "rejectedFiles", "discoveredRecords", "processedRecords",
+            "rejectedRecords", "processedBytes", "shards", "errorCount",
+        }
+        if (
+            not isinstance(covered, Mapping)
+            or set(covered) != coverage_counts | {
+                "modalityCounts", "errors", "errorsTruncated", "complete"
+            }
+            or any(type(covered[field]) is not int or covered[field] < 0
+                   for field in coverage_counts)
+            or covered["errors"] != []
+            or type(covered["errorsTruncated"]) is not bool
+            or type(covered["complete"]) is not bool
+            or not isinstance(covered["modalityCounts"], Mapping)
+            or any(
+                not isinstance(kind, str) or len(kind) > 32
+                or type(count) is not int or count < 0
+                for kind, count in covered["modalityCounts"].items()
+            )
+            or covered["discoveredRecords"] != checkpoint["visitedRecords"]
+            or covered["processedRecords"] != checkpoint["processedRecords"]
+            or covered["rejectedRecords"] != checkpoint["rejectedRecords"]
+            or covered["processedBytes"] != checkpoint["processedBytes"]
+        ):
+            raise ValueError("v3 paged checkpoint coverage snapshot is invalid")
+        schedule = validate_ingestion_schedule_v3(
+            checkpoint.get("learningSchedule"),
+            checkpoint.get("learningScheduleSha256"),
+            source_manifest_sha256=checkpoint["sourceManifestSha256"],
+            parser_manifest_sha256=checkpoint["parserManifestSha256"],
+            source_content_sha256=checkpoint["contentHash"],
+        )
+        binding = validate_unobserved_checkpoint_binding_v3(
+            checkpoint.get("pagedCheckpointBinding"),
+            checkpoint.get("pagedCheckpointBindingSha256"),
+            schedule=schedule,
+            schedule_sha256_value=checkpoint["learningScheduleSha256"],
+            source_manifest_sha256=checkpoint["sourceManifestSha256"],
+            parser_manifest_sha256=checkpoint["parserManifestSha256"],
+            source_content_sha256=checkpoint["contentHash"],
+        )
+        cursor = binding["cursor"]
+        coverage = binding["coverage"]
+        for field, expected in (
+            ("neuralStateChecksum", binding["neuralStateSha256"]),
+            ("recordPrefixSha256", cursor["recordPrefixSha256"]),
+            ("committedRecords", cursor["committedRecords"]),
+            ("visitedRecords", coverage["visitedRecords"]),
+            ("processedRecords", coverage["processedRecords"]),
+            ("rejectedRecords", coverage["rejectedRecords"]),
+            ("processedBytes", coverage["processedBytes"]),
+            ("commitSequence", binding["checkpointSequence"]),
+        ):
+            if checkpoint[field] != expected:
+                raise ValueError(
+                    "v3 paged ingestion checkpoint %s binding mismatch" % field
+                )
 
     @classmethod
     def _validated_ingestion_checkpoints(
@@ -4666,6 +5138,13 @@ class AdaptiveBrain:
             if not cls._sha256_identifier(key) or not isinstance(raw, Mapping):
                 raise ValueError("ingestion checkpoint identity is invalid")
             checkpoint = dict(raw)
+            if (
+                type(checkpoint.get("formatVersion")) is int
+                and checkpoint["formatVersion"] == 3
+            ):
+                cls._validated_paged_ingestion_checkpoint_v3(key, checkpoint)
+                validated[str(key)] = checkpoint
+                continue
             if (
                 checkpoint.get("format") != INGESTION_CHECKPOINT_FORMAT
                 or int(checkpoint.get("formatVersion", 0))
@@ -5405,6 +5884,7 @@ class AdaptiveBrain:
         self, pointer: Mapping[str, Any]
     ) -> None:
         if not self.ingestion_checkpoints:
+            self.ingestion_joint_generation = None
             return
         current_neural_checksum = self.parameter_checksum()
         substrate_pointer = self.memory.persistence_manifest or {}
@@ -5419,6 +5899,66 @@ class AdaptiveBrain:
                 raise RuntimeError(
                     "active ingestion cursor does not describe current neural state"
                 )
+            if checkpoint.get("formatVersion") == 3:
+                schedule = validate_ingestion_schedule_v3(
+                    checkpoint.get("learningSchedule"),
+                    checkpoint.get("learningScheduleSha256"),
+                    source_manifest_sha256=checkpoint["sourceManifestSha256"],
+                    parser_manifest_sha256=checkpoint["parserManifestSha256"],
+                    source_content_sha256=checkpoint["contentHash"],
+                )
+                counts = self.memory.persistence_manifest or {}
+                vector_generation, index_generation = (
+                    self._v3_committed_substrate_generations(counts)
+                )
+                coverage = {
+                    "visitedRecords": int(checkpoint["visitedRecords"]),
+                    "processedRecords": int(checkpoint["processedRecords"]),
+                    "rejectedRecords": int(checkpoint["rejectedRecords"]),
+                    "processedBytes": int(checkpoint["processedBytes"]),
+                    "expectedRecords": checkpoint.get("expectedRecords"),
+                    "sourceStreamExhausted": False,
+                    "sourceContentReverifiedSha256": None,
+                }
+                cursor = {
+                    "committedRecords": int(checkpoint["committedRecords"]),
+                    "recordPrefixSha256": str(checkpoint["recordPrefixSha256"]),
+                }
+                binding = make_checkpoint_binding_v3(
+                    schedule=schedule,
+                    schedule_sha256_value=checkpoint["learningScheduleSha256"],
+                    neural_state_sha256=current_neural_checksum,
+                    checkpoint_sequence=int(checkpoint["commitSequence"]),
+                    cursor=cursor,
+                    coverage=coverage,
+                    vector_generation=vector_generation,
+                    index_generation=index_generation,
+                )
+                # Stage immutable neural and substrate references without a
+                # full SQLite backup. The cache can be rebuilt from verified
+                # v3 shards; only brain.json commits this reference/cursor.
+                reference = stage_joint_generation(
+                    self.engine_path / "state" / "ingestion-joint",
+                    neural_store_root=self.engine_path / "state",
+                    neural_pointer=pointer,
+                    substrate_store_root=self.engine_path / "substrate",
+                    substrate_pointer=counts,
+                    sqlite_backup=None,
+                    source_manifest_sha256=checkpoint["sourceManifestSha256"],
+                    parser_manifest_sha256=checkpoint["parserManifestSha256"],
+                    source_content_sha256=checkpoint["contentHash"],
+                    checkpoint_sequence=int(checkpoint["commitSequence"]),
+                    cursor=cursor,
+                    coverage=coverage,
+                    previous_reference=self.ingestion_joint_generation,
+                    verified_cache=self._joint_artifact_cache,
+                )
+                checkpoint["pagedCheckpointBinding"] = binding
+                checkpoint["pagedCheckpointBindingSha256"] = (
+                    checkpoint_binding_sha256(binding)
+                )
+                self.ingestion_joint_generation = reference
+                continue
             binding = {
                 "format": "omni-ingestion-generation-binding",
                 "formatVersion": 1,
@@ -5612,6 +6152,8 @@ class AdaptiveBrain:
                 if isinstance(value, Mapping)
             ],
             "ingestion_checkpoints": self.ingestion_checkpoints,
+            "ingestion_joint_generation": self.ingestion_joint_generation,
+            "paged_substrate_required": self._paged_substrate_required,
             "completed_ingestions": self.completed_ingestions[
                 -COMPLETED_INGESTION_TOMBSTONES:
             ],
@@ -5703,7 +6245,10 @@ class AdaptiveBrain:
         else:
             # The bounded, content-addressed substrate generation is complete
             # before metadata can point at it. Unchanged shard blobs are reused.
-            self.memory.save_sharded(self.engine_path / "substrate")
+            self.memory.save_sharded(
+                self.engine_path / "substrate",
+                disk_reserve=self.resource_policy.require_disk,
+            )
         core = self._core_tensors()
         plasticity = self._plastic_tensors()
         try:
@@ -6212,24 +6757,35 @@ class AdaptiveBrain:
             "packedExecution": self.packed_runtime_audit(),
         }
 
-    def _organic_state(self) -> Dict[str, float]:
-        neurons = list(self.memory.neurons.values())
-        uncertainty = (
-            sum(float(item.get("uncertainty", 0.5)) for item in neurons)
-            / float(len(neurons))
-            if neurons
-            else 0.5
-        )
-        active = (
-            sum(
-                1
-                for item in neurons
-                if self.memory.effective_activation(item) >= 0.1
+    def _organic_state(self) -> Dict[str, Any]:
+        from .paged_neuron_metadata import PagedNeuronMetadata
+
+        estimated_activity = False
+        sampled_neurons = 0
+        if isinstance(self.memory.neurons, PagedNeuronMetadata):
+            measured = self.memory.neurons.activity_metrics(
+                active_ids=self.memory.attention_active_neuron_ids,
+                legacy_raw_active=self.memory.attention_legacy_raw_active,
+                threshold=0.1,
+                sample_rows=512,
             )
-            / float(len(neurons))
-            if neurons
-            else 0.0
-        )
+            uncertainty = float(measured["meanUncertainty"])
+            active = float(measured["activeFraction"])
+            estimated_activity = bool(measured["estimated"])
+            sampled_neurons = int(measured["sampledRows"])
+        else:
+            count = 0
+            uncertainty_total = 0.0
+            active_count = 0
+            for item in self.memory.neurons.values():
+                count += 1
+                uncertainty_total += float(item.get("uncertainty", 0.5))
+                active_count += int(
+                    self.memory.effective_activation(item) >= 0.1
+                )
+            uncertainty = uncertainty_total / count if count else 0.5
+            active = active_count / count if count else 0.0
+            sampled_neurons = count
         attention_epoch = self._attention_epoch()
         attention_traces = [
             trace
@@ -6289,6 +6845,8 @@ class AdaptiveBrain:
             "predictionError": prediction_error,
             "learningProgress": learning_progress,
             "activeFraction": active,
+            "activityEstimated": estimated_activity,
+            "sampledNeurons": sampled_neurons,
             "tension": tension,
             "curiosity": curiosity,
         }
@@ -9381,14 +9939,22 @@ class AdaptiveBrain:
         if policy["diskPressure"]:
             reason = "available disk is below the neural growth reserve"
         elif policy["memoryPressure"]:
-            # First make optimizer and recurrent scratch durable. Structural
-            # records themselves still need RAM, so growth pauses if pressure
-            # remains after the spill rather than risking an OOM.
+            # First spill eligible scratch, then sample the same projected
+            # growth again. A successful spill must not leave this operation
+            # falsely marked blocked from the pre-spill reading.
             try:
                 self._maintain_neural_state_resources()
             except NeuralStateResourcePause:
                 pass
-            reason = "available memory is below the neural growth reserve"
+            policy = self.resource_policy.status(
+                estimated_write_bytes=estimated_bytes * 2,
+                estimated_ram_bytes=estimated_bytes,
+            )
+            readings = self._resource_readings()
+            if policy["diskPressure"]:
+                reason = "available disk is below the neural growth reserve"
+            elif policy["memoryPressure"]:
+                reason = "available memory is below the neural growth reserve"
         if reason:
             self.growth_pause = {
                 "reason": reason,
@@ -9397,6 +9963,7 @@ class AdaptiveBrain:
                 "at": _iso_now(),
             }
             return False
+        self.growth_pause = None
         return True
 
     def _resource_readings(self) -> Dict[str, Any]:
@@ -9536,17 +10103,15 @@ class AdaptiveBrain:
     def _streaming_neural_storage_plan(
         self, source_bytes: int
     ) -> Dict[str, Any]:
-        """Choose detailed versus statistical encoding from real headroom.
+        """Keep detailed neural encoding independent of total source size.
 
-        Exact per-row assemblies and their distributed vectors amplify source bytes
-        through metadata, activations, and packed ternary synapses. Large sources
-        currently use a shared semantic field with
-        local sparse synapse updates from their first record instead of filling memory
-        and switching representations halfway through an epoch. Small sources
-        are classified against the stable device envelope; a transient RAM
-        watermark defers their detailed schedule instead of silently changing
-        it to statistical-only. This is a resource-derived representation
-        choice, not a record/concept cap.
+        The old whole-source estimate multiplied compressed bytes by every
+        potential structure, then silently mapped a large corpus to a shared
+        semantic field. That changed what the brain could learn from each
+        record. Admit one bounded checkpoint window instead; every record
+        remains eligible for its own distributed assembly. A real RAM/disk
+        refusal pauses at the last committed cursor, never downgrades the
+        representation or skips the remainder of a dataset.
         """
 
         source_bytes = max(0, int(source_bytes))
@@ -9563,22 +10128,20 @@ class AdaptiveBrain:
             if isinstance(available_memory, int)
             else disk_headroom
         )
-        system_ram_budget = int(
-            status.get("systemRamBudgetBytes", 0) or 0
-        )
+        system_ram_budget = int(status.get("systemRamBudgetBytes", 0) or 0)
         nominal_ram_capacity = (
             system_ram_budget if system_ram_budget > 0 else ram_headroom
         )
-        usable_headroom = min(disk_headroom, nominal_ram_capacity)
-        # The projection estimate deliberately errs high: compressed source
-        # text commonly expands into several semantic/synaptic structures and
-        # exact response codes. The 25% fraction preserves checkpoint and
-        # optimizer headroom inside the already-reserved safe region.
-        projected_detailed_bytes = source_bytes * max(
-            64, self.config.vsa_dim * 5
+        # This is only a bounded-window admission estimate, not a claim that
+        # every future record is the same size. Actual growth and checkpoint
+        # writes remain guarded at their own allocation boundaries.
+        projected_detailed_bytes = max(
+            64 * 1024,
+            int(self._ingestion_checkpoint_records)
+            * (max(64, (self.config.vsa_dim + 3) // 4) + 2048),
         )
-        detailed_budget = max(1, usable_headroom // 4)
-        detailed = projected_detailed_bytes <= detailed_budget
+        detailed_budget = min(disk_headroom, nominal_ram_capacity)
+        detailed = True
         detailed_admission = self.resource_policy.status(
             estimated_write_bytes=projected_detailed_bytes * 2,
             estimated_ram_bytes=projected_detailed_bytes,
@@ -9591,10 +10154,11 @@ class AdaptiveBrain:
             )
         )
         return {
-            "policy": "resource-derived-neural-representation",
+            "policy": "bounded-window-detailed-neural-representation",
             "sourceBytes": source_bytes,
             "projectedDetailedBytes": projected_detailed_bytes,
             "detailedBudgetBytes": detailed_budget,
+            "projectionScope": "next-checkpoint-window-not-whole-source",
             "nominalRamCapacityBytes": nominal_ram_capacity,
             "diskHeadroomBytes": disk_headroom,
             "ramHeadroomBytes": ram_headroom,
@@ -9604,24 +10168,12 @@ class AdaptiveBrain:
             "representationDecision": (
                 "detailed-awaiting-resources"
                 if detailed_deferred
-                else (
-                    "detailed-admitted"
-                    if detailed
-                    else "statistical-source-scale"
-                )
+                else "detailed-admitted"
             ),
             "representationDowngradedForTransientPressure": False,
             "detailedAdmissionStatus": detailed_admission,
-            "corpusRepresentation": (
-                "detailed-distributed-assemblies"
-                if detailed
-                else "shared-semantic-field-and-local-synapses"
-            ),
-            "slowGradientMode": (
-                "per-experience"
-                if detailed
-                else "streaming-microbatch-gradient-accumulation"
-            ),
+            "corpusRepresentation": "detailed-distributed-assemblies",
+            "slowGradientMode": "per-experience",
             "physicalBatchRecords": int(training_plan["physicalBatchRecords"]),
             "gradientAccumulation": int(training_plan["gradientAccumulation"]),
             "trainingSequenceTokens": int(
@@ -9635,6 +10187,85 @@ class AdaptiveBrain:
             "silentRecordSkipping": False,
             "resourceStatus": status,
         }
+
+    def _ensure_paged_ingestion_substrate(
+        self, source_bytes: int, *, force: bool = False
+    ) -> None:
+        """Page packed state when physical pressure warrants it.
+
+        A high-RAM brain may keep its live assemblies resident while its saved
+        generation remains packed v3 shards. Paging is a physical choice,
+        never a change in semantic detail or a prerequisite for learning.
+        The working SQLite file is derived; the next save must publish its
+        neural rows through packed v3 shards and brain.json before the cursor
+        can advance. A stale cache fails closed for explicit reconciliation.
+        """
+
+        from .live_paging_migration import migrate_live_substrate_to_paged
+        from .paged_assembly_vector_view import PagedAssemblyVectorView
+        from .paged_assembly_view import PagedAssemblyView
+        from .paged_packed_vectors import PagedPackedVectors
+
+        if (
+            isinstance(self.memory.assemblies, PagedAssemblyView)
+            and isinstance(self.memory.neuron_vectors, PagedPackedVectors)
+        ):
+            index = self.memory.assemblies.index
+            vectors = self.memory.neuron_vectors
+            view = self.memory.assembly_vectors
+            if (
+                index._vectors is not vectors
+                or index.path.resolve() != vectors.path.resolve()
+                or not isinstance(view, PagedAssemblyVectorView)
+                or view.index is not index
+                or view.backing is not vectors
+            ):
+                raise ValueError("paged neural regions lost their shared row authority")
+            self._paged_substrate_required = True
+            return
+        readings = self.resource_policy.status()
+        if not self.config.disk_state_offload:
+            if readings["memoryPressure"]:
+                raise NeuralStateResourcePause(
+                    "resident neural state reached its RAM reserve and disk "
+                    "offload is disabled", readings,
+                )
+            return
+        if readings["diskPressure"]:
+            raise NeuralStateResourcePause(
+                "paged neural ingestion reached the mandatory disk reserve",
+                readings,
+            )
+        system_budget = int(readings.get("systemRamBudgetBytes", 0) or 0)
+        resident_projection = (
+            len(self.memory.neurons)
+            * ((self.config.vsa_dim + 3) // 4 + 96)
+            + len(self.memory.assemblies) * 1536
+        )
+        page_worthwhile = bool(
+            force
+            or readings["memoryPressure"]
+            or (
+                system_budget > 0
+                and (
+                    resident_projection > system_budget // 8
+                    or max(0, int(source_bytes)) > system_budget // 4
+                )
+            )
+        )
+        if not page_worthwhile:
+            return
+        try:
+            migrate_live_substrate_to_paged(
+                self.memory,
+                self._live_paging_cache_directory,
+                disk_reserve=self.resource_policy.require_disk,
+            )
+        except SubstrateResourcePause as error:
+            raise NeuralStateResourcePause(
+                str(error), self.resource_policy.status()
+            ) from error
+        self._paged_substrate_required = True
 
     def _preview_chat_experience(
         self,
@@ -10059,19 +10690,19 @@ class AdaptiveBrain:
         # neural assemblies. They are not a second authoritative memory store.
         for recalled_item in recalled:
             assembly_id = str(recalled_item.get("assembly_id", ""))
-            node = self.memory.neurons.get(assembly_id)
-            if node is not None:
-                uncertainty = float(node.get("uncertainty", 0.5))
-                node["uncertainty"] = max(
-                    0.0, min(1.0, uncertainty - sign * 0.04)
-                )
-                node["activation"] = max(
-                    0.0,
-                    min(
-                        1.0,
-                        self.memory.effective_activation(node)
-                        + sign * 0.03,
-                    ),
+            if assembly_id in self.memory.neurons:
+                def revise_feedback_node(node: Dict[str, Any]) -> None:
+                    current_activation = self.memory.effective_activation(node)
+                    uncertainty = float(node.get("uncertainty", 0.5))
+                    node["uncertainty"] = max(
+                        0.0, min(1.0, uncertainty - sign * 0.04)
+                    )
+                    node["activation"] = max(
+                        0.0, min(1.0, current_activation + sign * 0.03)
+                    )
+
+                self.memory.edit_neuron_by_id(
+                    assembly_id, revise_feedback_node
                 )
                 self.memory.mark_attention_neuron(assembly_id)
         self._append_working_memory(
@@ -16111,6 +16742,8 @@ class AdaptiveBrain:
                     )
         checkpoint_key = ""
         checkpoint: Optional[Dict[str, Any]] = None
+        source_manifest_sha256 = ""
+        parser_manifest_sha256 = ""
         transaction_id = ""
         source_name_hash = hashlib.sha256(
             source_name.encode("utf-8")
@@ -16153,6 +16786,67 @@ class AdaptiveBrain:
                         "active ingestion checkpoint does not match content hash, "
                         "epoch, policy, kind, size, or source name"
                     )
+            if checkpoint is None or checkpoint.get("formatVersion") == 3:
+                # v3 may not treat a caller-supplied expected hash as a fresh
+                # observation. Read the actual file before the first neural
+                # update and again at final traversal verification.
+                verify_source_snapshot(full_hash=True)
+                source_manifest_sha256, parser_manifest_sha256 = (
+                    self._ingestion_v3_manifest_hashes(
+                        content_hash=content_hash,
+                        source_bytes=source_bytes,
+                        resolved_kind=resolved_kind,
+                        source_name_hash=source_name_hash,
+                        record_count_hint=record_count_hint,
+                    )
+                )
+            if checkpoint is not None and checkpoint.get("formatVersion") == 3:
+                if (
+                    checkpoint["sourceManifestSha256"] != source_manifest_sha256
+                    or checkpoint["parserManifestSha256"] != parser_manifest_sha256
+                    or checkpoint["expectedRecords"] != record_count_hint
+                ):
+                    raise ValueError(
+                        "v3 source/parser manifest changed before cursor resume"
+                    )
+                observed_joint = recover_joint_generation(
+                    self.engine_path / "state" / "ingestion-joint",
+                    self.ingestion_joint_generation,
+                    neural_store_root=self.engine_path / "state",
+                    substrate_store_root=self.engine_path / "substrate",
+                    source_manifest_sha256=source_manifest_sha256,
+                    parser_manifest_sha256=parser_manifest_sha256,
+                    source_content_sha256=content_hash,
+                )
+                if observed_joint is None or (
+                    observed_joint.manifest["neuralState"]["generationId"]
+                    != (self.mutable_state_manifest or {}).get("activeGeneration")
+                    or observed_joint.manifest["substrateState"]["generationId"]
+                    != (self.memory.persistence_manifest or {}).get("activeGeneration")
+                ):
+                    raise ValueError("v3 resume has no matching committed neural state")
+                vector_generation, index_generation = (
+                    self._v3_committed_substrate_generations(
+                        self.memory.persistence_manifest or {}
+                    )
+                )
+                observed_binding = validate_checkpoint_binding_v3(
+                    checkpoint["pagedCheckpointBinding"],
+                    checkpoint["pagedCheckpointBindingSha256"],
+                    schedule=checkpoint["learningSchedule"],
+                    schedule_sha256_value=checkpoint["learningScheduleSha256"],
+                    source_manifest_sha256=source_manifest_sha256,
+                    parser_manifest_sha256=parser_manifest_sha256,
+                    source_content_sha256=content_hash,
+                    neural_state_sha256=self.parameter_checksum(),
+                    vector_generation=vector_generation,
+                    index_generation=index_generation,
+                )
+                if (
+                    observed_binding["cursor"] != observed_joint.manifest["cursor"]
+                    or observed_binding["coverage"] != observed_joint.manifest["coverage"]
+                ):
+                    raise ValueError("v3 resume cursor differs from committed coverage")
         if self.ingestion_checkpoints and checkpoint is None:
             # Neural state may only advance along the transaction named by its
             # committed cursor. Interleaving another source would make a later
@@ -16246,9 +16940,34 @@ class AdaptiveBrain:
             }
         neural_storage_plan = self._streaming_neural_storage_plan(source_bytes)
         if checkpoint is None:
-            learning_schedule = self._ingestion_learning_schedule(
-                neural_storage_plan, self._ingestion_checkpoint_records
-            )
+            if checkpoint_key:
+                self._ensure_paged_ingestion_substrate(source_bytes)
+                learning_schedule = make_ingestion_schedule_v3(
+                    source_manifest_sha256=source_manifest_sha256,
+                    source_content_sha256=content_hash,
+                    parser_manifest_sha256=parser_manifest_sha256,
+                    physical_batch_records=max(
+                        1, int(neural_storage_plan["physicalBatchRecords"])
+                    ),
+                    gradient_accumulation=max(
+                        1, int(neural_storage_plan["gradientAccumulation"])
+                    ),
+                    training_sequence_tokens=max(
+                        8, int(neural_storage_plan["trainingSequenceTokens"])
+                    ),
+                    checkpoint_records=max(1, int(self._ingestion_checkpoint_records)),
+                    assembly_page_records=128,
+                )
+                for field in (
+                    "detailedRecordAssemblies", "corpusRepresentation",
+                    "slowGradientMode", "physicalBatchRecords",
+                    "gradientAccumulation", "trainingSequenceTokens",
+                ):
+                    neural_storage_plan[field] = learning_schedule[field]
+            else:
+                learning_schedule = self._ingestion_learning_schedule(
+                    neural_storage_plan, self._ingestion_checkpoint_records
+                )
         else:
             # The current plan remains useful for live pause/readiness signals,
             # but it must not rewrite choices that already produced committed
@@ -16435,8 +17154,15 @@ class AdaptiveBrain:
         )
         streaming_local_pending: List[Tuple[str, torch.Tensor]] = []
         learning_schedule_started = checkpoint is not None
-        compact_streaming = not bool(
-            neural_storage_plan["detailedRecordAssemblies"]
+        # Representation and gradient cadence are independent in the paged
+        # ingestion contract: a large source needs a distinct distributed
+        # assembly for each experience without forcing an optimizer step per
+        # section. Version 2 schedules still encode the old coupled choices,
+        # so this preserves their behavior while allowing v3 to use detailed
+        # assemblies with bounded streaming microbatches.
+        compact_streaming = (
+            str(neural_storage_plan["slowGradientMode"])
+            == "streaming-microbatch-gradient-accumulation"
         )
         capability_rehearsal_enabled = bool(
             policy == "pretrain" and eligible_ground_up_rehearsal(self)
@@ -16827,9 +17553,21 @@ class AdaptiveBrain:
                 "trainingSteps": before_training_steps,
                 "statisticalExperiences": before_statistical_experiences,
             }
+            v3_checkpoint = learning_schedule.get("formatVersion") == 3
+            checkpoint_coverage = dict(coverage_snapshot)
+            if v3_checkpoint:
+                # Detailed diagnostics can retain source paths/error text in
+                # RAM for the UI, but a neural cursor persists only counts,
+                # hashes, and fixed protocol metadata.
+                checkpoint_coverage["errors"] = []
+                checkpoint_coverage["errorsTruncated"] = bool(
+                    checkpoint_coverage.get("errorCount", 0)
+                )
             checkpoint = {
                 "format": INGESTION_CHECKPOINT_FORMAT,
-                "formatVersion": INGESTION_CHECKPOINT_VERSION,
+                "formatVersion": (
+                    3 if v3_checkpoint else INGESTION_CHECKPOINT_VERSION
+                ),
                 "parserContract": INGESTION_PARSER_CONTRACT,
                 "status": "active",
                 "sourceIdentity": checkpoint_key,
@@ -16849,17 +17587,9 @@ class AdaptiveBrain:
                 "rejectedRecords": int(coverage_snapshot["rejectedRecords"]),
                 "processedBytes": int(coverage_snapshot["processedBytes"]),
                 "commitSequence": commit_sequence,
-                "coverageAtCommit": coverage_snapshot,
+                "coverageAtCommit": checkpoint_coverage,
                 "learningSchedule": dict(learning_schedule),
-                "learningScheduleSha256": hashlib.sha256(
-                    json.dumps(
-                        learning_schedule,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ).encode("utf-8")
-                ).hexdigest(),
+                "learningScheduleSha256": schedule_sha256(learning_schedule),
                 "baseline": baseline,
                 "aggregate": {
                     "lossTotal": float(loss_total),
@@ -16887,6 +17617,16 @@ class AdaptiveBrain:
                 ),
                 "committedAt": _iso_now(),
             }
+            if v3_checkpoint:
+                checkpoint.update({
+                    "sourceManifestSha256": source_manifest_sha256,
+                    "parserManifestSha256": parser_manifest_sha256,
+                    "expectedRecords": record_count_hint,
+                    # Populated only after immutable neural+substrate staging,
+                    # before the single authoritative brain.json replacement.
+                    "pagedCheckpointBinding": None,
+                    "pagedCheckpointBindingSha256": None,
+                })
             self.ingestion_checkpoints[checkpoint_key] = checkpoint
             # save() publishes neural tensors, optimizer/replay state, and this
             # cursor through one generation pointer plus one atomic brain.json
@@ -17160,7 +17900,7 @@ class AdaptiveBrain:
                             train_local=not compact_streaming,
                             local_exact_response_windows=(
                                 int(learning_schedule["formatVersion"])
-                                == INGESTION_LEARNING_SCHEDULE_VERSION
+                                in {INGESTION_LEARNING_SCHEDULE_VERSION, 3}
                                 and learning_schedule.get(
                                     "localTypedTargetWindowPolicy"
                                 )
@@ -17169,7 +17909,7 @@ class AdaptiveBrain:
                             local_exact_training_sequence_tokens=(
                                 int(learning_schedule["trainingSequenceTokens"])
                                 if int(learning_schedule["formatVersion"])
-                                == INGESTION_LEARNING_SCHEDULE_VERSION
+                                in {INGESTION_LEARNING_SCHEDULE_VERSION, 3}
                                 else None
                             ),
                             local_exact_target_window_policy=(
@@ -17179,7 +17919,7 @@ class AdaptiveBrain:
                                     ]
                                 )
                                 if int(learning_schedule["formatVersion"])
-                                == INGESTION_LEARNING_SCHEDULE_VERSION
+                                in {INGESTION_LEARNING_SCHEDULE_VERSION, 3}
                                 else None
                             ),
                         )

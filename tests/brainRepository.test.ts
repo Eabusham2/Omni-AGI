@@ -209,9 +209,37 @@ async function writeSubstrateFixture(
   engineDirectory: string,
   sourceLabel?: string,
   generationNote?: string,
-  formatVersion: 1 | 2 = 1
+  formatVersion: 1 | 2 | 3 = 1
 ): Promise<Record<string, unknown>> {
   const store = join(engineDirectory, "substrate");
+  const packedRows = Buffer.alloc(4, 0x55);
+  const updateCounters = Buffer.alloc(8);
+  const packedHeaderValue = {
+    packed_rows: { dtype: "U8", shape: [1, 4], data_offsets: [0, 4] },
+    update_counters_le: { dtype: "U8", shape: [1, 8], data_offsets: [4, 12] }
+  };
+  const packedHeaderJson = JSON.stringify(packedHeaderValue);
+  const packedHeader = Buffer.from(
+    packedHeaderJson.padEnd(Math.ceil(packedHeaderJson.length / 8) * 8, " ")
+  );
+  const packedPrefix = Buffer.alloc(8);
+  packedPrefix.writeBigUInt64LE(BigInt(packedHeader.byteLength));
+  const packedTensorBytes = Buffer.concat([
+    packedPrefix, packedHeader, packedRows, updateCounters
+  ]);
+  const packedTensorHash = digest(packedTensorBytes);
+  const packedMetadata = {
+    format: "omni-packed-vsa-vectors",
+    formatVersion: 1,
+    dimensions: 16,
+    seed: 7,
+    zeroDeadband: 0.25,
+    rowCount: 1,
+    ids: ["neuron-fixture"],
+    idsSha256: digest(JSON.stringify(["neuron-fixture"])),
+    packedSha256: digest(packedRows),
+    countersSha256: digest(updateCounters)
+  };
   const record = {
     kind: "neurons",
     ids: ["neuron-fixture"],
@@ -220,14 +248,15 @@ async function writeSubstrateFixture(
       region: "cortical",
       ...(sourceLabel === undefined ? {} : { source_label: sourceLabel })
     }],
-    vectorIds: []
+    vectorIds: formatVersion === 3 ? ["neuron-fixture"] : [],
+    ...(formatVersion === 3 ? { packedVectorState: packedMetadata } : {})
   };
   const recordBytes = Buffer.from(canonicalJson(record));
   const recordHash = digest(recordBytes);
   const generationBody = {
     format: "omni-substrate-shards",
     formatVersion,
-    schema: 1,
+    schema: formatVersion === 3 ? "neural-substrate-2" : 1,
     dimensions: 16,
     seed: 7,
     growthEvents: 1,
@@ -238,7 +267,7 @@ async function writeSubstrateFixture(
     shards: [
       {
         kind: "neurons",
-        bucket: "a",
+        bucket: digest("neurons:neuron-fixture").slice(0, 1),
         part: 0,
         count: 1,
         records: {
@@ -246,7 +275,11 @@ async function writeSubstrateFixture(
           sha256: recordHash,
           bytes: recordBytes.byteLength
         },
-        tensors: null
+        tensors: formatVersion === 3 ? {
+          path: `blobs/${packedTensorHash}.safetensors`,
+          sha256: packedTensorHash,
+          bytes: packedTensorBytes.byteLength
+        } : null
       }
     ]
   };
@@ -271,6 +304,9 @@ async function writeSubstrateFixture(
   ]);
   await Promise.all([
     writeFile(join(store, "blobs", `${recordHash}.json`), recordBytes),
+    ...(formatVersion === 3 ? [
+      writeFile(join(store, "blobs", `${packedTensorHash}.safetensors`), packedTensorBytes)
+    ] : []),
     writeFile(join(store, ...generationRelative.split("/")), generationBytes),
     writeFile(join(store, "manifest.json"), canonicalJson(pointer))
   ]);
@@ -286,7 +322,7 @@ async function materializeSubstrateExportFixture(
     currentManifest?: string;
     originManifest?: string;
   } = {},
-  formatVersion: 1 | 2 = 1
+  formatVersion: 1 | 2 | 3 = 1
 ): Promise<void> {
   await materializeNativeEngineFixture(repository, brain);
   const engine = join(repository.brainDirectory(brain.id), "engine");
@@ -308,7 +344,12 @@ async function materializeSubstrateExportFixture(
   ] as const) {
     const statePath = join(directory, "brain.json");
     const state = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
-    state.substrate = { schema: 1, dimensions: 16, seed: 7, persistence: pointer };
+    state.substrate = {
+      schema: formatVersion === 3 ? "neural-substrate-2" : 1,
+      dimensions: 16,
+      seed: 7,
+      persistence: pointer
+    };
     await writeFile(statePath, JSON.stringify(state));
   }
 }
@@ -583,6 +624,24 @@ describe("BrainRepository lifecycle", () => {
     const engine = join(repository.brainDirectory(brain.id), "engine");
     await mkdir(engine, { recursive: true });
     const pointer = await writeSubstrateFixture(engine, undefined, undefined, 2);
+    await writeFile(
+      join(engine, "brain.json"),
+      canonicalJson({ brain_id: brain.id, substrate: { persistence: pointer } })
+    );
+    await expect(repository.persistedSubstrateOverview(brain.id)).resolves.toMatchObject({
+      revision: pointer.activeGeneration,
+      totals: { neurons: 1, assemblies: 0, synapses: 0 }
+    });
+  });
+
+  it("accepts checksum-validated packed-v3 native substrate totals", async () => {
+    const brain = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Packed-v3 substrate fixture"
+    });
+    const engine = join(repository.brainDirectory(brain.id), "engine");
+    await mkdir(engine, { recursive: true });
+    const pointer = await writeSubstrateFixture(engine, undefined, undefined, 3);
     await writeFile(
       join(engine, "brain.json"),
       canonicalJson({ brain_id: brain.id, substrate: { persistence: pointer } })
@@ -2767,6 +2826,37 @@ describe("BrainRepository lifecycle", () => {
         strFromU8(entries[`${prefix}/${pointer.generationManifest}`]!)
       ) as { formatVersion: number };
       expect(generation.formatVersion).toBe(2);
+    }
+  });
+
+  it("exports checksum-bound packed-v3 native substrate generations", async () => {
+    const brain = await repository.create({
+      ...DEFAULT_CONFIG,
+      name: "Packed-v3 portable fixture"
+    });
+    await materializeSubstrateExportFixture(repository, brain, {}, 3);
+    const destination = join(temporaryRoot, "packed-v3.omni");
+    await repository.exportBundle(brain.id, destination, "current");
+    const entries = unzipSync(new Uint8Array(await readFile(destination)));
+    for (const scope of ["current", "origin"] as const) {
+      const prefix = `substrate/${scope}`;
+      const pointer = JSON.parse(strFromU8(entries[`${prefix}/manifest.json`]!)) as {
+        formatVersion: number;
+        generationManifest: string;
+      };
+      expect(pointer.formatVersion).toBe(3);
+      const generation = JSON.parse(
+        strFromU8(entries[`${prefix}/${pointer.generationManifest}`]!)
+      ) as {
+        formatVersion: number;
+        schema: string;
+        shards: Array<{ kind: string; tensors: { path: string } | null }>;
+      };
+      expect(generation.formatVersion).toBe(3);
+      expect(generation.schema).toBe("neural-substrate-2");
+      const neuronShard = generation.shards.find((shard) => shard.kind === "neurons")!;
+      expect(neuronShard.tensors).not.toBeNull();
+      expect(entries[`${prefix}/${neuronShard.tensors!.path}`]).toBeDefined();
     }
   });
 

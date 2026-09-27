@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import MutableMapping
+from collections.abc import Mapping as AbstractMapping, MutableMapping
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -32,6 +32,14 @@ from .persistence import (
     load_tensors,
     read_json,
 )
+from .packed_vsa_vectors import PackedTernaryVectors, PackedTernaryVectorView
+from .paged_assembly_index import PagedAssemblyIndex, _record_payload
+from .paged_assembly_scoring import PagedAssemblyVectorProvider
+from .paged_assembly_vector_view import PagedAssemblyVectorView
+from .paged_assembly_view import PagedAssemblyView
+from .paged_packed_vectors import PagedPackedVectors
+from .paged_neuron_metadata import PagedNeuronMetadata
+from .paged_vector_scoring import prepare_exact_paged_similarity
 from .substrate_inspection import (
     neuron_shard_inspection,
     synapse_shard_inspection,
@@ -41,8 +49,10 @@ from .substrate_inspection import (
 _WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_+\-'.]{1,95}")
 _SEGMENT = re.compile(r"(?<=[.!?])\s+|\n+")
 _SUBSTRATE_STORE_FORMAT = "omni-substrate-shards"
-_SUBSTRATE_STORE_VERSION = 2
-_READABLE_SUBSTRATE_STORE_VERSIONS = frozenset((1, 2))
+_SUBSTRATE_STORE_VERSION = 3
+# Older generations remain inspectable for snapshot pruning, but live load
+# rejects their higher-precision VSA vectors instead of silently converting.
+_READABLE_SUBSTRATE_STORE_VERSIONS = frozenset((1, 2, 3))
 _SYNAPSE_TENSOR_FIELDS = (
     "effective_weight",
     "eligibility",
@@ -59,6 +69,31 @@ _RECALL_GRAPH_CACHE_BYTES = 64 * 1024 * 1024
 _RECALL_GRAPH_EDGE_ESTIMATE = 128
 _RECALL_GRAPH_NODE_ESTIMATE = 96
 _MISSING = object()
+
+
+class _PagedAssemblyLookup(AbstractMapping[str, Mapping[str, Any]]):
+    """Exact ID/fingerprint reads without a corpus-sized Python dictionary."""
+
+    def __init__(self, view: PagedAssemblyView, field: str) -> None:
+        self.view = view
+        self.field = field
+
+    def __getitem__(self, key: str) -> Mapping[str, Any]:
+        record = (
+            self.view.get_by_id(key)
+            if self.field == "id"
+            else self.view.get_by_fingerprint(key)
+        )
+        if record is None:
+            raise KeyError(key)
+        return record
+
+    def __iter__(self) -> Iterator[str]:
+        for record in self.view:
+            yield str(record[self.field])
+
+    def __len__(self) -> int:
+        return len(self.view)
 
 
 class _RevisionedNodes(dict):
@@ -283,6 +318,22 @@ def _unpack_persisted_synapse_weights(
 
 
 def _forward_hot_ids_sha256(values: Iterable[str]) -> str:
+    sorted_ids = getattr(values, "iter_sorted_ids", None)
+    if callable(sorted_ids):
+        # A paged assembly index supplies canonical ID order directly. The
+        # delimiter and UTF-8 encoding reproduce the resident set hash while
+        # keeping only one ID in memory at a time.
+        digest = hashlib.sha256()
+        previous: Optional[str] = None
+        for raw in sorted_ids():
+            identifier = str(raw)
+            if not identifier or (previous is not None and identifier <= previous):
+                raise ValueError("paged hot node IDs are not sorted and unique")
+            if previous is not None:
+                digest.update(b"\0")
+            digest.update(identifier.encode("utf-8"))
+            previous = identifier
+        return digest.hexdigest()
     payload = "\0".join(sorted({str(value) for value in values if str(value)}))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -600,7 +651,7 @@ class NeuralSubstrate:
     user-set or implementation-defined cardinality.
     """
 
-    SCHEMA = "neural-substrate-1"
+    SCHEMA = "neural-substrate-2"
 
     @staticmethod
     def exact_effective_weight(value: Any) -> int:
@@ -635,9 +686,9 @@ class NeuralSubstrate:
     ):
         self.space = HypervectorSpace(dimensions, seed)
         self.neurons: Dict[str, Dict[str, Any]] = _RevisionedNodes()
-        self.neuron_vectors: Dict[str, torch.Tensor] = {}
-        self.assemblies: List[Dict[str, Any]] = []
-        self.assembly_vectors: Dict[str, torch.Tensor] = {}
+        self.neuron_vectors = PackedTernaryVectors(dimensions, seed=seed)
+        self.assemblies: List[Dict[str, Any]] | PagedAssemblyView = []
+        self.assembly_vectors = PackedTernaryVectorView(self.neuron_vectors)
         self.synapses: MutableMapping[str, Dict[str, Any]] = _RevisionedSynapses()
         self._recall_graph_cache: Optional[
             Tuple[
@@ -651,6 +702,7 @@ class NeuralSubstrate:
         self._assembly_index_source: Optional[List[Dict[str, Any]]] = None
         self._assembly_indexed_count = 0
         self._assembly_by_id: Dict[str, Dict[str, Any]] = {}
+        self._assembly_by_fingerprint: Dict[str, Dict[str, Any]] = {}
         self._statistical_index_source: Optional[List[Dict[str, Any]]] = None
         self._statistical_indexed_count = 0
         self._statistical_pair_index: Dict[str, set[str]] = defaultdict(set)
@@ -692,6 +744,273 @@ class NeuralSubstrate:
             "suppressedAssemblies": 0,
         }
 
+    def enable_paged_vectors(
+        self,
+        path: Path,
+        *,
+        cache_bytes: int = 8 * 1024 * 1024,
+        resource_policy: Optional[Any] = None,
+        shard_rows: int = 512,
+    ) -> Dict[str, Any]:
+        """Move one in-memory packed authority into bounded disk-backed rows.
+
+        This is an explicit, one-way working-state transition. It never adopts
+        an existing SQLite file without generation validation: a later load
+        coordinator must rebuild or reconcile that file from a verified neural
+        shard generation. An interrupted migration leaves the original map
+        untouched and an orphan cache that cannot advance a brain cursor.
+        """
+
+        if isinstance(self.neuron_vectors, PagedPackedVectors):
+            if self.neuron_vectors.path.resolve() != Path(path).resolve():
+                raise ValueError("substrate is already paged at another path")
+            return {
+                "vectorCount": len(self.neuron_vectors),
+                "storageBytes": self.neuron_vectors.storage_bytes,
+                "alreadyPaged": True,
+            }
+        if not isinstance(self.neuron_vectors, PackedTernaryVectors):
+            raise ValueError("substrate has no in-memory packed vector authority")
+        if type(shard_rows) is not int or not 1 <= shard_rows <= 4096:
+            raise ValueError("paged vector migration shard size is invalid")
+        destination = Path(path)
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError("paged vector cache must be a new path")
+        self._validate_packed_vector_identity()
+        source = self.neuron_vectors
+
+        def reserve(estimated: int, _operation: str) -> bool:
+            return True if self.growth_guard is None else bool(self.growth_guard(estimated))
+
+        reserve_options = (
+            # Disk offload is invoked precisely when the host RAM watermark
+            # is tight. Reapplying that same watermark to a bounded import
+            # buffer would make paging impossible when it is needed most.
+            {}
+            if resource_policy is not None
+            else {"disk_reserve": reserve, "memory_reserve": reserve}
+        )
+        paged = PagedPackedVectors(
+            destination,
+            self.space.dimensions,
+            seed=source.seed,
+            zero_deadband=source.zero_deadband,
+            cache_bytes=cache_bytes,
+            resource_policy=resource_policy,
+            **reserve_options,
+        )
+        identifiers: List[str] = []
+
+        def import_page() -> None:
+            if not identifiers:
+                return
+            metadata, tensors = source.export_state(keys=identifiers)
+            paged.import_state(metadata, tensors)
+            for identifier in identifiers:
+                if (
+                    paged.packed_row(identifier) != source.packed_row(identifier)
+                    or paged.update_count(identifier) != source.update_count(identifier)
+                ):
+                    raise ValueError("paged vector migration changed a learned row")
+            identifiers.clear()
+
+        for identifier in source:
+            identifiers.append(identifier)
+            if len(identifiers) >= int(shard_rows):
+                import_page()
+        import_page()
+        if len(paged) != len(source):
+            raise ValueError("paged vector migration missed learned rows")
+        view = PackedTernaryVectorView(paged)
+        for assembly in self.assemblies:
+            view.link(str(assembly.get("id", "")))
+        previous_view = self.assembly_vectors
+        self.neuron_vectors = paged
+        self.assembly_vectors = view
+        try:
+            self._validate_packed_vector_identity()
+        except BaseException:
+            self.neuron_vectors = source
+            self.assembly_vectors = previous_view
+            raise
+        return {
+            "vectorCount": len(paged),
+            "storageBytes": paged.storage_bytes,
+            "alreadyPaged": False,
+        }
+
+    def enable_paged_assemblies(
+        self,
+        index: PagedAssemblyIndex,
+        *,
+        page_size: int = 128,
+    ) -> Dict[str, Any]:
+        """Move structural assembly metadata into bounded indexed pages.
+
+        The destination must be empty. It may be metadata-only or share the
+        exact authoritative neuron-vector object in one SQLite cache. A
+        second independently writable assembly-vector copy is forbidden.
+        A failed migration leaves the in-memory list active and the partial
+        destination unusable for attach.
+        """
+
+        if not isinstance(index, PagedAssemblyIndex):
+            raise TypeError("paged assembly migration needs an assembly index")
+        if isinstance(self.assemblies, PagedAssemblyView):
+            if self.assemblies.index.path.resolve() != index.path.resolve():
+                raise ValueError("assemblies are already paged at another path")
+            return {"assemblyCount": len(self.assemblies), "alreadyPaged": True}
+        if not isinstance(self.assemblies, list):
+            raise ValueError("substrate assembly metadata is not migratable")
+        if index.count() != 0:
+            raise ValueError("paged assembly migration needs an empty index")
+        if index._vectors is not None and index._vectors is not self.neuron_vectors:
+            raise ValueError("paged assembly metadata index must not own vector rows in a second store")
+        if index._vectors is self.neuron_vectors and (
+            not isinstance(self.neuron_vectors, PagedPackedVectors)
+            or index.path.resolve() != self.neuron_vectors.path.resolve()
+        ):
+            raise ValueError("shared assembly cache has a mismatched vector store")
+        self._validate_packed_vector_identity()
+        view = PagedAssemblyView(index, page_size=page_size)
+        window: List[Mapping[str, Any]] = []
+        window_charge = 0
+        max_payload_bytes = 8 * 1024 * 1024
+
+        def flush_window() -> None:
+            nonlocal window_charge
+            if not window:
+                return
+            with index.batch(
+                max_rows=256, max_payload_bytes=max_payload_bytes
+            ) as batch:
+                for item in window:
+                    if not batch.upsert(item):
+                        raise ValueError("paged assembly migration found duplicate IDs")
+            window.clear()
+            window_charge = 0
+
+        for record in self.assemblies:
+            identifier, fingerprint, payload, _digest = _record_payload(record)
+            charge = 4 * (len(payload) + len(identifier) + len(fingerprint)) + 128
+            if charge > max_payload_bytes:
+                raise ValueError("assembly record exceeds bounded migration window")
+            if window and (
+                len(window) >= 256 or window_charge + charge > max_payload_bytes
+            ):
+                flush_window()
+            window.append(record)
+            window_charge += charge
+        flush_window()
+        if len(view) != len(self.assemblies):
+            raise ValueError("paged assembly migration missed records")
+        original = iter(self.assemblies)
+        verified = 0
+        for page in index.iter_pages(page_size=page_size):
+            for paged_record in page.records:
+                if paged_record != next(original, None):
+                    raise ValueError("paged assembly migration altered structural metadata")
+                verified += 1
+        if verified != len(self.assemblies) or next(original, None) is not None:
+            raise ValueError("paged assembly migration coverage differs")
+        previous_records = self.assemblies
+        previous_vectors = self.assembly_vectors
+        self.assemblies = view
+        if isinstance(self.neuron_vectors, PagedPackedVectors):
+            self.assembly_vectors = PagedAssemblyVectorView(index, self.neuron_vectors)
+        self.invalidate_assembly_index()
+        try:
+            if (
+                len(self.neuron_vectors) != len(self.neurons)
+                or len(self.assembly_vectors) != len(view)
+                or (
+                    index._vectors is self.neuron_vectors
+                    and index.status()["packedVectorRows"] != len(view)
+                )
+            ):
+                raise ValueError("paged assembly migration lost neural rows")
+        except BaseException:
+            self.assemblies = previous_records
+            self.assembly_vectors = previous_vectors
+            self.invalidate_assembly_index()
+            raise
+        return {"assemblyCount": len(view), "alreadyPaged": False}
+
+    def attach_verified_paged_assemblies(
+        self,
+        index: PagedAssemblyIndex,
+        *,
+        page_size: int = 128,
+    ) -> Dict[str, Any]:
+        """Attach a *completed* cache rebuilt from this committed generation.
+
+        Unlike empty-index migration, this method never rewrites metadata or
+        vectors. It checks the committed binding and compares every existing
+        in-memory record against a bounded index page before dropping the
+        resident assembly list. A direct load is still not bounded until the
+        loader itself streams assembly metadata into this cache.
+        """
+
+        if not isinstance(index, PagedAssemblyIndex):
+            raise TypeError("verified assembly attach needs a paged index")
+        if not isinstance(self.assemblies, list):
+            raise ValueError("verified assembly attach needs a resident source list")
+        if (
+            not isinstance(self.neuron_vectors, PagedPackedVectors)
+            or index._vectors is not self.neuron_vectors
+            or index.path.resolve() != self.neuron_vectors.path.resolve()
+        ):
+            raise ValueError("verified assembly cache must share the exact neuron vector store")
+        expected_generation = (
+            self.persistence_manifest.get("activeGeneration")
+            if isinstance(self.persistence_manifest, dict) else None
+        )
+        status = index.status()
+        if (
+            not isinstance(expected_generation, str)
+            or status["dirtySinceCommit"]
+            or status["committedGenerationSha256"] != expected_generation
+            or status["count"] != len(self.assemblies)
+            or status["packedVectorRows"] != status["count"]
+            or len(self.neuron_vectors) != len(self.neurons)
+        ):
+            raise ValueError("assembly cache is not bound to this committed generation")
+        view = PagedAssemblyView(index, page_size=page_size)
+        original = iter(self.assemblies)
+        verified = 0
+        for page in index.iter_pages(page_size=page_size):
+            for paged_record in page.records:
+                resident = next(original, None)
+                if resident is None:
+                    raise ValueError("verified assembly cache has excess records")
+                _identifier, _fingerprint, projected, _digest = _record_payload(resident)
+                if paged_record != json.loads(projected):
+                    raise ValueError("verified assembly cache changed structural metadata")
+                verified += 1
+        if verified != status["count"] or next(original, None) is not None:
+            raise ValueError("verified assembly cache missed records")
+        final = index.status()
+        if any(
+            final[key] != status[key]
+            for key in ("storeId", "count", "indexRevision", "vectorRevision",
+                        "committedGenerationSha256", "dirtySinceCommit")
+        ):
+            raise ValueError("verified assembly cache changed during attach")
+        previous_records = self.assemblies
+        previous_vectors = self.assembly_vectors
+        self.assemblies = view
+        self.assembly_vectors = PagedAssemblyVectorView(index, self.neuron_vectors)
+        self.invalidate_assembly_index()
+        try:
+            if len(self.assembly_vectors) != verified:
+                raise ValueError("verified assembly view count differs")
+        except BaseException:
+            self.assemblies = previous_records
+            self.assembly_vectors = previous_vectors
+            self.invalidate_assembly_index()
+            raise
+        return {"assemblyCount": verified, "alreadyPaged": False}
+
     @property
     def concepts(self) -> Dict[str, Dict[str, Any]]:
         """Inspector view over substrate neurons (not separate storage)."""
@@ -699,7 +1018,7 @@ class NeuralSubstrate:
         return self.neurons
 
     @property
-    def concept_vectors(self) -> Dict[str, torch.Tensor]:
+    def concept_vectors(self) -> MutableMapping[str, torch.Tensor]:
         return self.neuron_vectors
 
     @property
@@ -709,7 +1028,7 @@ class NeuralSubstrate:
         return self.assemblies
 
     @property
-    def idea_vectors(self) -> Dict[str, torch.Tensor]:
+    def idea_vectors(self) -> MutableMapping[str, torch.Tensor]:
         return self.assembly_vectors
 
     @property
@@ -722,11 +1041,15 @@ class NeuralSubstrate:
         or same-length replacement.
         """
 
+        if isinstance(self.assemblies, PagedAssemblyView):
+            return _PagedAssemblyLookup(self.assemblies, "id")
+
         if (
             self._assembly_index_source is not self.assemblies
             or self._assembly_indexed_count > len(self.assemblies)
         ):
             self._assembly_by_id = {}
+            self._assembly_by_fingerprint = {}
             self._assembly_index_source = self.assemblies
             self._assembly_indexed_count = 0
         if self._assembly_indexed_count < len(self.assemblies):
@@ -734,8 +1057,36 @@ class NeuralSubstrate:
                 identifier = str(record.get("id", ""))
                 if identifier:
                     self._assembly_by_id[identifier] = record
+                fingerprint = str(record.get("fingerprint", ""))
+                if fingerprint:
+                    # Existing exact-repeat admission historically selected
+                    # the first record when duplicate fingerprints existed.
+                    self._assembly_by_fingerprint.setdefault(fingerprint, record)
             self._assembly_indexed_count = len(self.assemblies)
         return self._assembly_by_id
+
+    @property
+    def assembly_by_fingerprint(self) -> Mapping[str, Dict[str, Any]]:
+        """Append-aware exact-repeat lookup without a corpus-sized scan."""
+
+        if isinstance(self.assemblies, PagedAssemblyView):
+            return _PagedAssemblyLookup(self.assemblies, "fingerprint")
+        _ = self.assembly_by_id
+        return self._assembly_by_fingerprint
+
+    def _edit_assembly_by_id(
+        self, identifier: str, mutator: Callable[[Dict[str, Any]], None]
+    ) -> Mapping[str, Any]:
+        """Persist one bounded metadata edit or mutate the in-memory record."""
+
+        if isinstance(self.assemblies, PagedAssemblyView):
+            with self.assemblies.transaction(max_rows=1) as edits:
+                return edits.edit_by_id(identifier, mutator)
+        record = self.assembly_by_id.get(identifier)
+        if record is None:
+            raise KeyError(identifier)
+        mutator(record)
+        return record
 
     def invalidate_assembly_index(self) -> None:
         """Invalidate after an external non-append assembly list mutation."""
@@ -743,6 +1094,7 @@ class NeuralSubstrate:
         self._assembly_index_source = None
         self._assembly_indexed_count = 0
         self._assembly_by_id = {}
+        self._assembly_by_fingerprint = {}
         self._statistical_index_source = None
         self._statistical_indexed_count = 0
         self._statistical_pair_index = defaultdict(set)
@@ -762,6 +1114,11 @@ class NeuralSubstrate:
 
     def _refresh_statistical_index(self) -> None:
         """Index seed atoms of real field assemblies, never source text."""
+
+        if isinstance(self.assemblies, PagedAssemblyView):
+            # A full Python postings map would negate metadata paging. The
+            # paged candidate path below scans bounded pages instead.
+            return
 
         if (
             self._statistical_index_source is not self.assemblies
@@ -900,6 +1257,22 @@ class NeuralSubstrate:
     def _mark_state_changed(self) -> None:
         self.state_revision += 1
 
+    def edit_neuron_by_id(
+        self, neuron_id: str, mutator: Callable[[Dict[str, Any]], None]
+    ) -> Mapping[str, Any]:
+        """Mutate one neuron atomically when metadata is disk-paged.
+
+        A paged read is immutable. Never hand a detached row to callers who
+        expect their in-place edit to change learned state. The resident path
+        retains its original object identity and mutation behavior.
+        """
+
+        if isinstance(self.neurons, PagedNeuronMetadata):
+            return self.neurons.edit_by_id(neuron_id, mutator)
+        record = self.neurons[neuron_id]
+        mutator(record)
+        return record
+
     def mark_attention_neuron(self, identifier: str) -> None:
         # Epoch zero reads its raw activation fields directly. Recording every
         # historically touched id as well would make the first boundary scale
@@ -936,26 +1309,43 @@ class NeuralSubstrate:
                 "last_activated_at": timestamp,
                 "aliases": [],
             }
+            # The new record can be fully activated before its first paged
+            # commit, avoiding a second WAL write per novel neuron.
+            record["activation"] = min(
+                1.0, self.effective_activation(record) * 0.68 + 0.32
+            )
+            record["importance"] = min(
+                1.0, float(record["importance"]) + 1.0 / (10.0 + record["exposures"])
+            )
+            record["exposures"] += 1
             self.neurons[neuron_id] = record
             self.neuron_vectors[neuron_id] = self.space.symbol(
                 "%s-neuron:%s" % (region, label)
             )
             self.growth_events += 1
-        record["activation"] = min(
-            1.0, self.effective_activation(record) * 0.68 + 0.32
-        )
-        record["importance"] = min(
-            1.0, float(record["importance"]) + 1.0 / (10.0 + record["exposures"])
-        )
-        record["exposures"] += 1
-        record["last_activated_at"] = timestamp
+        else:
+            def activate(existing: Dict[str, Any]) -> None:
+                existing["activation"] = min(
+                    1.0, self.effective_activation(existing) * 0.68 + 0.32
+                )
+                existing["importance"] = min(
+                    1.0,
+                    float(existing["importance"])
+                    + 1.0 / (10.0 + existing["exposures"]),
+                )
+                existing["exposures"] += 1
+                existing["last_activated_at"] = timestamp
+
+            self.edit_neuron_by_id(neuron_id, activate)
         self.mark_attention_neuron(neuron_id)
         self._mark_state_changed()
         return neuron_id
 
     def vector_for_labels(self, labels: Sequence[str]) -> torch.Tensor:
         if not labels:
-            return self.space.symbol("empty-assembly")
+            return F.normalize(
+                self.space.symbol("empty-assembly").reshape(1, -1), dim=-1
+            )[0]
         vectors = []
         for index, label in enumerate(labels):
             neuron_id = hashlib.sha256(
@@ -968,46 +1358,17 @@ class NeuralSubstrate:
             vectors.append(
                 self.space.permute(self.space.bind(neuron, role), steps=index + 1)
             )
-        # A sign bundle would quantize away almost every small learning update
-        # to the semantic neurons. The cue is transient activity, not a
-        # synaptic weight, so retain its continuous superposition while
-        # matching the original bipolar cue norm. This lets experience-driven
-        # changes affect recall without storing text as a question/answer key.
+        # The cue is transient activity, not a synaptic weight. Keep its
+        # continuous superposition at unit norm to match the normalized
+        # read view of packed neuron and assembly rows, including sensory
+        # assemblies, without persisting a second learned scale.
         activity = torch.stack(vectors).mean(dim=0)
         if float(activity.norm()) <= 1e-8:
-            return self.space.bundle(vectors)
-        return F.normalize(activity.reshape(1, -1), dim=-1)[0] * math.sqrt(
-            self.space.dimensions
-        )
+            activity = self.space.bundle(vectors)
+        return F.normalize(activity.reshape(1, -1), dim=-1)[0]
 
     def vector_for_text(self, text: str) -> torch.Tensor:
         return self.vector_for_labels(self.extract_concepts(text))
-
-    @staticmethod
-    def _blend_latent_vector(
-        previous: torch.Tensor, target: torch.Tensor, rate: float
-    ) -> torch.Tensor:
-        """Integrate activity without turning a latent trace into a lookup key.
-
-        These vectors are continuous *learning state*, not effective synaptic
-        weights. Recurrent propagation still reads exact ternary synapses.
-        Keeping the previous norm also preserves the scale of sensory vectors,
-        which arrive normalized, and semantic vectors, which begin bipolar.
-        """
-
-        previous = previous.detach().cpu().float().reshape(-1)
-        target = target.detach().cpu().float().reshape(-1)
-        if previous.shape != target.shape or not bool(torch.isfinite(target).all()):
-            raise ValueError("latent vector update must match finite substrate state")
-        previous_norm = previous.norm()
-        target_norm = target.norm()
-        if float(previous_norm) <= 1e-8 or float(target_norm) <= 1e-8:
-            return previous
-        bounded_rate = max(0.0, min(1.0, float(rate)))
-        mixed = previous * (1.0 - bounded_rate) + (
-            target * (previous_norm / target_norm)
-        ) * bounded_rate
-        return F.normalize(mixed.reshape(1, -1), dim=-1)[0] * previous_norm
 
     def _continuous_assembly_activity(
         self, neuron_ids: Sequence[str]
@@ -1041,7 +1402,7 @@ class NeuralSubstrate:
             neuron_id: self.neuron_vectors[neuron_id]
             for neuron_id in neuron_ids
         }
-        changes: Dict[str, torch.Tensor] = {}
+        changes: Dict[str, Tuple[torch.Tensor, float]] = {}
         base_rate = 0.02 + 0.05 * max(0.0, min(1.0, float(importance)))
         for index, neuron_id in enumerate(neuron_ids):
             contexts: List[torch.Tensor] = []
@@ -1079,22 +1440,17 @@ class NeuralSubstrate:
             ) / magnitude
             exposure = max(0, int(self.neurons[neuron_id].get("exposures", 0)))
             rate = base_rate / (1.0 + 0.05 * math.log1p(exposure))
-            changes[neuron_id] = self._blend_latent_vector(
-                prior[neuron_id], context, rate
-            )
+            changes[neuron_id] = (context, rate)
         if changes:
-            self.neuron_vectors.update(changes)
+            for neuron_id, (target, rate) in changes.items():
+                self.neuron_vectors.adapt(neuron_id, target, rate)
             self._mark_state_changed()
 
     def _adapt_assembly_vector(
         self, assembly_id: str, target: torch.Tensor, rate: float
     ) -> torch.Tensor:
-        previous = self.assembly_vectors[assembly_id]
-        integrated = self._blend_latent_vector(previous, target, rate)
-        self.assembly_vectors[assembly_id] = integrated
-        # An assembly is also a neuron in the same substrate. Keep its two
-        # inspection paths identical; neither is a separate fact store.
-        self.neuron_vectors[assembly_id] = integrated
+        # The assembly view and neuron map refer to the same packed row.
+        integrated = self.assembly_vectors.adapt(assembly_id, target, rate)
         self._mark_state_changed()
         return integrated
 
@@ -1217,14 +1573,14 @@ class NeuralSubstrate:
                 if identifier in self.assembly_vectors
             )
         )
-        candidates = [
+        best = max((
             (self.space.similarity(vector, candidate), candidate_id)
             for candidate_id, candidate in candidate_vectors
             if candidate_id != assembly_id and candidate_id not in excluded
-        ]
-        if not candidates:
+        ), default=None)
+        if best is None:
             return
-        similarity, competitor_id = max(candidates)
+        similarity, competitor_id = best
         if similarity <= 0.0:
             return
         amount = -max(0.04, min(0.20, float(similarity) * 0.20))
@@ -1257,6 +1613,8 @@ class NeuralSubstrate:
         labels_override: Optional[Sequence[str]] = None,
         vector_override: Optional[torch.Tensor] = None,
     ) -> Tuple[Dict[str, Any], torch.Tensor, bool]:
+        if isinstance(self.assemblies, PagedAssemblyView) and retain_source_text:
+            raise ValueError("paged assembly metadata cannot retain raw source text")
         labels = (
             [
                 str(value).strip().lower()
@@ -1268,11 +1626,13 @@ class NeuralSubstrate:
         )
         if not labels:
             labels = ["empty-experience"]
+        packed_vector_bytes = (self.space.dimensions + 3) // 4 + 8
         estimated = (
-            len(labels) * (self.space.dimensions * 4 + 640)
+            len(labels) * (packed_vector_bytes + 640)
             + len(labels) * 20 * 320
             + len(child_ids or []) * 320
-            + self.space.dimensions * 4
+            + packed_vector_bytes
+            + self.space.dimensions * 4  # one transient decoded work row
         )
         self._check_growth(estimated)
         neuron_ids = [
@@ -1289,14 +1649,7 @@ class NeuralSubstrate:
             norm = vector.norm().clamp_min(1e-8)
             vector = vector / norm
         fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        existing = next(
-            (
-                assembly
-                for assembly in self.assemblies
-                if assembly["fingerprint"] == fingerprint
-            ),
-            None,
-        )
+        existing = self.assembly_by_fingerprint.get(fingerprint)
         created = existing is None
         if existing is None:
             assembly_id = hashlib.sha256(
@@ -1336,7 +1689,6 @@ class NeuralSubstrate:
                 "aliases": [],
             }
             self.mark_attention_neuron(assembly_id)
-            self.neuron_vectors[assembly_id] = vector
             self.growth_events += 1
             for member in neuron_ids:
                 self._strengthen_synapse(
@@ -1368,20 +1720,26 @@ class NeuralSubstrate:
                 exclude_ids=child_ids,
             )
         else:
-            record = existing
-            record["rehearsals"] += 1
-            record["last_recalled_at"] = timestamp
-            record["importance"] = min(
-                1.0, float(record["importance"]) + 0.03
-            )
-            assembly_id = str(record["id"])
+            assembly_id = str(existing["id"])
+
+            def reinforce_metadata(record: Dict[str, Any]) -> None:
+                record["rehearsals"] += 1
+                record["last_recalled_at"] = timestamp
+                record["importance"] = min(
+                    1.0, float(record["importance"]) + 0.03
+                )
+
+            record = self._edit_assembly_by_id(assembly_id, reinforce_metadata)
             node = self.neurons.get(assembly_id)
             if node is not None:
-                node["activation"] = min(
-                    1.0, self.effective_activation(node) * 0.7 + 0.3
-                )
-                node["exposures"] += 1
-                node["last_activated_at"] = timestamp
+                def reinforce_node(current: Dict[str, Any]) -> None:
+                    current["activation"] = min(
+                        1.0, self.effective_activation(current) * 0.7 + 0.3
+                    )
+                    current["exposures"] += 1
+                    current["last_activated_at"] = timestamp
+
+                self.edit_neuron_by_id(assembly_id, reinforce_node)
                 self.mark_attention_neuron(assembly_id)
             self.mark_attention_assembly(assembly_id)
             # Re-exposure must change the same pathways used during recall,
@@ -1505,7 +1863,7 @@ class NeuralSubstrate:
         vector: torch.Tensor,
         source: str,
         kind: str,
-    ) -> Tuple[Optional[Dict[str, Any]], set[str]]:
+    ) -> Tuple[Optional[Mapping[str, Any]], Optional[set[str]]]:
         """Route by shared neural atoms/relations, independent of source.
 
         The pair index normally yields a few fields. Rare atom postings are a
@@ -1513,6 +1871,54 @@ class NeuralSubstrate:
         approximate routing index, not a memory lookup or answer decoder;
         field vectors and live synapses remain the learned representation.
         """
+
+        if isinstance(self.assemblies, PagedAssemblyView):
+            # Keep only two winners while visiting bounded metadata pages.
+            # Pair overlap has the old fast-path precedence; the fallback
+            # considers every shared atom without keeping a corpus-sized
+            # postings dictionary or candidate-ID set in RAM.
+            atoms = set(neuron_ids)
+            query_pairs = set(self._statistical_pair_keys(neuron_ids))
+            best_pair: Optional[Mapping[str, Any]] = None
+            best_any: Optional[Mapping[str, Any]] = None
+            pair_rank: Tuple[Any, ...] = (-1.0, -1, -1, -1, "")
+            any_rank: Tuple[Any, ...] = (-1.0, -1, -1, -1, "")
+            for record in self.assemblies:
+                if not record.get("compressed_field"):
+                    continue
+                field_id = str(record.get("id", ""))
+                anchors = record.get("statistical_anchor_ids", ())
+                if not field_id or not isinstance(anchors, (list, tuple)):
+                    continue
+                shared = len(atoms.intersection(anchors))
+                if not shared:
+                    continue
+                field_vector = self.assembly_vectors.get(field_id)
+                if field_vector is None:
+                    continue
+                dice = 2.0 * shared / float(len(atoms) + len(anchors))
+                similarity = max(0.0, self.space.similarity(vector, field_vector))
+                rank = (
+                    0.8 * dice + 0.2 * similarity,
+                    shared,
+                    int(
+                        kind == record.get("kind")
+                        or kind in record.get("kind_provenance", {})
+                    ),
+                    int(
+                        source == record.get("source")
+                        or source in record.get("source_provenance", {})
+                    ),
+                    field_id,
+                )
+                if rank > any_rank:
+                    best_any, any_rank = record, rank
+                if query_pairs.intersection(self._statistical_pair_keys(anchors)):
+                    if rank > pair_rank:
+                        best_pair, pair_rank = record, rank
+            if pair_rank[0] >= 0.52:
+                return best_pair, None
+            return (best_any if any_rank[0] >= 0.52 else None), None
 
         self._refresh_statistical_index()
         indexed = self.assembly_by_id
@@ -1633,11 +2039,12 @@ class NeuralSubstrate:
         # This estimate is deliberately conservative and is checked before any
         # mutation. It covers new atoms, local/membership pathways, an indexed
         # seed field when novel, and newly observed source provenance.
+        packed_vector_bytes = (self.space.dimensions + 3) // 4 + 8
         estimated = (
-            new_neurons * (self.space.dimensions * 4 + 640)
+            new_neurons * (packed_vector_bytes + 640)
             + len(labels) * 18 * 320
             + (
-                self.space.dimensions * 4
+                packed_vector_bytes
                 + 1024
                 + len(labels) * 320
                 + len(clean_source) * 2
@@ -1656,6 +2063,7 @@ class NeuralSubstrate:
                 and clean_kind not in record.get("kind_provenance", [])
                 else 0
             )
+            + self.space.dimensions * 4  # one transient decoded work row
         )
         self._check_growth(max(1, estimated))
 
@@ -1709,7 +2117,6 @@ class NeuralSubstrate:
                 "aliases": [],
             }
             self.mark_attention_neuron(field_id)
-            self.neuron_vectors[field_id] = current_vector
             self.growth_events += 1
             self._wire_assembly_competition(
                 field_id,
@@ -1718,31 +2125,36 @@ class NeuralSubstrate:
                 candidate_ids=candidate_ids,
             )
         else:
-            sources = record.setdefault(
-                "source_provenance", {str(record.get("source", "")): 1}
-            )
-            sources[clean_source] = int(sources.get(clean_source, 0)) + 1
-            kinds = record.setdefault(
-                "kind_provenance", {str(record.get("kind", "")): 1}
-            )
-            kinds[clean_kind] = int(kinds.get(clean_kind, 0)) + 1
-            record["rehearsals"] = int(record.get("rehearsals", 0)) + 1
-            record["statistical_experiences"] = int(
-                record.get("statistical_experiences", 0)
-            ) + 1
-            record["last_recalled_at"] = timestamp
-            record["importance"] = min(
-                1.0,
-                float(record.get("importance", 0.0))
-                + 0.01 / (1.0 + math.log1p(record["rehearsals"])),
-            )
-            node = self.neurons[field_id]
-            node["activation"] = min(
-                1.0, self.effective_activation(node) * 0.68 + 0.32
-            )
-            node["importance"] = record["importance"]
-            node["exposures"] = int(node.get("exposures", 0)) + 1
-            node["last_activated_at"] = timestamp
+            def revise_field(record: Dict[str, Any]) -> None:
+                sources = record.setdefault(
+                    "source_provenance", {str(record.get("source", "")): 1}
+                )
+                sources[clean_source] = int(sources.get(clean_source, 0)) + 1
+                kinds = record.setdefault(
+                    "kind_provenance", {str(record.get("kind", "")): 1}
+                )
+                kinds[clean_kind] = int(kinds.get(clean_kind, 0)) + 1
+                record["rehearsals"] = int(record.get("rehearsals", 0)) + 1
+                record["statistical_experiences"] = int(
+                    record.get("statistical_experiences", 0)
+                ) + 1
+                record["last_recalled_at"] = timestamp
+                record["importance"] = min(
+                    1.0,
+                    float(record.get("importance", 0.0))
+                    + 0.01 / (1.0 + math.log1p(record["rehearsals"])),
+                )
+
+            record = self._edit_assembly_by_id(field_id, revise_field)
+            def revise_node(current: Dict[str, Any]) -> None:
+                current["activation"] = min(
+                    1.0, self.effective_activation(current) * 0.68 + 0.32
+                )
+                current["importance"] = record["importance"]
+                current["exposures"] = int(current.get("exposures", 0)) + 1
+                current["last_activated_at"] = timestamp
+
+            self.edit_neuron_by_id(field_id, revise_node)
             self.mark_attention_neuron(field_id)
             self.mark_attention_assembly(field_id)
 
@@ -1831,16 +2243,17 @@ class NeuralSubstrate:
             )
             child_ids.append(str(record["id"]))
             created_count += int(created)
-            comparisons = [
-                candidate
-                for assembly_id, candidate in self.assembly_vectors.items()
-                if assembly_id != record["id"]
-            ]
-            if comparisons:
-                nearest = max(
-                    nearest,
-                    max(self.space.similarity(vector, item) for item in comparisons),
-                )
+            nearest = max(
+                nearest,
+                max(
+                    (
+                        self.space.similarity(vector, candidate)
+                        for assembly_id, candidate in self.assembly_vectors.items()
+                        if assembly_id != record["id"]
+                    ),
+                    default=-1.0,
+                ),
+            )
 
         if len(segments) > 1:
             parent, parent_vector, parent_created = self._store_assembly(
@@ -1857,9 +2270,7 @@ class NeuralSubstrate:
             primary_vector = parent_vector
             created_count += int(parent_created)
         else:
-            primary = next(
-                item for item in self.assemblies if item["id"] == child_ids[0]
-            )
+            primary = self.assembly_by_id[child_ids[0]]
             primary_vector = self.assembly_vectors[str(primary["id"])]
 
         novelty = max(0.0, min(1.0, 1.0 - max(0.0, nearest)))
@@ -1969,24 +2380,66 @@ class NeuralSubstrate:
 
         if not self.assembly_vectors:
             return cue, []
-        scored = sorted(
-            (
-                (self.space.similarity(cue, vector), assembly_id, vector)
+        # The metadata and packed-neuron stores are separate SQLite files in
+        # paged mode. Score only assembly IDs through a paired generation
+        # provider: an all-neuron scan would mistake ordinary neurons for
+        # ideas, and the metadata index contains no duplicate vector rows.
+        paged_provider: Optional[PagedAssemblyVectorProvider] = None
+        paged_snapshot: Optional[str] = None
+        if (
+            isinstance(self.assemblies, PagedAssemblyView)
+            and isinstance(self.neuron_vectors, PagedPackedVectors)
+        ):
+            paged_provider = PagedAssemblyVectorProvider(
+                self.assemblies.index, self.neuron_vectors
+            )
+            prepared = prepare_exact_paged_similarity(
+                paged_provider, cue,
+                page_size=min(self.assemblies.page_size, 4096),
+                workspace_slots=workspace_slots,
+            )
+            if prepared.summary.positive_count == 0:
+                paged_provider.assert_unchanged(prepared.summary.snapshot_id)
+                return cue, []
+            slots = prepared.summary.workspace_slots
+            adaptive_floor = prepared.summary.adaptive_floor
+            paged_snapshot = prepared.summary.snapshot_id
+            # Only active seeds occupy memory. No top-k or fixed assembly cap
+            # is imposed; a truly enormous active set still needs a separate
+            # paged recurrent overlay before whole-recall memory is bounded.
+            seeds = {}
+            for match in prepared.iter_matches():
+                if len(seeds) % 128 == 0:
+                    # Admission is in bounded chunks, not a neural count
+                    # ceiling. A denied host reserve leaves recall unchanged.
+                    self._check_growth(128 * 256)
+                seeds[match.assembly_id] = float(match.score)
+            paged_provider.assert_unchanged(paged_snapshot)
+        else:
+            # In-memory packed vectors retain the original exact two-pass
+            # similarity. Avoid a full sorted (score,id,decoded-vector) list.
+            best = 0.0
+            positive_count = 0
+            for vector in self.assembly_vectors.values():
+                score = self.space.similarity(cue, vector)
+                if score > 0:
+                    positive_count += 1
+                    best = max(best, score)
+            if positive_count == 0:
+                return cue, []
+            slots = max(1, int(workspace_slots or max(8, math.sqrt(positive_count))))
+            adaptive_floor = max(0.01, best / (2.0 + math.log2(slots + 1.0)))
+            seeds = {
+                assembly_id: float(score)
                 for assembly_id, vector in self.assembly_vectors.items()
-            ),
-            reverse=True,
-        )
-        positive = [item for item in scored if item[0] > 0]
-        if not positive:
-            return cue, []
-        best = positive[0][0]
-        slots = max(1, int(workspace_slots or max(8, math.sqrt(len(positive)))))
-        adaptive_floor = max(0.01, best / (2.0 + math.log2(slots + 1.0)))
-        selected = [item for item in positive if item[0] >= adaptive_floor]
-
-        seeds: Dict[str, float] = {
-            assembly_id: float(score) for score, assembly_id, _ in selected
-        }
+                if (score := self.space.similarity(cue, vector)) > 0
+                and score >= adaptive_floor
+            }
+        if paged_provider is not None and self._recall_graph_cache is None:
+            # The current recurrent graph still materializes adjacency. Do
+            # not walk a potentially huge lazy edge store into host OOM. A
+            # future paged frontier can replace this conservative admission.
+            self._check_growth(max(1, len(self.synapses)) * 256)
         adjacency, incoming, eligible_edges, inhibitory_edges = (
             self._effective_recall_graph()
         )
@@ -2053,16 +2506,22 @@ class NeuralSubstrate:
                 break
 
         by_id = self.assembly_by_id
+        if paged_provider is not None:
+            self._check_growth(max(1, len(activation)) * 160)
         active = sorted(activation.items(), key=lambda item: item[1], reverse=True)
-        vectors = [cue]
-        weights = [1.0]
+        # Stored packed rows decode as unit-length transient activations.
+        # Normalize the current cue only for this readout so a text cue with
+        # more dimensions cannot drown out equally salient recalled activity.
+        signal_sum = F.normalize(cue.float(), dim=0).clone()
+        signal_weight = 1.0
         recalled = []
         for assembly_id, score in active:
             vector = self.assembly_vectors.get(assembly_id)
             if vector is None or score <= 0:
                 continue
-            vectors.append(vector)
-            weights.append(max(0.01, float(score)))
+            weight = max(0.01, float(score))
+            signal_sum.add_(vector.float(), alpha=weight)
+            signal_weight += weight
             assembly = by_id.get(assembly_id)
             if assembly is None:
                 continue
@@ -2075,6 +2534,11 @@ class NeuralSubstrate:
                     "neuron_ids": list(assembly["neuron_ids"]),
                 }
             )
+        if paged_provider is not None and paged_snapshot is not None:
+            # The readout above decoded only selected assembly rows. Detect a
+            # concurrent structural/vector edit before publishing activity;
+            # record_recall_activity itself then advances metadata revision.
+            paged_provider.assert_unchanged(paged_snapshot)
         if record_activity:
             self.record_recall_activity(recalled)
         # Recalled firing is a continuous decoder-conditioning signal, not a
@@ -2085,9 +2549,7 @@ class NeuralSubstrate:
         # contribution with a bounded activity-weighted mean. The underlying
         # forward synapses remain exactly ternary; no shadow-weight magnitude
         # or stored source text participates in this readout.
-        stacked = torch.stack([vector.float() for vector in vectors])
-        scale = torch.tensor(weights, dtype=stacked.dtype).reshape(-1, 1)
-        signal = (stacked * scale).sum(dim=0) / scale.sum().clamp_min(1e-8)
+        signal = signal_sum / max(signal_weight, 1e-8)
         # Exposed as inspection metadata only; it is derived from this recall
         # operation and is never an authoritative memory record.
         self._last_recall_rounds = propagation_rounds
@@ -2135,14 +2597,25 @@ class NeuralSubstrate:
             assembly = by_id.get(assembly_id)
             if assembly is None or score <= 0.0:
                 continue
-            assembly["last_recalled_at"] = timestamp
+            if isinstance(self.assemblies, PagedAssemblyView):
+                def mark_recalled(record: Dict[str, Any]) -> None:
+                    record["last_recalled_at"] = timestamp
+
+                self._edit_assembly_by_id(
+                    assembly_id, mark_recalled
+                )
+            else:
+                assembly["last_recalled_at"] = timestamp
             node = self.neurons.get(assembly_id)
             if node is not None:
-                node["activation"] = min(
-                    1.0,
-                    self.effective_activation(node) * 0.6 + min(0.4, score),
-                )
-                node["last_activated_at"] = timestamp
+                def mark_node(current: Dict[str, Any]) -> None:
+                    current["activation"] = min(
+                        1.0,
+                        self.effective_activation(current) * 0.6 + min(0.4, score),
+                    )
+                    current["last_activated_at"] = timestamp
+
+                self.edit_neuron_by_id(assembly_id, mark_node)
                 self.mark_attention_neuron(assembly_id)
             self.mark_attention_assembly(assembly_id)
             changed = True
@@ -2220,9 +2693,7 @@ class NeuralSubstrate:
                 raise ValueError("substrate attention overlay ids are invalid")
             return set(values)
 
-        assemblies = {
-            str(value.get("id", "")): value for value in self.assemblies
-        }
+        assemblies = self.assembly_by_id
         self.attention_legacy_raw_active = bool(
             overlay["legacyRawActive"]
         )
@@ -2281,13 +2752,21 @@ class NeuralSubstrate:
         """
 
         amount = max(0.0, min(float(amount), 1.0))
-        for neuron in self.neurons.values():
-            neuron["activation"] *= 1.0 - amount
-            neuron["uncertainty"] = min(
-                1.0,
-                float(neuron["uncertainty"])
-                + amount / (1.0 + neuron["exposures"]),
-            )
+        if isinstance(self.neurons, PagedNeuronMetadata):
+            if amount > 0.0:
+                # One durable epoch changes the effective state of all cold
+                # neurons. Reads project it; touched-node edits materialize
+                # their pending factor before changing exposures. No per-turn
+                # full-table WAL sweep or silent decay omission occurs.
+                self.neurons.decay(amount)
+        else:
+            for neuron in self.neurons.values():
+                neuron["activation"] *= 1.0 - amount
+                neuron["uncertainty"] = min(
+                    1.0,
+                    float(neuron["uncertainty"])
+                    + amount / (1.0 + neuron["exposures"]),
+                )
         selected_synapses = (
             self.synapses.values() if synapses is None else synapses
         )
@@ -2332,13 +2811,81 @@ class NeuralSubstrate:
             total += uses
         return total
 
+    def _validate_packed_vector_identity(self) -> None:
+        """Require one packed row per neuron and one assembly view per record."""
+
+        if (
+            getattr(self.neuron_vectors, "packed_authoritative", False) is not True
+            or getattr(self.neuron_vectors, "dimensions", None) != self.space.dimensions
+            or not isinstance(
+                self.assembly_vectors,
+                (PackedTernaryVectorView, PagedAssemblyVectorView),
+            )
+            or self.assembly_vectors.backing is not self.neuron_vectors
+        ):
+            raise ValueError("substrate vectors must share one packed authority")
+        if (
+            isinstance(self.assemblies, PagedAssemblyView)
+            and isinstance(self.assembly_vectors, PagedAssemblyVectorView)
+            and isinstance(self.neuron_vectors, PagedPackedVectors)
+            and self.assemblies.index._vectors is self.neuron_vectors
+            and self.assembly_vectors.index is self.assemblies.index
+            and isinstance(self.persistence_manifest, dict)
+        ):
+            generation = self.persistence_manifest.get("activeGeneration")
+            index_state = self.assemblies.index.status()
+            vectors_state = self.neuron_vectors.status()
+            if (
+                isinstance(generation, str)
+                and not index_state["dirtySinceCommit"]
+                and not vectors_state["dirtySinceCommit"]
+                and index_state["committedGenerationSha256"] == generation
+                and vectors_state["committedGenerationSha256"] == generation
+                and index_state["count"] == index_state["packedVectorRows"]
+                and vectors_state["rowCount"] == len(self.neurons)
+                and index_state["count"] == len(self.assemblies)
+            ):
+                # Rebuild verified every committed shard and every shared
+                # vector alias before binding this generation. Rechecking
+                # those same millions of IDs on each read/save is redundant;
+                # a dirty cache falls through to the full exact scan.
+                return
+        if len(self.neuron_vectors) != len(self.neurons) or any(
+            neuron_id not in self.neuron_vectors for neuron_id in self.neurons
+        ):
+            raise ValueError("substrate neuron records and packed vectors differ")
+        if isinstance(self.assemblies, PagedAssemblyView):
+            if isinstance(self.assembly_vectors, PagedAssemblyVectorView) and (
+                self.assembly_vectors.index is not self.assemblies.index
+            ):
+                raise ValueError("paged assembly vector view has a different index")
+            if len(self.assembly_vectors) != len(self.assemblies):
+                raise ValueError("paged assemblies and vector view counts differ")
+            for record in self.assemblies:
+                assembly_id = str(record.get("id", ""))
+                if (
+                    not assembly_id
+                    or assembly_id not in self.neurons
+                    or assembly_id not in self.assembly_vectors
+                ):
+                    raise ValueError("paged assembly lacks its shared neuron row")
+            return
+        assembly_ids = [str(item.get("id", "")) for item in self.assemblies]
+        if (
+            not all(assembly_ids)
+            or len(set(assembly_ids)) != len(assembly_ids)
+            or set(self.assembly_vectors) != set(assembly_ids)
+            or any(assembly_id not in self.neurons for assembly_id in assembly_ids)
+        ):
+            raise ValueError("substrate assembly vectors must alias neuron rows")
+
     def metadata(self, include_records: bool = True) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {
             "schema": self.SCHEMA,
             "dimensions": self.space.dimensions,
             "seed": self.space.seed,
             "cardinality_limit": None,
-            "authoritative_memory": "neurons-assemblies-ternary-synapses",
+            "authoritative_memory": "packed-ternary-neurons-assemblies-synapses",
             "growth_events": self.growth_events,
             "growth_pauses": self.growth_pauses,
             "state_revision": self.state_revision,
@@ -2346,6 +2893,12 @@ class NeuralSubstrate:
         if self.persistence_manifest is not None:
             metadata["persistence"] = dict(self.persistence_manifest)
         if include_records:
+            if isinstance(self.assemblies, PagedAssemblyView):
+                raise ValueError(
+                    "paged assemblies cannot use monolithic metadata export"
+                )
+            self._validate_packed_vector_identity()
+            packed_metadata, _packed_tensors = self.neuron_vectors.export_state()
             metadata.update(
                 {
                     "neurons": list(self.neurons.values()),
@@ -2358,8 +2911,7 @@ class NeuralSubstrate:
                         }
                         for record in self.synapses.values()
                     ],
-                    "neuron_vector_ids": list(self.neuron_vectors),
-                    "assembly_vector_ids": list(self.assembly_vectors),
+                    "packed_vector_state": packed_metadata,
                 }
             )
         return metadata
@@ -2553,16 +3105,29 @@ class NeuralSubstrate:
         root: Path,
         *,
         records_per_shard: int = 512,
+        disk_reserve: Optional[Callable[[int, str], Any]] = None,
     ) -> Dict[str, Any]:
         """Write a deterministic content-addressed substrate generation.
 
         Only bounded shards are materialized. Existing content blobs are
         reused, so a growth update rewrites the affected hash bucket rather
-        than the complete sparse substrate.
+        than the complete sparse substrate. ``disk_reserve`` is used only by
+        the paged writer; the resident path keeps its existing growth guard.
         """
 
         if records_per_shard < 1:
             raise ValueError("records_per_shard must be positive")
+        if isinstance(self.assemblies, PagedAssemblyView):
+            # Keep the paged path separate from _stable_groups, whose resident
+            # grouping map is proportional to the entire assembly corpus.
+            # Dynamic synapses remain fail-closed until their bounded v3
+            # publisher can commit the same generation and forward index.
+            from .paged_substrate_writer import write_paged_substrate_generation
+
+            return write_paged_substrate_generation(
+                self, root, records_per_shard=records_per_shard,
+                disk_reserve=disk_reserve,
+            )
         # Validate the live forward values before creating any generation or
         # content blob. A corrupt fractional value must not be truncated to an
         # int8 ternary level or leave a partially staged substrate behind.
@@ -2576,6 +3141,7 @@ class NeuralSubstrate:
         else:
             for synapse in self.synapses.values():
                 self.exact_effective_weight(synapse.get("effective_weight", 0))
+        self._validate_packed_vector_identity()
         store = Path(root).resolve()
         (store / "blobs").mkdir(parents=True, exist_ok=True)
         (store / "generations").mkdir(parents=True, exist_ok=True)
@@ -2609,8 +3175,8 @@ class NeuralSubstrate:
                 # pointer will be rejected on load rather than trusted for reuse.
                 prior_shards = {}
 
-        for kind, values, vectors in (
-            ("neurons", self.neurons.items(), self.neuron_vectors),
+        for kind, values in (
+            ("neurons", self.neurons.items()),
             (
                 "assemblies",
                 (
@@ -2620,7 +3186,6 @@ class NeuralSubstrate:
                     )
                     for index, item in enumerate(self.assemblies)
                 ),
-                self.assembly_vectors,
             ),
         ):
             for bucket, part, group in self._stable_groups(
@@ -2633,36 +3198,35 @@ class NeuralSubstrate:
                     }
                 )
                 ids = [record_id for record_id, _record in group]
+                packed_metadata: Optional[Dict[str, Any]] = None
+                packed_tensors: Optional[Dict[str, torch.Tensor]] = None
+                if kind == "neurons":
+                    packed_metadata, packed_tensors = self.neuron_vectors.export_state(
+                        keys=ids
+                    )
                 json_blob = self._store_json_blob(
                     store,
                     {
                         "kind": kind,
                         "ids": ids,
                         "records": [record for _record_id, record in group],
-                        "vectorIds": [
-                            record_id for record_id in ids if record_id in vectors
-                        ],
+                        "vectorIds": ids,
+                        **(
+                            {"packedVectorState": packed_metadata}
+                            if kind == "neurons"
+                            else {"vectorStorage": "shared-neuron-packed"}
+                        ),
                     },
                 )
-                vector_ids = [
-                    record_id for record_id in ids if record_id in vectors
-                ]
                 tensor_blob = (
                     self._store_tensor_blob(
                         store,
-                        {
-                            "vectors": torch.stack(
-                                [
-                                    vectors[record_id].detach().cpu()
-                                    for record_id in vector_ids
-                                ]
-                            )
-                        },
+                        packed_tensors,
                         reusable=prior_shards.get(
                             (kind, bucket, part), {}
                         ).get("tensors"),
                     )
-                    if vector_ids
+                    if packed_tensors is not None
                     else None
                 )
                 shards.append(
@@ -3091,8 +3655,13 @@ class NeuralSubstrate:
         *,
         growth_guard: Optional[Callable[[int], bool]] = None,
         lazy_synapses: Optional[bool] = None,
+        paged_vectors: Optional[PagedPackedVectors] = None,
+        paged_neurons: Optional[PagedNeuronMetadata] = None,
+        defer_paged_assemblies: bool = False,
     ) -> "NeuralSubstrate":
         store = Path(root).resolve()
+        if metadata.get("schema") != cls.SCHEMA:
+            raise ValueError("substrate metadata schema is incompatible")
         persistence = metadata.get("persistence")
         pointer = (
             dict(persistence)
@@ -3105,6 +3674,11 @@ class NeuralSubstrate:
             not in _READABLE_SUBSTRATE_STORE_VERSIONS
         ):
             raise ValueError("unsupported neural substrate shard format")
+        if int(pointer.get("formatVersion", 0)) != _SUBSTRATE_STORE_VERSION:
+            raise ValueError(
+                "legacy higher-precision VSA vector state cannot be loaded "
+                "without an explicit migration"
+            )
         generation_path = cls._safe_store_path(
             store, str(pointer.get("generationManifest", ""))
         )
@@ -3159,6 +3733,27 @@ class NeuralSubstrate:
             seed=int(generation["seed"]),
             growth_guard=growth_guard,
         )
+        if paged_vectors is not None:
+            if (
+                not isinstance(paged_vectors, PagedPackedVectors)
+                or paged_vectors.dimensions != substrate.space.dimensions
+                or paged_vectors.seed != substrate.space.seed
+                or len(paged_vectors) != 0
+            ):
+                raise ValueError("paged vector load requires an empty compatible cache")
+            substrate.neuron_vectors = paged_vectors
+            substrate.assembly_vectors = PackedTernaryVectorView(paged_vectors)
+        if paged_neurons is not None:
+            if (
+                not isinstance(paged_neurons, PagedNeuronMetadata)
+                or paged_vectors is None
+                or paged_neurons.path.resolve() != paged_vectors.path.resolve()
+                or len(paged_neurons) != 0
+            ):
+                raise ValueError("paged neuron load needs the same empty vector cache")
+            substrate.neurons = paged_neurons
+        if defer_paged_assemblies and paged_neurons is None:
+            raise ValueError("deferred assembly load needs paged neuron metadata")
         substrate.growth_events = int(generation.get("growthEvents", 0))
         substrate.growth_pauses = int(generation.get("growthPauses", 0))
         substrate.state_revision = int(generation.get("stateRevision", 0))
@@ -3169,12 +3764,22 @@ class NeuralSubstrate:
             if lazy_synapses is None
             else bool(lazy_synapses)
         )
+        if defer_paged_assemblies and not use_lazy_synapses:
+            raise ValueError("deferred assembly load requires lazy synapses")
         lazy_synapse_shards: List[Dict[str, Any]] = []
+        observed_deferred_assemblies = 0
 
         for shard in generation.get("shards", []):
             if not isinstance(shard, dict):
                 raise ValueError("substrate shard entry is invalid")
             kind = str(shard.get("kind", ""))
+            if defer_paged_assemblies and (
+                type(shard.get("count")) is not int
+                or not 1 <= shard["count"] <= 512
+            ):
+                raise SubstrateResourcePause(
+                    "paged cold-load shard exceeds bounded row window"
+                )
             if kind == "synapses" and use_lazy_synapses:
                 bucket = str(shard.get("bucket", ""))
                 part = int(shard.get("part", -1))
@@ -3196,6 +3801,13 @@ class NeuralSubstrate:
                 record_spec.get("sha256", "")
             ):
                 raise ValueError("substrate record shard identity is invalid")
+            if defer_paged_assemblies and (
+                type(record_spec.get("bytes")) is not int
+                or not 0 <= record_spec["bytes"] <= 64 * 1024 * 1024
+            ):
+                raise SubstrateResourcePause(
+                    "paged cold-load record blob exceeds bounded read window"
+                )
             if (
                 cls._file_sha256(record_path)
                 != str(record_spec.get("sha256", ""))
@@ -3221,6 +3833,13 @@ class NeuralSubstrate:
                     tensor_spec.get("sha256", "")
                 ):
                     raise ValueError("substrate tensor shard identity is invalid")
+                if defer_paged_assemblies and (
+                    type(tensor_spec.get("bytes")) is not int
+                    or not 0 <= tensor_spec["bytes"] <= 64 * 1024 * 1024
+                ):
+                    raise SubstrateResourcePause(
+                        "paged cold-load tensor blob exceeds bounded read window"
+                    )
                 if (
                     cls._file_sha256(tensor_path)
                     != str(tensor_spec.get("sha256", ""))
@@ -3238,40 +3857,55 @@ class NeuralSubstrate:
                 ids = [str(item) for item in payload.get("ids", [])]
                 if ids != [str(item.get("id", "")) for item in records]:
                     raise ValueError("neuron shard identifiers do not match")
-                substrate.neurons.update(
-                    {record_id: dict(record) for record_id, record in zip(ids, records)}
-                )
+                if paged_neurons is None:
+                    substrate.neurons.update(
+                        {record_id: dict(record) for record_id, record in zip(ids, records)}
+                    )
+                else:
+                    for start in range(0, len(records), 64):
+                        page = records[start : start + 64]
+                        if paged_neurons.import_page(
+                            page, max_rows=64,
+                            max_payload_bytes=20 * 1024 * 1024,
+                        ) != len(page):
+                            raise ValueError("paged neuron shard import missed records")
                 vector_ids = [
                     str(item) for item in payload.get("vectorIds", [])
                 ]
-                vectors = tensor_values.get("vectors")
-                if vectors is not None:
-                    if vectors.shape[0] != len(vector_ids):
-                        raise ValueError("neuron vector shard count mismatch")
-                    substrate.neuron_vectors.update(
-                        {
-                            record_id: vectors[index].detach().cpu()
-                            for index, record_id in enumerate(vector_ids)
-                        }
+                if vector_ids != ids or set(tensor_values) != {
+                    "packed_rows", "update_counters_le"
+                }:
+                    raise ValueError("neuron shard lacks exact packed vector state")
+                vector_metadata = payload.get("packedVectorState")
+                if (
+                    not isinstance(vector_metadata, Mapping)
+                    or vector_metadata.get("ids") != vector_ids
+                ):
+                    raise ValueError("neuron packed vector IDs do not match shard")
+                if paged_vectors is None:
+                    shard_vectors = PackedTernaryVectors.from_state(
+                        vector_metadata, tensor_values
                     )
+                    substrate.neuron_vectors.update_packed(shard_vectors)
+                elif paged_vectors.import_state(vector_metadata, tensor_values) != len(ids):
+                    raise ValueError("paged neuron shard import missed packed rows")
             elif kind == "assemblies":
                 ids = [str(item) for item in payload.get("ids", [])]
                 if ids != [str(item.get("id", "")) for item in records]:
                     raise ValueError("assembly shard identifiers do not match")
-                substrate.assemblies.extend(dict(record) for record in records)
+                if defer_paged_assemblies:
+                    observed_deferred_assemblies += len(records)
+                else:
+                    substrate.assemblies.extend(dict(record) for record in records)
                 vector_ids = [
                     str(item) for item in payload.get("vectorIds", [])
                 ]
-                vectors = tensor_values.get("vectors")
-                if vectors is not None:
-                    if vectors.shape[0] != len(vector_ids):
-                        raise ValueError("assembly vector shard count mismatch")
-                    substrate.assembly_vectors.update(
-                        {
-                            record_id: vectors[index].detach().cpu()
-                            for index, record_id in enumerate(vector_ids)
-                        }
-                    )
+                if (
+                    vector_ids != ids
+                    or payload.get("vectorStorage") != "shared-neuron-packed"
+                    or tensor_spec is not None
+                ):
+                    raise ValueError("assembly shard must alias packed neuron rows")
             elif kind == "synapses":
                 ids = [str(item) for item in payload.get("ids", [])]
                 if ids != [str(item.get("id", "")) for item in records]:
@@ -3322,14 +3956,21 @@ class NeuralSubstrate:
                 cls._bucket(kind, record_id) != bucket for record_id in ids
             ):
                 raise ValueError("substrate shard placement is invalid")
-            substrate._persistence_record_groups.update(
-                {
-                    (kind, record_id): (bucket, part)
-                    for record_id in ids
-                }
-            )
+            if not defer_paged_assemblies:
+                substrate._persistence_record_groups.update(
+                    {
+                        (kind, record_id): (bucket, part)
+                        for record_id in ids
+                    }
+                )
 
-        if use_lazy_synapses:
+        if use_lazy_synapses and defer_paged_assemblies:
+            # The verified-cache finisher rebuilds assembly membership from
+            # bounded shard pages, then installs lazy synapses against that
+            # paged membership. A half-loaded substrate is never published.
+            substrate._deferred_lazy_synapse_shards = lazy_synapse_shards
+            substrate._paged_load_incomplete = True
+        elif use_lazy_synapses:
             hot_node_ids = {
                 str(record.get("id", ""))
                 for record in substrate.assemblies
@@ -3384,17 +4025,27 @@ class NeuralSubstrate:
                     pass
         observed_counts = {
             "neurons": len(substrate.neurons),
-            "assemblies": len(substrate.assemblies),
-            "synapses": len(substrate.synapses),
+            "assemblies": (
+                observed_deferred_assemblies
+                if defer_paged_assemblies else len(substrate.assemblies)
+            ),
+            "synapses": (
+                sum(int(item.get("count", -1)) for item in lazy_synapse_shards)
+                if defer_paged_assemblies and use_lazy_synapses
+                else len(substrate.synapses)
+            ),
         }
         if observed_counts != expected_counts:
             raise ValueError("substrate shard generation count mismatch")
-        substrate.assemblies.sort(
-            key=lambda item: int(item.get("__persistence_ordinal", 0))
-        )
-        substrate.invalidate_assembly_index()
-        for item in substrate.assemblies:
-            item.pop("__persistence_ordinal", None)
+        if not defer_paged_assemblies:
+            substrate.assemblies.sort(
+                key=lambda item: int(item.get("__persistence_ordinal", 0))
+            )
+            substrate.invalidate_assembly_index()
+            for item in substrate.assemblies:
+                item.pop("__persistence_ordinal", None)
+                substrate.assembly_vectors.link(str(item.get("id", "")))
+            substrate._validate_packed_vector_identity()
         substrate.persistence_manifest = dict(pointer)
         substrate._persistence_records_per_shard = int(
             generation.get("recordsPerShard", 0)
@@ -3406,15 +4057,12 @@ class NeuralSubstrate:
         return substrate
 
     def tensor_state(self, prefix: str = "substrate.") -> Dict[str, torch.Tensor]:
-        tensors: Dict[str, torch.Tensor] = {}
-        if self.neuron_vectors:
-            tensors[prefix + "neuron_vectors"] = torch.stack(
-                [self.neuron_vectors[key] for key in self.neuron_vectors]
-            )
-        if self.assembly_vectors:
-            tensors[prefix + "assembly_vectors"] = torch.stack(
-                [self.assembly_vectors[key] for key in self.assembly_vectors]
-            )
+        if isinstance(self.assemblies, PagedAssemblyView):
+            raise ValueError("paged assemblies cannot use monolithic tensor export")
+        self._validate_packed_vector_identity()
+        _metadata, tensors = self.neuron_vectors.export_state(
+            prefix=prefix + "vectors."
+        )
         return tensors
 
     @classmethod
@@ -3426,8 +4074,15 @@ class NeuralSubstrate:
     ) -> "NeuralSubstrate":
         if metadata.get("schema") != cls.SCHEMA:
             raise ValueError(
-                "incompatible beta neural memory; stable v1 requires a new brain"
+                "legacy higher-precision VSA vector state requires an explicit migration"
             )
+        if (
+            "neuron_vector_ids" in metadata
+            or "assembly_vector_ids" in metadata
+            or prefix + "neuron_vectors" in tensors
+            or prefix + "assembly_vectors" in tensors
+        ):
+            raise ValueError("legacy float VSA vector state cannot be loaded")
         substrate = cls(
             dimensions=int(metadata["dimensions"]),
             seed=int(metadata["seed"]),
@@ -3449,20 +4104,17 @@ class NeuralSubstrate:
         substrate.growth_events = int(metadata.get("growth_events", 0))
         substrate.growth_pauses = int(metadata.get("growth_pauses", 0))
         substrate.state_revision = int(metadata.get("state_revision", 0))
-        neuron_ids = metadata.get("neuron_vector_ids", [])
-        neuron_tensor = tensors.get(prefix + "neuron_vectors")
-        if neuron_tensor is not None:
-            substrate.neuron_vectors = {
-                neuron_id: neuron_tensor[index].detach().cpu()
-                for index, neuron_id in enumerate(neuron_ids)
-            }
-        assembly_ids = metadata.get("assembly_vector_ids", [])
-        assembly_tensor = tensors.get(prefix + "assembly_vectors")
-        if assembly_tensor is not None:
-            substrate.assembly_vectors = {
-                assembly_id: assembly_tensor[index].detach().cpu()
-                for index, assembly_id in enumerate(assembly_ids)
-            }
+        substrate.neuron_vectors = PackedTernaryVectors.from_state(
+            metadata.get("packed_vector_state"),
+            tensors,
+            prefix=prefix + "vectors.",
+        )
+        substrate.assembly_vectors = PackedTernaryVectorView(
+            substrate.neuron_vectors
+        )
+        for item in substrate.assemblies:
+            substrate.assembly_vectors.link(str(item.get("id", "")))
+        substrate._validate_packed_vector_identity()
         return substrate
 
 
@@ -3520,9 +4172,15 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         self._dirty_locations: Dict[str, Tuple[Tuple[str, int], int]] = {}
         self._deleted_locations: Dict[str, Tuple[Tuple[str, int], int]] = {}
         self._new_ids: set[str] = set()
-        self._hot_node_ids = {
-            str(value) for value in hot_node_ids if str(value)
-        }
+        # A paged assembly source supports exact indexed membership and
+        # canonical ordered iteration without copying every assembly ID into
+        # another process-resident Python set.
+        if callable(getattr(hot_node_ids, "iter_sorted_ids", None)):
+            self._hot_node_ids = hot_node_ids
+        else:
+            self._hot_node_ids = {
+                str(value) for value in hot_node_ids if str(value)
+            }
         self._hot_locations: Dict[
             str, List[Tuple[str, Tuple[str, int], int]]
         ] = defaultdict(list)
@@ -3646,6 +4304,18 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     )
                 self._uses_by_shard[key] = shard_uses
                 seen_hot: set[Tuple[str, str, int]] = set()
+                contains_many = getattr(self._hot_node_ids, "contains_many", None)
+                allowed_hot_ids = (
+                    contains_many(
+                        {
+                            str(value[0])
+                            for value in raw_hot
+                            if isinstance(value, list) and value
+                        }
+                    )
+                    if callable(contains_many)
+                    else self._hot_node_ids
+                )
                 for value in raw_hot:
                     endpoints = (
                         _synapse_id_endpoints(value[1])
@@ -3657,7 +4327,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     if (
                         not isinstance(value, list)
                         or len(value) != 3
-                        or value[0] not in self._hot_node_ids
+                        or value[0] not in allowed_hot_ids
                         or not isinstance(value[1], str)
                         or isinstance(value[2], bool)
                         or not isinstance(value[2], int)

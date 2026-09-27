@@ -122,7 +122,7 @@ describe("renderer resource envelope", () => {
     expect(app).toContain("Active context stays resident");
     expect(app).toContain("Core, active-context, and neural-memory placement");
     expect(app).toContain("never paged to storage");
-    expect(app).toContain("storage cannot replace live masters");
+    expect(app).toContain("All initial learned weights use 2-bit packed ternary codes");
     expect(app).toContain("contextCapacityBandStyle(memoryPlan)");
     expect(app).not.toContain("maximum 100% of the currently safe pool");
     expect(presentation).toContain(STORAGE_BOUNDARY_COPY);

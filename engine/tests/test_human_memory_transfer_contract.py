@@ -135,7 +135,7 @@ class HumanMemoryTransferContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="omni-ternary-synapse-") as directory:
             root = Path(directory) / "substrate"
             pointer = memory.save_sharded(root, records_per_shard=32)
-            self.assertEqual(pointer["formatVersion"], 2)
+            self.assertEqual(pointer["formatVersion"], 3)
             generation = NeuralSubstrate._safe_store_path(
                 root, pointer["generationManifest"]
             )
@@ -192,7 +192,7 @@ class HumanMemoryTransferContractTests(unittest.TestCase):
                 2,
             )
 
-    def test_native_v1_sparse_shadow_is_discarded_and_migrates_by_shard(self):
+    def test_native_v1_with_float_vector_state_is_rejected_without_migration(self):
         memory = NeuralSubstrate(dimensions=32, seed=251)
         memory.learn("Copper lanterns drifted across the violet harbor.")
         with tempfile.TemporaryDirectory(prefix="omni-native-v1-migration-") as directory:
@@ -261,36 +261,10 @@ class HumanMemoryTransferContractTests(unittest.TestCase):
             metadata = memory.metadata(include_records=False)
             metadata["persistence"] = v1_pointer
 
-            restored = NeuralSubstrate.load_sharded(
-                root, metadata, lazy_synapses=True
-            )
-            self.assertEqual(len(restored.synapses), len(memory.synapses))
-            sample = next(iter(restored.synapses))
-            self.assertNotIn("latent_weight", restored.synapses[sample])
-            # A second load uses the freshly published generation-bound
-            # forward index, like a normally restarted native v1 brain.
-            restored = NeuralSubstrate.load_sharded(
-                root, metadata, lazy_synapses=True
-            )
-            migrated = restored.save_sharded(root, records_per_shard=32)
-            self.assertEqual(migrated["formatVersion"], 2)
-            new_shards = json.loads(
-                (root / migrated["generationManifest"]).read_text("utf-8")
-            )["shards"]
-            for shard in new_shards:
-                if shard["kind"] == "synapses":
-                    self.assertNotIn(
-                        "latent_weight",
-                        load_tensors(root / shard["tensors"]["path"], device="cpu"),
-                    )
-                    self.assertIn(
-                        "packed_effective_weight",
-                        load_tensors(root / shard["tensors"]["path"], device="cpu"),
-                    )
-            again = NeuralSubstrate.load_sharded(
-                root, restored.metadata(include_records=False), lazy_synapses=True
-            )
-            self.assertEqual(len(again.synapses), len(memory.synapses))
+            with self.assertRaisesRegex(ValueError, "legacy higher-precision VSA"):
+                NeuralSubstrate.load_sharded(
+                    root, metadata, lazy_synapses=True
+                )
 
 
 if __name__ == "__main__":

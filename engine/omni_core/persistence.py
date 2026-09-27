@@ -157,7 +157,7 @@ def copy_substrate_snapshot(
         return None
     if (
         pointer.get("format") != "omni-substrate-shards"
-        or int(pointer.get("formatVersion", 0)) not in {1, 2}
+        or int(pointer.get("formatVersion", 0)) not in {1, 2, 3}
     ):
         raise ValueError("substrate snapshot pointer is incompatible")
     source_store = Path(source_engine) / "substrate"
@@ -200,6 +200,10 @@ def copy_substrate_snapshot(
         generation.get("format") != "omni-substrate-shards"
         or int(generation.get("formatVersion", 0))
         != int(pointer.get("formatVersion", 0))
+        or (
+            int(generation.get("formatVersion", 0)) == 3
+            and generation.get("schema") != "neural-substrate-2"
+        )
         or content_sha != str(generation.get("contentSha256", ""))
         or content_sha != active_generation
         or content_sha != str(pointer.get("contentSha256", ""))

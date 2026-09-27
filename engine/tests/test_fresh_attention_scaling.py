@@ -112,10 +112,10 @@ class FreshAttentionScalingTests(unittest.TestCase):
         shared_vector = torch.ones(dimensions, dtype=torch.float32)
         cardinality = 8_192
         memory.neurons = {}
-        memory.neuron_vectors = {}
+        memory.assembly_vectors.clear()
+        memory.neuron_vectors.clear()
         memory.synapses = {}
         memory.assemblies = []
-        memory.assembly_vectors = {}
         for index in range(cardinality):
             identifier = "scale-neuron-%05d" % index
             memory.neurons[identifier] = {

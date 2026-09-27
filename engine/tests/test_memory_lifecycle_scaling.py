@@ -55,9 +55,9 @@ def _substrate(count=12):
         }
         for index in range(count)
     ]
-    substrate.assembly_vectors = {
+    substrate.assembly_vectors.update({
         record["id"]: torch.ones(16) for record in substrate.assemblies
-    }
+    })
     substrate.neurons = {
         record["id"]: {
             "id": record["id"],

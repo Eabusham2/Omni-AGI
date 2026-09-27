@@ -64,14 +64,18 @@ retain a full FP32 master copy or Adam moments for those synapses. It decodes
 bounded rows/positions for arithmetic; this is not yet a fused BitNet kernel.
 Working activations, fixed normalization and gain bases, liquid activity,
 eligibility, and bounded update scratch still use higher precision; they are
-not additional learned weight copies. The associative substrate also persists
-adaptive higher-precision neuron/assembly vectors alongside ternary synaptic
-links; these are not a second language model, but they remain an open strict
-“all persistent learned state is ternary” design gap. A floating trainable
-`nn.Parameter` in the native module roots now fails the packed-runtime audit;
-that audit does not yet cover those VSA vectors.
-Sparse idea links are exact ternary weights and their persisted v2 shards are
-packed; live graph records also contain non-weight metadata.
+not additional learned weight copies. In the new v3 substrate source, adaptive
+neuron/assembly vectors also use one shared packed ternary row, with transient
+normalized floating reads for VSA math. The v3 persistence and inspector
+readers are source-wired, but native learning/recall quality and disk-paged
+scaling remain unverified. A floating trainable `nn.Parameter` in the native
+module roots fails the packed-runtime audit; v3 VSA rows have their own
+canonical packed validation.
+Sparse idea links are exact ternary weights and their persisted v3 shards are
+packed; live graph records also contain non-weight metadata. The paged v3
+writer bounds row buffers and verifies immutable shards, but it still scans
+all neuron/assembly metadata on each checkpoint. This is not yet evidence of
+low-wear or fast whole-corpus training.
 
 Thus "1.58-bit" describes learned ternary weights, **not** the entire
 process's memory footprint. The new control schema is incompatible with older

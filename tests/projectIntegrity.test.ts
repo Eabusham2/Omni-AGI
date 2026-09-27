@@ -288,7 +288,7 @@ describe("project integrity", () => {
     expect(renderer).toContain("incomplete/resumable");
     expect(renderer).toContain("Progressive imagination");
     expect(readme).toContain(
-      "Compatible imported checkpoints retain their recorded context/model shape"
+      "A verified imported native OmniCortex retains its recorded context/model shape"
     );
     expect(readme).toContain(
       "native architecture's exact parameter inventory directly from the tier and selected recurrent/paged working-memory population"
@@ -297,7 +297,7 @@ describe("project integrity", () => {
       "Token context and recurrent memory items are separate"
     );
     expect(readme).toContain("neither frame-synchronous");
-    expect(compliance).toContain("committed deterministic manifest/source snapshot");
+    expect(compliance).toContain("Deterministic manifest/cursor code accounts for each valid committed record");
     expect(compliance).toContain("traversal accounting does not claim");
     expect(audit).not.toContain("passed 103 tests");
     expect(audit).not.toContain("passed 106/106");
@@ -331,7 +331,7 @@ describe("project integrity", () => {
     expect(workflow).toContain("engine/locks/*.lock");
     expect(workflow).toContain("python scripts/install-engine-lock.py");
     expect(workflow).toContain("python -m pip check");
-    expect(workflow).toContain("transformers.is_torch_available()");
+    expect(workflow).toContain("torch.isfinite(torch.empty(1).fill_(1))");
     expect(workflow.match(/OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"/gu)).toHaveLength(2);
     expect(workflow).not.toContain("python -m pip install -r engine/requirements.txt");
     expect(workflow).not.toContain("--index-url https://download.pytorch.org");

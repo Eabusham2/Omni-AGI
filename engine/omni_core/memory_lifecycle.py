@@ -18,6 +18,9 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+from .paged_assembly_view import PagedAssemblyView
+from .paged_neuron_metadata import PagedNeuronMetadata
+
 
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -99,6 +102,9 @@ class OrganicMemoryLifecycle:
 
     @staticmethod
     def _record_for(memory: Any, assembly_id: str) -> Optional[Dict[str, Any]]:
+        indexed = getattr(memory, "assembly_by_id", None)
+        if isinstance(indexed, Mapping):
+            return indexed.get(assembly_id)
         return next(
             (
                 record
@@ -125,14 +131,18 @@ class OrganicMemoryLifecycle:
         """Remove inert v1 categories while preserving every learned record."""
 
         removed = 0
-        for record in memory.assemblies:
-            if "memory_stage" in record:
-                record.pop("memory_stage", None)
-                removed += 1
-        for node in memory.neurons.values():
-            if "memory_stage" in node:
-                node.pop("memory_stage", None)
-                removed += 1
+        if not isinstance(memory.assemblies, PagedAssemblyView):
+            for record in memory.assemblies:
+                if "memory_stage" in record:
+                    record.pop("memory_stage", None)
+                    removed += 1
+        # Current paged schemas reject the removed label at admission; a
+        # read-only page cannot carry it and needs no corpus scan/mutation.
+        if not isinstance(memory.neurons, PagedNeuronMetadata):
+            for node in memory.neurons.values():
+                if "memory_stage" in node:
+                    node.pop("memory_stage", None)
+                    removed += 1
         return removed
 
     def _discard_legacy_stage_labels_for_settle(self, memory: Any) -> None:
@@ -145,6 +155,12 @@ class OrganicMemoryLifecycle:
 
         records = memory.assemblies
         neurons = memory.neurons
+        if isinstance(records, PagedAssemblyView):
+            self._legacy_clean_memory = memory
+            self._legacy_clean_assemblies = records
+            self._legacy_clean_neurons = neurons
+            self._legacy_clean_count = len(records)
+            return
         if (
             self._legacy_clean_memory is memory
             and self._legacy_clean_assemblies is records
@@ -569,6 +585,51 @@ class OrganicMemoryLifecycle:
         target["settling_signals"] = dict(signals)
         target["last_settled_at"] = timestamp
 
+    def _write_assembly_scores(
+        self,
+        memory: Any,
+        assembly_id: str,
+        record: Dict[str, Any],
+        *,
+        scores: Mapping[str, float],
+        signals: Mapping[str, float],
+        timestamp: str,
+    ) -> None:
+        if isinstance(memory.assemblies, PagedAssemblyView):
+            memory._edit_assembly_by_id(
+                assembly_id,
+                lambda current: self._write_scores(
+                    current, scores=scores, signals=signals, timestamp=timestamp
+                ),
+            )
+        else:
+            self._write_scores(
+                record, scores=scores, signals=signals, timestamp=timestamp
+            )
+
+    def _write_neuron_scores(
+        self,
+        memory: Any,
+        neuron_id: str,
+        *,
+        scores: Mapping[str, float],
+        signals: Mapping[str, float],
+        timestamp: str,
+    ) -> None:
+        if isinstance(memory.neurons, PagedNeuronMetadata):
+            memory.edit_neuron_by_id(
+                neuron_id,
+                lambda current: self._write_scores(
+                    current, scores=scores, signals=signals, timestamp=timestamp
+                ),
+            )
+        else:
+            node = memory.neurons.get(neuron_id)
+            if node is not None:
+                self._write_scores(
+                    node, scores=scores, signals=signals, timestamp=timestamp
+                )
+
     def _rescore_afterimages(
         self,
         memory: Any,
@@ -662,16 +723,17 @@ class OrganicMemoryLifecycle:
                 }
             )
             if record:
-                self._write_scores(
+                self._write_assembly_scores(
+                    memory,
+                    candidate_id,
                     record,
                     scores={**scores, "retention": strength},
                     signals=signals,
                     timestamp=self.last_settled_at,
                 )
-                node = memory.neurons.get(candidate_id)
-                if node is not None:
-                    self._write_scores(
-                        node,
+                if candidate_id in memory.neurons:
+                    self._write_neuron_scores(
+                        memory, candidate_id,
                         scores={**scores, "retention": strength},
                         signals=signals,
                         timestamp=self.last_settled_at,
@@ -889,16 +951,17 @@ class OrganicMemoryLifecycle:
 
         record = record_index.get(assembly_id)
         if record is not None:
-            self._write_scores(
+            self._write_assembly_scores(
+                memory,
+                assembly_id,
                 record,
                 scores=scores,
                 signals=signals,
                 timestamp=self.last_settled_at,
             )
-            node = memory.neurons.get(assembly_id)
-            if node is not None:
-                self._write_scores(
-                    node,
+            if assembly_id in memory.neurons:
+                self._write_neuron_scores(
+                    memory, assembly_id,
                     scores=scores,
                     signals=signals,
                     timestamp=self.last_settled_at,

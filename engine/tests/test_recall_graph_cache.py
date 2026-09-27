@@ -208,24 +208,27 @@ class RecallGraphCacheTests(unittest.TestCase):
         memory, cue = _small_graph()
         first = memory.assembly_by_id
         self.assertEqual(set(first), {"a", "b", "c"})
-        added = {"id": "d", "neuron_ids": []}
+        added = {"id": "d", "fingerprint": "repeat", "neuron_ids": []}
         memory.assemblies.append(added)
         memory.assembly_vectors["d"] = cue.clone()
         memory.neurons["d"] = _node("d")
         self.assertIs(memory.assembly_by_id["d"], added)
         self.assertIn("d", {row["assembly_id"] for row in _recall(memory, cue)[1]})
 
-        duplicate = {"id": "a", "neuron_ids": ["d"]}
+        duplicate = {"id": "a", "fingerprint": "repeat", "neuron_ids": ["d"]}
         memory.assemblies.append(duplicate)
         memory.assemblies.append({"id": "", "neuron_ids": []})
         memory.assemblies.append({"neuron_ids": []})
         self.assertIs(memory.assembly_by_id["a"], duplicate)
+        self.assertIs(memory.assembly_by_fingerprint["repeat"], added)
         self.assertNotIn("", memory.assembly_by_id)
-        memory.assemblies = [{"id": "replacement", "neuron_ids": []}]
+        memory.assemblies = [{"id": "replacement", "fingerprint": "new", "neuron_ids": []}]
         self.assertEqual(set(memory.assembly_by_id), {"replacement"})
-        memory.assemblies[0] = {"id": "same-length", "neuron_ids": []}
+        self.assertEqual(set(memory.assembly_by_fingerprint), {"new"})
+        memory.assemblies[0] = {"id": "same-length", "fingerprint": "newer", "neuron_ids": []}
         memory.invalidate_assembly_index()
         self.assertEqual(set(memory.assembly_by_id), {"same-length"})
+        self.assertEqual(set(memory.assembly_by_fingerprint), {"newer"})
 
     def test_lazy_forward_index_cache_keeps_cold_shards_cold_and_invalidates(self):
         with tempfile.TemporaryDirectory(prefix="omni-recall-graph-") as folder:

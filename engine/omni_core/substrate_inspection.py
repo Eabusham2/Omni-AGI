@@ -23,12 +23,13 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 import torch
 from safetensors.torch import load_file
 
+from .packed_vsa_vectors import PackedTernaryVectors
 from .persistence import atomic_write_bytes
 
 
 SUBSTRATE_STORE_FORMAT = "omni-substrate-shards"
-SUBSTRATE_STORE_VERSION = 2
-READABLE_SUBSTRATE_STORE_VERSIONS = frozenset((1, 2))
+SUBSTRATE_STORE_VERSION = 3
+READABLE_SUBSTRATE_STORE_VERSIONS = frozenset((1, 2, 3))
 INSPECTION_INDEX_FORMAT = "omni-substrate-inspection-index"
 INSPECTION_INDEX_VERSION = 1
 INSPECTION_INDEX_RECORDS_PER_SHARD = 512
@@ -325,6 +326,10 @@ class PersistedSubstrateView:
         if (
             generation.get("format") != SUBSTRATE_STORE_FORMAT
             or int(generation.get("formatVersion", 0)) != int(pointer.get("formatVersion", 0))
+            or (
+                int(generation.get("formatVersion", 0)) == 3
+                and generation.get("schema") != "neural-substrate-2"
+            )
             or generation.get("contentSha256") != generation_id
             or pointer.get("contentSha256") != generation_id
             or _sha256(_canonical_json(body)) != generation_id
@@ -350,6 +355,11 @@ class PersistedSubstrateView:
                 or part < 0
             ):
                 raise ValueError("persisted substrate shard placement is invalid")
+            if int(generation.get("formatVersion", 0)) == 3 and (
+                (kind == "neurons" and not isinstance(shard.get("tensors"), dict))
+                or (kind == "assemblies" and shard.get("tensors") is not None)
+            ):
+                raise ValueError("persisted packed vector shard layout is invalid")
             observed[kind] += _count(count, kind)
             key = (kind, bucket, part)
             if key in seen:
@@ -463,6 +473,31 @@ class PersistedSubstrateView:
             or len(payload["records"]) != _count(shard.get("count"), "shard")
         ):
             raise ValueError("persisted substrate record payload is invalid")
+        if int(self.generation.get("formatVersion", 0)) == 3:
+            kind = str(shard.get("kind", ""))
+            if kind in {"neurons", "assemblies"}:
+                ids = payload.get("ids")
+                if (
+                    not isinstance(ids, list)
+                    or not all(isinstance(identifier, str) and identifier for identifier in ids)
+                    or not all(isinstance(record, Mapping) for record in payload["records"])
+                    or ids != [record.get("id") for record in payload["records"]]
+                    or payload.get("vectorIds") != ids
+                ):
+                    raise ValueError("persisted packed vector record IDs are invalid")
+                if kind == "neurons":
+                    packed = payload.get("packedVectorState")
+                    if (
+                        not isinstance(packed, dict)
+                        or packed.get("ids") != ids
+                        or not isinstance(shard.get("tensors"), dict)
+                    ):
+                        raise ValueError("persisted neuron packed vector state is missing")
+                elif (
+                    payload.get("vectorStorage") != "shared-neuron-packed"
+                    or shard.get("tensors") is not None
+                ):
+                    raise ValueError("persisted assembly vector must alias a neuron row")
         return payload
 
     def tensors(self, shard: Mapping[str, Any]) -> Dict[str, Any]:
@@ -478,6 +513,16 @@ class PersistedSubstrateView:
         _read_bytes(path, checksum, size)
         tensors = load_file(str(path), device="cpu")
         if shard.get("kind") != "synapses":
+            if (
+                int(self.generation.get("formatVersion", 0)) == 3
+                and shard.get("kind") == "neurons"
+            ):
+                payload = self.records(shard)
+                if set(tensors) != {"packed_rows", "update_counters_le"}:
+                    raise ValueError("persisted neuron packed tensor fields are invalid")
+                PackedTernaryVectors.from_state(
+                    payload["packedVectorState"], tensors
+                )
             return tensors
         count = _count(shard.get("count"), "synapse count")
         version = int(self.generation.get("formatVersion", 0))
@@ -1294,14 +1339,60 @@ def _synapse_records(
             }
 
 
+def require_current_substrate_generation(
+    view: PersistedSubstrateView,
+    expected_live: Mapping[str, Any],
+) -> None:
+    """Fail closed before using a committed view for a mutable live brain.
+
+    The caller supplies only bounded identity/count metadata, never neuron or
+    synapse records. A changed live substrate must use a separate live paged
+    inspector; silently substituting the last checkpoint would be incorrect.
+    """
+
+    if not isinstance(expected_live, Mapping):
+        raise ValueError("live substrate inspection identity is invalid")
+    try:
+        counts = expected_live["counts"]
+        overlay = expected_live["attentionOverlay"]
+        if not isinstance(counts, Mapping) or not isinstance(overlay, Mapping):
+            raise ValueError("live substrate inspection identity is invalid")
+        exact_counts = {kind: _count(counts[kind], kind) for kind in _KINDS}
+        state_revision = _count(expected_live["stateRevision"], "state revision")
+        active_generation = str(expected_live["activeGeneration"])
+        same_overlay = _canonical_json(dict(overlay)) == _canonical_json(
+            view.attention_overlay
+        )
+    except (KeyError, TypeError, OverflowError) as error:
+        raise ValueError("live substrate inspection identity is invalid") from error
+    if (
+        int(view.generation.get("formatVersion", 0)) != SUBSTRATE_STORE_VERSION
+        or active_generation != str(view.pointer.get("activeGeneration", ""))
+        or state_revision != _count(view.generation.get("stateRevision"), "state revision")
+        or exact_counts != view.counts
+        or not same_overlay
+    ):
+        raise ValueError(
+            "live substrate differs from the committed inspection generation"
+        )
+
+
 def query_persisted_substrate(
     engine_directory: Path,
     expected_brain_id: str,
     query: Optional[Mapping[str, Any]] = None,
+    *,
+    expected_live: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Query one committed generation without loading the neural runtime."""
+    """Query one committed generation without loading the neural runtime.
+
+    Pass ``expected_live`` when delegating from an already loaded brain. A
+    dirty or mismatched live state is rejected before any shard query.
+    """
 
     view = PersistedSubstrateView.open(engine_directory, expected_brain_id)
+    if expected_live is not None:
+        require_current_substrate_generation(view, expected_live)
     raw = dict(query or {})
     entity = str(raw.get("entity", "overview"))
     if entity not in {"overview", "neurons", "assemblies", "synapses"}:

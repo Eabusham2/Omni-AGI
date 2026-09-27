@@ -87,9 +87,9 @@ release instructions *for this goal*; it does not erase the product vision.
    launch a hands-on Falcon memory test, or repeat completed feature tests in
    this goal. The user will initiate the later ground-up training/live goal.
 
-## Current-goal checklist — 1 of 4 steps source-scoped
+## Current-goal checklist — brain correction still in progress
 
-- [x] **1. Recover the request.** Read all 587 user-authored text entries in
+- [x] **1. Recover the request.** Read all 595 user-authored text entries in
   the raw project log, including repeats and the final corrections. This pass
   included the original prompt and both v1 plans. The linked screenshots are
   not interpreted as proof of their contents. No implementation pass follows
@@ -147,29 +147,35 @@ release instructions *for this goal*; it does not erase the product vision.
   gates remain outside it and its initial curriculum does not verify natural
   tool competence. We must not relabel any future fact/key-value lookup as
   “learned recall” in the GUI.
-- **Strict unification is still open.** The VSA substrate persists adaptive
-  higher-precision neuron/assembly vectors and consults them during recall,
-  in addition to packed ternary synaptic links. They are neural state, not a
-  cue→answer table or second language model, but are not yet packed ternary
-  learned synapses. The native module audit checks `nn.Parameter` and packed
-  projections, not these substrate tensors. Do not describe *all* persistent
-  learned state as 1.58-bit or literally one synapse representation.
+- **Strict unification is source-progress, not accepted.** The new v3 VSA
+  source stores adaptive neuron/assembly vectors as one shared packed ternary
+  row per identity and rejects old floating-vector states. Transient reads are
+  normalized for activation math. This removes the separate learned float
+  vector authority in new state, but full source-path verification, disk paging,
+  and actual learned recall are still open; do not call the brain fully
+  unified or 1.58-bit end-to-end from these edits alone.
 - Multi-rank packed training currently fails closed rather than claiming
   synchronized mutations. This is an honest limitation for the later
   distributed training goal, not a completed distributed capability.
 - The old FP32-anchor anti-forgetting path becomes a no-op when no trainable
   float parameters remain. Packed-weight stability/retention needs an actual
   replacement before metaplasticity can be claimed for cortical synapses.
-- **Large-source idea growth is not yet as requested.** Current source chooses
-  shared statistical fields when a source-scale estimate exceeds a resource
-  fraction. It still traverses and updates synapses/slow gradients, but can
-  merge many records into few assemblies. Merely forcing per-record detail
-  would exhaust RAM and make recall quadratic: assembly records/vectors load
-  eagerly, are scanned for deduplication/competition/recall, and the existing
-  source-size schedule is frozen into resume state. A safe correction requires
-  paged/indexed assemblies and vectors, a versioned resume-safe schedule,
-  per-record resource pauses, and full-coverage checks. This gate stays open;
-  a few shared fields must not be advertised as full human-like learning.
+- **Large-source idea growth is not yet accepted.** The source-size threshold
+  that silently sent large datasets into a few shared statistical fields has
+  been removed for new transactions: detailed assemblies are selected and
+  admission is estimated per bounded checkpoint window, with a recoverable
+  resource pause instead of representation downgrade. Existing active v2
+  cursors keep their frozen schedule. This is a correctness change, not proof
+  that a huge dataset will finish: the live pager, v3 resumable microbatch
+  schedule, and cold-load metadata path still need end-to-end integration.
+- Paged packed vectors, assembly metadata, exact paged similarity, and a
+  bounded v3 substrate writer have source-level storage checks. The new-file
+  ingestion path is being connected to detailed paged learning and a joint
+  `brain.json` checkpoint. This is not yet a completed large-dataset path:
+  neuron metadata still resides in RAM, and the writer scans all neuron and
+  assembly records at each checkpoint even though its buffers are bounded.
+  Source-only storage checks do not establish full-corpus throughput or
+  learned recall.
 - No claim of consciousness, biological equivalence, guaranteed AGI, perfect
   memory, or fluency from random weights is justified here.
 

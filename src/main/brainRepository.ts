@@ -90,6 +90,7 @@ const BUNDLE_FORMAT = "omni-brain";
 const BUNDLE_VERSION = 1;
 /** Must remain identical to engine/omni_core/vsa.py's store format. */
 export const SUBSTRATE_STORE_FORMAT = "omni-substrate-shards";
+const READABLE_SUBSTRATE_STORE_VERSIONS = new Set([1, 2, 3]);
 /** Must remain identical to engine/omni_core/offload.py's store format. */
 export const MUTABLE_STATE_STORE_FORMAT = "omni-mutable-state";
 const STABLE_RELEASE_FORMAT = "stable-1.0";
@@ -756,7 +757,7 @@ async function readPersistedSubstrateOverview(
   if (!embedded) return undefined;
   if (
     embedded.format !== SUBSTRATE_STORE_FORMAT ||
-    (embedded.formatVersion !== 1 && embedded.formatVersion !== 2) ||
+    !READABLE_SUBSTRATE_STORE_VERSIONS.has(embedded.formatVersion as number) ||
     typeof embedded.activeGeneration !== "string" ||
     !/^[a-f0-9]{64}$/.test(embedded.activeGeneration) ||
     embedded.contentSha256 !== embedded.activeGeneration ||
@@ -801,6 +802,7 @@ async function readPersistedSubstrateOverview(
     !isRecord(generation) ||
     generation.format !== SUBSTRATE_STORE_FORMAT ||
     generation.formatVersion !== embedded.formatVersion ||
+    (generation.formatVersion === 3 && generation.schema !== "neural-substrate-2") ||
     generation.contentSha256 !== embedded.activeGeneration ||
     !Array.isArray(generation.shards) ||
     generation.shards.length !== embedded.shardCount ||
@@ -872,7 +874,7 @@ async function collectSubstrateSnapshot(
   // follows the embedded record and synthesizes the matching portable pointer.
   if (
     embedded.format !== SUBSTRATE_STORE_FORMAT ||
-    (embedded.formatVersion !== 1 && embedded.formatVersion !== 2) ||
+    !READABLE_SUBSTRATE_STORE_VERSIONS.has(embedded.formatVersion as number) ||
     typeof embedded.generationManifest !== "string" ||
     typeof embedded.generationManifestSha256 !== "string" ||
     !/^[a-f0-9]{64}$/.test(embedded.generationManifestSha256)
@@ -898,6 +900,7 @@ async function collectSubstrateSnapshot(
     !isRecord(generation) ||
     generation.format !== SUBSTRATE_STORE_FORMAT ||
     generation.formatVersion !== embedded.formatVersion ||
+    (generation.formatVersion === 3 && generation.schema !== "neural-substrate-2") ||
     !Array.isArray(generation.shards) ||
     typeof generation.contentSha256 !== "string" ||
     generation.contentSha256 !== embedded.activeGeneration ||
@@ -1026,7 +1029,7 @@ async function validateExtractedSubstrateSnapshot(
   }
   if (
     embedded.format !== SUBSTRATE_STORE_FORMAT ||
-    (embedded.formatVersion !== 1 && embedded.formatVersion !== 2) ||
+    !READABLE_SUBSTRATE_STORE_VERSIONS.has(embedded.formatVersion as number) ||
     typeof embedded.generationManifest !== "string" ||
     typeof embedded.generationManifestSha256 !== "string" ||
     !/^[a-f0-9]{64}$/.test(embedded.generationManifestSha256) ||
@@ -1048,6 +1051,7 @@ async function validateExtractedSubstrateSnapshot(
     !isRecord(generation) ||
     generation.format !== SUBSTRATE_STORE_FORMAT ||
     generation.formatVersion !== embedded.formatVersion ||
+    (generation.formatVersion === 3 && generation.schema !== "neural-substrate-2") ||
     !Array.isArray(generation.shards) ||
     generation.contentSha256 !== embedded.activeGeneration ||
     embedded.contentSha256 !== embedded.activeGeneration ||

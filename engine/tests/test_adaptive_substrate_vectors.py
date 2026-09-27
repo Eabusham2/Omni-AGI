@@ -32,7 +32,8 @@ class AdaptiveSubstrateVectorTests(unittest.TestCase):
         first_assembly = memory.assembly_vectors[assembly_id].clone()
         first_cue = memory.vector_for_text(sentence).clone()
 
-        memory.learn(sentence, retain_source_text=False)
+        for _ in range(16):
+            memory.learn(sentence, retain_source_text=False)
 
         self.assertFalse(torch.equal(first_neuron, memory.neuron_vectors[semantic_id]))
         self.assertFalse(torch.equal(first_assembly, memory.assembly_vectors[assembly_id]))
@@ -56,7 +57,8 @@ class AdaptiveSubstrateVectorTests(unittest.TestCase):
         first_neuron = memory.neuron_vectors[semantic_id].clone()
         first_field = memory.assembly_vectors[first["assembly_id"]].clone()
 
-        memory.learn_statistical(sentence)
+        for _ in range(16):
+            memory.learn_statistical(sentence)
         self.assertFalse(torch.equal(first_neuron, memory.neuron_vectors[semantic_id]))
         self.assertFalse(torch.equal(first_field, memory.assembly_vectors[first["assembly_id"]]))
 

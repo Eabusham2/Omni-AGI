@@ -37,12 +37,7 @@ describe("native release Python compatibility", () => {
     expect(requirements).toContain(
       'torch==2.10.0; platform_system != "Darwin"'
     );
-    expect(requirements).toContain(
-      'transformers==4.57.6; platform_system == "Darwin" and platform_machine == "x86_64"'
-    );
-    expect(requirements).toContain(
-      'transformers==5.15.0; platform_system != "Darwin" or platform_machine != "x86_64"'
-    );
+    expect(requirements).not.toMatch(/^transformers==/mu);
     expect(requirements).toContain(
       'pyarrow==17.0.0; platform_system == "Darwin" and platform_machine == "x86_64"'
     );
@@ -57,14 +52,14 @@ describe("native release Python compatibility", () => {
       { cwd: resolve("."), encoding: "utf8" }
     );
     expect(verification.status, verification.stderr || verification.stdout).toBe(0);
-    expect(verification.stdout).toContain("Verified 5 engine locks (236 target package pins).");
+    expect(verification.stdout).toContain("Verified 5 engine locks (134 target package pins).");
 
     for (const [target, packageCount] of Object.entries({
-      "linux-aarch64": 48,
-      "linux-x86_64": 48,
-      "macos-arm64": 49,
-      "macos-x86_64": 40,
-      "windows-x86_64": 51
+      "linux-aarch64": 26,
+      "linux-x86_64": 26,
+      "macos-arm64": 27,
+      "macos-x86_64": 27,
+      "windows-x86_64": 28
     })) {
       const lock = read(`engine/locks/${target}-py311.lock`);
       expect(lock).toContain("--require-hashes");
@@ -144,7 +139,7 @@ describe("native release Python compatibility", () => {
       expect(job).toContain("engine/locks/*.lock");
       expect(job.match(/python scripts\/install-engine-lock\.py/gu)).toHaveLength(1);
       expect(job).toContain("python -m pip check");
-      expect(job).toContain("transformers.is_torch_available()");
+      expect(job).toContain("torch.isfinite(torch.empty(1).fill_(1))");
       expect(job).not.toContain("python -m pip install -r engine/requirements.txt");
       expect(job).not.toContain("--index-url https://download.pytorch.org");
       expect(job).not.toContain("matrix.torch_version");

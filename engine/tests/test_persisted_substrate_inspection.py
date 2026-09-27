@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 
 ENGINE = Path(__file__).resolve().parents[1]
 if str(ENGINE) not in sys.path:
@@ -74,6 +76,11 @@ class PersistedSubstrateInspectionTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def persist(self, substrate, records_per_shard=2):
+        for identifier in substrate.neurons:
+            if identifier not in substrate.neuron_vectors:
+                substrate.neuron_vectors[identifier] = torch.ones(
+                    substrate.space.dimensions
+                )
         pointer = substrate.save_sharded(
             self.store,
             records_per_shard=records_per_shard,
@@ -81,6 +88,7 @@ class PersistedSubstrateInspectionTests(unittest.TestCase):
         metadata = {
             "brain_id": self.brain_id,
             "substrate": {
+                "schema": substrate.SCHEMA,
                 "dimensions": substrate.space.dimensions,
                 "seed": substrate.space.seed,
                 "persistence": pointer,
@@ -187,6 +195,21 @@ class PersistedSubstrateInspectionTests(unittest.TestCase):
             {"health", "query_substrate", "cancel", "shutdown"},
         )
         self.assertFalse(worker.health({}, "health")["capabilities"]["neuralMutation"])
+
+    def test_v3_neuron_inspection_validates_packed_vector_tensor_state(self):
+        substrate = NeuralSubstrate(16, seed=29)
+        substrate.neurons = {"a": neuron("a")}
+        self.persist(substrate)
+        view = PersistedSubstrateView.open(self.engine, self.brain_id)
+        shard = view.kind_shards("neurons")[0]
+        self.assertEqual(
+            set(view.tensors(shard)), {"packed_rows", "update_counters_le"}
+        )
+        altered = view.records(shard)
+        altered["packedVectorState"]["packedSha256"] = "0" * 64
+        with mock.patch.object(view, "records", return_value=altered):
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                view.tensors(shard)
 
     def test_legacy_generation_backfills_atomically_from_bounded_shards(self):
         substrate = NeuralSubstrate(16, seed=11)

@@ -457,7 +457,10 @@ class MemoryAndModalityTests(unittest.TestCase):
             plastic_names = set(memory.tensor_state())
             self.assertEqual(
                 plastic_names,
-                {"substrate.neuron_vectors", "substrate.assembly_vectors"},
+                {
+                    "substrate.vectors.packed_rows",
+                    "substrate.vectors.update_counters_le",
+                },
             )
 
     def test_shard_promotion_pauses_before_resource_reserve_is_crossed(self):

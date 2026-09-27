@@ -1,8 +1,9 @@
 # Neural substrate persistence
 
 Stable v1 persists the growable neural substrate outside the monolithic
-`plasticity.safetensors` checkpoint. The in-memory substrate is still one
-authoritative neural state; sharding is only its bounded persistence format.
+`plasticity.safetensors` checkpoint. The substrate has one authoritative
+learned state; its working representation may be resident or disk-paged, and
+the content-addressed shards are its committed persistence format.
 
 ## Layout
 
@@ -21,9 +22,11 @@ load, copy, and export follow that embedded generation even if an interrupted
 save left a newer orphan root pointer. A generation manifest is immutable and
 declares every bounded record and tensor shard by relative path, kind, hash
 bucket, part, record count, byte count, and SHA-256. JSON shards hold neuron,
-assembly, and synapse structure. Safe-tensor shards hold neuron/assembly
-hypervectors and the higher-precision learning state for sparse synapses.
-Effective sparse weights reload only when they are exactly `-1`, `0`, or `+1`.
+assembly, and synapse structure. New v3 safe-tensor neuron shards hold
+canonical two-bit packed ternary vectors; assembly records reference the same
+neuron rows instead of duplicating a learned float vector. Sparse synapses
+also persist only exact ternary learned weights; eligibility and timing remain
+separate activity state. Old float-vector v1/v2 neural loads fail explicitly.
 
 Large generations also publish an atomic, internally checksummed forward index
 bound to the exact generation content hash, generation-manifest checksum, shard
@@ -33,15 +36,16 @@ ranges, and adjacency locators for connected assembly records. A valid index
 lets cold startup avoid opening every synapse JSON/safe-tensor pair. Any record
 page-in still verifies its content-addressed shard before use, and
 `scrub_persisted_shards()` performs an uncapped full verification plus
-source-shard/index parity proof for explicit or background maintenance. Legacy
-generations can build the same index once with
-`scripts/build-substrate-forward-index.py`.
+source-shard/index parity proof for explicit or background maintenance. The
+forward index is derived acceleration, not another learned memory authority.
 
-Shards use deterministic hash buckets and content-addressed names. An unchanged
-save reuses every shard. A local growth update normally replaces only the
-affected bucket and the small generation manifests; it does not rebuild a
-single all-neuron or all-synapse tensor. A bucket can split into further parts,
-so this format has no model-defined neuron, assembly, synapse, or shard-count
+Shards use deterministic hash buckets and content-addressed names. Unchanged
+blobs are reused and a local growth update rewrites only affected bounded
+parts, not one giant tensor. The current paged writer nevertheless scans all
+neuron and assembly metadata at each checkpoint to plan those parts. Its RAM
+buffers are bounded, but frequent full-corpus checkpoints are not yet a
+low-I/O or low-wear training path. A bucket can split into further parts, so
+the format has no model-defined neuron, assembly, synapse, or shard-count
 ceiling.
 
 The writer checks the host RAM/disk reserve before creating each new blob and
@@ -76,9 +80,14 @@ assemblies, convergence delta, and settling rounds.
 
 ## Stable-v1 limitations
 
-- Neurons, assemblies, vectors, the exact nonzero recurrent graph, and touched
-  synapse records are resident while a brain runs. Untouched synapse records
-  remain shard-backed and are paged exactly on demand.
+- Neuron metadata and the exact nonzero recurrent graph still have resident
+  paths. Under a hardware-derived offload decision, cold load streams verified
+  packed vector shards into SQLite and can attach verified paged assembly
+  metadata; small brains retain the resident packed map. Untouched synapse
+  records are shard-backed. The new-file v3 ingestion/checkpoint path is
+  source-wired but lacks a trained-brain acceptance run, fully paged neuron
+  cold load, and incremental dirty-shard publication. It is not a claim of
+  unlimited low-RAM growth or fast multi-gigabyte training.
 - Content-addressed generations are retained for rollback. Automatic
   mark-and-sweep garbage collection is not part of v1.
 - Hash-bucket updates bound rewrite scope; an especially hot bucket may still

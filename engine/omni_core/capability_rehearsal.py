@@ -780,18 +780,18 @@ def eligible_ground_up_rehearsal(brain: Any) -> bool:
     tool = manifest.get("toolCurriculum")
     action = manifest.get("actionTraining")
     public = manifest.get("publicCapabilityReadiness")
-    public_ready = getattr(brain, "_public_capability_readiness_ready", None)
+    public_receipt = getattr(brain, "_public_capability_origin_receipt_valid", None)
     return bool(
         brain.config.origin_kind == "ground-up"
         and expected is not None
         and manifest.get("id") == expected["id"]
         and manifest.get("sha256") == expected["sha256"]
         and isinstance(tool, Mapping)
-        and tool.get("ready") is True
+        and tool.get("perActionCoverage") is True
         and isinstance(action, Mapping)
-        and action.get("calibrated") is True
-        and callable(public_ready)
-        and public_ready(public)
+        and action.get("examples") == len(GROUND_UP_ACTION_EXAMPLES)
+        and callable(public_receipt)
+        and public_receipt(public)
         and brain._starter_action_language_cache is not None
         and brain._starter_action_internal_cache is not None
         and brain._starter_action_target_cache is not None
