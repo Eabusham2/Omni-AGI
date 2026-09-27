@@ -34,7 +34,11 @@ class StructuredToolSchemaTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def make_brain(self, brain_id: str) -> AdaptiveBrain:
-        return AdaptiveBrain.create(
+        # These are schema-channel/prompt-boundary unit fixtures, not Build or
+        # learned-tool-competence acceptance tests. Avoid training a fresh
+        # curriculum for each isolated inspection while keeping product
+        # creation and its verified origin on the real create() path.
+        return AdaptiveBrain(
             brain_id, self.root / brain_id, self.config
         )
 

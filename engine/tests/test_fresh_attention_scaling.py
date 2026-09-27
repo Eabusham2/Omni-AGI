@@ -98,7 +98,9 @@ class FreshAttentionScalingTests(unittest.TestCase):
         self.assertLess(elapsed, 0.5)
 
     def test_large_committed_reset_never_reads_or_rewrites_substrate_shards(self):
-        brain = AdaptiveBrain.create(
+        # A synthetic substrate/reset fixture; it does not assert that Build
+        # trained or promoted an origin.
+        brain = AdaptiveBrain(
             "fresh-scale-brain",
             self.root,
             OmniConfig.micro(
@@ -230,7 +232,7 @@ class FreshAttentionScalingTests(unittest.TestCase):
             with self.subTest(liquid_mode=mode):
                 root = Path(self.temporary.name) / ("liquid-" + mode)
                 brain_id = "fresh-liquid-" + mode
-                brain = AdaptiveBrain.create(
+                brain = AdaptiveBrain(
                     brain_id,
                     root,
                     OmniConfig.micro(
@@ -242,6 +244,7 @@ class FreshAttentionScalingTests(unittest.TestCase):
                 )
                 with torch.no_grad():
                     brain.liquid_state.fill_(0.625)
+                brain.save()
                 checksum = brain.parameter_checksum()
                 nonzero_units = int(
                     torch.count_nonzero(brain.liquid_state).item()

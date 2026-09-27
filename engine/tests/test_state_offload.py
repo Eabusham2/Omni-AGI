@@ -473,7 +473,9 @@ class DurableStateOffloadTests(unittest.TestCase):
         self.assertTrue(manual["memoryPressure"])
 
     def test_transient_pressure_wait_preserves_saved_cortex_capacity(self):
-        brain = AdaptiveBrain.create(
+        # Resource-admission unit fixture: no origin or learned capability is
+        # exercised, so a real Build curriculum is unnecessary here.
+        brain = AdaptiveBrain(
             "offload-brain",
             self.root,
             OmniConfig.micro(

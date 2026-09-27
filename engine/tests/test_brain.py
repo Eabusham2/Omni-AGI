@@ -641,6 +641,7 @@ class AdaptiveBrainTests(unittest.TestCase):
                 "created_at": "2026-09-07T07:20:00Z",
             }
         ]
+        brain.save()
 
         with mock.patch.object(
             brain, "save", side_effect=RuntimeError("precommit failure")
@@ -670,6 +671,7 @@ class AdaptiveBrainTests(unittest.TestCase):
         brain._append_recent_dialogue(
             "Keep this visible after the boundary.", "Acknowledged."
         )
+        brain.save()
 
         with mock.patch.object(
             brain.state_store,
@@ -703,6 +705,7 @@ class AdaptiveBrainTests(unittest.TestCase):
             {"assemblyId": "temporary-page", "source": "fixture"},
         )
         self.assertEqual(brain.paged_working_memory.count(), 1)
+        brain.save()
 
         with mock.patch.object(
             brain.paged_working_memory,
@@ -848,7 +851,7 @@ class AdaptiveBrainTests(unittest.TestCase):
         brain.events.close()
 
     def test_default_response_budget_is_state_scaled_not_the_context_ceiling(self):
-        brain = AdaptiveBrain.create(
+        brain = AdaptiveBrain(
             "long-response-brain",
             self.root,
             OmniConfig.micro(
@@ -1225,7 +1228,7 @@ class AdaptiveBrainTests(unittest.TestCase):
 
     def test_slow_learning_reaches_a_tail_beyond_one_context_window(self):
         left = self.make_brain(seed=91)
-        right = AdaptiveBrain.create(
+        right = AdaptiveBrain(
             "brain-tail-right",
             self.root / "tail-right",
             OmniConfig.micro(
@@ -1900,10 +1903,10 @@ class AdaptiveBrainTests(unittest.TestCase):
             memory_injection="working-memory",
             working_memory_slots=2,
         )
-        parameter = AdaptiveBrain.create(
+        parameter = AdaptiveBrain(
             "parameter", self.root / "parameter", parameter_config
         )
-        working = AdaptiveBrain.create(
+        working = AdaptiveBrain(
             "working", self.root / "working", working_config
         )
         left = parameter.chat("Remember the cobalt route.", seed=5, max_new_tokens=3)
@@ -1933,7 +1936,7 @@ class AdaptiveBrainTests(unittest.TestCase):
         reloaded.events.close()
 
     def test_recent_dialogue_tokens_participate_without_hidden_prompt_text(self):
-        brain = AdaptiveBrain.create(
+        brain = AdaptiveBrain(
             "recent-context",
             self.root / "recent-context",
             OmniConfig.micro(
@@ -1997,7 +2000,7 @@ class AdaptiveBrainTests(unittest.TestCase):
 
     def test_recent_dialogue_ring_evicts_by_capacity_and_survives_reload(self):
         root = self.root / "recent-reload"
-        brain = AdaptiveBrain.create(
+        brain = AdaptiveBrain(
             "recent-reload",
             root,
             OmniConfig.micro(

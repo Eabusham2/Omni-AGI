@@ -64,7 +64,12 @@ jobs:
       - name: Start host-backed Android emulator
         run: |
           sudo chmod 666 /dev/kvm
-          echo no | avdmanager create avd --force --name omni-api35 --package "system-images;android-35;google_apis;x86_64" --device pixel_6
+          export ANDROID_USER_HOME="$RUNNER_TEMP/omni-android-user"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | avdmanager create avd --force --name omni-api35 --package "system-images;android-35;google_apis;x86_64" --device pixel_6 -p "$ANDROID_AVD_HOME/omni-api35.avd"
+          test -f "$ANDROID_AVD_HOME/omni-api35.ini"
+          "$ANDROID_SDK_ROOT/emulator/emulator" -list-avds | grep -Fx omni-api35
           nohup "$ANDROID_SDK_ROOT/emulator/emulator" \
             -avd omni-api35 \
             -no-window \
