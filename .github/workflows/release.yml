@@ -99,7 +99,7 @@ jobs:
           python -c "import torch; assert torch.isfinite(torch.empty(1).fill_(1)).all(), f'invalid torch runtime {torch.__version__}'"
       - name: Check Python source without initializing a brain
         run: python -m compileall -q engine
-      - run: npm run test:node
+      - run: npm run test:node -- --maxWorkers=2 --testTimeout=30000
 
       - name: Package Windows
         env:

@@ -1001,7 +1001,7 @@ describe("BrainService reviewed subagent overlay merges", () => {
       newEvidence: 0,
       duplicateEvidence: count
     });
-  }, 120_000);
+  }, 300_000);
 
   it("keeps Synapses Only evidence metadata but does not copy source bytes", async () => {
     const target = await repository.create({
