@@ -1,0 +1,3 @@
+# This policy is hashed byte-for-byte in packaged compliance evidence.
+# Keep its checkout bytes identical across Windows, macOS, and Linux.
+licenses/ffmpeg-runtime-policy.json text eol=lf

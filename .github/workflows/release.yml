@@ -91,6 +91,14 @@ jobs:
             engine/requirements-build.txt
             engine/locks/*.lock
 
+      # Windows checkout can convert this JSON from LF to CRLF, changing the
+      # byte-for-byte compliance hash. Restore only that conversion from the
+      # verified source commit before any policy evidence or package is made.
+      - name: Restore exact FFmpeg policy source bytes
+        shell: pwsh
+        run: |
+          node -e 'const fs=require("node:fs"),cp=require("node:child_process"),crypto=require("node:crypto");const path="licenses/ffmpeg-runtime-policy.json";const expected=cp.execFileSync("git",["show","HEAD:"+path]);const actual=fs.readFileSync(path);if(!actual.equals(expected)){if(!Buffer.from(actual.toString("utf8").replace(/\r\n/g,"\n")).equals(expected))throw new Error("FFmpeg policy differs from the verified source commit.");fs.writeFileSync(path,expected)}if(!fs.readFileSync(path).equals(expected))throw new Error("FFmpeg policy bytes were not restored.");console.log("FFmpeg policy source SHA-256:",crypto.createHash("sha256").update(expected).digest("hex"));'
+
       - run: npm ci
       - name: Install hash-locked CPU brain runtime
         run: |
@@ -438,6 +446,7 @@ jobs:
         with:
           name: omni-android-failure-diagnostics
           if-no-files-found: warn
+          compression-level: 0
           path: |
             mobile/android/app/build/reports/androidTests/
             mobile/android/app/build/outputs/androidTest-results/
