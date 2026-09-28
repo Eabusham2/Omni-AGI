@@ -403,7 +403,12 @@ jobs:
           adb shell settings put global window_animation_scale 0
           adb shell settings put global transition_animation_scale 0
           adb shell settings put global animator_duration_scale 0
-          adb shell input keyevent 82
+          # Keep the screen awake and dismiss the keyguard explicitly before
+          # Espresso; KEYCODE_MENU does not guarantee a focused app window.
+          adb shell svc power stayon true
+          adb shell settings put system screen_off_timeout 1800000
+          adb shell input keyevent KEYCODE_WAKEUP
+          adb shell wm dismiss-keyguard
 
       - name: Run same-brain gateway emulator smoke
         run: |
@@ -414,9 +419,31 @@ jobs:
           done
           curl --fail --silent --show-error http://127.0.0.1:41837/v1/health >/dev/null
           adb shell pm clear ai.omniagi.companion.debug || true
+          adb shell input keyevent KEYCODE_WAKEUP
+          adb shell wm dismiss-keyguard
           cd mobile/android
           ./gradlew --no-daemon :app:connectedDebugAndroidTest \
             -Pandroid.testInstrumentationRunnerArguments.omniGatewayPort=41837
+
+      - name: Capture Android emulator diagnostics on failure
+        if: failure()
+        run: |
+          timeout 15s adb shell dumpsys window > "$RUNNER_TEMP/omni-android-window.txt" || true
+          timeout 15s adb shell dumpsys power > "$RUNNER_TEMP/omni-android-power.txt" || true
+          timeout 15s adb exec-out screencap -p > "$RUNNER_TEMP/omni-android-screen.png" || true
+
+      - name: Upload Android emulator diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-android-failure-diagnostics
+          if-no-files-found: warn
+          path: |
+            mobile/android/app/build/reports/androidTests/
+            mobile/android/app/build/outputs/androidTest-results/
+            ${{ runner.temp }}/omni-android-window.txt
+            ${{ runner.temp }}/omni-android-power.txt
+            ${{ runner.temp }}/omni-android-screen.png
 
       - name: Verify, label, and record both APK variants
         run: |
