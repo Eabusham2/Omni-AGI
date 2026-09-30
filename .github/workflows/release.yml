@@ -71,6 +71,10 @@ jobs:
             worker_arch: x64
             package_script: package:win:arm64
     steps:
+      - name: Preserve tagged source line endings on Windows
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.commit }}
