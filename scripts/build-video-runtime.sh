@@ -26,9 +26,10 @@ test "$(git -C "$build_root/x264" rev-parse HEAD)" = "$x264_commit"
 jobs=${OMNI_CODEC_BUILD_JOBS:-4}
 case "$jobs" in ''|*[!0-9]*) exit 2 ;; esac
 test "$jobs" -gt 0
-extra_ldflags=()
-x264_host=()
-ffmpeg_host=()
+# Nonempty option arrays also work with macOS's Bash 3 nounset semantics.
+extra_ldflags=(--extra-ldflags=)
+x264_host=(--enable-pic)
+ffmpeg_host=(--enable-pic)
 case "$target" in
   win32-x64) extra_ldflags=(--extra-ldflags=-static); x264_host=(--host=x86_64-w64-mingw32); ffmpeg_host=(--target-os=mingw32 --arch=x86_64) ;;
   win32-arm64) export CC=clang; extra_ldflags=(--extra-ldflags=-static); x264_host=(--host=aarch64-w64-mingw32); ffmpeg_host=(--target-os=mingw32 --arch=aarch64 --cc=clang) ;;
@@ -48,11 +49,11 @@ cp -R .git "$build_root/source/x264/.git"
 cp config.mak "$output/x264-config.mak"
 cd "$build_root/ffmpeg-$ffmpeg_version"
 export PKG_CONFIG_PATH="$build_root/prefix/lib/pkgconfig"
-configure=(--prefix="$build_root/prefix" --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --disable-hwaccels --disable-x86asm "${extra_ldflags[@]}" "${ffmpeg_host[@]}")
-./configure "${configure[@]}"
-make -j "$jobs" ffmpeg
+configure=(--prefix="$build_root/prefix" --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm "${extra_ldflags[@]}" "${ffmpeg_host[@]}")
+if ! ./configure "${configure[@]}"; then tail -n 90 ffbuild/config.log; exit 1; fi
 executable=ffmpeg
 case "$target" in win32-*) executable=ffmpeg.exe ;; esac
+make -j "$jobs" "$executable"
 cp "$executable" "$output/ffmpeg-$target${executable#ffmpeg}"
 ./"$executable" -version > "$output/version.txt"
 ./"$executable" -buildconf > "$output/buildconf.txt" 2>&1
