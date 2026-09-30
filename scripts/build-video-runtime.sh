@@ -32,7 +32,12 @@ x264_host=(--enable-pic)
 ffmpeg_host=(--enable-pic)
 case "$target" in
   win32-x64) extra_ldflags=(--extra-ldflags=-static); x264_host=(--host=x86_64-w64-mingw32); ffmpeg_host=(--target-os=mingw32 --arch=x86_64) ;;
-  win32-arm64) export CC=clang; extra_ldflags=(--extra-ldflags=-static); x264_host=(--host=aarch64-w64-mingw32); ffmpeg_host=(--target-os=mingw32 --arch=aarch64 --cc=clang) ;;
+  win32-arm64)
+    export CC=clang AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip NM=llvm-nm
+    extra_ldflags=(--extra-ldflags=-static)
+    x264_host=(--host=aarch64-w64-mingw32)
+    ffmpeg_host=(--target-os=mingw32 --arch=aarch64 --cc=clang --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --strip=llvm-strip)
+    ;;
 esac
 cd "$build_root/x264"
 ./configure --prefix="$build_root/prefix" --enable-static --disable-cli --disable-asm --disable-opencl "${extra_ldflags[@]}" "${x264_host[@]}"

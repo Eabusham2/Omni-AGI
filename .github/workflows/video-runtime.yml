@@ -2,23 +2,34 @@ name: Independent video runtime
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Build all platforms or one corrected target
+        required: true
+        default: all
+        type: choice
+        options: [all, win32-x64, win32-arm64, darwin-x64, darwin-arm64, linux-x64, linux-arm64]
 
 permissions:
   contents: read
 
 jobs:
+  targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - id: select
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          node -e 'const rows=[{target:"linux-x64",runner:"ubuntu-24.04"},{target:"linux-arm64",runner:"ubuntu-24.04-arm"},{target:"darwin-x64",runner:"macos-15-intel"},{target:"darwin-arm64",runner:"macos-15"},{target:"win32-x64",runner:"windows-latest",msystem:"UCRT64",compiler:"mingw-w64-ucrt-x86_64-gcc",pkgconfig:"mingw-w64-ucrt-x86_64-pkgconf"},{target:"win32-arm64",runner:"windows-11-arm",msystem:"CLANGARM64",compiler:"mingw-w64-clang-aarch64-clang",pkgconfig:"mingw-w64-clang-aarch64-pkgconf"}];const selected=process.env.TARGET==="all"?rows:rows.filter(r=>r.target===process.env.TARGET);if(!selected.length)throw Error("Invalid target");require("fs").appendFileSync(process.env.GITHUB_OUTPUT,"matrix="+JSON.stringify({include:selected})+"\n");'
   codec:
+    needs: targets
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { target: linux-x64, runner: ubuntu-24.04 }
-          - { target: linux-arm64, runner: ubuntu-24.04-arm }
-          - { target: darwin-x64, runner: macos-15-intel }
-          - { target: darwin-arm64, runner: macos-15 }
-          - { target: win32-x64, runner: windows-latest, msystem: UCRT64, compiler: mingw-w64-ucrt-x86_64-gcc, pkgconfig: mingw-w64-ucrt-x86_64-pkgconf }
-          - { target: win32-arm64, runner: windows-11-arm, msystem: CLANGARM64, compiler: mingw-w64-clang-aarch64-clang, pkgconfig: mingw-w64-clang-aarch64-pkgconf }
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
