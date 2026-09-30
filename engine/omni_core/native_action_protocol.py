@@ -179,6 +179,13 @@ class NativeActionEmissionLedger:
 
     def register(self, action: Mapping[str, Any], *, step: int, phase: str) -> Optional[Dict[str, Any]]:
         fingerprint = action_fingerprint(action)
+        if action.get("kind") == "ponder":
+            # Repeated external effects remain exactly-once, but an internal
+            # Ponder choice at a new real prefix is a new computation. Keep
+            # replay of that exact decision idempotent, not the whole turn.
+            fingerprint = hashlib.sha256(json.dumps(
+                [fingerprint, int(step), str(phase)], separators=(",", ":")
+            ).encode()).hexdigest()
         if fingerprint in self.actions:
             return None
         result = dict(action)

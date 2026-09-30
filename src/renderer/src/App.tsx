@@ -65,6 +65,7 @@ import type {
   BrainSnapshotSummary
 } from "@shared/types";
 import { BRAIN_EXPORT_DISCLOSURE } from "@shared/brainExportDisclosure";
+import { chatInputCapacity } from "@shared/chatInput";
 import {
   EXPERIENCE_UPLOADS,
   type ExperienceUploadKind
@@ -110,6 +111,7 @@ import {
   type ChatTimelineWindow
 } from "./chatTimelineWindow";
 import { pendingChatOutputPresentation } from "./chatLoadingPresentation";
+import { meanObservedTraceActivation } from "./observedTraceActivation";
 import {
   replyCompleteLearningPresentation
 } from "./chatPhasePresentation";
@@ -3814,6 +3816,12 @@ function ChatWorkspace({
     queuedTurn?: QueuedChatTurn
   ) => {
     const text = (queuedTurn?.text ?? input).trim();
+    const capacity = chatInputCapacity(text, brain.config.contextWindowTokens);
+    if (text && !capacity.fits) {
+      if (queuedTurn) setInput((current) => recoverFailedChatDraft(current, text));
+      onToast(capacity.reason!);
+      return;
+    }
     const steering = turnMetadata?.kind === "steer";
     if (!text || (!steering && sending) ||
         (!steering && liveVoiceGenerationActive && liveVoiceState?.phase === "pondering")) return;
@@ -4072,6 +4080,8 @@ function ChatWorkspace({
 
   const steerCurrentTurn = async (): Promise<void> => {
     if (cancellingTurn) return;
+    const capacity = chatInputCapacity(input, brain.config.contextWindowTokens);
+    if (!capacity.fits) { onToast(capacity.reason!); return; }
     const replacesTurnId = activeTurnIdRef.current;
     if (!replacesTurnId) {
       await send();
@@ -4096,6 +4106,8 @@ function ChatWorkspace({
   const queueCurrentTurn = (): void => {
     const text = input.trim();
     if (!text) return;
+    const capacity = chatInputCapacity(text, brain.config.contextWindowTokens);
+    if (!capacity.fits) { onToast(capacity.reason!); return; }
     const id = globalThis.crypto?.randomUUID?.() ??
       `queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const createdAt = new Date().toISOString();
@@ -4747,24 +4759,9 @@ function ChatWorkspace({
       : newerChatTimelineWindow(current));
   };
   const recentTrace = brain.traces.at(-1);
-  const measuredActivity = recentTrace
-    ? Math.max(
-        0,
-        Math.min(
-          1,
-          recentTrace.activatedConcepts.length
-            ? recentTrace.activatedConcepts.reduce(
-                (sum, concept) => sum + concept.activation,
-                0
-              ) / recentTrace.activatedConcepts.length
-            : (
-                recentTrace.driveScores.curiosity +
-                recentTrace.driveScores.coherence +
-                recentTrace.driveScores.novelty
-              ) / 3
-        )
-      )
-    : null;
+  const measuredActivity = meanObservedTraceActivation(
+    recentTrace?.activatedConcepts
+  );
   const voicePondering = liveVoiceGenerationActive && liveVoiceState?.phase === "pondering";
   const textTurnVisiblyActive = Boolean(activeTurnId);
   const pondering = voicePondering || (
@@ -4839,6 +4836,7 @@ function ChatWorkspace({
     turnActive
   ]);
   const draftTokenCount = utf8DraftTokenCount(input);
+  const draftCapacity = chatInputCapacity(input, brain.config.contextWindowTokens);
   const responseTokenCount = utf8DraftTokenCount(partialText);
   const responseOutputPresentation = pendingChatOutputPresentation({
     outputTokens: responseTokenCount,
@@ -5295,8 +5293,15 @@ function ChatWorkspace({
               }
               rows={1}
               aria-label={`Message ${brain.name}`}
+              aria-describedby={!draftCapacity.fits && input.trim() ? "chat-input-capacity-error" : undefined}
               aria-keyshortcuts="Enter Shift+Enter Control+Enter Meta+Enter"
             />
+            {!draftCapacity.fits && input.trim() ? (
+              <div id="chat-input-capacity-error" className="chat-tool-status" role="status">
+                <span><Icon name="warning" size={15} /></span>
+                <p>{draftCapacity.reason}</p>
+              </div>
+            ) : null}
             <div className="composer__bottom">
               <div>
                 <button
@@ -5387,6 +5392,7 @@ function ChatWorkspace({
                           className="composer__steer-choice"
                           aria-label="Steer current turn"
                           title="Apply this direction at the next safe neural boundary; the prior request remains visible and the loaded mind stays warm"
+                          disabled={!draftCapacity.fits}
                           onClick={() => void steerCurrentTurn()}
                         >
                           <Icon name="arrow" size={13} /> <span>Steer now</span>
@@ -5396,6 +5402,7 @@ function ChatWorkspace({
                         className="send-button composer__queue-choice"
                         aria-label="Queue message"
                         title="Run this message next without interrupting the active reply"
+                        disabled={!draftCapacity.fits}
                         onClick={submitOrdinaryTurn}
                       >
                         <Icon name="chat" size={13} /> <span>Queue</span>
@@ -5416,7 +5423,7 @@ function ChatWorkspace({
                 <button
                   className="send-button"
                   onClick={() => void send()}
-                  disabled={!input.trim() || !window.omni}
+                  disabled={!input.trim() || !window.omni || !draftCapacity.fits}
                   aria-label="Send message"
                   title={!window.omni ? "Neural engine unavailable in design preview" : undefined}
                 >
@@ -5665,8 +5672,8 @@ function CortexOrb({ activity }: { activity: number | null }) {
       className="cortex-orb"
       aria-label={
         measured === null
-          ? "No measured neural activity trace yet"
-          : `${Math.round(measured * 100)} percent neural activity in the latest completed trace`
+          ? "No observed activation measurement in the latest trace"
+          : `${Math.round(measured * 100)} percent mean observed activation in the latest completed trace; not the fraction of the whole brain firing`
       }
     >
       <svg viewBox="0 0 240 170" role="img" aria-hidden="true">

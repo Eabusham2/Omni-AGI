@@ -15,6 +15,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .config import OmniConfig
 from .native_action_protocol import structural_schema, validate_structural_value
+from .utf8_text_boundary import Utf8TextBoundary
 from .working_attention_paging import (
     PagedTensorSequence,
     SavedActivityTensor,
@@ -4815,22 +4816,15 @@ class OmniDecoder(nn.Module):
         generator.manual_seed(int(seed))
         cancelled = cancelled or (lambda: False)
 
-        printable = None
-        visible = None
-        if printable_only:
-            byte_values = [9, 10] + list(range(32, 127))
-            printable = torch.tensor(
-                [value + 3 for value in byte_values],
-                dtype=torch.long,
-                device=input_ids.device,
-            )
-            visible = torch.tensor(
-                [value + 3 for value in range(33, 127)],
-                dtype=torch.long,
-                device=input_ids.device,
-            )
+        # Keep the existing public keyword for callers, but constrain only
+        # text wire syntax: all valid Unicode scalars and natural initial EOS.
+        # Role/BOS/PAD tokens are structure, not assistant response bytes.
+        text_boundaries = [Utf8TextBoundary() for _ in range(input_ids.shape[0])] if printable_only else None
+        last_text_boundary = int(input_ids.shape[1])
+        emission_start = last_text_boundary
+        token_budget = max(1, int(max_new_tokens))
 
-        for step in range(max(1, int(max_new_tokens))):
+        for step in range(token_budget):
             if steer_check is not None and steer_check():
                 self.last_generation_stop_reason = "steered"
                 break
@@ -4876,56 +4870,20 @@ class OmniDecoder(nn.Module):
                 logits = logits + float(noise) * jitter
             logits = logits / max(float(temperature), 1e-4)
 
-            if printable is not None:
-                allowed = visible if step == 0 else printable
-                if step > 0:
-                    allowed = torch.cat(
-                        [
-                            printable,
-                            torch.tensor(
-                                [2], dtype=torch.long, device=input_ids.device
-                            ),
-                        ]
-                    )
-                selected = logits.index_select(-1, allowed)
-                if top_k > 0 and top_k < selected.shape[-1]:
-                    values, indices = torch.topk(selected, top_k, dim=-1)
-                    probabilities = F.softmax(values.float(), dim=-1)
-                    sample = torch.multinomial(
-                        probabilities, 1, generator=generator
-                    )
-                    token = allowed[indices.gather(-1, sample)]
-                    entropy = -(
-                        probabilities * probabilities.clamp_min(1e-9).log()
-                    ).sum(dim=-1)
-                else:
-                    probabilities = F.softmax(selected.float(), dim=-1)
-                    sample = torch.multinomial(
-                        probabilities, 1, generator=generator
-                    )
-                    token = allowed[sample]
-                    entropy = -(
-                        probabilities * probabilities.clamp_min(1e-9).log()
-                    ).sum(dim=-1)
+            if text_boundaries is not None:
+                mask = torch.zeros_like(logits, dtype=torch.bool)
+                for row, boundary in enumerate(text_boundaries):
+                    mask[row, boundary.allowed_token_ids(token_budget - step)] = True
+                logits = logits.masked_fill(~mask, -float("inf"))
+            if top_k > 0 and top_k < logits.shape[-1]:
+                values, indices = torch.topk(logits, top_k, dim=-1)
+                probabilities = F.softmax(values.float(), dim=-1)
+                sample = torch.multinomial(probabilities, 1, generator=generator)
+                token = indices.gather(-1, sample)
             else:
-                if top_k > 0 and top_k < logits.shape[-1]:
-                    values, indices = torch.topk(logits, top_k, dim=-1)
-                    probabilities = F.softmax(values.float(), dim=-1)
-                    sample = torch.multinomial(
-                        probabilities, 1, generator=generator
-                    )
-                    token = indices.gather(-1, sample)
-                    entropy = -(
-                        probabilities * probabilities.clamp_min(1e-9).log()
-                    ).sum(dim=-1)
-                else:
-                    probabilities = F.softmax(logits.float(), dim=-1)
-                    token = torch.multinomial(
-                        probabilities, 1, generator=generator
-                    )
-                    entropy = -(
-                        probabilities * probabilities.clamp_min(1e-9).log()
-                    ).sum(dim=-1)
+                probabilities = F.softmax(logits.float(), dim=-1)
+                token = torch.multinomial(probabilities, 1, generator=generator)
+            entropy = -(probabilities * probabilities.clamp_min(1e-9).log()).sum(dim=-1)
             entropy_value = float(entropy.mean().item())
             # The activity channel is an actual live native hidden state,
             # never response prose or a second model/backend. A Steer arriving
@@ -4942,20 +4900,50 @@ class OmniDecoder(nn.Module):
                 if directive is True or (isinstance(directive, Mapping) and directive.get("stop") is True):
                     self.last_generation_stop_reason = "native-action-stop"
                     break
+                if isinstance(directive, Mapping) and "memoryBias" in directive:
+                    refined = directive["memoryBias"]
+                    if not isinstance(refined, torch.Tensor) or refined.ndim not in {1, 2} or \
+                            refined.shape[-1] != self.last_generation_neural_state.shape[-1] or \
+                            (refined.ndim == 2 and refined.shape[0] not in {1, input_ids.shape[0]}) or \
+                            refined.device != input_ids.device or not bool(torch.isfinite(refined).all()):
+                        raise ValueError("native activity supplied invalid recurrent text conditioning")
+                    memory_bias = refined.detach()
+                    # Past KV/workspace sufficient statistics encode the old
+                    # cue. Refill the exact retained prefix under the new cue;
+                    # never append to a cache whose conditioning has changed.
+                    if inference_cache is not None:
+                        inference_cache.close()
+                        inference_cache = None
+                        if _cache_owner is not None: _cache_owner[0] = None
             if steer_check is not None and steer_check():
                 self.last_generation_stop_reason = "steered"
                 break
             entropies.append(entropy_value)
             generated = torch.cat([generated, token], dim=1)
-            if token_callback is not None:
+            if text_boundaries is not None:
+                for boundary, value in zip(text_boundaries, token.detach().cpu().reshape(-1).tolist()):
+                    boundary.accept(value)
+                if all(boundary.complete for boundary in text_boundaries):
+                    last_text_boundary = int(generated.shape[1])
+                    if token_callback is not None:
+                        token_callback(generated[:, emission_start:last_text_boundary].detach().cpu(), step, entropy_value)
+                    emission_start = last_text_boundary
+            elif token_callback is not None:
                 token_callback(
                     token.detach().cpu(),
                     step,
                     entropies[-1],
                 )
-            if step > 0 and bool((token == 2).all()):
+            if bool((token == 2).all()):
                 self.last_generation_stop_reason = "learned-boundary"
                 break
         else:
             self.last_generation_stop_reason = "token-budget"
+        if text_boundaries is not None and generated.shape[1] > last_text_boundary:
+            # A cooperative Stop/Steer may arrive inside a scalar. Those bytes
+            # were private and un-emitted: retain exactly the valid published
+            # prefix, without replacement characters or a fabricated suffix.
+            dropped = int(generated.shape[1]) - last_text_boundary
+            generated = generated[:, :last_text_boundary]
+            entropies = entropies[:-dropped]
         return generated, entropies

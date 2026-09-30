@@ -1,9 +1,21 @@
 # Omni AGI Studio implementation status
 
-The next application release is **v1.1.1**. Its source corrections are being
-integrated and verified; it is not yet a published application release. The
-existing v1.1.0 release remains unchanged. Neural training and capability
-qualification are separate from code, UI-contract and package checks.
+The application source version is **v1.1.1**, committed at `5b15e22`; application
+publication is not established by this repeat audit. The user canceled new GitHub CI/publication
+for the repeat comparison on 30 September. Current follow-up corrections are
+local source work, not a change to the immutable application tag or installed
+packages. Existing v1.1.0 and the separate codec release remain unchanged.
+Neural training and capability qualification stay deferred.
+
+See the [repeat agreement recheck](AGREEMENT_RECHECK_2026_09_30.md) for the latest
+request-to-code comparison. **The mechanism table is not a claim that all source
+gaps are closed.** Concrete remaining limits include cooperative RAM enforcement,
+no aggregate actual spill-pool quota, dense recurrent/control state, whole-value
+native decode/activation minima, width/head migration, and total-dependent
+integrity/scoring cost. Replaced settings and user-closed historical checks are
+not reintroduced as tasks.
+Same-turn tool-result continuation and full JSON Schema compatibility also
+remain incomplete; post-turn result learning is not the former.
 
 ## Verified source corrections
 
@@ -18,10 +30,10 @@ qualification are separate from code, UI-contract and package checks.
 | Runtime settings | Saved current geometry remains fixed while runtime context, RAM and storage refresh pager budgets. | Saved-shape/controller fixtures; no live neural run. |
 | RAM ceiling | Fixed Auto/manual share; managed app-family RSS accounting, conservative unknown usage, and reclaim-or-pause before warm execution. | Injected OS/process/control fixtures; sampled cooperative admission, not hard OS RSS isolation. |
 | Continuous activity | Exact episode-linked cooling, salience/reuse/interference and persistent neural state, without routine retrieved source-text injection. | Source/helper checks; useful recall requires trained-native proof. |
-| Chat | Warm safe-boundary Steer, independent artifact cancellation, completed-text reconciliation and honest no-reply receipts. | Controller/transport/ledger fixtures; no fabricated special-token text or question-mark response. |
+| Chat | Warm safe-boundary Steer with exact unfinished-human carry, full-current-input admission, independent artifact cancellation, completed-text reconciliation and honest no-reply receipts. | Controller/transport/ledger fixtures; no silent current-input crop or fabricated response, no live latency proof. |
 | Data | Streaming text/scalar leases, exact target windows, immutable source leases, transaction identity and resumable coverage. | Parser/storage/stubs; native decompression has explicit admission, not universal RSS isolation. |
 | Distributed updates | Canonical packed derivatives, actual source replay, shared fast/slow state seals and capacity-derived physical microbatches with real accumulation. | Tiny collectives and constructor-free source stubs; full native multi-GPU throughput/quality remains deferred. |
-| Actions | Same-cortex structured argument head, recursive schemas, generation-bound voluntary action reevaluation and pre-effect auditing. | Protocol/method fixtures; useful unseen-tool generalization unproven. |
+| Actions | Same-cortex structured argument head, supported nested schemas, generation-bound voluntary action reevaluation/Ponder conditioning and pre-effect auditing. | Protocol/method fixtures; full schema compatibility, same-turn result feedback and useful unseen-tool generalization are not established. |
 | Voice | Same-brain conditioned audio generation and exact paired speech supervision; platform STT/TTS remain defaults. | Route/pairing/resampling fixtures; intelligibility and long utterances unqualified. |
 | Inspection | Load-free packed cortical drilldown, cursor/range virtualization, actual selected trits and observed-only activity coverage. | Byte/tensor/renderer contracts; static links are computation relationships, not explanations of thought. |
 | Sparse readout | Paged graph/frontier, exact idle queries and full lazy neural readout; bounded host pages with complete structural action references. | Storage/math/protocol fixtures; exhaustive scoring may still cost O(brain size). |
@@ -38,10 +50,17 @@ The app catalog is pinned; first organic/mixed-ingestion use has an owned
 out-of-band setup lane. See [video runtime details](VIDEO_RUNTIME_PROVISIONING.md).
 This is neither an application release nor evidence of AI-generated media quality.
 
-## Remaining integration before application publication
+## Current local handoff
 
-- Run the final affected source/UI/package checks, publish the application
-  packages, and synchronize verified work to main.
+- Finish the repeat comparison, verify only affected code/helper contracts and
+  commit the scoped source/report changes locally. No GitHub CI, push or new
+  release is requested for this pass.
+
+Current-input overflow follows the actual user answer: older raw prompt words
+yield room while previously learned/scratch influence remains; a new message
+itself larger than the selected working window blocks Send instead of being
+cropped or automatically enlarging the setting. Slow refinement does not mean
+every older word instantly updates every cortical weight.
 
 Both choices are confirmed. The RAM percentage is a usage ceiling, not physical
 page pinning; compression and drive spill remain allowed. Auto targets a

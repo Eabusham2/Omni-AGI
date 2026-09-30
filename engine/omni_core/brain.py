@@ -55,6 +55,7 @@ from .native_action_protocol import (
 )
 from .architecture_migration import normalize_architecture_change
 from .chat_steering import generation_completion, mark_interrupted_turn, mark_no_reply_turn, validate_no_reply_turn
+from .temporary_steering_context import temporary_steering_inputs, prompt_with_temporary_user_inputs
 from .conversation_ledger import NeuralConversationLedger
 from .datasets import (
     DatasetCoverage,
@@ -6012,14 +6013,10 @@ class AdaptiveBrain:
         signals = settling.get("signals")
         signals = signals if isinstance(signals, Mapping) else {}
         assembly_id = str(experience.get("assembly_id", ""))
-        assembly = next(
-            (
-                item
-                for item in self.memory.assemblies
-                if str(item.get("id", "")) == assembly_id
-            ),
-            {},
-        )
+        # A just-admitted episode already has an exact structural ID. Use the
+        # authoritative index (SQLite-backed for paged brains), not a scan of
+        # every assembly in the foreground chat commit.
+        assembly = self.memory.assembly_by_id.get(assembly_id, {})
         retention_assessment = self.memory_lifecycle.assess_retention_candidate(
             novelty=float(experience.get("novelty", 0.0)),
             reuse=float(signals.get("reuse", 0.0)),
@@ -8266,15 +8263,24 @@ class AdaptiveBrain:
         self._sync_recent_dialogue_counts()
 
     def _prompt_with_recent_context(
-        self, human: str
+        self, human: str, temporary_user_inputs: Sequence[str] = ()
     ) -> Tuple[List[int], List[int]]:
         """Build a bounded prompt from explicit recent working context."""
 
         capacity = max(3, int(self.config.max_seq_len))
+        if temporary_user_inputs:
+            return prompt_with_temporary_user_inputs(self.tokenizer, human, temporary_user_inputs,
+                self.recent_token_context, capacity=capacity, policy=self.resource_policy)
         human_payload = self.tokenizer.encode(human)
         current_budget = capacity - 3
         if len(human_payload) > current_budget:
-            human_payload = human_payload[-current_budget:]
+            raise NeuralStateResourcePause(
+                "current user input exceeds the selected working-memory window; send is blocked without truncation",
+                {"paused": True, "recoverable": True,
+                 "stage": "current-user-input-capacity",
+                 "requiredTokens": len(human_payload) + 3,
+                 "selectedContextTokens": capacity, "inputTruncated": False},
+            )
         current = (
             [self.tokenizer.human_id]
             + human_payload
@@ -13331,6 +13337,7 @@ class AdaptiveBrain:
                     supporting_action_logits=(language, internal), neural_state=state,
                 )
                 stop = False
+                refined_memory = None
                 for action in actions:
                     registered = ledger.register(action, step=step, phase="mid-generation" if step else "pre-speech")
                     if registered is None:
@@ -13349,10 +13356,11 @@ class AdaptiveBrain:
                             **dict(registered.get("arguments", {})),
                             "completedInTurn": True, "ponderTrace": ponder_trace,
                         }
+                        refined_memory = cue
                     if emit is not None:
                         emit("action", {"actionId": registered["actionId"], "action": registered})
                     stop = stop or action.get("kind") == "stop"
-                return {"stop": stop}
+                return {"stop": stop, **({"memoryBias": refined_memory} if refined_memory is not None else {})}
 
         return callback
 
@@ -13777,30 +13785,53 @@ class AdaptiveBrain:
         defer_slow_learning: bool = False,
         cancel_check: Optional[Callable[[], bool]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
+        temporary_steering_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         clean = text.replace("\x00", "").strip()
         if not clean:
             raise ValueError("chat input cannot be empty")
-
+        # Current input is never silently suffix-cropped. Older prompt words
+        # may yield space while their previously admitted neural/scratch state
+        # remains; a message itself larger than the selected window is blocked
+        # before recall, learning, or allocation of an encoded token list.
+        current_input_tokens = 0
+        for character in clean:
+            point = ord(character)
+            if 0xD800 <= point <= 0xDFFF:
+                raise ValueError("chat input is not valid Unicode scalar text")
+            current_input_tokens += 1 if point < 0x80 else 2 if point < 0x800 else 3 if point < 0x10000 else 4
         def cancellation_boundary() -> None:
             if cancel_check is not None and cancel_check():
                 raise ChatGenerationCancelled("chat generation was cancelled")
 
         cancellation_boundary()
         turn_id = self._validated_chat_turn_id(turn_id)
-        input_sha256 = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+        input_sha256 = ""
         if turn_id:
-            existing_receipt = next(
-                (
-                    receipt
-                    for receipt in reversed(self.completed_chat_turns)
-                    if receipt.get("turnId") == turn_id
-                    and receipt.get("inputSha256") == input_sha256
-                ),
-                None,
+            candidates = [receipt for receipt in reversed(self.completed_chat_turns)
+                          if receipt.get("turnId") == turn_id]
+            if candidates:
+                # A completed receipt remains idempotent even if the user
+                # reduced context since that turn. Hash in bounded chunks;
+                # this is identity verification, not another neural input.
+                digest = hashlib.sha256()
+                for offset in range(0, len(clean), 16_384):
+                    digest.update(clean[offset:offset + 16_384].encode("utf-8"))
+                input_sha256 = digest.hexdigest()
+                existing_receipt = next((receipt for receipt in candidates
+                                         if receipt.get("inputSha256") == input_sha256), None)
+                if existing_receipt is not None:
+                    return self._completed_chat_result(existing_receipt)
+        if current_input_tokens + 3 > int(self.config.max_seq_len):
+            raise NeuralStateResourcePause(
+                "current user input exceeds the selected working-memory window; send is blocked without truncation",
+                {"paused": True, "recoverable": True,
+                 "stage": "current-user-input-capacity",
+                 "requiredTokens": current_input_tokens + 3,
+                 "selectedContextTokens": int(self.config.max_seq_len), "inputTruncated": False},
             )
-            if existing_receipt is not None:
-                return self._completed_chat_result(existing_receipt)
+        if not input_sha256:
+            input_sha256 = hashlib.sha256(clean.encode("utf-8")).hexdigest()
         if steer_check is not None and steer_check():
             # A control admitted before neural work never hashes/copies the
             # whole substrate or creates a private candidate merely to yield.
@@ -13808,6 +13839,8 @@ class AdaptiveBrain:
                     "inputSha256": input_sha256, "steered": True,
                     "nativeStopped": False, "zeroTokenYield": True,
                     "turnCommitted": False, "text": "", "response": "", "actions": []}
+        temporary_user_inputs, temporary_input_audit = temporary_steering_inputs(temporary_steering_context,
+            brain_id=self.brain_id, turn_id=turn_id, attention_epoch=self._attention_epoch(), policy=self.resource_policy)
         requested_generation_tokens = (
             max(1, int(max_new_tokens))
             if max_new_tokens is not None
@@ -13878,7 +13911,7 @@ class AdaptiveBrain:
             seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little")
             seed &= 0x7FFFFFFF
         prompt_list, recent_prompt_tokens = self._prompt_with_recent_context(
-            clean
+            clean, temporary_user_inputs
         )
         prompt_ids = torch.tensor(
             [prompt_list],
@@ -14801,6 +14834,7 @@ class AdaptiveBrain:
             "attention_epoch": self._attention_epoch(),
             "seed": int(seed),
             "input_sha256": input_sha256,
+            **({"temporary_steering_input": temporary_input_audit} if temporary_input_audit else {}),
             **({"turn_id": turn_id} if turn_id else {}),
             "textual_memory_injected": False,
             "long_term_source_text_injected": False,

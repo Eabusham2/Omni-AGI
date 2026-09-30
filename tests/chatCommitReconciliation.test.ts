@@ -197,6 +197,28 @@ describe("atomic neural chat commit reconciliation", () => {
     return { repository, brain };
   }
 
+  it("recovers an exact committed retry after context shrinks without reloading or learning", async () => {
+    const { repository, brain } = await fixture("Completed input after smaller context");
+    brain.config.contextWindowTokens = 8;
+    await repository.save(brain);
+    const turnId = "turn-completed-before-window-shrank";
+    await writeFile(join(repository.brainDirectory(brain.id), "engine", "brain.json"),
+      JSON.stringify(committedEngineState(brain.id, turnId)), "utf8");
+    const request = vi.fn(async () => { throw new Error("No worker is permitted for a committed retry."); });
+    const requestStream = vi.fn(async () => { throw new Error("No new decode is permitted."); });
+    const claimForeground = vi.fn();
+    const service = new BrainService(repository, { request, requestStream, claimForeground } as unknown as EngineSupervisor);
+    const first = await service.chat(brain.id, input, undefined, undefined, turnId);
+    const second = await service.chat(brain.id, input, undefined, undefined, turnId);
+    expect(first.brainMessage.content).toBe(answer);
+    expect(second.brainMessage.id).toBe(first.brainMessage.id);
+    expect((await repository.get(brain.id)).counters.inferenceCount).toBe(1);
+    await expect(service.chat(brain.id, input + " changed", undefined, undefined, turnId)).rejects.toThrow("Send is blocked");
+    expect(request).not.toHaveBeenCalled();
+    expect(requestStream).not.toHaveBeenCalled();
+    expect(claimForeground).not.toHaveBeenCalled();
+  });
+
   it("recovers the exact authoritative turn when Stop wins after the worker's atomic commit", async () => {
     const { repository, brain } = await fixture("Commit then cancel");
     const controller = new AbortController();

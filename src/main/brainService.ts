@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createReadStream, existsSync } from "node:fs";
 import { normalizeConceptIdView } from "../shared/conceptIdView";
+import { chatInputCapacity, cleanChatInput } from "../shared/chatInput";
+import type { TemporarySteeringContext } from "./temporarySteeringContext";
 import {
   lstat,
   mkdir,
@@ -2258,10 +2260,7 @@ function retainsMergedBlob(target: BrainDocument, source: TrainingSource): boole
 }
 
 function cleanMessage(value: string): string {
-  const clean = value.replace(/\0/g, "").trim();
-  if (!clean) throw new Error("A chat message cannot be empty.");
-  if (clean.length > 100_000) throw new Error("A chat message cannot exceed 100,000 characters.");
-  return clean;
+  return cleanChatInput(value);
 }
 
 function normalizeToolId(toolId: string): string {
@@ -3187,7 +3186,6 @@ async function latestChatReconciliationRequest(
     assistant.role !== "brain" ||
     typeof human.content !== "string" ||
     !human.content.trim() ||
-    human.content.length > 100_000 ||
     human.content.includes("\0")
   ) {
     return undefined;
@@ -5072,15 +5070,48 @@ export class BrainService {
     return persistedModalityCapabilities(brainDirectory, brainId);
   }
 
+  async currentChatAttentionEpoch(brainId: string): Promise<number> {
+    const metadata = await committedEngineMetadata(this.repository.brainDirectory(brainId));
+    if (!metadata || metadata.brain_id !== brainId) throw new Error("The saved neural attention owner is unavailable.");
+    const raw = metadata.fresh_attention_boundary;
+    if (raw === null || raw === undefined) return 0; // same native initial-epoch contract, not a guessed live value
+    const epoch = objectRecord(raw)?.epoch;
+    if (!Number.isSafeInteger(epoch) || Number(epoch) < 1) throw new Error("The saved neural attention epoch is invalid.");
+    return Number(epoch);
+  }
+
   async chat(
     id: string,
     input: string,
     signal?: AbortSignal,
     onStream?: (event: NeuralChatStreamEvent) => void,
     turnId: string = randomUUID(),
-    responseTokenBudget?: number
+    responseTokenBudget?: number,
+    temporarySteeringContext?: TemporarySteeringContext
   ): Promise<ChatResult> {
     const message = cleanMessage(input);
+    signal?.throwIfAborted();
+    const sizingBrain = await this.repository.get(id);
+    const inputCapacity = chatInputCapacity(message, sizingBrain.config.contextWindowTokens);
+    if (!inputCapacity.fits) {
+      // Recover an already committed exact turn without admitting it again.
+      // Changing the selected context must not invalidate a lost acknowledgement.
+      const metadata = await committedEngineMetadata(this.repository.brainDirectory(id));
+      const inputSha256 = sha256(message);
+      const completed = metadata?.brain_id === id && Array.isArray(metadata.completed_chat_turns)
+        ? metadata.completed_chat_turns.map(objectRecord).find((receipt) =>
+          receipt?.turnId === turnId && receipt.inputSha256 === inputSha256)
+        : undefined;
+      if (completed && Number.isSafeInteger(completed.inferenceCount) && Number(completed.inferenceCount) > 0) {
+        signal?.throwIfAborted();
+        const recovered = await this.reconcileCommittedChat(id, {
+          turnId, input: message, inputSha256,
+          minimumInferenceCount: Number(completed.inferenceCount) - 1
+        });
+        if (recovered) return recovered;
+      }
+      throw new Error(inputCapacity.reason);
+    }
     signal?.throwIfAborted();
     if (this.liveChatTurns.has(turnId)) throw new Error("This chat turn already owns the neural write boundary.");
     const ownership = { brainId: id, inputSha256: sha256(message),
@@ -5110,7 +5141,8 @@ export class BrainService {
             responseTokenBudget,
             () => {
               neuralRequestStarted = true;
-            }
+            },
+            temporarySteeringContext
           );
         },
         signal
@@ -5303,7 +5335,8 @@ export class BrainService {
     onStream?: (event: NeuralChatStreamEvent) => void,
     turnId: string = randomUUID(),
     responseTokenBudget?: number,
-    onNeuralRequestStarted?: () => void
+    onNeuralRequestStarted?: () => void,
+    temporarySteeringContext?: TemporarySteeringContext
   ): Promise<ChatResult> {
     signal?.throwIfAborted();
     this.chatSteerAdmissionBoundary(id, turnId);
@@ -5363,6 +5396,7 @@ export class BrainService {
         config: brain.config,
         onlineLearning: brain.config.onlineLearning,
         storagePath: brainDirectory,
+        ...(temporarySteeringContext ? { temporarySteeringContext } : {}),
         ...(responseTokenBudget === undefined
           ? {}
           : { maxNewTokens: responseTokenBudget })

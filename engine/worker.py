@@ -2579,6 +2579,7 @@ class Worker:
                 defer_slow_learning=True,
                 cancel_check=self._cooperative_cancel.is_set,
                 steer_check=steer_check,
+                temporary_steering_context=params.get("temporarySteeringContext"),
             )
         except ChatGenerationCancelled as error:
             # The model raises this only at a pre-commit boundary. Preserve

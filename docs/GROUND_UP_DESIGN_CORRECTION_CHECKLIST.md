@@ -6,14 +6,20 @@ native-only source/GUI/CI/package goal concluded with published **v1.1.0**;
 this document must not reopen that goal or claim a trained brain passed live
 acceptance. It preserves the earlier 26 September checklist as a dated
 checkpoint and separates its design requirements from the later release
-closure and the new uncommitted source corrections. Later user corrections
+closure and subsequent source corrections. Later user corrections
 take precedence over the older v1 plans wherever they differ.
 
 The audit records 27 release assets and successful all-target run
 `36495422025`, package-source tag `e96f580`, release-workflow commit `bd3ac8e`,
-and only `main` locally/remotely at the audit. Full native corpus/quality
-testing remains user-deferred. New source edits and their focused checks are
-not a commit/push, new packaged release, or proof of useful native recall.
+and only `main` locally/remotely at that historical audit. Full native corpus/
+quality testing remains user-deferred. Application corrections were committed
+as `5b15e22`; the repeat comparison now requests a local commit, not GitHub CI
+or publication. Neither source checks nor a commit prove useful native recall.
+
+The [30 September repeat recheck](AGREEMENT_RECHECK_2026_09_30.md) and
+[implementation status](IMPLEMENTATION_STATUS.md) govern current source
+disposition. The dated boxes and evidence below are historical; they must not
+override newer code findings or become another model-testing checklist.
 
 ## What the user actually wants
 
@@ -148,7 +154,7 @@ source step is not proof that native-only packaging is still unpublished.
   gap report. Defer full-folder training and live capability proof until the
   user sends the next goal.
 
-## Current source evidence, retained limitations and exclusions
+## Historical source evidence from the earlier cleanup
 
 - The five named app-managed Falcon instances were separately approved for
   permanent deletion (550, 553) and were removed after exact-target checks.
@@ -214,17 +220,23 @@ source step is not proof that native-only packaging is still unpublished.
 - No claim of consciousness, biological equivalence, guaranteed AGI, perfect
   memory, or fluency from random weights is justified here.
 
-## Current corrections and later native-quality proof
+## Later corrections and native quality proof
 
-New uncommitted corrections for the disk floor, parser allocation behavior,
-proved-episode raw-token cooling, exact export/recovery state, learned-memory
-parameter accounting and automatic codec provisioning are tracked in the
-transcript audit. Their focused source evidence does not mean all large-record
-decoding is bounded, legacy unlinked context has dynamic cooling, every saved
-recovery point contains all references, or a real codec catalog is available.
-Active-token/core paging, initial cortex scale, multi-rank packed updates,
-dirty checkpoint/recall scaling, full cortical inspection, neural speech and
-mid-generation decision-making remain substantive implementation limits.
+The newer source adds disk-floor enforcement, parser leases/admission,
+episode-linked raw-token cooling, exact unsanitized saved-state export/recovery,
+shared learned-memory parameter accounting, paged core/attention, RAM-first
+Auto, synchronized packed updates, incremental checkpoints, cortical inspection,
+speech and mid-generation action routes. The separate vetted codec catalog is
+published. The old claims above that multi-rank is blocked or the codec catalog
+is empty are historical, not current source findings.
+
+The repeat recheck still identifies real limits: dense recurrent state,
+cooperative rather than hard aggregate RAM limits, incomplete shared actual
+spill-quota accounting, native whole-value allocations, compatible rather than
+arbitrary width/head migration and total-dependent integrity work. Native
+fluency/recall, media quality and beneficial autonomous improvement remain
+deferred proof. Do not mark those limits fixed merely because a source mechanism
+exists, nor call already corrected source paths missing from the current tree.
 
 The broader requirements below are retained, but existing engineering checks
 are **not being reopened** and useful native quality is **not claimed now**:

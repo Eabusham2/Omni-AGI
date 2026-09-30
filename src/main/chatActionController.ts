@@ -27,6 +27,7 @@ import type {
 } from "./brainService";
 import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
 import { EngineRequestError } from "./engineSupervisor";
+import { inheritTemporarySteeringContext, type TemporarySteeringContext } from "./temporarySteeringContext";
 
 export interface ActionChatService {
   chat(
@@ -34,8 +35,11 @@ export interface ActionChatService {
     input: string,
     signal?: AbortSignal,
     onStream?: (event: NeuralChatStreamEvent) => void,
-    turnId?: string
+    turnId?: string,
+    responseTokenBudget?: number,
+    temporarySteeringContext?: TemporarySteeringContext
   ): Promise<ChatResult>;
+  currentChatAttentionEpoch?(brainId: string): Promise<number>;
   idleCycle?(brainId: string, minimumIdleSeconds?: number): Promise<IdleCycleResult>;
   learnStructuredExperience?(
     brainId: string,
@@ -264,6 +268,10 @@ interface ActiveTurn {
   neuralEnded: boolean;
   steerSuccessor?: string;
   earlySteeredYield?: boolean;
+  neuralSteered?: boolean;
+  input: string;
+  attentionEpoch?: number;
+  temporarySteeringContext?: TemporarySteeringContext;
   pendingDrain?: Promise<void>;
 }
 
@@ -822,7 +830,7 @@ export class ChatActionController extends EventEmitter {
       settled,
       resolveSettled,
       actions: new Map(), neuralBoundary, resolveNeuralBoundary,
-      neuralCallStarted: false, neuralEnded: false
+      neuralCallStarted: false, neuralEnded: false, input
     };
     const abortFromCaller = (): void => controller.abort();
     signal?.addEventListener("abort", abortFromCaller, { once: true });
@@ -984,6 +992,9 @@ export class ChatActionController extends EventEmitter {
     };
 
     try {
+      if (this.service.currentChatAttentionEpoch) {
+        turn.attentionEpoch = await this.service.currentChatAttentionEpoch(brainId);
+      }
       if (warmHandoffPredecessor) {
         // Steer interrupts only the old generation at its next native safe
         // boundary. Its committed partial reply and independent actions remain.
@@ -1013,6 +1024,8 @@ export class ChatActionController extends EventEmitter {
           }
         }
         await waitForTurnNeuralBoundary(warmHandoffPredecessor, controller.signal);
+        turn.temporarySteeringContext = inheritTemporarySteeringContext(warmHandoffPredecessor,
+          turnId, turn.attentionEpoch);
         turn.runtimePhase = "pending";
         turn.queue = undefined;
       }
@@ -1032,13 +1045,16 @@ export class ChatActionController extends EventEmitter {
         input,
         controller.signal,
         consumeNeuralStream,
-        turnId
+        turnId,
+        undefined,
+        turn.temporarySteeringContext
       );
       for (const action of result.proposedActions ?? []) queueAction(action);
 
       // service.chat has returned only after its atomic neural/host turn save
       // (or exact durable receipt reconciliation). Optional artifacts and their
       // learning must not keep the completed text owned by generation controls.
+      turn.neuralSteered = result.generationEnd === "steered";
       this.publishStream(turn, {
         type: "chat-reply-committed",
         humanMessage: result.humanMessage,
@@ -1136,7 +1152,8 @@ export class ChatActionController extends EventEmitter {
            (error.data as Record<string, unknown>).nativeStopped === true) &&
           (error.data as Record<string, unknown>).brainId === brainId &&
           (error.data as Record<string, unknown>).turnId === turnId) {
-        turn.earlySteeredYield = true;
+        turn.earlySteeredYield = (error.data as Record<string, unknown>).zeroTokenYield === true;
+        turn.neuralSteered = error.code === -32801;
         turn.neuralEnded = true;
         this.publishStream(turn, { type: "chat-state", state: error.code === -32801 ? "steered" : "stopped" });
         turn.resolveNeuralBoundary();

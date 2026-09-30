@@ -475,9 +475,9 @@ export class EvolutionController {
    * Source evolution keeps its external immutable Git evaluator. Neural and
    * data learning use the worker's transactional safe-tensor overlay manager.
    * Architecture evolution is deliberately narrower than arbitrary tensor
-   * reshaping: it may add resource-checked, load-compatible zero-residual
-   * ternary experts, while incompatible width/depth/router/modality shape
-   * mutations remain rejected.
+   * reshaping: it may add resource-checked zero-residual depth/experts and
+   * dormant router/region capacity while preserving the existing function.
+   * Width/head geometry migrations remain unsupported and fail explicitly.
    */
   candidateRoutes(): EvolutionCandidateRoute[] {
     return [
