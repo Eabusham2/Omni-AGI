@@ -84,7 +84,7 @@ function legalArchive(prefix: string): Record<string, Uint8Array> {
 
 function workerSmoke(): Record<string, unknown> {
   return {
-    engineVersion: "1.1.0",
+    engineVersion: packageDocument.version,
     protocolVersion: 1,
     healthOnly: true,
     persistedBrain: false,
@@ -300,6 +300,15 @@ afterEach(() => {
 });
 
 describe("stable release artifact gate", () => {
+  it("rejects health evidence from a stale worker even when artifact hashes match", () => {
+    const directory = writeReleaseFixture();
+    const path = join(directory, "linux-package-smoke-x64.json");
+    const smoke = JSON.parse(readFileSync(path, "utf8"));
+    smoke.workerSmoke.engineVersion = "0.0.0";
+    writeFileSync(path, JSON.stringify(smoke));
+    expect(() => verify(directory)).toThrow(/worker version 0\.0\.0 does not match release/);
+  });
+
   it("records hash-bound mobile packages only for exact ZIP signatures", () => {
     const directory = mkdtempSync(join(tmpdir(), "omni-mobile-recorder-"));
     temporaryDirectories.push(directory);

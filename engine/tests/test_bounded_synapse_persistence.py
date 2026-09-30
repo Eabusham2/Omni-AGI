@@ -170,7 +170,8 @@ class BoundedSynapsePersistenceTests(unittest.TestCase):
         self.assertEqual(list(paged), ["a", "m", "z"])
         self.assertIn("m", paged)
         self.assertNotIn("unknown", paged)
-        self.assertEqual(_forward_hot_ids_sha256(paged), _forward_hot_ids_sha256(["z", "a", "m"]))
+        self.assertEqual(_forward_hot_ids_sha256(paged, "sha256-sorted-ids-v1"), _forward_hot_ids_sha256(["z", "a", "m"]))
+        self.assertEqual(paged.ids_checksum_algorithm, "sha256-patricia-id-set-v1")
 
     def test_new_assembly_reindexes_reused_synapse_endpoints(self):
         self.source.synapses.update(dict(self._record(n) for n in range(8)))

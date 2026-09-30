@@ -59,6 +59,9 @@ export function neuralParameterAccounting(
   const accounting = record(runtimeCard?.parameterAccounting);
   if (!accounting) return undefined;
   const mutableDenseParameters = safeCount(accounting.mutableDenseParameters);
+  const substrateVectorParameters = accounting.substrateVectorParameters === undefined
+    ? 0
+    : safeCount(accounting.substrateVectorParameters);
   const substrateDynamicSparseSynapses = safeCount(
     accounting.substrateDynamicSparseSynapses
   );
@@ -69,6 +72,7 @@ export function neuralParameterAccounting(
     : "";
   if (
     mutableDenseParameters === undefined ||
+    substrateVectorParameters === undefined ||
     substrateDynamicSparseSynapses === undefined ||
     dynamicSparseSynapses === undefined ||
     totalNeuralParameters === undefined ||
@@ -76,7 +80,7 @@ export function neuralParameterAccounting(
     substrateDynamicSparseSynapses !== dynamicSparseSynapses ||
     ["foundationEffectiveParameters", "sequenceDynamicSparseSynapses", "fixedSequenceStatisticalCapacity"]
       .some((field) => Object.hasOwn(accounting, field)) ||
-    mutableDenseParameters + dynamicSparseSynapses !==
+    mutableDenseParameters + substrateVectorParameters + dynamicSparseSynapses !==
       totalNeuralParameters ||
     !countingRule ||
     countingRule.length > 512
@@ -86,6 +90,7 @@ export function neuralParameterAccounting(
   const exact = (value: number): string => value.toLocaleString("en-US");
   return {
     mutableDenseParameters,
+    ...(accounting.substrateVectorParameters !== undefined ? { substrateVectorParameters } : {}),
     substrateDynamicSparseSynapses,
     dynamicSparseSynapses,
     totalNeuralParameters,
@@ -94,6 +99,9 @@ export function neuralParameterAccounting(
     exactLabel:
       `${exact(totalNeuralParameters)} logical neural weights and connections, counted once in one brain. ` +
       `${exact(mutableDenseParameters)} core weights and ` +
+      (substrateVectorParameters > 0
+        ? `${exact(substrateVectorParameters)} learned memory weights and `
+        : "") +
       `${exact(dynamicSparseSynapses)} grown connections. ${countingRule}`
   };
 }

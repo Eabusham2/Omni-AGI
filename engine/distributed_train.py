@@ -380,7 +380,7 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--device", default="auto")
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--global-batch-records", type=int, default=16)
-    train.add_argument("--micro-batch-records", type=int, default=2)
+    train.add_argument("--micro-batch-records", type=int, default=0, help="Physical learner microbatch ceiling; 0 uses admitted CPU/CUDA capacity")
     train.add_argument("--gradient-accumulation", type=int, default=0)
     train.add_argument("--learning-rate", type=float)
     train.add_argument("--strategy", choices=("auto", "ddp", "fsdp"), default="auto")

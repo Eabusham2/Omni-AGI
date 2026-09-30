@@ -9,7 +9,7 @@ export const MAX_SYSTEM_RAM_SHARE_PERCENT = 100;
 export const DEFAULT_MANUAL_SYSTEM_RAM_SHARE_PERCENT = 65;
 
 export const STORAGE_BOUNDARY_COPY =
-  "Storage may hold cold memory, replay batches, and infrequent checkpoints. Active context and per-step training activations stay in RAM or accelerator memory and are never paged to storage.";
+  "Active tiles, token indexes and the hottest pathways stay in RAM. Cold attention and saved activity may use the designated storage pool alongside cold memory, replay batches, and checkpoints. Resource pressure pauses work without resizing learned workspace tables.";
 
 export interface ContextCapacityBandStyle {
   "--capacity-black-low": string;
@@ -84,12 +84,15 @@ export function configWithResourceEnvelope(
 ): BrainConfig {
   return {
     ...config,
-    workingMemorySlots: plan.selectedItems,
+    // Learned latent-table geometry belongs to the saved architecture. This
+    // helper is for Device settings, not the separately preflighted new Build.
+    workingMemorySlots: config.workingMemorySlots,
     contextWindowTokens: plan.context.selectedTokens,
     workingMemoryMode: plan.mode,
     extendedWorkingMemory: plan.mode === "extended",
     memoryOffloadBytes: plan.resources.configuredMemorySpillBytes,
-    memoryResidentItems: plan.offload.residentMemoryItems,
+    contextOffloadBudgetBytes: plan.context.evidence?.contextOffloadBudgetBytes ?? config.contextOffloadBudgetBytes ?? 0,
+    memoryResidentItems: Math.max(1, Math.min(config.workingMemorySlots, plan.offload.residentMemoryItems)),
     memoryOffloadSlowdownPercent: plan.offload.estimatedSlowdownPercent,
     systemRamMode,
     systemRamSharePercent:

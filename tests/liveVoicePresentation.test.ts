@@ -50,6 +50,19 @@ describe("live voice presentation", () => {
     });
   });
 
+  it("labels native waveform production and unverified quality without claiming TTS", () => {
+    const own = { ...base, preferences: { ...base.preferences, neuralVoice: true },
+      capabilities: { ...base.capabilities, neuralVoice: true, neuralVoiceQuality: "needs-speech-training" as const } };
+    expect(liveVoiceStatusCopy({ ...own, phase: "rendering-audio", synthesis: "preparing" })).toMatchObject({
+      title: "Producing the brain's waveform", detail: expect.stringContaining("Needs speech training")
+    });
+    expect(liveVoiceStatusCopy({ ...own, phase: "speaking", synthesis: "speaking" })).toMatchObject({
+      title: "Playing the brain's waveform", detail: expect.stringContaining("may not match the words")
+    });
+    expect(liveVoiceStatusCopy({ ...own, phase: "speaking", synthesis: "speaking",
+      capabilities: { ...own.capabilities, neuralVoiceQuality: "unverified" } }).detail).toContain("Speech quality not verified");
+  });
+
   it("does not promise voice-triggered barge-in for buffered delivery", () => {
     const copy = liveVoiceStatusCopy({
       ...base,

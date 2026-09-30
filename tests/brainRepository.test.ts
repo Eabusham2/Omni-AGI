@@ -15,6 +15,7 @@ import {
   serializeArtifactIndex
 } from "../src/main/mediaArtifactRegistry";
 import { verifyPortableReplaySqlite } from "../src/main/portableReplayIntegrity";
+import { persistAuthorizedToolIntent } from "../src/main/toolIntentJournal";
 import type { BrainStorageOperationHooks } from "../src/main/brainStorageOperations";
 import { DEFAULT_CONFIG, type DiskSpaceTelemetry } from "../src/shared/types";
 
@@ -83,6 +84,9 @@ function refreshArchiveIntegrity(entries: Record<string, Uint8Array>): void {
   const manifest = JSON.parse(strFromU8(entries["manifest.json"]!)) as {
     files: Record<string, { sha256: string; bytes: number }>;
   };
+  for (const path of Object.keys(manifest.files)) {
+    if (!Object.hasOwn(entries, path)) delete manifest.files[path];
+  }
   for (const [path, contents] of Object.entries(entries)) {
     if (path === "manifest.json" || path === "checksums.sha256") continue;
     manifest.files[path] = {
@@ -203,6 +207,82 @@ async function materializeNativeEngineFixture(
     writePackedTernaryFixture(join(engine, "packed-ternary")),
     writePackedTernaryFixture(join(origin, "packed-ternary"))
   ]);
+}
+
+const fixtureWalWriters: DatabaseSync[] = [];
+
+async function writeNeuralConversationFixture(
+  engineDirectory: string, brainId: string, text: string, keepWalOpen = false
+): Promise<Record<string, unknown>> {
+  const database = new DatabaseSync(join(engineDirectory, "conversation.sqlite3"));
+  database.exec(`
+    PRAGMA journal_mode=${keepWalOpen ? "WAL" : "DELETE"};
+    PRAGMA wal_autocheckpoint=0;
+    CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE entries(sequence INTEGER PRIMARY KEY,entry_key TEXT UNIQUE,kind TEXT,
+      created_at TEXT,attention_epoch INTEGER,payload_json TEXT,payload_sha256 TEXT,
+      previous_sha256 TEXT,row_sha256 TEXT UNIQUE);
+  `);
+  database.prepare("INSERT INTO meta VALUES('brain_id',?)").run(brainId);
+  database.prepare("INSERT INTO meta VALUES('format','omni-neural-conversation-ledger')").run();
+  let previous = "0".repeat(64);
+  const records = [
+    { kind: "message", value: { id: "saved-human", role: "human", content: text } },
+    { kind: "message", value: { id: "saved-assistant", role: "assistant", content: "saved reply" } },
+    { kind: "trace", value: { id: "saved-trace", input: text, seed: 7 } }
+  ];
+  const createdAt = "2026-09-29T00:00:00.000Z";
+  for (const [index, record] of records.entries()) {
+    const payload = canonicalJson(record.value);
+    const body = {
+      sequence: index + 1, entryKey: `${record.kind}:${record.value.id}`,
+      kind: record.kind, createdAt, attentionEpoch: 2,
+      payloadSha256: digest(payload), previousSha256: previous
+    };
+    const rowSha256 = digest(canonicalJson(body));
+    database.prepare("INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?)").run(
+      body.sequence, body.entryKey, body.kind, createdAt, 2, payload,
+      body.payloadSha256, previous, rowSha256
+    );
+    previous = rowSha256;
+  }
+  if (keepWalOpen) fixtureWalWriters.push(database); else database.close();
+  return {
+    format: "omni-neural-conversation-ledger", formatVersion: 1,
+    totalEntries: 3, messageCount: 2, actionCount: 0, traceCount: 1,
+    attentionEpoch: 2, headSequence: 3, headSha256: previous
+  };
+}
+
+async function writeWorkingPagesFixture(
+  engineDirectory: string, text: string, keepWalOpen = false
+): Promise<Record<string, unknown>> {
+  await mkdir(join(engineDirectory, "state"), { recursive: true });
+  const database = new DatabaseSync(join(engineDirectory, "state", "working-memory.sqlite3"));
+  database.exec(`
+    PRAGMA journal_mode=${keepWalOpen ? "WAL" : "DELETE"};
+    PRAGMA wal_autocheckpoint=0;
+    CREATE TABLE working_pages(sequence INTEGER PRIMARY KEY AUTOINCREMENT,page_id TEXT UNIQUE,
+      assembly_id TEXT,metadata_json TEXT,sha256 TEXT,dtype TEXT,shape_json TEXT,
+      payload BLOB,updated_at REAL);
+  `);
+  const rows = [1, 2].map((number) => {
+    const payload = Buffer.from([number]);
+    const sha256 = digest(Buffer.concat([Buffer.from("torch.uint8\0[1]\0"), payload]));
+    const pageId = `page-${number}`;
+    database.prepare("INSERT INTO working_pages VALUES(?,?,?,?,?,?,?,?,?)").run(
+      number, pageId, `assembly-${number}`,
+      JSON.stringify({ assemblyId: `assembly-${number}`, note: text }),
+      sha256, "torch.uint8", "[1]", payload, 1.0
+    );
+    return `${number}\0${pageId}\0${sha256}\n`;
+  });
+  if (keepWalOpen) fixtureWalWriters.push(database); else database.close();
+  return {
+    format: "omni-working-memory-pages", formatVersion: 1, count: 2,
+    highWaterId: 2, contentSha256: digest(rows.join("")), temporary: true,
+    runtimeReadable: true, learningReadable: true, pageInSupported: true
+  };
 }
 
 async function writeSubstrateFixture(
@@ -594,6 +674,7 @@ describe("BrainRepository lifecycle", () => {
   });
 
   afterEach(async () => {
+    for (const database of fixtureWalWriters.splice(0)) database.close();
     await rm(temporaryRoot, { recursive: true, force: true });
   });
 
@@ -774,12 +855,22 @@ describe("BrainRepository lifecycle", () => {
     await expect(repository.persistedSubstrateOverview(brain.id)).resolves.toMatchObject({
       parameterAccounting: accounting
     });
+    const vectorAccounting = {
+      ...accounting, substrateVectorParameters: 16, totalNeuralParameters: 136
+    };
+    await writeMetadata(vectorAccounting);
+    await expect(repository.persistedSubstrateOverview(brain.id)).resolves.toMatchObject({
+      parameterAccounting: vectorAccounting
+    });
     for (const stale of [
       { ...accounting, foundationEffectiveParameters: 0 },
       { ...accounting, sequenceDynamicSparseSynapses: 0 },
       { ...accounting, fixedSequenceStatisticalCapacity: 0 },
       { ...accounting, totalNeuralParameters: 121 },
-      { ...accounting, substrateDynamicSparseSynapses: 1 }
+      { ...accounting, substrateDynamicSparseSynapses: 1 },
+      { ...accounting, substrateVectorParameters: -1 },
+      { ...accounting, substrateVectorParameters: "16", totalNeuralParameters: 136 },
+      { ...vectorAccounting, totalNeuralParameters: 120 }
     ]) {
       await writeMetadata(stale);
       await expect(repository.persistedSubstrateOverview(brain.id))
@@ -1052,26 +1143,23 @@ describe("BrainRepository lifecycle", () => {
     await expect(repository.getBlob(digest(payload))).rejects.toThrow();
   });
 
-  it("exports a native brain without phantom conversation rows or transient chat text", async () => {
+  it.each(["current", "private-archive", "referenced", "origin"] as const)(
+    "round-trips saved chat, pending replay, workspace pages and cursors without sanitizing (%s)", async (mode) => {
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Portable native mind" });
     await materializeNativeEngineFixture(repository, brain);
-    const enginePath = join(repository.brainDirectory(brain.id), "engine", "brain.json");
+    const engineDirectory = join(repository.brainDirectory(brain.id), "engine", ...(mode === "origin" ? ["origin"] : []));
+    const enginePath = join(engineDirectory, "brain.json");
     const native = JSON.parse(await readFile(enginePath, "utf8")) as Record<string, unknown>;
     const privateText = "private turn: violet lantern at midnight";
-    native.conversation = {
-      format: "omni-neural-conversation-ledger",
-      formatVersion: 1,
-      totalEntries: 3,
-      messageCount: 2,
-      actionCount: 0,
-      traceCount: 1,
-      attentionEpoch: 2,
-      headSequence: 3,
-      headSha256: "a".repeat(64)
-    };
+    native.conversation = await writeNeuralConversationFixture(engineDirectory, brain.id, privateText, true);
     native.completed_chat_turns = [{ content: privateText }];
     native.completed_chat_slow_learning = ["b".repeat(64)];
-    native.pending_chat_slow_learning = [{ content: privateText }];
+    native.pending_chat_slow_learning = [{
+      jobId: "e".repeat(64), inputSha256: digest(privateText),
+      humanMessageId: "saved-human", content: privateText
+    }];
+    native.paged_working_memory = await writeWorkingPagesFixture(engineDirectory, privateText, true);
+    native.ingestion_checkpoints = { ["f".repeat(64)]: { formatVersion: 2, nextRecordIndex: 2 } };
     native.recent_token_context = [65, 66, 67];
     native.current_context = {
       tokenCount: 3,
@@ -1090,68 +1178,55 @@ describe("BrainRepository lifecycle", () => {
       fresh_attention: { content: privateText }
     };
     await writeFile(enginePath, JSON.stringify(native));
+    const historyNative = JSON.parse(await readFile(join(repository.brainDirectory(brain.id), "engine", "brain.json"), "utf8"));
+    const recoveryPoint = await repository.snapshot(brain.id, "saved private recovery note");
     const original = await readFile(enginePath);
-    const bundle = join(temporaryRoot, "portable-native-conversation.omni");
-    await repository.exportBundle(brain.id, bundle, "current");
+    const bundle = join(temporaryRoot, `saved-native-conversation-${mode}.omni`);
+    await repository.exportBundle(brain.id, bundle, mode);
     expect(await readFile(enginePath)).toEqual(original);
     const bundleBytes = new Uint8Array(await readFile(bundle));
     const archive = unzipSync(bundleBytes);
-    expect(archive["conversation/neural-ledger.sqlite3"]).toBeUndefined();
+    expect(archive["conversation/neural-ledger.sqlite3"]).toBeDefined();
+    expect(archive["working/current/working-memory.sqlite3"]).toBeDefined();
     const manifest = JSON.parse(strFromU8(archive["manifest.json"]!)) as Record<string, unknown>;
     expect(manifest.conversationProjection).toEqual({
-      historyIncluded: false,
-      omittedLedgerRows: 3,
-      omittedPendingReplayJobs: 1
+      historyIncluded: true, omittedLedgerRows: 0, omittedPendingReplayJobs: 0
     });
+    expect(manifest.savedInstance).toEqual({ version: 1, content: "unsanitized" });
     const modelCard = strFromU8(archive["model-card.md"]!);
-    expect(modelCard).toContain("chat history is omitted (3 ledger rows)");
-    expect(modelCard).toContain("1 pending background replay job(s) are omitted and will not resume");
-    for (const path of ["state/engine.json", "origin/state/engine.json"]) {
-      const exported = JSON.parse(strFromU8(archive[path]!)) as Record<string, unknown>;
-      expect(exported.conversation).toEqual({
-        format: "omni-neural-conversation-ledger",
-        formatVersion: 1,
-        totalEntries: 0,
-        messageCount: 0,
-        actionCount: 0,
-        traceCount: 0,
-        attentionEpoch: 0,
-        headSequence: 0,
-        headSha256: "0".repeat(64)
-      });
-      expect(exported.completed_chat_turns).toEqual([]);
-      expect(exported.completed_chat_slow_learning).toEqual([]);
-      expect(exported.pending_chat_slow_learning).toEqual([]);
-      expect(exported.recent_token_context).toEqual([]);
-      expect(exported.current_context).toMatchObject({
-        tokenCount: 0,
-        tokenHash: "",
-        sensorySlots: 0
-      });
-      expect(exported.fresh_attention_boundary).toBeNull();
-      expect(exported.attention_overlay).toBeNull();
-      expect(exported.workspace_items).toEqual([]);
-      expect(exported.messages).toBeUndefined();
-      expect(exported.traces).toBeUndefined();
-    }
+    expect(modelCard).toContain("Unsanitized saved-instance export");
+    expect(Buffer.from(archive["state/engine.json"]!)).toEqual(original);
     expect(Object.values(archive).some((entry) =>
       Buffer.from(entry).includes(Buffer.from(privateText))
-    )).toBe(false);
+    )).toBe(true);
     const portableBrain = JSON.parse(strFromU8(archive["state/brain.json"]!)) as Record<string, unknown>;
-    expect(portableBrain.conversation).toBeUndefined();
+    expect(portableBrain.conversation).toBeDefined();
     const imported = await repository.importBundle(bundle);
     const importedEngine = JSON.parse(
       await readFile(join(repository.brainDirectory(imported.id), "engine", "brain.json"), "utf8")
     ) as Record<string, unknown>;
     expect(importedEngine.brain_id).toBe(imported.id);
-    expect((importedEngine.conversation as Record<string, unknown>).headSequence).toBe(0);
+    expect(importedEngine).toEqual({ ...native, brain_id: imported.id });
     expect(imported.originChecksum).toBe(portableBrain.originChecksum);
+    expect(imported.config.idleCognition).toBe(false);
+    expect(await repository.listSnapshots(imported.id)).toEqual([
+      expect.objectContaining({ id: recoveryPoint.id, brainId: imported.id, label: "saved private recovery note" })
+    ]);
+    const importedWorking = new DatabaseSync(join(repository.brainDirectory(imported.id), "engine", "state", "working-memory.sqlite3"), { readOnly: true });
+    try { expect(importedWorking.prepare("SELECT COUNT(*) AS count FROM working_pages").get()?.count).toBe(2); }
+    finally { importedWorking.close(); }
+    await repository.restoreSnapshot(imported.id, recoveryPoint.id);
+    const restoredHistory = JSON.parse(await readFile(
+      join(repository.brainDirectory(imported.id), "engine", "brain.json"), "utf8"
+    ));
+    expect(restoredHistory).toEqual({ ...historyNative, brain_id: imported.id });
 
     for (const path of ["state/engine.json", "origin/state/engine.json"]) {
       const tampered = unzipSync(bundleBytes);
       const changed = JSON.parse(strFromU8(tampered[path]!)) as Record<string, unknown>;
       changed.conversation = {
-        ...(changed.conversation as Record<string, unknown>),
+        format: "omni-neural-conversation-ledger", formatVersion: 1,
+        actionCount: 0, traceCount: 0, attentionEpoch: 0,
         totalEntries: 1,
         messageCount: 1,
         headSequence: 1,
@@ -1160,8 +1235,220 @@ describe("BrainRepository lifecycle", () => {
       tampered[path] = Buffer.from(JSON.stringify(changed));
       refreshArchiveIntegrity(tampered);
       await expect(repository.importBundleBuffer(Buffer.from(zipSync(tampered))))
-        .rejects.toThrow(/omits their neural ledger/i);
+        .rejects.toThrow(/omits their neural ledger|does not match its saved ledger/i);
     }
+    const tampered = unzipSync(bundleBytes);
+    const broken = JSON.parse(strFromU8(tampered["state/engine.json"]!));
+    broken.paged_working_memory.contentSha256 = "0".repeat(64);
+    tampered["state/engine.json"] = Buffer.from(JSON.stringify(broken));
+    refreshArchiveIntegrity(tampered);
+    const visible = (await repository.list()).map((entry) => entry.id).sort();
+    await expect(repository.importBundleBuffer(Buffer.from(zipSync(tampered))))
+      .rejects.toThrow(/working-memory checkpoint checksum/i);
+    expect((await repository.list()).map((entry) => entry.id).sort()).toEqual(visible);
+  });
+
+  it("preserves a WAL-held neural ledger suffix beyond the saved head but rejects dangling replay refs", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Neural committed-prefix fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const engine = join(repository.brainDirectory(brain.id), "engine");
+    const statePath = join(engine, "brain.json");
+    const native = JSON.parse(await readFile(statePath, "utf8"));
+    native.conversation = await writeNeuralConversationFixture(engine, brain.id, "committed human input");
+    native.pending_chat_slow_learning = [{ jobId: "a".repeat(64), inputSha256: digest("committed human input"), humanMessageId: "saved-human" }];
+    const database = new DatabaseSync(join(engine, "conversation.sqlite3"));
+    database.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+    fixtureWalWriters.push(database);
+    const payload = canonicalJson({ id: "uncommitted-human", role: "human", content: "saved ahead-of-checkpoint suffix" });
+    const body = {
+      sequence: 4, entryKey: "message:uncommitted-human", kind: "message",
+      createdAt: "2026-09-29T01:00:00.000Z", attentionEpoch: 3,
+      payloadSha256: digest(payload), previousSha256: native.conversation.headSha256
+    };
+    database.prepare("INSERT INTO entries VALUES(?,?,?,?,?,?,?,?,?)").run(
+      4, body.entryKey, body.kind, body.createdAt, 3, payload,
+      body.payloadSha256, body.previousSha256, digest(canonicalJson(body))
+    );
+    await writeFile(statePath, JSON.stringify(native));
+    const destination = join(temporaryRoot, "neural-prefix.omni");
+    await repository.exportBundle(brain.id, destination);
+    const imported = await repository.importBundle(destination);
+    const importedLedger = new DatabaseSync(join(repository.brainDirectory(imported.id), "engine", "conversation.sqlite3"), { readOnly: true });
+    try { expect(importedLedger.prepare("SELECT COUNT(*) AS count FROM entries").get()?.count).toBe(4); }
+    finally { importedLedger.close(); }
+    const importedState = JSON.parse(await readFile(join(repository.brainDirectory(imported.id), "engine", "brain.json"), "utf8"));
+    expect(importedState.conversation.headSequence).toBe(3);
+    expect(importedState.pending_chat_slow_learning).toEqual(native.pending_chat_slow_learning);
+    native.pending_chat_slow_learning[0].humanMessageId = "uncommitted-human";
+    await writeFile(statePath, JSON.stringify(native));
+    await expect(repository.exportBundle(brain.id, join(temporaryRoot, "dangling-job.omni")))
+      .rejects.toThrow(/pending chat replay has no saved human message/i);
+  });
+
+  it("preserves a cursor-bound v3 joint generation and rejects rebinding before import publication", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Saved joint cursor fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const engine = join(repository.brainDirectory(brain.id), "engine");
+    const statePath = join(engine, "brain.json");
+    const native = JSON.parse(await readFile(statePath, "utf8"));
+    const substrate = await writeSubstrateFixture(engine, undefined, undefined, 3);
+    const mutable = await writeMutableStateFixture(engine);
+    const mutableGeneration = JSON.parse(await readFile(
+      join(engine, "state", String(mutable.pointer.generationManifest)), "utf8"
+    ));
+    // Transport-only fixture: no worker/model is instantiated or trained.
+    const cursor = {
+      formatVersion: 3, commitSequence: 2, committedRecords: 2,
+      recordPrefixSha256: "a".repeat(64), sourceManifestSha256: "b".repeat(64),
+      parserManifestSha256: "c".repeat(64), contentHash: "d".repeat(64),
+      sourceLabel: "/Users/fixture/private/data.csv"
+    };
+    const generationId = "e".repeat(32);
+    const relativeManifest = `generations/${generationId}/manifest.json`;
+    const jointDirectory = join(engine, "state", "ingestion-joint", "generations", generationId);
+    await mkdir(jointDirectory, { recursive: true });
+    const snapshotPath = join(jointDirectory, "packed-vector-index.sqlite3");
+    const snapshot = new DatabaseSync(snapshotPath);
+    snapshot.exec("CREATE TABLE fixture(key TEXT PRIMARY KEY,value TEXT); INSERT INTO fixture VALUES('cursor','saved');");
+    snapshot.close();
+    const snapshotBytes = await readFile(snapshotPath);
+    const blobs = Object.fromEntries(Object.entries(mutableGeneration.roles).map(([role, value]) => {
+      const descriptor = value as { path: string; sha256: string; bytes: number };
+      return [role, { path: descriptor.path, sha256: descriptor.sha256, bytes: descriptor.bytes }];
+    }));
+    const joint = {
+      format: "omni-joint-checkpoint-generation", formatVersion: 2, generationId,
+      neuralState: {
+        generationId: mutable.pointer.activeGeneration,
+        generationManifest: mutable.pointer.generationManifest,
+        generationManifestSha256: mutable.pointer.generationManifestSha256, blobs
+      },
+      neuralGenerationSha256: mutable.pointer.activeGeneration,
+      substrateState: {
+        generationId: substrate.activeGeneration, generationManifest: substrate.generationManifest,
+        generationManifestSha256: substrate.generationManifestSha256, counts: substrate.counts
+      },
+      substrateGenerationSha256: substrate.activeGeneration,
+      sqliteSnapshot: { file: "packed-vector-index.sqlite3", sha256: digest(snapshotBytes), bytes: snapshotBytes.byteLength },
+      checkpointSequence: cursor.commitSequence, previousManifestSha256: null,
+      sourceManifestSha256: cursor.sourceManifestSha256, parserManifestSha256: cursor.parserManifestSha256,
+      sourceContentSha256: cursor.contentHash,
+      sourceParserManifestSha256: digest(canonicalJson({
+        sourceManifestSha256: cursor.sourceManifestSha256, parserManifestSha256: cursor.parserManifestSha256
+      })),
+      cursor: { committedRecords: cursor.committedRecords, recordPrefixSha256: cursor.recordPrefixSha256 },
+      coverage: {
+        visitedRecords: 2, processedRecords: 2, rejectedRecords: 0, processedBytes: 10,
+        expectedRecords: 5, sourceStreamExhausted: false, sourceContentReverifiedSha256: null
+      }
+    };
+    const jointBytes = Buffer.from(canonicalJson(joint));
+    await writeFile(join(jointDirectory, "manifest.json"), jointBytes);
+    Object.assign(native, {
+      substrate: { persistence: substrate }, mutable_state: mutable.pointer,
+      ingestion_checkpoints: { ["f".repeat(64)]: cursor },
+      ingestion_joint_generation: {
+        format: "omni-joint-checkpoint-reference", formatVersion: 2,
+        generationId, relativeManifest, sha256: digest(jointBytes)
+      }
+    });
+    await writeFile(statePath, JSON.stringify(native));
+    const recoveryPoint = await repository.snapshot(brain.id, "saved v3 cursor boundary");
+    const destination = join(temporaryRoot, "saved-joint.omni");
+    await repository.exportBundle(brain.id, destination);
+    const entries = unzipSync(new Uint8Array(await readFile(destination)));
+    expect(digest(entries[`joint/current/${relativeManifest}`]!)).toBe(digest(jointBytes));
+    expect(digest(entries[`snapshots/${recoveryPoint.id}/engine/state/ingestion-joint/${relativeManifest}`]!)).toBe(digest(jointBytes));
+    const imported = await repository.importBundle(destination);
+    const importedEngine = join(repository.brainDirectory(imported.id), "engine");
+    const importedState = JSON.parse(await readFile(join(importedEngine, "brain.json"), "utf8"));
+    expect(importedState.ingestion_checkpoints).toEqual(native.ingestion_checkpoints);
+    expect(importedState.ingestion_joint_generation).toEqual(native.ingestion_joint_generation);
+    expect(digest(await readFile(join(importedEngine, "state", "ingestion-joint", relativeManifest)))).toBe(digest(jointBytes));
+    expect(digest(await readFile(join(importedEngine, "state", "ingestion-joint", "generations", generationId, "packed-vector-index.sqlite3")))).toBe(digest(snapshotBytes));
+    await repository.restoreSnapshot(imported.id, recoveryPoint.id);
+    const restoredState = JSON.parse(await readFile(join(importedEngine, "brain.json"), "utf8"));
+    expect(restoredState.ingestion_checkpoints).toEqual(native.ingestion_checkpoints);
+    const visible = (await repository.list()).map((entry) => entry.id).sort();
+    for (const mutation of ["cursor", "path", "sqlite"] as const) {
+      const tampered = { ...entries };
+      const state = JSON.parse(strFromU8(tampered["state/engine.json"]!));
+      if (mutation === "cursor") state.ingestion_checkpoints["f".repeat(64)].commitSequence += 1;
+      if (mutation === "path") state.ingestion_joint_generation.relativeManifest = "../external-vault.sqlite3";
+      if (mutation === "sqlite") {
+        tampered[`joint/current/generations/${generationId}/packed-vector-index.sqlite3`] = Buffer.from("not SQLite");
+      }
+      tampered["state/engine.json"] = Buffer.from(JSON.stringify(state));
+      refreshArchiveIntegrity(tampered);
+      await expect(repository.importBundleBuffer(Buffer.from(zipSync(tampered))))
+        .rejects.toThrow(/joint.*(?:cursor|reference|SQLite)/i);
+      expect((await repository.list()).map((entry) => entry.id).sort()).toEqual(visible);
+    }
+  });
+
+  it("retains already-incomplete historical recovery records and reports missing payloads precisely", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Incomplete historical workspace fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const engine = join(repository.brainDirectory(brain.id), "engine");
+    const native = JSON.parse(await readFile(join(engine, "brain.json"), "utf8"));
+    native.paged_working_memory = await writeWorkingPagesFixture(engine, "saved historical scratch");
+    await writeFile(join(engine, "brain.json"), JSON.stringify(native));
+    const recoveryPoint = await repository.snapshot(brain.id, "old capture missing cold pages");
+    const base = join(repository.brainDirectory(brain.id), "snapshots", recoveryPoint.id);
+    const summary = JSON.parse(await readFile(`${base}.meta.json`, "utf8"));
+    const missing = "engine/state/working-memory.sqlite3";
+    // Reproduce an older capture protocol in a private storage fixture only.
+    await rm(join(base, ...missing.split("/")));
+    summary.checkpointComponentSha256.splice(summary.checkpointComponentSha256.length - 3, 1);
+    summary.engineChecksum = digest(summary.checkpointComponentSha256.join(":"));
+    delete summary.savedContinuation;
+    await writeFile(`${base}.meta.json`, JSON.stringify(summary, null, 2));
+    const destination = join(temporaryRoot, "historical-missing-pages.omni");
+    await repository.exportBundle(brain.id, destination);
+    const entries = unzipSync(new Uint8Array(await readFile(destination)));
+    const manifest = JSON.parse(strFromU8(entries["manifest.json"]!));
+    expect(manifest.recoveryPoints).toEqual([{ id: recoveryPoint.id, brainId: brain.id, missingPayloads: [missing] }]);
+    expect(strFromU8(entries["model-card.md"]!).includes(recoveryPoint.id)).toBe(true);
+    expect(JSON.parse(strFromU8(entries[`snapshots/${recoveryPoint.id}/engine/brain.json`]!)).paged_working_memory.count).toBe(2);
+    const imported = await repository.importBundle(destination);
+    expect(await repository.listSnapshots(imported.id)).toEqual([
+      expect.objectContaining({ id: recoveryPoint.id, brainId: imported.id, exportMissingPayloads: [missing] })
+    ]);
+    const before = await readFile(join(repository.brainDirectory(imported.id), "engine", "brain.json"));
+    await expect(repository.restoreSnapshot(imported.id, recoveryPoint.id)).rejects.toThrow(/working-memory pages are missing/i);
+    expect(await readFile(join(repository.brainDirectory(imported.id), "engine", "brain.json"))).toEqual(before);
+  });
+
+  it("keeps older sanitized native bundles readable without adding a legacy model fallback", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Earlier native bundle fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const path = join(temporaryRoot, "legacy-native-format.omni");
+    await repository.exportBundle(brain.id, path);
+    const entries = unzipSync(new Uint8Array(await readFile(path)));
+    const manifest = JSON.parse(strFromU8(entries["manifest.json"]!));
+    delete manifest.savedInstance;
+    delete manifest.recoveryPoints;
+    manifest.conversationProjection = { historyIncluded: false, omittedLedgerRows: 0, omittedPendingReplayJobs: 0 };
+    entries["manifest.json"] = Buffer.from(JSON.stringify(manifest));
+    delete entries["conversation/ledger.sqlite3"];
+    const host = JSON.parse(strFromU8(entries["state/brain.json"]!));
+    delete host.conversation;
+    entries["state/brain.json"] = Buffer.from(JSON.stringify(host));
+    for (const name of ["state/engine.json", "origin/state/engine.json"]) {
+      const engine = JSON.parse(strFromU8(entries[name]!));
+      engine.paged_working_memory = {
+        format: "omni-working-memory-pages", formatVersion: 1, count: 0,
+        highWaterId: 0, contentSha256: digest(""), temporary: true,
+        runtimeReadable: true, learningReadable: true, pageInSupported: true
+      };
+      engine.ingestion_checkpoints = {};
+      entries[name] = Buffer.from(JSON.stringify(engine));
+    }
+    refreshArchiveIntegrity(entries);
+    const imported = await repository.importBundleBuffer(Buffer.from(zipSync(entries)));
+    expect(imported.name).toBe(brain.name);
+    expect(imported.config.idleCognition).toBe(false);
+    expect((await repository.conversationPage(imported.id)).entries).toEqual([]);
   });
 
   it("preserves an imported checkpoint workspace above the former product cap", async () => {
@@ -1200,6 +1487,7 @@ describe("BrainRepository lifecycle", () => {
       ...DEFAULT_CONFIG,
       name: "Cancelled export source"
     });
+    await materializeNativeEngineFixture(repository, source);
     const destination = join(temporaryRoot, "cancelled-export.omni");
     await writeFile(destination, "existing destination remains");
     const controller = new AbortController();
@@ -1232,6 +1520,7 @@ describe("BrainRepository lifecycle", () => {
       ...DEFAULT_CONFIG,
       name: "Cancelled import source"
     });
+    await materializeNativeEngineFixture(repository, source);
     const bundle = join(temporaryRoot, "cancelled-import.omni");
     await repository.exportBundle(source.id, bundle, "current");
     const before = (await repository.list()).map((entry) => entry.id).sort();
@@ -1258,6 +1547,87 @@ describe("BrainRepository lifecycle", () => {
         name.startsWith(".omni-import-")
       )
     ).toBe(false);
+  });
+
+  it("does not publish a mixed export when its saved engine commit changes during staging", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Export commit race fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const enginePath = join(repository.brainDirectory(brain.id), "engine", "brain.json");
+    const destination = join(temporaryRoot, "prior-export.omni");
+    const prior = Buffer.from("prior destination stays intact");
+    await writeFile(destination, prior);
+    let diskChecks = 0;
+    const hooks: BrainStorageOperationHooks = {
+      signal: new AbortController().signal,
+      checkpoint: vi.fn(async () => undefined),
+      checkDisk: vi.fn(async () => {
+        diskChecks += 1;
+        if (diskChecks === 3) {
+          const state = JSON.parse(await readFile(enginePath, "utf8"));
+          state.updated_at = "newly committed fixture state";
+          await writeFile(enginePath, JSON.stringify(state));
+        }
+        return safeDiskTelemetry();
+      })
+    };
+    await expect(repository.exportBundle(brain.id, destination, "current", hooks))
+      .rejects.toThrow(/changed during export/i);
+    expect(await readFile(destination)).toEqual(prior);
+  });
+
+  it("keeps an installing identity invisible and rolls it back if installation is cancelled", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Private install fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const bundle = join(temporaryRoot, "private-install.omni");
+    await repository.exportBundle(brain.id, bundle);
+    const controller = new AbortController();
+    let checked = false;
+    const hooks: BrainStorageOperationHooks = {
+      signal: controller.signal,
+      checkDisk: vi.fn(async () => safeDiskTelemetry()),
+      checkpoint: vi.fn(async (update = {}) => {
+        if (update.phase === "installing" && update.targetBrainId) {
+          expect((await repository.list()).some((entry) => entry.id === update.targetBrainId)).toBe(false);
+          checked = true;
+          controller.abort();
+        }
+      })
+    };
+    await expect(repository.importBundle(bundle, {}, hooks)).rejects.toMatchObject({ name: "AbortError" });
+    expect(checked).toBe(true);
+    expect((await repository.list()).map((entry) => entry.id)).toEqual([brain.id]);
+  });
+
+  it("preserves historical training-source versions and their retained blobs, not only the latest row", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Historical source version fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const initial = Buffer.from("first deliberately retained private source");
+    const latest = Buffer.from("new deliberately retained private source");
+    const initialHash = await repository.storeBlob(initial);
+    const latestHash = await repository.storeBlob(latest);
+    brain.trainingSources.push({
+      id: "saved-source", name: "private.txt", path: "/Users/fixture/private/original.txt", kind: "text",
+      bytes: initial.byteLength, learnedIdeas: 0, learnedConcepts: 0, learnedSynapses: 0,
+      importedAt: "2026-09-29T00:00:00.000Z", rawTextRetained: true, rawText: initial.toString(),
+      contentHash: initialHash, blobHash: initialHash, policy: "archive"
+    });
+    await repository.save(brain);
+    brain.trainingSources[0] = { ...brain.trainingSources[0]!, bytes: latest.byteLength,
+      importedAt: "2026-09-29T01:00:00.000Z", rawText: latest.toString(), contentHash: latestHash, blobHash: latestHash };
+    await repository.save(brain);
+    const bundle = join(temporaryRoot, "historical-sources.omni");
+    await repository.exportBundle(brain.id, bundle);
+    const entries = unzipSync(new Uint8Array(await readFile(bundle)));
+    expect(Buffer.from(entries[`blobs/${initialHash}`]!)).toEqual(initial);
+    expect(Buffer.from(entries[`blobs/${latestHash}`]!)).toEqual(latest);
+    const imported = await repository.importBundle(bundle);
+    expect(imported.activity?.trainingSourceVersionCount).toBe(2);
+    expect(imported.trainingSources[0]?.rawText).toBe(latest.toString());
+    const database = new DatabaseSync(join(repository.brainDirectory(imported.id), "activity", "ledger.sqlite3"), { readOnly: true });
+    try {
+      const first = database.prepare("SELECT payload_json FROM training_source_versions ORDER BY sequence LIMIT 1").get();
+      expect(JSON.parse(String(first?.payload_json)).rawText).toBe(initial.toString());
+    } finally { database.close(); }
   });
 
   it("atomically reserves unique identities for concurrent imports of one bundle", async () => {
@@ -1846,6 +2216,7 @@ describe("BrainRepository lifecycle", () => {
       ...DEFAULT_CONFIG,
       name: "Stable shell"
     });
+    await materializeNativeEngineFixture(repository, stable);
     const engine = join(repository.brainDirectory(stable.id), "engine");
     await mkdir(engine, { recursive: true });
     await writeFile(
@@ -1861,6 +2232,31 @@ describe("BrainRepository lifecycle", () => {
     ).rejects.toThrow(/beta engine/i);
   });
 
+  it("rejects draft or missing-origin exports before writing an unimportable identity backup", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Unmaterialized storage fixture" });
+    const destination = join(temporaryRoot, "unfinished.omni");
+    const prior = Buffer.from("existing destination is preserved");
+    await writeFile(destination, prior);
+    for (const mode of ["current", "origin", "private-archive", "referenced"] as const) {
+      await expect(repository.exportBundle(brain.id, destination, mode))
+        .rejects.toThrow(/finish initial learning before exporting this mind/i);
+      expect(await readFile(destination)).toEqual(prior);
+    }
+    await materializeNativeEngineFixture(repository, brain);
+    brain.readiness = { state: "initializing", startedAt: brain.createdAt, attempt: 1 };
+    await repository.save(brain);
+    await expect(repository.exportBundle(brain.id, destination, "current"))
+      .rejects.toThrow(/finish initial learning/i);
+    brain.readiness = { state: "ready", startedAt: brain.createdAt, completedAt: brain.createdAt, attempt: 1 };
+    await repository.save(brain);
+    await rm(join(repository.brainDirectory(brain.id), "engine", "origin", "brain.json"));
+    await expect(repository.exportBundle(brain.id, destination, "origin"))
+      .rejects.toThrow(/materialized origin/i);
+    await expect(repository.exportBundle(brain.id, destination, "current"))
+      .rejects.toThrow(/materialized origin/i);
+    expect(await readFile(destination)).toEqual(prior);
+  });
+
   it("snapshots and restores both inspectable and neural state", async () => {
     const brain = await repository.create({
       ...DEFAULT_CONFIG,
@@ -1870,6 +2266,7 @@ describe("BrainRepository lifecycle", () => {
     await mkdir(engine, { recursive: true });
     const substratePointer = await writeSubstrateFixture(engine);
     const mutableState = await writeMutableStateFixture(engine);
+    const neuralSummary = await writeNeuralConversationFixture(engine, brain.id, "neural conversation before");
     await writeFile(
       join(engine, "brain.json"),
       JSON.stringify({
@@ -1878,14 +2275,14 @@ describe("BrainRepository lifecycle", () => {
         release_format: "stable-1.0",
         brain_id: brain.id,
         marker: "before",
+        conversation: neuralSummary,
         substrate: { persistence: substratePointer },
         mutable_state: mutableState.pointer
       })
     );
     await Promise.all([
       writeFile(join(engine, "core.safetensors"), emptySafetensors()),
-      writeFile(join(engine, "plasticity.safetensors"), emptySafetensors()),
-      writeFile(join(engine, "conversation.sqlite3"), "neural conversation before")
+      writeFile(join(engine, "plasticity.safetensors"), emptySafetensors())
     ]);
     await writePackedTernaryFixture(join(engine, "packed-ternary"));
     const beforeArtifact = Buffer.from("recovery artifact before");
@@ -2067,11 +2464,9 @@ describe("BrainRepository lifecycle", () => {
     await expect(readFile(join(engine, "state", "manifest.json"), "utf8")).resolves.toBe(
       canonicalJson(mutableState.pointer)
     );
-    await expect(readFile(join(engine, "state", "replay.sqlite3"))).resolves.toEqual(
-      mutableState.replay
-    );
-    await expect(readFile(join(engine, "conversation.sqlite3"), "utf8")).resolves.toBe(
-      "neural conversation before"
+    expect(replayRowCount(join(engine, "state", "replay.sqlite3"))).toBe(3);
+    await expect(readFile(join(engine, "conversation.sqlite3"))).resolves.toEqual(
+      await readFile(join(repository.brainDirectory(brain.id), "snapshots", snapshot.id, "engine", "conversation.sqlite3"))
     );
     await expect(readFile(join(engine, "artifacts", beforeArtifactName))).resolves.toEqual(
       beforeArtifact
@@ -2190,7 +2585,7 @@ describe("BrainRepository lifecycle", () => {
     }
   }, 20_000);
 
-  it("round-trips a checksum-verified ZIP and omits private sources by default", async () => {
+  it("round-trips checksum-verified saved sources, activity and annotated artifacts in every mode", async () => {
     const brain = await repository.create({
       ...DEFAULT_CONFIG,
       name: "Portable mind"
@@ -2240,17 +2635,8 @@ describe("BrainRepository lifecycle", () => {
       ingestion_checkpoints: {
         "fixture-source": { nextRecordIndex: 2 }
       },
-      paged_working_memory: {
-        format: "omni-working-memory-pages",
-        formatVersion: 1,
-        count: 2,
-        highWaterId: 2,
-        contentSha256: "c".repeat(64),
-        temporary: true,
-        runtimeReadable: true,
-        learningReadable: true,
-        pageInSupported: true
-      },
+      conversation: await writeNeuralConversationFixture(engine, brain.id, "raw private tool output"),
+      paged_working_memory: await writeWorkingPagesFixture(engine, "saved scratch notes"),
       substrate: {
         schema: 1,
         dimensions: 16,
@@ -2259,6 +2645,8 @@ describe("BrainRepository lifecycle", () => {
       },
       mutable_state: mutableState.pointer
     };
+    await writeNeuralConversationFixture(join(engine, "origin"), brain.id, "raw private tool output");
+    await writeWorkingPagesFixture(join(engine, "origin"), "saved scratch notes");
     await Promise.all([
       writeFile(join(engine, "brain.json"), JSON.stringify(engineState)),
       writeFile(join(engine, "core.safetensors"), emptySafetensors()),
@@ -2334,10 +2722,6 @@ describe("BrainRepository lifecycle", () => {
         output: "raw private tool output"
       })
     });
-    await writeFile(
-      join(engine, "conversation.sqlite3"),
-      Buffer.from(`unexportable neural history ${privateNeedles.join(" ")}`)
-    );
     const blobHash = await repository.storeBlob(sourceBytes);
     brain.trainingSources.push({
       id: randomUUID(),
@@ -2373,18 +2757,18 @@ describe("BrainRepository lifecycle", () => {
       ingestion_checkpoints: Record<string, unknown>;
       paged_working_memory: { count: number };
     };
-    expect(portableEngineState.ingestion_checkpoints).toEqual({});
-    expect(portableEngineState.paged_working_memory.count).toBe(0);
+    expect(portableEngineState.ingestion_checkpoints).toEqual(engineState.ingestion_checkpoints);
+    expect(portableEngineState.paged_working_memory.count).toBe(2);
     const portableOriginEngineState = JSON.parse(
       strFromU8(entries["origin/state/engine.json"]!)
     ) as {
       ingestion_checkpoints: Record<string, unknown>;
       paged_working_memory: { count: number };
     };
-    expect(portableOriginEngineState.ingestion_checkpoints).toEqual({});
-    expect(portableOriginEngineState.paged_working_memory.count).toBe(0);
+    expect(portableOriginEngineState.ingestion_checkpoints).toEqual(engineState.ingestion_checkpoints);
+    expect(portableOriginEngineState.paged_working_memory.count).toBe(2);
     expect(strFromU8(entries["model-card.md"]!)).toContain(
-      "1 active ingestion cursor(s) are omitted and will not resume after import"
+      "ingestion cursors are preserved"
     );
     expect(Object.keys(entries)).toEqual(
       expect.arrayContaining([
@@ -2409,15 +2793,16 @@ describe("BrainRepository lifecycle", () => {
         `artifacts/files/${artifactName}`
       ])
     );
-    expect(entries["conversation/ledger.sqlite3"]).toBeUndefined();
-    expect(entries["conversation/neural-ledger.sqlite3"]).toBeUndefined();
+    expect(entries["conversation/ledger.sqlite3"]).toBeDefined();
+    expect(entries["conversation/neural-ledger.sqlite3"]).toBeDefined();
+    expect(entries["artifacts/index.sqlite3"]).toBeDefined();
     const portableArchiveText = Object.values(entries)
       .map((value) => Buffer.from(value).toString("utf8"))
-      .join("\n");
+      .join("\n").replace(/\\\\/g, "\\");
     for (const needle of privateNeedles) {
-      expect(portableArchiveText).not.toContain(needle);
+      expect(portableArchiveText.includes(needle), "Saved user content is included").toBe(true);
     }
-    expect(Object.keys(entries).some((name) => name.startsWith("blobs/"))).toBe(false);
+    expect(Object.keys(entries).some((name) => name.startsWith("blobs/"))).toBe(true);
     expect(portableState.trainingSources[0]?.rawText).toBeUndefined();
     expect(portableState.trainingSources[0]?.path).toBeUndefined();
     expect(
@@ -2432,7 +2817,7 @@ describe("BrainRepository lifecycle", () => {
     } = portableEngineState.training_sources[0]!.distributed_training_receipt;
     expect(portableReceiptSha256).toBe(digest(canonicalJson(portableReceiptBody)));
     expect(strFromU8(entries["state/brain.json"]!)).not.toContain(copiedCredential);
-    expect(portableArchiveText).toContain("[REDACTED_SECRET]");
+    expect(portableArchiveText).not.toContain("[REDACTED_SECRET]");
     const manifest = JSON.parse(strFromU8(entries["manifest.json"]!)) as {
       architecture: string;
       architectureSchemaVersion: number;
@@ -2454,7 +2839,7 @@ describe("BrainRepository lifecycle", () => {
         originTensorCount: 1
       }
     });
-    expect(manifest.secretRedaction.replacements).toBeGreaterThan(0);
+    expect(manifest.secretRedaction.replacements).toBe(0);
     expect(manifest.licenseLedger.application).toContain("PolyForm");
     expect(manifest.licenseLedger).toMatchObject({
       sourceCount: 1,
@@ -2470,8 +2855,8 @@ describe("BrainRepository lifecycle", () => {
         ingestion_checkpoints: Record<string, unknown>;
         paged_working_memory: { count: number };
       };
-      expect(exported.ingestion_checkpoints).toEqual({});
-      expect(exported.paged_working_memory.count).toBe(0);
+      expect(exported.ingestion_checkpoints).toEqual(engineState.ingestion_checkpoints);
+      expect(exported.paged_working_memory.count).toBe(2);
     }
     for (const source of [engine, join(engine, "origin")]) {
       const unchanged = JSON.parse(await readFile(join(source, "brain.json"), "utf8")) as {
@@ -2481,13 +2866,14 @@ describe("BrainRepository lifecycle", () => {
       expect(unchanged.ingestion_checkpoints).toEqual(engineState.ingestion_checkpoints);
       expect(unchanged.paged_working_memory).toEqual(engineState.paged_working_memory);
     }
-    expect(originEntries["conversation/ledger.sqlite3"]).toBeUndefined();
-    expect(originEntries["conversation/neural-ledger.sqlite3"]).toBeUndefined();
+    expect(originEntries["conversation/ledger.sqlite3"]).toBeDefined();
+    expect(originEntries["conversation/neural-ledger.sqlite3"]).toBeDefined();
     const originArchiveText = Object.values(originEntries)
       .map((value) => Buffer.from(value).toString("utf8"))
       .join("\n");
     for (const needle of privateNeedles) {
-      expect(originArchiveText).not.toContain(needle);
+      if (needle === "raw private tool output") expect(originArchiveText).toContain(needle);
+      else expect(originArchiveText).not.toContain(needle);
     }
 
     const imported = await repository.importBundle(portablePath);
@@ -2500,8 +2886,8 @@ describe("BrainRepository lifecycle", () => {
     expect(imported.trainingSources).toEqual([
       expect.objectContaining({ name: "private.txt" })
     ]);
-    expect(imported.trainingSources[0]?.path).toBeUndefined();
-    expect(imported.trainingSources[0]?.rawText).toBeUndefined();
+    expect(imported.trainingSources[0]?.path).toBe("C:\\private\\private.txt");
+    expect(imported.trainingSources[0]?.rawText).toBe(sourceBytes.toString("utf8"));
     const importedEngine = JSON.parse(
       await readFile(join(repository.brainDirectory(imported.id), "engine", "brain.json"), "utf8")
     ) as {
@@ -2520,9 +2906,9 @@ describe("BrainRepository lifecycle", () => {
     ).toBe(distributedReceipt.contentSha256);
     const importedConversation = JSON.stringify(
       (await repository.conversationPage(imported.id)).entries
-    );
+    ).replace(/\\\\/g, "\\");
     for (const needle of privateNeedles) {
-      expect(importedConversation).not.toContain(needle);
+      expect(importedConversation).toContain(needle);
     }
     await expect(
       readFile(
@@ -2570,8 +2956,8 @@ describe("BrainRepository lifecycle", () => {
       bytes: artifactBytes.length,
       seed: 17
     });
-    expect(importedArtifactIndex.artifacts[0]?.initialization).toBeUndefined();
-    expect(importedArtifactIndex.artifacts[0]?.qualityNote).toBeUndefined();
+    expect(importedArtifactIndex.artifacts[0]?.initialization).toBe(`loaded from ${localPosixPath}`);
+    expect(importedArtifactIndex.artifacts[0]?.qualityNote).toBe(`tool said ${mcpEnvironmentSecret}`);
     await expect(
       readFile(join(repository.brainDirectory(imported.id), "engine", "artifacts", artifactName))
     ).resolves.toEqual(artifactBytes);
@@ -2615,13 +3001,13 @@ describe("BrainRepository lifecycle", () => {
     await repository.exportBundle(brain.id, privatePath, "private-archive");
     const privateEntries = unzipSync(new Uint8Array(await readFile(privatePath)));
     expect(privateEntries[`blobs/${blobHash}`]).toBeDefined();
-    expect(privateEntries["conversation/ledger.sqlite3"]).toBeUndefined();
-    expect(privateEntries["conversation/neural-ledger.sqlite3"]).toBeUndefined();
+    expect(privateEntries["conversation/ledger.sqlite3"]).toBeDefined();
+    expect(privateEntries["conversation/neural-ledger.sqlite3"]).toBeDefined();
     const privateArchiveText = Object.values(privateEntries)
       .map((value) => Buffer.from(value).toString("utf8"))
-      .join("\n");
+      .join("\n").replace(/\\\\/g, "\\");
     for (const needle of privateNeedles) {
-      expect(privateArchiveText).not.toContain(needle);
+      expect(privateArchiveText).toContain(needle);
     }
     await repository.importBundle(privatePath);
     await expect(repository.getBlob(blobHash)).resolves.toEqual(sourceBytes);
@@ -2643,6 +3029,7 @@ describe("BrainRepository lifecycle", () => {
       ...DEFAULT_CONFIG,
       name: "Schema mind"
     });
+    await materializeNativeEngineFixture(repository, brain);
     const portablePath = join(temporaryRoot, "schema.omni");
     await repository.exportBundle(brain.id, portablePath, "current");
     const entries = unzipSync(new Uint8Array(await readFile(portablePath)));
@@ -2667,6 +3054,7 @@ describe("BrainRepository lifecycle", () => {
       ...DEFAULT_CONFIG,
       name: "Stable bundle"
     });
+    await materializeNativeEngineFixture(repository, brain);
     const portablePath = join(temporaryRoot, "stable.omni");
     await repository.exportBundle(brain.id, portablePath, "current");
     const entries = unzipSync(new Uint8Array(await readFile(portablePath)));
@@ -2685,11 +3073,12 @@ describe("BrainRepository lifecycle", () => {
     ).rejects.toThrow(/beta .omni bundle/i);
   });
 
-  it("refuses a private source archive when retained text appears to contain a credential", async () => {
+  it("preserves credential-like text deliberately saved as user source content", async () => {
     const brain = await repository.create({
       ...DEFAULT_CONFIG,
       name: "Private mind"
     });
+    await materializeNativeEngineFixture(repository, brain);
     const secretBytes = Buffer.from(`api_key=sk-${"b".repeat(36)}`);
     const blobHash = await repository.storeBlob(secretBytes);
     brain.trainingSources.push({
@@ -2709,9 +3098,36 @@ describe("BrainRepository lifecycle", () => {
       policy: "archive"
     });
     await repository.save(brain);
-    await expect(
-      repository.exportBundle(brain.id, join(temporaryRoot, "credentials.omni"), "private-archive")
-    ).rejects.toThrow(/appears to contain credentials/);
+    const destination = join(temporaryRoot, "credentials.omni");
+    await repository.exportBundle(brain.id, destination, "private-archive");
+    const entries = unzipSync(new Uint8Array(await readFile(destination)));
+    expect(Buffer.from(entries[`blobs/${blobHash}`]!)).toEqual(secretBytes);
+    const imported = await repository.importBundle(destination);
+    expect(imported.trainingSources[0]?.rawText).toBe(secretBytes.toString("utf8"));
+  });
+
+  it("preserves inert ancestral tool intents through recovery and every saved-instance export", async () => {
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Intent history fixture" });
+    await materializeNativeEngineFixture(repository, brain);
+    const intentPath = await persistAuthorizedToolIntent(repository.brainDirectory(brain.id), {
+      brainId: brain.id, toolId: "files.read", action: "read", arguments: { path: "/private/unchanged-user-path" }
+    }, { id: randomUUID(), requestId: "fixture-turn", startedAt: new Date().toISOString(), permission: "ask", permissionRevision: "fixture-approved" });
+    const original = await readFile(intentPath);
+    const intentName = intentPath.split(/[\\/]/).at(-1)!;
+    const snapshot = await repository.snapshot(brain.id, "With historical intent");
+    expect(await readFile(join(repository.brainDirectory(brain.id), "snapshots", snapshot.id,
+      "engine", "operational-tool-intents", intentName))).toEqual(original);
+    for (const mode of ["current", "private-archive", "referenced"] as const) {
+      const destination = join(temporaryRoot, `intent-${mode}.omni`);
+      await repository.exportBundle(brain.id, destination, mode);
+      const imported = await repository.importBundle(destination);
+      expect(imported.id).not.toBe(brain.id);
+      expect(await readFile(join(repository.brainDirectory(imported.id), "engine", "operational-tool-intents", intentName))).toEqual(original);
+      expect(imported.config.idleCognition).toBe(false);
+      const recovered = (await repository.listSnapshots(imported.id)).find(item => item.id === snapshot.id)!;
+      expect(await readFile(join(repository.brainDirectory(imported.id), "snapshots", recovered.id,
+        "engine", "operational-tool-intents", intentName))).toEqual(original);
+    }
   });
 
   it.each([
@@ -2720,7 +3136,7 @@ describe("BrainRepository lifecycle", () => {
     { mode: "private-archive", scope: "current", leak: "private path" },
     { mode: "referenced", scope: "origin", leak: "credential" }
   ] as const)(
-    "refuses $mode export when $scope substrate JSON contains a $leak",
+    "preserves $scope substrate $leak content unchanged in $mode export",
     async ({ mode, scope, leak }) => {
       const brain = await repository.create({
         ...DEFAULT_CONFIG,
@@ -2730,31 +3146,20 @@ describe("BrainRepository lifecycle", () => {
         ? `sk-${"q".repeat(36)}`
         : "C:\\Users\\fixture\\private\\neuron-label.txt";
       await materializeSubstrateExportFixture(repository, brain, { [scope]: leakValue });
-      const destination = join(temporaryRoot, `blocked-${mode}-${scope}.omni`);
-      const priorArchive = Buffer.from("existing archive must not be replaced");
-      await writeFile(destination, priorArchive);
-
-      let failure: unknown;
-      try {
-        await repository.exportBundle(brain.id, destination, mode);
-      } catch (error) {
-        failure = error;
-      }
-      expect(failure).toBeInstanceOf(Error);
-      const message = (failure as Error).message;
-      // Origin-portable projects immutable origin into both archive slots.
+      const destination = join(temporaryRoot, `unsanitized-${mode}-${scope}.omni`);
+      await repository.exportBundle(brain.id, destination, mode);
+      const entries = unzipSync(new Uint8Array(await readFile(destination)));
       const archiveScope = mode === "origin" ? "current" : scope;
-      expect(message).toMatch(
-        new RegExp(`substrate/${archiveScope}/blobs/[a-f0-9]{64}\\.json.*(?:credentials|private path)`, "i")
+      const records = Object.entries(entries).filter(([name]) =>
+        name.startsWith(`substrate/${archiveScope}/blobs/`) && name.endsWith(".json")
       );
-      expect(message.includes(leakValue)).toBe(false);
-      await expect(readFile(destination)).resolves.toEqual(priorArchive);
-      expect((await readdir(temporaryRoot)).filter((name) => name.startsWith(".omni-export-")))
-        .toEqual([]);
+      expect(records.some(([, bytes]) => JSON.parse(strFromU8(bytes)).records[0]?.source_label === leakValue)).toBe(true);
+      const imported = await repository.importBundle(destination);
+      expect(imported.name).toBe(brain.name);
     }
   );
 
-  it("refuses a credential in a selected substrate generation manifest", async () => {
+  it("retains credential-like annotations in a hash-bound substrate manifest", async () => {
     const brain = await repository.create({
       ...DEFAULT_CONFIG,
       name: "Substrate manifest privacy fixture"
@@ -2763,26 +3168,16 @@ describe("BrainRepository lifecycle", () => {
     await materializeSubstrateExportFixture(repository, brain, {
       originManifest: fakeKey
     });
-    const destination = join(temporaryRoot, "blocked-manifest.omni");
-
-    let failure: unknown;
-    try {
-      await repository.exportBundle(brain.id, destination, "current");
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(Error);
-    const message = (failure as Error).message;
-    expect(message).toMatch(
-      /substrate\/origin\/generations\/[a-f0-9]{64}\/manifest\.json.*credentials/i
-    );
-    expect(message.includes(fakeKey)).toBe(false);
-    await expect(stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await readdir(temporaryRoot)).filter((name) => name.startsWith(".omni-export-")))
-      .toEqual([]);
+    const destination = join(temporaryRoot, "unsanitized-manifest.omni");
+    await repository.exportBundle(brain.id, destination, "current");
+    const entries = unzipSync(new Uint8Array(await readFile(destination)));
+    const pointer = JSON.parse(strFromU8(entries["substrate/origin/manifest.json"]!));
+    const bytes = entries[`substrate/origin/${pointer.generationManifest}`]!;
+    expect(digest(bytes)).toBe(pointer.generationManifestSha256);
+    expect(JSON.parse(strFromU8(bytes)).source_note).toBe(fakeKey);
   });
 
-  it("scans a substrate record beyond the initial file sample", async () => {
+  it("does not redact a large saved substrate record beyond the initial file sample", async () => {
     const brain = await repository.create({
       ...DEFAULT_CONFIG,
       name: "Large substrate privacy fixture"
@@ -2791,19 +3186,12 @@ describe("BrainRepository lifecycle", () => {
     await materializeSubstrateExportFixture(repository, brain, {
       current: `${"ordinary label ".repeat(20_000)}${fakeKey}`
     });
-    const destination = join(temporaryRoot, "blocked-late-key.omni");
-
-    let failure: unknown;
-    try {
-      await repository.exportBundle(brain.id, destination, "current");
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(Error);
-    const message = (failure as Error).message;
-    expect(message).toMatch(/substrate\/current\/blobs\/[a-f0-9]{64}\.json.*credentials/i);
-    expect(message.includes(fakeKey)).toBe(false);
-    await expect(stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+    const destination = join(temporaryRoot, "unsanitized-late-key.omni");
+    await repository.exportBundle(brain.id, destination, "current");
+    const entries = unzipSync(new Uint8Array(await readFile(destination)));
+    expect(Object.entries(entries).some(([name, bytes]) =>
+      name.startsWith("substrate/current/blobs/") && Buffer.from(bytes).includes(Buffer.from(fakeKey))
+    )).toBe(true);
   });
 
   it("exports checksum-bound packed-v2 native substrate generations", async () => {
@@ -2962,13 +3350,13 @@ describe("BrainRepository lifecycle", () => {
     };
     expect(referenceManifest.mode).toBe("referenced-local");
     for (const archiveEntries of [portableEntries, referenceEntries]) {
-      expect(archiveEntries["conversation/ledger.sqlite3"]).toBeUndefined();
+      expect(archiveEntries["conversation/ledger.sqlite3"]).toBeDefined();
       expect(archiveEntries["conversation/neural-ledger.sqlite3"]).toBeUndefined();
       const exposedText = Object.values(archiveEntries)
         .map((value) => Buffer.from(value).toString("utf8"))
         .join("\n");
-      expect(exposedText).not.toContain(historySecret);
-      expect(exposedText).not.toContain(historyPath);
+      expect(exposedText).toContain(historySecret);
+      expect(exposedText).toContain(historyPath);
     }
     expect(Object.values(referenceManifest.references)).toHaveLength(4);
     expect(

@@ -161,6 +161,19 @@ function committedWorkerResult(brainId: string, turnId: string, replayed: boolea
   };
 }
 
+function noReplyEngineState(brainId: string, turnId: string) {
+  const state = committedEngineState(brainId, turnId);
+  return {
+    ...state,
+    messages: state.messages.map((message) => ({ ...message,
+      content: message.role === "brain" ? "" : message.content, generation_end: "no-reply" })),
+    traces: state.traces.map((trace) => ({ ...trace, generation_stop_reason: "no-reply",
+      generation_decoder_stop_reason: "eos", generation_no_reply_reason: "no-decoded-text",
+      generated_token_count: 1, generation_printable_text_characters: 0 })),
+    completed_chat_turns: state.completed_chat_turns!.map((receipt) => ({ ...receipt, generationEnd: "no-reply" }))
+  };
+}
+
 describe("atomic neural chat commit reconciliation", () => {
   const temporaryRoots: string[] = [];
 
@@ -359,6 +372,76 @@ describe("atomic neural chat commit reconciliation", () => {
     ]);
     expect(saved.traces.map((trace) => trace.id)).toEqual([traceId]);
     expect(saved.counters.inferenceCount).toBe(1);
+  });
+
+  it("commits typed no-reply with zero assistant text and keeps exact ids on idempotent replay", async () => {
+    const { repository, brain } = await fixture("No printable reply");
+    const turnId = "turn-no-reply";
+    const state = noReplyEngineState(brain.id, turnId);
+    let calls = 0;
+    const requestStream = vi.fn(async () => {
+      await writeFile(join(repository.brainDirectory(brain.id), "engine", "brain.json"), JSON.stringify(state), "utf8");
+      return { ...committedWorkerResult(brain.id, turnId, calls++ > 0), text: "", response: "", content: "",
+        noReply: true, humanMessage: state.messages[0], message: state.messages[1], trace: state.traces[0],
+        turnReceipt: state.completed_chat_turns[0] };
+    });
+    const engine = { request: vi.fn(async (method: string) => {
+      if (method === "load") return {};
+      throw new Error(`Unexpected worker method: ${method}`);
+    }), requestStream } as unknown as EngineSupervisor;
+    const service = new BrainService(repository, engine);
+    for (const result of [await service.chat(brain.id, input, undefined, undefined, turnId),
+      await service.chat(brain.id, input, undefined, undefined, turnId)]) {
+      expect(result.generationEnd).toBe("no-reply");
+      expect(result.humanMessage).toMatchObject({ id: humanMessageId, content: input, generationEnd: "no-reply" });
+      expect(result.brainMessage).toMatchObject({ id: brainMessageId, content: "", generationEnd: "no-reply" });
+      expect(result.trace.generation).toEqual({ disposition: "no-reply", decoderStopReason: "eos",
+        noReplyReason: "no-decoded-text", generatedTokenCount: 1, printableTextCharacters: 0 });
+    }
+    const messages = (await repository.conversationPage(brain.id)).entries.flatMap((entry) => entry.message ? [entry.message] : []);
+    expect(messages.map((message) => message.content)).toEqual([input, ""]);
+    expect(messages.every((message) => message.generationEnd === "no-reply")).toBe(true);
+    expect((await repository.get(brain.id)).counters.inferenceCount).toBe(1);
+  });
+
+  it("recovers no-reply after a lost acknowledgement and stays visible across restart without a worker load", async () => {
+    const { repository, brain } = await fixture("No-reply acknowledgement recovery");
+    const turnId = "turn-no-reply-lost-ack";
+    const state = noReplyEngineState(brain.id, turnId);
+    const request = vi.fn(async (method: string) => {
+      if (method === "load") return {};
+      throw new Error(`No-reply reconciliation must not load or query a worker: ${method}`);
+    });
+    const service = new BrainService(repository, { request, requestStream: vi.fn(async () => {
+      await writeFile(join(repository.brainDirectory(brain.id), "engine", "brain.json"), JSON.stringify(state), "utf8");
+      throw new Error("simulated acknowledgement loss after atomic no-reply commit");
+    }) } as unknown as EngineSupervisor);
+    const recovered = await service.chat(brain.id, input, undefined, undefined, turnId);
+    expect(recovered).toMatchObject({ generationEnd: "no-reply", humanMessage: { content: input },
+      brainMessage: { content: "", generationEnd: "no-reply" } });
+    expect(recovered.trace.generation?.printableTextCharacters).toBe(0);
+    const restarted = new BrainService(repository, { request: vi.fn(async () => { throw new Error("unexpected worker"); }) } as unknown as EngineSupervisor);
+    await restarted.getReconciledBrain(brain.id);
+    const entries = (await repository.conversationPage(brain.id)).entries;
+    expect(entries.flatMap((entry) => entry.message ? [{ id: entry.message.id, content: entry.message.content,
+      generationEnd: entry.message.generationEnd }] : [])).toEqual([
+      { id: humanMessageId, content: input, generationEnd: "no-reply" },
+      { id: brainMessageId, content: "", generationEnd: "no-reply" }
+    ]);
+    expect((await repository.recentConversationEvidence(brain.id)).flatMap((entry) => entry.trace ? [entry.trace.id] : []))
+      .toEqual([traceId]);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(["load"]);
+  });
+
+  it("reconciles a no-reply split on open using its receipt without manufacturing a new response", async () => {
+    const { repository, brain } = await fixture("No-reply split on open");
+    await writeFile(join(repository.brainDirectory(brain.id), "engine", "brain.json"),
+      JSON.stringify(noReplyEngineState(brain.id, "turn-no-reply-on-open")), "utf8");
+    const service = new BrainService(repository, { request: vi.fn(async () => { throw new Error("unexpected worker"); }) } as unknown as EngineSupervisor);
+    const reopened = await service.getReconciledBrain(brain.id);
+    expect(reopened.counters.inferenceCount).toBe(1);
+    expect((await repository.conversationPage(brain.id)).entries.flatMap((entry) => entry.message ? [entry.message.content] : []))
+      .toEqual([input, ""]);
   });
 
   it("does not invent a turn when cancellation has no authoritative commit receipt", async () => {

@@ -146,26 +146,27 @@ class CommittedPagedCacheTests(unittest.TestCase):
             self.assertFalse(loaded.neurons.status()["dirtySinceCommit"])
             self.assertEqual(loaded.neurons.path, result.path)
 
-    def test_deferred_load_fails_closed_without_verified_forward_index(self):
+    def test_deferred_load_rebuilds_missing_derived_forward_index_from_checked_shards(self):
         metadata = json.loads((self.engine / "brain.json").read_text("utf-8"))["substrate"]
         forward = self.store / "forward-index" / "generations" / (
             self.pointer["activeGeneration"] + ".json"
         )
         self.assertTrue(forward.is_file())
         forward.unlink()
-        with self.assertRaisesRegex(ValueError, "requires a verified forward index"):
-            with prepare_committed_paged_cache(self.engine, self.caches) as prepared:
-                staged = prepared.staged_directory
-                loaded = NeuralSubstrate.load_sharded(
-                    self.store, metadata,
-                    paged_vectors=prepared.vectors,
-                    paged_neurons=prepared.neurons,
-                    defer_paged_assemblies=True,
-                    lazy_synapses=True,
-                )
-                finish_verified_index_from_loaded_vectors(prepared, loaded)
+        with prepare_committed_paged_cache(self.engine, self.caches) as prepared:
+            staged = prepared.staged_directory
+            loaded = NeuralSubstrate.load_sharded(
+                self.store, metadata,
+                paged_vectors=prepared.vectors,
+                paged_neurons=prepared.neurons,
+                defer_paged_assemblies=True,
+                lazy_synapses=True,
+            )
+            result = finish_verified_index_from_loaded_vectors(prepared, loaded)
+            self.assertTrue(forward.is_file())
+            self.assertEqual(len(loaded.synapses), result.synapses)
         self.assertFalse(staged.exists())
-        self.assertEqual(self.published_paths(), [])
+        self.assertEqual([path.resolve() for path in self.published_paths()], [result.path])
 
     def test_composable_failure_discards_only_private_staging(self):
         metadata = json.loads((self.engine / "brain.json").read_text("utf-8"))["substrate"]

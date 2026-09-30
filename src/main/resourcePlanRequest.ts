@@ -13,6 +13,7 @@ export function requireWorkingMemoryPlanRequest(
 ): WorkingMemoryPlanRequest {
   if (
     !isRecord(value) ||
+    (value.brainId !== undefined && (typeof value.brainId !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value.brainId))) ||
     !["auto", "extended", "manual"].includes(String(value.mode)) ||
     (value.hardwareTier !== undefined &&
       !["micro", "personal", "gpu", "workstation"].includes(
@@ -43,6 +44,7 @@ export function requireWorkingMemoryPlanRequest(
 
   return {
     mode: value.mode as WorkingMemoryPlanRequest["mode"],
+    ...(value.brainId !== undefined ? { brainId: value.brainId as string } : {}),
     hardwareTier:
       value.hardwareTier as WorkingMemoryPlanRequest["hardwareTier"],
     requestedItems: value.requestedItems as string | undefined,

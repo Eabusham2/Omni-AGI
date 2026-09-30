@@ -2,7 +2,9 @@
 
 import math
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
+
+from .native_architecture import validate_native_architecture
 
 
 # Stable v1 no longer exposes these beta builder controls. Removed fields are
@@ -73,9 +75,15 @@ class OmniConfig:
     hardware_tier: str = "personal"
     # Every OmniCortex starts from this process's seeded random initialization.
     origin_kind: str = "ground-up"
+    # Trusted main-selected Build descriptor. Legacy saved/research shapes
+    # omit it and retain their exact explicit tensor dimensions unchanged.
+    native_architecture: Optional[Dict[str, Any]] = None
     train_batch_size: int = 2
     gradient_accumulation: int = 2
     gradient_checkpointing: bool = False
+    # -1 preserves legacy all-expert softmax. Compatible expansion pins the
+    # old pool's normalization and adds independently gated zero residuals.
+    expert_routing_baseline_count: int = -1
     # Auto is RAM-first and continuously clamps the physical batch/window to
     # live RAM/accelerator headroom. Manual budgets are optional operational
     # ceilings; they never permit crossing the live safety watermark.
@@ -154,6 +162,8 @@ class OmniConfig:
     ram_reserve_bytes: int = 0
     disk_reserve_bytes: int = 0
     disk_state_offload: bool = True
+    storage_pool_bytes: int = 0
+    working_attention_scratch_budget_bytes: Optional[int] = None
 
     def validate(self) -> None:
         # Stable v1 treats prompt-free recurrence/Ponder as a permanent
@@ -217,6 +227,9 @@ class OmniConfig:
             raise ValueError("memory_offload_slowdown_percent must be in [0, 95]")
         if self.train_batch_size < 1 or self.gradient_accumulation < 1:
             raise ValueError("training batch size and accumulation must be positive")
+        if (type(self.expert_routing_baseline_count) is not int
+            or self.expert_routing_baseline_count < -1):
+            raise ValueError("expert routing baseline must be -1 or a nonnegative integer")
         if self.training_resource_mode not in {"auto", "manual"}:
             raise ValueError("training_resource_mode must be auto or manual")
         if self.system_ram_share_percent != 0.0 and not (
@@ -240,6 +253,28 @@ class OmniConfig:
             raise ValueError("slow_importance_decay must be in [0, 1)")
         if self.ram_reserve_bytes < 0 or self.disk_reserve_bytes < 0:
             raise ValueError("resource reserve bytes cannot be negative")
+        if isinstance(self.storage_pool_bytes, bool) or self.storage_pool_bytes < 0:
+            raise ValueError("storage pool bytes must be nonnegative")
+        if (self.working_attention_scratch_budget_bytes is not None
+            and (isinstance(self.working_attention_scratch_budget_bytes, bool)
+                 or self.working_attention_scratch_budget_bytes < 0)):
+            raise ValueError("working attention scratch bytes must be nonnegative")
+        if self.native_architecture is not None:
+            descriptor = validate_native_architecture(self.native_architecture)
+            from .architecture_migration import validate_compatible_architecture_lineage
+            validate_compatible_architecture_lineage(descriptor)
+            shape = descriptor["shape"]
+            declared = {
+                "dModel": self.d_model, "layers": self.n_layers, "feedForward": self.d_ff,
+                "nHeads": self.n_heads, "vsaDimensions": self.vsa_dim,
+                "routerNeurons": self.router_neurons, "modalityChannels": self.modality_channels,
+                "imageSize": self.image_size, "audioSamples": self.audio_samples,
+                "videoFrames": self.video_frames, "workingMemoryItems": self.working_memory_slots,
+                "workspaceLatents": max(8, self.working_memory_slots // 4),
+                "vocabSize": self.vocab_size, "liquidMode": self.liquid_mode,
+            }
+            if dict(shape) != declared or descriptor["hardwareTier"] != self.hardware_tier:
+                raise ValueError("saved native descriptor does not match explicit checkpoint dimensions")
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
@@ -247,6 +282,9 @@ class OmniConfig:
             for key, value in asdict(self).items()
             if key not in _DEPRECATED_BETA_CONTROL_FIELDS
             and key != "long_term_threshold"
+            and not (key == "native_architecture" and value is None)
+            and not (key == "storage_pool_bytes" and value == 0)
+            and not (key == "working_attention_scratch_budget_bytes" and value is None)
         }
         if payload.get("memory_recipe") in {"human", "human-consolidation"}:
             payload["memory_recipe"] = "adaptive-retention"
@@ -294,7 +332,9 @@ class OmniConfig:
         return config
 
     @classmethod
-    def from_external(cls, raw: Dict[str, Any]) -> "OmniConfig":
+    def from_external(
+        cls, raw: Dict[str, Any], *, native_architecture: Optional[Mapping[str, Any]] = None,
+    ) -> "OmniConfig":
         """Translate the desktop app's camelCase builder config.
 
         Stable v1 ignores beta personality sliders and cardinality ceilings.
@@ -308,6 +348,12 @@ class OmniConfig:
         switches parsers based on caller-controlled keys.
         """
         tier = str(raw.get("hardwareTier", "personal"))
+        if any(key in raw for key in ("nativeArchitecture", "native_architecture", "nativeArchitectureSha256")):
+            raise ValueError("native architecture must come from the trusted main command, not renderer config")
+        descriptor = (validate_native_architecture(native_architecture)
+                      if native_architecture is not None else None)
+        if descriptor is not None and descriptor["hardwareTier"] != tier:
+            raise ValueError("native descriptor and public hardware tier disagree")
         profiles = {
             "micro": {
                 "dimensions": 32,
@@ -409,6 +455,14 @@ class OmniConfig:
         # attention allocation.
         if "workingMemoryMode" in raw:
             workspace_slots = max(1, int(raw.get("workingMemorySlots", workspace_slots)))
+        if descriptor is not None:
+            resolved = descriptor["shape"]
+            if "workingMemorySlots" in raw and int(raw["workingMemorySlots"]) != resolved["workingMemoryItems"]:
+                raise ValueError("native descriptor and planned working-memory selection disagree")
+            dimensions = int(resolved["dModel"])
+            heads = int(resolved["nHeads"])
+            physical_neurons = int(resolved["routerNeurons"])
+            workspace_slots = int(resolved["workingMemoryItems"])
         values: Dict[str, Any] = {
             "name": str(raw.get("name", "New OmniCortex")),
             "d_model": dimensions,
@@ -498,9 +552,26 @@ class OmniConfig:
                 0, int(raw.get("diskReserveBytes", 0))
             ),
             "disk_state_offload": True,
+            "storage_pool_bytes": max(0, int(raw.get("storagePoolBytes", 0))),
+            "working_attention_scratch_budget_bytes": (
+                max(0, int(raw["contextOffloadBudgetBytes"]))
+                if "contextOffloadBudgetBytes" in raw else None
+            ),
         }
         if values["memory_recipe"] in {"human", "human-consolidation"}:
             values["memory_recipe"] = "adaptive-retention"
+        if descriptor is not None:
+            resolved = descriptor["shape"]
+            values.update({
+                "native_architecture": descriptor,
+                "n_layers": int(resolved["layers"]), "d_ff": int(resolved["feedForward"]),
+                "vsa_dim": int(resolved["vsaDimensions"]),
+                "image_size": int(resolved["imageSize"]), "audio_samples": int(resolved["audioSamples"]),
+                "video_frames": int(resolved["videoFrames"]), "modality_channels": int(resolved["modalityChannels"]),
+                "vocab_size": int(resolved["vocabSize"]), "liquid_mode": str(resolved["liquidMode"]),
+            })
+            if not values["storage_pool_bytes"]:
+                values["storage_pool_bytes"] = max(0, int(descriptor["sizing"].get("selectedStoragePoolBytes", 0)))
         config = cls(**values)
         config.validate()
         return config

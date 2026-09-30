@@ -29,6 +29,7 @@ import platform
 import shutil
 import socket
 import sqlite3
+import stat
 import tempfile
 import time
 import uuid
@@ -42,6 +43,9 @@ import torch.distributed as dist
 
 from .datasets import DatasetCoverage, DatasetRecord, iter_dataset_records
 from .persistence import atomic_write_bytes, atomic_write_json, read_json
+from .record_window_wave import validate_record_window_cursor
+from .text_spool import bounded_json_sha256
+from .distributed_seal import validate_distributed_training_seal
 
 try:  # ``resource`` is POSIX-only; importing this module must work on Windows.
     import resource as _resource
@@ -52,9 +56,44 @@ except ImportError:  # pragma: no cover - exercised by the Windows CI runner.
 DATASET_MANIFEST_FORMAT = "omni-distributed-dataset-manifest"
 DATASET_MANIFEST_VERSION = 2
 CHECKPOINT_FORMAT = "omni-distributed-training-checkpoint"
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 STATUS_FORMAT = "omni-distributed-training-status"
 STATUS_VERSION = 1
+
+
+class DistributedRunLease:
+    """One rank-zero writer owns an external run folder until it is quiescent."""
+
+    def __init__(self, path):
+        path = Path(path)
+        if path.is_symlink():
+            raise ValueError("distributed run lease cannot follow a symbolic link")
+        self.descriptor = os.open(str(path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            identity = os.fstat(self.descriptor)
+            if not stat.S_ISREG(identity.st_mode) or identity.st_nlink != 1:
+                raise ValueError("distributed run lease must have one regular-file owner")
+            if os.name == "nt":
+                import msvcrt
+                if identity.st_size == 0:
+                    os.write(self.descriptor, b"0")
+                os.lseek(self.descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(self.descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(self.descriptor)
+            self.descriptor = None
+            raise
+
+    def close(self):
+        if self.descriptor is None:
+            return
+        # Closing releases the OS lock. Never unlink a lock inode while a
+        # concurrent opener could still hold it and create a second owner.
+        os.close(self.descriptor)
+        self.descriptor = None
 
 
 def _utc_now() -> str:
@@ -306,8 +345,9 @@ class DatasetManifestEntry:
     def from_record(ordinal: int, record: DatasetRecord) -> "DatasetManifestEntry":
         content_hash = str(record.content_sha256 or "").strip().lower()
         if not content_hash:
-            content_hash = hashlib.sha256(record.text.encode("utf-8")).hexdigest()
-        provenance_hash = _canonical_sha256(record.provenance)
+            payload = getattr(record, "text_payload", None)
+            content_hash = payload.sha256 if payload is not None else hashlib.sha256(record.text.encode("utf-8")).hexdigest()
+        provenance_hash = bounded_json_sha256(record.provenance)
         identity = _canonical_sha256(
             {
                 "ordinal": int(ordinal),
@@ -489,6 +529,7 @@ class DatasetManifest:
         requested_kind: str = "",
         *,
         database_path: Optional[Path] = None,
+        resource_admission=None,
     ) -> "DatasetManifest":
         source = str(Path(path).resolve())
         if database_path is None:
@@ -526,6 +567,7 @@ class DatasetManifest:
                         Path(source),
                         requested_kind=requested_kind,
                         coverage=coverage,
+                        _resource_admission=resource_admission,
                     )
                 ):
                     entry = DatasetManifestEntry.from_record(ordinal, record)
@@ -544,12 +586,16 @@ class DatasetManifest:
                     )
                     count += 1
                     if len(batch) >= 1024:
+                        if resource_admission is not None:
+                            resource_admission("distributed manifest ordinal index", 0, 4096 * len(batch))
                         connection.executemany(
                             "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)", batch
                         )
                         connection.commit()
                         batch.clear()
                 if batch:
+                    if resource_admission is not None:
+                        resource_admission("distributed manifest ordinal index", 0, 4096 * len(batch))
                     connection.executemany(
                         "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?)", batch
                     )
@@ -706,8 +752,8 @@ class DatasetManifest:
             temporary_index=False,
         )
 
-    def verify_current_source(self) -> None:
-        current = DatasetManifest.build(Path(self.source), self.requested_kind)
+    def verify_current_source(self, resource_admission=None) -> None:
+        current = DatasetManifest.build(Path(self.source), self.requested_kind, resource_admission=resource_admission)
         try:
             if current.content_sha256 != self.content_sha256:
                 raise ValueError(
@@ -730,6 +776,7 @@ class DatasetManifest:
         world_size: int,
         start_ordinal: int = 0,
         stop_ordinal: Optional[int] = None,
+        resource_admission=None,
     ) -> Iterator[tuple[DatasetManifestEntry, DatasetRecord]]:
         """Stream and verify this rank's exact global-ordinal shard."""
 
@@ -747,6 +794,7 @@ class DatasetManifest:
                 Path(self.source),
                 requested_kind=self.requested_kind,
                 coverage=coverage,
+                _resource_admission=resource_admission,
             )
         ):
             try:
@@ -787,9 +835,10 @@ class RankCursor:
     owned_records_completed: int
     optimizer_steps_completed: int
     manifest_sha256: str
+    record_window: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        value = {
             "rank": self.rank,
             "worldSize": self.world_size,
             "epoch": self.epoch,
@@ -798,6 +847,9 @@ class RankCursor:
             "optimizerStepsCompleted": self.optimizer_steps_completed,
             "manifestSha256": self.manifest_sha256,
         }
+        if self.record_window is not None:
+            value["recordWindow"] = validate_record_window_cursor(self.record_window)
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RankCursor":
@@ -809,6 +861,7 @@ class RankCursor:
             owned_records_completed=int(value["ownedRecordsCompleted"]),
             optimizer_steps_completed=int(value["optimizerStepsCompleted"]),
             manifest_sha256=str(value["manifestSha256"]),
+            record_window=validate_record_window_cursor(value["recordWindow"]) if "recordWindow" in value else None,
         )
         if (
             cursor.rank < 0
@@ -820,6 +873,12 @@ class RankCursor:
             or cursor.optimizer_steps_completed < 0
         ):
             raise ValueError("distributed rank cursor is invalid")
+        if cursor.record_window is not None and (
+            cursor.record_window["ordinal"] % cursor.world_size != cursor.rank
+            or cursor.record_window["phase"] == "complete"
+            or not cursor.next_global_ordinal <= cursor.record_window["ordinal"] < cursor.next_global_ordinal + cursor.world_size
+        ):
+            raise ValueError("distributed active record does not belong to its exact rank group")
         return cursor
 
 
@@ -964,6 +1023,10 @@ class DistributedRunStore:
         self.failures_path.mkdir(parents=True, exist_ok=True)
         self.ranks_path.mkdir(parents=True, exist_ok=True)
 
+    def acquire_run_lease(self):
+        self.path.mkdir(parents=True, exist_ok=True)
+        return DistributedRunLease(self.path / ".run-owner.lock")
+
     def write_status(self, **fields: Any) -> Dict[str, Any]:
         prior: Dict[str, Any] = {}
         if self.status_path.is_file():
@@ -1047,6 +1110,7 @@ class DistributedRunStore:
         telemetry: Mapping[str, Any],
         capability_rehearsal: Optional[Mapping[str, Any]] = None,
         media_training: Optional[Mapping[str, Any]] = None,
+        native_brain_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """Publish the cursor only after the matching brain save exists."""
 
@@ -1098,12 +1162,32 @@ class DistributedRunStore:
             "rawTokenIdsStored": False,
             "transactional": True,
         }
+        if native_brain_path is not None:
+            native_source = Path(native_brain_path).resolve()
+            if (native_source / "engine" / "brain.json").resolve() != Path(brain_json_path).resolve():
+                raise ValueError("native distributed snapshot is not the cursor's exact neural save")
+            body["nativeBrainDirectory"] = "native"
+            seal = validate_distributed_training_seal(brain_value.get("distributed_training_seal"))
+            if seal is None or seal["manifestSha256"] != manifest.content_sha256 or seal["rankCursors"] != body["rankCursors"] or seal["recordsPerEpoch"] != len(manifest.entries) or seal["epochsRequested"] != epochs_requested or seal["committedRecordStop"] != dynamic_value or seal["globalOptimizerSteps"] != global_optimizer_steps:
+                raise ValueError("distributed native save is not independently sealed to these exact cursors")
+            for cursor in ordered:
+                if cursor.record_window is not None:
+                    window = cursor.record_window
+                    expected = manifest.entries[window["ordinal"]]
+                    if expected.record_id != window["recordId"] or expected.content_sha256 != window["contentSha256"]:
+                        raise ValueError("distributed native cursor does not bind its exact manifest record")
+            body["distributedSealSha256"] = seal["contentSha256"]
         content_sha = _canonical_sha256(body)
         checkpoint = {**body, "contentSha256": content_sha}
         temporary = self.checkpoints_path / (".%s.next" % uuid.uuid4().hex)
         destination = self.checkpoints_path / content_sha
         temporary.mkdir(parents=True, exist_ok=False)
         try:
+            if native_brain_path is not None:
+                # Copy all referenced immutable generations before the only
+                # publication pointer moves. An old pointer never depends on
+                # mutable checkpoint-brain contents or a just-pruned suffix.
+                shutil.copytree(native_source, temporary / "native")
             atomic_write_bytes(temporary / "brain.json", brain_bytes)
             ranks_dir = temporary / "ranks"
             ranks_dir.mkdir()
@@ -1150,6 +1234,13 @@ class DistributedRunStore:
         brain_path = Path(path) / "brain.json"
         if _file_sha256(brain_path) != str(value.get("brainJsonSha256", "")):
             raise ValueError("distributed checkpoint brain metadata checksum mismatch")
+        if "nativeBrainDirectory" in value:
+            if value["nativeBrainDirectory"] != "native" or _file_sha256(Path(path) / "native" / "engine" / "brain.json") != str(value["brainJsonSha256"]):
+                raise ValueError("distributed immutable native snapshot identity is invalid")
+            native_metadata = read_json(Path(path) / "native" / "engine" / "brain.json")
+            seal = validate_distributed_training_seal(native_metadata.get("distributed_training_seal"))
+            if seal is None or seal["contentSha256"] != value.get("distributedSealSha256") or seal["manifestSha256"] != value["manifestSha256"] or seal["rankCursors"] != value["rankCursors"] or seal["worldSize"] != value["worldSize"] or seal["epochsRequested"] != value["epochsRequested"] or seal["committedRecordStop"] != value["dynamicHighWater"] or seal["globalOptimizerSteps"] != value["globalOptimizerSteps"]:
+                raise ValueError("external distributed cursor differs from the committed native seal")
         raw_cursors = value.get("rankCursors")
         if not isinstance(raw_cursors, list):
             raise ValueError("distributed checkpoint cursors are invalid")
@@ -1191,6 +1282,17 @@ class DistributedRunStore:
                 "distributed checkpoint WORLD_SIZE changed; resume with the original rank count"
             )
         return checkpoint
+
+    def published_native_path(self, checkpoint: Mapping[str, Any]) -> Path:
+        if checkpoint.get("nativeBrainDirectory") != "native":
+            raise ValueError("distributed cursor is not bound to a complete immutable native snapshot")
+        generation = str(checkpoint.get("contentSha256", ""))
+        if len(generation) != 64 or any(value not in "0123456789abcdef" for value in generation):
+            raise ValueError("distributed native generation identity is invalid")
+        path = self.checkpoints_path / generation / "native"
+        if _file_sha256(path / "engine" / "brain.json") != checkpoint.get("brainJsonSha256"):
+            raise ValueError("distributed native publication metadata changed")
+        return path
 
     def restore_published_brain_json(
         self, checkpoint: Mapping[str, Any], destination: Path

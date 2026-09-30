@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, createReadStream } from "node:fs";
+import { savedConceptIdViewFiles, validateConceptIdViewFile } from "./conceptIdViewFiles";
 import {
   access,
   cp,
@@ -20,6 +21,8 @@ import {
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { basename, dirname, join, resolve } from "node:path";
+import { validateNativeArchitectureDescriptor } from "./nativeCoreInventory";
+import { savedToolIntentFiles, validateSavedToolIntent } from "./savedToolIntents";
 import { strToU8 } from "fflate";
 import {
   BRAIN_SCHEMA_VERSION,
@@ -114,7 +117,7 @@ interface OmniManifest {
   rawEpisodesPresent: boolean;
   quantization: "ternary-effective";
   conversationProjection: {
-    historyIncluded: false;
+    historyIncluded: boolean;
     omittedLedgerRows: number;
     omittedPendingReplayJobs: number;
   };
@@ -134,6 +137,9 @@ interface OmniManifest {
     version: 1;
     replacements: number;
   };
+  /** v1: saved content is preserved, not a sanitized sharing projection. */
+  savedInstance?: { version: 1; content: "unsanitized" };
+  recoveryPoints?: Array<{ id: string; brainId: string; missingPayloads: string[] }>;
   licenseLedger: {
     application: "PolyForm-Noncommercial-1.0.0-or-commercial-license";
     sourceCount?: number;
@@ -152,6 +158,232 @@ interface OmniManifest {
     originPlasticity: string;
   };
   files: Record<string, { sha256: string; bytes: number }>;
+}
+
+interface SavedSnapshotSummary extends BrainSnapshotSummary {
+  savedContinuation?: { version: 1; componentPaths: string[] };
+  exportMissingPayloads?: string[];
+}
+
+function safeSnapshotContinuationPath(path: string): string {
+  if (path !== "engine/state/working-memory.sqlite3" &&
+    !/^engine\/state\/concept-id-views\/[a-f0-9]{64}\.jsonl$/.test(path) &&
+    !/^engine\/operational-tool-intents\/[a-f0-9-]{36}\.json$/i.test(path) &&
+    !/^engine\/state\/ingestion-joint\/generations\/[a-f0-9]{32}\/(?:manifest\.json|packed-vector-index\.sqlite3)$/.test(path)) {
+    throw new Error("Recovery point has an unsupported continuation path.");
+  }
+  return path;
+}
+
+async function savedTreeFiles(directory: string): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  async function visit(path: string, prefix: string): Promise<void> {
+    const info = await lstat(path);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Recovery-point directory is unsafe.");
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      assertAllowedBundlePath(relative);
+      const source = join(path, entry.name);
+      if (entry.isSymbolicLink()) throw new Error("Recovery-point payload is a filesystem link.");
+      if (entry.isDirectory()) await visit(source, relative);
+      else if (entry.isFile()) {
+        if (/(?:-wal|-shm|-journal)$/.test(entry.name)) {
+          if ((await lstat(source)).size > 0) throw new Error("Immutable recovery-point payload has a live SQLite sidecar.");
+          continue;
+        }
+        files.set(relative, source);
+      } else throw new Error("Recovery-point payload is not a regular file.");
+    }
+  }
+  await visit(directory, "");
+  return files;
+}
+
+async function snapshotComponentHashes(base: string, summary: SavedSnapshotSummary): Promise<string[]> {
+  const engine = join(base, "engine");
+  const hashes: string[] = [];
+  const metadataPath = join(engine, "brain.json");
+  if (await pathExists(metadataPath)) {
+    const metadata = await readFile(metadataPath);
+    savedEngineState(metadata);
+    const state = JSON.parse(metadata.toString("utf8")) as Record<string, unknown>;
+    if (state.brain_id !== summary.brainId) throw new Error("Recovery-point neural identity does not match its owner.");
+    hashes.push(sha256(metadata));
+    for (const name of ["core.safetensors", "plasticity.safetensors"]) {
+      const path = join(engine, name);
+      if (await pathExists(path)) {
+        await assertSafeTensorsFile(path, `Recovery point ${name}`);
+        hashes.push(await fileSha256(path));
+      }
+    }
+    if (await pathExists(join(engine, "packed-ternary", "manifest.json"))) {
+      hashes.push((await inspectPackedTernaryDirectory(join(engine, "packed-ternary"), "Recovery point")).manifestSha256);
+    }
+    const substrate = await collectSubstrateSnapshot(engine, "substrate/snapshot", state);
+    if (substrate) hashes.push(sha256(canonicalJson(substrate.pointer)));
+    const mutable = await collectMutableStateSnapshot(engine, "mutable/snapshot", state);
+    if (mutable) hashes.push(sha256(canonicalJson(mutable.pointer)));
+    if (summary.durableState) {
+      const artifactDirectory = join(engine, "artifacts");
+      let artifacts: PersistedArtifactIndex["artifacts"] | undefined;
+      const ledgerPath = ArtifactIndexStore.databasePath(artifactDirectory);
+      if (await pathExists(ledgerPath)) {
+        const database = new DatabaseSync(ledgerPath, { readOnly: true });
+        try {
+          if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||
+            database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== summary.brainId) {
+            throw new Error("Recovery-point artifact ledger integrity failed.");
+          }
+          artifacts = parseArtifactIndex(JSON.parse(serializeArtifactIndex(summary.brainId,
+            [...database.prepare("SELECT payload_json FROM artifacts ORDER BY sequence").iterate()]
+              .map((row) => JSON.parse(String(row.payload_json)))
+          )), summary.brainId).artifacts;
+        } finally { database.close(); }
+      } else if (await pathExists(join(artifactDirectory, "index.json"))) {
+        artifacts = parseArtifactIndex(JSON.parse(await readFile(join(artifactDirectory, "index.json"), "utf8")), summary.brainId).artifacts;
+      }
+      if (summary.durableState.artifactIndex && artifacts === undefined) throw new Error("Recovery-point artifact index is missing.");
+      if (artifacts !== undefined) {
+        for (const artifact of artifacts) {
+          const path = join(artifactDirectory, basename(artifact.relativePath));
+          if ((await lstat(path)).size !== artifact.bytes || await fileSha256(path) !== artifact.sha256) {
+            throw new Error("Recovery-point generated artifact checksum failed.");
+          }
+        }
+        hashes.push(sha256(serializeArtifactIndex(summary.brainId, artifacts)));
+      }
+      const neural = join(engine, "conversation.sqlite3");
+      if (await pathExists(neural)) {
+        validateNeuralConversationLedger(neural, summary.brainId, state);
+        hashes.push(await fileSha256(neural));
+      } else if (summary.durableState.neuralConversationLedger) {
+        throw new Error("Recovery-point neural conversation ledger is missing.");
+      }
+    }
+    if (summary.savedContinuation) {
+      if (summary.savedContinuation.version !== 1 || !Array.isArray(summary.savedContinuation.componentPaths)) {
+        throw new Error("Recovery-point continuation declaration is invalid.");
+      }
+      for (const relative of summary.savedContinuation.componentPaths) {
+        if (relative.startsWith("engine/state/concept-id-views/")) {
+          await validateConceptIdViewFile(join(base, ...relative.split("/")), basename(relative));
+        }
+        if (relative.startsWith("engine/operational-tool-intents/")) {
+          await validateSavedToolIntent(join(base, ...relative.split("/")));
+        }
+        hashes.push(await fileSha256(join(base, ...safeSnapshotContinuationPath(relative).split("/"))));
+      }
+      const declaredIntents = new Set(summary.savedContinuation.componentPaths
+        .filter(path => path.startsWith("engine/operational-tool-intents/"))
+        .map(path => basename(path)));
+      const observedIntents = await savedToolIntentFiles(engine);
+      if (observedIntents.size !== declaredIntents.size ||
+        [...observedIntents.keys()].some(name => !declaredIntents.has(name))) {
+        throw new Error("Recovery-point operational journal differs from its committed declaration.");
+      }
+      validateSavedWorkingPages(await pathExists(join(engine, "state", "working-memory.sqlite3"))
+        ? join(engine, "state", "working-memory.sqlite3") : undefined, state);
+      await savedJointGenerationFiles(state, (kind, relative) =>
+        join(engine, "state", ...(kind === "joint" ? ["ingestion-joint"] : []), ...relative.split("/"))
+      );
+    }
+  }
+  if (summary.durableState) {
+    for (const path of [join(base, "conversation", "ledger.sqlite3"), BrainActivityLedger.databasePath(base)]) {
+      const database = new DatabaseSync(path, { readOnly: true });
+      try {
+        if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||
+          database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== summary.brainId) {
+          throw new Error("Recovery-point host ledger integrity failed.");
+        }
+      } finally { database.close(); }
+      hashes.push(await fileSha256(path));
+    }
+  }
+  return hashes;
+}
+
+async function validateSavedSnapshot(base: string, id: string, brainId: string): Promise<{ summary: SavedSnapshotSummary; missingPayloads: string[] }> {
+  const [document, summaryText] = await Promise.all([readFile(`${base}.json`), readFile(`${base}.meta.json`, "utf8")]);
+  const summary = JSON.parse(summaryText) as SavedSnapshotSummary;
+  const brain = normalizeBrain(JSON.parse(document.toString("utf8")));
+  if (summary.id !== id || summary.brainId !== brainId || brain.id !== brainId ||
+    summary.checksum !== sha256(document)) throw new Error("Recovery-point document checksum or identity failed.");
+  const hashes = await snapshotComponentHashes(base, summary);
+  if (summary.engineChecksum && summary.engineChecksum !== sha256(hashes.join(":"))) {
+    throw new Error("Recovery-point neural and ledger checksum failed.");
+  }
+  const missingPayloads: string[] = [];
+  const metadataPath = join(base, "engine", "brain.json");
+  if (await pathExists(metadataPath)) {
+    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>;
+    if (isRecord(metadata.paged_working_memory) && Number(metadata.paged_working_memory.count) > 0 &&
+      !await pathExists(join(base, "engine", "state", "working-memory.sqlite3"))) {
+      missingPayloads.push("engine/state/working-memory.sqlite3");
+    }
+    if (isRecord(metadata.ingestion_joint_generation) && typeof metadata.ingestion_joint_generation.relativeManifest === "string") {
+      const reference = metadata.ingestion_joint_generation.relativeManifest;
+      if (!/^generations\/[a-f0-9]{32}\/manifest\.json$/.test(reference)) {
+        throw new Error("Recovery-point joint reference is unsafe.");
+      }
+      const relative = `engine/state/ingestion-joint/${reference}`;
+      const manifestPath = join(base, ...relative.split("/"));
+      if (!await pathExists(manifestPath)) missingPayloads.push(relative);
+      else {
+        const joint = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+        if (isRecord(joint.sqliteSnapshot)) {
+          if (joint.sqliteSnapshot.file !== "packed-vector-index.sqlite3") throw new Error("Recovery-point joint SQLite path is unsafe.");
+          const sqliteRelative = relative.replace(/manifest\.json$/, "packed-vector-index.sqlite3");
+          if (!await pathExists(join(base, ...sqliteRelative.split("/")))) missingPayloads.push(sqliteRelative);
+        }
+        if (!missingPayloads.length) await savedJointGenerationFiles(metadata, (kind, path) =>
+          join(base, "engine", "state", ...(kind === "joint" ? ["ingestion-joint"] : []), ...path.split("/"))
+        );
+      }
+    }
+  }
+  return { summary, missingPayloads };
+}
+
+async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads: string[]): Promise<void> {
+  const summary = JSON.parse(await readFile(`${base}.meta.json`, "utf8")) as SavedSnapshotSummary;
+  const document = JSON.parse(await readFile(`${base}.json`, "utf8")) as BrainDocument;
+  const priorId = summary.brainId;
+  document.id = brainId;
+  const documentBytes = JSON.stringify(document, null, 2);
+  await atomicWrite(`${base}.json`, documentBytes);
+  const enginePath = join(base, "engine", "brain.json");
+  if (await pathExists(enginePath)) {
+    const state = JSON.parse(await readFile(enginePath, "utf8")) as Record<string, unknown>;
+    state.brain_id = brainId;
+    await atomicWrite(enginePath, JSON.stringify(state, null, 2));
+  }
+  for (const [relative, key] of [
+    ["conversation/ledger.sqlite3", "brainId"], ["activity/ledger.sqlite3", "brainId"],
+    ["engine/conversation.sqlite3", "brain_id"], ["engine/artifacts/index.sqlite3", "brainId"]
+  ] as const) {
+    const path = join(base, ...relative.split("/"));
+    if (!await pathExists(path)) continue;
+    const database = new DatabaseSync(path);
+    try {
+      if (database.prepare("SELECT value FROM meta WHERE key=?").get(key)?.value !== priorId) {
+        throw new Error("Imported recovery-point ledger identity failed.");
+      }
+      database.prepare("UPDATE meta SET value=? WHERE key=?").run(brainId, key);
+    } finally { database.close(); }
+  }
+  const legacyArtifacts = join(base, "engine", "artifacts", "index.json");
+  if (await pathExists(legacyArtifacts)) {
+    const index = parseArtifactIndex(JSON.parse(await readFile(legacyArtifacts, "utf8")), priorId, brainId);
+    await atomicWrite(legacyArtifacts, serializeArtifactIndex(brainId, index.artifacts));
+  }
+  summary.brainId = brainId;
+  summary.checksum = sha256(documentBytes);
+  if (missingPayloads.length) summary.exportMissingPayloads = missingPayloads;
+  const hashes = await snapshotComponentHashes(base, summary);
+  if (summary.engineChecksum) summary.engineChecksum = sha256(hashes.join(":"));
+  if (summary.checkpointComponentSha256) summary.checkpointComponentSha256 = hashes;
+  await atomicWrite(`${base}.meta.json`, JSON.stringify(summary, null, 2));
 }
 
 interface StreamingPackedTernaryDirectory {
@@ -214,72 +446,8 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-interface RedactionCounter {
-  replacements: number;
-}
-
-const SECRET_FIELD =
-  /^(?:password|passwd|passphrase|secret|client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|credential|cookie|session[_-]?cookie|private[_-]?key)$/i;
-
-function redactSecretText(value: string, counter: RedactionCounter): string {
-  let redacted = value;
-  const patterns = [
-    /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
-    // The header alone must trip a streamed shard scan even when a PEM body
-    // spans more than one chunk and exceeds the overlap window.
-    /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
-    /\bAKIA[0-9A-Z]{16}\b/g,
-    /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
-    /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-    /\bAIza[0-9A-Za-z_-]{30,}\b/g,
-    /\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*\b/gi,
-    /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret)\s*[:=]\s*["']?[^\s"',;]{8,}["']?/gi,
-    /\b[A-Z][A-Z0-9_]*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET|PASSWORD)\s*=\s*[^\s"',;]{8,}/g,
-    /(?:^|[\s"'(=:])\/(?:Users|home|private|tmp|var|opt|etc)(?:\/[^\s"',;)}\]]+)+/gm,
-    /\b[A-Za-z]:\\(?:[^\\\r\n]+\\)*[^\\\r\n\s"',;)}\]]+/g,
-    /https?:\/\/[^:\s/@]{1,256}:[^@\s/]{1,256}@/gi
-  ];
-  for (const pattern of patterns) {
-    redacted = redacted.replace(pattern, () => {
-      counter.replacements += 1;
-      return "[REDACTED_SECRET]";
-    });
-  }
-  return redacted;
-}
-
-function containsPortableSecretText(value: string): boolean {
-  const counter: RedactionCounter = { replacements: 0 };
-  redactSecretText(value, counter);
-  if (counter.replacements > 0) return true;
-  // JSON escapes backslashes in Windows paths. Normalize only the scan copy;
-  // the content-addressed shard itself and its manifest hashes stay unchanged.
-  redactSecretText(value.replace(/\\\\/g, "\\").replace(/\\\//g, "/"), counter);
-  return counter.replacements > 0;
-}
-
-async function assertFileContainsNoPortableSecrets(
-  path: string,
-  label: string,
-  requireUtf8Text = false
-): Promise<void> {
-  if (!requireUtf8Text) {
-    const probe = await open(path, "r");
-    try {
-      const sample = Buffer.alloc(256 * 1024);
-      const { bytesRead } = await probe.read(sample, 0, sample.byteLength, 0);
-      const text = sample.subarray(0, bytesRead).toString("utf8");
-      const binaryRatio =
-        text.length === 0
-          ? 0
-          : ((text.match(/\uFFFD/g)?.length ?? 0) + (text.match(/\0/g)?.length ?? 0)) / text.length;
-      if (binaryRatio >= 0.01) return;
-    } finally {
-      await probe.close();
-    }
-  }
-  const decoder = new TextDecoder("utf-8", { fatal: requireUtf8Text });
-  let overlap = "";
+async function assertFileContainsValidJsonText(path: string, label: string): Promise<void> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   for await (const chunk of createReadStream(path)) {
     let text: string;
     try {
@@ -287,42 +455,15 @@ async function assertFileContainsNoPortableSecrets(
     } catch {
       throw new Error(`${label} is not valid UTF-8 text and cannot be safely exported.`);
     }
-    if (requireUtf8Text && text.includes("\0")) {
+    if (text.includes("\0")) {
       throw new Error(`${label} is not valid JSON text and cannot be safely exported.`);
     }
-    const combined = overlap + text;
-    if (containsPortableSecretText(combined)) {
-      throw new Error(
-        `${label} appears to contain credentials or a private path. Remove or sanitize it before export.`
-      );
-    }
-    overlap = combined.slice(-4096);
   }
   try {
     decoder.decode();
   } catch {
     throw new Error(`${label} is not valid UTF-8 text and cannot be safely exported.`);
   }
-}
-
-function redactPortableValue(value: unknown, counter: RedactionCounter, key = ""): unknown {
-  if (SECRET_FIELD.test(key) && value !== undefined && value !== null) {
-    counter.replacements += 1;
-    return "[REDACTED_SECRET]";
-  }
-  if (typeof value === "string") return redactSecretText(value, counter);
-  if (Array.isArray(value)) {
-    return value.map((entry) => redactPortableValue(entry, counter));
-  }
-  if (isRecord(value)) {
-    return Object.fromEntries(
-      Object.entries(value).map(([entryKey, entryValue]) => [
-        entryKey,
-        redactPortableValue(entryValue, counter, entryKey)
-      ])
-    );
-  }
-  return value;
 }
 
 function sha256(value: string | Buffer): string {
@@ -401,7 +542,16 @@ function parseChecksumFile(value: string): Map<string, string> {
   return checksums;
 }
 
-function validateNeuralConversationLedger(path: string, expectedBrainId: string): void {
+function validateNeuralConversationLedger(
+  path: string,
+  expectedBrainId: string,
+  expectedState?: unknown
+): void {
+  const summary = isRecord(expectedState) ? expectedState.conversation : undefined;
+  const committedSequence = isRecord(summary) ? Number(summary.headSequence) : undefined;
+  if (committedSequence !== undefined && (!Number.isSafeInteger(committedSequence) || committedSequence < 0)) {
+    throw new Error("Neural conversation committed head is invalid.");
+  }
   const database = new DatabaseSync(path, { readOnly: true });
   try {
     const quick = database.prepare("PRAGMA quick_check").get() as
@@ -416,10 +566,14 @@ function validateNeuralConversationLedger(path: string, expectedBrainId: string)
       SELECT sequence,entry_key,kind,created_at,attention_epoch,payload_json,
         payload_sha256,previous_sha256,row_sha256
       FROM entries ORDER BY sequence
-    `).all() as unknown as Array<Record<string, unknown>>;
+    `).iterate();
     let previous = "0".repeat(64);
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index]!;
+    let count = 0;
+    let committedEntries = 0;
+    let committedSha256 = previous;
+    let epoch = 0;
+    const counts = { messageCount: 0, actionCount: 0, traceCount: 0 };
+    for (const row of rows) {
       const payloadJson = String(row.payload_json ?? "");
       const payloadSha256 = sha256(payloadJson);
       const body = {
@@ -432,7 +586,9 @@ function validateNeuralConversationLedger(path: string, expectedBrainId: string)
         previousSha256: String(row.previous_sha256)
       };
       if (
-        body.sequence !== index + 1 ||
+        body.sequence !== count + 1 ||
+        !["message", "action", "trace"].includes(body.kind) ||
+        !Number.isSafeInteger(body.attentionEpoch) || body.attentionEpoch < 0 ||
         body.previousSha256 !== previous ||
         row.payload_sha256 !== payloadSha256 ||
         row.row_sha256 !== sha256(canonicalJson(body))
@@ -440,6 +596,133 @@ function validateNeuralConversationLedger(path: string, expectedBrainId: string)
         throw new Error("Neural conversation ledger hash chain failed.");
       }
       previous = String(row.row_sha256);
+      count += 1;
+      // The worker can have durable ledger rows ahead of brain.json and
+      // truncates that suffix during crash recovery. Retain and validate all
+      // rows in the archive; bind pending jobs only to the committed prefix.
+      if (committedSequence === undefined || body.sequence <= committedSequence) {
+        committedEntries += 1;
+        committedSha256 = previous;
+        epoch = Math.max(epoch, body.attentionEpoch);
+        counts[`${body.kind}Count` as keyof typeof counts] += 1;
+      }
+    }
+    if (summary !== undefined && canonicalJson(summary) !== canonicalJson({
+      format: "omni-neural-conversation-ledger", formatVersion: 1,
+      totalEntries: committedEntries, ...counts, attentionEpoch: epoch,
+      headSequence: committedEntries, headSha256: committedSha256
+    })) {
+      throw new Error("Neural conversation head does not match its saved ledger.");
+    }
+    if (isRecord(expectedState) && Array.isArray(expectedState.pending_chat_slow_learning)) {
+      const messages = database.prepare(
+        "SELECT 1 FROM entries WHERE kind='message' AND json_extract(payload_json,'$.id')=? AND sequence<=?"
+      );
+      for (const pending of expectedState.pending_chat_slow_learning) {
+        if (!isRecord(pending) || typeof pending.humanMessageId !== "string" ||
+          !messages.get(pending.humanMessageId, committedSequence ?? count)) {
+          throw new Error("Pending chat replay has no saved human message in its neural ledger.");
+        }
+      }
+    }
+  } finally {
+    database.close();
+  }
+}
+
+/** A consistent private snapshot includes committed WAL rows, never sidecars. */
+async function snapshotSavedSqlite(
+  source: string,
+  destination: string,
+  operation?: BrainStorageOperationHooks
+): Promise<void> {
+  const info = await lstat(source);
+  const wal = await lstat(`${source}-wal`).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (!info.isFile() || info.isSymbolicLink() ||
+    (wal && (!wal.isFile() || wal.isSymbolicLink()))) {
+    throw new Error("Saved SQLite state is not a safe regular file.");
+  }
+  const bytes = info.size + (wal?.size ?? 0);
+  if (!Number.isSafeInteger(bytes)) throw new Error("Saved SQLite state is too large.");
+  operation?.signal.throwIfAborted();
+  await operation?.checkDisk(dirname(destination), bytes);
+  await ensureDiskReserve(dirname(destination), bytes);
+  await snapshotMutableSqliteIsolated(source, destination);
+  operation?.signal.throwIfAborted();
+}
+
+function validateSavedWorkingPages(path: string | undefined, state: unknown): void {
+  if (!isRecord(state)) throw new Error("Saved working-memory state is invalid.");
+  const checkpoint = state.paged_working_memory;
+  const expected = checkpoint === undefined ? undefined : checkpoint;
+  const shape = emptyPortableWorkingMemoryCheckpoint();
+  if (expected !== undefined && (!isRecord(expected) ||
+    Object.keys(expected).length !== Object.keys(shape).length ||
+    expected.format !== shape.format || expected.formatVersion !== 1 ||
+    !Number.isSafeInteger(expected.count) || Number(expected.count) < 0 ||
+    !Number.isSafeInteger(expected.highWaterId) || Number(expected.highWaterId) < 0 ||
+    typeof expected.contentSha256 !== "string" || !/^[a-f0-9]{64}$/.test(expected.contentSha256) ||
+    ["temporary", "runtimeReadable", "learningReadable", "pageInSupported"].some(
+      (key) => expected[key] !== true
+    ))) throw new Error("Saved working-memory checkpoint is invalid.");
+  if (!path) {
+    if (expected !== undefined && canonicalJson(expected) !== canonicalJson(shape)) {
+      throw new Error("Saved working-memory pages are missing from the bundle.");
+    }
+    return;
+  }
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const quick = database.prepare("PRAGMA quick_check").get();
+    const table = database.prepare("SELECT type FROM sqlite_master WHERE name='working_pages'").get();
+    if (quick?.quick_check !== "ok" || table?.type !== "table") {
+      throw new Error("Saved working-memory SQLite integrity failed.");
+    }
+    const dtypeBytes: Record<string, number> = {
+      "torch.bool": 1, "torch.uint8": 1, "torch.int8": 1,
+      "torch.int16": 2, "torch.int32": 4, "torch.int64": 8,
+      "torch.float16": 2, "torch.bfloat16": 2, "torch.float32": 4, "torch.float64": 8
+    };
+    const digest = createHash("sha256");
+    let count = 0;
+    let highWater = 0;
+    let previous = 0;
+    for (const row of database.prepare("SELECT * FROM working_pages ORDER BY sequence").iterate()) {
+      const sequence = Number(row.sequence);
+      const dtype = String(row.dtype);
+      const payload = row.payload;
+      const tensorShape = JSON.parse(String(row.shape_json)) as unknown;
+      const metadata = JSON.parse(String(row.metadata_json)) as unknown;
+      if (!Number.isSafeInteger(sequence) || sequence <= previous ||
+        typeof row.page_id !== "string" || !/^[\x20-\x7e]+$/.test(row.page_id) ||
+        typeof row.assembly_id !== "string" || !isRecord(metadata) ||
+        (metadata.assemblyId !== undefined && metadata.assemblyId !== row.assembly_id) ||
+        !Array.isArray(tensorShape) || tensorShape.length === 0 ||
+        tensorShape.some((dimension) => !Number.isSafeInteger(dimension) || dimension < 0) ||
+        !Object.hasOwn(dtypeBytes, dtype) || !(payload instanceof Uint8Array) ||
+        !Number.isFinite(row.updated_at)) {
+        throw new Error("Saved working-memory page schema is invalid.");
+      }
+      const bytes = tensorShape.reduce((total: number, dimension: number) => total * dimension, 1) * dtypeBytes[dtype]!;
+      const checksum = createHash("sha256").update(dtype).update("\0")
+        .update(`[${tensorShape.join(", ")}]`).update("\0").update(payload).digest("hex");
+      if (!Number.isSafeInteger(bytes) || bytes !== payload.byteLength || row.sha256 !== checksum) {
+        throw new Error("Saved working-memory tensor checksum failed.");
+      }
+      if (!isRecord(expected) || sequence <= Number(expected.highWaterId)) {
+        digest.update(String(sequence)).update("\0").update(row.page_id).update("\0")
+          .update(checksum).update("\n");
+        count += 1;
+        highWater = sequence;
+      }
+      previous = sequence;
+    }
+    if (isRecord(expected) && (count !== expected.count || highWater !== expected.highWaterId ||
+      digest.digest("hex") !== expected.contentSha256)) {
+      throw new Error("Saved working-memory checkpoint checksum failed.");
     }
   } finally {
     database.close();
@@ -637,7 +920,7 @@ interface SubstrateSnapshot {
   relativePaths: Set<string>;
 }
 
-async function assertSubstrateSnapshotContainsNoPortableSecrets(
+async function assertSubstrateSnapshotJsonText(
   snapshot: SubstrateSnapshot | undefined,
   signal?: AbortSignal
 ): Promise<void> {
@@ -648,7 +931,7 @@ async function assertSubstrateSnapshotContainsNoPortableSecrets(
     // content-addressed paths. Never include the source JSON in diagnostics.
     const label = `Neural substrate shard ${source.name}`;
     if (source.sourcePath) {
-      await assertFileContainsNoPortableSecrets(source.sourcePath, label, true);
+      await assertFileContainsValidJsonText(source.sourcePath, label);
       continue;
     }
     if (source.contents === undefined) {
@@ -662,9 +945,6 @@ async function assertSubstrateSnapshotContainsNoPortableSecrets(
     }
     if (text.includes("\0")) {
       throw new Error(`${label} is not valid JSON text and cannot be safely exported.`);
-    }
-    if (containsPortableSecretText(text)) {
-      throw new Error(`${label} appears to contain credentials or a private path. Remove or sanitize it before export.`);
     }
   }
 }
@@ -716,15 +996,20 @@ function persistedParameterAccounting(
   const substrateDynamicSparseSynapses = Number(value.substrateDynamicSparseSynapses);
   const dynamicSparseSynapses = Number(value.dynamicSparseSynapses);
   const totalNeuralParameters = Number(value.totalNeuralParameters);
+  const substrateVectorParameters = value.substrateVectorParameters === undefined
+    ? 0 : Number(value.substrateVectorParameters);
   if (
+    (value.substrateVectorParameters !== undefined &&
+      (!Number.isSafeInteger(value.substrateVectorParameters) || substrateVectorParameters < 0)) ||
     substrateDynamicSparseSynapses !== substrateSynapses ||
     dynamicSparseSynapses !== substrateSynapses ||
-    mutableDenseParameters + dynamicSparseSynapses !== totalNeuralParameters
+    mutableDenseParameters + substrateVectorParameters + dynamicSparseSynapses !== totalNeuralParameters
   ) {
     throw new Error("Persisted neural parameter accounting is invalid.");
   }
   return {
     mutableDenseParameters: Number(value.mutableDenseParameters),
+    ...(value.substrateVectorParameters === undefined ? {} : { substrateVectorParameters }),
     substrateDynamicSparseSynapses,
     dynamicSparseSynapses,
     totalNeuralParameters,
@@ -1428,15 +1713,7 @@ async function validateExtractedMutableStateSnapshot(
   return expected;
 }
 
-function portableEngineState(
-  contents: Buffer,
-  redactions: RedactionCounter,
-  omissions?: {
-    ledgerRows: number;
-    pendingReplayJobs: number;
-    activeIngestionCheckpoints: number;
-  }
-): Uint8Array {
+function savedEngineState(contents: Buffer): Uint8Array {
   let state: unknown;
   try {
     state = JSON.parse(contents.toString("utf8"));
@@ -1450,79 +1727,139 @@ function portableEngineState(
     );
   }
   assertNativeOmniEngineState(state, "Exported neural state");
-  if (omissions) {
-    const summary = isRecord(state.conversation) ? state.conversation : undefined;
-    const rows = summary?.totalEntries;
-    const pending = state.pending_chat_slow_learning;
-    if (
-      (rows !== undefined && (!Number.isSafeInteger(rows) || Number(rows) < 0)) ||
-      (pending !== undefined && !Array.isArray(pending))
-    ) {
-      throw new Error("The neural conversation metadata is invalid for portable export.");
+  if (
+    (state.pending_chat_slow_learning !== undefined &&
+      !Array.isArray(state.pending_chat_slow_learning)) ||
+    (state.ingestion_checkpoints !== undefined && !isRecord(state.ingestion_checkpoints))
+  ) {
+    throw new Error("The saved neural continuation metadata is invalid.");
+  }
+  // Preserve even source paths, private text, and workspace annotations. The
+  // OS credential vault is external and is never traversed by this exporter.
+  return contents;
+}
+
+/** Preserve the active v3 cursor's committed joint generation, not orphan stages. */
+async function savedJointGenerationFiles(
+  state: unknown,
+  filePath: (kind: "joint" | "mutable", relative: string) => string
+): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  if (!isRecord(state)) return files;
+  const cursors = isRecord(state.ingestion_checkpoints) ? Object.values(state.ingestion_checkpoints) : [];
+  const v3 = cursors.filter((cursor) => isRecord(cursor) && cursor.formatVersion === 3);
+  const reference = state.ingestion_joint_generation;
+  if (reference === undefined || reference === null) {
+    if (v3.length) throw new Error("Saved v3 ingestion cursor has no committed joint generation.");
+    return files;
+  }
+  if (!isRecord(reference) || reference.format !== "omni-joint-checkpoint-reference" ||
+    reference.formatVersion !== 2 || typeof reference.generationId !== "string" ||
+    !/^[a-f0-9]{32}$/.test(reference.generationId) ||
+    reference.relativeManifest !== `generations/${reference.generationId}/manifest.json` ||
+    typeof reference.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(reference.sha256) ||
+    v3.length !== 1 || cursors.length !== 1) {
+    throw new Error("Saved ingestion joint-generation reference is invalid.");
+  }
+  const relative = String(reference.relativeManifest);
+  const manifestPath = filePath("joint", relative);
+  const info = await lstat(manifestPath);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > 64 * 1024 ||
+    await streamFileSha256(manifestPath) !== reference.sha256) {
+    throw new Error("Saved ingestion joint manifest checksum failed.");
+  }
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as unknown;
+  const cursor = v3[0] as Record<string, unknown>;
+  const mutable = state.mutable_state;
+  const substrate = isRecord(state.substrate) ? state.substrate.persistence : undefined;
+  if (!isRecord(manifest) || manifest.format !== "omni-joint-checkpoint-generation" ||
+    manifest.formatVersion !== 2 || manifest.generationId !== reference.generationId ||
+    !isRecord(manifest.neuralState) || !isRecord(manifest.substrateState) ||
+    !isRecord(mutable) || !isRecord(substrate) || !isRecord(manifest.cursor) ||
+    !isRecord(manifest.coverage) ||
+    manifest.neuralState.generationId !== mutable.activeGeneration ||
+    manifest.neuralState.generationManifest !== mutable.generationManifest ||
+    manifest.neuralState.generationManifestSha256 !== mutable.generationManifestSha256 ||
+    manifest.neuralGenerationSha256 !== mutable.activeGeneration ||
+    manifest.substrateState.generationId !== substrate.activeGeneration ||
+    manifest.substrateState.generationManifest !== substrate.generationManifest ||
+    manifest.substrateState.generationManifestSha256 !== substrate.generationManifestSha256 ||
+    manifest.substrateGenerationSha256 !== substrate.activeGeneration ||
+    canonicalJson(manifest.substrateState.counts) !== canonicalJson(substrate.counts) ||
+    manifest.checkpointSequence !== cursor.commitSequence ||
+    !Number.isSafeInteger(manifest.checkpointSequence) || Number(manifest.checkpointSequence) < 1 ||
+    manifest.cursor.committedRecords !== cursor.committedRecords ||
+    manifest.cursor.recordPrefixSha256 !== cursor.recordPrefixSha256 ||
+    manifest.sourceManifestSha256 !== cursor.sourceManifestSha256 ||
+    manifest.parserManifestSha256 !== cursor.parserManifestSha256 ||
+    manifest.sourceContentSha256 !== cursor.contentHash ||
+    manifest.sourceParserManifestSha256 !== sha256(canonicalJson({
+      sourceManifestSha256: cursor.sourceManifestSha256,
+      parserManifestSha256: cursor.parserManifestSha256
+    }))) {
+    throw new Error("Saved ingestion joint generation does not bind its cursor and neural state.");
+  }
+  for (const hash of [manifest.sourceManifestSha256, manifest.parserManifestSha256,
+    manifest.sourceContentSha256, manifest.cursor.recordPrefixSha256,
+    manifest.previousManifestSha256 ?? "0".repeat(64)]) {
+    if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash)) {
+      throw new Error("Saved ingestion joint manifest contains an invalid hash.");
     }
-    omissions.ledgerRows = Number(rows ?? 0);
-    omissions.pendingReplayJobs = Array.isArray(pending) ? pending.length : 0;
-    const ingestion = state.ingestion_checkpoints;
-    if (ingestion !== undefined && !isRecord(ingestion)) {
-      throw new Error("The neural ingestion metadata is invalid for portable export.");
+  }
+  const coverage = manifest.coverage;
+  for (const number of [manifest.cursor.committedRecords, coverage.visitedRecords,
+    coverage.processedRecords, coverage.rejectedRecords, coverage.processedBytes,
+    coverage.expectedRecords ?? 0]) {
+    if (!Number.isSafeInteger(number) || Number(number) < 0) {
+      throw new Error("Saved ingestion joint coverage is invalid.");
     }
-    omissions.activeIngestionCheckpoints = ingestion ? Object.keys(ingestion).length : 0;
   }
-  // Portable .omni deliberately excludes both raw conversation ledgers. The
-  // exported copy must not claim rows that cannot be restored, or retain
-  // receipts/temporary tokens from a conversation that was omitted. Learned
-  // substrate, core tensors, optimizer state, and long-term neural state are
-  // untouched; the live source metadata is never mutated.
-  state.conversation = {
-    format: "omni-neural-conversation-ledger",
-    formatVersion: 1,
-    totalEntries: 0,
-    messageCount: 0,
-    actionCount: 0,
-    traceCount: 0,
-    attentionEpoch: 0,
-    headSequence: 0,
-    headSha256: "0".repeat(64)
-  };
-  state.completed_chat_turns = [];
-  state.completed_chat_slow_learning = [];
-  state.pending_chat_slow_learning = [];
-  // An in-progress corpus cursor is bound to source-machine files and the
-  // cold-page checkpoint. Neither is portable in sanitized bundles.
-  state.ingestion_checkpoints = {};
-  state.recent_token_context = [];
-  state.current_context = {
-    tokenCount: 0,
-    tokenHash: "",
-    sensorySlots: 0,
-    updatedAt: typeof state.updated_at === "string" ? state.updated_at : ""
-  };
-  state.fresh_attention_boundary = null;
-  state.attention_overlay = null;
-  state.workspace_items = [];
-  // The cold-page SQLite store is intentionally absent from sanitized .omni
-  // bundles. Do not leave a nonempty checkpoint that the imported worker would
-  // have to discard during recovery (or mistake for restored working state).
-  state.paged_working_memory = emptyPortableWorkingMemoryCheckpoint();
-  delete state.messages;
-  delete state.traces;
-  const runtimeCard = isRecord(state.runtime_card) ? state.runtime_card : undefined;
-  if (runtimeCard) {
-    runtimeCard.fresh_attention = null;
-    delete runtimeCard.workspace;
+  if (coverage.visitedRecords !== Number(coverage.processedRecords) + Number(coverage.rejectedRecords) ||
+    Number(manifest.cursor.committedRecords) > Number(coverage.visitedRecords) ||
+    (coverage.expectedRecords !== null && Number(coverage.visitedRecords) > Number(coverage.expectedRecords)) ||
+    typeof coverage.sourceStreamExhausted !== "boolean" ||
+    (coverage.sourceStreamExhausted
+      ? ((coverage.expectedRecords !== null && coverage.visitedRecords !== coverage.expectedRecords) ||
+        coverage.sourceContentReverifiedSha256 !== manifest.sourceContentSha256)
+      : coverage.sourceContentReverifiedSha256 !== null)) {
+    throw new Error("Saved ingestion joint coverage is incomplete.");
   }
-  if (Array.isArray(state.training_sources)) {
-    state.training_sources = state.training_sources.map((source) => {
-      if (!isRecord(source)) return source;
-      const sanitized = { ...source };
-      delete sanitized.raw_text;
-      delete sanitized.path;
-      delete sanitized.source_path;
-      sanitized.raw_text_retained = false;
-      return sanitized;
-    });
+  const neuralManifest = JSON.parse(await readFile(
+    filePath("mutable", safeMutableStateRelativePath(String(mutable.generationManifest))), "utf8"
+  )) as Record<string, unknown>;
+  if (!isRecord(neuralManifest.roles) || !isRecord(manifest.neuralState.blobs)) {
+    throw new Error("Saved ingestion joint neural roles are invalid.");
   }
-  return strToU8(JSON.stringify(redactPortableValue(state, redactions), null, 2));
+  for (const role of ["core", "plasticity", "optimizer"]) {
+    const descriptor = neuralManifest.roles[role];
+    if (!isRecord(descriptor) || canonicalJson(manifest.neuralState.blobs[role]) !== canonicalJson({
+      path: descriptor.path, sha256: descriptor.sha256, bytes: descriptor.bytes
+    })) throw new Error("Saved ingestion joint neural blob binding failed.");
+  }
+  files.set(relative, manifestPath);
+  if (manifest.sqliteSnapshot !== null) {
+    const snapshot = manifest.sqliteSnapshot;
+    if (!isRecord(snapshot) || snapshot.file !== "packed-vector-index.sqlite3" ||
+      typeof snapshot.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(snapshot.sha256) ||
+      !Number.isSafeInteger(snapshot.bytes) || Number(snapshot.bytes) < 1) {
+      throw new Error("Saved ingestion joint SQLite descriptor is invalid.");
+    }
+    const snapshotRelative = `generations/${reference.generationId}/${snapshot.file}`;
+    const path = filePath("joint", snapshotRelative);
+    const snapshotInfo = await lstat(path);
+    if (!snapshotInfo.isFile() || snapshotInfo.isSymbolicLink() || snapshotInfo.size !== snapshot.bytes ||
+      await streamFileSha256(path) !== snapshot.sha256) {
+      throw new Error("Saved ingestion joint SQLite checksum failed.");
+    }
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+      if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") {
+        throw new Error("Saved ingestion joint SQLite integrity failed.");
+      }
+    } finally { database.close(); }
+    files.set(snapshotRelative, path);
+  }
+  return files;
 }
 
 function assertImportedNeuralConversationHead(
@@ -1532,6 +1869,9 @@ function assertImportedNeuralConversationHead(
 ): void {
   const state = isRecord(engineState) ? engineState : undefined;
   const summary = isRecord(state?.conversation) ? state.conversation : undefined;
+  // Early stable checkpoints may omit an empty native ledger summary.
+  if (state?.format === "omni-engine-unmaterialized" ||
+    (summary === undefined && !hasLedger)) return;
   const countFields = [
     "totalEntries", "messageCount", "actionCount", "traceCount",
     "attentionEpoch", "headSequence"
@@ -1646,6 +1986,13 @@ function normalizeConfig(value: unknown): BrainConfig {
     merged.workingMemorySlots > 0
       ? merged.workingMemorySlots
       : DEFAULT_CONFIG.workingMemorySlots;
+  if (config.nativeArchitecture !== undefined) {
+    const descriptor = validateNativeArchitectureDescriptor(config.nativeArchitecture);
+    if (descriptor.shape.workingMemoryItems !== merged.workingMemorySlots) {
+      throw new Error("Saved native architecture does not match its neural workspace shape.");
+    }
+    merged.nativeArchitecture = descriptor;
+  }
   merged.contextWindowTokens =
     typeof merged.contextWindowTokens === "number" &&
     Number.isSafeInteger(merged.contextWindowTokens) &&
@@ -1679,6 +2026,12 @@ function normalizeConfig(value: unknown): BrainConfig {
     merged.storagePoolBytes >= 0
       ? merged.storagePoolBytes
       : 0;
+  if (config.contextOffloadBudgetBytes !== undefined) {
+    if (!Number.isSafeInteger(config.contextOffloadBudgetBytes) || Number(config.contextOffloadBudgetBytes) < 0) {
+      throw new Error("Context offload budget must be a nonnegative exact byte count.");
+    }
+    merged.contextOffloadBudgetBytes = Number(config.contextOffloadBudgetBytes);
+  }
   if (merged.storagePoolMode === "manual" && merged.storagePoolBytes < 1) {
     merged.storagePoolMode = "auto";
   }
@@ -3196,6 +3549,53 @@ export class BrainRepository {
     return sha256(canonicalJson(snapshot.pointer));
   }
 
+  private async copySavedContinuation(
+    sourceEngine: string,
+    destinationEngine: string,
+    metadata: unknown,
+    operation?: BrainStorageOperationHooks
+  ): Promise<{ paths: string[]; hashes: string[] }> {
+    const paths: string[] = [];
+    const hashes: string[] = [];
+    const working = join(sourceEngine, "state", "working-memory.sqlite3");
+    const targetWorking = join(destinationEngine, "state", "working-memory.sqlite3");
+    if (await pathExists(working)) {
+      await snapshotSavedSqlite(working, targetWorking, operation);
+      validateSavedWorkingPages(targetWorking, metadata);
+      paths.push("engine/state/working-memory.sqlite3");
+      hashes.push(await fileSha256(targetWorking));
+    } else {
+      validateSavedWorkingPages(undefined, metadata);
+      await rm(targetWorking, { force: true });
+    }
+    const joint = await savedJointGenerationFiles(metadata, (kind, relative) =>
+      join(sourceEngine, "state", ...(kind === "joint" ? ["ingestion-joint"] : []), ...relative.split("/"))
+    );
+    for (const [relative, source] of [...joint].sort(([left], [right]) => left.localeCompare(right))) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      const target = join(destinationEngine, "state", "ingestion-joint", ...relative.split("/"));
+      await this.linkBlobTo(hash, target, operation);
+      paths.push(`engine/state/ingestion-joint/${relative}`);
+      hashes.push(hash);
+    }
+    for (const [name, source] of await savedToolIntentFiles(sourceEngine)) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      await this.linkBlobTo(hash, join(destinationEngine, "operational-tool-intents", name), operation);
+      paths.push(`engine/operational-tool-intents/${name}`);
+      hashes.push(hash);
+    }
+    for (const [relative, source] of await savedConceptIdViewFiles(sourceEngine)) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      await this.linkBlobTo(hash, join(destinationEngine, ...relative.split("/")), operation);
+      paths.push(`engine/${relative}`);
+      hashes.push(hash);
+    }
+    return { paths, hashes };
+  }
+
   private async copyMutableStateSnapshot(
     sourceEngine: string,
     destinationEngine: string,
@@ -3225,6 +3625,10 @@ export class BrainRepository {
         operation?.signal.throwIfAborted();
         const relative = source.name.slice(`${prefix}/`.length);
         const target = join(temporary, ...relative.split("/"));
+        if (relative === "replay.sqlite3" && source.sourcePath) {
+          await snapshotSavedSqlite(source.sourcePath, target, operation);
+          continue;
+        }
         if (relative === "manifest.json") {
           const bytes = source.sourcePath
             ? (await lstat(source.sourcePath)).size
@@ -3396,6 +3800,15 @@ export class BrainRepository {
         shareable
       });
     };
+
+    for (const [source, destination] of [[sourceEngine, targetEngine], [originSourceEngine, targetOrigin]]) {
+      for (const [name, path] of await savedToolIntentFiles(source!)) {
+        await addPath(path, join(destination!, "operational-tool-intents", name), `historical tool intent ${name}`, true);
+      }
+      for (const [relative, path] of await savedConceptIdViewFiles(source!)) {
+        await addPath(path, join(destination!, ...relative.split("/")), "historical structural argument view", true);
+      }
+    }
 
     for (const name of ["core.safetensors", "plasticity.safetensors"] as const) {
       const sourcePath = join(sourceEngine, name);
@@ -4794,6 +5207,7 @@ export class BrainRepository {
     const checkpointHashes: string[] = [];
     let neuralConversationIncluded = false;
     let artifactIndexIncluded = false;
+    let savedContinuation: SavedSnapshotSummary["savedContinuation"];
     try {
       await operation?.checkpoint({
         phase: "planning",
@@ -4804,6 +5218,12 @@ export class BrainRepository {
         await mkdir(engineSnapshot, { recursive: true });
         const metadata = await readFile(join(engineSource, "brain.json"));
         const metadataValue = JSON.parse(metadata.toString("utf8")) as unknown;
+        const hasNeuralConversation = await pathExists(join(engineSource, "conversation.sqlite3"));
+        assertImportedNeuralConversationHead(metadataValue, "Recovery-point source", hasNeuralConversation);
+        if (!hasNeuralConversation && isRecord(metadataValue) &&
+          Array.isArray(metadataValue.pending_chat_slow_learning) && metadataValue.pending_chat_slow_learning.length) {
+          throw new Error("Recovery-point pending chat replay is missing its neural conversation ledger.");
+        }
         const hashes: string[] = [sha256(metadata)];
         for (const name of ["core.safetensors", "plasticity.safetensors"]) {
           operation?.signal.throwIfAborted();
@@ -4860,10 +5280,14 @@ export class BrainRepository {
             label: "Copying the exact neural conversation ledger"
           });
           const destination = join(engineSnapshot, "conversation.sqlite3");
-          await copyFile(neuralConversation, destination);
+          await snapshotSavedSqlite(neuralConversation, destination, operation);
+          validateNeuralConversationLedger(destination, brain.id, metadataValue);
           hashes.push(await fileSha256(destination));
           neuralConversationIncluded = true;
         }
+        const continuation = await this.copySavedContinuation(engineSource, engineSnapshot, metadataValue, operation);
+        hashes.push(...continuation.hashes);
+        savedContinuation = { version: 1, componentPaths: continuation.paths };
         operation?.signal.throwIfAborted();
         // Commit metadata after every referenced shard is durable.
         await atomicWrite(join(engineSnapshot, "brain.json"), metadata);
@@ -4910,7 +5334,7 @@ export class BrainRepository {
       const documentBytes = Buffer.byteLength(document, "utf8");
       const fixedLogicalBytes = engineUsage.logicalBytes + documentBytes;
       const fixedPhysicalBytes = engineUsage.physicalBytesAdded + documentBytes;
-      let summary: BrainSnapshotSummary = {
+      let summary: SavedSnapshotSummary = {
         id: snapshotId,
         brainId: brain.id,
         label: label?.replace(/\0/g, "").trim().slice(0, 120) ||
@@ -4920,6 +5344,7 @@ export class BrainRepository {
         metrics: recoveryPointMetrics(brain, persisted, fixedLogicalBytes),
         engineChecksum,
         checkpointComponentSha256: checkpointHashes,
+        savedContinuation,
         durableState: {
           conversationLedger: true,
           activityLedger: true,
@@ -5057,7 +5482,7 @@ export class BrainRepository {
       readFile(`${base}.json`, "utf8"),
       readFile(`${base}.meta.json`, "utf8")
     ]);
-    const summary = JSON.parse(metadata) as BrainSnapshotSummary;
+    const summary = JSON.parse(metadata) as SavedSnapshotSummary;
     if (summary.brainId !== id || sha256(document) !== summary.checksum) {
       throw new Error("Snapshot checksum validation failed.");
     }
@@ -5156,6 +5581,9 @@ export class BrainRepository {
         );
         if (await pathExists(neuralConversation)) {
           hashes.push(await fileSha256(neuralConversation));
+        }
+        for (const relative of summary.savedContinuation?.componentPaths ?? []) {
+          hashes.push(await fileSha256(join(base, ...safeSnapshotContinuationPath(relative).split("/"))));
         }
         hashes.push(
           await fileSha256(join(base, "conversation", "ledger.sqlite3")),
@@ -5288,6 +5716,7 @@ export class BrainRepository {
         metadataValue,
         operation
       );
+      await this.copySavedContinuation(engineSnapshot, stagedEngine, metadataValue, operation);
       if (summary.durableState) {
         await rm(join(stagedEngine, "artifacts"), {
           recursive: true,
@@ -5421,6 +5850,15 @@ export class BrainRepository {
     mode: BrainExportMode = "current",
     operation?: BrainStorageOperationHooks
   ): Promise<void> {
+    return withBrainWrite(this, id, () => this.exportBundleUnlocked(id, destination, mode, operation), operation?.signal);
+  }
+
+  private async exportBundleUnlocked(
+    id: string,
+    destination: string,
+    mode: BrainExportMode,
+    operation?: BrainStorageOperationHooks
+  ): Promise<void> {
     await operation?.checkpoint({
       phase: "planning",
       label: "Validating export sources and checksums"
@@ -5429,96 +5867,73 @@ export class BrainRepository {
     try {
     const currentBrain = await this.get(id);
     const directory = this.brainDirectory(id);
-    const redactions: RedactionCounter = { replacements: 0 };
+    const engineDirectory =
+      mode === "origin" ? join(directory, "engine", "origin") : join(directory, "engine");
+    if (currentBrain.readiness.state !== "ready" ||
+      !await pathExists(join(engineDirectory, "brain.json")) ||
+      !await pathExists(join(directory, "engine", "origin", "brain.json"))) {
+      throw new Error("Finish initial learning before exporting this mind; a saved native checkpoint and its materialized origin are required.");
+    }
+    const storedOriginBytes = await readFile(join(directory, "origin.json"));
+    const storedOriginValue: unknown = JSON.parse(storedOriginBytes.toString("utf8"));
+    const storedOriginChecksum = assertOriginChecksum(storedOriginValue, "The stored origin");
+    const originBrain = normalizeBrain(storedOriginValue);
+    const currentDocumentBytes = await readFile(this.documentPath(id));
+    if (currentBrain.originChecksum !== storedOriginChecksum) {
+      throw new Error("The current brain does not reference its immutable origin checksum.");
+    }
     let portableBrain =
       mode === "origin"
-        ? normalizeBrain(JSON.parse(await readFile(join(directory, "origin.json"), "utf8")))
-        : clone(currentBrain);
+        ? clone(storedOriginValue) as BrainDocument
+        : JSON.parse(currentDocumentBytes.toString("utf8")) as BrainDocument;
+    normalizeBrain(portableBrain);
     const activityExportBrainDirectory = join(activityExportRoot, "brain");
     let rawEpisodesPresent = false;
-    const portableJournal = (entry: JournalEntry): JournalEntry =>
-      redactPortableValue({
-        ...entry,
-        ...(entry.detail
-          ? {
-              detail:
-                `Private operational detail omitted from export; ` +
-                `sha256=${sha256(entry.detail)}`
-            }
-          : {})
-      }, redactions) as JournalEntry;
-    const portableTrainingSource = (source: TrainingSource): TrainingSource => {
-      if (source.rawTextRetained) rawEpisodesPresent = true;
-      const sanitized = { ...source };
-      delete sanitized.path;
-      delete sanitized.rawText;
-      if (mode !== "private-archive") delete sanitized.blobHash;
-      sanitized.rawTextRetained = false;
-      return redactPortableValue(sanitized, redactions) as TrainingSource;
-    };
     let activitySummary: BrainActivityLedgerSummary;
     if (mode === "origin") {
-      const journals = (portableBrain.journal ?? []).map(portableJournal);
-      const sources = portableBrain.trainingSources.map(portableTrainingSource);
       await BrainActivityLedger.replace(
         activityExportBrainDirectory,
         portableBrain.id,
-        journals,
-        sources
+        portableBrain.journal ?? [],
+        portableBrain.trainingSources
       );
-      const activity = await BrainActivityLedger.open(
-        activityExportBrainDirectory,
-        portableBrain.id
-      );
-      try {
-        activitySummary = activity.getSummary();
-      } finally {
-        activity.close();
-      }
     } else {
-      activitySummary = await BrainActivityLedger.project(
-        directory,
-        activityExportBrainDirectory,
-        currentBrain.id,
-        portableBrain.id,
-        portableJournal,
-        portableTrainingSource
+      await snapshotSavedSqlite(
+        BrainActivityLedger.databasePath(directory),
+        BrainActivityLedger.databasePath(activityExportBrainDirectory),
+        operation
       );
     }
-    portableBrain.messages = [];
-    portableBrain.traces = [];
-    portableBrain.conversation = undefined;
-    portableBrain.journal = [];
-    portableBrain.trainingSources = [];
+    const activity = await BrainActivityLedger.open(activityExportBrainDirectory, portableBrain.id);
+    try {
+      activitySummary = activity.integrity();
+    } finally {
+      activity.close();
+    }
     portableBrain.activity = activitySummary;
-    portableBrain.toolPermissions = (portableBrain.toolPermissions ?? []).map((permission) => ({
-      ...permission,
-      level: permission.level === "off" ? "off" : "ask"
-    }));
-    if (mode !== "private-archive") {
-      portableBrain.ideas = portableBrain.ideas.map((idea) =>
-        idea.source === "document" || idea.source === "import"
-          ? { ...idea, statement: undefined }
-          : idea
+    if (mode !== "origin") {
+      await snapshotSavedSqlite(
+        join(directory, "conversation", "ledger.sqlite3"),
+        join(activityExportBrainDirectory, "conversation", "ledger.sqlite3"),
+        operation
       );
     }
-    portableBrain = redactPortableValue(portableBrain, redactions) as BrainDocument;
-    const engineDirectory =
-      mode === "origin" ? join(directory, "engine", "origin") : join(directory, "engine");
+    const conversation = await ConversationLedger.open(activityExportBrainDirectory, portableBrain.id);
+    try {
+      if (mode === "origin") conversation.backfill(portableBrain.messages, portableBrain.traces);
+      portableBrain.conversation = conversation.integrity();
+    } finally {
+      conversation.close();
+    }
     const engineStatePath = join(engineDirectory, "brain.json");
-    const engineMaterialized = await pathExists(engineStatePath);
-    const conversationOmissions = {
-      ledgerRows: 0,
-      pendingReplayJobs: 0,
-      activeIngestionCheckpoints: 0
-    };
+    const engineMaterialized = true;
     const selectedPackedPath = join(engineDirectory, "packed-ternary");
     const selectedPacked =
       engineMaterialized && (await pathExists(join(selectedPackedPath, "manifest.json")))
         ? await inspectPackedTernaryDirectory(selectedPackedPath, "Current")
         : undefined;
     const engineState = engineMaterialized
-      ? portableEngineState(await readFile(engineStatePath), redactions, conversationOmissions)
+      ? savedEngineState(await readFile(engineStatePath))
       : strToU8(
           JSON.stringify(
             {
@@ -5557,11 +5972,12 @@ export class BrainRepository {
           `# ${portableBrain.name}\n\nOmniCortex brain ${portableBrain.id}.\n\n` +
             `Preset: ${portableBrain.config.preset}\n\n` +
             `Memory recipe: ${portableBrain.config.memoryRecipe ?? "adaptive-retention"}\n\n` +
-            `Portable privacy projection: chat history is omitted (${conversationOmissions.ledgerRows} ledger rows). ` +
-            `${conversationOmissions.pendingReplayJobs} pending background replay job(s) are omitted and will not resume after import. ` +
-            `${conversationOmissions.activeIngestionCheckpoints} active ingestion cursor(s) are omitted and will not resume after import. ` +
-            `Temporary cold working-memory pages are omitted and their checkpoint is reset. ` +
-            `The selected checkpoint's committed neural weights remain in the bundle.\n`
+            `Unsanitized saved-instance export: chat, activity, artifacts, workspace, ` +
+            `pending replay jobs and ingestion cursors are preserved. Share only with trusted recipients. ` +
+            `OS-vault credentials are not included. Import starts dormant; a collision rekeys the live identity. ` +
+            `Dataset continuation retains its original absolute-path/stat, content, kind/policy/epoch ` +
+            `and parser bindings; relocated sources are not automatically remapped. ` +
+            `This is not an in-flight process clone.\n`
         )
       },
       "state/brain.json": {
@@ -5576,6 +5992,10 @@ export class BrainRepository {
         name: "activity/ledger.sqlite3",
         sourcePath: BrainActivityLedger.databasePath(activityExportBrainDirectory)
       },
+      "conversation/ledger.sqlite3": {
+        name: "conversation/ledger.sqlite3",
+        sourcePath: join(activityExportBrainDirectory, "conversation", "ledger.sqlite3")
+      },
       "tensors/core.safetensors": {
         name: "tensors/core.safetensors",
         ...(coreExists ? { sourcePath: corePath } : { contents: coreFallback })
@@ -5585,14 +6005,24 @@ export class BrainRepository {
         ...(plasticityExists ? { sourcePath: plasticityPath } : { contents: plasticityFallback })
       }
     };
-    // Conversation ledgers are intentionally never embedded in .omni files.
-    // Their row payloads can contain chat, tool output, environment material,
-    // and credentials that cannot be made safe by redacting only brain.json.
-    if (mode !== "origin") {
-      const artifactDirectory = join(directory, "engine", "artifacts");
+    const includeSavedSourceBlob = async (source: TrainingSource): Promise<void> => {
+      if (source.rawTextRetained || source.rawText !== undefined) rawEpisodesPresent = true;
+      if (!source.blobHash || entries[`blobs/${source.blobHash}`]) return;
+      if (!/^[a-f0-9]{64}$/.test(source.blobHash)) throw new Error("Saved source blob reference is invalid.");
+      const blobPath = join(this.root, ".blobs", source.blobHash);
+      if (await streamFileSha256(blobPath) !== source.blobHash) throw new Error("Saved source blob checksum failed.");
+      const name = `blobs/${source.blobHash}`;
+      entries[name] = { name, sourcePath: blobPath };
+    };
+    for (const source of originBrain.trainingSources) await includeSavedSourceBlob(source);
+    for (const [artifactEngine, artifactBrainId, prefix] of [
+      [engineDirectory, portableBrain.id, "artifacts"],
+      [join(directory, "engine", "origin"), originBrain.id, "origin/artifacts"]
+    ] as const) {
+      const artifactDirectory = join(artifactEngine, "artifacts");
       const artifactStore = await ArtifactIndexStore.openExisting(
         artifactDirectory,
-        currentBrain.id
+        artifactBrainId
       );
       if (artifactStore) {
         let artifactIndex: PersistedArtifactIndex;
@@ -5601,25 +6031,23 @@ export class BrainRepository {
         } finally {
           artifactStore.close();
         }
-        const portableArtifacts = artifactIndex.artifacts.map((artifact) => {
-          const {
-            initialization: _initialization,
-            qualityNote: _qualityNote,
-            ...portable
-          } = artifact;
-          if (_initialization) redactions.replacements += 1;
-          if (_qualityNote) redactions.replacements += 1;
-          return portable;
-        });
-        entries["artifacts/index.json"] = {
-          name: "artifacts/index.json",
+        const artifactSnapshotDirectory = join(activityExportRoot, prefix);
+        const artifactLedgerSnapshot = join(artifactSnapshotDirectory, "index.sqlite3");
+        await snapshotSavedSqlite(
+          ArtifactIndexStore.databasePath(artifactDirectory), artifactLedgerSnapshot, operation
+        );
+        const savedArtifacts = await ArtifactIndexStore.open(artifactSnapshotDirectory, artifactBrainId);
+        try { artifactIndex = savedArtifacts.snapshot(); } finally { savedArtifacts.close(); }
+        entries[`${prefix}/index.sqlite3`] = { name: `${prefix}/index.sqlite3`, sourcePath: artifactLedgerSnapshot };
+        entries[`${prefix}/index.json`] = {
+          name: `${prefix}/index.json`,
           contents: strToU8(
-            serializeArtifactIndex(artifactIndex.brainId, portableArtifacts)
+            serializeArtifactIndex(artifactIndex.brainId, artifactIndex.artifacts)
           )
         };
         for (const artifact of artifactIndex.artifacts) {
           const name = basename(artifact.relativePath);
-          const sourcePath = join(directory, "engine", "artifacts", name);
+          const sourcePath = join(artifactDirectory, name);
           const info = await lstat(sourcePath);
           if (
             !info.isFile() ||
@@ -5629,8 +6057,8 @@ export class BrainRepository {
           ) {
             throw new Error(`Generated artifact failed export integrity: ${name}`);
           }
-          entries[`artifacts/files/${name}`] = {
-            name: `artifacts/files/${name}`,
+          entries[`${prefix}/files/${name}`] = {
+            name: `${prefix}/files/${name}`,
             sourcePath
           };
         }
@@ -5642,39 +6070,9 @@ export class BrainRepository {
         entries[archivePath] = { name: archivePath, sourcePath };
       }
     }
-    const storedOriginValue: unknown = JSON.parse(
-      await readFile(join(directory, "origin.json"), "utf8")
-    );
-    const storedOriginChecksum = assertOriginChecksum(
-      storedOriginValue,
-      "The stored origin"
-    );
-    let originBrain = normalizeBrain(storedOriginValue);
-    if (currentBrain.originChecksum !== storedOriginChecksum) {
-      throw new Error("The current brain does not reference its immutable origin checksum.");
-    }
-    originBrain.toolPermissions = (originBrain.toolPermissions ?? []).map((permission) => ({
-      ...permission,
-      level: permission.level === "off" ? "off" : "ask"
-    }));
-    originBrain.journal = [];
-    originBrain.trainingSources = [];
-    originBrain.conversation = undefined;
-    originBrain.ideas = originBrain.ideas.map((idea) =>
-      idea.source === "document" || idea.source === "import"
-        ? { ...idea, statement: undefined }
-        : idea
-    );
-    originBrain = redactPortableValue(originBrain, redactions) as BrainDocument;
-    if (mode === "origin") {
-      originBrain.activity = activitySummary;
-      // Re-normalize so checksum-sensitive property order matches import.
-      originBrain = normalizeBrain(originBrain);
-    }
-    originBrain.originChecksum = undefined;
-    originBrain.originChecksum = originChecksumFor(originBrain);
-    if (mode === "origin") portableBrain = clone(originBrain);
-    else portableBrain.originChecksum = originBrain.originChecksum;
+    // The original is immutable, including its content checksum and user
+    // annotations. A different exported ledger does not redefine the origin.
+    portableBrain.originChecksum = storedOriginChecksum;
     entries["state/brain.json"] = {
       name: "state/brain.json",
       contents: strToU8(JSON.stringify(portableBrain, null, 2))
@@ -5734,7 +6132,7 @@ export class BrainRepository {
       );
     }
     const immutableState = immutableStateBytes
-      ? portableEngineState(immutableStateBytes, redactions)
+      ? savedEngineState(immutableStateBytes)
       : mode === "origin"
         ? engineState
         : strToU8(
@@ -5781,7 +6179,7 @@ export class BrainRepository {
     }
     entries["origin/state/brain.json"] = {
       name: "origin/state/brain.json",
-      contents: strToU8(JSON.stringify(originBrain, null, 2))
+      contents: storedOriginBytes
     };
     entries["origin/state/engine.json"] = {
       name: "origin/state/engine.json",
@@ -5842,24 +6240,18 @@ export class BrainRepository {
         }
       }
     }
-    if (mode === "private-archive") {
-      const portableActivity = await BrainActivityLedger.open(
-        activityExportBrainDirectory,
-        portableBrain.id
+    {
+      const portableActivity = new DatabaseSync(
+        BrainActivityLedger.databasePath(activityExportBrainDirectory), { readOnly: true }
       );
       try {
-        for (const source of portableActivity.trainingSources()) {
-          if (!source.blobHash || entries[`blobs/${source.blobHash}`]) continue;
-          if (!/^[a-f0-9]{64}$/.test(source.blobHash)) {
-            throw new Error("Private archive contains an invalid content-addressed blob.");
-          }
-          const blobPath = join(this.root, ".blobs", source.blobHash);
-          if ((await streamFileSha256(blobPath)) !== source.blobHash) {
-            throw new Error("Content-addressed blob checksum failed.");
-          }
-          await assertFileContainsNoPortableSecrets(blobPath, source.name);
-          const archivePath = `blobs/${source.blobHash}`;
-          entries[archivePath] = { name: archivePath, sourcePath: blobPath };
+        // Historical source versions are saved state too, not merely the
+        // latest training-source projection.
+        for (const row of portableActivity.prepare(
+          "SELECT payload_json FROM training_source_versions ORDER BY sequence"
+        ).iterate()) {
+          const source = JSON.parse(String(row.payload_json)) as TrainingSource;
+          await includeSavedSourceBlob(source);
         }
       } finally {
         portableActivity.close();
@@ -5873,6 +6265,49 @@ export class BrainRepository {
       .includes("omni-cortex-engine")
       ? (JSON.parse(Buffer.from(immutableState).toString("utf8")) as unknown)
       : undefined;
+    for (const [sourceEngine, metadata, scope, sourceBrainId, ledgerPrefix] of [
+      [engineDirectory, currentEngineMetadata, "current", portableBrain.id, "conversation"],
+      [immutableEngine, originEngineMetadata, "origin", originBrain.id, "origin/conversation"]
+    ] as const) {
+      if (!metadata) continue;
+      for (const [relative, path] of await savedConceptIdViewFiles(sourceEngine)) {
+        const name = `concept-views/${scope}/${relative.split("/").at(-1)}`;
+        entries[name] = { name, sourcePath: path };
+      }
+      for (const [file, path] of await savedToolIntentFiles(sourceEngine)) {
+        const name = `operational/${scope}/${file}`;
+        entries[name] = { name, sourcePath: path };
+      }
+      const ledgerPath = join(sourceEngine, "conversation.sqlite3");
+      const hasLedger = await pathExists(ledgerPath);
+      assertImportedNeuralConversationHead(metadata, `Saved ${scope} state`, hasLedger);
+      if (hasLedger) {
+        const snapshot = join(activityExportRoot, `${scope}-neural-ledger.sqlite3`);
+        await snapshotSavedSqlite(ledgerPath, snapshot, operation);
+        validateNeuralConversationLedger(snapshot, sourceBrainId, metadata);
+        const name = `${ledgerPrefix}/neural-ledger.sqlite3`;
+        entries[name] = { name, sourcePath: snapshot };
+      } else if (isRecord(metadata) && Array.isArray(metadata.pending_chat_slow_learning) &&
+        metadata.pending_chat_slow_learning.length) {
+        throw new Error("Pending chat replay is missing its saved neural conversation ledger.");
+      }
+      const workingPath = join(sourceEngine, "state", "working-memory.sqlite3");
+      let snapshot: string | undefined;
+      if (await pathExists(workingPath)) {
+        snapshot = join(activityExportRoot, `${scope}-working-memory.sqlite3`);
+        await snapshotSavedSqlite(workingPath, snapshot, operation);
+        const name = `working/${scope}/working-memory.sqlite3`;
+        entries[name] = { name, sourcePath: snapshot };
+      }
+      validateSavedWorkingPages(snapshot, metadata);
+      const joint = await savedJointGenerationFiles(metadata, (kind, relative) =>
+        join(sourceEngine, "state", ...(kind === "joint" ? ["ingestion-joint"] : []), ...relative.split("/"))
+      );
+      for (const [relative, sourcePath] of joint) {
+        const name = `joint/${scope}/${relative}`;
+        entries[name] = { name, sourcePath };
+      }
+    }
     const [currentSubstrate, originSubstrate] = await Promise.all([
       collectSubstrateSnapshot(
         engineDirectory,
@@ -5920,11 +6355,10 @@ export class BrainRepository {
         } : {})
       }
     );
-    // Substrate JSON is committed by hash and cannot be redacted without
-    // invalidating the generation graph. Refuse contaminated exports before
-    // writeStreamingZip creates or publishes an archive, in every export mode.
-    await assertSubstrateSnapshotContainsNoPortableSecrets(currentSubstrate, operation?.signal);
-    await assertSubstrateSnapshotContainsNoPortableSecrets(originSubstrate, operation?.signal);
+    // Content-addressed JSON must retain its exact bytes and generation
+    // hashes. Validate text integrity without screening private saved content.
+    await assertSubstrateSnapshotJsonText(currentSubstrate, operation?.signal);
+    await assertSubstrateSnapshotJsonText(originSubstrate, operation?.signal);
     for (const snapshot of [
       currentSubstrate,
       originSubstrate,
@@ -5933,7 +6367,61 @@ export class BrainRepository {
     ]) {
       for (const source of snapshot?.sources ?? []) entries[source.name] = source;
     }
+    const recoveryPoints: NonNullable<OmniManifest["recoveryPoints"]> = [];
+    const snapshotRoot = join(directory, "snapshots");
+    if (await pathExists(snapshotRoot)) {
+      for (const entry of await readdir(snapshotRoot, { withFileTypes: true })) {
+        if (!entry.name.endsWith(".meta.json")) continue;
+        if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("Saved recovery-point record is unsafe.");
+        const snapshotId = requireSafeId(entry.name.slice(0, -".meta.json".length), "recovery point id");
+        const sourceBase = join(snapshotRoot, snapshotId);
+        const stagedBase = join(activityExportRoot, "snapshots", snapshotId);
+        const sourceFiles = await pathExists(sourceBase) ? await savedTreeFiles(sourceBase) : new Map<string, string>();
+        sourceFiles.set("../document", `${sourceBase}.json`);
+        sourceFiles.set("../summary", `${sourceBase}.meta.json`);
+        for (const [relative, source] of sourceFiles) {
+          const target = relative === "../document" ? `${stagedBase}.json`
+            : relative === "../summary" ? `${stagedBase}.meta.json`
+              : join(stagedBase, ...relative.split("/"));
+          await operation?.checkDisk(this.root, (await lstat(source)).size);
+          await copyMutableFileIsolated(source, target);
+        }
+        const checked = await validateSavedSnapshot(stagedBase, snapshotId, currentBrain.id);
+        recoveryPoints.push({ id: snapshotId, brainId: currentBrain.id, missingPayloads: checked.missingPayloads });
+        for (const relative of sourceFiles.keys()) {
+          const name = relative === "../document" ? `snapshots/${snapshotId}.json`
+            : relative === "../summary" ? `snapshots/${snapshotId}.meta.json`
+              : `snapshots/${snapshotId}/${relative}`;
+          const stagedPath = relative === "../document" ? `${stagedBase}.json`
+            : relative === "../summary" ? `${stagedBase}.meta.json`
+              : join(stagedBase, ...relative.split("/"));
+          entries[name] = { name, sourcePath: stagedPath };
+          // Historical activity can reference blobs absent from the live
+          // activity generation after a restore. Preserve those references.
+          if (relative === "../document") {
+            for (const source of (JSON.parse(await readFile(stagedPath, "utf8")) as BrainDocument).trainingSources ?? []) {
+              await includeSavedSourceBlob(source);
+            }
+          }
+          if (relative === "activity/ledger.sqlite3") {
+            const database = new DatabaseSync(stagedPath, { readOnly: true });
+            try {
+              for (const row of database.prepare("SELECT payload_json FROM training_source_versions ORDER BY sequence").iterate()) {
+                await includeSavedSourceBlob(JSON.parse(String(row.payload_json)) as TrainingSource);
+              }
+            } finally { database.close(); }
+          }
+        }
+      }
+    }
+    const missingHistory = recoveryPoints.filter((snapshot) => snapshot.missingPayloads.length);
+    if (missingHistory.length) {
+      const modelCard = Buffer.from(entries["model-card.md"]!.contents!).toString("utf8");
+      entries["model-card.md"]!.contents = strToU8(modelCard + "\nAlready-missing historical recovery payloads (records retained, not claimed restorable):\n" +
+        missingHistory.map((snapshot) => `${snapshot.id}: ${snapshot.missingPayloads.join(", ")}`).join("\n") + "\n");
+    }
     const fileRecords: Record<string, { sha256: string; bytes: number }> = {};
+    const stagedSourceRoot = join(activityExportRoot, "sources");
     for (const [path, source] of Object.entries(entries)) {
       operation?.signal.throwIfAborted();
       if (source.contents) {
@@ -5946,11 +6434,27 @@ export class BrainRepository {
         if (!info.isFile() || info.isSymbolicLink()) {
           throw new Error(`Bundle source ${path} is not a regular file.`);
         }
+        // Streaming must read the same bytes that the manifest hashes. A
+        // private reflink/byte copy pins mutable tensor mirrors and pointers
+        // while preserving the content-addressed generation unchanged.
+        if (!source.sourcePath.startsWith(`${activityExportRoot}/`)) {
+          await operation?.checkDisk(this.root, info.size);
+          await ensureDiskReserve(this.root, info.size);
+          const staged = join(stagedSourceRoot, ...path.split("/"));
+          await copyMutableFileIsolated(source.sourcePath, staged);
+          source.sourcePath = staged;
+        }
         fileRecords[path] = {
           sha256: await streamFileSha256(source.sourcePath),
           bytes: info.size
         };
       } else throw new Error(`Bundle source ${path} is empty.`);
+    }
+    if (!Buffer.from(await readFile(join(directory, "origin.json"))).equals(storedOriginBytes) ||
+      (mode !== "origin" && !Buffer.from(await readFile(this.documentPath(id))).equals(currentDocumentBytes)) ||
+      (engineMaterialized && !Buffer.from(await readFile(engineStatePath)).equals(Buffer.from(engineState))) ||
+      (immutableStateBytes && !Buffer.from(await readFile(immutableStatePath)).equals(immutableStateBytes))) {
+      throw new Error("Saved instance changed during export; retry after its checkpoint finishes.");
     }
     const manifest: OmniManifest = {
       format: BUNDLE_FORMAT,
@@ -5974,14 +6478,12 @@ export class BrainRepository {
               : "current-portable",
       engineMaterialized,
       memoryRecipe: portableBrain.config.memoryRecipe ?? "adaptive-retention",
-      rawEpisodesPresent:
-        mode === "private-archive" &&
-        rawEpisodesPresent,
+      rawEpisodesPresent,
       quantization: "ternary-effective",
       conversationProjection: {
-        historyIncluded: false,
-        omittedLedgerRows: conversationOmissions.ledgerRows,
-        omittedPendingReplayJobs: conversationOmissions.pendingReplayJobs
+        historyIncluded: true,
+        omittedLedgerRows: 0,
+        omittedPendingReplayJobs: 0
       },
       packedTernary:
         selectedPacked && immutablePacked
@@ -5997,8 +6499,10 @@ export class BrainRepository {
           : undefined,
       secretRedaction: {
         version: 1,
-        replacements: redactions.replacements
+        replacements: 0
       },
+      savedInstance: { version: 1, content: "unsanitized" },
+      recoveryPoints,
       licenseLedger: {
         application: "PolyForm-Noncommercial-1.0.0-or-commercial-license",
         sourceCount: activitySummary.trainingSourceCount,
@@ -6323,6 +6827,13 @@ export class BrainRepository {
     ) {
       throw new Error("The .omni bundle does not declare a supported secret-redaction policy.");
     }
+    const savedInstance = manifestValue.savedInstance !== undefined;
+    if (savedInstance && (!isRecord(manifestValue.savedInstance) ||
+      manifestValue.savedInstance.version !== 1 ||
+      manifestValue.savedInstance.content !== "unsanitized" ||
+      manifestValue.secretRedaction.replacements !== 0)) {
+      throw new Error("The .omni bundle has an invalid saved-instance preservation contract.");
+    }
     if (
       !isRecord(manifestValue.licenseLedger) ||
       typeof manifestValue.licenseLedger.application !== "string" ||
@@ -6542,10 +7053,16 @@ export class BrainRepository {
         )
       : [...imported.trainingSources];
     const hasConversationLedger = names.has("conversation/ledger.sqlite3");
+    if (savedInstance && !hasConversationLedger) {
+      throw new Error("The saved-instance bundle is missing its host conversation ledger.");
+    }
     if (hasConversationLedger) {
       const conversation = await ConversationLedger.open(archive.root, imported.id);
       try {
-        conversation.integrity();
+        const summary = conversation.integrity();
+        if (savedInstance && canonicalJson(imported.conversation) !== canonicalJson(summary)) {
+          throw new Error("The bundled host conversation head does not match its ledger.");
+        }
       } finally {
         conversation.close();
       }
@@ -6558,36 +7075,73 @@ export class BrainRepository {
       "Current .omni state",
       hasNeuralConversationLedger
     );
-    // The immutable origin has no separate bundled conversation ledger.
-    assertImportedNeuralConversationHead(originEngineValue, "Origin .omni state", false);
-    assertPortableWorkingMemoryCheckpoint(engineValue, "Current .omni state");
-    assertPortableWorkingMemoryCheckpoint(originEngineValue, "Origin .omni state");
+    const hasOriginNeuralConversationLedger = names.has("origin/conversation/neural-ledger.sqlite3");
+    assertImportedNeuralConversationHead(originEngineValue, "Origin .omni state", hasOriginNeuralConversationLedger);
+    if (savedInstance) {
+      for (const [scope, state] of [["current", engineValue], ["origin", originEngineValue]] as const) {
+        const working = `working/${scope}/working-memory.sqlite3`;
+        const paths = [...names].filter((name) => name.startsWith(`working/${scope}/`));
+        if (paths.some((name) => name !== working)) throw new Error("The bundle contains unlisted working-memory files.");
+        validateSavedWorkingPages(names.has(working) ? entryPath(working) : undefined, state);
+      }
+    } else {
+      assertPortableWorkingMemoryCheckpoint(engineValue, "Current .omni state");
+      assertPortableWorkingMemoryCheckpoint(originEngineValue, "Origin .omni state");
+    }
     if (hasNeuralConversationLedger) {
       validateNeuralConversationLedger(
         entryPath("conversation/neural-ledger.sqlite3"),
-        imported.id
+        imported.id,
+        engineValue
       );
     }
-    let importedArtifactIndex: PersistedArtifactIndex | undefined;
-    if (names.has("artifacts/index.json")) {
-      importedArtifactIndex = parseArtifactIndex(
-        JSON.parse(await readFile(entryPath("artifacts/index.json"), "utf8")),
-        imported.id
+    if (hasOriginNeuralConversationLedger) {
+      validateNeuralConversationLedger(
+        entryPath("origin/conversation/neural-ledger.sqlite3"), importedOrigin.id, originEngineValue
       );
+    }
+    for (const [state, hasLedger] of [
+      [engineValue, hasNeuralConversationLedger], [originEngineValue, hasOriginNeuralConversationLedger]
+    ] as const) {
+      if (savedInstance && !hasLedger && isRecord(state) &&
+        Array.isArray(state.pending_chat_slow_learning) && state.pending_chat_slow_learning.length) {
+        throw new Error("Pending chat replay is missing its saved neural conversation ledger.");
+      }
+    }
+    let importedArtifactIndex: PersistedArtifactIndex | undefined;
+    let originArtifactIndex: PersistedArtifactIndex | undefined;
+    for (const [prefix, brainId] of [["artifacts", imported.id], ["origin/artifacts", importedOrigin.id]] as const) {
+    if (names.has(`${prefix}/index.json`)) {
+      const artifactIndex = parseArtifactIndex(
+        JSON.parse(await readFile(entryPath(`${prefix}/index.json`), "utf8")), brainId
+      );
+      if (prefix === "artifacts") importedArtifactIndex = artifactIndex;
+      else originArtifactIndex = artifactIndex;
+      if (savedInstance && !names.has(`${prefix}/index.sqlite3`)) {
+        throw new Error("Saved generated artifacts are missing their exact ledger.");
+      }
+      if (names.has(`${prefix}/index.sqlite3`)) {
+        const ledger = await ArtifactIndexStore.open(join(archive.root, prefix), brainId);
+        try {
+          if (canonicalJson(ledger.snapshot()) !== canonicalJson(artifactIndex)) {
+            throw new Error("Saved artifact ledger does not match its bundled index.");
+          }
+        } finally { ledger.close(); }
+      }
       const declared = new Set(
-        importedArtifactIndex.artifacts.map(
-          (artifact) => `artifacts/files/${basename(artifact.relativePath)}`
+        artifactIndex.artifacts.map(
+          (artifact) => `${prefix}/files/${basename(artifact.relativePath)}`
         )
       );
-      const bundled = [...names].filter((name) => name.startsWith("artifacts/files/"));
+      const bundled = [...names].filter((name) => name.startsWith(`${prefix}/files/`));
       if (
         bundled.length !== declared.size ||
         bundled.some((name) => !declared.has(name))
       ) {
         throw new Error("Generated artifact bundle files do not match their index.");
       }
-      for (const artifact of importedArtifactIndex.artifacts) {
-        const path = `artifacts/files/${basename(artifact.relativePath)}`;
+      for (const artifact of artifactIndex.artifacts) {
+        const path = `${prefix}/files/${basename(artifact.relativePath)}`;
         const entry = archive.entries.get(path);
         if (
           !entry ||
@@ -6597,8 +7151,9 @@ export class BrainRepository {
           throw new Error(`Bundled generated artifact failed integrity: ${path}`);
         }
       }
-    } else if ([...names].some((name) => name.startsWith("artifacts/files/"))) {
+    } else if ([...names].some((name) => name.startsWith(`${prefix}/files/`) || name === `${prefix}/index.sqlite3`)) {
       throw new Error("The bundle contains generated artifacts without an index.");
+    }
     }
     const importedOriginChecksum = assertOriginChecksum(
       originBrainValue,
@@ -6635,6 +7190,56 @@ export class BrainRepository {
       validateExtractedMutableStateSnapshot(archive, "mutable/current", engineValue),
       validateExtractedMutableStateSnapshot(archive, "mutable/origin", originEngineValue)
     ]);
+    const jointPaths = { current: new Set<string>(), origin: new Set<string>() };
+    const operationalIntentPaths = { current: [] as string[], origin: [] as string[] };
+    for (const name of names) {
+      if (!name.startsWith("concept-views/")) continue;
+      const match = /^concept-views\/(current|origin)\/([a-f0-9]{64}\.jsonl)$/.exec(name);
+      if (!match) throw new Error("The bundle contains an unsafe structural concept view path.");
+      await validateConceptIdViewFile(entryPath(name), match[2]!);
+    }
+    for (const name of names) {
+      if (!name.startsWith("operational/")) continue;
+      const match = /^operational\/(current|origin)\/([a-f0-9-]{36}\.json)$/i.exec(name);
+      if (!match) throw new Error("The bundle contains an unsafe operational intent path.");
+      await validateSavedToolIntent(entryPath(name));
+      operationalIntentPaths[match[1] as "current" | "origin"].push(name);
+    }
+    for (const [scope, state] of [["current", engineValue], ["origin", originEngineValue]] as const) {
+      const files = await savedJointGenerationFiles(state, (kind, relative) =>
+        entryPath(`${kind}/${scope}/${relative}`)
+      );
+      jointPaths[scope] = new Set(files.keys());
+      const matching = [...names].filter((name) => name.startsWith(`joint/${scope}/`));
+      if (matching.some((name) => !jointPaths[scope].has(name.slice(`joint/${scope}/`.length)))) {
+        throw new Error("The bundle contains an unlisted ingestion joint-generation file.");
+      }
+    }
+    const recoveryPoints: NonNullable<OmniManifest["recoveryPoints"]> = [];
+    if (manifestValue.recoveryPoints !== undefined) {
+      if (!Array.isArray(manifestValue.recoveryPoints)) throw new Error("Saved recovery-point declaration is invalid.");
+      const ids = new Set<string>();
+      for (const value of manifestValue.recoveryPoints) {
+        if (!isRecord(value) || typeof value.id !== "string" || !SAFE_ID.test(value.id) ||
+          ids.has(value.id) || typeof value.brainId !== "string" || !SAFE_ID.test(value.brainId) ||
+          !Array.isArray(value.missingPayloads) || value.missingPayloads.some((path) => typeof path !== "string")) {
+          throw new Error("Saved recovery-point declaration is invalid.");
+        }
+        ids.add(value.id);
+        const checked = await validateSavedSnapshot(join(archive.root, "snapshots", value.id), value.id, value.brainId);
+        if (canonicalJson(checked.missingPayloads) !== canonicalJson(value.missingPayloads)) {
+          throw new Error("Saved recovery-point missing-payload report is invalid.");
+        }
+        recoveryPoints.push({ id: value.id, brainId: value.brainId, missingPayloads: checked.missingPayloads });
+      }
+    }
+    for (const path of names) {
+      if (path.startsWith("snapshots/") && !recoveryPoints.some((snapshot) =>
+        path === `snapshots/${snapshot.id}.json` || path === `snapshots/${snapshot.id}.meta.json` ||
+        path.startsWith(`snapshots/${snapshot.id}/`))) {
+        throw new Error("The bundle contains an undeclared saved recovery-point file.");
+      }
+    }
     const bundledBrainId = imported.id;
     const bundledGeneration = imported.lineage.generation;
     let rekeyed = false;
@@ -6793,7 +7398,8 @@ export class BrainRepository {
           join(destination, ...relative.split("/")),
           // Active pointers change as learning commits later generations.
           // Content-addressed generation manifests and blobs remain shareable.
-          !(prefix.endsWith("/current") && relative === "manifest.json")
+          !(prefix.endsWith("/current") && relative === "manifest.json") &&
+            !(prefix.startsWith("mutable/") && relative === "replay.sqlite3")
         );
       }
     };
@@ -6817,9 +7423,21 @@ export class BrainRepository {
         const destination = join(directory, "engine", "conversation.sqlite3");
         const info = await lstat(source);
         await operation?.checkDisk(this.root, info.size);
-        await copyFile(source, destination);
+        await copyMutableFileIsolated(source, destination);
         rekeyNeuralConversationLedger(destination, imported.id);
-        validateNeuralConversationLedger(destination, imported.id);
+        validateNeuralConversationLedger(destination, imported.id, engineValue);
+      }
+      if (hasOriginNeuralConversationLedger) {
+        await materializeFile(
+          entryPath("origin/conversation/neural-ledger.sqlite3"),
+          join(directory, "engine", "origin", "conversation.sqlite3"), false
+        );
+      }
+      for (const scope of ["current", "origin"] as const) {
+        for (const path of operationalIntentPaths[scope]) {
+          await materializeFile(entryPath(path), join(directory, "engine",
+            ...(scope === "origin" ? ["origin"] : []), "operational-tool-intents", basename(path)), false);
+        }
       }
       if (hasActivityLedger) {
         await BrainActivityLedger.clone(
@@ -6850,25 +7468,35 @@ export class BrainRepository {
       }
       const importedDocument = JSON.stringify(imported, null, 2);
       await operation?.checkDisk(this.root, Buffer.byteLength(importedDocument));
-      await atomicWrite(this.documentPath(imported.id), importedDocument);
-      if (importedArtifactIndex) {
-        const artifactDirectory = join(directory, "engine", "artifacts");
+      for (const [prefix, artifactIndex, artifactBrainId, artifactEngine] of [
+        ["artifacts", importedArtifactIndex, imported.id, join(directory, "engine")],
+        ["origin/artifacts", originArtifactIndex, importedOrigin.id, join(directory, "engine", "origin")]
+      ] as const) {
+      if (artifactIndex) {
+        const artifactDirectory = join(artifactEngine, "artifacts");
         await mkdir(artifactDirectory, { recursive: true });
         const materialized = new Set<string>();
-        for (const artifact of importedArtifactIndex.artifacts) {
+        for (const artifact of artifactIndex.artifacts) {
           const name = basename(artifact.relativePath);
           if (materialized.has(name)) continue;
           materialized.add(name);
           await materializeFile(
-            entryPath(`artifacts/files/${name}`),
+            entryPath(`${prefix}/files/${name}`),
             join(artifactDirectory, name)
           );
         }
-        await ArtifactIndexStore.replace(
-          artifactDirectory,
-          imported.id,
-          importedArtifactIndex.artifacts
-        );
+        if (names.has(`${prefix}/index.sqlite3`)) {
+          const ledgerPath = ArtifactIndexStore.databasePath(artifactDirectory);
+          await materializeFile(entryPath(`${prefix}/index.sqlite3`), ledgerPath, false);
+          const database = new DatabaseSync(ledgerPath);
+          try { database.prepare("UPDATE meta SET value=? WHERE key='brainId'").run(artifactBrainId); }
+          finally { database.close(); }
+          const ledger = await ArtifactIndexStore.open(artifactDirectory, artifactBrainId);
+          try { ledger.integrity(); } finally { ledger.close(); }
+        } else {
+          await ArtifactIndexStore.replace(artifactDirectory, artifactBrainId, artifactIndex.artifacts);
+        }
+      }
       }
       if (engineMaterialized) {
         if (resolvedReferences) {
@@ -6920,6 +7548,22 @@ export class BrainRepository {
           currentMutableStatePaths,
           join(directory, "engine", "state")
         );
+      }
+      for (const scope of ["current", "origin"] as const) {
+        const engine = scope === "current" ? join(directory, "engine") : join(directory, "engine", "origin");
+        for (const name of names) {
+          if (!name.startsWith(`concept-views/${scope}/`)) continue;
+          const file = name.slice(`concept-views/${scope}/`.length);
+          await validateConceptIdViewFile(entryPath(name), file);
+          await materializeFile(entryPath(name), join(engine, "state", "concept-id-views", file), false);
+        }
+        const working = `working/${scope}/working-memory.sqlite3`;
+        if (names.has(working)) {
+          await materializeFile(entryPath(working), join(engine, "state", "working-memory.sqlite3"), false);
+        }
+        if (jointPaths[scope].size) {
+          await installSubstrate(`joint/${scope}`, jointPaths[scope], join(engine, "state", "ingestion-joint"));
+        }
       }
       if (engineMaterialized) {
         operation?.signal.throwIfAborted();
@@ -6995,6 +7639,15 @@ export class BrainRepository {
           throw new Error(`Content-addressed blob validation failed for ${path}.`);
         }
       }
+      for (const snapshot of recoveryPoints) {
+        for (const path of [...names].filter((name) =>
+          name === `snapshots/${snapshot.id}.json` || name === `snapshots/${snapshot.id}.meta.json` ||
+          name.startsWith(`snapshots/${snapshot.id}/`)).sort()) {
+          await materializeFile(entryPath(path), join(directory, ...path.split("/")),
+            !/\.(?:json|sqlite3)$/.test(path));
+        }
+        await rekeySavedSnapshot(join(directory, "snapshots", snapshot.id), imported.id, snapshot.missingPayloads);
+      }
       await materializeFile(entryPath("origin/state/brain.json"), join(directory, "origin.json"));
       await operation?.checkpoint({
         phase: "promoting",
@@ -7008,6 +7661,9 @@ export class BrainRepository {
         sharedBytes: installedSharedBytes
       });
       operation?.signal.throwIfAborted();
+      // The host document is the final identity commit record. Reserved
+      // directories without it are not visible as half-installed brains.
+      await atomicWrite(this.documentPath(imported.id), importedDocument);
       return clone(await this.get(imported.id));
     } catch (error) {
       await removeTreeWithRetry(directory);

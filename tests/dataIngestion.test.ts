@@ -1627,6 +1627,26 @@ describe("whole-dataset persistence", { timeout: 30_000 }, () => {
       complete: true,
     });
     expect(run.results).toHaveLength(2);
+    expect(calls[0]?.transactionKey).not.toBe(calls[1]?.transactionKey);
+    await service.ingestManifest(brain.id, manifest.id, "encode");
+    expect(calls).toHaveLength(2);
+
+    // Explicit restart keeps this exact source snapshot, but gives each epoch
+    // a new durable identity. Resume of that restarted run keeps its identity.
+    await service.datasets.reset(brain.id, manifest.id, 2);
+    const restartId = (await service.datasets.cursor(brain.id, manifest.id)).runId;
+    expect(restartId).toEqual(expect.any(String));
+    const restarted = await service.ingestManifest(
+      brain.id, manifest.id, "encode", () => false, () => undefined, false, 2,
+    );
+    expect(restarted.coverage.complete).toBe(true);
+    expect(calls).toHaveLength(4);
+    expect(new Set(calls.map((params) => params.transactionKey)).size).toBe(4);
+    const committed = await service.datasets.progress(brain.id, manifest.id);
+    expect(committed.cursor.runId).toBe(restartId);
+    expect(committed.lastEntryReceipt?.runId).toBe(restartId);
+    await service.ingestManifest(brain.id, manifest.id, "encode");
+    expect(calls).toHaveLength(4);
   });
 
   it("replays a prelearned source in an explicit manifest but deduplicates one-off uploads", async () => {
@@ -1744,7 +1764,15 @@ describe("whole-dataset persistence", { timeout: 30_000 }, () => {
     expect(engineRequests[0]).toMatchObject({
       url: `${origin}/index.html`,
       kind: "text",
+      policy: "archive",
     });
+    const accepted = await service.ingestWeb({
+      brainId, url: `${origin}/index.html`, quarantine: false, policy: "pretrain",
+    });
+    expect(engineRequests).toHaveLength(2);
+    expect(engineRequests[1]).toMatchObject({ policy: "pretrain", allowReplay: true });
+    expect(accepted.source.id).toBe(result.results[0]?.source.id);
+    expect(accepted.source.policy).toBe("pretrain");
   });
 
   it("does not fetch a redirect target outside the default crawl origin", async () => {
@@ -2084,7 +2112,7 @@ describe("whole-dataset persistence", { timeout: 30_000 }, () => {
     expect(result.warnings.join(" ")).toMatch(/disk reserve/i);
   });
 
-  it("preserves a crawled page on typed neural resource pause but skips unrelated RPC failures", async () => {
+  it("preserves a crawled page on both resource pauses and learner failures", async () => {
     process.env.OMNI_ALLOW_LOCAL_URLS = "1";
     process.env.OMNI_CRAWL_MIN_DELAY_MS = "1";
     const origin = await listen((_request, response) => {
@@ -2155,10 +2183,10 @@ describe("whole-dataset persistence", { timeout: 30_000 }, () => {
     });
     expect(failed).toMatchObject({
       visited: 0,
-      skipped: 1,
-      frontierRemaining: 0,
-      stopped: false,
-      coverage: { complete: true },
+      skipped: 0,
+      frontierRemaining: 1,
+      stopped: true,
+      coverage: { complete: false },
     });
     expect(failed.warnings.join(" ")).toMatch(/unrelated worker failure/i);
   });

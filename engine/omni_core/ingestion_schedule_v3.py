@@ -191,6 +191,7 @@ def validate_ingestion_schedule_v3(
         "trainingSequenceTokens", "checkpointRecords",
     ):
         _count(schedule[field], field, minimum=1)
+    _count(schedule["trainingSequenceTokens"], "trainingSequenceTokens", minimum=2)
     page_records = _count(
         schedule["assemblyPageRecords"], "assemblyPageRecords", minimum=1
     )
@@ -266,12 +267,17 @@ def _validate_checkpoint_shape(value: Any) -> Dict[str, Any]:
     ):
         _hash(binding[field], field)
     _count(binding["checkpointSequence"], "checkpoint sequence", minimum=1)
+    cursor_fields = {"committedRecords", "recordPrefixSha256"}
+    if isinstance(binding["cursor"], Mapping) and "activeRecordWindowSha256" in binding["cursor"]:
+        cursor_fields.add("activeRecordWindowSha256")
     cursor = _mapping(
-        binding["cursor"], {"committedRecords", "recordPrefixSha256"},
+        binding["cursor"], cursor_fields,
         "v3 checkpoint cursor",
     )
     _count(cursor["committedRecords"], "committed records")
     _hash(cursor["recordPrefixSha256"], "record prefix")
+    if "activeRecordWindowSha256" in cursor:
+        _hash(cursor["activeRecordWindowSha256"], "active record window")
     if (
         cursor["committedRecords"] == 0
         and cursor["recordPrefixSha256"] != EMPTY_RECORD_PREFIX_SHA256
@@ -296,6 +302,8 @@ def _validate_checkpoint_shape(value: Any) -> Dict[str, Any]:
     ):
         raise ValueError("v3 checkpoint record coverage is incomplete")
     if coverage["sourceStreamExhausted"]:
+        if "activeRecordWindowSha256" in cursor:
+            raise ValueError("exhausted v3 source still has an active record window")
         if expected is not None and coverage["visitedRecords"] != expected:
             raise ValueError("v3 checkpoint final record coverage is incomplete")
         if coverage["sourceContentReverifiedSha256"] != binding["sourceContentSha256"]:

@@ -13,6 +13,8 @@ export interface ChatWorkspaceActivitySnapshot {
   queuedMessages: number;
   queuedJobs: number;
   runningJobs: number;
+  /** Completed text has no generation controls while optional work continues. */
+  postReplyWork?: number;
   queue?: ChatQueueState;
 }
 
@@ -43,11 +45,14 @@ export function workspaceChatActivityPresentation(
   const queuedJobs = safeCount(snapshot.queuedJobs);
   const runningJobs = safeCount(snapshot.runningJobs);
   const jobCount = queuedJobs + runningJobs;
+  const postReplyWork = safeCount(snapshot.postReplyWork ?? 0);
   const queuedSuffix = queuedMessages > 0
     ? ` · ${queuedMessages.toLocaleString()} message${queuedMessages === 1 ? "" : "s"} queued`
     : "";
 
-  if (snapshot.turnActive) {
+  const generating = snapshot.turnActive &&
+    snapshot.phase !== "reply-complete-learning" && snapshot.phase !== "action-result-learning";
+  if (generating) {
     if (snapshot.phase === "queued" && snapshot.queue) {
       const position = Math.max(1, Math.floor(snapshot.queue.position));
       const owner = snapshot.queue.queuedBehind.label;
@@ -62,25 +67,30 @@ export function workspaceChatActivityPresentation(
         blocksImmediateBrainActions: true
       };
     }
-    const replyComplete = snapshot.phase === "reply-complete-learning";
-    const actionResultLearning = snapshot.phase === "action-result-learning";
-    const postReplyLearning = replyComplete || actionResultLearning;
-    const headerLabel = actionResultLearning
-      ? `Action complete · integrating result${queuedSuffix}`
-      : replyComplete
-        ? `Reply complete · learning/saving${queuedSuffix}`
-        : `Reply in progress${queuedSuffix}`;
+    const headerLabel = `Reply in progress${queuedSuffix}`;
     return {
       headerLabel,
       headerAriaLabel:
         `${headerLabel}. Return to Conversation for explicit Queue or Steer controls.`,
-      waitingLabel: actionResultLearning
-        ? "The visible action is complete while its result enters neural learning. Return to Conversation to Queue or Steer."
-        : replyComplete
-          ? "Waiting for this reply to finish learning and saving. Return to Conversation to Queue or Steer."
-          : "Waiting for the current reply. Return to Conversation to Queue or Steer.",
-      showStreamingCursor: !postReplyLearning,
+      waitingLabel: "Waiting for the current reply. Return to Conversation to Queue or Steer.",
+      showStreamingCursor: true,
       blocksImmediateBrainActions: true
+    };
+  }
+
+  if (postReplyWork > 0 || snapshot.phase === "reply-complete-learning" ||
+      snapshot.phase === "action-result-learning") {
+    const headerLabel = snapshot.phase === "action-result-learning"
+      ? `Action complete · integrating result${queuedSuffix}`
+      : snapshot.phase === "reply-complete-learning"
+        ? `Reply complete · learning/saving${queuedSuffix}`
+        : `${postReplyWork.toLocaleString()} completed repl${postReplyWork === 1 ? "y" : "ies"} · save/action work`;
+    return {
+      headerLabel,
+      headerAriaLabel: `${headerLabel}. Completed output is preserved; the next message can be sent normally.`,
+      waitingLabel: "Completed output stays visible while save/action work runs independently.",
+      showStreamingCursor: false,
+      blocksImmediateBrainActions: false
     };
   }
 
@@ -130,7 +140,8 @@ export function workspaceViewWaitsForForegroundTurn(
   view: BusyAwareWorkspaceView,
   snapshot: ChatWorkspaceActivitySnapshot
 ): boolean {
-  return snapshot.turnActive && IMMEDIATE_BRAIN_ACTION_VIEWS.has(view);
+  return snapshot.turnActive && snapshot.phase !== "reply-complete-learning" &&
+    snapshot.phase !== "action-result-learning" && IMMEDIATE_BRAIN_ACTION_VIEWS.has(view);
 }
 
 export type DataActionScheduling = "queue-long-job" | "immediate-write";

@@ -615,7 +615,12 @@ jobs:
             echo "Release $RELEASE_TAG already exists; refusing to replace immutable assets." >&2
             exit 1
           fi
+          notes=()
+          if test -f "docs/releases/$RELEASE_TAG.md"; then
+            notes=(--notes-file "docs/releases/$RELEASE_TAG.md")
+          fi
           gh release create "$RELEASE_TAG" "${assets[@]}" \
             --verify-tag \
             --title "Omni AGI Studio $RELEASE_TAG" \
+            "${notes[@]}" \
             --generate-notes

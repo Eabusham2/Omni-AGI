@@ -11,6 +11,18 @@
   "executable": {
     "bundled": false,
     "distributionMode": "external-runtime-only",
+    "automaticProvisioning": {
+      "implementation": "reviewed-on-demand",
+      "status": "ready-pinned",
+      "manifestFile": "ffmpeg-runtime-manifest.json",
+      "manifestContentSha256": "1e9b02b716cc6b0700dcbfbaf86e155195894f2cd3edc78855c9e988ce67c514",
+      "requireExactBinaryAndPayloadHashes": true,
+      "requireCompleteCorrespondingSourceBeforeExecution": true,
+      "requireBuildAndInstallMaterialBeforeExecution": true,
+      "requireLinkedNonSystemLibrarySources": true,
+      "requirePreservedLicenseNotices": true,
+      "executeDownloadedSetupScripts": false
+    },
     "resolution": [
       "IMAGEIO_FFMPEG_EXE selected by the user or administrator",
       "an FFmpeg executable already installed on the host PATH"
@@ -33,6 +45,7 @@
     "requireCompleteCorrespondingSource": true,
     "requireBuildAndInstallScripts": true,
     "requireLinkedNonSystemLibrarySources": true,
+    "requireRuntimeProvisionerVerification": true,
     "requireArtifactVerifierUpdate": true
   }
 }

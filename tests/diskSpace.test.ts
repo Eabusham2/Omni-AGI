@@ -82,19 +82,19 @@ describe("global disk space-left contract", () => {
     ).rejects.toBeInstanceOf(DiskReservePauseError);
   });
 
-  it("adapts the OS reserve for small Linux/mobile storage and capable desktops", () => {
+  it("keeps the local-brain disk minimum independent of the RAM/device reserve", () => {
     expect(adaptiveDiskReserve({
       platform: "linux",
       diskTotalBytes: 16 * GIB
-    })).toBe(GIB);
+    })).toBe(MANDATORY_FREE_DISK_BYTES);
     expect(adaptiveDiskReserve({
       platform: "android",
       diskTotalBytes: 16 * GIB
-    })).toBe(Math.ceil(16 * GIB * 0.04));
+    })).toBe(MANDATORY_FREE_DISK_BYTES);
     expect(adaptiveDiskReserve({
       platform: "ios",
       diskTotalBytes: 256 * GIB
-    })).toBe(2 * GIB);
+    })).toBe(MANDATORY_FREE_DISK_BYTES);
     expect(adaptiveDiskReserve({
       platform: "darwin",
       diskTotalBytes: 500 * GIB
@@ -103,6 +103,21 @@ describe("global disk space-left contract", () => {
       platform: "linux",
       diskTotalBytes: 16 * GIB,
       operationWriteBytes: 4 * GIB
-    })).toBe(GIB + Math.ceil(4 * GIB * 0.05));
+    })).toBe(MANDATORY_FREE_DISK_BYTES);
+  });
+
+  it("does not clamp the required reserve to an undersized volume or an override", () => {
+    expect(adaptiveDiskReserve({ diskTotalBytes: 0 })).toBe(MANDATORY_FREE_DISK_BYTES);
+    expect(adaptiveDiskReserve({
+      diskTotalBytes: 16 * GIB,
+      userMinimumReserveBytes: 24 * GIB
+    })).toBe(24 * GIB);
+    const report = calculateDiskSpaceReport({
+      diskTotalBytes: 16 * GIB,
+      diskFreeBytes: 15 * GIB,
+      mandatoryReserveBytes: GIB
+    });
+    expect(report.mandatoryReserveBytes).toBe(MANDATORY_FREE_DISK_BYTES);
+    expect(report.paused).toBe(true);
   });
 });

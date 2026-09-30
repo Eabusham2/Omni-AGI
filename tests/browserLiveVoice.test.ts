@@ -94,7 +94,7 @@ describe("browser live voice adapters", () => {
       recognitionDetail:
         "Web Speech recognition is not exposed by this Electron/Chromium build. No transcript fallback is fabricated.",
       neuralDetail:
-        "Platform Web Speech/TTS is not neural audio. Direct trained-modality input/output requires a compatible neural audio pack."
+        "Platform STT/TTS are the defaults. Own waveform output uses this brain's audio region; speech quality requires paired training and verification."
     });
     expect(createBrowserRecognitionAdapter({}).available).toBe(false);
   });

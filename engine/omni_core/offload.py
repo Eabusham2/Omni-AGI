@@ -33,6 +33,7 @@ from .persistence import (
     load_tensors,
     read_json,
 )
+from .managed_process_memory import default_managed_process_sampler
 
 
 GIB = 1024 ** 3
@@ -60,6 +61,15 @@ class ResourceReading:
     accelerator_free_memory_bytes: Optional[int] = None
     accelerator_allocated_memory_bytes: Optional[int] = None
     process_peak_memory_bytes: Optional[int] = None
+    managed_process_memory_bytes: Optional[int] = None
+    managed_worker_rss_bytes: Optional[int] = None
+    managed_memory_verified: Optional[bool] = None
+    managed_memory_scope: str = "single-process-provider"
+    managed_memory_root_pid: Optional[int] = None
+    managed_memory_process_count: int = 1
+    managed_memory_cached: bool = False
+    managed_memory_sample_duration_ms: float = 0.0
+    managed_memory_sample_age_seconds: float = 0.0
 
 
 _MAC_FOOTPRINT_CACHE_SECONDS = 1.0
@@ -531,6 +541,7 @@ class ResourcePolicy:
             else (None, None, None)
         )
         process_memory, process_peak_memory = _process_memory()
+        managed = default_managed_process_sampler().sample()
         return ResourceReading(
             total_memory_bytes=total,
             available_memory_bytes=available,
@@ -541,6 +552,15 @@ class ResourcePolicy:
             accelerator_free_memory_bytes=accelerator_free,
             accelerator_allocated_memory_bytes=accelerator_allocated,
             process_peak_memory_bytes=process_peak_memory,
+            managed_process_memory_bytes=managed.rss_bytes,
+            managed_worker_rss_bytes=managed.worker_rss_bytes,
+            managed_memory_verified=managed.verified,
+            managed_memory_scope=managed.scope,
+            managed_memory_root_pid=managed.root_pid,
+            managed_memory_process_count=managed.process_count,
+            managed_memory_cached=managed.cached,
+            managed_memory_sample_duration_ms=managed.sample_duration_ms,
+            managed_memory_sample_age_seconds=managed.sample_age_seconds,
         )
 
     @staticmethod
@@ -560,14 +580,11 @@ class ResourcePolicy:
 
     @staticmethod
     def _adaptive_disk_reserve(total: int) -> int:
-        # Twenty GiB remains the recommendation/ceiling on capable desktop
-        # volumes. Constrained Linux devices use a proportional floor so the
-        # reserve cannot make the entire device unusable before model/scratch
-        # bytes are accounted separately.
-        total = max(0, int(total))
-        if total <= 0:
-            return 1 * GIB
-        return min(20 * GIB, max(1 * GIB, math.ceil(total * 0.05)))
+        # The user repeated a twenty-GiB minimum for every local brain. The
+        # small-device exception concerned RAM, not this disk watermark. Keep
+        # an undersized or unmeasured volume paused instead of lowering it.
+        del total
+        return 20 * GIB
 
     @staticmethod
     def _adaptive_system_ram_share(
@@ -609,24 +626,33 @@ class ResourcePolicy:
                 self.storage_bytes_per_second,
             )
         )
-        # Auto is a live allocation policy, not a rigid percentage. Raise it
-        # when the measured process plus the next allocation safely fits in the
-        # pool, otherwise a healthy device can be paused merely because Omni is
-        # already resident. Manual remains an exact ceiling. The 90% Auto cap
-        # and the separately subtracted OS reserve still protect the host.
-        estimate = max(0, int(estimated_ram_bytes))
-        if (
-            not self.configured_system_ram_share_percent
-            and safe_pool > 0
-            and estimate > 0
-        ):
-            projected = int(reading.process_memory_bytes or 0) + estimate
-            allocation_margin = max(64 * MIB, math.ceil(estimate * 0.05))
-            required_share = math.ceil(
-                (projected + allocation_margin) * 100.0 / safe_pool
-            )
-            share = max(float(share), min(90.0, float(required_share)))
+        # Auto's recommendation is also a ceiling, not permission to raise
+        # the selected share merely because the next allocation is larger.
+        # Spill eligible hot data, choose smaller exhaustive windows, or pause.
+        del estimated_ram_bytes
         return safe_pool, int(safe_pool * share / 100.0), float(share)
+
+    @staticmethod
+    def _admission_resident_memory(reading: ResourceReading) -> Tuple[Optional[int], str, bool]:
+        current, peak = reading.process_memory_bytes, reading.process_peak_memory_bytes
+        family, worker_rss = reading.managed_process_memory_bytes, reading.managed_worker_rss_bytes
+        if type(current) is int and current >= 0:
+            local, basis = current, "current-worker-residency"
+        elif reading.managed_memory_verified is True and type(worker_rss) is int and worker_rss > 0:
+            local, basis = worker_rss, "measured-family-worker-rss-fallback"
+        elif type(peak) is int and peak >= 0:
+            local, basis = peak, "conservative-worker-peak-fallback"
+        else:
+            return None, "unmeasured-worker-residency", False
+        if type(family) is int and family >= 0 and reading.managed_memory_verified is True:
+            # On macOS the primary worker footprint can exceed RSS (compressed
+            # or driver-owned pages). Floor the local contribution at it.
+            others = max(0, family - worker_rss) if type(worker_rss) is int and worker_rss >= 0 else family
+            aggregate = max(family, others + local)
+            return aggregate, "managed-family-rss-conservative-shared-pages-double-counted", basis in {"current-worker-residency", "measured-family-worker-rss-fallback"}
+        if reading.managed_memory_verified is False:
+            return local, basis + ";managed-family-unmeasured", False
+        return local, basis, basis == "current-worker-residency"
 
     def status(
         self,
@@ -653,26 +679,28 @@ class ResourcePolicy:
                 estimated_ram_bytes=estimated_ram_bytes,
             )
         )
-        projected_process_memory = int(reading.process_memory_bytes or 0) + max(
-            0, int(estimated_ram_bytes)
-        )
+        admission_resident, accounting_basis, accounting_verified = self._admission_resident_memory(reading)
+        projected_process_memory = None if admission_resident is None else admission_resident + max(0, int(estimated_ram_bytes))
         available_safe_ram = max(0, int(available or 0) - ram_reserve)
         # Already-resident Omni pages count toward its committed envelope. A
         # free-RAM-only reading would report false pressure as the model fills
         # the very capacity reserved for it.
         current_omni_available = min(
             system_ram_budget,
-            available_safe_ram + int(reading.process_memory_bytes or 0),
+            available_safe_ram + int(admission_resident or 0),
         )
         current_omni_shortfall = max(
             0, system_ram_budget - current_omni_available
         )
+        unknown_ram = (not accounting_verified or reading.total_memory_bytes is None or available is None)
         memory_pressure = bool(
+            unknown_ram
+            or
             (
                 available is not None
                 and available - max(0, int(estimated_ram_bytes)) <= ram_reserve
             )
-            or projected_process_memory > system_ram_budget
+            or (projected_process_memory is not None and projected_process_memory > system_ram_budget)
         )
         disk_pressure = projected_disk <= disk_reserve
         return {
@@ -681,6 +709,22 @@ class ResourcePolicy:
             "availableMemoryBytes": available,
             "processMemoryBytes": reading.process_memory_bytes,
             "processPeakMemoryBytes": reading.process_peak_memory_bytes,
+            "admissionResidentMemoryBytes": admission_resident,
+            "managedProcessMemoryBytes": reading.managed_process_memory_bytes,
+            "managedMemoryRootPid": reading.managed_memory_root_pid,
+            "managedMemoryProcessCount": reading.managed_memory_process_count,
+            "managedMemoryScope": reading.managed_memory_scope,
+            "managedMemorySampleCached": reading.managed_memory_cached,
+            "managedMemorySampleDurationMs": reading.managed_memory_sample_duration_ms,
+            "managedMemorySampleAgeSeconds": reading.managed_memory_sample_age_seconds,
+            "managedMemoryCacheIntervalSeconds": 1.0,
+            "memoryAccountingBasis": accounting_basis,
+            "memoryAccountingVerified": accounting_verified,
+            "ramAdmissionVerified": not unknown_ram,
+            "ramCapMechanism": "cooperative-measured-family-plus-estimated-allocation-admission",
+            "hardRssIsolation": False,
+            "crossProcessAtomicReservation": False,
+            "osPhysicalPagePinning": False,
             "acceleratorTotalMemoryBytes": (
                 reading.accelerator_total_memory_bytes
             ),
@@ -721,7 +765,8 @@ class ResourcePolicy:
             "waitForMemory": memory_pressure,
             "retryAfterSeconds": 5 if memory_pressure else 0,
             "userAction": (
-                "Close memory-heavy applications, then retry; saved context "
+                "RAM residency measurement is unavailable; retry under the selected ceiling."
+                if unknown_ram else "Close memory-heavy applications, then retry; saved context "
                 "capacity will not be reduced."
                 if memory_pressure
                 else None
@@ -758,7 +803,9 @@ class ResourcePolicy:
 
         if resource_mode not in {"auto", "manual"}:
             raise ValueError("training resource mode must be auto or manual")
-        max_window_tokens = max(8, int(max_window_tokens))
+        max_window_tokens = int(max_window_tokens)
+        if max_window_tokens < 2:
+            raise ValueError("training windows need at least two tokens for next-token labels")
         requested_batch_size = max(1, int(requested_batch_size))
         requested_gradient_accumulation = max(
             1, int(requested_gradient_accumulation)
@@ -778,6 +825,7 @@ class ResourcePolicy:
             1024, int(activation_bytes_per_token)
         )
         reading = self.readings()
+        admission_resident, accounting_basis, accounting_verified = self._admission_resident_memory(reading)
         ram_reserve = self.configured_ram_reserve or self._adaptive_ram_reserve(
             reading.total_memory_bytes
         )
@@ -790,10 +838,13 @@ class ResourcePolicy:
         learning_state_bytes = (
             optimizer_and_gradient_bytes + packed_update_scratch_bytes
         )
-        minimum_window = min(MIN_TRAINING_WINDOW_TOKENS, max_window_tokens)
+        # Two adjacent tokens are the actual mathematical minimum for shifted
+        # labels. Sixty-four remains a preferred shape, never an allocation
+        # floor that can override the measured live compute reservation.
+        minimum_window = 2
+        preferred_window = min(MIN_TRAINING_WINDOW_TOKENS, max_window_tokens)
         minimum_training_allocation = (
             learning_state_bytes
-            + 128 * MIB
             + activation_bytes_per_token * minimum_window
         )
         safe_ram_pool, system_ram_budget, system_ram_share = (
@@ -806,10 +857,12 @@ class ResourcePolicy:
         physical_ram_headroom = max(
             0,
             min(
-                system_ram_budget - int(reading.process_memory_bytes or 0),
+                system_ram_budget - int(admission_resident or 0),
                 int(reading.available_memory_bytes or 0) - ram_reserve,
             ),
         )
+        if not accounting_verified or reading.total_memory_bytes is None or reading.available_memory_bytes is None:
+            physical_ram_headroom = 0
         requested_ram_budget = max(0, int(manual_ram_budget_bytes))
         ram_budget = physical_ram_headroom
         warnings: list[str] = []
@@ -848,15 +901,25 @@ class ResourcePolicy:
         # AdamW creates two moments and gradients in addition to the already
         # resident mutable parameters. The margin absorbs allocator
         # fragmentation, routing state, Python record objects, and OS jitter.
-        allocator_margin = max(128 * MIB, int(ram_budget * 0.10))
+        def allocator_margin_for(budget: int) -> int:
+            # The process/model baseline has already been measured and
+            # subtracted above. Reserve a proportional part of a small
+            # remaining partition instead of inventing a further 128-MiB
+            # resident allocation that would reject otherwise valid windows.
+            return max(
+                1,
+                math.ceil(max(0, budget) * 0.10),
+                min(128 * MIB, math.ceil(max(0, budget) * 0.25)),
+            )
+
+        allocator_margin = allocator_margin_for(ram_budget)
+        accelerator_margin = 0
         training_headroom = max(
             0,
             ram_budget - learning_state_bytes - allocator_margin,
         )
         if accelerator_budget is not None:
-            accelerator_margin = max(
-                128 * MIB, int(accelerator_budget * 0.10)
-            )
+            accelerator_margin = allocator_margin_for(accelerator_budget)
             training_headroom = min(
                 training_headroom,
                 max(
@@ -868,6 +931,7 @@ class ResourcePolicy:
             )
 
         window_tokens = max_window_tokens
+        affordable_window_tokens = training_headroom // activation_bytes_per_token
         bytes_per_full_sample = activation_bytes_per_token * window_tokens
         maximum_full_batch = training_headroom // max(1, bytes_per_full_sample)
         if maximum_full_batch < 1:
@@ -875,7 +939,7 @@ class ResourcePolicy:
                 max_window_tokens,
                 max(
                     minimum_window,
-                    training_headroom // activation_bytes_per_token,
+                    affordable_window_tokens,
                 ),
             )
         physical_batch_limit = min(
@@ -910,7 +974,7 @@ class ResourcePolicy:
                 accelerator_budget is not None
                 and accelerator_budget
                 < learning_state_bytes
-                + 128 * MIB
+                + accelerator_margin
                 + activation_bytes_per_token * minimum_window
             )
         )
@@ -982,7 +1046,15 @@ class ResourcePolicy:
             "effectiveBatchTarget": int(effective_target),
             "windowTokens": int(window_tokens),
             "requestedWindowTokens": int(max_window_tokens),
+            "minimumWindowTokens": minimum_window,
+            "preferredWindowTokens": preferred_window,
+            "maximumAffordableWindowTokens": int(affordable_window_tokens),
+            "admittedWindowTokens": 0 if pause_before_step else int(window_tokens),
+            "windowOverlapTokens": 1,
+            "labelTargetsCoveredOnce": True,
             "allSourceBytesVisited": True,
+            "coverageConfirmed": False,
+            "sourceCoverage": "exhaustive-overlapping-window-schedule-required",
             "pauseBeforeStep": bool(pause_before_step),
             "warnings": warnings,
             "memory": {
@@ -997,6 +1069,9 @@ class ResourcePolicy:
                     else "auto"
                 ),
                 "ramReserveBytes": int(ram_reserve),
+                "admissionResidentMemoryBytes": admission_resident,
+                "memoryAccountingBasis": accounting_basis,
+                "memoryAccountingVerified": accounting_verified,
                 "acceleratorBudgetBytes": accelerator_budget,
                 "acceleratorHeadroomBytes": accelerator_headroom,
                 "acceleratorReserveBytes": int(accelerator_reserve),
@@ -1006,6 +1081,7 @@ class ResourcePolicy:
                 "packedUpdateScratchBytes": int(packed_update_scratch_bytes),
                 "activationBytesPerToken": int(activation_bytes_per_token),
                 "allocatorMarginBytes": int(allocator_margin),
+                "acceleratorAllocatorMarginBytes": int(accelerator_margin),
             },
             "scratch": {
                 "available": scratch_available,
@@ -2940,8 +3016,8 @@ class MutableStateStore:
         }
 
     def prior_core_generations(
-        self, pointer: Mapping[str, Any]
-    ) -> Sequence[Tuple[str, Dict[str, torch.Tensor]]]:
+        self, pointer: Mapping[str, Any], *, bounded: bool = False,
+    ) -> Sequence[Tuple[str, Mapping[str, torch.Tensor]]]:
         """Return newest-first, fully verified core recovery generations.
 
         The collector retains the immediately previous committed generation
@@ -2949,12 +3025,14 @@ class MutableStateStore:
         directory name alone: each manifest, content hash, role path, blob
         length, and blob checksum is revalidated through :meth:`_generation`
         before any tensor is exposed to checkpoint repair.
+        ``bounded=True`` keeps only a verified lazy inventory and reads the
+        affected control tensor on demand, rather than loading a full core map.
         """
 
         active = self._generation(pointer)
         active_id = str(pointer.get("activeGeneration", ""))
         active_created = float(active.get("createdAt", float("inf")))
-        candidates: list[Tuple[float, str, Dict[str, torch.Tensor]]] = []
+        candidates: list[Tuple[float, str, Mapping[str, torch.Tensor]]] = []
         generations = self.path / "generations"
         if not generations.is_dir():
             return ()
@@ -2980,9 +3058,13 @@ class MutableStateStore:
                 if not math.isfinite(created) or created > active_created:
                     continue
                 core_spec = generation["roles"]["core"]
-                core = load_tensors(
-                    self.path / str(core_spec["path"]), device="cpu"
-                )
+                if bounded:
+                    from .bounded_tensor_io import LazyTensorMapping
+                    core = LazyTensorMapping(self.path / str(core_spec["path"]))
+                else:
+                    core = load_tensors(
+                        self.path / str(core_spec["path"]), device="cpu"
+                    )
                 candidates.append((created, generation_id, core))
             except (OSError, ValueError, KeyError, TypeError):
                 # A broken non-authoritative recovery point must never prevent

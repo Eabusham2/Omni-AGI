@@ -15,11 +15,15 @@ An `.omni` file is a non-executable ZIP container for OmniCortex state. The curr
 
 The schema-version value above is illustrative of the current build constant; import requires an exact match with that build. The importer never loads pickle objects and never executes repository code or setup scripts from a bundle.
 
-This format carries a brain's neural identity and immutable origin. Its current
-sanitized export is **not** an exact conversational or training continuation:
-chat ledgers, pending chat-learning jobs, active ingestion cursors, and
-temporary cold working-memory pages are not restored. Build recipes and
-modality-only weights use smaller, separate
+This format carries a brain's saved neural identity and immutable origin.
+The local source correction preserves saved content **unsanitized**, including
+chat ledgers, pending chat-learning jobs, committed ingestion cursors and cold
+working-memory pages. This is saved-state preservation, not an in-flight
+process clone or automatic relocation/resumption of external datasets. The
+correction is not part of the already-published v1.1.0 artifacts.
+An unfinished/unready instance or missing materialized origin is rejected
+before export rather than producing an archive that native import cannot load.
+Build recipes and modality-only weights use smaller, separate
 contracts documented in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
 
 ## Required entries
@@ -72,16 +76,17 @@ root pointer is synthesized from the generation recorded in
 pointer left by an interrupted save cannot change the exported identity.
 
 `state/brain.json` is inspectable Electron state: configuration, lineage,
-messages, traces, journal, derived concept/synapse summaries, and sanitized or
-archived source metadata. `state/engine.json` is Python-worker metadata. Core
+messages, traces, journal, derived concept/synapse summaries, and saved source
+metadata without redaction. `state/engine.json` is Python-worker metadata. Core
 safe tensors contain slow neural and modality parameters. Plastic safe tensors
 contain non-substrate SNN state, replay tensors, liquid activity, and other
 mutable recurrent state.
 
 The substrate tree is the authoritative associative-memory payload. Its JSON
 shards contain neuron, distributed-assembly, and signed ternary synapse
-records. Its safe-tensor shards contain neuron/assembly hypervectors and
-higher-precision sparse learning state. The sharded persistence contract is
+records. V3 safe-tensor shards contain authoritative packed neuron/assembly
+vector rows; higher-precision transient activity/eligibility is not a learned
+floating weight shadow. The sharded persistence contract is
 documented in [SUBSTRATE_PERSISTENCE.md](SUBSTRATE_PERSISTENCE.md).
 
 Each `packed/**` directory is a complete `omni-packed-ternary` inference
@@ -92,7 +97,18 @@ codes, least-significant pair first: `00 = -1`, `01 = 0`, `10 = +1`; `11` is
 reserved and rejected. Unused pairs must use canonical zero padding (`01`).
 `manifest.sha256` authenticates the exact canonical manifest bytes.
 
-Private archives may add `blobs/<sha256>` source objects. Referenced-local bundles keep all required paths but replace their four safe-tensor entries with valid placeholder safe tensors and every packed-ternary entry with a local-reference marker. The manifest points to the real content-addressed objects held by the originating local repository.
+Every mode preserves source blobs actually referenced by its saved state and
+recovery history; it does not resurrect deleted or unretained training files.
+Referenced-local bundles keep required paths but replace their four
+safe-tensor entries with valid placeholder safe tensors and every
+packed-ternary entry with a local-reference marker. The manifest points to the
+real content-addressed objects held by the originating local repository.
+
+Saved-instance bundles additionally carry conversation/activity ledgers,
+annotated artifact ledgers/files, referenced working-page databases, committed
+joint-generation manifests/index snapshots and declared recovery history.
+Every payload is checksum-bound. A missing historical cold-page/joint payload
+is explicitly listed, not recreated or described as a restorable checkpoint.
 
 ## Manifest contract
 
@@ -106,7 +122,9 @@ The manifest records and validates:
   counts, and—only for referenced-local mode—per-file object references;
 - descriptors and checksums for the current and immutable-origin substrate
   pointers, generation manifests, and every referenced bounded shard;
-- secret-redaction policy version and replacement count;
+- `savedInstance: {version: 1, content: "unsanitized"}`, zero replacements in
+  the retained `secretRedaction` envelope, and included conversation state;
+- declared recovery points and any exact already-missing historical references;
 - an application-license declaration and normalized per-source provenance/license ledger;
 - SHA-256 and exact byte length for every payload entry except `manifest.json` and `checksums.sha256`;
 - for referenced-local mode, the SHA-256 object IDs for current and origin
@@ -164,10 +182,10 @@ before it becomes a visible brain.
 
 | API mode | Manifest mode | Selected payload | Portability |
 | --- | --- | --- | --- |
-| `current` | `current-portable` | Current committed neural state; chat and cold temporary pages omitted | Self-contained |
-| `origin` | `origin-portable` | Immutable starting state | Self-contained |
-| `private-archive` | `private-archive` | Current neural state plus retained source blobs after confirmation; chat omitted | Self-contained and sensitive |
-| `referenced` | `referenced-local` | Sanitized current state with local tensor references | Same repository only |
+| `current` | `current-portable` | Current saved neural/chat/working/continuation state and recovery history, unsanitized | Self-contained saved state; external datasets not relocated |
+| `origin` | `origin-portable` | Selected immutable starting checkpoint plus its saved state and declared recovery history | Self-contained saved state |
+| `private-archive` | `private-archive` | Current saved state and referenced retained source content, unsanitized | Self-contained saved state and sensitive |
+| `referenced` | `referenced-local` | Unsanitized current saved state with local tensor references | Same repository only |
 
 Every mode includes an `origin/**` payload and both `packed/current/**` and
 `packed/origin/**`, plus `substrate/current/**` and `substrate/origin/**`, when
@@ -199,51 +217,31 @@ infinite storage: host filesystem limits, available address space, configured
 free-disk reserve, user cancellation, and corrupt or unsupported ZIP structures
 remain explicit stopping conditions.
 
-## Privacy and secret-redaction boundary
+## Saved content and privacy
 
-For `current-portable`, `origin-portable`, and `referenced-local`, the exporter:
+Every mode preserves saved text, source paths, settings, annotations, retained
+blobs and neural state without credential-pattern redaction. Private paths or
+credential-shaped text are not silently removed or refused merely for being
+private. JSON/text, hashes, native origins, safetensors, archive paths and
+reference integrity remain validated. A passing export is **not** a
+secret-free certificate: the desktop warns before all modes, and sharing must
+be limited to trusted recipients.
 
-- removes training-source local paths, retained raw text, and source blob hashes from application state;
-- removes retained `raw_text` from worker source records;
-- removes statements from document/import idea records;
-- excludes content-addressed source blobs;
-- downgrades every non-`Off` tool grant to `Ask`;
-- recursively redacts recognized credential-shaped values in application and engine JSON.
+The bundle excludes the app's external browser partition and OS credential
+vault. Saved brain content may itself contain secrets; that is preserved as
+requested. Import begins dormant rather than automatically performing external
+actions. A collision rekeys live ownership while preserving the immutable
+origin and rehashing imported recovery ownership.
 
-Portable bundles omit both raw conversation ledgers. The exported engine copy
-therefore has an empty chat-ledger head, no prior turn receipts, no temporary
-dialogue tokens, and no queued chat replay that would need an omitted raw
-message. The model card and manifest disclose the number of omitted ledger
-rows and pending replay jobs; those jobs will **not** resume after import.
-The model card also counts omitted active ingestion cursors; their local source
-files and cold-page generation bindings cannot be resumed from this bundle.
-The current bundle also omits `state/working-memory.sqlite3`, so cold temporary
-pages do not return even if the source brain had them. Its exported checkpoint
-is set to the Python worker's empty-page checksum, and import rejects a
-nonempty page claim without that database. The export must not be
-described as a byte-exact continuation of its temporary attention state.
-Committed neural weights and substrate state remain in the bundle, but this
-privacy projection is not an exact continuation of pending learning. The live
-source brain and its queue are unchanged by export.
-
-The recursive redactor replaces values under credential-like field names and recognized private-key, AWS access-key, GitHub token, OpenAI-style key, bearer-token, password/assignment, and credential-bearing URL patterns. It runs in private-archive mode as well.
-
-Current and immutable-origin substrate JSON shards are content-addressed and
-cannot be redacted without invalidating their generation manifests. Before
-publishing any `.omni` mode, export streams every selected substrate `.json`
-file and refuses the archive if it finds a recognized credential or local
-private-path pattern, or if the shard is not valid UTF-8 text. The source
-brain and its shard graph are not rewritten; errors name only the relative
-shard path, not its contents.
-
-A private archive may retain source paths, raw text, and source blobs only after explicit desktop confirmation. Before packaging, each text-like retained blob is scanned with the same patterns; export refuses the archive if a likely credential is found. Binary blobs are sampled to determine whether they are text-like. This is a deliberate practical boundary, not a proof that arbitrary user-authored or binary data is secret-free. Users must still inspect sensitive archives before sharing them.
-
-Pattern scanning cannot certify binary tensors or arbitrary memorized
-information as secret-free. Even a passing export is not a full privacy
-guarantee for learned weights or unrecognized secret formats.
-
-The bundle does not contain the app's browser partition, operating-system credentials, or a credential vault.
+Pending learning receipts and dataset cursors are preserved, not automatically
+executed. Dataset continuation still checks its original absolute path/stat,
+content hash, name/kind/policy/epoch and parser bindings. Moving the source
+elsewhere does not silently reset or remap its cursor. Durable neural-ledger
+rows beyond the authoritative checkpoint are archived as present; the worker's
+existing authorized-load recovery discards the uncommitted suffix. No old
+missing snapshot payload is fabricated. Export does not modify the source
+mind's learned state or queued records.
 
 ## Provenance and licensing
 
-The manifest's license ledger preserves the Omni application license declaration plus source name, optional provenance URL, license label, and optional license URL. The state continues to retain source content hashes, import timestamps, policies, and provenance where the selected privacy mode allows it. Import requires a structurally valid ledger, and the desktop can expose those declarations before a pack is installed. License metadata is attribution and warning data; it does not itself verify ownership or grant rights.
+The manifest's license ledger preserves the Omni application license declaration plus source name, optional provenance URL, license label, and optional license URL. Saved source content hashes, timestamps, policies and provenance are preserved without a privacy projection. Import requires a structurally valid ledger, and the desktop can expose those declarations before a pack is installed. License metadata is attribution and warning data; it does not itself verify ownership or grant rights.

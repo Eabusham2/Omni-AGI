@@ -4,11 +4,12 @@ Only ordinary next-token/reconstruction learning is performed here. A run
 must use a randomly initialized OmniCortex brain; there is no reward model,
 preference objective, RLHF stage, or imported model.
 
-Dense gradients would be reduced by DDP/FSDP, but packed-authoritative
-synapses mutate during backward outside that reduction. Multi-rank training
-therefore fails closed until those updates can be synchronized. The historical
-rank-zero replay and checkpoint path below is not a proof of distributed
-packed-synapse equivalence.
+Packed derivatives are staged, reduced in a fixed owner/row order, and applied
+once to a canonical uint8 identity. Literal source windows are not sampled.
+Fast substrate/STDP state is replayed in global source order on the canonical
+native checkpoint, then every replica refreshes from that exact publication.
+Runtime neural quality and distributed throughput remain separate acceptance
+gates; source and primitive checks do not establish either.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import signal
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -51,6 +52,7 @@ from .distributed_runtime import (
     DatasetManifestEntry,
     DistributedContext,
     DistributedRunStore,
+    DistributedRunLease,
     RankCursor,
     ResourceReading,
     aggregate_resource_readings,
@@ -64,10 +66,18 @@ from .ground_up import (
     ground_up_curriculum_manifest,
     validate_ground_up_v3_training_manifest,
 )
-from .model import PACKED_AUTHORITATIVE_PROJECTION_TYPES
+from .model import PACKED_AUTHORITATIVE_PROJECTION_TYPES, _apply_packed_gradient_rows
+from .packed_collective import PackedCollectiveController
+from .packed_collective_hooks import packed_derivative_sink
+from .collective_controls import synchronize_control_state
+from .window_wave_buffer import PreparedWindowWave
 from .optimizers import PackedOnlyOptimizer, adamw_for_remaining_parameters
 from .persistence import tensor_checksum
 from .ternary_packing import verify_ternary_shards
+from .text_spool import DatasetResourcePause
+from .record_window_wave import RecordWindowStream
+from .distributed_seal import make_distributed_training_seal, native_topology_sha256
+from .text_spool import bounded_json_sha256
 
 
 _DISTRIBUTED_ORIGIN_IDENTITY_FIELDS = (
@@ -470,7 +480,7 @@ def _validate_distributed_origin_template(
 class DistributedTrainingOptions:
     epochs: int = 1
     global_batch_records: int = 16
-    micro_batch_records: int = 2
+    micro_batch_records: int = 0  # Auto: admitted capacity, not a fixed ceiling.
     gradient_accumulation: int = 0
     learning_rate: Optional[float] = None
     strategy: str = "auto"
@@ -488,8 +498,8 @@ class DistributedTrainingOptions:
             raise ValueError("distributed training epochs must be positive")
         if self.global_batch_records < 1:
             raise ValueError("global batch records must be positive")
-        if self.micro_batch_records < 1:
-            raise ValueError("micro batch records must be positive")
+        if self.micro_batch_records < 0:
+            raise ValueError("micro batch records must be auto (0) or positive")
         if self.gradient_accumulation < 0:
             raise ValueError("gradient accumulation cannot be negative")
         if self.strategy not in {"auto", "ddp", "fsdp"}:
@@ -649,13 +659,14 @@ class DistributedBrainTrainingModule(nn.Module):
         *,
         world_size: int,
         global_window_count: int,
+        global_label_count: int,
         include_stability: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if global_window_count < 1:
+        if global_window_count < 1 or global_label_count < 1:
             raise ValueError("global training wave contains no token windows")
         if ids.shape[0] == 0:
             loss = self._zero_loss()
-            measurements = torch.zeros((5,), dtype=torch.float32, device=loss.device)
+            measurements = torch.zeros((6,), dtype=torch.float32, device=loss.device)
         else:
             if (
                 ids.ndim != 2
@@ -705,29 +716,28 @@ class DistributedBrainTrainingModule(nn.Module):
                 (token_losses * prediction_mask).sum(dim=1)
                 / prediction_mask.sum(dim=1).clamp_min(1)
             )
-            per_window = (
-                language_losses
-                + 0.2 * idea_losses
+            auxiliary = (
+                0.2 * idea_losses
                 + 0.05 * temporal_losses
                 + 0.1 * workspace_losses
             )
-            if not bool(torch.isfinite(per_window).all()):
+            if not bool(torch.isfinite(auxiliary).all()) or not bool(torch.isfinite(token_losses).all()):
                 raise RuntimeError("non-finite distributed corpus loss")
-            # DDP divides reduced gradients by WORLD_SIZE. Multiplying each
-            # owned window by WORLD_SIZE/global_count yields the exact global
-            # mean, including an uneven final shard.
-            loss = per_window.sum() * (
-                float(world_size) / float(global_window_count)
-            )
+            # Context/padding is unlabelled. Short tails carry their actual
+            # target count, not the weight of an entire padded long window.
+            label_sum = (token_losses * prediction_mask).sum()
+            loss = float(world_size) * (label_sum / float(global_label_count)
+                + auxiliary.sum() / float(global_window_count))
             measurements = torch.stack(
                 (
-                    per_window.detach().sum(),
-                    language_losses.detach().sum(),
+                    auxiliary.detach().sum(),
+                    label_sum.detach(),
                     idea_losses.detach().sum(),
                     workspace_losses.detach().sum(),
                     torch.as_tensor(
                         float(ids.shape[0]), device=ids.device, dtype=torch.float32
                     ),
+                    prediction_mask.sum().detach().float(),
                 )
             ).float()
         if include_stability:
@@ -756,6 +766,8 @@ def _resolve_strategy(
 ) -> str:
     if context.world_size == 1:
         return "single"
+    if any(isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES) for child in module.modules()):
+        return "packed-collective"
     if options.strategy == "fsdp":
         if (
             context.device.type != "cuda"
@@ -782,19 +794,13 @@ def _wrap_module(
     strategy: str,
     context: DistributedContext,
 ) -> nn.Module:
-    # DDP/FSDP only reduce nn.Parameter gradients. Packed modules mutate
-    # authoritative uint8 synapses inside backward, so no rank may train an
-    # unsynchronized copy until those discrete updates have a collective.
-    if context.world_size > 1 and any(
-        isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES)
-        for child in module.modules()
-    ):
-        raise RuntimeError(
-            "multi-rank training is not supported for packed-authoritative "
-            "ternary synapses: their direct backward mutations are not "
-            "synchronized by DDP/FSDP; use one rank until synchronized "
-            "packed updates are implemented"
-        )
+    has_packed = any(isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES) for child in module.modules())
+    if has_packed and context.world_size > 1 and strategy != "packed-collective":
+        raise RuntimeError("multi-rank native packed updates require the canonical packed collective, not DDP/FSDP or independent single replicas")
+    # Packed derivatives use an explicit collective, not DDP/FSDP's parameter
+    # reducer. Each rank shares the same authoritative ternary bytes.
+    if strategy == "packed-collective":
+        return module
     if strategy == "single":
         return module
     if strategy == "ddp":
@@ -1051,19 +1057,21 @@ def apply_dynamic_updates(
 
 
 def _media_parameter_checksum(brain: AdaptiveBrain) -> str:
+    if hasattr(brain, "core_pager"):
+        brain.core_pager.flush()
     return tensor_checksum(
-        parameter.detach().cpu()
-        for parameter in brain.modalities.parameters()
+        value for _name, value in sorted(brain.modalities.state_dict().items())
     )
 
 
 class MonotonicManifestReplay:
     """One rank-zero verified source pass, resumed from one global position."""
 
-    def __init__(self, manifest: DatasetManifest, start_position: int = 0):
+    def __init__(self, manifest: DatasetManifest, start_position: int = 0, resource_admission=None):
         self.manifest = manifest
         self.cardinality = len(manifest.entries)
         self.position = max(0, int(start_position))
+        self.resource_admission = resource_admission
         if self.cardinality == 0 and self.position:
             raise ValueError("manifest replay position exceeds an empty manifest")
         self.epoch = (
@@ -1083,6 +1091,7 @@ class MonotonicManifestReplay:
                 rank=0,
                 world_size=1,
                 start_ordinal=start,
+                resource_admission=self.resource_admission,
             )
         )
 
@@ -1110,6 +1119,11 @@ class MonotonicManifestReplay:
             position = self.position
             self.position += 1
             yield position, entry, record
+
+    def close(self):
+        if self._iterator is not None:
+            self._iterator.close()
+            self._iterator = None
 
 
 def apply_media_updates(
@@ -1139,6 +1153,7 @@ def apply_media_updates(
             "distributed manifest record",
             steps=1,
             content_sha256=entry.content_sha256,
+            **({"speech_text": record.provenance["speech_text"]} if "speech_text" in record.provenance else {}),
         )
         after = _media_parameter_checksum(brain)
         coverage = result.get("coverage")
@@ -1169,6 +1184,36 @@ def apply_media_updates(
             }
         )
     return reports
+
+
+def apply_authoritative_source_updates(brain, records):
+    """Canonical fast learning from every literal source section, not labels.
+
+    The surrounding native publication is the durable transaction boundary.
+    A failure discards the private replica and leaves the previous pointer.
+    """
+    reports = []
+    committed = None
+    from . import vsa as vsa_module
+    original_now = vsa_module._now
+    try:
+        for position, entry, record in records:
+            if entry.kind in {"image", "audio", "video"}:
+                reports.extend(apply_media_updates(brain, [(position, entry, record)]))
+            else:
+                payload = getattr(record, "text_payload", None)
+                sections = payload.windows() if payload is not None else (
+                    (piece, 0) for piece in brain._experience_chunks(record.text))
+                for section_index, (piece, _end) in enumerate(sections):
+                    logical_time = 1_700_000_000.0 + float(position) + float(section_index) / 1_000_000.0
+                    vsa_module._now = lambda value=logical_time: value
+                    brain.learn_experience(piece, kind="knowledge", source="distributed-dataset",
+                        source_label="distributed manifest record", steps=0, importance=0.5,
+                        structural_detail=True)
+            committed = position + 1
+    finally:
+        vsa_module._now = original_now
+    return committed, reports
 
 
 def merge_media_training_state(
@@ -1546,6 +1591,26 @@ def _collect_objects(context: DistributedContext, value: Any) -> List[Any]:
     return gathered
 
 
+def _failure_payload(failure):
+    status = getattr(failure, "status", None)
+    message = "%s: %s" % (type(failure).__name__, str(failure)[:2_000])
+    resource = isinstance(failure, (DatasetResourcePause, MemoryError)) or (
+        isinstance(status, Mapping) and any(bool(status.get(key)) for key in ("recoverable", "paused", "memoryPressure", "diskPressure"))) or any(
+            marker in message.lower() for marker in ("out of memory", "no space left", "disk is full", "cannot allocate memory"))
+    return {"message": message, "resource": bool(resource), "status": dict(status) if isinstance(status, Mapping) else {}}
+
+
+def _raise_phase_failures(values, label):
+    failures = [value for value in values if value]
+    if not failures:
+        return
+    selected = next((value for value in failures if isinstance(value, Mapping) and not value.get("resource")), failures[0])
+    message = selected.get("message", "unknown phase failure") if isinstance(selected, Mapping) else str(selected)
+    if isinstance(selected, Mapping) and selected.get("resource"):
+        raise DatasetResourcePause("%s: %s" % (label, message), selected.get("status", {}))
+    raise RuntimeError("%s: %s" % (label, message))
+
+
 def _collective_cancelled(
     context: DistributedContext, local_cancelled: bool
 ) -> bool:
@@ -1565,8 +1630,7 @@ def _broadcast_rank_zero_error(
     values: List[Optional[str]] = [error if context.is_rank_zero else None]
     if context.distributed:
         dist.broadcast_object_list(values, src=0)
-    if values[0]:
-        raise RuntimeError(str(values[0]))
+    _raise_phase_failures(values, "rank-zero phase failed")
 
 
 def _apply_rehearsal_sync(
@@ -1664,25 +1728,127 @@ class DistributedGroundUpTrainer:
             signal.signal(signum, handler)
         self._prior_handlers.clear()
 
-    def _prepare_manifest(self) -> DatasetManifest:
+    def _training_policy_sha256(self):
+        cached = getattr(self, "_training_policy_identity", None)
+        if cached is not None:
+            return cached
+        options = {key: value for key, value in asdict(self.options).items()
+                   if key not in {"resume", "failure_injection", "replace_output", "keep_checkpoints", "strategy", "amp", "fsdp_min_parameter_bytes"}}
+        support = {}
+        for name in ("brain.py", "datasets.py", "text_spool.py", "columnar_admission.py", "tokenizer.py",
+            "record_window_wave.py", "distributed_seal.py", "distributed_runtime.py", "distributed_training.py",
+            "packed_collective.py", "packed_collective_hooks.py", "collective_controls.py", "window_wave_buffer.py", "model.py", "modalities.py", "liquid.py", "spiking.py", "optimizers.py"):
+            digest = hashlib.sha256()
+            with open(Path(__file__).parent / name, "rb") as source:
+                for block in iter(lambda: source.read(1 << 20), b""):
+                    digest.update(block)
+            support[name] = digest.hexdigest()
+        self._training_policy_identity = bounded_json_sha256({"policy": "resource-admitted-window-waves/canonical-packed-mutation/source-fast-replay-v2",
+            "options": options, "supportCodeSha256": support})
+        return self._training_policy_identity
+
+    def _acquire_run_leases(self):
+        owner, local, error = None, None, None
         if self.context.is_rank_zero:
-            self.store.initialize()
-            if self.store.manifest_path.is_file():
-                manifest = DatasetManifest.read(self.store.manifest_path)
-                manifest.verify_current_source()
-            else:
-                manifest = DatasetManifest.build(
-                    self.dataset_path,
-                    self.requested_kind,
-                    database_path=self.store.manifest_path.with_suffix(
-                        ".sqlite3"
-                    ),
-                )
-                manifest.write(self.store.manifest_path)
-        self.context.barrier()
-        manifest = DatasetManifest.read(self.store.manifest_path)
-        if str(self.dataset_path) != manifest.source:
-            raise ValueError("run directory belongs to another dataset path")
+            try:
+                owner = self.store.acquire_run_lease()
+            except BaseException as failure:
+                error = _failure_payload(failure)
+        _broadcast_rank_zero_error(self.context, error)
+        try:
+            rank_path = self.store.ranks_path / ("rank-%05d" % self.context.rank)
+            rank_path.mkdir(parents=True, exist_ok=True)
+            local = DistributedRunLease(rank_path / ".rank-owner.lock")
+        except BaseException as failure:
+            error = _failure_payload(failure)
+        errors = _collect_objects(self.context, error)
+        if any(errors):
+            if local is not None: local.close()
+            if owner is not None: owner.close()
+        _raise_phase_failures(errors, "distributed private rank replica is still owned by another run")
+        return local, owner
+
+    def _distributed_window_plan(self, brain, group_start, group_end, sequence_tokens=None):
+        """Use real CPU/CUDA headroom and requested work, with no Auto cap."""
+        base = brain._training_resource_plan()
+        memory = base["memory"]
+        first = group_start + (self.context.rank - group_start) % self.context.world_size
+        owned = 0 if first >= group_end else 1 + (group_end - 1 - first) // self.context.world_size
+        accumulation = max(1, int(self.options.gradient_accumulation))
+        requested_micro = int(self.options.micro_batch_records) or max(1, math.ceil(max(1, owned) / accumulation))
+        effective_work = max(1, owned, requested_micro * accumulation)
+        resident = bool(brain._optimizer.state) and not brain._optimizer_offloaded
+        plan = brain.resource_policy.training_plan(
+            max_window_tokens=int(sequence_tokens or min(brain.config.max_seq_len, brain._runtime_training_max_seq_len)),
+            requested_batch_size=requested_micro, requested_gradient_accumulation=accumulation,
+            effective_batch_target=effective_work, require_physical_batch_divisor=False,
+            trainable_parameter_bytes=int(memory["optimizerAndGradientBytes"]) // (1 if resident else 3),
+            packed_update_scratch_bytes=int(memory["packedUpdateScratchBytes"]),
+            activation_bytes_per_token=int(memory["activationBytesPerToken"]), optimizer_state_resident=resident,
+            resource_mode=brain.config.training_resource_mode, manual_ram_budget_bytes=brain.config.training_ram_budget_bytes,
+            manual_accelerator_budget_bytes=brain.config.training_accelerator_budget_bytes,
+            manual_scratch_budget_bytes=brain.config.training_scratch_budget_bytes,
+            storage_bytes_per_second=brain.config.storage_bytes_per_second, disk_state_offload=brain.config.disk_state_offload)
+        selected_sequence = int(plan["windowTokens"])
+        if sequence_tokens is not None and selected_sequence < sequence_tokens:
+            raise DatasetResourcePause("resume is waiting for its frozen causal context", plan)
+        physical = int(plan["physicalBatchRecords"])
+        if hasattr(brain.decoder, "maximum_forward_tokens"):
+            low, high = 1, physical
+            while low < high:
+                candidate = (low + high + 1) // 2
+                if brain.decoder.maximum_forward_tokens(candidate) >= selected_sequence:
+                    low = candidate
+                else:
+                    high = candidate - 1
+            physical = low
+            if brain.decoder.maximum_forward_tokens(physical) < selected_sequence:
+                if sequence_tokens is not None:
+                    raise DatasetResourcePause("frozen context cannot fit the working compute reservation", plan)
+                selected_sequence = min(selected_sequence, int(brain.decoder.maximum_forward_tokens(physical)))
+        if selected_sequence < 2 or plan["pauseBeforeStep"]:
+            raise DatasetResourcePause("distributed labelled windows cannot fit admitted CPU/CUDA resources", plan)
+        peak = (int(plan["memory"]["optimizerAndGradientBytes"]) + int(plan["memory"]["packedUpdateScratchBytes"])
+            + int(plan["memory"]["allocatorMarginBytes"]) + physical * selected_sequence * int(plan["memory"]["activationBytesPerToken"]))
+        plan.update(windowTokens=selected_sequence, physicalBatchRecords=physical,
+            waveWindowTarget=effective_work, requestedRecordGroup=[group_start, group_end],
+            requestedMicroBatchRecords=int(self.options.micro_batch_records),
+            inputRamBudgetBytes=max(0, int(plan["memory"]["ramBudgetBytes"]) - peak),
+            accumulationSlots=max(accumulation, math.ceil(effective_work / physical)))
+        return plan
+
+    def _prepare_manifest(self) -> DatasetManifest:
+        error = None
+        if self.context.is_rank_zero:
+            try:
+                from .offload import ResourcePolicy
+                policy = ResourcePolicy(self.store.path, ram_reserve_bytes=self.config.ram_reserve_bytes,
+                    disk_reserve_bytes=self.config.disk_reserve_bytes,
+                    system_ram_share_percent=self.config.system_ram_share_percent,
+                    hardware_tier=self.config.hardware_tier)
+                def admit(stage, ram_bytes, disk_bytes):
+                    status = policy.status(estimated_ram_bytes=ram_bytes, estimated_write_bytes=disk_bytes)
+                    if status["memoryPressure"] or status["diskPressure"]:
+                        raise DatasetResourcePause("%s is waiting for manifest parser resources" % stage, status)
+                self.store.initialize()
+                if self.store.manifest_path.is_file():
+                    manifest = DatasetManifest.read(self.store.manifest_path)
+                    manifest.verify_current_source(resource_admission=admit)
+                else:
+                    manifest = DatasetManifest.build(self.dataset_path, self.requested_kind,
+                        database_path=self.store.manifest_path.with_suffix(".sqlite3"), resource_admission=admit)
+                    manifest.write(self.store.manifest_path)
+            except BaseException as failure:
+                error = _failure_payload(failure)
+        _broadcast_rank_zero_error(self.context, error)
+        local_error, manifest = None, None
+        try:
+            manifest = DatasetManifest.read(self.store.manifest_path)
+            if str(self.dataset_path) != manifest.source:
+                raise ValueError("run directory belongs to another dataset path")
+        except BaseException as failure:
+            local_error = _failure_payload(failure)
+        _raise_phase_failures(_collect_objects(self.context, local_error), "distributed manifest setup failed")
         return manifest
 
     def _new_ground_up_brain(self, path: Path) -> AdaptiveBrain:
@@ -1730,6 +1896,125 @@ class DistributedGroundUpTrainer:
             initialize_ground_up=True,
         )
 
+    def _prepare_brains_rank_zero(self, manifest):
+        checkpoint = None
+        self.store.initialize()
+        checkpoint = self.store.load_active_checkpoint(
+            manifest_sha256=manifest.content_sha256,
+            world_size=self.context.world_size,
+        )
+        if self.options.resume == "required" and checkpoint is None:
+            raise RuntimeError("resume was required but no checkpoint exists")
+        if self.options.resume == "never" and checkpoint is not None:
+            raise RuntimeError("run already has a checkpoint; use a new run directory")
+        checkpoint_brain_path = self.store.path / "checkpoint-brain"
+        if checkpoint is None:
+            if not self.store.template_path.exists():
+                template = self._new_ground_up_brain(
+                    self.store.template_path
+                )
+                template.close()
+            template = AdaptiveBrain.load(
+                self.store.template_path,
+                expected_brain_id=self.brain_id,
+            )
+            try:
+                _validate_distributed_origin_template(
+                    template, self.config
+                )
+            finally:
+                template.close()
+            # A failed attempt without a published cursor owns no durable
+            # progress. Always reset its working checkpoint before the
+            # start rehearsal so retry cannot apply that event twice.
+            _copytree_transactional(
+                self.store.template_path, checkpoint_brain_path
+            )
+        else:
+            _copytree_transactional(self.store.published_native_path(checkpoint), checkpoint_brain_path)
+            recovered = AdaptiveBrain.load(checkpoint_brain_path)
+            try:
+                _validate_distributed_checkpoint_identity(
+                    recovered, self.config
+                )
+                self._verify_native_seal(recovered, checkpoint)
+            finally:
+                recovered.close()
+        schedule_state = CapabilityScheduleState.from_dict(
+            checkpoint.get("capabilityRehearsal")
+            if checkpoint is not None
+            and isinstance(checkpoint.get("capabilityRehearsal"), Mapping)
+            else None
+        )
+        media_training_state = (
+            dict(checkpoint["mediaTraining"])
+            if checkpoint is not None
+            and isinstance(checkpoint.get("mediaTraining"), Mapping)
+            else merge_media_training_state(None, ())
+        )
+        start_phase = due_rehearsal_phase(
+            schedule_state,
+            CapabilityRehearsalPolicy(
+                periodic_global_waves=self.options.capability_rehearsal_waves
+            ),
+            committed_global_waves=(
+                int(checkpoint.get("globalOptimizerSteps", 0))
+                if checkpoint is not None
+                else 0
+            ),
+        )
+        if start_phase == "start":
+            start_brain = AdaptiveBrain.load(checkpoint_brain_path)
+            try:
+                receipt = rehearse_capabilities(
+                    start_brain,
+                    phase="start",
+                    committed_global_waves=0,
+                    policy=CapabilityRehearsalPolicy(
+                        periodic_global_waves=(
+                            self.options.capability_rehearsal_waves
+                        )
+                    ),
+                )
+                schedule_state = advance_schedule_state(
+                    schedule_state, receipt
+                )
+                from .persistence import atomic_write_json
+
+                atomic_write_json(
+                    start_brain.engine_path / "capability-rehearsal.json",
+                    receipt,
+                )
+                start_brain.save()
+            finally:
+                start_brain.events.close()
+        cursors = (
+            [
+                RankCursor.from_dict(value)
+                for value in checkpoint["rankCursors"]
+            ]
+            if checkpoint is not None
+            else initial_rank_cursors(
+                world_size=self.context.world_size,
+                manifest_sha256=manifest.content_sha256,
+            )
+        )
+        dynamic_high_water = (
+            int(checkpoint.get("dynamicHighWater", 0))
+            if checkpoint is not None
+            else 0
+        )
+        global_steps = int(checkpoint.get("globalOptimizerSteps", 0)) if checkpoint else 0
+        payload: List[Any] = [
+            [cursor.to_dict() for cursor in cursors],
+            dynamic_high_water,
+            global_steps,
+            checkpoint is not None,
+            schedule_state.to_dict(),
+            media_training_state,
+        ]
+        return payload
+
     def _prepare_brains(
         self, manifest: DatasetManifest
     ) -> Tuple[
@@ -1741,127 +2026,14 @@ class DistributedGroundUpTrainer:
         CapabilityScheduleState,
         Dict[str, Any],
     ]:
-        checkpoint: Optional[Dict[str, Any]] = None
+        error = None
+        payload = [None, None, None, None, None, None]
         if self.context.is_rank_zero:
-            self.store.initialize()
-            checkpoint = self.store.load_active_checkpoint(
-                manifest_sha256=manifest.content_sha256,
-                world_size=self.context.world_size,
-            )
-            if self.options.resume == "required" and checkpoint is None:
-                raise RuntimeError("resume was required but no checkpoint exists")
-            if self.options.resume == "never" and checkpoint is not None:
-                raise RuntimeError("run already has a checkpoint; use a new run directory")
-            checkpoint_brain_path = self.store.path / "checkpoint-brain"
-            if checkpoint is None:
-                if not self.store.template_path.exists():
-                    template = self._new_ground_up_brain(
-                        self.store.template_path
-                    )
-                    template.close()
-                template = AdaptiveBrain.load(
-                    self.store.template_path,
-                    expected_brain_id=self.brain_id,
-                )
-                try:
-                    _validate_distributed_origin_template(
-                        template, self.config
-                    )
-                finally:
-                    template.close()
-                # A failed attempt without a published cursor owns no durable
-                # progress. Always reset its working checkpoint before the
-                # start rehearsal so retry cannot apply that event twice.
-                _copytree_transactional(
-                    self.store.template_path, checkpoint_brain_path
-                )
-            else:
-                self.store.restore_published_brain_json(
-                    checkpoint,
-                    checkpoint_brain_path / "engine" / "brain.json",
-                )
-                recovered = AdaptiveBrain.load(checkpoint_brain_path)
-                try:
-                    _validate_distributed_checkpoint_identity(
-                        recovered, self.config
-                    )
-                finally:
-                    recovered.close()
-            schedule_state = CapabilityScheduleState.from_dict(
-                checkpoint.get("capabilityRehearsal")
-                if checkpoint is not None
-                and isinstance(checkpoint.get("capabilityRehearsal"), Mapping)
-                else None
-            )
-            media_training_state = (
-                dict(checkpoint["mediaTraining"])
-                if checkpoint is not None
-                and isinstance(checkpoint.get("mediaTraining"), Mapping)
-                else merge_media_training_state(None, ())
-            )
-            start_phase = due_rehearsal_phase(
-                schedule_state,
-                CapabilityRehearsalPolicy(
-                    periodic_global_waves=self.options.capability_rehearsal_waves
-                ),
-                committed_global_waves=(
-                    int(checkpoint.get("globalOptimizerSteps", 0))
-                    if checkpoint is not None
-                    else 0
-                ),
-            )
-            if start_phase == "start":
-                start_brain = AdaptiveBrain.load(checkpoint_brain_path)
-                try:
-                    receipt = rehearse_capabilities(
-                        start_brain,
-                        phase="start",
-                        committed_global_waves=0,
-                        policy=CapabilityRehearsalPolicy(
-                            periodic_global_waves=(
-                                self.options.capability_rehearsal_waves
-                            )
-                        ),
-                    )
-                    schedule_state = advance_schedule_state(
-                        schedule_state, receipt
-                    )
-                    from .persistence import atomic_write_json
-
-                    atomic_write_json(
-                        start_brain.engine_path / "capability-rehearsal.json",
-                        receipt,
-                    )
-                    start_brain.save()
-                finally:
-                    start_brain.events.close()
-            cursors = (
-                [
-                    RankCursor.from_dict(value)
-                    for value in checkpoint["rankCursors"]
-                ]
-                if checkpoint is not None
-                else initial_rank_cursors(
-                    world_size=self.context.world_size,
-                    manifest_sha256=manifest.content_sha256,
-                )
-            )
-            dynamic_high_water = (
-                int(checkpoint.get("dynamicHighWater", 0))
-                if checkpoint is not None
-                else 0
-            )
-            global_steps = int(checkpoint.get("globalOptimizerSteps", 0)) if checkpoint else 0
-            payload: List[Any] = [
-                [cursor.to_dict() for cursor in cursors],
-                dynamic_high_water,
-                global_steps,
-                checkpoint is not None,
-                schedule_state.to_dict(),
-                media_training_state,
-            ]
-        else:
-            payload = [None, None, None, None, None, None]
+            try:
+                payload = self._prepare_brains_rank_zero(manifest)
+            except BaseException as failure:
+                error = _failure_payload(failure)
+        _broadcast_rank_zero_error(self.context, error)
         if self.context.distributed:
             dist.broadcast_object_list(payload, src=0)
         cursors = [RankCursor.from_dict(value) for value in payload[0]]
@@ -1873,16 +2045,18 @@ class DistributedGroundUpTrainer:
 
         self.context.barrier()
         rank_brain_path = self.store.ranks_path / ("rank-%05d" % self.context.rank) / "brain"
-        _copytree_transactional(
-            self.store.path / "checkpoint-brain", rank_brain_path
-        )
-        _rewrite_brain_device(rank_brain_path, str(self.context.device))
-        brain = AdaptiveBrain.load(rank_brain_path)
+        brain, local_error = None, None
         try:
+            _copytree_transactional(self.store.path / "checkpoint-brain", rank_brain_path)
+            _rewrite_brain_device(rank_brain_path, str(self.context.device))
+            brain = AdaptiveBrain.load(rank_brain_path)
             _validate_distributed_checkpoint_identity(brain, self.config)
-        except BaseException:
+        except BaseException as failure:
+            local_error = _failure_payload(failure)
+        errors = _collect_objects(self.context, local_error)
+        if any(errors) and brain is not None:
             brain.close()
-            raise
+        _raise_phase_failures(errors, "distributed native replica setup failed")
         return (
             brain,
             cursors,
@@ -1892,6 +2066,18 @@ class DistributedGroundUpTrainer:
             schedule_state,
             media_training_state,
         )
+
+    def _bind_actual_native_device(self, brain):
+        actual_devices = _collect_objects(self.context, str(brain.device))
+        if self.context.backend == "nccl" and any(not value.startswith("cuda") for value in actual_devices):
+            raise DatasetResourcePause("native CPU fallback requires relaunch with CPU/Gloo; an existing NCCL group cannot migrate", {
+                "actualDevices": actual_devices, "backend": self.context.backend, "relaunchRequired": True})
+        self.context = replace(self.context, device=torch.device(brain.device))
+
+    def _verify_native_seal(self, brain, checkpoint):
+        seal = brain.distributed_training_seal
+        if seal is None or seal["contentSha256"] != checkpoint.get("distributedSealSha256") or seal["rankCursors"] != checkpoint["rankCursors"] or seal["manifestSha256"] != checkpoint["manifestSha256"] or seal["trainingPolicySha256"] != self._training_policy_sha256() or seal["topologySha256"] != native_topology_sha256(brain):
+            raise ValueError("distributed resume does not match its independently committed native cursor/topology/policy seal")
 
     def _failure_injection_matches(self, global_step: int) -> bool:
         raw = self.options.failure_injection.strip()
@@ -1928,45 +2114,23 @@ class DistributedGroundUpTrainer:
     ]:
         prepared = []
         dynamic = []
-        sequence_tokens = min(
-            int(brain.config.max_seq_len),
-            int(brain._runtime_training_max_seq_len),
-        )
-        for entry, record in records:
-            clean = str(record.text).replace("\x00", "").strip()
-            cue = brain.memory.vector_for_text(clean or " ".join(
-                brain.memory.extract_atomic_concepts(entry.name)
-            )).detach().cpu().float()
-            windows = []
-            if clean:
-                for window_index, values in enumerate(
-                    brain.tokenizer.window_tensors(
-                        clean,
-                        torch.device("cpu"),
-                        max_length=sequence_tokens,
-                        add_bos=True,
-                        add_eos=True,
-                    )
-                ):
-                    if values.shape[1] < 2:
-                        continue
-                    windows.append(
-                        (
-                            values[0].detach().cpu(),
-                            cue,
-                            _deterministic_noise(
-                                manifest_sha256=manifest.content_sha256,
-                                epoch=epoch,
-                                record_id=entry.record_id,
-                                window_index=window_index,
-                                dimensions=brain.config.idea_dim,
-                            ),
-                        )
-                    )
-            prepared.append((entry, windows))
-            dynamic.append(
-                _dynamic_update(brain, manifest, entry, clean, epoch)
-            )
+        for entry, literal_window in records:
+            if literal_window.human is not None:
+                seal = getattr(brain, "distributed_training_seal", None) or {}
+                key = (epoch, entry.record_id, literal_window.human.sha256, seal.get("committedRecordStop", 0))
+                cached = getattr(self, "_leased_human_cue_cache", None)
+                if cached is None or cached[0] != key:
+                    cached = (key, brain._leased_dialogue_cue(literal_window.human).detach().cpu().float())
+                    self._leased_human_cue_cache = cached
+                cue = cached[1]
+            else:
+                cue = brain.memory.vector_for_text(literal_window.text or " ").detach().cpu().float()
+            prepared.append((entry, [(
+                torch.tensor(literal_window.ids, dtype=torch.long), cue,
+                _deterministic_noise(manifest_sha256=manifest.content_sha256, epoch=epoch,
+                    record_id=entry.record_id, window_index=literal_window.window_index,
+                    dimensions=brain.config.idea_dim),
+            )]))
         return prepared, dynamic
 
     def _train_wave(
@@ -1978,7 +2142,7 @@ class DistributedGroundUpTrainer:
         scaler: Any,
         amp_enabled: bool,
         amp_dtype: Optional[torch.dtype],
-        local_records: Sequence[Tuple[DatasetManifestEntry, Any]],
+        local_records: PreparedWindowWave,
         manifest: DatasetManifest,
         epoch: int,
     ) -> Tuple[Dict[str, float], List[DynamicNeuralUpdate], bool]:
@@ -1988,22 +2152,42 @@ class DistributedGroundUpTrainer:
         )
         if isinstance(optimizer, PackedOnlyOptimizer) and not direct_packed:
             raise RuntimeError("corpus objective has no learnable weights")
-        if direct_packed and (self.context.world_size != 1 or amp_enabled):
+        if direct_packed and amp_enabled:
             raise RuntimeError(
-                "direct packed backward updates require one rank and unscaled FP32 execution"
+                "direct packed backward updates require unscaled execution"
             )
-        prepared, dynamic = self._rank_records_for_wave(
-            brain, manifest, epoch, local_records
-        )
-        local_window_count = sum(len(windows) for _entry, windows in prepared)
+        controller = None
+        if direct_packed:
+            controller = getattr(self, "_packed_collective_controller", None)
+            if controller is None:
+                def reserve(**amounts):
+                    if self._signal_cancelled or self.store.cancel_requested():
+                        raise DatasetResourcePause("distributed cancellation stopped an uncommitted packed window", {"cancelled": True})
+                    status = brain.resource_policy.status(
+                        estimated_ram_bytes=amounts.get("ram_bytes", 0),
+                        estimated_write_bytes=amounts.get("disk_bytes", 0))
+                    if status["memoryPressure"] or status["diskPressure"]:
+                        raise DatasetResourcePause("packed collective is waiting for derivative/rollback resources", status)
+                controller = PackedCollectiveController(
+                    {name: child for name, child in _unwrap(wrapped).named_modules()
+                     if isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES)},
+                    self.context, self.store.path / ("rank-packed-scratch-%05d" % self.context.rank),
+                    _apply_packed_gradient_rows, reserve)
+                self._packed_collective_controller = controller
+            step_id = "%s:%d:%d" % (manifest.content_sha256, epoch, int(brain.counters["training_steps"]))
+        if not isinstance(local_records, PreparedWindowWave):
+            raise ValueError("distributed learner requires a bounded prepared-input wave")
+        dynamic = []
+        local_window_count = local_records.window_count
         count = torch.tensor(
-            [local_window_count],
+            [local_window_count, local_records.label_count],
             dtype=torch.int64,
             device=(self.context.device if self.context.backend == "nccl" else torch.device("cpu")),
         )
         if self.context.distributed:
             dist.all_reduce(count, op=dist.ReduceOp.SUM)
-        global_window_count = int(count.item())
+        global_window_count = int(count[0].item())
+        global_label_count = int(count[1].item())
         if global_window_count == 0:
             return {
                 "loss": 0.0,
@@ -2012,28 +2196,10 @@ class DistributedGroundUpTrainer:
                 "workspaceLoss": 0.0,
                 "windows": 0.0,
             }, dynamic, False
+        if controller is not None:
+            controller.begin(step_id)
 
-        chunks: List[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
-        for offset in range(0, len(prepared), self.options.micro_batch_records):
-            chunks.append(
-                list(
-                    itertools.chain.from_iterable(
-                        windows
-                        for _entry, windows in prepared[
-                            offset : offset + self.options.micro_batch_records
-                        ]
-                    )
-                )
-            )
-        minimum_slots = max(
-            1,
-            math.ceil(
-                math.ceil(self.options.global_batch_records / self.context.world_size)
-                / self.options.micro_batch_records
-            ),
-        )
-        slots = self.options.gradient_accumulation or minimum_slots
-        local_required = max(1, len(chunks))
+        local_required = max(1, math.ceil(local_window_count / local_records.physical_batch))
         required = torch.tensor(
             [local_required],
             dtype=torch.int64,
@@ -2041,46 +2207,64 @@ class DistributedGroundUpTrainer:
         )
         if self.context.distributed:
             dist.all_reduce(required, op=dist.ReduceOp.MAX)
-        if slots < int(required.item()):
-            raise ValueError(
-                "configured gradient accumulation cannot cover the global batch"
-            )
-        while len(chunks) < slots:
-            chunks.append([])
+        slots = max(int(required.item()), int(self.options.gradient_accumulation))
+        chunks = iter(local_records.batches())
 
         optimizer.zero_grad(set_to_none=True)
-        measurement = torch.zeros((5,), dtype=torch.float64, device=(
+        measurement = torch.zeros((6,), dtype=torch.float64, device=(
             self.context.device if self.context.backend == "nccl" else torch.device("cpu")
         ))
-        for slot, windows in enumerate(chunks):
-            final = slot == len(chunks) - 1
+        for slot in range(slots):
+            final = slot == slots - 1
             sync_context = (
                 contextlib.nullcontext()
                 if final or not hasattr(wrapped, "no_sync")
                 else wrapped.no_sync()  # type: ignore[attr-defined]
             )
-            ids, mask, vectors, noise = _pad_windows(brain, windows)
-            with sync_context:
-                with _autocast_context(amp_enabled, amp_dtype, self.context.device):
-                    loss, measured = wrapped(
-                        ids,
-                        mask,
-                        vectors,
-                        noise,
-                        world_size=self.context.world_size,
-                        global_window_count=global_window_count,
-                        include_stability=final,
-                    )
-                if not bool(torch.isfinite(loss)):
-                    raise RuntimeError("non-finite distributed corpus loss")
-                if direct_packed:
-                    loss.backward()
-                else:
-                    scaler.scale(loss).backward()
+            local_error = None
+            try:
+                windows = next(chunks, [])
+                ids, mask, vectors, noise = _pad_windows(brain, windows)
+                with sync_context, packed_derivative_sink(controller):
+                    with _autocast_context(amp_enabled, amp_dtype, self.context.device):
+                        loss, measured = wrapped(
+                            ids, mask, vectors, noise,
+                            world_size=1 if controller is not None else self.context.world_size,
+                            global_window_count=global_window_count,
+                            global_label_count=global_label_count,
+                            include_stability=final and (controller is None or self.context.is_rank_zero))
+                    if not bool(torch.isfinite(loss)):
+                        raise RuntimeError("non-finite distributed corpus loss")
+                    if direct_packed:
+                        loss.backward()
+                    else:
+                        scaler.scale(loss).backward()
+            except BaseException as failure:
+                local_error = _failure_payload(failure)
+            slot_errors = _collect_objects(self.context, local_error)
+            if any(slot_errors):
+                if controller is not None: controller.rollback()
+                optimizer.zero_grad(set_to_none=True)
+                _raise_phase_failures(slot_errors, "distributed backward slot failed")
             measurement += measured.to(measurement).detach()
 
         if not direct_packed:
             scaler.unscale_(optimizer)
+        if controller is not None:
+            # Residual scalar controls, if any, get the same explicit SUM as
+            # packed derivatives. There is no private DDP gradient identity.
+            for _name, parameter in sorted(_unwrap(wrapped).named_parameters()):
+                present = torch.tensor([int(parameter.grad is not None)], dtype=torch.int32,
+                    device=self.context.device if self.context.backend == "nccl" else torch.device("cpu"))
+                dist.all_reduce(present, op=dist.ReduceOp.MAX)
+                if not present.item(): continue
+                if parameter.grad is None: parameter.grad = torch.zeros_like(parameter)
+                communication_device = self.context.device if self.context.backend == "nccl" else torch.device("cpu")
+                def prepare_control():
+                    return parameter.grad.to(communication_device).contiguous()
+                reduced = controller._phase(prepare_control)
+                dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+                controller._phase(lambda: parameter.grad.copy_(reduced.to(parameter.grad.device)))
         local_finite = all(
             parameter.grad is None or bool(torch.isfinite(parameter.grad).all())
             for parameter in _unwrap(wrapped).parameters()
@@ -2093,6 +2277,7 @@ class DistributedGroundUpTrainer:
         if self.context.distributed:
             dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         if not bool(finite.item()):
+            if controller is not None: controller.rollback()
             optimizer.zero_grad(set_to_none=True)
             if not direct_packed:
                 scaler.update()
@@ -2107,7 +2292,11 @@ class DistributedGroundUpTrainer:
             raise RuntimeError(
                 "packed-only optimizer received unexpected floating gradients"
             )
-        brain._accumulate_slow_importance(parameters)
+        if controller is not None:
+            controller._phase(brain._drain_packed_stability_events)
+            controller._phase(lambda: brain._accumulate_slow_importance(parameters) if self.context.is_rank_zero else None)
+        else:
+            brain._accumulate_slow_importance(parameters)
         if not parameters:
             norm = measurement.new_zeros(())
         elif hasattr(wrapped, "clip_grad_norm_") and not isinstance(
@@ -2121,26 +2310,43 @@ class DistributedGroundUpTrainer:
         if not bool(torch.isfinite(torch.as_tensor(norm))):
             raise RuntimeError("distributed gradient norm is non-finite")
         if direct_packed:
-            optimizer.step()
+            if controller is not None: controller.commit(retain_rollback=True)
+            try:
+                if controller is not None:
+                    controller._phase(lambda: optimizer.step() if self.context.is_rank_zero else None)
+                else:
+                    optimizer.step()
+            except BaseException:
+                if controller is not None: controller.rollback()
+                raise
         else:
             scaler.step(optimizer)
             scaler.update()
-        brain._commit_slow_anchors(rate=0.08, parameters=parameters)
-        if _resolve_strategy(self.options, self.context, _unwrap(wrapped)) != "fsdp":
-            _canonicalize_distributed_learning_state(
-                brain, optimizer, parameters
-            )
+        def finish_controls():
+            brain._commit_slow_anchors(rate=0.08, parameters=parameters)
+            if _resolve_strategy(self.options, self.context, _unwrap(wrapped)) != "fsdp":
+                _canonicalize_distributed_learning_state(brain, optimizer, parameters)
+        if controller is not None:
+            controller._phase(lambda: finish_controls() if self.context.is_rank_zero else None)
+            synchronize_control_state(controller, _unwrap(wrapped), optimizer, brain)
+        else:
+            finish_controls()
         optimizer.zero_grad(set_to_none=True)
+        if controller is not None: controller.finalize()
         brain.counters["training_steps"] += 1
         if self.context.distributed:
             dist.all_reduce(measurement, op=dist.ReduceOp.SUM)
         divisor = max(1.0, float(measurement[4].item()))
+        labels = max(1.0, float(measurement[5].item()))
         return {
-            "loss": float(measurement[0].item()) / divisor,
-            "languageLoss": float(measurement[1].item()) / divisor,
+            "loss": float(measurement[0].item()) / divisor + float(measurement[1].item()) / labels,
+            "languageLoss": float(measurement[1].item()) / labels,
             "ideaLoss": float(measurement[2].item()) / divisor,
             "workspaceLoss": float(measurement[3].item()) / divisor,
             "windows": float(measurement[4].item()),
+            "labels": float(measurement[5].item()),
+            "physicalMicrobatchWindows": float(local_records.physical_batch),
+            "accumulationSlots": float(slots),
             "gradientNorm": float(torch.as_tensor(norm).detach().cpu().item()),
         }, dynamic, True
 
@@ -2162,6 +2368,12 @@ class DistributedGroundUpTrainer:
         media_training_state: Mapping[str, Any],
         media_replay: Optional[MonotonicManifestReplay],
     ) -> Tuple[int, CapabilityScheduleState, Dict[str, Any]]:
+        if any(isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES) for child in _unwrap(wrapped).modules()):
+            return self._checkpoint_native_collective(brain=brain, wrapped=wrapped, optimizer=optimizer,
+                manifest=manifest, cursors=cursors, dynamic_high_water=dynamic_high_water,
+                global_steps=global_steps, strategy=strategy, final_pack=final_pack,
+                schedule_state=schedule_state, rehearsal_phase=rehearsal_phase,
+                media_training_state=media_training_state, media_replay=media_replay)
         gathered_dynamic = _collect_objects(self.context, list(local_dynamic))
         readings = _collect_objects(
             self.context,
@@ -2314,6 +2526,114 @@ class DistributedGroundUpTrainer:
             CapabilityScheduleState.from_dict(values[1]),
             dict(values[3]),
         )
+
+    def _checkpoint_native_collective(self, *, brain, wrapped, optimizer, manifest, cursors,
+        dynamic_high_water, global_steps, strategy, final_pack, schedule_state,
+        rehearsal_phase, media_training_state, media_replay):
+        """Publish one native identity without a whole-model CPU state clone."""
+        readings = _collect_objects(self.context, sample_resources(rank=self.context.rank,
+            device=self.context.device, path=brain.engine_path, policy_status=brain.resource_policy.status()))
+        result, error = None, None
+        if self.context.is_rank_zero:
+            try:
+                telemetry = aggregate_resource_readings([value for value in readings if isinstance(value, ResourceReading)])
+                if telemetry["diskPressure"] or telemetry.get("memoryPressure", False):
+                    raise DatasetResourcePause("canonical native checkpoint is waiting for physical resources", telemetry)
+                if media_replay is None or media_replay.position != dynamic_high_water:
+                    raise ValueError("canonical source replay is not at its published record boundary")
+                positions = [cursor.epoch * len(manifest.entries) + cursor.next_global_ordinal for cursor in cursors]
+                committed_stop = min(positions)
+                if committed_stop < dynamic_high_water:
+                    raise ValueError("canonical record coverage cannot move backward")
+                # Optimizer controls belong to the same parameter objects; no
+                # full-precision projection mirror or private state average.
+                for parameter, state in optimizer.state.items():
+                    brain._optimizer.state[parameter] = state
+                committed, media_reports = apply_authoritative_source_updates(
+                    brain, media_replay.consume_until(committed_stop))
+                if committed is not None and committed != committed_stop:
+                    raise ValueError("canonical source replay did not reach complete record coverage")
+                if media_replay.position != committed_stop:
+                    raise ValueError("canonical source replay cursor did not exhaust its requested prefix")
+                next_schedule = schedule_state
+                if rehearsal_phase is not None:
+                    if any(cursor.record_window is not None for cursor in cursors):
+                        raise RuntimeError("architecture/capability rehearsal cannot mutate an active record transaction")
+                    receipt = rehearse_capabilities(brain, phase=rehearsal_phase,
+                        committed_global_waves=global_steps,
+                        policy=CapabilityRehearsalPolicy(periodic_global_waves=self.options.capability_rehearsal_waves),
+                        baseline_minimum_probability=schedule_state.baseline_minimum_probability)
+                    next_schedule = advance_schedule_state(schedule_state, receipt)
+                next_media = merge_media_training_state(media_training_state, media_reports)
+                seal = make_distributed_training_seal(manifest_sha256=manifest.content_sha256,
+                    topology_sha256=native_topology_sha256(brain), training_policy_sha256=self._training_policy_sha256(),
+                    record_count=len(manifest.entries), epochs=self.options.epochs, cursors=cursors,
+                    committed_record_stop=committed_stop, global_steps=global_steps)
+                brain.stage_distributed_training_seal(seal)
+                brain.save()
+                if final_pack:
+                    brain.export_packed_ternary()
+                source_path = brain.storage_path
+                brain.close()
+                copy_bytes = sum(path.stat().st_size for path in source_path.rglob("*") if path.is_file())
+                brain.resource_policy.require_disk(copy_bytes, "canonical distributed native checkpoint copy")
+                checkpoint = self.store.publish_checkpoint(brain_json_path=source_path / "engine" / "brain.json",
+                    manifest=manifest, cursors=cursors, epochs_requested=self.options.epochs,
+                    global_optimizer_steps=global_steps, dynamic_high_water=committed_stop,
+                    strategy=strategy, telemetry=telemetry, capability_rehearsal=next_schedule.to_dict(),
+                    media_training=next_media, native_brain_path=source_path)
+                brain.resource_policy.require_disk(copy_bytes, "canonical distributed working replica copy")
+                _copytree_transactional(self.store.published_native_path(checkpoint), self.store.path / "checkpoint-brain")
+                self.store.append_telemetry({**telemetry, "globalOptimizerSteps": global_steps,
+                    "checkpoint": checkpoint["contentSha256"]})
+                self.store.prune_checkpoints(self.options.keep_checkpoints)
+                result = [committed_stop, next_schedule.to_dict(), next_media, checkpoint["contentSha256"]]
+            except BaseException as failure:
+                error = _failure_payload(failure)
+        _broadcast_rank_zero_error(self.context, error)
+        values = [result]
+        if self.context.distributed:
+            dist.broadcast_object_list(values, src=0)
+        if not isinstance(values[0], list) or len(values[0]) != 4:
+            raise RuntimeError("canonical native checkpoint publication did not return an identity")
+        self._last_native_publication_sha256 = values[0][3]
+        return int(values[0][0]), CapabilityScheduleState.from_dict(values[0][1]), dict(values[0][2])
+
+    def _refresh_native_replica(self, brain, manifest):
+        """All fast/slow/nonweight owners come from the same publication."""
+        controller = getattr(self, "_packed_collective_controller", None)
+        if controller is not None:
+            if controller.step_id:
+                raise RuntimeError("cannot refresh native topology during an active packed transaction")
+            controller.close()
+            self._packed_collective_controller = None
+        path = brain.storage_path
+        policy = brain.resource_policy
+        brain.close()
+        local_error, restored = None, None
+        try:
+            checkpoint = self.store.load_active_checkpoint(manifest_sha256=manifest.content_sha256,
+                world_size=self.context.world_size)
+            if checkpoint is None or checkpoint["contentSha256"] != self._last_native_publication_sha256:
+                raise RuntimeError("rank cannot see the exact canonical native publication")
+            canonical = self.store.published_native_path(checkpoint)
+            copy_bytes = sum(item.stat().st_size for item in canonical.rglob("*") if item.is_file())
+            # The previous replica is quiescent; admission never changes the
+            # requested architecture or skips the current leased record.
+            policy.require_disk(copy_bytes, "distributed replica checkpoint refresh")
+            _copytree_transactional(canonical, path)
+            _rewrite_brain_device(path, str(self.context.device))
+            restored = AdaptiveBrain.load(path)
+            _validate_distributed_checkpoint_identity(restored, self.config)
+            self._verify_native_seal(restored, checkpoint)
+        except BaseException as failure:
+            local_error = _failure_payload(failure)
+        errors = _collect_objects(self.context, local_error)
+        if any(errors):
+            if restored is not None:
+                restored.close()
+            _raise_phase_failures(errors, "native replica refresh failed")
+        return restored
 
     def _promote_output(
         self,
@@ -2788,7 +3108,11 @@ class DistributedGroundUpTrainer:
     def run(self) -> Dict[str, Any]:
         self._install_signal_handlers()
         brain: Optional[AdaptiveBrain] = None
+        leases = ()
+        write_authority = False
         try:
+            leases = self._acquire_run_leases()
+            write_authority = True
             manifest = self._prepare_manifest()
             if _collective_cancelled(
                 self.context,
@@ -2812,6 +3136,7 @@ class DistributedGroundUpTrainer:
             ) = (
                 self._prepare_brains(manifest)
             )
+            self._bind_actual_native_device(brain)
             media_replay = (
                 MonotonicManifestReplay(manifest, dynamic_high_water)
                 if self.context.is_rank_zero
@@ -2833,6 +3158,8 @@ class DistributedGroundUpTrainer:
                 isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES)
                 for child in module.modules()
             )
+            if not direct_packed:
+                raise RuntimeError("distributed corpus runs require the native packed-authoritative architecture")
             amp_enabled, amp_dtype, scaled_amp = (
                 (False, None, False)
                 if direct_packed
@@ -2877,27 +3204,52 @@ class DistributedGroundUpTrainer:
                     final=final,
                 )
 
+            def admit_source(stage, ram_bytes, disk_bytes):
+                status = brain.resource_policy.status(estimated_ram_bytes=ram_bytes, estimated_write_bytes=disk_bytes)
+                if status["memoryPressure"] or status["diskPressure"]:
+                    raise DatasetResourcePause("%s is waiting for distributed parser resources" % stage, status)
+
+            if media_replay is not None:
+                media_replay.resource_admission = admit_source
+
+            def refresh_replica():
+                nonlocal brain, module, wrapped, optimizer, scaler
+                brain = self._refresh_native_replica(brain, manifest)
+                self._bind_actual_native_device(brain)
+                module = DistributedBrainTrainingModule(brain).to(self.context.device)
+                wrapped = _wrap_module(module, strategy=strategy, context=self.context)
+                optimizer = _new_training_optimizer(brain, module, self.options.learning_rate)
+                scaler = _make_grad_scaler(False)
+
             while cursor.epoch < self.options.epochs:
                 epoch = cursor.epoch
+                if any(value.epoch != epoch for value in cursors):
+                    raise ValueError("distributed ranks disagree on the requested epoch boundary")
                 start = cursor.next_global_ordinal
                 owned_iterator = iter(
                     manifest.iter_verified_records(
                         rank=self.context.rank,
                         world_size=self.context.world_size,
                         start_ordinal=start,
+                        resource_admission=admit_source,
                     )
                 )
-                lookahead: Optional[Tuple[DatasetManifestEntry, Any]]
-                try:
-                    lookahead = next(owned_iterator)
-                except StopIteration:
-                    lookahead = None
-                wave_start = start
+                active_stream = None
+                active_entry = None
+                minimum_ordinal = min(value.next_global_ordinal for value in cursors)
+                wave_start = (minimum_ordinal if minimum_ordinal == len(manifest.entries) else
+                    minimum_ordinal // self.options.global_batch_records * self.options.global_batch_records)
                 while wave_start < len(manifest.entries):
                     if _collective_cancelled(
                         self.context,
                         self._signal_cancelled or self.store.cancel_requested(),
                     ):
+                        dynamic_high_water, schedule_state, media_training_state = self._checkpoint(
+                            brain=brain, wrapped=wrapped, optimizer=optimizer, manifest=manifest,
+                            cursors=cursors, local_dynamic=(), dynamic_high_water=dynamic_high_water,
+                            global_steps=global_steps, strategy=strategy, final_pack=False,
+                            schedule_state=schedule_state, rehearsal_phase=None,
+                            media_training_state=media_training_state, media_replay=media_replay)
                         if self.context.is_rank_zero:
                             self.store.write_status(
                                 state="cancelled",
@@ -2914,24 +3266,86 @@ class DistributedGroundUpTrainer:
                         len(manifest.entries),
                         wave_start + self.options.global_batch_records,
                     )
-                    local_records = []
-                    while lookahead is not None and lookahead[0].ordinal < wave_end:
-                        local_records.append(lookahead)
-                        try:
-                            lookahead = next(owned_iterator)
-                        except StopIteration:
-                            lookahead = None
-                    metrics, dynamic, stepped = self._train_wave(
-                        brain=brain,
-                        wrapped=wrapped,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        amp_enabled=amp_enabled,
-                        amp_dtype=amp_dtype,
-                        local_records=local_records,
-                        manifest=manifest,
-                        epoch=epoch,
-                    )
+                    # The requested record group bounds lookahead. Each rank
+                    # opens only one record lease at a time and prepares its
+                    # data before advancing that lease.
+                    local_records, source_error = None, None
+                    owned_completed = cursor.owned_records_completed
+                    next_ordinal = cursor.next_global_ordinal
+                    next_window = cursor.record_window
+                    try:
+                        frozen_sequences = {value.record_window["sequenceTokens"] for value in cursors if value.record_window is not None}
+                        if len(frozen_sequences) > 1:
+                            raise ValueError("distributed ranks have incompatible frozen record-window shapes")
+                        frozen_sequence = next(iter(frozen_sequences)) if frozen_sequences else None
+                        plan = self._distributed_window_plan(brain, wave_start, wave_end, frozen_sequence)
+                        proposed_sequence = int(plan["windowTokens"])
+                    except BaseException as failure:
+                        source_error = _failure_payload(failure)
+                        proposed_sequence = 0
+                    source_errors = _collect_objects(self.context, source_error)
+                    _raise_phase_failures(source_errors, "distributed record-wave admission failed")
+                    proposals = _collect_objects(self.context, proposed_sequence)
+                    sequence_tokens = next(iter(frozen_sequences)) if frozen_sequences else min(proposals)
+                    if min(proposals) < sequence_tokens:
+                        raise DatasetResourcePause("resume is waiting for its frozen causal-window resources", {
+                            "requestedSequenceTokens": sequence_tokens, "availableSequenceTokens": min(proposals)})
+                    source_error = None
+                    try:
+                        # Re-admit the chosen common context with this rank's
+                        # own CPU/CUDA budget. Physical batches can differ,
+                        # and adapt only between committed optimizer waves.
+                        plan = self._distributed_window_plan(brain, wave_start, wave_end, sequence_tokens)
+                        def reserve_input(**amounts):
+                            if self._signal_cancelled or self.store.cancel_requested():
+                                raise DatasetResourcePause("cancelled during input-wave preparation", {"cancelled": True})
+                            admit_source("distributed input wave", amounts.get("ram_bytes", 0), amounts.get("disk_bytes", 0))
+                        local_records = PreparedWindowWave(physical_batch=plan["physicalBatchRecords"],
+                            ram_budget=plan["inputRamBudgetBytes"], directory=self.store.path / ("rank-input-scratch-%05d" % self.context.rank),
+                            reserve=reserve_input, allow_spill=brain.config.disk_state_offload)
+                        while next_ordinal < wave_end and local_records.window_count < plan["waveWindowTarget"]:
+                            owned_ordinal = next_ordinal + (self.context.rank - next_ordinal) % self.context.world_size
+                            if owned_ordinal >= wave_end:
+                                next_ordinal, next_window = wave_end, None
+                                break
+                            else:
+                                if active_stream is None:
+                                    active_entry, record = next(owned_iterator)
+                                    if active_entry.ordinal != owned_ordinal:
+                                        raise ValueError("rank-owned record order differs from its exact global group")
+                                    active_stream = RecordWindowStream(record, active_entry, brain.tokenizer,
+                                        sequence_tokens, cursor.record_window)
+                                    cursor_window = cursor.record_window
+                                    if cursor_window is not None:
+                                        cursor = RankCursor(cursor.rank, cursor.world_size, cursor.epoch,
+                                            cursor.next_global_ordinal, cursor.owned_records_completed,
+                                            cursor.optimizer_steps_completed, cursor.manifest_sha256)
+                                literal = [(active_entry, item) for item in active_stream.next_batch(
+                                    min(plan["physicalBatchRecords"], plan["waveWindowTarget"] - local_records.window_count))]
+                                prepared, _ = self._rank_records_for_wave(brain, manifest, epoch, literal)
+                                for _entry, values in prepared:
+                                    for ids, cue, noise in values:
+                                        local_records.append(ids, cue, noise)
+                                if active_stream.complete:
+                                    owned_completed += 1
+                                    next_ordinal, next_window = min(wave_end, active_entry.ordinal + self.context.world_size), None
+                                    active_stream.close()
+                                    active_stream, active_entry = None, None
+                                else:
+                                    next_ordinal, next_window = active_entry.ordinal, active_stream.state()
+                                    next_window["lastWavePlan"] = {"physicalBatchWindows": plan["physicalBatchRecords"],
+                                        "waveWindowTarget": plan["waveWindowTarget"], "recordGroup": [wave_start, wave_end],
+                                        "adaptAtCommittedBoundary": True}
+                    except BaseException as failure:
+                        source_error = _failure_payload(failure)
+                    source_errors = _collect_objects(self.context, source_error)
+                    _raise_phase_failures(source_errors, "distributed exact record traversal failed before mutation")
+                    try:
+                        metrics, dynamic, stepped = self._train_wave(brain=brain, wrapped=wrapped,
+                            optimizer=optimizer, scaler=scaler, amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                            local_records=local_records, manifest=manifest, epoch=epoch)
+                    finally:
+                        if local_records is not None: local_records.close()
                     last_metrics = metrics
                     if stepped:
                         global_steps += 1
@@ -2939,36 +3353,28 @@ class DistributedGroundUpTrainer:
                         raise RuntimeError(
                             "injected distributed rank failure before cursor publication"
                         )
-                    pending_dynamic.extend(dynamic)
-                    owned_completed = cursor.owned_records_completed + len(local_records)
                     cursor = RankCursor(
                         rank=self.context.rank,
                         world_size=self.context.world_size,
                         epoch=epoch,
-                        next_global_ordinal=wave_end,
+                        next_global_ordinal=next_ordinal,
                         owned_records_completed=owned_completed,
                         optimizer_steps_completed=(
                             cursor.optimizer_steps_completed + int(stepped)
                         ),
                         manifest_sha256=manifest.content_sha256,
+                        record_window=next_window,
                     )
                     cursor_payloads = _collect_objects(
                         self.context, cursor.to_dict()
                     )
                     cursors = [RankCursor.from_dict(value) for value in cursor_payloads]
-                    # The epoch-transition checkpoint below owns the final
-                    # wave and, for the final epoch, the packed export. Avoid
-                    # writing the same native state twice at the boundary.
+                    group_complete = all(value.next_global_ordinal >= wave_end and value.record_window is None for value in cursors)
                     rehearsal_phase = phase_at_completed_wave(
                         completed_epochs=epoch,
-                        next_global_ordinal=wave_end,
-                    )
+                        next_global_ordinal=wave_end) if group_complete else None
                     if (
-                        wave_end < len(manifest.entries)
-                        and (
-                            global_steps % self.options.checkpoint_steps == 0
-                            or rehearsal_phase == "middle"
-                        )
+                        group_complete or global_steps % self.options.checkpoint_steps == 0
                     ):
                         (
                             dynamic_high_water,
@@ -2991,21 +3397,38 @@ class DistributedGroundUpTrainer:
                             media_replay=media_replay,
                         )
                         pending_dynamic.clear()
+                        refresh_replica()
                     if self.context.is_rank_zero:
-                        completed_units = epoch * len(manifest.entries) + wave_end
+                        committed_ordinal = min(value.next_global_ordinal for value in cursors)
+                        completed_units = epoch * len(manifest.entries) + committed_ordinal
                         total_units = self.options.epochs * max(1, len(manifest.entries))
                         self.store.write_status(
                             state="running",
                             globalOptimizerSteps=global_steps,
                             epoch=epoch,
-                            nextGlobalOrdinal=wave_end,
-                            progress=min(1.0, completed_units / float(total_units)),
+                            nextGlobalOrdinal=committed_ordinal,
+                            activeRecordWindows=[value.record_window for value in cursors],
+                            learnerWave={"physicalBatchWindows": plan["physicalBatchRecords"],
+                                "windowTargetPerRank": plan["waveWindowTarget"], "requestedRecordGroup": [wave_start, wave_end]},
+                            progress=min(0.99, completed_units / float(total_units)),
                             metrics=last_metrics,
                         )
-                    wave_start = wave_end
+                    if group_complete:
+                        if active_stream is not None:
+                            active_stream.close()
+                        active_stream, active_entry = None, None
+                        self._leased_human_cue_cache = None
+                        wave_start = wave_end
 
                 # Publish the epoch transition itself so resume never repeats
                 # a completed last wave under the next epoch number.
+                tail_error = None
+                try:
+                    if next(owned_iterator, None) is not None:
+                        raise ValueError("distributed rank iterator retained an uncommitted source record")
+                except BaseException as failure:
+                    tail_error = _failure_payload(failure)
+                _raise_phase_failures(_collect_objects(self.context, tail_error), "distributed epoch source exhaustion failed")
                 cursor = RankCursor(
                     rank=self.context.rank,
                     world_size=self.context.world_size,
@@ -3044,6 +3467,8 @@ class DistributedGroundUpTrainer:
                     media_replay=media_replay,
                 )
                 pending_dynamic.clear()
+                refresh_replica()
+                owned_iterator.close()
 
             error: Optional[str] = None
             promotion: Optional[Dict[str, Any]] = None
@@ -3089,14 +3514,21 @@ class DistributedGroundUpTrainer:
                 "mediaTraining": media_training_state,
                 "promotion": values[0],
             }
+        except DatasetResourcePause as error:
+            state = "cancelled" if error.status.get("cancelled") else "paused"
+            if write_authority and self.context.is_rank_zero:
+                self.store.write_status(state=state, reason=str(error),
+                    resumable=self.store.active_path.is_file(), resourceReadings=error.status)
+            return {"state": state, "resumable": self.store.active_path.is_file(), "reason": str(error)}
         except BaseException as error:
             # Packed synapses may have mutated before backward/finite/step
             # failed. This rank brain is a private, unsaved clone: never save
             # it on this path. The next run recreates it from the last
             # published native generation and cursor, discarding the entire
             # failed wave rather than replaying a partially learned state.
-            self.store.record_failure(self.context.rank, error)
-            if self.context.is_rank_zero:
+            if write_authority:
+                self.store.record_failure(self.context.rank, error)
+            if write_authority and self.context.is_rank_zero:
                 self.store.write_status(
                     state="failed",
                     reason="%s: %s" % (type(error).__name__, error),
@@ -3105,9 +3537,27 @@ class DistributedGroundUpTrainer:
                 )
             raise
         finally:
-            if brain is not None:
-                brain.events.close()
-            self._restore_signal_handlers()
+            # All owned leases are released even if another teardown fails.
+            # No cleanup path publishes an unsaved failed replica.
+            with contextlib.ExitStack() as cleanup:
+                cleanup.callback(self._restore_signal_handlers)
+                for lease in reversed(leases):
+                    if lease is not None: cleanup.callback(lease.close)
+                if brain is not None: cleanup.callback(brain.close)
+                controller = getattr(self, "_packed_collective_controller", None)
+                if controller is not None:
+                    def close_controller():
+                        try:
+                            if controller.step_id: controller.rollback()
+                        finally:
+                            controller.close()
+                            self._packed_collective_controller = None
+                    cleanup.callback(close_controller)
+                for name in ("media_replay", "owned_iterator", "active_stream"):
+                    resource = locals().get(name)
+                    if resource is not None: cleanup.callback(resource.close)
+                input_wave = locals().get("local_records")
+                if isinstance(input_wave, PreparedWindowWave): cleanup.callback(input_wave.close)
 
 
 __all__ = [

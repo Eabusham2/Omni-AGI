@@ -81,9 +81,14 @@ Official Omni release packaging deliberately removes the wheel-provided FFmpeg
 executable before the neural worker is embedded. The BSD-licensed Python
 wrapper remains and may use an FFmpeg executable explicitly selected through
 `IMAGEIO_FFMPEG_EXE` or already installed on the host. When none is available,
-the same brain emits its built-in APNG video or PCM WAV fallback instead of
-silently installing a binary. Therefore the official artifact conveys no
-FFmpeg executable and has no FFmpeg corresponding-source payload to match.
+the same brain retains its built-in APNG video or PCM WAV fallback. The user
+has chosen automatic video-runtime setup; source now provides a cancellable,
+hash-pinned on-demand installer. The checked-in catalog now binds separately
+published FFmpeg 9.0.2 and x264 builds for all six desktop targets, with exact
+executable/corresponding-source/build/license hashes. It does not install an unreviewed wheel binary
+or execute downloaded setup scripts. Therefore the current official artifact
+still conveys no FFmpeg executable and has no bundled FFmpeg corresponding-
+source payload to match.
 
 The package verifier fails if an FFmpeg executable is found or if the embedded
 machine-readable policy and notices are absent. A downstream distributor that
@@ -91,6 +96,18 @@ changes this design to bundle FFmpeg must also change that policy, bind the
 exact binary hash, and provide the complete corresponding source and build and
 installation material for FFmpeg and every linked non-system library. Merely
 linking to upstream source is not treated as satisfying that requirement.
+
+For automatic provisioning the same exact-binary and complete-source review
+is required. Source/build material and license notices must be downloaded and
+verified before the standalone executable is selected, and remain alongside
+it in the app-owned cache. The declarative catalog ships as
+`licenses/ffmpeg-runtime-manifest.json`. The independent runtime and matching
+sources are available at <https://github.com/Eabusham2/Omni-AGI/releases/tag/omni-video-9.0.2-r1>.
+These GPL components communicate with Omni through ordinary standalone CLI
+media formats and retain their own license rights. Technical source/dependency
+review and six native codec round-trip checks are not legal advice, patent
+clearance or proof of AI-generated media quality. See
+`docs/VIDEO_RUNTIME_PROVISIONING.md` for provenance and remaining live integration evidence.
 
 ## Research inspirations
 

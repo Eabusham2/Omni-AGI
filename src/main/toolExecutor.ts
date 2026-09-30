@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { isUtf8 } from "node:buffer";
+import { normalizeConceptIdView } from "../shared/conceptIdView";
 import {
   lstat,
   mkdir,
@@ -61,6 +62,7 @@ import {
   type DeviceInputResult
 } from "./deviceInput";
 import { withBrainWrite } from "./brainWriteCoordinator";
+import { persistAuthorizedToolIntent } from "./toolIntentJournal";
 import type { ToolPreferencesStore } from "./toolPreferences";
 
 export interface ExternalToolBridge {
@@ -732,6 +734,14 @@ export class ToolExecutor {
       if (!needsApproval && invocation.approvalToken) {
         this.approvals.delete(invocation.approvalToken);
       }
+      // Persist independent authorization intent before any external effect.
+      // Whole-brain result auditing remains serialized after the chat's
+      // atomic checkpoint; this receipt cannot overwrite a live draft brain.
+      await persistAuthorizedToolIntent(
+        this.service.repository.brainDirectory(invocation.brainId), invocation,
+        { id, requestId, startedAt, permission, permissionRevision: permissionDecision.revision }
+      );
+      controller.signal.throwIfAborted();
       let output: unknown;
       try {
         output = await this.dispatch(
@@ -1708,6 +1718,10 @@ export class ToolExecutor {
       conceptIds: Array.isArray(args.conceptIds)
         ? args.conceptIds.filter((value): value is string => typeof value === "string")
         : undefined,
+      ...(args.conceptIdView === undefined ? {} : {
+        conceptIdView: normalizeConceptIdView(args.conceptIdView, brainId, args.sourceTurnId),
+        sourceTurnId: String(args.sourceTurnId)
+      }),
       settings:
         typeof args.settings === "object" && args.settings !== null
           ? ({

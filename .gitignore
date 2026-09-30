@@ -12,6 +12,9 @@ engine-dist/
 __pycache__/
 *.py[cod]
 .codex/
+# Private chronological requirements evidence is not release source.
+work/
+docs/TRANSCRIPT_REQUIREMENTS_AUDIT.md
 *.omni
 *.log
 .DS_Store

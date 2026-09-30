@@ -164,11 +164,16 @@ def _fields(value: Any, expected: set[str], label: str) -> Dict[str, Any]:
 def _validate_cursor_coverage(
     cursor_value: Any, coverage_value: Any, source_content_sha256: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    cursor_fields = {"committedRecords", "recordPrefixSha256"}
+    if isinstance(cursor_value, Mapping) and "activeRecordWindowSha256" in cursor_value:
+        cursor_fields.add("activeRecordWindowSha256")
     cursor = _fields(
-        cursor_value, {"committedRecords", "recordPrefixSha256"}, "cursor",
+        cursor_value, cursor_fields, "cursor",
     )
     _count(cursor["committedRecords"], "committed records")
     _hash(cursor["recordPrefixSha256"], "record prefix")
+    if "activeRecordWindowSha256" in cursor:
+        _hash(cursor["activeRecordWindowSha256"], "active record window")
     if (
         cursor["committedRecords"] == 0
         and cursor["recordPrefixSha256"] != EMPTY_RECORD_PREFIX_SHA256
@@ -199,6 +204,8 @@ def _validate_cursor_coverage(
     ):
         raise JointGenerationError("record coverage is incomplete")
     if coverage["sourceStreamExhausted"]:
+        if "activeRecordWindowSha256" in cursor:
+            raise JointGenerationError("exhausted source still has an active record window")
         if (
             coverage["expectedRecords"] is not None
             and coverage["visitedRecords"] != coverage["expectedRecords"]

@@ -64,4 +64,24 @@ describe("native OmniCortex runtime presentation", () => {
       "2.0 GiB current · 6.0 GiB peak · physical footprint"
     ]]);
   });
+
+  it("includes packed memory weights once and rejects inconsistent totals", () => {
+    const accounting = {
+      mutableDenseParameters: 100,
+      substrateVectorParameters: 192,
+      substrateDynamicSparseSynapses: 2,
+      dynamicSparseSynapses: 2,
+      totalNeuralParameters: 294,
+      countingRule: "core + shared memory rows + edges"
+    };
+    const presented = neuralParameterAccounting({ parameterAccounting: accounting });
+    expect(presented?.totalNeuralParameters).toBe(294);
+    expect(presented?.exactLabel).toContain("192 learned memory weights");
+    expect(neuralParameterAccounting({ parameterAccounting: {
+      ...accounting, totalNeuralParameters: 486
+    }})).toBeUndefined();
+    expect(neuralParameterAccounting({ parameterAccounting: {
+      ...accounting, substrateVectorParameters: -1
+    }})).toBeUndefined();
+  });
 });

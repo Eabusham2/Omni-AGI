@@ -359,29 +359,20 @@ class DistributedRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "FSDP requires"):
             _resolve_strategy(forced, context, module)
 
-    def test_multi_rank_rejects_unsynchronized_packed_mutations_before_wrap(self):
+    def test_multi_rank_uses_packed_collective_and_rejects_private_ddp_fsdp_paths(self):
         context = SimpleNamespace(world_size=2, local_rank=0, device=torch.device("cpu"))
-        packed_modules = (
-            PackedAdaptiveBitLinear(2, 2),
-            PackedAdaptiveTernaryEmbedding(3, 2),
-            PackedAdaptiveBitConv1d(1, 1, 1),
-        )
-        for packed in packed_modules:
-            packed.online_learning_rate = 0.0
-            module = torch.nn.Sequential(packed)
-            for strategy in ("ddp", "fsdp"):
-                with self.subTest(layer=type(packed).__name__, strategy=strategy):
-                    with mock.patch(
-                        "omni_core.distributed_training.DistributedDataParallel",
-                        side_effect=AssertionError("DDP must not be constructed"),
-                    ):
-                        with self.assertRaisesRegex(
-                            RuntimeError,
-                            "direct backward mutations are not synchronized",
-                        ):
-                            _wrap_module(module, strategy=strategy, context=context)
-            with self.assertRaisesRegex(RuntimeError, "direct backward mutations"):
-                _wrap_module(module, strategy="single", context=context)
+        class PackedMarker: pass
+        module = SimpleNamespace(modules=lambda: (PackedMarker(),))
+        with mock.patch("omni_core.distributed_training.PACKED_AUTHORITATIVE_PROJECTION_TYPES", (PackedMarker,)):
+            for hint in ("auto", "ddp", "fsdp"):
+                self.assertEqual(_resolve_strategy(DistributedTrainingOptions(strategy=hint), context, module), "packed-collective")
+            self.assertIs(_wrap_module(module, strategy="packed-collective", context=context), module)
+            for strategy in ("ddp", "fsdp", "single"):
+                with self.subTest(strategy=strategy), mock.patch(
+                    "omni_core.distributed_training.DistributedDataParallel",
+                    side_effect=AssertionError("DDP must not be constructed")):
+                    with self.assertRaisesRegex(RuntimeError, "canonical packed collective"):
+                        _wrap_module(module, strategy=strategy, context=context)
             single = SimpleNamespace(world_size=1, local_rank=0, device=torch.device("cpu"))
             self.assertIs(_wrap_module(module, strategy="single", context=single), module)
 

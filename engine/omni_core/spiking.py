@@ -1,6 +1,7 @@
 """Leaky spiking dynamics and local STDP plasticity."""
 
 import math
+from contextlib import nullcontext
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -11,6 +12,8 @@ from .model import (
     pack_ternary_weight,
     unpack_ternary_weight_rows,
 )
+from .architecture_migration import copy_packed_prefix, copy_tensor_prefix
+from .bounded_tensor_io import TRANSFER_BYTES
 
 
 class LIFPopulation(nn.Module):
@@ -118,7 +121,7 @@ class STDPSynapses(nn.Module):
     def authoritative_packed_tensors(self) -> Tuple[torch.Tensor, ...]:
         """The sole persistent synaptic weight bytes for checksum/accounting."""
 
-        self.effective_weight()  # Validate reserved and padding codes.
+        self._validate_packed()
         return (self._packed_weights,)
 
     @property
@@ -145,40 +148,11 @@ class STDPSynapses(nn.Module):
     ):
         legacy_name = prefix + "weights"
         packed_name = prefix + "_packed_weights"
-        if legacy_name in state_dict and packed_name in state_dict:
-            error_msgs.append(
-                prefix + "synapse checkpoint has both packed and floating weights"
-            )
-        elif legacy_name in state_dict:
-            legacy = state_dict.pop(legacy_name)
-            if (
-                not isinstance(legacy, torch.Tensor)
-                or legacy.shape != (self.post_neurons, self.pre_neurons)
-                or not legacy.is_floating_point()
-                or not bool(torch.isfinite(legacy).all())
-            ):
-                error_msgs.append(prefix + "legacy STDP weights are invalid")
-            else:
-                # Native pre-packed checkpoints used this threshold for their
-                # effective recurrent synapses. Preserve those exact levels;
-                # discard the former dense float master after migration.
-                threshold = max(1e-6, self.weight_limit * 0.25)
-                levels = torch.where(
-                    legacy >= threshold,
-                    torch.ones_like(legacy, dtype=torch.int8),
-                    torch.where(
-                        legacy <= -threshold,
-                        -torch.ones_like(legacy, dtype=torch.int8),
-                        torch.zeros_like(legacy, dtype=torch.int8),
-                    ),
-                )
-                state_dict[packed_name] = pack_ternary_weight(levels)
-                state_dict[prefix + "eligibility_accumulator"] = (
-                    torch.zeros_like(self.eligibility_accumulator)
-                )
-                state_dict[prefix + "decay_cycles"] = torch.zeros_like(
-                    self.decay_cycles
-                )
+        if legacy_name in state_dict:
+            # Loading is not authorization to threshold or quantize learned
+            # state. Keep the incompatible archive intact and fail closed.
+            error_msgs.append(prefix + "floating learned synapse weights are incompatible with packed-native state")
+            return
         if packed_name not in state_dict:
             error_msgs.append(packed_name + " is required")
         super()._load_from_state_dict(
@@ -187,7 +161,7 @@ class STDPSynapses(nn.Module):
         )
         if packed_name in state_dict:
             try:
-                self.effective_weight()
+                self._validate_packed()
             except (ValueError, RuntimeError) as error:
                 error_msgs.append(str(error))
 
@@ -195,23 +169,30 @@ class STDPSynapses(nn.Module):
         self.pre_trace.zero_()
         self.post_trace.zero_()
 
-    def effective_weight(self) -> torch.Tensor:
-        """Return the exact ternary synapses used by recurrent computation."""
-
+    def _validate_packed(self) -> None:
+        """Bounded byte/code validation, without an N² decoded shadow."""
         packed = self._packed_weights
-        if packed.dtype != torch.uint8 or packed.shape != (
+        if packed.dtype != torch.uint8 or not packed.is_contiguous() or packed.shape != (
             self.post_neurons, (self.pre_neurons + 3) // 4
         ):
             raise ValueError("packed STDP synapse shape or dtype is invalid")
-        decoded = unpack_ternary_weight_rows(packed, self.pre_neurons)
-        # The generic decoder verifies active codes. Enforce canonical zero
-        # padding too, so a malformed checkpoint never enters recurrent use.
+        step = max(1, TRANSFER_BYTES // 8)
+        flat = packed.reshape(-1)
+        for start in range(0, flat.numel(), step):
+            block = flat[start:start + step]
+            if any(bool((((block >> shift) & 3) == 3).any()) for shift in (0, 2, 4, 6)):
+                raise ValueError("packed STDP synapse contains reserved ternary codes")
         if self.pre_neurons % 4:
-            last = packed[:, -1]
-            for lane in range(self.pre_neurons % 4, 4):
-                if bool((((last >> (2 * lane)) & 0x03) != 1).any()):
-                    raise ValueError("packed STDP synapse has nonzero row padding")
-        return decoded
+            for start in range(0, self.post_neurons, step):
+                last = packed[start:start + step, -1]
+                for lane in range(self.pre_neurons % 4, 4):
+                    if bool((((last >> (2 * lane)) & 3) != 1).any()):
+                        raise ValueError("packed STDP synapse has nonzero row padding")
+
+    def effective_weight(self) -> torch.Tensor:
+        """Ephemeral exact recurrent input, not a persistent FP weight master."""
+        self._validate_packed()
+        return unpack_ternary_weight_rows(self._packed_weights, self.pre_neurons)
 
     def step(
         self, pre_spikes: torch.Tensor, post_spikes: torch.Tensor
@@ -328,6 +309,8 @@ class AssociativeSpikingRouter(nn.Module):
         super().__init__()
         self.idea_dim = idea_dim
         self.neurons = neurons
+        self.register_buffer("active_prefix_neurons", torch.tensor(int(neurons), dtype=torch.long))
+        self.register_buffer("region_ends", torch.tensor([int(neurons)], dtype=torch.long))
         self.input_projection = BitLinear(idea_dim, neurons, bias=True)
         self.output_projection = BitLinear(neurons, idea_dim, bias=True)
         self.population = LIFPopulation(neurons, leak=leak, threshold=threshold)
@@ -341,6 +324,105 @@ class AssociativeSpikingRouter(nn.Module):
             a_minus=a_minus,
             metaplasticity_rate=metaplasticity_rate,
         )
+
+    @torch.no_grad()
+    def grow_neurons(self, add_neurons: int, *, region_sizes: Optional[Tuple[int, ...]] = None) -> int:
+        """Preserve old trits/activity and add an initially dormant region."""
+        if isinstance(add_neurons, bool) or not isinstance(add_neurons, int) or add_neurons < 1:
+            raise ValueError("router additions must be a positive integer")
+        old_neurons, new_neurons = int(self.neurons), int(self.neurons) + add_neurons
+        if region_sizes is not None and (any(type(size) is not int or size < 1 for size in region_sizes) or sum(region_sizes) != add_neurons):
+            raise ValueError("router region sizes must cover all appended neurons")
+        pager = getattr(self.input_projection, "_native_core_pager", None)
+        scope = pager.construction(from_checkpoint=False) if pager is not None else nullcontext()
+        device = self.population.membrane.device
+        with scope:
+            incoming = BitLinear(self.idea_dim, new_neurons, bias=True)
+            outgoing = BitLinear(new_neurons, self.idea_dim, bias=True)
+            for old, new in ((self.input_projection, incoming), (self.output_projection, outgoing)):
+                copy_packed_prefix(old._packed_forward_weight, new._packed_forward_weight, old.in_features, new.in_features)
+                copy_packed_prefix(old._packed_forward_bias, new._packed_forward_bias, old.out_features, new.out_features)
+                for name in ("_packed_forward_scale", "_online_learning_rate", "_row_stability", "_bias_row_stability"):
+                    copy_tensor_prefix(getattr(old, name), getattr(new, name))
+                new._packed_stability_strength = old._packed_stability_strength
+                new._pending_stability_events = old._pending_stability_events
+            population = LIFPopulation(new_neurons, leak=self.population.leak, threshold=self.population.threshold).to(device)
+            copy_tensor_prefix(self.population.membrane, population.membrane)
+            copy_tensor_prefix(self.population.spike_count, population.spike_count)
+            old_synapses = self.synapses
+            synapses = STDPSynapses(new_neurons, new_neurons,
+                learning_rate=old_synapses.learning_rate,
+                tau_pre=8.0, tau_post=8.0,
+                a_plus=old_synapses.a_plus, a_minus=old_synapses.a_minus,
+                metaplasticity_rate=old_synapses.metaplasticity_rate,
+                weight_limit=old_synapses.weight_limit).to(device)
+            synapses.pre_decay = old_synapses.pre_decay
+            synapses.post_decay = old_synapses.post_decay
+            copy_packed_prefix(old_synapses._packed_weights, synapses._packed_weights, old_neurons, new_neurons)
+            for name in ("eligibility_accumulator", "stability", "uses", "pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
+                copy_tensor_prefix(getattr(old_synapses, name), getattr(synapses, name))
+            incoming.to(device)
+            outgoing.to(device)
+        ends = self.region_ends.detach().cpu().tolist()
+        running = old_neurons
+        for size in region_sizes or (add_neurons,):
+            running += size
+            ends.append(running)
+        self.input_projection, self.output_projection = incoming, outgoing
+        self.population, self.synapses = population, synapses
+        self.neurons = new_neurons
+        self.region_ends = torch.tensor(ends, dtype=torch.long, device=device)
+        return new_neurons
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Legacy saved routers mean every existing neuron is active. New
+        # control buffers never discard or reset their old nonweight state.
+        state_dict = dict(state_dict)
+        state_dict.setdefault(prefix + "active_prefix_neurons", torch.tensor(self.neurons, dtype=torch.long))
+        ends = state_dict.get(prefix + "region_ends")
+        if isinstance(ends, torch.Tensor):
+            if ends.ndim != 1 or ends.dtype != torch.long or not ends.numel() or int(ends[0]) < 1 or int(ends[-1]) != self.neurons or bool((ends[1:] <= ends[:-1]).any()):
+                error_msgs.append(prefix + "router region geometry is invalid")
+            else:
+                self.region_ends = torch.empty_like(ends, device=self.population.membrane.device)
+        else:
+            state_dict[prefix + "region_ends"] = torch.tensor([self.neurons], dtype=torch.long)
+        active = state_dict[prefix + "active_prefix_neurons"]
+        if active.numel() != 1 or active.dtype != torch.long or not 1 <= int(active) <= self.neurons:
+            error_msgs.append(prefix + "router active-prefix geometry is invalid")
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    def prepare_bounded_state_load(self, specs, prefix: str) -> None:
+        spec = specs.get(prefix + "region_ends")
+        if spec is not None:
+            if len(spec.shape) != 1 or spec.dtype != torch.long or not 1 <= spec.shape[0] <= self.neurons:
+                raise ValueError("router region geometry header is invalid")
+            self.region_ends = torch.empty(spec.shape, dtype=torch.long, device=self.population.membrane.device)
+        active = specs.get(prefix + "active_prefix_neurons")
+        if active is not None and (active.shape != () or active.dtype != torch.long):
+            raise ValueError("router active-prefix header is invalid")
+
+    def bounded_optional_state_defaults(self, specs, prefix: str):
+        """Only the two additive control fields may be absent in legacy files."""
+        return {
+            name: value for name, value in (
+                ("active_prefix_neurons", torch.tensor(self.neurons, dtype=torch.long)),
+                ("region_ends", torch.tensor([self.neurons], dtype=torch.long)),
+            ) if prefix + name not in specs
+        }
+
+    def validate_bounded_state_load(self) -> None:
+        """Post-bounded-load control validation; learned bytes are unchanged."""
+        active, ends = self.active_prefix_neurons, self.region_ends
+        if active.ndim != 0 or active.dtype != torch.long or not 1 <= int(active) <= self.neurons:
+            raise ValueError("router active-prefix geometry is invalid")
+        if (ends.ndim != 1 or ends.dtype != torch.long or not 1 <= ends.numel() <= self.neurons
+            or int(ends[0]) < 1 or int(ends[-1]) != self.neurons
+            or bool((ends[1:] <= ends[:-1]).any())):
+            raise ValueError("router region geometry is invalid")
+
+    def _validate_packed(self) -> None:
+        self.validate_bounded_state_load()
 
     def reset_activity(self) -> None:
         self.population.reset()
@@ -358,7 +440,13 @@ class AssociativeSpikingRouter(nn.Module):
         if idea.shape[0] != 1 or idea.shape[-1] != self.idea_dim:
             raise ValueError("router expects one idea vector")
 
+        if learn:
+            self.active_prefix_neurons.fill_(self.neurons)
+        active_neurons = int(self.active_prefix_neurons)
+
         projected = torch.sigmoid(self.input_projection(idea))[0]
+        if active_neurons < self.neurons:
+            projected = projected * (torch.arange(self.neurons, device=projected.device) < active_neurons)
         previous = torch.zeros_like(projected)
         total_spikes = torch.zeros_like(projected)
         total_update = 0.0
@@ -368,6 +456,8 @@ class AssociativeSpikingRouter(nn.Module):
                 previous.detach(),
             )
             current = projected + 0.35 * recurrent
+            if active_neurons < self.neurons:
+                current = current * (torch.arange(self.neurons, device=current.device) < active_neurons)
             spikes, _ = self.population.step(
                 current, threshold_offset=threshold_offset
             )
@@ -383,10 +473,10 @@ class AssociativeSpikingRouter(nn.Module):
             self.output_projection(activity.unsqueeze(0))
         )
         metrics = {
-            "spike_rate": float((total_spikes.detach() > 0).float().mean().item()),
+            "spike_rate": float((total_spikes.detach()[:active_neurons] > 0).float().mean().item()),
             "spikes": float(total_spikes.detach().sum().item()),
             "stdp_update": total_update,
-            "mean_stability": float(self.synapses.stability.mean().item()),
+            "mean_stability": float(self.synapses.stability[:active_neurons, :active_neurons].mean().item()),
             "active_synapses": float(
                 self.synapses.effective_weight().ne(0).sum().item()
             ),
@@ -407,6 +497,7 @@ class AssociativeSpikingRouter(nn.Module):
 
         if direction not in {-1, 1}:
             raise ValueError("feedback direction must be -1 or +1")
+        self.active_prefix_neurons.fill_(self.neurons)
         if idea.ndim == 1:
             idea = idea.unsqueeze(0)
         if idea.shape != (1, self.idea_dim):

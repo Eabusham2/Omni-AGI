@@ -90,6 +90,9 @@ const api: OmniApi = {
     persistedSubstrateOverview: (id) =>
       invoke(IPC.brain.persistedSubstrateOverview, id),
     querySubstrate: (id, query) => invoke(IPC.brain.querySubstrate, id, query),
+    queryConceptIds: (id, view, sourceTurnId, offset) => invoke(IPC.brain.queryConceptIds, id, view, sourceTurnId, offset),
+    queryCortex: (id, query) => invoke(IPC.brain.queryCortex, id, query),
+    cortexActivity: (id, query) => invoke(IPC.brain.cortexActivity, id, query),
     workspace: (id) => invoke(IPC.brain.workspace, id),
     freshAttention: (id) => invoke(IPC.brain.freshAttention, id),
     journalPage: (id, cursor, limit) =>
@@ -99,6 +102,8 @@ const api: OmniApi = {
     send: (id, input, turnId, turnMetadata) =>
       invoke(IPC.chat.send, id, input, turnId, turnMetadata),
     cancel: (id, turnId) => invoke(IPC.chat.cancel, id, turnId),
+    cancelInlineAction: (id, turnId, actionEventId) =>
+      invoke(IPC.chat.cancelInlineAction, id, turnId, actionEventId),
     recordDeliveryReceipt: (id, receipt) =>
       invoke(IPC.chat.recordDeliveryReceipt, id, receipt),
     approveAction: (request) => invoke(IPC.chat.approveAction, request),
@@ -203,6 +208,12 @@ const api: OmniApi = {
     artifacts: (brainId, cursor, limit) =>
       invoke(IPC.modality.artifacts, brainId, cursor, limit),
     generate: (request) => invoke(IPC.modality.generate, request),
+    generateSpeech: (request) => invoke(IPC.modality.generateSpeech, request),
+    onGeneration: (listener) => {
+      const handler = (_event: Electron.IpcRendererEvent, value: RuntimeJobEvent) => listener(value);
+      ipcRenderer.on(IPC.train.event, handler);
+      return () => ipcRenderer.removeListener(IPC.train.event, handler);
+    },
     selectInput: (request) => invoke(IPC.modality.selectInput, request),
     cancel: (jobId) => invoke(IPC.modality.cancel, jobId),
     startObservation: (request) =>
@@ -235,7 +246,7 @@ const api: OmniApi = {
     setPermission: (brainId, toolId, level) =>
       invoke(IPC.tool.setPermission, brainId, toolId, level),
     execute: (request) => invoke(IPC.tool.execute, request),
-    cancel: (brainId) => invoke(IPC.tool.cancel, brainId),
+    cancel: (brainId, requestId) => invoke(IPC.tool.cancel, brainId, requestId),
     preferences: () => invoke(IPC.tool.preferences),
     setPreferences: (value) => invoke(IPC.tool.setPreferences, value)
   },

@@ -12,6 +12,7 @@ const ROOT_LEGAL_FILES = [
   "THIRD_PARTY_NOTICES.md"
 ];
 const POLICY_FILE = "licenses/ffmpeg-runtime-policy.json";
+const VIDEO_RUNTIME_MANIFEST_FILE = "licenses/ffmpeg-runtime-manifest.json";
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
@@ -26,6 +27,38 @@ function option(name, argv = process.argv.slice(2)) {
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function reviewedRuntimeArtifact(value) {
+  if (!value || value.license !== "GPL-2.0-or-later" ||
+      !/^ffmpeg-[0-9.]+-(?:win32|darwin|linux)-(?:x64|arm64)-r[0-9]+$/.test(value.id ?? "") ||
+      !value.provenance?.configuration?.includes("--disable-autodetect") ||
+      !value.provenance.configuration.includes("--enable-gpl") ||
+      !value.provenance.configuration.includes("--enable-libx264") ||
+      /--enable-(?:nonfree|version3|lib(?!x264\b))/.test(value.provenance.configuration) ||
+      value.provenance.buildRepositoryUrl !== "https://github.com/Eabusham2/Omni-AGI" ||
+      !/^[a-f0-9]{40}$/.test(value.provenance.buildCommit ?? "") ||
+      value.provenance.linkage !== "standalone-cli-static-except-system" ||
+      value.provenance.completeCorrespondingSourceReviewed !== true ||
+      value.provenance.allLinkedNonSystemLibrariesReviewed !== true ||
+      value.provenance.distributionLicenseReviewed !== true ||
+      !value.provenance.reviewId || !Number.isFinite(Date.parse(value.provenance.reviewedAt)) ||
+      !Array.isArray(value.linkedLibraries) || value.linkedLibraries.length !== 1 ||
+      value.linkedLibraries[0].configureFlag !== "--enable-libx264" ||
+      value.linkedLibraries[0].license !== "GPL-2.0-or-later" ||
+      value.binary?.fileName !== (value.target.startsWith("win32-") ? "ffmpeg.exe" : "ffmpeg")) return false;
+  if (value.provenance.upstreamReleaseUrl !== `https://ffmpeg.org/releases/ffmpeg-${value.version}.tar.xz`) return false;
+  const pins = [value.binary, value.correspondingSource, value.buildAndInstallMaterial, value.licenseNotices, value.linkedLibraries[0].source];
+  return new Set(pins.map(pin => pin?.fileName)).size === pins.length && pins.every(pin => {
+    if (!pin || !/^[A-Za-z0-9][A-Za-z0-9._-]+$/.test(pin.fileName ?? "") ||
+        !/^[a-f0-9]{64}$/.test(pin.sha256 ?? "") || !Number.isSafeInteger(pin.sizeBytes) ||
+        pin.sizeBytes <= 0 || pin.sizeBytes > 16 * 1024 ** 3) return false;
+    try {
+      const url = new URL(pin.url);
+      return url.protocol === "https:" && url.hostname === "github.com" && !url.username && !url.password && !url.port && !url.search && !url.hash &&
+        /^\/Eabusham2\/Omni-AGI\/releases\/download\/omni-video-[0-9.]+-r[0-9]+\/[A-Za-z0-9._-]+$/.test(url.pathname);
+    } catch { return false; }
+  });
 }
 
 function normalizedArchivePath(value) {
@@ -104,6 +137,33 @@ export async function legalSourcePayload(repoRoot = resolve(".")) {
       policy?.policyChange?.requireBuildAndInstallScripts === true &&
       policy?.policyChange?.requireLinkedNonSystemLibrarySources === true,
     `${POLICY_FILE} does not describe the enforced external-runtime distribution.`
+  );
+  const runtimeManifestBytes = sources.get(VIDEO_RUNTIME_MANIFEST_FILE);
+  requireValue(runtimeManifestBytes, `${VIDEO_RUNTIME_MANIFEST_FILE} is missing.`);
+  const runtimeManifest = JSON.parse(runtimeManifestBytes.toString("utf8"));
+  const provisioning = policy.executable.automaticProvisioning;
+  const targets = ["win32-x64", "win32-arm64", "darwin-x64", "darwin-arm64", "linux-x64", "linux-arm64"];
+  const blockedCatalog = provisioning?.status === "blocked-awaiting-vetted-builds" &&
+    runtimeManifest?.artifacts?.length === 0 && runtimeManifest?.unavailableTargets?.length === targets.length &&
+    targets.every(target => runtimeManifest.unavailableTargets.filter(entry =>
+      entry.target === target && typeof entry.reason === "string" && entry.reason.length > 0).length === 1);
+  const readyCatalog = provisioning?.status === "ready-pinned" &&
+    runtimeManifest?.artifacts?.length === targets.length && runtimeManifest?.unavailableTargets?.length === 0 &&
+    targets.every(target => runtimeManifest.artifacts.filter(entry => entry.target === target && reviewedRuntimeArtifact(entry)).length === 1);
+  requireValue(
+    provisioning?.implementation === "reviewed-on-demand" &&
+      (blockedCatalog || readyCatalog) &&
+      provisioning?.manifestFile === "ffmpeg-runtime-manifest.json" &&
+      provisioning?.manifestContentSha256 === sha256(JSON.stringify(runtimeManifest)) &&
+      provisioning?.requireExactBinaryAndPayloadHashes === true &&
+      provisioning?.requireCompleteCorrespondingSourceBeforeExecution === true &&
+      provisioning?.requireBuildAndInstallMaterialBeforeExecution === true &&
+      provisioning?.requireLinkedNonSystemLibrarySources === true &&
+      provisioning?.requirePreservedLicenseNotices === true &&
+      provisioning?.executeDownloadedSetupScripts === false &&
+      runtimeManifest?.schemaVersion === 1 && runtimeManifest?.component === "FFmpeg" &&
+      Array.isArray(runtimeManifest.artifacts) && Array.isArray(runtimeManifest.unavailableTargets),
+    "Automatic video runtime catalog/policy is stale or claims unreviewed readiness; update artifact verification with the vetted build payloads before enabling it."
   );
   const notices = sources.get("THIRD_PARTY_NOTICES.md")?.toString("utf8") ?? "";
   requireValue(

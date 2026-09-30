@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import platform
 import signal
 import shutil
@@ -19,7 +20,8 @@ import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, CancelledError as FutureCancelledError
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -30,6 +32,7 @@ if str(WORKER_DIR) not in sys.path:
     sys.path.insert(0, str(WORKER_DIR))
 
 import torch
+from worker_transport import ProtocolLineReader, serve_worker_stdio
 
 from omni_core import AdaptiveBrain, OmniConfig, __version__
 from omni_core.brain import ChatGenerationCancelled, is_allocator_oom_error
@@ -49,6 +52,13 @@ from omni_core.persistence import (
     read_json,
 )
 from omni_core.substrate_inspection import query_persisted_substrate
+from omni_core.text_spool import DatasetResourcePause, require_parser_resources
+from omni_core.isolated_module_snapshot import IsolatedModuleSnapshot
+from omni_core.slow_state_snapshot import admit_snapshot_metadata
+from video_runtime import (
+    VideoRuntimeConfigurationCancelled,
+)
+from codec_gateway import CodecOwner, CodecRuntimeGateway, CodecRuntimeCancelled
 
 
 PROTOCOL_VERSION = 1
@@ -247,6 +257,16 @@ class IsolatedModalityDecoder(ModalityHub):
 
 
 @dataclass
+class ChatSteeringState:
+    brain_id: str
+    stream_id: str
+    requested: threading.Event = field(default_factory=threading.Event)
+    successor_id: str = ""
+    request_id: str = ""
+    claimed: bool = False
+
+
+@dataclass
 class InlineGeneration:
     brain_id: str
     action_id: str
@@ -262,8 +282,12 @@ class InlineGeneration:
     preview_revision: int = 0
     latest_preview: Optional[Dict[str, Any]] = None
     cancelled: bool = False
+    finished: threading.Event = field(default_factory=threading.Event)
+    cancellation_notified: bool = False
+    publication_started: bool = False
     execution_device: str = "unknown"
     authoritative_accelerator_isolated: bool = False
+    snapshot_state: Optional[Any] = None
 
 
 @dataclass
@@ -298,6 +322,10 @@ class Worker:
         self._cooperative_cancel = threading.Event()
         self._active_request_lock = threading.Lock()
         self._active_request: Optional[Tuple[str, str]] = None
+        self._artifact_request_owner: Optional[CodecOwner] = None
+        self._codec_gateway = CodecRuntimeGateway(self._notify_codec_runtime)
+        self._steering_lock = threading.RLock()
+        self._chat_steering: Dict[Tuple[str, str], ChatSteeringState] = {}
         self.running = True
         self._inline_lock = threading.RLock()
         self._inline_generations: Dict[Tuple[str, str], InlineGeneration] = {}
@@ -310,6 +338,8 @@ class Worker:
         self._observation_sessions: Dict[str, LiveObservationSessionState] = {}
         self.methods: Dict[str, Callable[[Dict[str, Any], Optional[str]], Any]] = {
             "health": self.health,
+            "hardware_projection_profile": self.hardware_projection_profile,
+            "configure_video_runtime": self.configure_video_runtime,
             "create": self.create,
             "load": self.load,
             "reload": self.reload,
@@ -323,6 +353,9 @@ class Worker:
             "state": self.state,
             "export_state": self.state,
             "query_substrate": self.query_substrate,
+            "query_concept_id_view": self.query_concept_id_view,
+            "query_cortex": self.query_cortex,
+            "cortex_activity": self.cortex_activity,
             "workspace": self.workspace,
             "fresh_attention": self.fresh_attention,
             "feedback": self.feedback,
@@ -336,6 +369,7 @@ class Worker:
             "ingest": self.ingest,
             "modality_capabilities": self.modality_capabilities,
             "generate_modality": self.generate_modality,
+            "generate_neural_speech": self.generate_neural_speech,
             "start_observation": self.start_observation,
             "observe_packet": self.observe_packet,
             "stop_observation": self.stop_observation,
@@ -366,6 +400,8 @@ class Worker:
             self.methods = {
                 "health": self.health,
                 "query_substrate": self.query_substrate,
+                "query_concept_id_view": self.query_concept_id_view,
+                "query_cortex": self.query_cortex,
                 "cancel": self.cancel,
                 "shutdown": self.shutdown,
             }
@@ -436,6 +472,10 @@ class Worker:
             params["data"] = data
         self._send({"jsonrpc": "2.0", "method": "event", "params": params})
 
+    def _notify_codec_runtime(self, event_type, owner, data):
+        self.notify(event_type, brain_id=owner.brain_id, job_id=owner.job_id,
+            stream_id=owner.stream_id, action_id=owner.action_id, data=data)
+
     def request_cooperative_cancel(self) -> bool:
         with self._active_request_lock:
             active = self._active_request
@@ -443,10 +483,95 @@ class Worker:
             "load",
             "chat",
             "consolidate_chat_learning",
+            "configure_video_runtime",
+            "generate_neural_speech",
+            "generate_modality",
         }:
             return False
         self._cooperative_cancel.set()
         return True
+
+    def _acknowledge_inline_cancellation(self, record: InlineGeneration) -> None:
+        with self._inline_lock:
+            if not record.cancelled or not record.finished.is_set() or record.cancellation_notified:
+                return
+            self._remove_inline_root(record)
+            if record.staging_root.exists():
+                return
+            record.cancellation_notified = True
+        self.notify("inline-imagination-cancelled", brain_id=record.brain_id,
+                    stream_id=record.stream_id, action_id=record.action_id,
+                    data={"acknowledged": True, "cleanupCompleted": True})
+
+    def dispatch_control(self, request: Any) -> Dict[str, Any]:
+        if self.worker_role != "neural" or not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or \
+                request.get("method") not in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request"} or \
+                not isinstance(request.get("id"), (str, int)) or not isinstance(request.get("params"), dict):
+            raise RpcFault(-32600, "invalid flags-only worker control request")
+        params = request["params"]
+        if request["method"] == "cancel_artifact_request":
+            with self._active_request_lock:
+                owner = getattr(self, "_artifact_request_owner", None)
+                if owner is None or params != owner.fields() or self._active_request is None or \
+                        self._active_request[1] != owner.request_id or self._active_request[0] not in {"generate_modality", "generate_neural_speech"}:
+                    raise RpcFault(-32602, "artifact cancel does not own the active neural request")
+                self._cooperative_cancel.set()
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {"requested": True, "requestId": owner.request_id}}
+        if request["method"] == "resolve_codec_runtime":
+            try:
+                result = self._codec_gateway.resolve(params)
+            except ValueError as error:
+                raise RpcFault(-32602, str(error)) from error
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        brain_id = self._brain_id(params)
+        stream_id = params.get("streamId")
+        if request["method"] == "steer_chat":
+            successor_id = params.get("successorTurnId")
+            if not isinstance(stream_id, str) or not isinstance(successor_id, str) or \
+                    not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", stream_id) or \
+                    not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", successor_id) or successor_id == stream_id:
+                raise RpcFault(-32602, "invalid warm steering ownership")
+            with self._steering_lock:
+                session = self._chat_steering.get((brain_id, stream_id))
+                if session is None:
+                    raise RpcFault(-32602, "warm steering does not own the requested live chat")
+                session.successor_id = successor_id
+                session.requested.set()
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {
+                "requested": True, "warm": True, "successorTurnId": successor_id}}
+        action_id = self._valid_inline_action_id(params.get("neuralActionId"))
+        if not action_id or not isinstance(stream_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", stream_id):
+            raise RpcFault(-32602, "invalid inline artifact ownership")
+        with self._inline_lock:
+            record = self._inline_generations.get((brain_id, action_id))
+            if record is None or record.stream_id != stream_id:
+                raise RpcFault(-32602, "inline artifact is not owned by the requested chat turn")
+            if record.publication_started:
+                raise RpcFault(-32602, "artifact publication has already started; no inline cancellation was admitted")
+            record.cancelled = True
+            record.first_preview.set()
+            if record.future is not None and record.future.cancel():
+                record.finished.set()
+        self._acknowledge_inline_cancellation(record)
+        return {"jsonrpc": "2.0", "id": request["id"], "result": {
+            "requested": True, "acknowledged": record.cancellation_notified}}
+
+    def reserve_chat_steering(self, request: Dict[str, Any]) -> None:
+        if self.worker_role != "neural" or request.get("method") != "chat":
+            return
+        params = request.get("params")
+        if request.get("jsonrpc") != "2.0" or not isinstance(params, dict):
+            raise RpcFault(-32600, "invalid chat control reservation")
+        brain_id = self._brain_id(params)
+        request_id = str(request.get("id", ""))
+        stream_id = str(params.get("streamId", "")).strip() or request_id
+        if not request_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", stream_id):
+            raise RpcFault(-32602, "invalid chat steering reservation")
+        key = (brain_id, stream_id)
+        with self._steering_lock:
+            if key in self._chat_steering:
+                raise RpcFault(-32602, "chat steering ownership is already reserved")
+            self._chat_steering[key] = ChatSteeringState(brain_id, stream_id, request_id=request_id)
 
     @staticmethod
     def _inline_request(value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -471,6 +596,14 @@ class Worker:
             raw_settings = {}
         if not isinstance(raw_settings, dict):
             return None
+        concept_view = value.get("conceptIdView")
+        if concept_view is not None:
+            from omni_core.concept_id_views import validate_descriptor
+            try:
+                concept_view = validate_descriptor(concept_view, brain_id=str(concept_view.get("brainId", "")),
+                                                   turn_id=value.get("sourceTurnId", ""))
+            except (ValueError, TypeError, AttributeError):
+                return None
         raw_settings = copy.deepcopy(raw_settings)
         raw_settings.setdefault("outputMode", "auto")
         input_path = value.get("inputPath", "")
@@ -489,6 +622,7 @@ class Worker:
             "modality": modality,
             "prompt": prompt,
             "conceptIds": list(raw_concepts),
+            **({"conceptIdView": concept_view, "sourceTurnId": concept_view["turnId"]} if concept_view is not None else {}),
             "inputPath": input_path,
             "settings": raw_settings,
             "seed": seed,
@@ -537,6 +671,9 @@ class Worker:
 
     @staticmethod
     def _remove_inline_root(record: InlineGeneration) -> None:
+        if record.snapshot_state is not None:
+            record.snapshot_state.close()
+            record.snapshot_state = None
         root = record.staging_root
         try:
             if root.is_symlink() or root.is_file():
@@ -608,6 +745,7 @@ class Worker:
         stream_id: str,
         action: Dict[str, Any],
         emit_preview: Callable[[InlineGeneration, Dict[str, Any]], None],
+        emit_started: Optional[Callable[[InlineGeneration], None]] = None,
     ) -> Optional[InlineGeneration]:
         if self._inline_executor_closed:
             return None
@@ -636,86 +774,102 @@ class Worker:
         # authoritative chat thread and an inline decoder thread, even when
         # the modules are distinct Python objects. Move every tensor the
         # background decoder can reach to CPU before submitting its future.
-        # CUDA and CPU retain their existing device/concurrency behavior.
+        # CUDA and CPU also use isolated CPU state: no original-device
+        # allocation may happen before the shared resource admission.
         staging_root = (
             brain.engine_path / ".inline-imagination" / action_id
         ).resolve()
         staging_parent = (brain.engine_path / ".inline-imagination").resolve()
+        record = InlineGeneration(brain_id=brain.brain_id, action_id=action_id,
+                                  stream_id=stream_id, signature=signature,
+                                  staging_root=staging_root, events=DeferredEventLog())
+        gateway = getattr(self, "_codec_gateway", None)
+        parent_owner = gateway.current_owner() if gateway is not None else None
+        codec_owner = CodecOwner(parent_owner.request_id, brain.brain_id, "", stream_id, action_id) if parent_owner else None
+        with self._inline_lock:
+            self._inline_generations[key] = record
+        def finish() -> None:
+            record.finished.set()
+            self._acknowledge_inline_cancellation(record)
+            if codec_owner:
+                self.notify("inline-imagination-finished", brain_id=brain.brain_id,
+                    stream_id=stream_id, action_id=action_id, data={"requestId": codec_owner.request_id})
         try:
+            if emit_started is not None:
+                emit_started(record)
             staging_root.relative_to(staging_parent)
             staging_root.mkdir(parents=True, exist_ok=False)
             with torch.no_grad():
+                if record.cancelled:
+                    raise ModalityGenerationCancelled("inline imagination was cancelled")
                 source_device = torch.device(brain.device)
-                isolate_mps = source_device.type == "mps"
-                inline_device = (
-                    torch.device("cpu") if isolate_mps else source_device
-                )
+                isolate_mps = source_device.type != "cpu"
+                inline_device = torch.device("cpu")
+                snapshot_policy = copy.copy(brain.resource_policy)
+                snapshot_policy.include_accelerator_memory = False
+                state_minimum = int(brain.liquid_state.numel() * brain.liquid_state.element_size() * 2) + int(brain.config.vsa_dim) * 16 + 131072
+                status = snapshot_policy.status(estimated_ram_bytes=state_minimum)
+                if status.get("memoryPressure"):
+                    raise NeuralStateResourcePause("inline idea and liquid state require an admitted CPU minimum", {**status,
+                        "recoverable": True, "paused": True, "minimumResidentBytes": state_minimum,
+                        "stage": "inline-neural-cue-snapshot", "neuralWorkerRestartRequired": False})
+                concept_ids = request["conceptIds"]
+                if request.get("conceptIdView") is not None:
+                    from omni_core.concept_id_views import IdView
+                    concept_ids = IdView(brain.engine_path, request["conceptIdView"], brain_id=brain.brain_id,
+                                         turn_id=request["sourceTurnId"])
                 idea = brain._modality_idea(
-                    request["prompt"], request["conceptIds"]
+                    request["prompt"], concept_ids
                 ).detach().to(inline_device).clone()
                 idea_evidence = brain._modality_idea_evidence(
-                    request["prompt"], request["conceptIds"]
+                    request["prompt"], concept_ids
                 )
 
-                def decoder_snapshot(name: str) -> torch.nn.Module:
-                    selected = copy.deepcopy(getattr(brain.modalities, name))
-                    if isolate_mps:
-                        selected = selected.to(torch.device("cpu"))
-                    return selected
-
+                selected_names = [request["modality"]]
+                if request["modality"] == "video" and self._trained_modality_capabilities(brain)["audioGeneration"]:
+                    selected_names.append("audio")
+                record.snapshot_state = IsolatedModuleSnapshot(
+                    {name: getattr(brain.modalities, name) for name in selected_names},
+                    directory=staging_root / "decoder-state", policy=snapshot_policy,
+                    cancelled=lambda: record.cancelled)
                 modality_snapshot = IsolatedModalityDecoder(
                     request["modality"],
-                    decoder_snapshot(request["modality"]),
-                    companion_modules=(
-                        {
-                            "audio": decoder_snapshot("audio"),
-                        }
-                        if request["modality"] == "video"
-                        and self._trained_modality_capabilities(brain)[
-                            "audioGeneration"
-                        ]
-                        else None
-                    ),
+                    record.snapshot_state.roots[request["modality"]],
+                    companion_modules={name: record.snapshot_state.roots[name] for name in selected_names[1:]},
                 )
-        except Exception:
-            if staging_root.exists():
-                shutil.rmtree(staging_root, ignore_errors=True)
-            return None
-
-        deferred_events = DeferredEventLog()
-        snapshot = copy.copy(brain)
-        snapshot.modalities = modality_snapshot
-        snapshot.events = deferred_events
-        snapshot.engine_path = staging_root
-        snapshot.counters = dict(brain.counters)
-        snapshot.modality_training = dict(brain.modality_training)
-        snapshot.installed_modality_packs = copy.deepcopy(
-            brain.installed_modality_packs
-        )
-        if isolate_mps:
-            snapshot.device = inline_device
-            snapshot.device_backend = "cpu"
-            snapshot.liquid_state = (
-                brain.liquid_state.detach().to(inline_device).clone()
-            )
-            snapshot.resource_policy = copy.copy(brain.resource_policy)
-            snapshot.resource_policy.include_accelerator_memory = False
-        snapshot._modality_idea = (
-            lambda _prompt="", _concept_ids=None: idea.detach().clone()
-        )
-        snapshot._modality_idea_evidence = (
-            lambda _prompt="", _concept_ids=None: copy.deepcopy(idea_evidence)
-        )
-        record = InlineGeneration(
-            brain_id=brain.brain_id,
-            action_id=action_id,
-            stream_id=stream_id,
-            signature=signature,
-            staging_root=staging_root,
-            events=deferred_events,
-            execution_device=str(inline_device),
-            authoritative_accelerator_isolated=isolate_mps,
-        )
+                admit_snapshot_metadata(snapshot_policy, {
+                    "config": brain.config, "counters": brain.counters,
+                    "modality_training": brain.modality_training,
+                    "installed_modality_packs": brain.installed_modality_packs,
+                    "idea_evidence": idea_evidence,
+                }, "inline snapshot control metadata")
+                deferred_events = DeferredEventLog()
+                snapshot = copy.copy(brain)
+                snapshot.config = copy.deepcopy(brain.config)
+                snapshot.modalities = modality_snapshot
+                snapshot.events = deferred_events
+                snapshot.engine_path = staging_root
+                snapshot.counters = dict(brain.counters)
+                snapshot.modality_training = dict(brain.modality_training)
+                snapshot.installed_modality_packs = copy.deepcopy(brain.installed_modality_packs)
+                snapshot.device = inline_device
+                snapshot.device_backend = "cpu"
+                snapshot.liquid_state = brain.liquid_state.detach().to(inline_device).clone()
+                snapshot.resource_policy = snapshot_policy
+                snapshot._modality_idea = lambda _prompt="", _concept_ids=None: idea.detach().clone()
+                snapshot._modality_idea_evidence = lambda _prompt="", _concept_ids=None: copy.deepcopy(idea_evidence)
+                record.events = deferred_events
+                record.execution_device = str(inline_device)
+                record.authoritative_accelerator_isolated = isolate_mps
+        except Exception as error:
+            self._remove_inline_root(record)
+            if record.cancelled:
+                finish()
+                return record
+            record.future = Future()
+            record.future.set_exception(error)
+            finish()
+            return record # typed failed/paused artifact, never silently drop or regenerate it
 
         def preview(
             generation_progress: float,
@@ -765,16 +919,17 @@ class Worker:
 
         def generate() -> Dict[str, Any]:
             try:
-                result = snapshot.generate_modality(
-                    modality=request["modality"],
-                    prompt=request["prompt"],
-                    concept_ids=request["conceptIds"],
-                    input_path=request["inputPath"],
-                    settings=request["settings"],
-                    seed=request["seed"],
-                    preview_callback=preview,
-                    cancel_check=lambda: record.cancelled,
-                )
+                with gateway.scope(codec_owner, lambda: record.cancelled) if codec_owner else nullcontext():
+                    result = snapshot.generate_modality(
+                        modality=request["modality"],
+                        prompt=request["prompt"],
+                        concept_ids=request["conceptIds"],
+                        input_path=request["inputPath"],
+                        settings=request["settings"],
+                        seed=request["seed"],
+                        preview_callback=preview,
+                        cancel_check=lambda: record.cancelled,
+                    )
                 with self._inline_lock:
                     cancelled = record.cancelled
                 if cancelled:
@@ -788,16 +943,26 @@ class Worker:
             except Exception:
                 self._remove_inline_root(record)
                 raise
+            finally:
+                if record.snapshot_state is not None:
+                    record.snapshot_state.close()
+                    record.snapshot_state = None
+                finish()
 
         with self._inline_lock:
-            self._inline_generations[key] = record
+            if record.cancelled:
+                self._remove_inline_root(record)
+                finish()
+                return record
         try:
-            record.future = self._inline_executor.submit(generate)
-        except Exception:
             with self._inline_lock:
-                self._inline_generations.pop(key, None)
+                record.future = self._inline_executor.submit(generate)
+        except Exception as error:
             self._remove_inline_root(record)
-            return None
+            record.future = Future()
+            record.future.set_exception(error)
+            finish()
+            return record
         return record
 
     def _claim_inline_generation(
@@ -817,8 +982,10 @@ class Worker:
             return None
         with record.preview_emit_lock:
             with self._inline_lock:
-                if record.signature != signature or record.cancelled:
+                if record.signature != signature:
                     return None
+                if record.cancelled:
+                    raise RpcFault(-32800, "this inline artifact was cancelled; it must not be regenerated")
                 record.job_id = job_id
                 latest_preview = copy.deepcopy(record.latest_preview)
                 future = record.future
@@ -837,7 +1004,16 @@ class Worker:
             return None
 
         try:
-            result = dict(future.result())
+            try:
+                result = dict(future.result())
+            except FutureCancelledError as error:
+                raise ModalityGenerationCancelled("owned inline artifact was cancelled before decoder execution") from error
+            with self._inline_lock:
+                if record.cancelled:
+                    raise RpcFault(-32800, "this inline artifact was cancelled")
+                # Cancellation and artifact promotion have one atomic ownership
+                # boundary. A control never deletes files during publication.
+                record.publication_started = True
             if job_id and job_id in self.cancelled_jobs:
                 raise RpcFault(-32800, "job was cancelled")
             raw_path = result.get("path")
@@ -1226,12 +1402,89 @@ class Worker:
             "loadedBrains": len(self.brains),
         }
 
+    def hardware_projection_profile(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Explicit, main-owned hardware measurement; never loads a brain."""
+        del request_id
+        if self.worker_role != "neural":
+            raise RpcFault(-32601, "Projection profiling is not an inspection operation")
+        if set(params) - {"device", "ramBudgetBytes", "hardwareTier"}:
+            raise RpcFault(-32602, "Projection profiling accepts hardware fields only")
+        device = params.get("device", "cpu")
+        budget = params.get("ramBudgetBytes")
+        tier = params.get("hardwareTier", "personal")
+        if not isinstance(device, str) or re.fullmatch(r"cpu|mps|directml|cuda(?::[0-9]+)?", device) is None:
+            raise RpcFault(-32602, "Projection profiling device is invalid")
+        if type(budget) is not int or not 1 <= budget <= (1 << 53) - 1:
+            raise RpcFault(-32602, "Projection profiling requires a measured positive RAM envelope")
+        if not isinstance(tier, str) or tier not in {"micro", "personal", "gpu", "workstation"}:
+            raise RpcFault(-32602, "Projection profiling tier is invalid")
+        with getattr(self, "_inline_lock", nullcontext()):
+            if any(record.future is not None and not record.future.done()
+                   for record in getattr(self, "_inline_generations", {}).values()):
+                return {"available": False, "reason": "hardware-measurement-deferred-active-inline-job"}
+        from omni_core.native_compute_profile import profile_native_projection_compute
+        from omni_core.offload import ResourcePolicy
+        policy = ResourcePolicy(self._default_root(), hardware_tier=tier)
+
+        def reserve(byte_count: int, actual_device: str) -> None:
+            status = policy.status(estimated_ram_bytes=byte_count)
+            free = status.get("acceleratorFreeMemoryBytes")
+            accelerator_reserve = max(256 * 1024 * 1024, int(status.get("acceleratorTotalMemoryBytes") or 0) // 10)
+            if (status["memoryPressure"] or int(status.get("projectedProcessMemoryBytes") or 0) > budget
+                or actual_device != "cpu" and isinstance(free, int) and free < byte_count + accelerator_reserve):
+                raise NeuralStateResourcePause("Hardware projection measurement waits for its admitted memory envelope", status)
+        try:
+            return profile_native_projection_compute(
+                device=device, reserve=reserve, cancelled=self._cooperative_cancel.is_set,
+            )
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error), {"hardwareMeasurementCancelled": True, "safeBoundary": True}) from error
+        except NeuralStateResourcePause as error:
+            return {"available": False, "reason": "hardware-measurement-memory-admission", "status": error.status}
+
+    def configure_video_runtime(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        if self.worker_role != "neural":
+            raise RpcFault(-32601, "Video runtime selection is not an inspection operation")
+        try:
+            gateway = getattr(self, "_codec_gateway", None)
+            if gateway is None:
+                gateway = self._codec_gateway = CodecRuntimeGateway(self._notify_codec_runtime)
+            return gateway.configure(params, cancelled=self._cooperative_cancel.is_set)
+        except (VideoRuntimeConfigurationCancelled, CodecRuntimeCancelled) as error:
+            raise RpcFault(-32800, str(error)) from error
+        except (ValueError, OSError) as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    @staticmethod
+    def _native_builder_metadata(params: Dict[str, Any], raw_config: Dict[str, Any]) -> Dict[str, Any]:
+        if "nativeArchitecture" in raw_config:
+            from omni_core.native_architecture import validate_native_architecture
+            trusted = params.get("nativeArchitecture")
+            try:
+                if trusted is None:
+                    raise ValueError("embedded native architecture needs the trusted top-level descriptor")
+                top = validate_native_architecture(trusted)
+                embedded = validate_native_architecture(raw_config["nativeArchitecture"])
+                if top != embedded:
+                    raise ValueError("embedded and trusted native architecture descriptors differ")
+            except (ValueError, TypeError, KeyError) as error:
+                raise RpcFault(-32602, str(error)) from error
+            raw_config = dict(raw_config)
+            del raw_config["nativeArchitecture"]
+        return raw_config
+
     def create(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain_id = self._brain_id(params, required=False) or uuid.uuid4().hex
         storage = self._storage(params, brain_id)
         raw_config = params.get("config") or {}
         if not isinstance(raw_config, dict):
             raise RpcFault(-32602, "params.config must be an object")
+        raw_config = self._native_builder_metadata(params, raw_config)
         # A new Build selects one versioned architecture through hardwareTier.
         # Snake-case tensor-shape fields belong only to persisted checkpoints
         # and explicit research constructors.  Reject them here instead of
@@ -1312,7 +1565,10 @@ class Worker:
                 -32602,
                 "Build does not accept a foundation model",
             )
-        config = OmniConfig.from_external(self._builder_config(params, raw_config))
+        config = OmniConfig.from_external(
+            self._builder_config(params, raw_config),
+            native_architecture=params.get("nativeArchitecture"),
+        )
         if config.origin_kind != "ground-up":
             raise RpcFault(
                 -32602,
@@ -1640,6 +1896,9 @@ class Worker:
             "videoGeneration": capabilities["videoGeneration"],
             "neuralSpeechRecognition": False,
             "neuralSpeechSynthesis": False,
+            "audioRegionAvailable": bool(brain.config.audio_enabled),
+            "speechPairedExamples": int(brain.modality_training.get("audio_speech_pairs", 0)),
+            "speechQuality": ("unverified" if int(brain.modality_training.get("audio_speech_pairs", 0)) > 0 else "needs-speech-training"),
             "synchronizedVideoAudioGeneration": bool(
                 capabilities["videoGeneration"]
                 and capabilities["audioGeneration"]
@@ -1648,9 +1907,67 @@ class Worker:
             "hiddenBehavioralPrompt": False,
             "detail": (
                 "Direct audio perception enters the same neural substrate; "
-                "platform STT/TTS remain separate until a verified speech pack exists."
+                "platform STT/TTS remain defaults. Own waveform output needs paired speech training; intelligibility is not verified."
             ),
         }
+
+    def query_cortex(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        del request_id
+        from omni_core.cortical_inspection import query_committed_cortex
+        query = params.get("query", {})
+        if not isinstance(query, dict):
+            raise RpcFault(-32602, "params.query must be an object")
+        brain_id = self._brain_id(params)
+        try:
+            return query_committed_cortex(self._storage(params, brain_id) / "engine", brain_id, query)
+        except (ValueError, OSError, TypeError) as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def cortex_activity(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        del request_id
+        brain_id = self._brain_id(params)
+        loaded = self.brains.get(brain_id)
+        if loaded is None:
+            return {"available": False, "observed": False, "observation": None,
+                    "reason": "brain-not-loaded-no-inspection-model-created"}
+        if self._storage(params, brain_id) != loaded.storage_path:
+            raise RpcFault(-32602, "cortical activity storage identity mismatch")
+        query = params.get("query", {})
+        if not isinstance(query, dict) or not isinstance(query.get("enabled", False), bool):
+            raise RpcFault(-32602, "invalid cortical activity request")
+        module = str(query.get("module", ""))
+        if len(module) > 512:
+            raise RpcFault(-32602, "cortical activity module is too long")
+        start, count = query.get("start", 0), query.get("count", 64)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (start, count)):
+            raise RpcFault(-32602, "invalid cortical activity viewport")
+        return loaded.core_pager.observation(module, enabled=query.get("enabled", False), start=start, count=count)
+
+    def query_concept_id_view(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        del request_id
+        from omni_core.concept_id_views import IdView
+        from omni_core.recall_views import id_page
+        brain_id = self._brain_id(params)
+        engine = self._storage(params, brain_id) / "engine"
+        try:
+            metadata = json.loads((engine / "brain.json").read_bytes())
+            if metadata.get("brain_id") != brain_id:
+                raise ValueError("concept ID query brain identity differs")
+            descriptor = params.get("conceptIdView")
+            source_owner = descriptor.get("brainId", "") if isinstance(descriptor, dict) else ""
+            historical = source_owner != brain_id
+            if historical and params.get("historicalInspection") is not True:
+                raise ValueError("foreign concept view owner requires explicit historical read-only inspection")
+            view = IdView(engine, descriptor, brain_id=source_owner if historical else brain_id,
+                          turn_id=params.get("sourceTurnId", ""))
+            page, coverage = id_page(view, byte_budget=65536, offset=params.get("offset", 0))
+            return {"brainId": brain_id, "ids": page, **coverage,
+                    "sourceBrainId": source_owner, "sourceTurnId": params.get("sourceTurnId", ""),
+                    "ownership": "owned-historical-file" if historical else "current-brain-owned-file",
+                    "historicalInspection": historical, "executionAuthorized": False,
+                    "ancestryProvenance": "preserved-original-header; current-owned-copy; no inherited execution permission" if historical else "current-owner"}
+        except (ValueError, OSError, TypeError, KeyError) as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def query_substrate(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -2081,6 +2398,27 @@ class Worker:
         return True
 
     def chat(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        brain_id = self._brain_id(params)
+        stream_id = str(params.get("streamId", "")).strip() or str(request_id or uuid.uuid4().hex)
+        session = ChatSteeringState(brain_id, stream_id)
+        key = (brain_id, stream_id)
+        with self._steering_lock:
+            reserved = self._chat_steering.get(key)
+            if reserved is not None:
+                if reserved.claimed or reserved.request_id != str(request_id or ""):
+                    raise RpcFault(-32602, "this chat does not own the reserved steering session")
+                session = reserved
+            else:
+                self._chat_steering[key] = session
+            session.claimed = True
+        try:
+            return self._chat(params, request_id, session.requested.is_set)
+        finally:
+            with self._steering_lock:
+                self._chat_steering.pop(key, None)
+
+    def _chat(self, params: Dict[str, Any], request_id: Optional[str],
+              steer_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
         brain = self._get(params)
         # The desktop's small, atomic switch is authoritative even when this
         # warm worker still holds a checkpoint from before Pause was pressed.
@@ -2188,6 +2526,10 @@ class Worker:
                         sequence=sequence,
                         data=dict(payload),
                     )
+                elif kind == "inline-started":
+                    self.notify("inline-imagination-started", brain_id=brain.brain_id,
+                                stream_id=stream_id, sequence=sequence,
+                                action_id=str(payload.get("actionId", "")), data={"requestId": str(request_id or "")})
                 else:
                     raise RuntimeError("unsupported neural chat stream event")
                 sequence += 1
@@ -2213,6 +2555,7 @@ class Worker:
                             "preview": preview,
                         },
                     ),
+                    lambda current: stream("inline-started", {"actionId": current.action_id}),
                 )
                 if record is not None and record not in inline_records:
                     inline_records.append(record)
@@ -2235,6 +2578,7 @@ class Worker:
                 turn_id=turn_id,
                 defer_slow_learning=True,
                 cancel_check=self._cooperative_cancel.is_set,
+                steer_check=steer_check,
             )
         except ChatGenerationCancelled as error:
             # The model raises this only at a pre-commit boundary. Preserve
@@ -2259,10 +2603,21 @@ class Worker:
             )
             raise
 
-        # A streamed Auto/Full imagination action always publishes at least one
+        if result.get("zeroTokenYield") is True and (result.get("steered") is True or result.get("nativeStopped") is True):
+            steered = result.get("steered") is True
+            raise RpcFault(-32801 if steered else -32802, "Chat stopped at a safe boundary before visible output.", {
+                "brainId": brain.brain_id, "turnId": turn_id,
+                "inputSha256": input_sha256, "steered": steered, "nativeStopped": not steered,
+                "zeroTokenYield": True, "safeBoundary": True, "warm": True})
+
+        if result.get("noReply") is True:
+            if result.get("text") != "" or result.get("turnCommitted") is not True:
+                raise RuntimeError("no-reply must be an exact committed zero-text completion")
+
+        # A streamed Auto/Full imagination action normally publishes at least one
         # real decoder preview before the chat RPC resolves. Longer generation
         # continues concurrently and becomes the same typed tool job/artifact.
-        for record in inline_records:
+        for record in ([] if result.get("steered") is True or result.get("nativeStopped") is True else inline_records):
             while not record.first_preview.wait(timeout=0.05):
                 future = record.future
                 if future is None or future.done():
@@ -2583,6 +2938,11 @@ class Worker:
             or trace.get("turn_id") != turn_id
         ):
             raise RpcFault(-32004, "committed chat turn binding is invalid")
+        from omni_core.chat_steering import validate_no_reply_turn
+        try:
+            no_reply = validate_no_reply_turn(human_message, brain_message, trace, receipt or {})
+        except ValueError as error:
+            raise RpcFault(-32004, "committed no-reply evidence is invalid") from error
 
         def external_message(
             value: Dict[str, Any], *, trace_value: str = ""
@@ -2604,6 +2964,8 @@ class Worker:
             epoch = value.get("attention_epoch", value.get("attentionEpoch"))
             if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0:
                 result["attentionEpoch"] = epoch
+            if value.get("generation_end") is not None:
+                result["generation_end"] = value["generation_end"]
             return result
 
         substrate = metadata.get("substrate", {})
@@ -2641,6 +3003,9 @@ class Worker:
                 else ""
             ),
             "idempotentCompletion": True,
+            "noReply": no_reply,
+            **({"generationEnd": receipt["generationEnd"]}
+               if receipt is not None and "generationEnd" in receipt else {}),
         }
 
     @staticmethod
@@ -2738,6 +3103,17 @@ class Worker:
         }
 
     def ingest(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        transaction_key = params.get("transactionKey", params.get("idempotencyKey", ""))
+        if not isinstance(transaction_key, str) or (
+            transaction_key and not re.fullmatch(r"[a-f0-9]{64}", transaction_key)
+        ):
+            raise RpcFault(-32602, "ingestion transaction key must be a lowercase sha256")
+        if (
+            params.get("transactionKey") is not None
+            and params.get("idempotencyKey") is not None
+            and params["transactionKey"] != params["idempotencyKey"]
+        ):
+            raise RpcFault(-32602, "ingestion idempotency keys disagree")
         brain, job_id, progress = self._job(params, request_id, "ingestion")
         try:
             result = brain.ingest(
@@ -2760,6 +3136,7 @@ class Worker:
                 ),
                 allow_replay=bool(params.get("allowReplay", False)),
                 epoch=int(params.get("epoch", 0)),
+                transaction_key=transaction_key,
                 progress=progress,
             )
         except Exception as error:
@@ -2772,7 +3149,7 @@ class Worker:
             if (
                 not isinstance(
                     error,
-                    (NeuralStateResourcePause,),
+                    (NeuralStateResourcePause, DatasetResourcePause),
                 )
                 and is_allocator_oom_error(error)
             ):
@@ -2794,7 +3171,7 @@ class Worker:
             resource_status: Optional[Dict[str, Any]] = None
             if isinstance(
                 recovered_error,
-                (NeuralStateResourcePause,),
+                (NeuralStateResourcePause, DatasetResourcePause),
             ):
                 resource_status = dict(recovered_error.status)
                 resource_status.setdefault("recoverable", True)
@@ -3197,6 +3574,30 @@ class Worker:
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
 
+    def generate_neural_speech(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        text, speech_id = params.get("text"), params.get("speechRequestId")
+        if not isinstance(text, str) or not text.strip() or "\x00" in text or \
+                not isinstance(speech_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", speech_id):
+            raise RpcFault(-32602, "invalid same-brain speech waveform request")
+        rate = _number(params.get("rate", 1.0))
+        if rate <= 0:
+            raise RpcFault(-32602, "speech presentation rate must be positive")
+        try:
+            require_parser_resources("speech text-to-idea conditioning", ram_bytes=len(text) * 64 + 131072)
+        except DatasetResourcePause as error:
+            raise RpcFault(-32020, "speech waveform generation paused at physical text allocation admission", {"resourcePause": error.status}) from error
+        words = max(1, len(text.split()))
+        result = self.generate_modality({**params, "modality": "audio", "prompt": text,
+            "inputPath": "", "settings": {"outputMode": "auto", "sampleRate": 16000,
+                "durationMs": max(250.0, words * 1000.0 / 3.0)}}, request_id)
+        result["speech"] = {"requestId": speech_id, "source": "same-brain-audio-region",
+            "textSha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "textConditioned": True, "sameBrain": True, "externalModelUsed": False,
+            "intelligibilityVerified": False,
+            "pairedExamples": int(result.get("speechPairedExamples", 0)),
+            "trainingState": "needs-speech-training" if not result.get("speechPairedExamples", 0) else "speech-quality-unverified"}
+        return result
+
     def generate_modality(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
@@ -3205,8 +3606,10 @@ class Worker:
         )
         try:
             inline_result = self._claim_inline_generation(brain, params, job_id)
+        except NeuralStateResourcePause as error:
+            raise RpcFault(-32020, "inline artifact snapshot awaits physical resources", {"resourcePause": error.status}) from error
         except ModalityGenerationCancelled as error:
-            raise RpcFault(-32800, "job was cancelled") from error
+            raise RpcFault(-32800, "job was cancelled", {"modalityCancelled": True, "safeBoundary": True}) from error
         except MediaResourcePause as error:
             demand = error.demand
             status = brain.resource_policy.status(
@@ -3310,6 +3713,8 @@ class Worker:
                 modality=modality,
                 prompt=str(params.get("prompt", "")),
                 concept_ids=params.get("conceptIds"),
+                concept_id_view=params.get("conceptIdView"),
+                source_turn_id=str(params.get("sourceTurnId", "")),
                 input_path=str(params.get("inputPath", "")),
                 settings=(
                     params.get("settings")
@@ -3324,10 +3729,10 @@ class Worker:
                 preview_callback=preview,
                 cancel_check=lambda: bool(
                     job_id and job_id in self.cancelled_jobs
-                ),
+                ) or self._cooperative_cancel.is_set(),
             )
         except ModalityGenerationCancelled as error:
-            raise RpcFault(-32800, "job was cancelled") from error
+            raise RpcFault(-32800, "job was cancelled", {"modalityCancelled": True, "safeBoundary": True}) from error
         except MediaResourcePause as error:
             demand = error.demand
             status = brain.resource_policy.status(
@@ -3369,6 +3774,8 @@ class Worker:
                 "modality generation paused after allocator exhaustion",
                 {"resourcePause": status},
             ) from error
+        if params.get("speechRequestId"):
+            result["speechPairedExamples"] = max(0, int(brain.modality_training.get("audio_speech_pairs", 0)))
         self._job_complete(brain, job_id, "modality-generation", result)
         return result
 
@@ -3731,22 +4138,45 @@ class Worker:
         if handler is None:
             raise RpcFault(-32601, "method not found: %s" % method)
         correlated_id = str(request_id) if request_id is not None else ""
+        owner = CodecOwner(correlated_id, str(params.get("brainId", "")), str(params.get("jobId", "")),
+            str(params.get("streamId", "")), str(params.get("neuralActionId", "")))
         cooperatively_cancellable = method in {
+            "hardware_projection_profile",
             "load",
             "chat",
             "consolidate_chat_learning",
+            "configure_video_runtime",
+            "generate_neural_speech",
+            "generate_modality",
         }
         if cooperatively_cancellable:
             self._cooperative_cancel.clear()
             with self._active_request_lock:
                 self._active_request = (method, correlated_id)
+                self._artifact_request_owner = owner if method in {"generate_modality", "generate_neural_speech"} else None
         try:
-            result = handler(params, correlated_id or None)
+            # Serialized neural dispatch is a quiescent migration boundary.
+            # State/inspection/export requests do not move execution devices.
+            if self.worker_role == "neural" and method in {
+                "chat", "consolidate_chat_learning", "learn_tool_route_outcome",
+                "train", "ingest", "generate_modality", "generate_neural_speech", "idle_cycle", "feedback",
+                "observe_packet", "evolution.evaluate", "evolution_evaluate",
+            }:
+                brain = self._get(params)
+                prepare = getattr(brain, "prepare_native_execution", None)
+                if callable(prepare):
+                    prepare(operation=method, quiescent=True)
+            gateway = getattr(self, "_codec_gateway", None)
+            with gateway.scope(owner, lambda: self._cooperative_cancel.is_set() or bool(owner.job_id and owner.job_id in self.cancelled_jobs)) if gateway else nullcontext():
+                result = handler(params, correlated_id or None)
+        except CodecRuntimeCancelled as error:
+            raise RpcFault(-32800, str(error), {"codecRuntimeCancelled": True, "safeBoundary": True}) from error
         finally:
             if cooperatively_cancellable:
                 with self._active_request_lock:
                     if self._active_request == (method, correlated_id):
                         self._active_request = None
+                        self._artifact_request_owner = None
                 self._cooperative_cancel.clear()
         if request_id is None:
             return None
@@ -3812,81 +4242,8 @@ def main() -> int:
             cooperative_signal,
             lambda _signum, _frame: worker.request_cooperative_cancel(),
         )
-    while worker.running:
-        available_memory = _available_memory_bytes()
-        line_limit = (
-            max(1, available_memory // 8)
-            if available_memory is not None
-            else None
-        )
-        raw = (
-            sys.stdin.buffer.readline(line_limit + 1)
-            if line_limit is not None
-            else sys.stdin.buffer.readline()
-        )
-        if not raw:
-            break
-        if (
-            line_limit is not None
-            and len(raw) > line_limit
-            and not raw.endswith(b"\n")
-        ):
-            Worker._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {
-                        "code": -32600,
-                        "message": (
-                            "request line exceeds the current resource-derived "
-                            "protocol envelope"
-                        ),
-                    },
-                }
-            )
-            break
-        request_id: Any = None
-        try:
-            request = json.loads(raw.decode("utf-8"))
-            if isinstance(request, dict):
-                request_id = request.get("id")
-            response = worker.dispatch(request)
-            if response is not None:
-                Worker._send(response)
-        except json.JSONDecodeError as error:
-            Worker._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "parse error: %s" % error},
-                }
-            )
-        except RpcFault as error:
-            payload: Dict[str, Any] = {
-                "code": error.code,
-                "message": error.message,
-            }
-            if error.data is not None:
-                payload["data"] = error.data
-            Worker._send(
-                {"jsonrpc": "2.0", "id": request_id, "error": payload}
-            )
-        except Exception as error:
-            diagnostic = traceback.format_exc()
-            sys.stderr.write(diagnostic)
-            sys.stderr.flush()
-            Worker._send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -32000,
-                        "message": "%s: %s"
-                        % (error.__class__.__name__, str(error)),
-                        "data": {"traceback": diagnostic[-8_000:]},
-                    },
-                }
-            )
+    serve_worker_stdio(worker, ProtocolLineReader(sys.stdin.buffer.fileno()), Worker._send,
+                       _available_memory_bytes, RpcFault)
     for brain in worker.brains.values():
         try:
             brain.close()

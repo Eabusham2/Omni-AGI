@@ -37,9 +37,10 @@ function safeBytes(value: unknown): number {
 }
 
 /**
- * Keep constrained/mobile volumes usable while preserving substantial OS and
- * recovery headroom on desktop storage. Twenty GiB is the desktop ceiling and
- * recommendation for volumes large enough to support it, not a mobile floor.
+ * Local brain storage keeps the user-requested twenty-GiB minimum on every
+ * volume. Platform/operation headroom may increase it, never lower it. RAM's
+ * device-specific OS reserve is a separate policy. A volume too small for this
+ * reserve must report a resource pause rather than silently shrink the floor.
  */
 export function adaptiveDiskReserve(input: DiskReservePolicyInput): number {
   const total = safeBytes(input.diskTotalBytes);
@@ -53,12 +54,10 @@ export function adaptiveDiskReserve(input: DiskReservePolicyInput): number {
     mobile ? 512 * MIB : 2 * GIB,
     Math.ceil(safeBytes(input.operationWriteBytes) * 0.05)
   );
-  return Math.min(
-    Math.max(0, total),
-    Math.max(
-      safeBytes(input.userMinimumReserveBytes),
-      base + amplificationMargin
-    )
+  return Math.max(
+    MANDATORY_FREE_DISK_BYTES,
+    safeBytes(input.userMinimumReserveBytes),
+    base + amplificationMargin
   );
 }
 
@@ -85,7 +84,7 @@ export function calculateDiskSpaceReport(input: {
         diskFreeBytes,
         operationWriteBytes: input.components?.operationWriteBytes
       })
-    : safeBytes(input.mandatoryReserveBytes);
+    : Math.max(MANDATORY_FREE_DISK_BYTES, safeBytes(input.mandatoryReserveBytes));
   const selectedDatasetBytes = safeBytes(
     input.components?.selectedDatasetBytes
   );

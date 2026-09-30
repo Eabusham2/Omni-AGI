@@ -14,6 +14,7 @@ import {
   planLivePerception,
   type LivePerceptionCaptureAdapter
 } from "./livePerceptionController";
+import { createNeuralSpeechSynthesisAdapter, type NeuralWavePlayerConstructor } from "./neuralSpeechPlayback";
 
 interface RecognitionAlternativeLike {
   transcript: string;
@@ -62,6 +63,7 @@ export interface BrowserVoiceEnvironment {
   recognitionConstructor?: RecognitionConstructor;
   speechSynthesis?: Pick<SpeechSynthesis, "speak" | "cancel">;
   utteranceConstructor?: typeof SpeechSynthesisUtterance;
+  audioConstructor?: NeuralWavePlayerConstructor;
 }
 
 export const LIVE_VOICE_CAPTURE_REQUEST_TIMEOUT_MS = 15_000;
@@ -76,7 +78,9 @@ function runtimeEnvironment(): BrowserVoiceEnvironment {
     recognitionConstructor:
       scope.SpeechRecognition ?? scope.webkitSpeechRecognition,
     speechSynthesis: globalThis.speechSynthesis,
-    utteranceConstructor: globalThis.SpeechSynthesisUtterance
+    utteranceConstructor: globalThis.SpeechSynthesisUtterance,
+    audioConstructor: typeof globalThis.Audio === "function"
+      ? globalThis.Audio as unknown as NeuralWavePlayerConstructor : undefined
   };
 }
 
@@ -100,7 +104,7 @@ export function inspectBrowserVoiceCapabilities(
       ? "Web Speech recognition is available. Transcripts come from the platform recognizer."
       : "Web Speech recognition is not exposed by this Electron/Chromium build. No transcript fallback is fabricated.",
     neuralDetail:
-      "Platform Web Speech/TTS is not neural audio. Direct trained-modality input/output requires a compatible neural audio pack."
+      "Platform STT/TTS are the defaults. Own waveform output uses this brain's audio region; speech quality requires paired training and verification."
   };
 }
 
@@ -252,13 +256,17 @@ function runtimeOmniModality(): OmniApi["modality"] | undefined {
 /**
  * Feeds raw microphone audio into this brain's trained sensory substrate. It
  * deliberately does not transcribe or synthesize speech: Web Speech remains
- * the language-boundary transcript until a verified speech pack exists.
+ * the language-boundary transcript. Output quality is separate from connectivity.
  */
 export function createOmniNeuralAudioAdapter(
   modality: OmniApi["modality"] | undefined = runtimeOmniModality(),
-  capture: LivePerceptionCaptureAdapter = createBrowserLivePerceptionCapture()
+  capture: LivePerceptionCaptureAdapter = createBrowserLivePerceptionCapture(),
+  options: { brainId?: string; audioConstructor?: NeuralWavePlayerConstructor } = {}
 ): LiveVoiceNeuralAdapter {
   const measured = new Map<string, NeuralModalityCapabilities>();
+  let selectedBrainId = options.brainId;
+  const synthesis = createNeuralSpeechSynthesisAdapter(() => selectedBrainId, modality,
+    options.audioConstructor ?? runtimeEnvironment().audioConstructor);
 
   const inspect = async (
     brainId: string
@@ -271,6 +279,8 @@ export function createOmniNeuralAudioAdapter(
 
   return {
     async inspect(brainId) {
+      if (options.brainId && options.brainId !== brainId) throw new Error("Neural voice is bound to another mind.");
+      selectedBrainId = brainId;
       if (!modality) {
         return {
           listening: false,
@@ -279,32 +289,19 @@ export function createOmniNeuralAudioAdapter(
             "The trusted neural-media preload API is unavailable. Platform STT/TTS remain separate."
         };
       }
-      if (!capture.capabilities.microphone) {
-        return {
-          listening: false,
-          voice: false,
-          detail:
-            "This runtime cannot encode direct microphone packets with MediaRecorder. Platform STT/TTS remain separate."
-        };
-      }
       const capabilities = await inspect(brainId);
-      if (!capabilities?.audioPerception) {
-        return {
-          listening: false,
-          voice: false,
-          detail:
-            "This brain has no verified trained neural audio-input path. Platform STT/TTS remain separate."
-        };
-      }
+      const listening = capabilities?.audioPerception === true && capture.capabilities.microphone;
+      const voice = capabilities?.audioRegionAvailable === true && synthesis.available;
+      const quality = capabilities?.speechQuality ?? "needs-speech-training";
       return {
-        listening: true,
-        // The built-in audio decoder creates general sound, not intelligible
-        // speech. Do not turn a generic audio capability into fake TTS.
-        // No production intelligible-speech renderer is installed in this
-        // adapter yet, even if a future worker can report such a pack.
-        voice: false,
-        detail:
-          "Microphone waveforms enter this brain's persistent assemblies and STDP. Platform Web Speech supplies only the literal transcript; generic neural audio is not TTS."
+        listening,
+        voice,
+        voiceQuality: quality,
+        detail: voice
+          ? quality === "needs-speech-training"
+            ? "Own waveform output uses this brain's audio region and needs paired speech training. It may not match the words yet. STT/TTS remain defaults."
+            : "Own waveform output uses this brain's audio region. Speech quality is not verified; STT/TTS remain defaults."
+          : "Same-brain waveform output or local playback is unavailable. Platform STT/TTS remain separate."
       };
     },
     async startListening(brainId) {
@@ -339,12 +336,14 @@ export function createOmniNeuralAudioAdapter(
           void controller.dispose();
         }
       };
-    }
+    },
+    ...(synthesis.available ? { synthesis } : {})
   };
 }
 
 export function createBrowserLiveVoiceAdapters(
-  environment: BrowserVoiceEnvironment = runtimeEnvironment()
+  environment: BrowserVoiceEnvironment = runtimeEnvironment(),
+  brainId?: string
 ): {
   capture: LiveVoiceCaptureAdapter;
   recognition: LiveVoiceRecognitionAdapter;
@@ -355,6 +354,8 @@ export function createBrowserLiveVoiceAdapters(
     capture: createBrowserCaptureAdapter(environment),
     recognition: createBrowserRecognitionAdapter(environment),
     synthesis: createBrowserSynthesisAdapter(environment),
-    neural: createOmniNeuralAudioAdapter()
+    neural: createOmniNeuralAudioAdapter(runtimeOmniModality(), createBrowserLivePerceptionCapture(), {
+      brainId, audioConstructor: environment.audioConstructor
+    })
   };
 }

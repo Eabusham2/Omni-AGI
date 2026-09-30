@@ -81,7 +81,11 @@ class AdaptiveBrainTests(unittest.TestCase):
         self.assertEqual(expected_mutable, core_packed + router_parameters)
 
         accounting = brain.parameter_accounting()
+        expected_vector_parameters = (
+            len(brain.memory.neuron_vectors) * brain.memory.space.dimensions
+        )
         self.assertEqual(accounting["mutableDenseParameters"], expected_mutable)
+        self.assertEqual(accounting["substrateVectorParameters"], expected_vector_parameters)
         self.assertEqual(
             accounting["dynamicSparseSynapses"],
             len(brain.memory.synapses),
@@ -92,7 +96,7 @@ class AdaptiveBrainTests(unittest.TestCase):
         )
         self.assertEqual(
             accounting["totalNeuralParameters"],
-            expected_mutable + len(brain.memory.synapses),
+            expected_mutable + expected_vector_parameters + len(brain.memory.synapses),
         )
         self.assertEqual(brain.runtime_card()["parameterAccounting"], accounting)
         metrics = brain.metrics()
@@ -1444,6 +1448,8 @@ class AdaptiveBrainTests(unittest.TestCase):
             brain,
             "_iter_audio_windows",
             return_value=iter([(audio, brain.config.audio_samples)]),
+        ), mock.patch.object(
+            brain, "_assert_embedded_audio_track", return_value=None,
         ):
             trained = brain._train_media(
                 "movie-with-sound.mp4",

@@ -14,6 +14,24 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import OmniConfig
+from .native_action_protocol import structural_schema, validate_structural_value
+from .working_attention_paging import (
+    PagedTensorSequence,
+    SavedActivityTensor,
+    WorkingAttentionCancelled,
+    WorkingAttentionPager,
+    current_working_attention_pager,
+    exact_causal_attention,
+    freeze_runtime_tensor,
+    materialize_runtime_tensor,
+)
+from .native_core_paging import (
+    NativePackedModuleMixin,
+    current_native_core_pager,
+    paged_projection_call,
+)
+from .packed_collective_hooks import defer_packed_rows, packed_row_owner, current_packed_row_owner, packed_derivative_collective_active
+from .parameter_diagnostics import packed_diagnostic_write
 
 
 ACTION_KINDS = (
@@ -34,7 +52,16 @@ PACKED_TERNARY_LEARN_SAMPLE_BLOCK = 256
 PACKED_STABILITY_MAX = 15
 
 
-class _PackedRowMetaplasticity:
+def _zero_packed_state(module, target):
+    flat = target.reshape(-1)
+    for start in range(0, flat.numel(), 4096):
+        count = min(4096, flat.numel() - start)
+        replacement = torch.zeros(count, dtype=target.dtype, device=target.device)
+        with packed_diagnostic_write(module, target, replacement, start=start):
+            flat[start:start + count].zero_()
+
+
+class _PackedRowMetaplasticity(NativePackedModuleMixin):
     """One byte of resistance per output row, never a dense weight shadow.
 
     Repeated successful plastic changes make that row harder, but never
@@ -45,11 +72,15 @@ class _PackedRowMetaplasticity:
 
     def _init_packed_stability(self, rows: int, has_bias: bool) -> None:
         self.register_buffer(
-            "_row_stability", torch.zeros(int(rows), dtype=torch.uint8)
+            "_row_stability", self._native_buffer(
+                "_row_stability", (int(rows),),
+                fill=None if self._native_loading_checkpoint else 0,
+            )
         )
         self.register_buffer(
             "_bias_row_stability",
-            torch.zeros(1, dtype=torch.uint8) if has_bias else None,
+            self._native_buffer("_bias_row_stability", (1,), fill=0)
+            if has_bias else None,
         )
         self._packed_stability_strength = 0.0
         self._pending_stability_events = 0
@@ -198,6 +229,12 @@ def _apply_packed_gradient_rows(
     stability_strength: float = 0.0,
 ) -> int:
     """Apply a bounded stochastic step directly to authoritative 2-bit rows."""
+    deferred = defer_packed_rows(
+        packed, width, row_start, gradient, rate, scale,
+        row_stability, stability_strength,
+    )
+    if deferred is not None:
+        return int(deferred)
     row_end = int(row_start) + int(gradient.shape[0])
     levels = unpack_ternary_weight_rows(
         packed, width, row_start, row_end, validate_reserved=False
@@ -238,18 +275,20 @@ def _apply_packed_gradient_rows(
     ).to(torch.int8)
     changed = int((movement != 0).sum().item())
     if changed:
-        packed[row_start:row_end].copy_(pack_ternary_weight(levels + movement))
+        replacement = pack_ternary_weight(levels + movement)
+        with packed_diagnostic_write(current_packed_row_owner(), packed, replacement, start=int(row_start) * packed.shape[1]):
+            packed[row_start:row_end].copy_(replacement)
         if row_stability is not None and stability_strength > 0.0:
             rows = row_stability[row_start:row_end]
             grew = movement.ne(0).any(dim=1)
-            rows.copy_(
-                torch.where(
+            replacement_rows = torch.where(
                     grew,
                     (rows.to(torch.int16) + 1).clamp_max(PACKED_STABILITY_MAX)
                     .to(torch.uint8),
                     rows,
                 )
-            )
+            with packed_diagnostic_write(current_packed_row_owner(), row_stability, replacement_rows, start=row_start):
+                rows.copy_(replacement_rows)
     return changed
 
 
@@ -429,11 +468,10 @@ class _PackedOnlyTernaryLinear(torch.autograd.Function):
         ctx.in_features = int(in_features)
         ctx.out_features = int(out_features)
         ctx.module = module
-        # The packed tensor is kept by reference, not as an autograd-saved
-        # tensor: this is an online plasticity rule that may mutate it during
-        # backward. No dense copy of the weights is retained per graph.
-        ctx.packed = packed
-        ctx.scale = scale
+        # Keep only the module owner. A saved accelerator packed reference
+        # would silently defeat layer eviction for the entire backward graph.
+        # The online rule already uses mutable current synapses, not a dense
+        # frozen forward-weight shadow.
         ctx.save_for_backward(inputs)
         output = _packed_ternary_forward(
             inputs, packed, ctx.in_features, ctx.out_features, scale
@@ -448,19 +486,20 @@ class _PackedOnlyTernaryLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
         (inputs,) = ctx.saved_tensors
-        grad_input = _packed_ternary_input_gradient(
-            grad_output,
-            ctx.packed,
-            ctx.in_features,
-            ctx.out_features,
-            ctx.scale,
-        )
-        if ctx.module.training:
-            ctx.module.learn_from_gradient(
-                inputs,
+        with ctx.module._packed_residency_scope(grad_output.device):
+            grad_input = _packed_ternary_input_gradient(
                 grad_output,
-                ctx.module.online_learning_rate,
+                ctx.module.packed_forward_weight(),
+                ctx.in_features,
+                ctx.out_features,
+                ctx.module._packed_forward_scale,
             )
+            if ctx.module.training:
+                ctx.module.learn_from_gradient(
+                    inputs,
+                    grad_output,
+                    ctx.module.online_learning_rate,
+                )
         return grad_input, None, None, None, None, None, None
 
 
@@ -492,6 +531,7 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         online_learning_rate: float = 1.0,
     ) -> None:
         super().__init__()
+        self._init_native_paging()
         if int(in_features) <= 0 or int(out_features) <= 0:
             raise ValueError("packed ternary dimensions must be positive")
         self.in_features = int(in_features)
@@ -508,17 +548,16 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
             raise ValueError("online_learning_rate must be finite and nonnegative")
         self.register_buffer(
             "_packed_forward_weight",
-            torch.empty(
-                (self.out_features, (self.in_features + 3) // 4),
-                dtype=torch.uint8,
-            ),
+            self._native_buffer("_packed_forward_weight", (
+                self.out_features, (self.in_features + 3) // 4,
+            )),
         )
         self.register_buffer(
             "_packed_forward_bias",
             (
-                torch.full(
-                    (1, (self.out_features + 3) // 4), 0x55, dtype=torch.uint8
-                )
+                self._native_buffer("_packed_forward_bias", (
+                    1, (self.out_features + 3) // 4,
+                ), fill=None if self._native_loading_checkpoint else 0x55)
                 if self.has_bias
                 else None
             ),
@@ -543,17 +582,20 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         self._scale_validated_version = -1
         self._validated_device: Optional[torch.device] = None
         self._online_transaction: Optional[Dict[str, Any]] = None
+        self._online_pager_scope = None
         # Initialization itself is row-blocked: no whole dense weight is held.
-        with torch.no_grad():
-            for start in range(0, self.out_features, PACKED_TERNARY_OUTPUT_BLOCK):
-                end = min(self.out_features, start + PACKED_TERNARY_OUTPUT_BLOCK)
-                levels = torch.randint(
-                    -1, 2, (end - start, self.in_features), dtype=torch.int8
-                )
-                self._packed_forward_weight[start:end].copy_(
-                    pack_ternary_weight(levels)
-                )
-        self._validate_packed()
+        if not self._native_loading_checkpoint:
+            with torch.no_grad():
+                for start in range(0, self.out_features, PACKED_TERNARY_OUTPUT_BLOCK):
+                    end = min(self.out_features, start + PACKED_TERNARY_OUTPUT_BLOCK)
+                    levels = torch.randint(
+                        -1, 2, (end - start, self.in_features), dtype=torch.int8
+                    )
+                    self._packed_forward_weight[start:end].copy_(
+                        pack_ternary_weight(levels)
+                    )
+            self._validate_packed()
+        self._finish_native_paging()
 
     def _apply(self, fn):
         if self._online_transaction is not None:
@@ -657,8 +699,10 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         ):
             raise ValueError("packed ternary replacement has invalid shape or dtype")
         packed = self.packed_forward_weight()
-        packed.copy_(pack_ternary_weight(levels.to(device=packed.device)))
-        self._row_stability.zero_()
+        replacement = pack_ternary_weight(levels.to(device=packed.device))
+        with packed_diagnostic_write(self, packed, replacement):
+            packed.copy_(replacement)
+        _zero_packed_state(self, self._row_stability)
         self._pending_stability_events = 0
         self._validate_packed()
 
@@ -713,13 +757,20 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
                 dtype=torch.int8,
                 device=packed.device,
             )
-            packed[start:end].copy_(pack_ternary_weight(levels))
-        self._row_stability.zero_()
+            replacement = pack_ternary_weight(levels)
+            with packed_diagnostic_write(self, packed, replacement, start=start * packed.shape[1]):
+                packed[start:end].copy_(replacement)
+        _zero_packed_state(self, self._row_stability)
         self._pending_stability_events = 0
         self._packed_validated_version = int(packed._version)
         if zero_bias and self._packed_forward_bias is not None:
-            self._packed_forward_bias.fill_(0x55)
-            self._bias_row_stability.zero_()
+            bias = self._packed_forward_bias.reshape(-1)
+            for start in range(0, bias.numel(), 4096):
+                count = min(4096, bias.numel() - start)
+                replacement = torch.full((count,), 0x55, dtype=torch.uint8, device=bias.device)
+                with packed_diagnostic_write(self, self._packed_forward_bias, replacement, start=start):
+                    bias[start:start + count].fill_(0x55)
+            _zero_packed_state(self, self._bias_row_stability)
             self._bias_validated_version = int(self._packed_forward_bias._version)
         return self
 
@@ -734,24 +785,40 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
             raise RuntimeError("packed online step is already active")
         if self.logical_ternary_parameter_count > int(max_scratch_synapses):
             raise ValueError("packed online step exceeds bounded scratch allowance")
-        device = self.packed_forward_weight().device
-        self._online_transaction = {
-            "weight": torch.zeros(
-                (self.out_features, self.in_features),
-                dtype=torch.float32,
-                device=device,
-            ),
-            "bias": (
-                torch.zeros((self.out_features,), dtype=torch.float32, device=device)
-                if self.has_bias
-                else None
-            ),
-            "rate": None,
-            "calls": 0,
-        }
+        device = (self._native_compute_device if self._native_core_pager is not None
+                  else self.packed_forward_weight().device)
+        scope = self._packed_residency_scope(device)
+        scope.__enter__()
+        try:
+            self._online_transaction = {
+                "weight": torch.zeros(
+                    (self.out_features, self.in_features),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "bias": (
+                    torch.zeros((self.out_features,), dtype=torch.float32, device=device)
+                    if self.has_bias
+                    else None
+                ),
+                "rate": None,
+                "calls": 0,
+            }
+            self._online_pager_scope = scope
+        except BaseException:
+            scope.__exit__(None, None, None)
+            raise
 
     @torch.no_grad()
     def commit_online_step(self) -> int:
+        try:
+            with packed_row_owner(self):
+                return self._commit_online_step_impl()
+        finally:
+            self._release_online_pager_scope()
+
+    @torch.no_grad()
+    def _commit_online_step_impl(self) -> int:
         """Apply one level update from the sum of all uses in a graph."""
         transaction = self._online_transaction
         if transaction is None:
@@ -794,6 +861,13 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
     def discard_online_step(self) -> None:
         """Drop temporary derivatives without changing packed synapses."""
         self._online_transaction = None
+        self._release_online_pager_scope()
+
+    def _release_online_pager_scope(self) -> None:
+        scope = self._online_pager_scope
+        self._online_pager_scope = None
+        if scope is not None:
+            scope.__exit__(None, None, None)
 
     @property
     def bias(self) -> Optional[torch.Tensor]:
@@ -820,6 +894,7 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
             **self.packed_stability_status(),
         }
 
+    @paged_projection_call
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return _PackedOnlyTernaryLinear.apply(
             inputs,
@@ -832,6 +907,7 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         )
 
     @torch.no_grad()
+    @paged_projection_call
     def learn_from_gradient(
         self,
         inputs: torch.Tensor,
@@ -891,7 +967,8 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
                     downstream[sample_start:sample_end, start:end].float().t()
                     @ activity[sample_start:sample_end].float()
                 )
-            gradient.div_(float(activity.shape[0]))
+            if not packed_derivative_collective_active():
+                gradient.div_(float(activity.shape[0]))
             if transaction is not None:
                 transaction["weight"][start:end].add_(gradient)
                 continue
@@ -927,7 +1004,8 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
                         .float()
                         .sum(dim=0)
                     )
-                bias_gradient[start:end] = block_gradient / float(activity.shape[0])
+                bias_gradient[start:end] = (block_gradient if packed_derivative_collective_active()
+                    else block_gradient / float(activity.shape[0]))
             if transaction is not None:
                 transaction["bias"].add_(bias_gradient)
                 return 0
@@ -1005,7 +1083,8 @@ def packed_online_step(
                 for tensor, original in zip(
                     current, snapshot[0]
                 ):
-                    tensor.copy_(original)
+                    with packed_diagnostic_write(module, tensor, original):
+                        tensor.copy_(original)
                 module._row_stability.copy_(snapshot[1])
                 if module._bias_row_stability is not None and snapshot[2] is not None:
                     module._bias_row_stability.copy_(snapshot[2])
@@ -1080,6 +1159,7 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
         initial_level: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self._init_native_paging()
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         if self.num_embeddings <= 0 or self.embedding_dim <= 0:
@@ -1099,10 +1179,9 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
             raise ValueError("packed embedding initial level must be -1, 0, or +1")
         self.register_buffer(
             "_packed_forward_weight",
-            torch.empty(
-                (self.num_embeddings, (self.embedding_dim + 3) // 4),
-                dtype=torch.uint8,
-            ),
+            self._native_buffer("_packed_forward_weight", (
+                self.num_embeddings, (self.embedding_dim + 3) // 4,
+            )),
         )
         self.register_buffer(
             "_packed_forward_scale", torch.tensor(gain, dtype=torch.float32)
@@ -1117,28 +1196,30 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
         self._packed_validated_version = -1
         self._scale_validated_version = -1
         self._validated_device: Optional[torch.device] = None
-        with torch.no_grad():
-            if initial_level == 0:
-                self._packed_forward_weight.fill_(0x55)
-            else:
-                for start in range(0, self.num_embeddings, PACKED_TERNARY_OUTPUT_BLOCK):
-                    end = min(self.num_embeddings, start + PACKED_TERNARY_OUTPUT_BLOCK)
-                    levels = (
-                        torch.randint(
-                            -1, 2, (end - start, self.embedding_dim), dtype=torch.int8
+        if not self._native_loading_checkpoint:
+            with torch.no_grad():
+                if initial_level == 0:
+                    self._packed_forward_weight.fill_(0x55)
+                else:
+                    for start in range(0, self.num_embeddings, PACKED_TERNARY_OUTPUT_BLOCK):
+                        end = min(self.num_embeddings, start + PACKED_TERNARY_OUTPUT_BLOCK)
+                        levels = (
+                            torch.randint(
+                                -1, 2, (end - start, self.embedding_dim), dtype=torch.int8
+                            )
+                            if initial_level is None
+                            else torch.full(
+                                (end - start, self.embedding_dim),
+                                int(initial_level), dtype=torch.int8,
+                            )
                         )
-                        if initial_level is None
-                        else torch.full(
-                            (end - start, self.embedding_dim),
-                            int(initial_level), dtype=torch.int8,
+                        if self.padding_idx is not None and start <= self.padding_idx < end:
+                            levels[self.padding_idx - start].zero_()
+                        self._packed_forward_weight[start:end].copy_(
+                            pack_ternary_weight(levels)
                         )
-                    )
-                    if self.padding_idx is not None and start <= self.padding_idx < end:
-                        levels[self.padding_idx - start].zero_()
-                    self._packed_forward_weight[start:end].copy_(
-                        pack_ternary_weight(levels)
-                    )
-        self._validate_packed()
+            self._validate_packed()
+        self._finish_native_paging()
 
     def _apply(self, fn):
         result = super()._apply(fn)
@@ -1240,8 +1321,10 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
             )
             if self.padding_idx is not None and start <= self.padding_idx < end:
                 values[self.padding_idx - start].zero_()
-            packed[start:end].copy_(pack_ternary_weight(values))
-        self._row_stability.zero_()
+            replacement = pack_ternary_weight(values)
+            with packed_diagnostic_write(self, packed, replacement, start=start * packed.shape[1]):
+                packed[start:end].copy_(replacement)
+        _zero_packed_state(self, self._row_stability)
         self._pending_stability_events = 0
         self._validate_packed()
 
@@ -1258,6 +1341,7 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
             **self.packed_stability_status(),
         }
 
+    @paged_projection_call
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.dtype not in (torch.int32, torch.int64):
             raise ValueError("packed embedding indices must be integers")
@@ -1274,6 +1358,7 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
         )
 
     @torch.no_grad()
+    @paged_projection_call
     def learn_from_gradient(
         self,
         indices: torch.Tensor,
@@ -1907,8 +1992,6 @@ class _PackedOnlyTernaryConvolution(torch.autograd.Function):
         autograd_trigger: torch.Tensor,
     ) -> torch.Tensor:
         ctx.module = module
-        ctx.packed = packed
-        ctx.scale = scale
         ctx.save_for_backward(inputs)
         if module.transposed:
             output = _packed_transpose_conv_forward(
@@ -1948,37 +2031,40 @@ class _PackedOnlyTernaryConvolution(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
         (inputs,) = ctx.saved_tensors
         module = ctx.module
-        if module.transposed:
-            grad_input, _ = _packed_transpose_conv_backward(
-                inputs,
-                grad_output,
-                ctx.packed,
-                module._weight_shape,
-                ctx.scale,
-                module.stride,
-                module.padding,
-                module.dilation,
-                module.groups,
-                compute_weight_gradient=False,
-            )
-        else:
-            grad_input, _ = _packed_standard_conv_backward(
-                inputs,
-                grad_output,
-                ctx.packed,
-                module._weight_shape,
-                ctx.scale,
-                module.stride,
-                module.padding,
-                module.dilation,
-                module.groups,
-                module.padding_mode,
-                compute_weight_gradient=False,
-            )
-        if module.training:
-            module.learn_from_gradient(
-                inputs, grad_output, module.online_learning_rate
-            )
+        with module._packed_residency_scope(grad_output.device):
+            packed = module.packed_forward_weight()
+            scale = module._packed_forward_scale
+            if module.transposed:
+                grad_input, _ = _packed_transpose_conv_backward(
+                    inputs,
+                    grad_output,
+                    packed,
+                    module._weight_shape,
+                    scale,
+                    module.stride,
+                    module.padding,
+                    module.dilation,
+                    module.groups,
+                    compute_weight_gradient=False,
+                )
+            else:
+                grad_input, _ = _packed_standard_conv_backward(
+                    inputs,
+                    grad_output,
+                    packed,
+                    module._weight_shape,
+                    scale,
+                    module.stride,
+                    module.padding,
+                    module.dilation,
+                    module.groups,
+                    module.padding_mode,
+                    compute_weight_gradient=False,
+                )
+            if module.training:
+                module.learn_from_gradient(
+                    inputs, grad_output, module.online_learning_rate
+                )
         return grad_input, None, None, None, None
 
 
@@ -2007,6 +2093,7 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
         _output_padding: object = 0,
     ) -> None:
         super().__init__()
+        self._init_native_paging()
         if self.dimensions not in (1, 2, 3):
             raise ValueError("packed convolution dimensions must be 1, 2, or 3")
         self.in_channels = int(in_channels)
@@ -2083,17 +2170,16 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
             raise ValueError("online_learning_rate must be finite and nonnegative")
         self.register_buffer(
             "_packed_forward_weight",
-            torch.empty(
-                (self._matrix_rows, (self._matrix_width + 3) // 4),
-                dtype=torch.uint8,
-            ),
+            self._native_buffer("_packed_forward_weight", (
+                self._matrix_rows, (self._matrix_width + 3) // 4,
+            )),
         )
         self.register_buffer(
             "_packed_forward_bias",
             (
-                torch.full(
-                    (1, (self.out_channels + 3) // 4), 0x55, dtype=torch.uint8
-                )
+                self._native_buffer("_packed_forward_bias", (
+                    1, (self.out_channels + 3) // 4,
+                ), fill=None if self._native_loading_checkpoint else 0x55)
                 if self.has_bias
                 else None
             ),
@@ -2112,16 +2198,18 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
         self._bias_validated_version = -1
         self._scale_validated_version = -1
         self._validated_device: Optional[torch.device] = None
-        with torch.no_grad():
-            for start in range(0, self._matrix_rows, PACKED_TERNARY_OUTPUT_BLOCK):
-                end = min(self._matrix_rows, start + PACKED_TERNARY_OUTPUT_BLOCK)
-                levels = torch.randint(
-                    -1, 2, (end - start, self._matrix_width), dtype=torch.int8
-                )
-                self._packed_forward_weight[start:end].copy_(
-                    pack_ternary_weight(levels)
-                )
-        self._validate_packed()
+        if not self._native_loading_checkpoint:
+            with torch.no_grad():
+                for start in range(0, self._matrix_rows, PACKED_TERNARY_OUTPUT_BLOCK):
+                    end = min(self._matrix_rows, start + PACKED_TERNARY_OUTPUT_BLOCK)
+                    levels = torch.randint(
+                        -1, 2, (end - start, self._matrix_width), dtype=torch.int8
+                    )
+                    self._packed_forward_weight[start:end].copy_(
+                        pack_ternary_weight(levels)
+                    )
+            self._validate_packed()
+        self._finish_native_paging()
 
     def _apply(self, fn):
         result = super()._apply(fn)
@@ -2272,6 +2360,7 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
             **self.packed_stability_status(),
         }
 
+    @paged_projection_call
     def forward(
         self, inputs: torch.Tensor, output_size: Optional[List[int]] = None
     ) -> torch.Tensor:
@@ -2288,6 +2377,7 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
         )
 
     @torch.no_grad()
+    @paged_projection_call
     def learn_from_gradient(
         self,
         inputs: torch.Tensor,
@@ -2377,7 +2467,8 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
                             gathered[:, local_start:local_end].float().t()
                             @ activity.float()
                         )
-                    gradient.div_(max(1, batch * total))
+                    if not packed_derivative_collective_active():
+                        gradient.div_(max(1, batch * total))
                     changed += _apply_packed_gradient_rows(
                         packed,
                         in_per_group,
@@ -2438,7 +2529,8 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
                             :, position_start:position_end, start:end
                         ].reshape(-1, end - start)
                         gradient.add_(downstream.float().t() @ patches.float())
-                    gradient.div_(max(1, batch * total))
+                    if not packed_derivative_collective_active():
+                        gradient.div_(max(1, batch * total))
                     changed += _apply_packed_gradient_rows(
                         packed,
                         self._matrix_width,
@@ -2465,7 +2557,8 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
                         .float()
                         .sum(dim=(0, 2))
                     )
-            bias_gradient.div_(max(1, batch * total))
+            if not packed_derivative_collective_active():
+                bias_gradient.div_(max(1, batch * total))
             changed += _apply_packed_gradient_rows(
                 self._packed_forward_bias,
                 self.out_channels,
@@ -2677,6 +2770,9 @@ class RotaryEmbedding(nn.Module):
         self.head_dim = int(head_dim)
         self.max_seq_len = max(1, int(max_seq_len))
         self.base = float(base)
+        # This is a compute cache, not context capacity. Large absolute
+        # positions are rotated from a bounded local table below.
+        self.max_cached_tokens = 256
         inverse = 1.0 / (
             base
             ** (
@@ -2725,7 +2821,7 @@ class RotaryEmbedding(nn.Module):
             return
         current = self.cached_seq_len if self.cos.device == device else 0
         target = max(sequence, max(16, current * 2))
-        target = min(self.max_seq_len, target)
+        target = min(self.max_seq_len, target, self.max_cached_tokens)
         positions = torch.arange(target, dtype=torch.float32, device=device)
         inverse = self.inverse_frequency.to(device=device, dtype=torch.float32)
         angles = torch.outer(positions, inverse)
@@ -2743,9 +2839,26 @@ class RotaryEmbedding(nn.Module):
         if start < 0:
             raise ValueError("rotary position offset must be non-negative")
         end = start + sequence
-        self._ensure_cache(end, query.device)
-        cos = self.cos[start:end].to(dtype=query.dtype)[None, None, :, :]
-        sin = self.sin[start:end].to(dtype=query.dtype)[None, None, :, :]
+        if end > self.max_seq_len:
+            raise ValueError("attention sequence exceeds the configured context capacity")
+        if end <= self.max_cached_tokens:
+            self._ensure_cache(end, query.device)
+            cos = self.cos[start:end].to(dtype=query.dtype)[None, None, :, :]
+            sin = self.sin[start:end].to(dtype=query.dtype)[None, None, :, :]
+        else:
+            if end > 2 ** 24:
+                # Float32 positions stop distinguishing adjacent tokens here.
+                # Compute this bounded local phase on CPU in float64 (MPS has
+                # no float64 kernels), then transfer only the active tile.
+                positions = torch.arange(start, end, dtype=torch.float64, device="cpu")
+                angles = torch.outer(positions, self.inverse_frequency.to(device="cpu", dtype=torch.float64))
+                cos = angles.cos().to(device=query.device, dtype=query.dtype)[None, None, :, :]
+                sin = angles.sin().to(device=query.device, dtype=query.dtype)[None, None, :, :]
+            else:
+                positions = torch.arange(start, end, dtype=torch.float32, device=query.device)
+                angles = torch.outer(positions, self.inverse_frequency.to(query.device))
+                cos = angles.cos().to(query.dtype)[None, None, :, :]
+                sin = angles.sin().to(query.dtype)[None, None, :, :]
 
         def rotate(value: torch.Tensor) -> torch.Tensor:
             even = value[..., 0::2]
@@ -2760,8 +2873,13 @@ class RotaryEmbedding(nn.Module):
 
 @dataclass
 class _AttentionInferenceCache:
-    key: torch.Tensor
-    value: torch.Tensor
+    key: Any
+    value: Any
+
+    def close(self) -> None:
+        for source in (self.key, self.value):
+            if isinstance(source, PagedTensorSequence):
+                source.close()
 
 
 class CausalSelfAttention(nn.Module):
@@ -2773,9 +2891,10 @@ class CausalSelfAttention(nn.Module):
         self.output = PackedAdaptiveBitLinear(config.d_model, config.d_model)
         self.rotary = RotaryEmbedding(self.head_dim, config.max_seq_len)
         self.dropout = config.dropout
-        # Bound live long-context score allocation. This preserves exact
-        # causal attention while trading speed for a linear peak working set.
+        # Both dimensions are tiled. The total context/KV capacity is not
+        # bounded by these operational tile sizes.
         self.query_chunk_tokens = 256
+        self.key_chunk_tokens = 256
 
     def _project(
         self,
@@ -2797,33 +2916,19 @@ class CausalSelfAttention(nn.Module):
     def _attend(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key: Any,
+        value: Any,
         position_offset: int = 0,
     ) -> torch.Tensor:
         batch, _, sequence, _ = query.shape
-        attended_chunks = []
-        key_positions = torch.arange(key.shape[-2], device=query.device)
-        scale = math.sqrt(float(self.head_dim))
-        for start in range(0, sequence, self.query_chunk_tokens):
-            end = min(sequence, start + self.query_chunk_tokens)
-            scores = torch.matmul(
-                query[..., start:end, :], key.transpose(-2, -1)
-            )
-            scores = scores / scale
-            query_positions = torch.arange(
-                position_offset + start,
-                position_offset + end,
-                device=query.device,
-            )
-            mask = key_positions[None, :] > query_positions[:, None]
-            scores = scores.masked_fill(mask[None, None, :, :], -torch.inf)
-            probabilities = F.softmax(scores.float(), dim=-1).to(query.dtype)
-            probabilities = F.dropout(
-                probabilities, p=self.dropout, training=self.training
-            )
-            attended_chunks.append(torch.matmul(probabilities, value))
-        attended = torch.cat(attended_chunks, dim=-2)
+        attended = exact_causal_attention(
+            query, key, value,
+            position_offset=position_offset,
+            query_chunk_tokens=self.query_chunk_tokens,
+            key_chunk_tokens=self.key_chunk_tokens,
+            dropout=self.dropout,
+            training=self.training,
+        )
         attended = attended.transpose(1, 2).contiguous().view(
             batch, sequence, self.n_heads * self.head_dim
         )
@@ -2843,6 +2948,25 @@ class CausalSelfAttention(nn.Module):
             raise RuntimeError("attention inference cache requires eval and no_grad")
         position_offset = 0 if cache is None else int(cache.key.shape[-2])
         query, key, value = self._project(hidden, position_offset)
+        pager = current_working_attention_pager()
+        if pager is None and cache is not None and isinstance(cache.key, PagedTensorSequence):
+            pager = cache.key.pager
+        if pager is not None:
+            if cache is None:
+                key_pages = pager.sequence(key)
+                try:
+                    value_pages = pager.sequence(value)
+                except BaseException:
+                    key_pages.close()
+                    raise
+                cache = _AttentionInferenceCache(key_pages, value_pages)
+            elif isinstance(cache.key, PagedTensorSequence):
+                cache.key.append(key)
+                cache.value.append(value)
+            else:
+                raise RuntimeError("working attention pager changed within a live cache")
+            attended = self._attend(query, cache.key, cache.value, position_offset)
+            return attended, cache
         if cache is not None:
             key = torch.cat((cache.key, key), dim=-2)
             value = torch.cat((cache.value, value), dim=-2)
@@ -3061,9 +3185,14 @@ class _SequentialWorkspaceSummary(torch.autograd.Function):
 
 @dataclass
 class _WorkspaceInferenceChunk:
-    queries: torch.Tensor
-    mass: torch.Tensor
-    weighted_values: torch.Tensor
+    queries: Any
+    mass: Any
+    weighted_values: Any
+
+    def close(self) -> None:
+        for value in (self.queries, self.mass, self.weighted_values):
+            if isinstance(value, SavedActivityTensor):
+                value.close()
 
 
 class GlobalWorkspace(nn.Module):
@@ -3100,10 +3229,15 @@ class GlobalWorkspace(nn.Module):
 
     def _latent_rows(self, start: int, end: int) -> torch.Tensor:
         """Decode only the active slot rows, not the full learned table."""
+        pager = getattr(self.latent_table, "_native_core_pager", None)
+        device = (
+            self.latent_table._native_compute_device
+            if pager is not None else self.latent_table.packed_forward_weight().device
+        )
         indexes = torch.arange(
             int(start), int(end),
             dtype=torch.long,
-            device=self.latent_table.packed_forward_weight().device,
+            device=device,
         )
         return self.latent_table(indexes)
 
@@ -3228,9 +3362,9 @@ class GlobalWorkspace(nn.Module):
                 # [batch, slots, prefix, dimensions] prefill allocation.
                 _inference_cache.append(
                     _WorkspaceInferenceChunk(
-                        queries,
-                        prefix_mass[:, :, -1].clone(),
-                        weighted_values[:, :, -1].clone(),
+                        freeze_runtime_tensor(queries),
+                        freeze_runtime_tensor(prefix_mass[:, :, -1].clone()),
+                        freeze_runtime_tensor(weighted_values[:, :, -1].clone()),
                     )
                 )
             del weighted_values
@@ -3266,21 +3400,29 @@ class GlobalWorkspace(nn.Module):
         summary_sum: Optional[torch.Tensor] = None
         start = 0
         for chunk in cache:
-            end = start + int(chunk.queries.shape[0])
+            queries = materialize_runtime_tensor(chunk.queries, inputs.device)
+            old_mass = materialize_runtime_tensor(chunk.mass, inputs.device)
+            old_values = materialize_runtime_tensor(chunk.weighted_values, inputs.device)
+            end = start + int(queries.shape[0])
             latent_chunk = self._latent_rows(start, end)
             scores = torch.matmul(
-                chunk.queries.unsqueeze(0), keys.transpose(-2, -1)
+                queries.unsqueeze(0), keys.transpose(-2, -1)
             ) / math.sqrt(float(self.dimensions))
             weights = scores.float().clamp(-16.0, 16.0).exp()
-            prefix_mass = weights.cumsum(dim=-1) + chunk.mass.unsqueeze(-1)
+            prefix_mass = weights.cumsum(dim=-1) + old_mass.unsqueeze(-1)
             weighted_values = (
                 weights.unsqueeze(-1) * values[:, None].float()
-            ).cumsum(dim=2) + chunk.weighted_values.unsqueeze(2)
+            ).cumsum(dim=2) + old_values.unsqueeze(2)
             prefix_values = weighted_values / prefix_mass.clamp_min(
                 torch.finfo(weights.dtype).tiny
             ).unsqueeze(-1)
-            chunk.mass = prefix_mass[:, :, -1].clone()
-            chunk.weighted_values = weighted_values[:, :, -1].clone()
+            new_mass = freeze_runtime_tensor(prefix_mass[:, :, -1].clone())
+            new_values = freeze_runtime_tensor(weighted_values[:, :, -1].clone())
+            for previous in (chunk.mass, chunk.weighted_values):
+                if isinstance(previous, SavedActivityTensor):
+                    previous.close()
+            chunk.mass = new_mass
+            chunk.weighted_values = new_values
             updated = latent_chunk[None, :, None, :] + self.update(
                 prefix_values.to(inputs.dtype)
             )
@@ -3450,20 +3592,27 @@ class ToolRouteHead(nn.Module):
     def encode(cls, text: str) -> torch.Tensor:
         """Apply the same domain-agnostic token/character map to every input."""
         words = str(text).casefold().split()
-        units = ["word:" + word for word in words]
-        for word in words:
-            bounded = "^" + word + "$"
-            for width in (2, 3, 4):
-                units.extend(
-                    "gram:" + bounded[index:index + width]
-                    for index in range(max(0, len(bounded) - width + 1))
-                )
-        values = torch.zeros(cls.feature_width, dtype=torch.float32)
-        for unit in units:
+        values = [0.0] * cls.feature_width
+        pager = current_working_attention_pager()
+        visited = 0
+
+        def accumulate(unit: str) -> None:
+            nonlocal visited
             digest = hashlib.blake2b(unit.encode("utf-8"), digest_size=8).digest()
             index = int.from_bytes(digest[:4], "little") % cls.feature_width
             values[index] += 1.0 if digest[4] & 1 else -1.0
-        return F.normalize(values, dim=0)
+            visited += 1
+            if pager is not None and visited % 1024 == 0:
+                pager.check_cancelled()
+
+        for word in words:
+            accumulate("word:" + word)
+        for word in words:
+            bounded = "^" + word + "$"
+            for width in (2, 3, 4):
+                for index in range(max(0, len(bounded) - width + 1)):
+                    accumulate("gram:" + bounded[index:index + width])
+        return F.normalize(torch.tensor(values, dtype=torch.float32), dim=0)
 
     @staticmethod
     def identity(tool_id: str, action: str) -> bytes:
@@ -3494,12 +3643,15 @@ class ToolRouteHead(nn.Module):
         )), dim=-1)
         return 16.0 * (queries @ candidates.t())
 
-    def forward_internal(self, neural_state: torch.Tensor) -> torch.Tensor:
+    def forward_internal(
+        self, neural_state: torch.Tensor, candidate_features: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if neural_state.ndim != 2:
             raise ValueError("internal route state must be batched")
         queries = F.normalize(torch.tanh(self.internal_query(neural_state)), dim=-1)
+        features = self.route_features if candidate_features is None else candidate_features
         candidates = F.normalize(self.candidate(torch.cat(
-            (self.null_features[None], self.route_features), dim=0
+            (self.null_features[None], features), dim=0
         )), dim=-1)
         return 16.0 * (queries @ candidates.t())
 
@@ -3567,17 +3719,37 @@ class ToolRouteHead(nn.Module):
         if not evidence["trainingSteps"]:
             return {**evidence, "reason": "untrained-internal-route"}
         enabled: Dict[int, Tuple[str, str]] = {}
+        novel_features: List[torch.Tensor] = []
+        novel_indexes: Dict[Tuple[str, str], int] = {}
         for schema in schemas:
             if str(schema.get("grant", "ask")).lower() == "off":
                 continue
             for action in schema.get("actions", ()):
                 tool_id = str(schema.get("id", ""))
                 index = self.route_index(tool_id, str(action))
+                if index is None:
+                    pair = (tool_id, str(action))
+                    if pair not in novel_indexes:
+                        novel_indexes[pair] = int(self.route_features.shape[0]) + len(novel_features)
+                        novel_features.append(self.encode(tool_id + " " + str(action)).to(self.route_features.device))
+                    index = novel_indexes[pair]
                 if index is not None:
                     enabled[index + 1] = (tool_id, str(action))
         if not enabled:
             return {**evidence, "reason": "no-trained-enabled-candidate"}
-        logits = self.forward_internal(neural_state.to(self.route_features.device))[0]
+        pager = current_working_attention_pager()
+        if pager is not None:
+            pager.admit_compute(
+                (int(self.route_features.shape[0]) + len(novel_features) + 1) * self.feature_width * 16,
+                "structural route candidate activity", device=self.route_features.device,
+            )
+        candidate_features = (
+            torch.cat((self.route_features, torch.stack(novel_features)), dim=0)
+            if novel_features else self.route_features
+        )
+        evidence["unseenStructuralCandidates"] = len(novel_features)
+        evidence["generalizationVerified"] = False
+        logits = self.forward_internal(neural_state.to(self.route_features.device), candidate_features)[0]
         if not bool(torch.isfinite(logits).all()):
             return {**evidence, "reason": "non-finite-internal-route"}
         probabilities = logits.softmax(-1)
@@ -3592,6 +3764,27 @@ class ToolRouteHead(nn.Module):
             "selected": {"toolId": pair[0], "action": pair[1]},
             "reason": "trained-internal-weights",
         }
+
+    def prepare_bounded_state_load(self, specs, prefix: str) -> None:
+        pager = getattr(self.query, "_native_core_pager", None)
+        if pager is not None and pager.reserve_admission is not None:
+            required = sum(specs[prefix + name].byte_count
+                           for name in ("route_keys", "route_features", "experience_event_keys")
+                           if prefix + name in specs)
+            pager.reserve_admission(required, self.null_features.device)
+        keys = specs.get(prefix + "route_keys")
+        features = specs.get(prefix + "route_features")
+        if keys is not None and features is not None and keys.shape[0] != features.shape[0]:
+            raise ValueError(prefix + "route registry lengths disagree")
+        for name in ("route_keys", "route_features", "experience_event_keys"):
+            spec = specs.get(prefix + name)
+            if spec is None:
+                continue
+            width = self.feature_width if name == "route_features" else 32
+            dtype = torch.float32 if name == "route_features" else torch.uint8
+            if len(spec.shape) != 2 or spec.shape[1] != width or spec.dtype != dtype:
+                raise ValueError(prefix + name + " has invalid route registry shape/dtype")
+            setattr(self, name, torch.empty(spec.shape, dtype=dtype, device=self.null_features.device))
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
@@ -3687,13 +3880,11 @@ class ActionArgumentHead(nn.Module):
         required = typed.get("required", ())
         if not isinstance(properties, Mapping) or not isinstance(required, (list, tuple)):
             return None
-        fields = [
-            [str(name), str(spec.get("type", "unknown")), str(name) in required]
-            for name, spec in sorted(properties.items())
-            if isinstance(spec, Mapping)
-        ]
+        typed = structural_schema(typed)
+        if typed is None:
+            return None
         structure = json.dumps(
-            [tool_id, action, fields], ensure_ascii=False,
+            [tool_id, action, typed], ensure_ascii=False, sort_keys=True,
             separators=(",", ":"),
         )
         return ToolRouteHead.encode(structure)
@@ -3737,8 +3928,14 @@ class ActionArgumentHead(nn.Module):
             dict(arguments), ensure_ascii=False, sort_keys=True,
             separators=(",", ":"), allow_nan=False,
         ).encode("utf-8")
-        if not encoded or len(encoded) > 4096:
-            raise ValueError("action argument target exceeds the decode budget")
+        if not encoded:
+            raise ValueError("action argument target is empty")
+        pager = current_working_attention_pager()
+        if pager is not None:
+            pager.admit_compute(
+                (len(encoded) + 1) * (12 * self.dimensions + 4 * self.output_count) * 4,
+                "bounded typed-argument teacher forcing", device=neural_state.device,
+            )
         device = neural_state.device
         prefixes = torch.tensor(
             [[self.start_id, *encoded]], dtype=torch.long, device=device,
@@ -3746,7 +3943,9 @@ class ActionArgumentHead(nn.Module):
         targets = torch.tensor(
             [[*encoded, self.eos_id]], dtype=torch.long, device=device,
         )
-        logits = self(neural_state, schema_features, prefixes)
+        hooks = pager.saved_activation_hooks() if pager is not None else nullcontext()
+        with hooks:
+            logits = self(neural_state, schema_features, prefixes)
         return F.cross_entropy(
             logits.float().reshape(-1, self.output_count),
             targets.reshape(-1),
@@ -3762,6 +3961,9 @@ class ActionArgumentHead(nn.Module):
         action: str,
         max_output_bytes: int = 512,
         minimum_mean_probability: float = 0.85,
+        input_schema: Optional[Mapping[str, Any]] = None,
+        allow_declared_training: bool = True,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         evidence: Dict[str, Any] = {
             "kind": "ternary-neural-argument-decoder",
@@ -3771,14 +3973,28 @@ class ActionArgumentHead(nn.Module):
             "hiddenPrompt": False,
             "sourceTextLookup": False,
             "arguments": None,
+            "generalizationVerified": False,
+            "hostCapabilityVerified": False,
         }
-        if evidence["groundedRouteUpdates"] < 1:
+        known_route = any(
+            torch.equal(row.cpu(), torch.tensor(list(ToolRouteHead.identity(tool_id, action)), dtype=torch.uint8))
+            for row in self.route_keys
+        )
+        if evidence["groundedRouteUpdates"] < 1 and not (
+            allow_declared_training and evidence["syntaxTrainingSteps"] > 0
+        ):
             return {**evidence, "reason": "untrained-grounded-route"}
+        evidence["trainingProvenance"] = (
+            "confirmed-host-trajectory" if evidence["groundedRouteUpdates"] > 0
+            else "declared-native-typed-trajectory" if known_route
+            else "declared-native-typed-generalization"
+        )
+        evidence["routeSeenInDeclaredTraining"] = known_route
         if not bool(torch.isfinite(neural_state).all()) or not bool(
             torch.isfinite(schema_features).all()
         ):
             return {**evidence, "reason": "non-finite-condition"}
-        budget = max(1, min(int(max_output_bytes), 4096))
+        budget = max(1, int(max_output_bytes))
         state = torch.tanh(
             self.condition(torch.cat((neural_state, schema_features), dim=-1))
         )
@@ -3786,6 +4002,11 @@ class ActionArgumentHead(nn.Module):
         generated = bytearray()
         probabilities: List[float] = []
         for _ in range(budget):
+            if cancelled is not None and cancelled():
+                return {**evidence, "reason": "argument-decoding-cancelled"}
+            pager = current_working_attention_pager()
+            if pager is not None:
+                pager.admit_compute((16 * self.dimensions + 2 * self.output_count) * 4, "same-cortex argument token")
             state = torch.tanh(
                 self.transition(
                     torch.cat((state, self.token_embedding(token)), dim=-1)
@@ -3813,10 +4034,15 @@ class ActionArgumentHead(nn.Module):
             return {**evidence, "reason": "invalid-argument-json"}
         if not isinstance(parsed, dict):
             return {**evidence, "reason": "arguments-not-an-object"}
+        if input_schema is not None and not validate_structural_value(parsed, input_schema):
+            return {**evidence, "reason": "argument-schema-rejected"}
 
         def synthetic_placeholder(value: Any) -> bool:
             if isinstance(value, str):
-                return value.startswith("<") and value.endswith(">")
+                return value in {
+                    "<absolute-path>", "<explicit-query>", "<explicit-objective>",
+                    "<explicit-content>", "<explicit-command>", "<explicit-path>",
+                }
             if isinstance(value, list):
                 return any(synthetic_placeholder(item) for item in value)
             if isinstance(value, dict):
@@ -3826,6 +4052,26 @@ class ActionArgumentHead(nn.Module):
         if synthetic_placeholder(parsed):
             return {**evidence, "reason": "curriculum-placeholder-rejected"}
         return {**evidence, "arguments": parsed, "reason": "learned-typed-arguments"}
+
+    def prepare_bounded_state_load(self, specs, prefix: str) -> None:
+        pager = getattr(self.condition, "_native_core_pager", None)
+        if pager is not None and pager.reserve_admission is not None:
+            required = sum(specs[prefix + name].byte_count
+                           for name in ("route_keys", "grounded_route_updates")
+                           if prefix + name in specs)
+            pager.reserve_admission(required, self.training_steps.device)
+        keys = specs.get(prefix + "route_keys")
+        updates = specs.get(prefix + "grounded_route_updates")
+        if keys is not None and updates is not None and (
+            len(keys.shape) != 2 or keys.shape[1] != 32
+            or len(updates.shape) != 1 or keys.shape[0] != updates.shape[0]
+            or keys.dtype != torch.uint8 or updates.dtype != torch.long
+        ):
+            raise ValueError(prefix + "grounded route registry lengths/dtypes disagree")
+        for name in ("route_keys", "grounded_route_updates"):
+            spec = specs.get(prefix + name)
+            if spec is not None:
+                setattr(self, name, torch.empty(spec.shape, dtype=spec.dtype, device=self.training_steps.device))
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict,
@@ -3862,6 +4108,13 @@ class _DecoderInferenceCache:
     attention: List[_AttentionInferenceCache]
     hidden_sum: torch.Tensor
     memory_hidden: Optional[torch.Tensor]
+    neural_state: Optional[torch.Tensor] = None
+
+    def close(self) -> None:
+        for chunk in self.workspace:
+            chunk.close()
+        for layer in self.attention:
+            layer.close()
 
 
 class OmniDecoder(nn.Module):
@@ -3876,6 +4129,7 @@ class OmniDecoder(nn.Module):
         super().__init__()
         config.validate()
         self.config = config
+        self.native_core_pager = current_native_core_pager()
         self.embedding = PackedAdaptiveTernaryEmbedding(
             config.vocab_size, config.d_model, padding_idx=0
         )
@@ -3912,9 +4166,23 @@ class OmniDecoder(nn.Module):
         return len(self.experts)
 
     def grow_expert(self, prototype: Optional[torch.Tensor] = None) -> int:
-        device = self.embedding.packed_forward_weight().device
-        expert = TernaryExpert(self.config.d_model, max(16, self.config.d_ff // 2))
-        expert.to(device)
+        scope = (self.native_core_pager.construction(
+            from_checkpoint=bool(self.embedding._native_loading_checkpoint)
+        ) if self.native_core_pager is not None else nullcontext())
+        with scope:
+            return self._grow_expert_impl(prototype)
+
+    def _grow_expert_impl(self, prototype: Optional[torch.Tensor] = None) -> int:
+        device = (self.embedding._native_compute_device if self.native_core_pager is not None
+                  else self.embedding.packed_forward_weight().device)
+        # Dynamic growth uses the same model storage owner as construction.
+        # The outer load scope carries deferred initialization for saved experts.
+        pager_scope = (self.native_core_pager.construction(
+            from_checkpoint=bool(self.embedding._native_loading_checkpoint)
+        ) if self.native_core_pager is not None else nullcontext())
+        with pager_scope:
+            expert = TernaryExpert(self.config.d_model, max(16, self.config.d_ff // 2))
+            expert.to(device)
         if prototype is None:
             prototype = torch.randn(self.config.d_model, device=device)
         prototype = prototype.detach().reshape(-1).to(device=device, dtype=torch.float32)
@@ -3928,14 +4196,21 @@ class OmniDecoder(nn.Module):
             prototype.sign(),
             torch.zeros_like(prototype),
         ).to(torch.int8)
-        route = PackedAdaptiveBitLinear(
-            self.config.d_model,
-            1,
-            scale=math.sqrt(3.0 / (2.0 * self.config.d_model)),
-        ).to(device)
-        route.set_ternary_weight_(levels.unsqueeze(0))
+        route_scope = (nullcontext() if self.native_core_pager is None else self.native_core_pager.construction(
+            from_checkpoint=bool(self.embedding._native_loading_checkpoint)
+        ))
+        with route_scope:
+            route = PackedAdaptiveBitLinear(
+                self.config.d_model,
+                1,
+                scale=math.sqrt(3.0 / (2.0 * self.config.d_model)),
+            ).to(device)
+        if not route._native_loading_checkpoint:
+            route.set_ternary_weight_(levels.unsqueeze(0))
         self.experts.append(expert)
         self.expert_prototypes.append(route)
+        if self.native_core_pager is not None:
+            self.native_core_pager.bind_names((("decoder.", self),))
         return len(self.experts) - 1
 
     def _apply_experts(
@@ -3962,14 +4237,140 @@ class OmniDecoder(nn.Module):
         routing_logits = torch.cat(
             [route(pooled) for route in self.expert_prototypes], dim=-1
         )
-        routing = F.softmax(routing_logits, dim=-1)
-        residuals = torch.stack(
-            [expert(hidden) for expert in self.experts], dim=1
-        )
-        mixed = (residuals * routing[:, :, None, None]).sum(dim=1)
+        baseline = int(getattr(self.config, "expert_routing_baseline_count", -1))
+        if baseline < 0:
+            routing = F.softmax(routing_logits, dim=-1)
+        else:
+            if baseline > len(self.experts):
+                raise ValueError("expert routing baseline exceeds existing experts")
+            old = F.softmax(routing_logits[:, :baseline], dim=-1) if baseline else routing_logits[:, :0]
+            added = torch.sigmoid(routing_logits[:, baseline:])
+            routing = torch.cat((old, added), dim=-1)
+        # Expert count is resource-governed, not a tensor-axis RAM multiplier.
+        # Saved-activity hooks handle training intermediates; inference keeps
+        # one residual at a time instead of stacking E complete token windows.
+        mixed = torch.zeros_like(hidden)
+        for index, expert in enumerate(self.experts):
+            mixed = mixed + expert(hidden) * routing[:, index, None, None]
         return hidden + mixed, routing
 
+    @torch.no_grad()
+    def grow_depth(self, add_layers: int) -> List[int]:
+        """Append learnable zero-residual blocks without changing old heads."""
+        if isinstance(add_layers, bool) or not isinstance(add_layers, int) or add_layers < 1:
+            raise ValueError("depth additions must be a positive integer")
+        device = self.embedding._native_compute_device if self.native_core_pager is not None else self.embedding.packed_forward_weight().device
+        scope = self.native_core_pager.construction(from_checkpoint=False) if self.native_core_pager is not None else nullcontext()
+        pending = []
+        with scope:
+            for _ in range(add_layers):
+                block = DecoderBlock(self.config).to(device)
+                # QKV/up pathways have real initial activity. Only their
+                # outward residual maps are zero, so future gradients can
+                # activate new capacity rather than creating a dead branch.
+                block.attention.output.fill_ternary_(0)
+                block.feed_forward.down.fill_ternary_(0)
+                pending.append(block)
+        first = len(self.blocks)
+        self.blocks.extend(pending)
+        if self.native_core_pager is not None:
+            self.native_core_pager.bind_names((("decoder.", self),))
+        return list(range(first, first + add_layers))
+
+    def configure_working_attention(self, pager: WorkingAttentionPager) -> None:
+        """Attach the shared operational activity budget, not learned state."""
+        self.working_attention_pager = pager
+        # Recurrent slots remain intact; only the concurrently active slot
+        # chunk follows the compute reservation. No learned slots are removed.
+        max_slots = max(1, pager.device_tile_budget_bytes // max(1, 64 * self.config.d_model))
+        self.global_workspace.query_chunk_slots = min(
+            int(self.global_workspace.query_chunk_slots), int(self.global_workspace.slots), max_slots
+        )
+
+    def working_attention_status(self) -> Dict[str, Any]:
+        pager = getattr(self, "working_attention_pager", None)
+        return pager.status() if pager is not None else {
+            "mode": "unpaged-bounded-score-reference",
+            "contextPagedToStorage": False,
+            "exactCausalAttention": True,
+        }
+
+    def _working_pager(self) -> Optional[WorkingAttentionPager]:
+        return getattr(self, "working_attention_pager", None) or current_working_attention_pager()
+
+    def maximum_forward_tokens(self, batch: int = 1, element_bytes: int = 4) -> int:
+        """Window admitting full logits/hidden and their first-order gradients.
+
+        This is an operational training/full-output bound. Generation does
+        not allocate these complete-prefix outputs and streams larger windows.
+        """
+        pager = self._working_pager()
+        if pager is None:
+            return int(self.config.max_seq_len)
+        per_token = self._forward_window_bytes(batch, 1, element_bytes)
+        return min(int(self.config.max_seq_len), pager.device_tile_budget_bytes // max(1, per_token))
+
+    def _forward_window_bytes(self, batch: int, tokens: int, element_bytes: int = 4) -> int:
+        workspace_slots = max(1, min(int(self.global_workspace.query_chunk_slots), int(self.global_workspace.slots)))
+        return int(tokens) * int(batch) * max(4, int(element_bytes)) * (
+            32 * int(self.config.d_model)
+            + 8 * int(self.config.d_ff)
+            + 2 * int(self.config.vocab_size)
+            + 8 * workspace_slots * int(self.config.d_model)
+        )
+
+    def _prefill_block_bytes(self, batch: int, tokens: int) -> int:
+        return int(tokens) * int(batch) * 4 * (
+            32 * int(self.config.d_model)
+            + 8 * int(self.config.d_ff)
+            + 8 * max(1, min(int(self.global_workspace.query_chunk_slots), int(self.global_workspace.slots))) * int(self.config.d_model)
+        )
+
+    def _prefill_block_tokens(self, batch: int) -> int:
+        pager = self._working_pager()
+        preferred = min(
+            (max(1, int(block.attention.query_chunk_tokens)) for block in self.blocks),
+            default=256,
+        )
+        if pager is None:
+            return preferred
+        per_token = self._prefill_block_bytes(batch, 1)
+        maximum = pager.device_tile_budget_bytes // max(1, per_token)
+        if maximum < 1:
+            pager._pause("one prefill token exceeds live activity headroom", requiredComputeBytes=per_token)
+        return min(preferred, maximum)
+
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        memory_bias: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_global_workspace: Optional[bool] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        pager = self._working_pager()
+        if pager is None:
+            return self._forward_bounded(input_ids, memory_bias, labels, use_global_workspace, attention_mask)
+        with pager.activate():
+            if input_ids.ndim != 2:
+                raise ValueError("input_ids must have shape [batch, sequence]")
+            maximum = self.maximum_forward_tokens(input_ids.shape[0])
+            if input_ids.shape[1] > maximum:
+                pager._pause(
+                    "full-output forward exceeds its supported bounded window; input was not truncated",
+                    requestedTokens=int(input_ids.shape[1]),
+                    maximumForwardTokens=maximum,
+                    streamedGenerationAvailable=True,
+                )
+            pager.admit_compute(
+                self._forward_window_bytes(input_ids.shape[0], input_ids.shape[1]),
+                "full-output forward", device=input_ids.device,
+            )
+            hooks = pager.saved_activation_hooks() if torch.is_grad_enabled() else nullcontext()
+            with hooks:
+                return self._forward_bounded(input_ids, memory_bias, labels, use_global_workspace, attention_mask)
+
+    def _forward_bounded(
         self,
         input_ids: torch.Tensor,
         memory_bias: Optional[torch.Tensor] = None,
@@ -3996,11 +4397,11 @@ class OmniDecoder(nn.Module):
             ):
                 raise ValueError("attention_mask must describe right padding")
         if input_ids.shape[1] > self.config.max_seq_len:
-            input_ids = input_ids[:, -self.config.max_seq_len :]
-            if labels is not None:
-                labels = labels[:, -self.config.max_seq_len :]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, -self.config.max_seq_len :]
+            raise ValueError("forward input exceeds context capacity; input was not truncated")
+        if input_ids.shape[1] < 1:
+            raise ValueError("forward input must contain at least one token")
+        if labels is not None and labels.shape != input_ids.shape:
+            raise ValueError("labels must match the complete input window")
         if attention_mask is not None and not bool(
             attention_mask.any(dim=1).all()
         ):
@@ -4072,8 +4473,66 @@ class OmniDecoder(nn.Module):
 
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
-        input_ids = input_ids[:, -self.config.max_seq_len :]
-        return self.global_workspace.summarize(self.embedding(input_ids))
+        if input_ids.shape[1] < 1 or input_ids.shape[1] > self.config.max_seq_len:
+            raise ValueError("whole-input encoding exceeds context capacity or is empty; input was not truncated")
+        pager = self._working_pager()
+        if pager is None:
+            return self.global_workspace.summarize(self.embedding(input_ids))
+        with pager.activate():
+            if torch.is_grad_enabled():
+                maximum = self.maximum_forward_tokens(input_ids.shape[0])
+                if input_ids.shape[1] > maximum:
+                    pager._pause("whole-input training encoding requires a bounded window", maximumForwardTokens=maximum)
+                pager.admit_compute(
+                    self._forward_window_bytes(input_ids.shape[0], input_ids.shape[1]),
+                    "whole-input training encoding", device=input_ids.device,
+                )
+                with pager.saved_activation_hooks():
+                    return self.global_workspace.summarize(self.embedding(input_ids))
+            # Project complete-input K/V once in bounded input blocks. Every
+            # workspace recurrent iteration then streams all exact key tiles.
+            block_tokens = self._prefill_block_tokens(input_ids.shape[0])
+            keys: Optional[PagedTensorSequence] = None
+            values: Optional[PagedTensorSequence] = None
+            try:
+                for start in range(0, input_ids.shape[1], block_tokens):
+                    pager.admit_compute(
+                        self._prefill_block_bytes(input_ids.shape[0], min(block_tokens, input_ids.shape[1] - start)),
+                        "whole-input encoding prefill block", device=input_ids.device,
+                    )
+                    embedded = self.embedding(input_ids[:, start:start + block_tokens])
+                    key = self.global_workspace.key(embedded).unsqueeze(1)
+                    value = self.global_workspace.value(embedded).unsqueeze(1)
+                    if keys is None:
+                        keys = pager.sequence(key)
+                        values = pager.sequence(value)
+                    else:
+                        keys.append(key)
+                        values.append(value)
+                    pager.note_prefill(embedded.shape[1])
+                summary: Optional[torch.Tensor] = None
+                for start in range(0, self.global_workspace.slots, self.global_workspace.query_chunk_slots):
+                    latent = self.global_workspace._latent_rows(
+                        start, min(self.global_workspace.slots, start + self.global_workspace.query_chunk_slots)
+                    ).unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+                    for _ in range(self.global_workspace.iterations):
+                        query = self.global_workspace.query(self.global_workspace.norm(latent)).unsqueeze(1)
+                        attended = exact_causal_attention(
+                            query, keys, values, causal=False,
+                            query_chunk_tokens=self.global_workspace.query_chunk_slots,
+                            key_chunk_tokens=pager.page_tokens,
+                        ).squeeze(1)
+                        latent = latent + self.global_workspace.update(attended)
+                    contribution = self.global_workspace.broadcast(self.global_workspace.norm(latent)).sum(dim=1)
+                    summary = contribution if summary is None else summary + contribution
+                if summary is None:
+                    raise RuntimeError("global workspace has no latent slots")
+                return summary / float(self.global_workspace.slots)
+            finally:
+                if keys is not None:
+                    keys.close()
+                if values is not None:
+                    values.close()
 
     def _generation_signature(
         self, memory_bias: Optional[torch.Tensor]
@@ -4099,9 +4558,31 @@ class OmniDecoder(nn.Module):
             )
             for block in self.blocks
         )
+        native_pager = getattr(self, "native_core_pager", None)
+        packed_signature = (
+            (id(native_pager), int(native_pager.mutation_revision))
+            if native_pager is not None
+            else tuple(
+                (name, id(value), int(value._version))
+                for name, value in self.named_buffers()
+                if any(part in name for part in (
+                    "_packed_forward_weight", "_packed_forward_bias", "_packed_forward_scale",
+                    "_packed_bias", "_row_stability", "_bias_row_stability",
+                ))
+            )
+        )
+        working_pager = self._working_pager()
+        working_signature = None if working_pager is None else (
+            id(working_pager), working_pager.resident_budget_bytes,
+            working_pager.scratch_budget_bytes, working_pager.device_tile_budget_bytes,
+            working_pager.page_tokens,
+        )
         return (
             parameters,
+            packed_signature,
             rotary,
+            working_signature,
+            tuple((int(block.attention.query_chunk_tokens), int(block.attention.key_chunk_tokens)) for block in self.blocks),
             memory_signature,
             int(self.config.max_seq_len),
             int(self.global_workspace.slots),
@@ -4109,6 +4590,18 @@ class OmniDecoder(nn.Module):
         )
 
     def _generation_step(
+        self,
+        window: torch.Tensor,
+        memory_bias: Optional[torch.Tensor],
+        cache: Optional[_DecoderInferenceCache],
+    ) -> Tuple[torch.Tensor, Optional[_DecoderInferenceCache]]:
+        pager = self._working_pager()
+        if pager is None:
+            return self._generation_step_bounded(window, memory_bias, cache)
+        with pager.activate():
+            return self._generation_step_bounded(window, memory_bias, cache)
+
+    def _generation_step_bounded(
         self,
         window: torch.Tensor,
         memory_bias: Optional[torch.Tensor],
@@ -4135,13 +4628,18 @@ class OmniDecoder(nn.Module):
             or self.global_workspace.training
             or any(block.attention.training for block in self.blocks)
         ):
-            return self.forward(window, memory_bias=memory_bias)["logits"][:, -1], None
+            output = self.forward(window, memory_bias=memory_bias)
+            self.last_generation_neural_state = output["hidden"][:, -1].detach().clone()
+            return output["logits"][:, -1], None
         signature = self._generation_signature(memory_bias)
         if signature is None:
-            return self.forward(window, memory_bias=memory_bias)["logits"][:, -1], None
+            output = self.forward(window, memory_bias=memory_bias)
+            self.last_generation_neural_state = output["hidden"][:, -1].detach().clone()
+            return output["logits"][:, -1], None
         if window.ndim != 2 or window.shape[1] < 1:
             raise ValueError("generation input must be a non-empty [batch, sequence]")
-        window = window[:, -self.config.max_seq_len :]
+        if window.shape[1] > self.config.max_seq_len:
+            raise ValueError("generation step exceeds context capacity; input was not truncated")
         length = int(window.shape[1])
         if (
             cache is not None
@@ -4151,42 +4649,70 @@ class OmniDecoder(nn.Module):
                 or cache.hidden_sum.shape[0] != window.shape[0]
             )
         ):
+            cache.close()
             cache = None
-        hidden = self.embedding(window if cache is None else window[:, -1:])
-        if cache is None:
-            workspace_cache: List[_WorkspaceInferenceChunk] = []
-            summary = self.global_workspace.causal_summaries(
-                hidden, _inference_cache=workspace_cache
+        workspace_cache = [] if cache is None else cache.workspace
+        attention_cache = [] if cache is None else cache.attention
+        memory_hidden = None if cache is None else cache.memory_hidden
+        if cache is None and memory_bias is not None:
+            cue = memory_bias.unsqueeze(0) if memory_bias.ndim == 1 else memory_bias
+            memory_hidden = self.memory_strength() * self.memory_projection(cue).unsqueeze(1)
+        hidden_sum = None if cache is None else cache.hidden_sum
+        first = cache is None
+        start = 0 if first else length - 1
+        block_tokens = self._prefill_block_tokens(window.shape[0])
+        pager = self._working_pager()
+        # Only a token block, the fixed-size running hidden sum and pageable
+        # prefix sufficient statistics survive a prefill iteration. No full
+        # context hidden/logits/projection or full accelerator keys are made.
+        try:
+            for position in range(start, length, block_tokens):
+                if pager is not None:
+                    pager.admit_compute(
+                        self._prefill_block_bytes(window.shape[0], min(block_tokens, length - position)),
+                        "streamed prefill token block", device=window.device,
+                    )
+                hidden = self.embedding(window[:, position:position + block_tokens])
+                if first:
+                    summary = self.global_workspace.causal_summaries(hidden, _inference_cache=workspace_cache)
+                else:
+                    summary = self.global_workspace.causal_step(hidden, workspace_cache)
+                hidden = hidden + self.workspace_strength() * summary
+                if memory_hidden is not None:
+                    hidden = hidden + memory_hidden
+                for index, block in enumerate(self.blocks):
+                    layer = None if first else attention_cache[index]
+                    hidden, layer = block.forward_cached(hidden, layer)
+                    if first:
+                        attention_cache.append(layer)
+                    else:
+                        attention_cache[index] = layer
+                contribution = hidden.sum(dim=1)
+                hidden_sum = contribution if hidden_sum is None else hidden_sum + contribution
+                first = False
+                if pager is not None:
+                    pager.note_prefill(hidden.shape[1])
+        except BaseException:
+            for chunk in workspace_cache:
+                chunk.close()
+            for layer in attention_cache:
+                layer.close()
+            raise
+        pooled_hidden = hidden_sum / float(length)
+        try:
+            hidden, _ = self._apply_experts(
+                hidden[:, -1:], pooled_hidden=pooled_hidden
             )
-            memory_hidden = None
-            if memory_bias is not None:
-                cue = memory_bias.unsqueeze(0) if memory_bias.ndim == 1 else memory_bias
-                memory_hidden = self.memory_strength() * (
-                    self.memory_projection(cue).unsqueeze(1)
-                )
-        else:
-            workspace_cache = cache.workspace
-            summary = self.global_workspace.causal_step(hidden, workspace_cache)
-            memory_hidden = cache.memory_hidden
-        hidden = hidden + self.workspace_strength() * summary
-        if memory_hidden is not None:
-            hidden = hidden + memory_hidden
-        attention_cache: List[_AttentionInferenceCache] = []
-        for index, block in enumerate(self.blocks):
-            hidden, layer_cache = block.forward_cached(
-                hidden, None if cache is None else cache.attention[index]
-            )
-            attention_cache.append(layer_cache)
-        hidden_sum = hidden.sum(dim=1)
-        if cache is not None:
-            hidden_sum = cache.hidden_sum + hidden_sum
-        pooled_hidden = (
-            hidden.mean(dim=1) if cache is None else hidden_sum / float(length)
-        )
-        hidden, _ = self._apply_experts(
-            hidden[:, -1:], pooled_hidden=pooled_hidden
-        )
-        logits = self.language_head(self.final_norm(hidden))[:, -1]
+            normalized = self.final_norm(hidden)
+            neural_state = normalized[:, -1].detach().clone()
+            self.last_generation_neural_state = neural_state
+            logits = self.language_head(normalized)[:, -1]
+        except BaseException:
+            for chunk in workspace_cache:
+                chunk.close()
+            for layer in attention_cache:
+                layer.close()
+            raise
         return logits, _DecoderInferenceCache(
             length,
             signature,
@@ -4194,10 +4720,64 @@ class OmniDecoder(nn.Module):
             attention_cache,
             hidden_sum,
             memory_hidden,
+            neural_state,
         )
 
     @torch.no_grad()
     def generate(
+        self,
+        input_ids: torch.Tensor,
+        memory_bias: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 48,
+        temperature: float = 0.9,
+        top_k: int = 40,
+        noise: float = 0.0,
+        seed: int = 0,
+        printable_only: bool = True,
+        token_callback: Optional[Callable[[torch.Tensor, int, float], None]] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
+        *,
+        use_cache: bool = True,
+        activity_callback: Optional[Callable[[torch.Tensor, int, float], Any]] = None,
+        steer_check: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[torch.Tensor, List[float]]:
+        if input_ids.ndim != 2 or input_ids.shape[1] < 1:
+            raise ValueError("generation input must be a non-empty [batch, sequence]")
+        if input_ids.shape[1] > self.config.max_seq_len:
+            raise ValueError("generation prompt exceeds context capacity; input was not truncated")
+        self.last_generation_cache_mode = "not-started"
+        self.last_generation_stop_reason = "not-started"
+        pager = self._working_pager()
+        owner: List[Optional[_DecoderInferenceCache]] = [None]
+        stop_requested = lambda: bool(
+            (cancelled is not None and cancelled())
+            or (steer_check is not None and steer_check())
+        )
+        scope = pager.activate(stop_requested) if pager is not None else nullcontext()
+        try:
+            with scope:
+                if pager is not None:
+                    pager.admit_compute(
+                        3 * (input_ids.numel() + max(1, int(max_new_tokens)) * input_ids.shape[0]) * input_ids.element_size(),
+                        "generation token input/output reservation",
+                        device=input_ids.device,
+                    )
+                return self._generate_scoped(
+                    input_ids, memory_bias, max_new_tokens, temperature, top_k,
+                    noise, seed, printable_only, token_callback, cancelled,
+                    use_cache=use_cache, _cache_owner=owner,
+                    activity_callback=activity_callback, steer_check=steer_check,
+                )
+        except WorkingAttentionCancelled:
+            # Cancellation before any sample or prefill mutation.
+            self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
+            return input_ids, []
+        finally:
+            if owner[0] is not None:
+                owner[0].close()
+
+    @torch.no_grad()
+    def _generate_scoped(
         self,
         input_ids: torch.Tensor,
         memory_bias: Optional[torch.Tensor] = None,
@@ -4213,6 +4793,9 @@ class OmniDecoder(nn.Module):
         cancelled: Optional[Callable[[], bool]] = None,
         *,
         use_cache: bool = True,
+        _cache_owner: Optional[List[Optional[_DecoderInferenceCache]]] = None,
+        activity_callback: Optional[Callable[[torch.Tensor, int, float], Any]] = None,
+        steer_check: Optional[Callable[[], bool]] = None,
     ) -> Tuple[torch.Tensor, List[float]]:
         """Sample from the decoder with invocation-local inference state.
 
@@ -4248,28 +4831,40 @@ class OmniDecoder(nn.Module):
             )
 
         for step in range(max(1, int(max_new_tokens))):
+            if steer_check is not None and steer_check():
+                self.last_generation_stop_reason = "steered"
+                break
             if cancelled():
+                self.last_generation_stop_reason = "cancelled"
                 break
             window = generated[:, -self.config.max_seq_len :]
-            if use_cache:
-                logits, inference_cache = self._generation_step(
-                    window, memory_bias, inference_cache
-                )
-                cache_mode = (
-                    "incremental-v1"
-                    if inference_cache is not None
-                    else "full-prefix-fallback"
-                )
-            else:
-                logits = self.forward(window, memory_bias=memory_bias)[
-                    "logits"
-                ][:, -1]
-                cache_mode = "full-prefix-reference"
+            try:
+                if use_cache:
+                    logits, inference_cache = self._generation_step(
+                        window, memory_bias, inference_cache
+                    )
+                    if _cache_owner is not None:
+                        _cache_owner[0] = inference_cache
+                    cache_mode = (
+                        "paged-incremental-v2"
+                        if inference_cache is not None and self._working_pager() is not None
+                        else "incremental-v1" if inference_cache is not None
+                        else "full-prefix-fallback"
+                    )
+                else:
+                    output = self.forward(window, memory_bias=memory_bias)
+                    self.last_generation_neural_state = output["hidden"][:, -1].detach().clone()
+                    logits = output["logits"][:, -1]
+                    cache_mode = "full-prefix-reference"
+            except WorkingAttentionCancelled:
+                self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
+                break
             if self.last_generation_cache_mode == "not-started":
                 self.last_generation_cache_mode = cache_mode
             elif self.last_generation_cache_mode != cache_mode:
                 self.last_generation_cache_mode = "mixed"
             if cancelled():
+                self.last_generation_stop_reason = "cancelled"
                 break
             if noise > 0:
                 jitter = torch.randn(
@@ -4331,7 +4926,26 @@ class OmniDecoder(nn.Module):
                     entropy = -(
                         probabilities * probabilities.clamp_min(1e-9).log()
                     ).sum(dim=-1)
-            entropies.append(float(entropy.mean().item()))
+            entropy_value = float(entropy.mean().item())
+            # The activity channel is an actual live native hidden state,
+            # never response prose or a second model/backend. A Steer arriving
+            # before this safe boundary cannot publish another token/action.
+            if steer_check is not None and steer_check():
+                self.last_generation_stop_reason = "steered"
+                break
+            if activity_callback is not None:
+                try:
+                    directive = activity_callback(self.last_generation_neural_state, step, entropy_value)
+                except WorkingAttentionCancelled:
+                    self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
+                    break
+                if directive is True or (isinstance(directive, Mapping) and directive.get("stop") is True):
+                    self.last_generation_stop_reason = "native-action-stop"
+                    break
+            if steer_check is not None and steer_check():
+                self.last_generation_stop_reason = "steered"
+                break
+            entropies.append(entropy_value)
             generated = torch.cat([generated, token], dim=1)
             if token_callback is not None:
                 token_callback(
@@ -4340,5 +4954,8 @@ class OmniDecoder(nn.Module):
                     entropies[-1],
                 )
             if step > 0 and bool((token == 2).all()):
+                self.last_generation_stop_reason = "learned-boundary"
                 break
+        else:
+            self.last_generation_stop_reason = "token-budget"
         return generated, entropies

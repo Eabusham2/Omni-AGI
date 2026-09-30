@@ -7,10 +7,10 @@ must serialize working-state writes and then commit the returned pointer in
 ``brain.json``. The substrate root pointer is only a convenience pointer,
 never recovery authority.
 
-Memory is bounded by shard buffers, but neuron and assembly grouping still
-streams the full live corpus on every checkpoint. Frequent tiny ingestion
-commits are therefore not yet low-I/O/low-wear. A persistent dirty bucket/part
-journal in the paged SQLite stores is required before claiming that property.
+Clean generation-bound shared caches publish only changed complete stable
+groups, reusing untouched descriptors. Initial migration, stale journal
+recovery, and a global neuron decay epoch retain explicit full/group rewrite
+costs. The v3 descriptor manifest still costs O(number of shards).
 """
 
 from __future__ import annotations
@@ -20,6 +20,12 @@ import json
 import os
 import stat
 import tempfile
+import sqlite3
+import re
+import subprocess
+import sys
+from collections import namedtuple
+from contextlib import closing
 from functools import lru_cache
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -31,6 +37,13 @@ from .packed_vsa_vectors import PackedTernaryVectorView, PackedTernaryVectors
 from .paged_assembly_index import _record_payload
 from .paged_assembly_vector_view import PagedAssemblyVectorView
 from .paged_assembly_view import PagedAssemblyView
+from .paged_neuron_metadata import PagedNeuronMetadata
+from .paged_packed_vectors import PagedPackedVectors
+from .paged_dirty_journal import (
+    DirtyJournalResourcePause, DirtyShardPlan, rebuild_generation_journal, source_stamp,
+)
+from .authenticated_paged_cache import active_blob_session, cache_session
+from .paged_synapse_endpoints import SynapseEndpointIndex, SynapseEndpointPlan
 from .persistence import atomic_save_tensors
 from .substrate_inspection import neuron_shard_inspection
 from .vsa import (
@@ -51,6 +64,8 @@ _NEURON_FIELDS = frozenset({
 })
 _MAX_BLOB_BYTES = 64 * 1024 * 1024
 _MAX_BUFFER_BYTES = 8 * 1024 * 1024
+_PROOF_STATS = {"hits": 0, "misses": 0}
+_ProofCacheInfo = namedtuple("ProofCacheInfo", "hits misses maxsize currsize")
 
 
 def _canonical(value: Any) -> bytes:
@@ -79,7 +94,6 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-@lru_cache(maxsize=65536)
 def _verified_identity_sha(
     path: str, device: int, inode: int, size: int, mtime_ns: int, ctime_ns: int
 ) -> str:
@@ -90,7 +104,94 @@ def _verified_identity_sha(
     against a malicious filesystem that forges all change timestamps.
     """
 
-    return NeuralSubstrate._file_sha256(Path(path))
+    target = Path(path)
+    identity = (device, inode, size, mtime_ns, ctime_ns)
+    session = active_blob_session()
+    known = session.lookup_blob(target, identity) if session is not None else None
+    if known is not None:
+        _PROOF_STATS["hits"] += 1
+        return known
+    _PROOF_STATS["misses"] += 1
+    observed = NeuralSubstrate._file_sha256(target)
+    after = target.stat()
+    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise ValueError("substrate blob changed during cryptographic proof read")
+    if session is not None:
+        session.remember_blob(target, observed, identity)
+    return observed
+
+
+def _proof_cache_info() -> tuple:
+    # Compatibility diagnostics: proofs are disk-backed, not an entry-capped LRU.
+    return _ProofCacheInfo(_PROOF_STATS["hits"], _PROOF_STATS["misses"], None, 0)
+
+
+def _clear_proof_stats() -> None:
+    _PROOF_STATS.update(hits=0, misses=0)
+
+
+_verified_identity_sha.cache_info = _proof_cache_info
+_verified_identity_sha.cache_clear = _clear_proof_stats
+
+
+@lru_cache(maxsize=64)
+def _strong_local_change_times(device: int, directory: str, platform: str) -> bool:
+    """Conservative allowlist; Windows birth times/network/unknown FS rehash."""
+
+    try:
+        if platform == "darwin":
+            result = subprocess.run(
+                ["/sbin/mount"], check=True, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=5, text=True,
+            )
+            if len(result.stdout) > 256 * 1024:
+                return False
+            mounts = []
+            for line in result.stdout.splitlines():
+                match = re.fullmatch(r".+ on (.+) \(([^)]+)\)", line)
+                if match is not None:
+                    mount_path, raw = match.groups()
+                    flags = raw.split(", ")
+                    if directory == mount_path or directory.startswith(mount_path.rstrip("/") + "/"):
+                        mounts.append((len(mount_path), flags))
+            if not mounts:
+                return False
+            flags = max(mounts, key=lambda item: item[0])[1]
+            # HFS-family/coarse timestamps are deliberately not proof sources.
+            return flags[0] == "apfs" and "local" in flags
+        # No tested reliable Linux inode change-cookie contract is available
+        # here. A filesystem type alone does not prove timestamp granularity.
+        # It therefore uses actual hashes, just like unknown/network/Windows.
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return False
+
+
+def _identity_proof_supported(path: Path, details: os.stat_result) -> bool:
+    return (
+        sys.platform == "darwin"
+        and details.st_ctime_ns > 0 and details.st_mtime_ns > 0
+        and details.st_ctime_ns % 1_000_000_000 != 0
+        and _strong_local_change_times(details.st_dev, str(path.parent.resolve()), sys.platform)
+    )
+
+
+def remember_verified_blob(
+    path: Path, checksum: str, *, before: Optional[os.stat_result] = None,
+) -> None:
+    """Reuse an already checked read/publication, not another whole blob read."""
+
+    details = path.stat()
+    identity = lambda item: (
+        item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns
+    )
+    if before is not None and identity(before) != identity(details):
+        raise ValueError("substrate blob changed during checked read")
+    if not _identity_proof_supported(path, details):
+        return
+    session = active_blob_session()
+    if session is not None:
+        session.remember_blob(path, checksum, identity(details))
 
 
 def _reserve(
@@ -122,7 +223,11 @@ def _verified_file(path: Path, checksum: str, size: int) -> None:
         details.st_dev, details.st_ino, details.st_size,
         details.st_mtime_ns, details.st_ctime_ns,
     )
-    observed = _verified_identity_sha(str(path), *identity)
+    observed = (
+        _verified_identity_sha(str(path), *identity)
+        if _identity_proof_supported(path, details)
+        else NeuralSubstrate._file_sha256(path)
+    )
     after = path.stat()
     if identity != (
         after.st_dev, after.st_ino, after.st_size,
@@ -154,7 +259,14 @@ def _link_immutable(temporary: Path, destination: Path, checksum: str, size: int
     except FileExistsError:
         _verified_file(destination, checksum, size)
     else:
+        # Remove the owned temporary link FIRST. That link-count mutation
+        # changes inode change-time; a proof from before it would immediately
+        # become stale and cause a full unchanged-blob rehash on the next save.
+        temporary.unlink()
         _fsync_directory(destination.parent)
+        # Prove the published inode with actual bytes before storing a proof;
+        # no unchecked link/publication timestamp becomes content authority.
+        _verified_file(destination, checksum, size)
 
 
 def _write_immutable_bytes(
@@ -374,9 +486,179 @@ def _check_paged_authority(substrate: NeuralSubstrate) -> None:
         raise ValueError("paged substrate has inconsistent packed authority or counts")
     if isinstance(assembly_vectors, PagedAssemblyVectorView) and assembly_vectors.index is not assemblies.index:
         raise ValueError("paged assembly vector view has a different index")
+    if assemblies.index._vectors is not None:
+        status = assemblies.index.status()
+        if status["packedVectorRows"] != status["count"]:
+            raise ValueError("paged assembly membership lacks shared packed neuron rows")
 
 
-def write_paged_substrate_generation(
+def _shared_paged_path(substrate: NeuralSubstrate) -> Optional[Path]:
+    if not (
+        isinstance(substrate.neurons, PagedNeuronMetadata)
+        and isinstance(substrate.neuron_vectors, PagedPackedVectors)
+        and isinstance(substrate.assemblies, PagedAssemblyView)
+        and substrate.assemblies.index._vectors is substrate.neuron_vectors
+    ):
+        return None
+    path = substrate.assemblies.index.path.resolve()
+    if (
+        substrate.neurons.path.resolve() != path
+        or substrate.neuron_vectors.path.resolve() != path
+    ):
+        return None
+    return path
+
+
+def _emit_record_group(
+    substrate: NeuralSubstrate, store: Path, kind: str, bucket: str, part: int,
+    group: list[tuple[str, dict[str, Any]]], reusable: Optional[Mapping[str, Any]],
+    callback: Optional[Callable[[int, str], Any]],
+) -> dict[str, Any]:
+    ordered = sorted(group, key=lambda item: item[0])
+    ids = [identifier for identifier, _record in ordered]
+    if not ids or ids != sorted(set(ids)) or len(ids) > 512:
+        raise ValueError("paged shard IDs or bounded membership are invalid")
+    records = [record for _identifier, record in ordered]
+    payload: dict[str, Any] = {
+        "kind": kind, "ids": ids, "records": records, "vectorIds": ids,
+    }
+    tensors = None
+    if kind == "neurons":
+        vector_metadata, tensors = substrate.neuron_vectors.export_state(keys=ids)
+        if vector_metadata.get("ids") != ids or set(tensors) != {
+            "packed_rows", "update_counters_le"
+        }:
+            raise ValueError("paged vector shard export differs from neuron IDs")
+        PackedTernaryVectors.from_state(vector_metadata, tensors)
+        payload["packedVectorState"] = vector_metadata
+    else:
+        payload["vectorStorage"] = "shared-neuron-packed"
+    return {
+        "kind": kind, "bucket": bucket, "part": part, "count": len(ids),
+        "records": _write_json_blob(substrate, store, payload, callback),
+        "tensors": (
+            _write_tensor_blob(substrate, store, tensors, reusable, callback)
+            if tensors is not None else None
+        ),
+        **({"inspection": neuron_shard_inspection(records)} if kind == "neurons" else {}),
+    }
+
+
+def _incremental_record_descriptors(
+    substrate: NeuralSubstrate, store: Path, prior: Mapping[str, Any],
+    plan: DirtyShardPlan, callback: Optional[Callable[[int, str], Any]],
+) -> list[dict[str, Any]]:
+    descriptors = {
+        (item["kind"], item["bucket"], item["part"]): dict(item)
+        for item in prior["shards"] if item["kind"] in {"neurons", "assemblies"}
+    }
+    changed: set[tuple[str, str, int]] = set()
+    for group in plan.groups():
+        key = (group.kind, group.bucket, group.part)
+        changed.add(key)
+        reusable = descriptors.get(key, {}).get("tensors")
+        if not group.record_ids:
+            descriptors.pop(key, None)
+            continue
+        records: list[tuple[str, dict[str, Any]]] = []
+        charge = 0
+        for identifier in group.record_ids:
+            if group.kind == "neurons":
+                record = _neuron_record(identifier, substrate.neurons[identifier])
+            else:
+                found = substrate.assemblies.index.get_by_id_with_ordinal(identifier)
+                if found is None:
+                    raise ValueError("dirty assembly group is missing a live record")
+                ordinal, raw = found
+                if identifier not in substrate.neurons or identifier not in substrate.neuron_vectors:
+                    raise ValueError("paged assembly lacks its shared neuron row")
+                _identifier, _fingerprint, payload, _digest = _record_payload(raw)
+                record = json.loads(payload)
+                record["__persistence_ordinal"] = ordinal
+            charge += len(_canonical(record)) + len(identifier) + 128
+            if charge > _MAX_BUFFER_BYTES:
+                # Stable membership must not silently drop or repartition IDs.
+                raise SubstrateResourcePause("changed paged group exceeds byte window")
+            records.append((identifier, record))
+        descriptors[key] = _emit_record_group(
+            substrate, store, group.kind, group.bucket, group.part, records,
+            reusable, callback,
+        )
+    for key, descriptor in descriptors.items():
+        if key not in changed:
+            _verified_spec(store, descriptor["records"], ".json")
+            if descriptor.get("tensors") is not None:
+                _verified_spec(store, descriptor["tensors"], ".safetensors")
+    plan.assert_unchanged()
+    return list(descriptors.values())
+
+
+def commit_paged_substrate_generation(
+    substrate: NeuralSubstrate, store_root: Path, brain_json_path: Path,
+    *, disk_reserve: Optional[Callable[[int, str], Any]] = None,
+) -> dict[str, Any]:
+    """Finalize a writer's cache ONLY after the real atomic brain commit.
+
+    Production calls this immediately after replacing brain.json. Recovery
+    never adopts this pending Python object or a convenience root pointer;
+    it rebuilds a fresh cache from the independently verified brain pointer.
+    """
+
+    pending = getattr(substrate, "_pending_paged_checkpoint", None)
+    if pending is None:
+        return {"incremental": False, "reason": "no shared paged checkpoint"}
+    path, pointer, stamp, plan, state_revision, endpoint_plan, synapses, synapse_revision, persistence_revision = pending
+    brain_path = Path(brain_json_path)
+    if brain_path.is_symlink() or not brain_path.is_file():
+        raise ValueError("paged journal needs the real committed brain.json")
+    brain_bytes = brain_path.read_bytes()
+    brain = json.loads(brain_bytes)
+    committed = brain.get("substrate", {}).get("persistence") if isinstance(brain, dict) else None
+    if committed != pointer or substrate.persistence_manifest != pointer:
+        raise ValueError("brain.json has not committed the pending paged generation")
+
+    def verify() -> bool:
+        return (
+            brain_path.read_bytes() == brain_bytes
+            and substrate.state_revision == state_revision
+            and _shared_paged_path(substrate) == path
+            and substrate.synapses is synapses
+            and getattr(synapses, "graph_revision", None) == synapse_revision
+            and getattr(synapses, "persistence_revision", None) == persistence_revision
+        )
+
+    def reserve(size: int, operation: str) -> None:
+        _reserve(substrate, disk_reserve, size, operation)
+
+    if plan is not None:
+        plan.rebase(
+            pointer, verify_brain_commit=verify, disk_reserve=reserve,
+            additional_rebase=(
+                lambda connection: endpoint_plan.rebase_in_connection(connection, pointer)
+            ) if endpoint_plan is not None else None,
+        )
+    else:
+        rebuild_generation_journal(
+            path, store_root, pointer, expected_stamp=stamp,
+            verify_brain_commit=verify, disk_reserve=reserve,
+            additional_rebase=(
+                lambda connection: endpoint_plan.rebase_in_connection(connection, pointer)
+            ) if endpoint_plan is not None else None,
+        )
+    del substrate._pending_paged_checkpoint
+    session = cache_session(substrate.assemblies.index)
+    return {
+        "incremental": plan is not None, "generationSha256": pointer["activeGeneration"],
+        "synapseHotGroupsReindexed": endpoint_plan.reindexed_groups if endpoint_plan is not None else None,
+        "endpointLookupSelective": endpoint_plan.selective if endpoint_plan is not None else False,
+        "fileProofStorage": "process-authenticated-sqlite",
+        "fileProofHits": session.proof_hits, "fileProofMisses": session.proof_misses,
+        "fileProofWritePauses": session.proof_write_pauses,
+        "fileProofSqliteWindowBytes": session.sqlite_window_bytes,
+    }
+
+
+def _write_paged_substrate_generation(
     substrate: NeuralSubstrate,
     root: Path,
     *,
@@ -388,8 +670,10 @@ def write_paged_substrate_generation(
     Record buffers contain at most 512 rows per hash bucket. The manifest's
     descriptor list scales with shard count, never record count. Unchanged
     synapse shards are reused; changed groups are persisted exactly.
-    This still scans every neuron and assembly on each call; shard reuse saves
-    writes, not full-corpus scan time.
+    A ready shared-store journal reads only changed complete stable groups.
+    Unbound/old caches retain the exact full-scan fallback until their first
+    brain.json commit creates a safe journal. Global decay rewrites every
+    neuron group without treating logically changed rows as unchanged.
     Returned pointer is suitable for ``NeuralSubstrate.load_sharded`` and for
     the caller's later atomic ``brain.json`` commit.
     """
@@ -422,10 +706,47 @@ def write_paged_substrate_generation(
     _fsync_directory(store)
     prior_pointer = substrate.persistence_manifest
     prior = _prior_generation(store, prior_pointer) if prior_pointer else None
+    shared_path = _shared_paged_path(substrate)
+    initial_stamp = None
+    dirty_plan = None
+    if shared_path is not None:
+        with closing(sqlite3.connect(shared_path)) as connection:
+            initial_stamp = source_stamp(connection)
+        if prior_pointer is not None:
+            try:
+                candidate = DirtyShardPlan(
+                    shared_path, prior_pointer,
+                    disk_reserve=lambda size, operation: _reserve(
+                        substrate, disk_reserve, size, operation
+                    ),
+                )
+                if candidate.records_per_shard == records_per_shard:
+                    dirty_plan = candidate
+            except DirtyJournalResourcePause as error:
+                raise SubstrateResourcePause(str(error)) from error
+            except ValueError:
+                # Never use absent/stale/building membership to skip rows.
+                # A successful full brain commit will reconstruct the journal.
+                pass
     from .bounded_synapse_persistence import (
         BoundedSynapseShardPlan,
         PagedHotNodeIds,
     )
+
+    endpoint_plan = None
+    if shared_path is not None:
+        session = active_blob_session()
+        assert session is not None
+        endpoint_index = getattr(substrate.assemblies.index, "_synapse_endpoint_index", None)
+        if not isinstance(endpoint_index, SynapseEndpointIndex) or endpoint_index.session is not session:
+            endpoint_index = SynapseEndpointIndex(session)
+            substrate.assemblies.index._synapse_endpoint_index = endpoint_index
+        prior_synapses = [item for item in prior["shards"] if item["kind"] == "synapses"] if prior else []
+        endpoint_plan = SynapseEndpointPlan(
+            endpoint_index, store, prior_pointer, prior_synapses,
+            incremental_membership=dirty_plan is not None,
+            forward_manifest=getattr(substrate.synapses, "_forward_index_manifest", None),
+        )
 
     synapse_plan = BoundedSynapseShardPlan(
         substrate,
@@ -439,6 +760,7 @@ def write_paged_substrate_generation(
         ),
         disk_reserve=disk_reserve,
         verify_reusable=lambda spec, suffix: _verified_spec(store, spec, suffix),
+        endpoint_plan=endpoint_plan,
     )
     previous_tensors = {
         (item["kind"], item["bucket"], item["part"]): item.get("tensors")
@@ -453,8 +775,15 @@ def write_paged_substrate_generation(
     initial_vectors = vector_status() if callable(vector_status) else None
     shards: list[dict[str, Any]] = []
     observed = {"neurons": 0, "assemblies": 0}
+    if dirty_plan is not None:
+        assert prior is not None
+        shards = _incremental_record_descriptors(
+            substrate, store, prior, dirty_plan, disk_reserve,
+        )
+        for item in shards:
+            observed[item["kind"]] += int(item["count"])
 
-    for kind in ("neurons", "assemblies"):
+    for kind in (() if dirty_plan is not None else ("neurons", "assemblies")):
         buffers: dict[str, list[tuple[str, dict[str, Any]]]] = {
             bucket: [] for bucket in _BUCKETS
         }
@@ -561,7 +890,7 @@ def write_paged_substrate_generation(
     current_neurons = neuron_status() if initial_neurons is not None else None
     if initial_neurons is not None and any(
         current_neurons.get(key) != initial_neurons.get(key)
-        for key in ("storeId", "revision", "rowCount")
+        for key in ("storeId", "revision", "rowCount", "decayEpoch")
     ):
         raise ValueError("paged neuron metadata changed while writing shards")
     current_vectors = vector_status() if initial_vectors is not None else None
@@ -570,6 +899,12 @@ def write_paged_substrate_generation(
         for key in ("storeId", "revision", "rowCount")
     ):
         raise ValueError("packed vector rows changed while writing shards")
+    if shared_path is not None:
+        with closing(sqlite3.connect(shared_path)) as connection:
+            if source_stamp(connection) != initial_stamp:
+                raise ValueError("paged source revisions/decay changed while writing shards")
+    if dirty_plan is not None:
+        dirty_plan.assert_unchanged()
 
     body = {
         "format": _SUBSTRATE_STORE_FORMAT,
@@ -607,7 +942,46 @@ def write_paged_substrate_generation(
         "contentSha256": content_checksum,
     }
     synapse_plan.prepare_commit(pointer)
+    if endpoint_plan is not None:
+        endpoint_plan.prepare_commit(pointer, synapse_plan.descriptors, synapse_plan._index_manifest)
+    if dirty_plan is not None:
+        dirty_plan.assert_unchanged()
     _replace_pointer(substrate, store / "manifest.json", _canonical(pointer), disk_reserve)
     synapse_plan.commit(pointer)
     substrate.persistence_manifest = dict(pointer)
+    if shared_path is not None:
+        substrate._pending_paged_checkpoint = (
+            shared_path, dict(pointer), initial_stamp, dirty_plan, initial_state_revision,
+            endpoint_plan, substrate.synapses, getattr(substrate.synapses, "graph_revision", None),
+            getattr(substrate.synapses, "persistence_revision", None),
+        )
     return dict(pointer)
+
+
+def write_paged_substrate_generation(
+    substrate: NeuralSubstrate, root: Path, *, records_per_shard: int = 512,
+    disk_reserve: Optional[Callable[[int, str], Any]] = None,
+) -> dict[str, Any]:
+    """Publish within one bounded, process-authenticated derived-cache scope."""
+
+    if not isinstance(substrate, NeuralSubstrate):
+        raise TypeError("paged writer requires a neural substrate")
+    if not isinstance(substrate.assemblies, PagedAssemblyView):
+        raise ValueError("paged writer requires a paged assembly view")
+    session = cache_session(
+        substrate.assemblies.index,
+        disk_reserve=lambda size, operation: _reserve(substrate, disk_reserve, size, operation),
+    )
+    with session.blob_scope():
+        return _write_paged_substrate_generation(
+            substrate, root, records_per_shard=records_per_shard, disk_reserve=disk_reserve,
+        )
+
+
+def forget_paged_blob_proof(substrate: NeuralSubstrate, path: Path) -> None:
+    """Best-effort GC hook; this never deletes learned state or blob files."""
+
+    if isinstance(substrate.assemblies, PagedAssemblyView):
+        session = getattr(substrate.assemblies.index, "_authenticated_cache_session", None)
+        if session is not None:
+            session.forget_blob(path)

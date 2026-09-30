@@ -59,12 +59,12 @@ describe("renderer resource envelope", () => {
     const plan = reviewedPlan();
     const manual = configWithResourceEnvelope(DEFAULT_CONFIG, plan, "manual", 74);
     expect(manual).toMatchObject({
-      workingMemorySlots: 65_536,
+      workingMemorySlots: DEFAULT_CONFIG.workingMemorySlots,
       contextWindowTokens: 16_384,
       workingMemoryMode: "extended",
       extendedWorkingMemory: true,
       memoryOffloadBytes: 4_096,
-      memoryResidentItems: 52_000,
+      memoryResidentItems: Math.min(DEFAULT_CONFIG.workingMemorySlots, 52_000),
       memoryOffloadSlowdownPercent: 9,
       systemRamMode: "manual",
       systemRamSharePercent: 74,
@@ -119,15 +119,14 @@ describe("renderer resource envelope", () => {
     expect(app).toContain("storageSliderUnavailable");
     expect(app).toContain("Saved context and cortex capacity are derived from physical RAM");
     expect(app).toContain("Temporarily occupied by other apps");
-    expect(app).toContain("Active context stays resident");
+    expect(app.includes("RAM first")).toBe(true);
     expect(app).toContain("Core, active-context, and neural-memory placement");
-    expect(app).toContain("never paged to storage");
     expect(app).toContain("All initial learned weights use 2-bit packed ternary codes");
     expect(app).toContain("contextCapacityBandStyle(memoryPlan)");
     expect(app).not.toContain("maximum 100% of the currently safe pool");
     expect(presentation).toContain(STORAGE_BOUNDARY_COPY);
-    expect(STORAGE_BOUNDARY_COPY).toContain("cold memory, replay batches, and infrequent checkpoints");
-    expect(STORAGE_BOUNDARY_COPY).toContain("never paged to storage");
+    expect(STORAGE_BOUNDARY_COPY).toContain("cold memory, replay batches, and checkpoints");
+    expect(STORAGE_BOUNDARY_COPY).toContain("Cold attention and saved activity");
     expect(css).toContain(".resource-settings-layout");
     expect(css).toContain(".working-memory-placement");
     expect(css).toContain("var(--capacity-green-start)");

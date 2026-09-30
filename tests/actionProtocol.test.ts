@@ -29,29 +29,70 @@ function chatResult(content: string, proposedActions?: ChatResult["proposedActio
 }
 
 describe("structured chat actions", () => {
-  it("grounds only bounded query/objective fields, never commands or common credentials", () => {
+  it("starts an admitted streamed tool during decoding and reuses its identity after commit", async () => {
+    let release!: () => void;
+    const boundary = new Promise<void>((resolve) => { release = resolve; });
+    const action = {
+      kind: "tool" as const, source: "brain" as const,
+      actionId: "abcdef0123456789abcdef0123456789",
+      toolId: "web.search", action: "search", arguments: { query: "typed source" }
+    };
+    const service = {
+      chat: vi.fn(async (_id: string, _text: string, _signal: AbortSignal | undefined, onStream: ((event: NeuralChatStreamEvent) => void) | undefined) => {
+        onStream?.({ type: "chat-action", sequence: 0, actionId: action.actionId, action });
+        await boundary;
+        return chatResult("native text", [action]);
+      }),
+      learnStructuredExperience: vi.fn(async () => ({})),
+      learnToolRouteOutcome: vi.fn(async () => ({ processed: true, applied: false, duplicate: false, ready: false, steps: 0 }))
+    };
+    const tools = {
+      execute: vi.fn(async () => ({ id: "execution", toolId: action.toolId, action: action.action, state: "complete" as const, startedAt: "now", finishedAt: "now", output: { sources: [] } })),
+      cancel: vi.fn(() => 0)
+    };
+    const controller = new ChatActionController(service, tools, { start: vi.fn() });
+    const pending = controller.send("fixture", "native source", undefined, "fixture-turn");
+    await vi.waitFor(() => expect(tools.execute).toHaveBeenCalledOnce());
+    expect(service.learnStructuredExperience).not.toHaveBeenCalled();
+    expect(service.learnToolRouteOutcome).not.toHaveBeenCalled();
+    release();
+    const result = await pending;
+    expect(tools.execute).toHaveBeenCalledOnce();
+    expect(result.actionEvents).toHaveLength(1);
+    expect(result.actionEvents?.[0]?.neuralActionId).toBe(action.actionId);
+    expect(service.learnToolRouteOutcome).toHaveBeenCalledOnce();
+  });
+
+  it("learns complete host payloads without deleting user content or transport credentials into targets", () => {
     expect(confirmedArgumentTrainingFields({
       kind: "tool", source: "brain", toolId: "web.search", action: "search",
       arguments: { query: "liquid neural circuits", internal: "not a target" }
-    })).toEqual({ query: "liquid neural circuits" });
+    })).toEqual({ typedActionArguments: { query: "liquid neural circuits", internal: "not a target" } });
     expect(confirmedArgumentTrainingFields({
       kind: "tool", source: "brain", toolId: "system.shell", action: "run",
       arguments: { command: "cat /tmp/private", cwd: "/tmp" }
-    })).toEqual({});
+    })).toEqual({ typedActionArguments: { command: "cat /tmp/private", cwd: "/tmp" } });
     expect(confirmedArgumentTrainingFields({
       kind: "tool", source: "brain", toolId: "web.search", action: "search",
       arguments: { query: "api_key=sk-secret-credential" }
-    })).toEqual({});
+    })).toEqual({ typedActionArguments: { query: "api_key=sk-secret-credential" } });
     expect(confirmedArgumentTrainingFields({
       kind: "evolve", source: "brain", toolId: "source.self-modify", action: "propose",
       arguments: {
         objective: "Improve retention", candidateKind: "substrate",
         sourceEdits: [{ path: "/tmp/private", content: "do not train" }]
       }
-    })).toEqual({ objective: "Improve retention", candidateKind: "substrate" });
+    })).toEqual({ typedActionArguments: {
+      objective: "Improve retention", candidateKind: "substrate",
+      sourceEdits: [{ path: "/tmp/private", content: "do not train" }]
+    } });
+    expect(confirmedArgumentTrainingFields({
+      kind: "tool", source: "brain", toolId: "mcp.custom", action: "call",
+      arguments: { content: "user-authored content", authorization: "Bearer host-only", api_key: "host-key" }
+    })).toEqual({ typedActionArguments: { content: "user-authored content" } });
   });
 
-  it("sends only a bounded browser operation and non-typing operands from a confirmed action", () => {
+  it("learns complete browser plans and ordinary typed text while excluding explicitly sensitive entry", () => {
     expect(confirmedArgumentTrainingFields({
       kind: "tool", source: "brain", toolId: "browser.automation", action: "task",
       arguments: {
@@ -59,8 +100,7 @@ describe("structured chat actions", () => {
         assemblyIds: ["internal"]
       }
     })).toEqual({
-      browserOperation: "click",
-      browserActionArguments: {
+      typedActionArguments: {
         url: "https://example.com", steps: [{ kind: "click", selector: "#go" }]
       }
     });
@@ -70,13 +110,21 @@ describe("structured chat actions", () => {
         url: "https://example.com",
         steps: [{ kind: "type", selector: "#secret", value: "private text" }]
       }
-    })).toEqual({ browserOperation: "type" });
+    })).toEqual({ typedActionArguments: {
+      url: "https://example.com", steps: [{ kind: "type", selector: "#secret", value: "private text" }]
+    } });
     expect(confirmedArgumentTrainingFields({
       kind: "tool", source: "brain", toolId: "browser.automation", action: "task",
       arguments: {
         url: "https://example.com",
         steps: [{ kind: "click", selector: "#a" }, { kind: "press", key: "Enter" }]
       }
+    })).toEqual({ typedActionArguments: {
+      url: "https://example.com", steps: [{ kind: "click", selector: "#a" }, { kind: "press", key: "Enter" }]
+    } });
+    expect(confirmedArgumentTrainingFields({
+      kind: "tool", source: "brain", toolId: "browser.automation", action: "task",
+      arguments: { url: "https://example.com", steps: [{ kind: "type", selector: "#credential", value: "host-secret", sensitive: true }] }
     })).toEqual({});
   });
 
@@ -380,7 +428,7 @@ describe("structured chat actions", () => {
         utterance: "Search for approval-bound evidence",
         toolId: "web.search",
         action: "search",
-        arguments: { query: "approval-bound evidence" }
+        arguments: { typedActionArguments: { query: "approval-bound evidence" } }
       },
       undefined
     );
@@ -1607,7 +1655,7 @@ describe("structured chat actions", () => {
     expect(stream.at(-1)).toMatchObject({
       type: "chat-state",
       state: "complete",
-      sequence: 2
+      sequence: 3
     });
   });
 

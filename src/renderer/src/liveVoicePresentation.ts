@@ -47,11 +47,26 @@ export function liveVoiceStatusCopy(
         tone: "active"
       };
     case "speaking":
+      if (state.preferences.neuralVoice) return {
+        title: "Playing the brain's waveform",
+        detail: state.capabilities.neuralVoiceQuality === "needs-speech-training"
+          ? "Needs speech training; the waveform may not match the words yet. The microphone remains live."
+          : "Speech quality not verified. The microphone remains live; playback can be interrupted.",
+        tone: "active"
+      };
       return {
         title: "Speaking the brain reply",
         detail: state.preferences.deliveryMode === "live"
           ? `The microphone remains live; speaking now immediately barges in.${pressureDetail}`
           : "Buffered delivery is speaking the complete reply. Use Stop to cancel it.",
+        tone: "active"
+      };
+    case "rendering-audio":
+      return {
+        title: "Producing the brain's waveform",
+        detail: state.capabilities.neuralVoiceQuality === "needs-speech-training"
+          ? "Needs speech training. Output comes from this brain's audio region, not platform TTS."
+          : "Speech quality not verified. Awaiting this brain's audio region and local playback.",
         tone: "active"
       };
     case "stopping":

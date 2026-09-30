@@ -8,6 +8,8 @@ function sameActionRevision(left: ActionEvent, right: ActionEvent): boolean {
     left.progress === right.progress &&
     left.statusLabel === right.statusLabel &&
     left.runtimeJobId === right.runtimeJobId &&
+    left.cancellationRequested === right.cancellationRequested &&
+    left.inlineGenerationOwned === right.inlineGenerationOwned &&
     left.error === right.error &&
     left.evolutionRunId === right.evolutionRunId &&
     left.execution?.id === right.execution?.id &&

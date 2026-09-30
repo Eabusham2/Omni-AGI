@@ -145,7 +145,7 @@ describe("chat turn presentation state", () => {
       "action-result-learning"
     ] as const) {
       expect(composerTurnCapabilities(phase)).toEqual({
-        turnActive: true,
+        turnActive: false,
         queueAvailable: false,
         steerAvailable: false
       });

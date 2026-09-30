@@ -148,17 +148,21 @@ describe("hardware-safe recurrent/paged memory planning", () => {
         0,
         safeRam -
           plan.resources.residentFoundationBytes -
-          plan.context.evidence.selectedContextResidentBytes
-      ) / RAM_BYTES_PER_MEMORY_ITEM
+          plan.context.evidence.selectedContextResidentBytes -
+          plan.context.evidence.reservedTrainingTransferBytes
+      ) / plan.context.evidence.estimatedResidentMemoryItemBytes
     );
     const diskAfterReserve =
       resources.diskFreeBytes -
       MANDATORY_FREE_DISK_BYTES -
       Math.ceil(modelBytes * MODEL_CHECKPOINT_HEADROOM_RATIO) -
-      plan.offload.modelOffloadScratchBytes;
+      plan.offload.modelOffloadScratchBytes -
+      (plan.context.evidence.contextOffloadBudgetBytes ?? 0) -
+      plan.resources.trainingScratchBytes -
+      plan.resources.futureGrowthHeadroomBytes;
     const pagedItems = Math.floor(
       Math.max(0, diskAfterReserve) /
-        DISK_BYTES_PER_MEMORY_ITEM
+        plan.context.evidence.estimatedPagedMemoryItemBytes
     );
 
     expect(plan.sliderMaximumItems).toBe(residentItems + pagedItems);
@@ -168,7 +172,7 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     );
     expect(plan.semantics.denseAttentionClaim).toBe(false);
     expect(plan.semantics.contextFloorTokens).toBe(16_384);
-    expect(plan.semantics.contextPagedToStorage).toBe(false);
+    expect(plan.semantics.contextPagedToStorage).toBe((plan.offload.contextSpillBytes ?? 0) > 0);
     expect(plan.allowed).toBe(true);
   });
 
@@ -542,7 +546,7 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     expect(capable.context.maximumTokens).toBe(32_768);
     expect(capable.context.selectedTokens).toBe(capable.context.autoTokens);
     expect(capable.context.evidence).toMatchObject({
-      source: "live-device-model-measurement",
+      source: "measured-device-theoretical-allocation",
       acceleratorAvailable: true,
       storageClass: "fast-storage",
       modelContextLimitTokens: 32_768
@@ -582,11 +586,13 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     expect(below.blockers.join(" ")).toMatch(/below the .* baseline/i);
     expect(exact.allowed).toBe(true);
     expect(exact.context.selectedTokens).toBe(12_288);
-    expect(exact.context.evidence.selectedContextResidentBytes).toBe(
-      12_288 * exact.context.evidence.estimatedKvActivationBytesPerToken * 2
-    );
+    const evidence = exact.context.evidence;
+    expect(evidence.selectedContextResidentBytes + (evidence.selectedContextSpillBytes ?? 0)).toBe(
+      (evidence.workspaceResidentBytes ?? 0) + 12_288 *
+      (evidence.estimatedKvActivationBytesPerToken + (evidence.residentTokenBytesPerToken ?? 0) +
+        (evidence.contextMetadataBytesPerToken ?? 0)));
     expect(impossible.allowed).toBe(false);
-    expect(impossible.blockers.join(" ")).toMatch(/cannot stay resident/i);
+    expect(impossible.blockers.join(" ")).toMatch(/cannot fit RAM/i);
     expect(legacy.allowed).toBe(true);
     expect(legacy.warnings.join(" ")).toMatch(/checkpoint compatibility/i);
   });
@@ -642,7 +648,7 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     });
 
     expect(plan.allowed).toBe(false);
-    expect(plan.blockers.join(" ")).toMatch(/one complete neural layer/i);
+    expect(plan.blockers.join(" ")).toMatch(/live neural tile/i);
   });
 
   it("blocks layer offload when its safe-tensor scratch crosses the adaptive reserve", () => {
@@ -690,6 +696,10 @@ describe("hardware-safe recurrent/paged memory planning", () => {
       benchmark,
       hardwareTier: "gpu" as const,
       modelBytes: 76 * MIB,
+      // This saved native checkpoint has small actual dimensions; its device
+      // tier must not masquerade as a much wider legacy foundation.
+      modelHiddenSize: 96,
+      modelLayers: 3,
       minimumStoragePoolBytes: 2_884_068_301,
       enforceContextFloor: false
     };
@@ -712,5 +722,34 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     expect(runtime.diskSpace.operationWriteBytes).toBe(0);
     expect(runtime.diskSpace.checkpointBytes).toBeGreaterThan(0);
     expect(runtime.warnings.join(" ")).toMatch(/actual checkpoint.*reserve-gated/i);
+  });
+
+  it("uses physical RAM and designated storage rather than a default 32768 token ceiling", () => {
+    const common = { resources, benchmark, hardwareTier: "personal" as const,
+      modelBytes: 64 * MIB, modelHiddenSize: 256, modelLayers: 8 };
+    const auto = planWorkingMemory({ ...common, request: { mode: "auto" } });
+    expect(auto.allowed).toBe(true);
+    expect(auto.context.autoTokens).toBeGreaterThan(32_768);
+    expect(auto.context.maximumTokens).toBeGreaterThan(auto.context.evidence.residentContextMaximumTokens!);
+    const spilled = planWorkingMemory({ ...common, request: { mode: "manual",
+      requestedContextTokens: "500000", storagePoolMode: "manual", storagePoolBytes: String(16 * GIB) } });
+    expect(spilled.allowed).toBe(true);
+    expect(spilled.offload.contextSpillBytes).toBeGreaterThan(0);
+    expect(spilled.semantics.contextPagedToStorage).toBe(true);
+    expect(spilled.context.evidence.selectedContextResidentBytes).toBeLessThanOrEqual(
+      spilled.context.evidence.contextResidentBudgetBytes);
+    expect(spilled.resources.requiredStoragePoolBytes).toBeLessThanOrEqual(16 * GIB);
+    const largerPool = planWorkingMemory({ ...common, request: { mode: "auto",
+      storagePoolMode: "manual", storagePoolBytes: String(64 * GIB) } });
+    expect(largerPool.context.maximumTokens).toBeGreaterThan(spilled.context.maximumTokens);
+  });
+
+  it("prices float32 KV and resident token/descriptor indexes independently of ternary weights", () => {
+    const result = planWorkingMemory({ request: { mode: "auto" }, resources, benchmark,
+      hardwareTier: "personal", modelBytes: 64 * MIB, modelHiddenSize: 256, modelLayers: 8 });
+    expect(result.context.evidence.estimatedKvActivationBytesPerToken).toBe(8 * 8 * 256);
+    expect(result.context.evidence.residentTokenBytesPerToken).toBe(96);
+    expect(result.context.evidence.contextMetadataBytesPerToken).toBeGreaterThan(0);
+    expect(result.context.evidence.contextWorkspaceMultiplier).toBe(1);
   });
 });

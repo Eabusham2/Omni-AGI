@@ -141,7 +141,10 @@ class LazySubstrateLoadingTests(unittest.TestCase):
                 / (pointer["activeGeneration"] + ".json")
             )
             legacy = json.loads(index_path.read_text("utf-8"))
+            from omni_core.paged_forward_index import iter_entries
+            legacy["shards"] = list(iter_entries(store, legacy))
             legacy["formatVersion"] = 1
+            legacy.pop("hotNodeIdsChecksumAlgorithm", None)
             legacy.pop("synapticUses")
             for entry in legacy["shards"]:
                 entry.pop("synapticUses")
@@ -169,7 +172,7 @@ class LazySubstrateLoadingTests(unittest.TestCase):
                 )
             upgraded = json.loads(index_path.read_text("utf-8"))
             self.assertGreater(opened, 0)
-            self.assertEqual(upgraded["formatVersion"], 2)
+            self.assertEqual(upgraded["formatVersion"], 4)
             self.assertEqual(
                 restored.synaptic_use_count(),
                 sum(int(record["uses"]) for record in memory.synapses.values()),

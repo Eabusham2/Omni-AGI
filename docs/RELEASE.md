@@ -17,7 +17,7 @@ in `main`; release jobs deliberately reject tags cut from another branch.
 Mobile marketing versions exactly match `package.json`. Android `versionCode`
 and iOS `CURRENT_PROJECT_VERSION` share the stable numeric mapping
 `MAJOR * 10000 + MINOR * 100 + PATCH`; release `1.1.0` therefore uses build
-number `10100` on both platforms.
+number `10100` on both platforms; candidate `1.1.1` uses `10101`.
 
 Electron Builder uses target-native x64 suffixes on Linux: `x86_64` for
 AppImage, `amd64` for DEB, and `x64` for tar.gz. The package smoke, upload
@@ -98,7 +98,8 @@ applies to both indexes.
 
 ## Publication gate
 
-Run `npm run verify:release -- --tag v1.1.0` before creating the tag. Pushing
+Run `npm run verify:release` before creating a new tag, then
+`npm run verify:release -- --tag v1.1.1` once that exact tag exists. Pushing
 that tag starts `.github/workflows/release.yml`; it rebuilds every required
 artifact rather than reusing an unverified local package. Publication stops if
 one expected artifact is missing, duplicated, empty, has a hash that disagrees
@@ -114,6 +115,11 @@ The publish job writes:
   names, byte sizes, SHA-256 values, native worker architectures, and observed
   signing/notarization state, including explicit mobile debug-signed and
   unsigned-signed-ready labels.
+
+Version-specific public notes in `docs/releases/<tag>.md` accompany generated
+GitHub notes. They describe source/package evidence separately from deferred
+trained-native behavior. Private transcripts and local audit materials are not
+release source or package assets.
 
 Windows signing uses `WINDOWS_CSC_LINK` and
 `WINDOWS_CSC_KEY_PASSWORD` when configured (forwarded to electron-builder as

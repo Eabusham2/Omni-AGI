@@ -19,6 +19,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Optional
 
+from .paged_store_counts import ensure_row_count, row_count
+
 
 _FIELDS = frozenset({
     "id", "neuron_id", "label", "region", "activation", "importance",
@@ -210,6 +212,7 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
                     } <= columns:
                         raise ValueError("paged neuron decay-anchor schema is incomplete")
                     self._decay_state(connection)
+                ensure_row_count(connection, "paged_neuron_records", self._reserve_disk)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -220,6 +223,8 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA temp_store=FILE")
+        from .paged_idle_selection import observe_idle_source_connection
+        observe_idle_source_connection(connection, self.path)
         return connection
 
     @contextmanager
@@ -302,6 +307,14 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
                 "UPDATE paged_neuron_meta SET value=? WHERE key='graph_revision'",
                 (str(int(prior) + 1),),
             )
+
+    def _notify_membership(self, identifiers: tuple[str, ...], revision: int) -> None:
+        # This is an optional, process-owned execution index, not recovery
+        # authority. Its callback catches failure and marks itself invalid;
+        # committed source mutations never depend on a cache write succeeding.
+        observer = getattr(self, "_recall_graph_observer", None)
+        if callable(observer):
+            observer(identifiers, revision)
 
     @staticmethod
     def _decode(
@@ -393,9 +406,7 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
 
     def __len__(self) -> int:
         with self._transaction() as connection:
-            return int(connection.execute(
-                "SELECT COUNT(*) FROM paged_neuron_records"
-            ).fetchone()[0])
+            return row_count(connection, "paged_neuron_records")
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
@@ -455,6 +466,9 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
                     (key, encoded, digest, anchor_log, anchor_sum, anchor_zero),
                 )
             self._advance(connection, structural=current is None)
+            graph_revision = int(self._meta(connection, "graph_revision"))
+        if current is None:
+            self._notify_membership((key,), graph_revision)
 
     def __delitem__(self, key: str) -> None:
         self._reserve_disk(64 * 1024, "paged neuron delete")
@@ -471,6 +485,8 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
                 "DELETE FROM paged_neuron_records WHERE neuron_id=?", (key,)
             )
             self._advance(connection, structural=True)
+            graph_revision = int(self._meta(connection, "graph_revision"))
+        self._notify_membership((key,), graph_revision)
 
     def edit_by_id(
         self, key: str, mutator: Callable[[dict[str, Any]], None]
@@ -554,6 +570,8 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
                     ),
                 )
             self._advance(connection, structural=True)
+            graph_revision = int(self._meta(connection, "graph_revision"))
+        self._notify_membership(tuple(identifier for identifier, _encoded, _digest in prepared), graph_revision)
         return len(prepared)
 
     def iter_pages(
@@ -565,9 +583,10 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
             store_id = self._meta(connection, "store_id")
             revision = self._revision(connection)
             decay_state = self._decay_state(connection)
-            count, through = connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM paged_neuron_records"
-            ).fetchone()
+            count = row_count(connection, "paged_neuron_records")
+            through = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM paged_neuron_records"
+            ).fetchone()[0]
         after = 0
         seen = 0
         while True:
@@ -656,9 +675,10 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
         with self._transaction() as connection:
             state = self._decay_state(connection)
             revision = self._revision(connection)
-            count, high_water = connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM paged_neuron_records"
-            ).fetchone()
+            count = row_count(connection, "paged_neuron_records")
+            high_water = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM paged_neuron_records"
+            ).fetchone()[0]
             count, high_water = int(count), int(high_water)
             if count == 0:
                 return {
@@ -757,9 +777,10 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
 
     def status(self) -> dict[str, Any]:
         with self._transaction() as connection:
-            count, high_water = connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM paged_neuron_records"
-            ).fetchone()
+            count = row_count(connection, "paged_neuron_records")
+            high_water = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM paged_neuron_records"
+            ).fetchone()[0]
             revision = self._revision(connection)
             committed_generation = self._meta(
                 connection, "committed_generation_sha256"

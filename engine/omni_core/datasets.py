@@ -9,7 +9,9 @@ library.
 from __future__ import annotations
 
 import bz2
+import codecs
 import csv
+import errno
 import gzip
 import hashlib
 import io
@@ -20,6 +22,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 import tarfile
 import tempfile
 import urllib.error
@@ -42,6 +45,23 @@ from typing import (
     Tuple,
 )
 from xml.parsers import expat
+from .text_spool import (
+    BoundedCharacters,
+    DatasetResourcePause,
+    INLINE_TEXT_BYTES,
+    TEXT_BLOCK_CHARS,
+    TextBuilder,
+    TextPayload,
+    TypedDialogueLease,
+    capture_json_value,
+    parse_spooled_json,
+    parser_admission,
+    require_parser_resources,
+    write_json_string_piece,
+)
+from .columnar_admission import (
+    admit_parquet_footer, admit_parquet_row_group, ipc_allocation_frames,
+)
 
 
 TEXT_EXTENSIONS = {
@@ -271,6 +291,9 @@ class DatasetRecord:
     local_path: Optional[str] = None
     content_sha256: str = ""
     provenance: Dict[str, Any] = field(default_factory=dict)
+    # This is a lease, not retained source text. It lasts until the record
+    # iterator advances/closes, and its digest—not its path—binds checkpoints.
+    text_payload: Optional[TextPayload] = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +319,29 @@ class SQLiteSnapshot:
 
     path: Path
     sha256: str
+
+
+class ColumnarTextValue:
+    """A native StringScalar buffer view; never an as_py giant string copy."""
+
+    def __init__(self, scalar):
+        # Apache Arrow StringScalar.as_buffer() returns a view, not a copy.
+        self.buffer = memoryview(scalar.as_buffer())
+
+    def chunks(self):
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        for offset in range(0, len(self.buffer), TEXT_BLOCK_CHARS):
+            end = min(len(self.buffer), offset + TEXT_BLOCK_CHARS)
+            yield decoder.decode(self.buffer[offset:end], final=end == len(self.buffer))
+
+    def usable(self):
+        return any(piece and not piece.isspace() for piece in self.chunks())
+
+    def metadata(self):
+        digest = hashlib.sha256()
+        for offset in range(0, len(self.buffer), TEXT_BLOCK_CHARS):
+            digest.update(self.buffer[offset:offset + TEXT_BLOCK_CHARS])
+        return {"sha256": digest.hexdigest(), "bytes": len(self.buffer)}
 
 
 @dataclass
@@ -443,6 +489,17 @@ class DatasetCoverage:
 
 class DatasetTraversalIncomplete(RuntimeError):
     """A readable source stopped before all of its records were visited."""
+
+
+def _parser_resource_failure(error: Exception) -> bool:
+    return isinstance(error, (MemoryError, RecursionError)) or (
+        isinstance(error, OSError)
+        and error.errno in {
+            errno.ENOMEM,
+            errno.ENOSPC,
+            getattr(errno, "EDQUOT", errno.ENOSPC),
+        }
+    )
 
 
 def _media_kind(path: Path) -> Optional[str]:
@@ -773,6 +830,8 @@ def dataset_record_count_hint(path: Path, requested: str = "") -> Optional[int]:
 
     format_name = dataset_format(path, requested)
     if format_name == "parquet":
+        require_parser_resources("columnar row-count decoder import", ram_bytes=32 * 1024 * 1024)
+        admit_parquet_footer(path)
         _require_pyarrow()
         import pyarrow.parquet as parquet  # type: ignore
 
@@ -790,6 +849,14 @@ def _record(
     kind: str = "text",
     provenance: Optional[Mapping[str, Any]] = None,
 ) -> Optional[DatasetRecord]:
+    if len(text) > INLINE_TEXT_BYTES:
+        builder = TextBuilder(clean=True)
+        try:
+            builder.write(text)
+            return _payload_record(builder.finish(), name, bytes_read, coverage, kind, provenance)
+        except BaseException:
+            builder.close()
+            raise
     clean = text.replace("\x00", "").strip()
     coverage.discovered_records += 1
     coverage.processed_bytes += max(0, int(bytes_read))
@@ -811,6 +878,27 @@ def _record(
     )
 
 
+def _payload_record(payload, name, bytes_read, coverage, kind="text", provenance=None, source_directory=None):
+    descriptor = (provenance or {}).get("speechPair")
+    if descriptor is not None:
+        if (provenance or {}).get("selectedField") != "text":
+            coverage.discovered_records += 1
+            coverage.processed_bytes += max(0, int(bytes_read))
+            coverage.reject(name, "speech pair requires its literal text field, not a fallback or another content column", already_discovered=True)
+            return None
+        return _speech_pair_record(descriptor, payload, name, bytes_read, coverage, source_directory)
+    coverage.discovered_records += 1
+    coverage.processed_bytes += max(0, int(bytes_read))
+    if not payload.bytes:
+        payload.close()
+        coverage.reject(name, "record contained no usable text", already_discovered=True)
+        return None
+    coverage.processed_records += 1
+    coverage.modality_counts[kind] = coverage.modality_counts.get(kind, 0) + 1
+    return DatasetRecord(payload.text, name, max(0, int(bytes_read)), kind,
+                         provenance=dict(provenance or {}), text_payload=payload)
+
+
 def _row_provenance(
     value: Mapping[str, Any], selected_fields: Set[str]
 ) -> Dict[str, Any]:
@@ -823,18 +911,21 @@ def _row_provenance(
             continue
         if entry is None or isinstance(entry, (bool, int, float)):
             metadata[key] = entry
+        elif isinstance(entry, ColumnarTextValue):
+            metadata[key] = entry.metadata()
         elif isinstance(entry, str):
             # Identifiers and URLs are useful provenance. Very large strings
             # are represented by a hash so ingestion remains streaming.
-            encoded = entry.encode("utf-8", errors="replace")
-            metadata[key] = (
-                entry
-                if len(encoded) <= 4_096
-                else {
-                    "sha256": hashlib.sha256(encoded).hexdigest(),
-                    "bytes": len(encoded),
-                }
-            )
+            if len(entry) <= 4_096 and len(entry.encode("utf-8", errors="replace")) <= 4_096:
+                metadata[key] = entry
+            else:
+                digest = hashlib.sha256()
+                count = 0
+                for offset in range(0, len(entry), TEXT_BLOCK_CHARS):
+                    encoded = entry[offset:offset + TEXT_BLOCK_CHARS].encode("utf-8", errors="replace")
+                    digest.update(encoded)
+                    count += len(encoded)
+                metadata[key] = {"sha256": digest.hexdigest(), "bytes": count}
     return metadata
 
 
@@ -912,6 +1003,46 @@ def _training_value(
         return value, {}, None
     if isinstance(value, Mapping):
         if "messages" in value:
+            messages = value.get("messages")
+            # A native nested scalar may already have needed a whole-scalar
+            # library allocation under explicit admission. Do not add a
+            # second giant joined transcript/list of literal target copies,
+            # and never lose supervision just because its text is spooled.
+            size_hint = 0
+            if isinstance(messages, list):
+                for message in messages:
+                    content = message.get("content") if isinstance(message, Mapping) else None
+                    size_hint += (len(content) * 4 if isinstance(content, str) else 0) + 64
+                    if size_hint > INLINE_TEXT_BYTES:
+                        break
+            if size_hint > INLINE_TEXT_BYTES:
+                lease = TypedDialogueLease()
+                transferred = False
+                try:
+                    for message in messages:
+                        content = message.get("content") if isinstance(message, Mapping) else None
+                        role = str(message.get("role", "")) if isinstance(message, Mapping) else "invalid"
+                        payload = None
+                        if isinstance(content, str):
+                            builder = TextBuilder(clean="strip")
+                            try:
+                                builder.write(content)
+                                payload = builder.finish()
+                            except BaseException:
+                                builder.close()
+                                raise
+                        try:
+                            lease.add(role, payload)
+                        finally:
+                            if payload is not None: payload.close()
+                    text, dialogue = lease.finish()
+                    if not text.bytes:
+                        text.close()
+                        return "", dialogue, "dialogue row has no trainable human or brain messages"
+                    transferred = True
+                    return text, {**_row_provenance(value, {"messages"}), **dialogue}, None
+                finally:
+                    if not transferred: lease.close()
             text, dialogue = _conversation_training_text(value.get("messages"))
             if text:
                 return (
@@ -934,7 +1065,11 @@ def _training_value(
             )
         for field_name in _TRAINING_TEXT_FIELDS:
             content = value.get(field_name)
-            if isinstance(content, str) and content.strip():
+            if isinstance(content, ColumnarTextValue) and content.usable():
+                return content, {
+                    **_row_provenance(value, {field_name}), "selectedField": field_name,
+                }, None
+            if isinstance(content, str) and content and not content.isspace():
                 return (
                     content,
                     {
@@ -947,10 +1082,61 @@ def _training_value(
         if normalized_keys and normalized_keys.issubset(_METADATA_ONLY_FIELDS):
             return "", _row_provenance(value, set()), "metadata-only row has no trainable content"
     try:
-        text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        builder = TextBuilder(clean=True)
+        try:
+            for piece in _bounded_json_encoding(value, compact=True):
+                builder.write(piece)
+            return builder.finish(), {"selectedField": "structured-row"}, None
+        except BaseException:
+            builder.close()
+            raise
     except (TypeError, ValueError) as error:
         return "", {}, "structured row is not serializable: %s" % error
-    return text, {"selectedField": "structured-row"}, None
+
+
+def _speech_pair_record(descriptor, transcript, name, bytes_read, coverage, source_directory=None):
+    """Admit one explicit, hash-bound local transcript/audio pair, never infer a transcript."""
+    try:
+        if not isinstance(descriptor, Mapping) or descriptor.get("format") != "omni-speech-pair-1":
+            raise ValueError("unsupported speech pairing format")
+        audio_reference, declared = descriptor.get("audioPath"), descriptor.get("audioSha256")
+        if not isinstance(audio_reference, str) or not audio_reference or "\x00" in audio_reference or \
+                not isinstance(declared, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", declared):
+            raise ValueError("speech pair needs a relative audioPath and full audioSha256")
+        if source_directory is None or Path(audio_reference).is_absolute():
+            raise ValueError("speech pair audioPath must be relative to its local source directory")
+        source_root = Path(source_directory).resolve()
+        audio_path = (source_root / audio_reference).resolve()
+        if not audio_path.is_relative_to(source_root) or not audio_path.is_file() or _media_kind(audio_path) != "audio":
+            raise ValueError("speech pair references no supported audio file inside its source directory")
+        if _sha256_path(audio_path) != declared.lower():
+            raise ValueError("speech pair audio checksum mismatch")
+        if isinstance(transcript, TextPayload):
+            # The present neural text-to-idea library needs one utterance. This
+            # allocation is measured, not silently shortened at a text cap.
+            require_parser_resources("speech utterance text conditioning", ram_bytes=transcript.bytes * 64 + TEXT_BLOCK_CHARS * 8)
+            text = "".join(piece for piece, _ in transcript.windows())
+        elif isinstance(transcript, ColumnarTextValue):
+            require_parser_resources("speech utterance text conditioning", ram_bytes=len(transcript.buffer) * 64 + TEXT_BLOCK_CHARS * 8)
+            text = "".join(transcript.chunks())
+        else:
+            text = transcript
+        if not isinstance(text, str) or not text.strip() or "\x00" in text:
+            raise ValueError("speech pair text must be the literal nonempty recorded utterance")
+        require_parser_resources("speech utterance text conditioning", ram_bytes=len(text) * 64 + TEXT_BLOCK_CHARS * 8)
+        text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        pair_sha = hashlib.sha256(bytes.fromhex(declared) + bytes.fromhex(text_sha)).hexdigest()
+        return _binary_record(name=name, local_path=audio_path, bytes_read=bytes_read,
+            content_sha256=pair_sha, kind="audio", coverage=coverage, provenance={
+                "format": "omni-speech-pair-1", "speech_text": text,
+                "speech_text_sha256": text_sha, "audio_sha256": declared.lower(),
+                "audio_bytes": audio_path.stat().st_size, "selectedField": "text",
+            })
+    except (ValueError, OSError) as error:
+        coverage.discovered_records += 1
+        coverage.processed_bytes += max(0, int(bytes_read))
+        coverage.reject(name, str(error), already_discovered=True)
+        return None
 
 
 def _structured_record(
@@ -958,13 +1144,37 @@ def _structured_record(
     name: str,
     bytes_read: int,
     coverage: DatasetCoverage,
+    source_directory: Optional[Path] = None,
 ) -> Optional[DatasetRecord]:
+    if isinstance(value, Mapping):
+        format_value = value.get("format")
+        if isinstance(format_value, ColumnarTextValue) and len(format_value.buffer) <= 64:
+            format_value = "".join(format_value.chunks())
+        if format_value == "omni-speech-pair-1":
+            descriptor = {"format": format_value}
+            for field_name in ("audioPath", "audioSha256"):
+                scalar = value.get(field_name)
+                if isinstance(scalar, ColumnarTextValue) and len(scalar.buffer) <= 4096:
+                    scalar = "".join(scalar.chunks())
+                descriptor[field_name] = scalar
+            return _speech_pair_record(descriptor, value.get("text"), name, bytes_read, coverage, source_directory)
     text, provenance, rejection = _training_value(value)
     if rejection is not None:
         coverage.discovered_records += 1
         coverage.processed_bytes += max(0, int(bytes_read))
         coverage.reject(name, rejection, already_discovered=True)
         return None
+    if isinstance(text, TextPayload):
+        return _payload_record(text, name, bytes_read, coverage, provenance=provenance)
+    if isinstance(text, ColumnarTextValue):
+        builder = TextBuilder(clean=True)
+        try:
+            for piece in text.chunks():
+                builder.write(piece)
+            return _payload_record(builder.finish(), name, bytes_read, coverage, provenance=provenance)
+        except BaseException:
+            builder.close()
+            raise
     return _record(
         text,
         name,
@@ -1015,100 +1225,331 @@ def _iter_text_path(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRe
         yield from _iter_text_stream(stream, path.name, coverage)
 
 
+def _configure_csv_field_limit() -> None:
+    # csv's small default field ceiling is not a dataset policy. Use the
+    # largest positive integer accepted by this runtime instead. Some Python
+    # builds expose a narrower C integer than sys.maxsize; find its actual
+    # boundary without replacing the default with another arbitrary cap.
+    try:
+        csv.field_size_limit(sys.maxsize)
+        return
+    except OverflowError:
+        lower, upper = 0, sys.maxsize
+    while lower + 1 < upper:
+        candidate = (lower + upper) // 2
+        try:
+            csv.field_size_limit(candidate)
+        except OverflowError:
+            upper = candidate
+        else:
+            lower = candidate
+    csv.field_size_limit(lower)
+
+
 def _iter_delimited(
     path: Path, delimiter: str, coverage: DatasetCoverage
 ) -> Iterator[DatasetRecord]:
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
-        reader = csv.reader(stream, delimiter=delimiter)
-        for index, row in enumerate(reader):
-            text = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-            record = _record(
-                text,
-                "%s#row-%d" % (path.name, index + 1),
-                len(text.encode("utf-8")),
-                coverage,
-            )
-            if record is not None:
-                yield record
+        chars = BoundedCharacters(stream)
+        with path.open("rb") as prefix:
+            bom_bytes = 3 if prefix.read(3) == b"\xef\xbb\xbf" else 0
+        index = 0
+        while True:
+            row_start_bytes = chars.byte_position
+            builder = TextBuilder()
+            builder.write("[")
+            in_quotes = False
+            at_field_start = True
+            field_open = False
+            row_started = False
+            pending = []
+            eof = False
+            def start_field():
+                nonlocal field_open, row_started
+                if not field_open:
+                    builder.write('"')
+                    field_open = True
+                    row_started = True
+            def flush_field():
+                if pending:
+                    write_json_string_piece(builder, "".join(pending))
+                    pending.clear()
+            try:
+                while True:
+                    char = chars.get()
+                    if not char:
+                        eof = True
+                        break
+                    if in_quotes:
+                        if char == '"':
+                            following = chars.get()
+                            if following == '"':
+                                pending.append('"')
+                            else:
+                                in_quotes = False
+                                chars.unread(following)
+                        else:
+                            pending.append(char)
+                    elif char == delimiter:
+                        start_field()
+                        flush_field()
+                        builder.write('",')
+                        field_open = False
+                        at_field_start = True
+                        # A trailing delimiter means a final empty field.
+                        row_started = True
+                    elif char in {"\r", "\n"}:
+                        if char == "\r":
+                            following = chars.get()
+                            if following != "\n":
+                                chars.unread(following)
+                        break
+                    else:
+                        start_field()
+                        if at_field_start and char == '"':
+                            in_quotes = True
+                        else:
+                            pending.append(char)
+                        at_field_start = False
+                    if len(pending) >= TEXT_BLOCK_CHARS:
+                        flush_field()
+                if eof and not row_started:
+                    builder.close()
+                    return
+                if row_started:
+                    start_field()
+                    flush_field()
+                    builder.write('"')
+                builder.write("]")
+                payload = builder.finish()
+                index += 1
+                record = _payload_record(payload, "%s#row-%d" % (path.name, index),
+                                         chars.byte_position - row_start_bytes + (bom_bytes if index == 1 else 0), coverage)
+                if record is not None:
+                    yield record
+                if eof:
+                    return
+            except BaseException:
+                builder.close()
+                raise
 
 
 def _iter_jsonl(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]:
-    with path.open("r", encoding="utf-8-sig", errors="replace") as stream:
-        for index, line in enumerate(stream):
+    with path.open("rb") as stream:
+        index = 0
+        while True:
+            line = stream.readline(INLINE_TEXT_BYTES + 1)
+            if not line:
+                break
+            index += 1
+            if len(line) > INLINE_TEXT_BYTES and not line.endswith(b"\n"):
+                descriptor, raw_path = tempfile.mkstemp(prefix="omni-json-row-", suffix=".json")
+                raw_bytes = 0
+                payload = None
+                try:
+                    with os.fdopen(descriptor, "wb") as raw:
+                        while True:
+                            require_parser_resources("JSONL record spool", disk_bytes=len(line))
+                            raw.write(line)
+                            raw_bytes += len(line)
+                            if line.endswith(b"\n"):
+                                break
+                            line = stream.readline(TEXT_BLOCK_CHARS)
+                            if not line:
+                                break
+                    with open(raw_path, "r", encoding="utf-8-sig" if index == 1 else "utf-8", errors="replace", newline="") as raw:
+                        payload, provenance, rejection = parse_spooled_json(
+                            raw, _TRAINING_TEXT_FIELDS, _METADATA_ONLY_FIELDS
+                        )
+                    if rejection:
+                        coverage.processed_bytes += raw_bytes
+                        coverage.reject("%s#line-%d" % (path.name, index), rejection)
+                    elif payload is not None:
+                        record = _payload_record(payload, "%s#line-%d" % (path.name, index),
+                                                 raw_bytes, coverage, provenance=provenance, source_directory=path.parent)
+                        if record is not None:
+                            yield record
+                except ValueError as error:
+                    coverage.processed_bytes += raw_bytes
+                    coverage.reject("%s#line-%d" % (path.name, index), "invalid JSONL: %s" % error)
+                finally:
+                    if payload is not None:
+                        payload.close()
+                    os.unlink(raw_path)
+                continue
+            physical_bytes = len(line)
+            line = line.decode("utf-8-sig" if index == 1 else "utf-8", errors="replace")
             stripped = line.strip()
             if not stripped:
+                coverage.processed_bytes += physical_bytes
                 continue
             try:
                 value = json.loads(stripped)
             except json.JSONDecodeError as error:
+                coverage.processed_bytes += physical_bytes
                 coverage.reject(
-                    "%s#line-%d" % (path.name, index + 1),
+                    "%s#line-%d" % (path.name, index),
                     "invalid JSONL: %s" % error,
                 )
                 continue
             record = _structured_record(
                 value,
-                "%s#line-%d" % (path.name, index + 1),
-                len(line.encode("utf-8", errors="replace")),
+                "%s#line-%d" % (path.name, index),
+                physical_bytes,
                 coverage,
+                source_directory=path.parent,
             )
             if record is not None:
                 yield record
+
+
+def _known_root_json_record(path: Path) -> bool:
+    """Recognize explicit root records without materializing/skipping values.
+
+    Other root maps retain their historical key/value-record semantics. This
+    bounded lexical pass inspects only keys and the tiny format declaration;
+    it is not a record-count pre-scan or a whole-value Python conversion.
+    """
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as source:
+        chars = BoundedCharacters(source)
+        if chars.nonspace() != "{":
+            return False
+        following = chars.nonspace()
+        while following and following != "}":
+            if following != '"':
+                return False
+            key = capture_json_value(chars, following)
+            try:
+                name = json.loads(key.text) if not key.path else None
+            finally:
+                key.close()
+            if chars.nonspace() != ":":
+                return False
+            first = chars.nonspace()
+            if name == "messages" and first == "[":
+                return True
+            if name == "format":
+                declaration = capture_json_value(chars, first)
+                try:
+                    if not declaration.path and json.loads(declaration.text) == "omni-speech-pair-1":
+                        return True
+                finally:
+                    declaration.close()
+            else:
+                capture_json_value(chars, first, store=False)
+            following = chars.nonspace()
+            if following != ",":
+                return False
+            following = chars.nonspace()
+    return False
 
 
 def _iter_json(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]:
-    # The packaged runtime includes ijson so large arrays/maps are visited
-    # incrementally. Keep a standard-library fallback for minimal developer
-    # environments.
     try:
-        import ijson  # type: ignore
-    except ImportError:
-        ijson = None
-
-    values: Iterable[Any]
-    stream: Any = None
-    if ijson is not None:
-        stream = path.open("rb")
-        prefix = stream.read(4_096).lstrip(b"\xef\xbb\xbf \t\r\n")[:1]
-        stream.seek(0)
-        if prefix == b"[":
-            values = ijson.items(stream, "item")
-        elif prefix == b"{":
-            values = (
-                {"key": key, "value": entry}
-                for key, entry in ijson.kvitems(stream, "")
-            )
-        else:
-            values = ijson.items(stream, "")
-    else:
-        with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
-            value = json.load(handle)
-        if isinstance(value, list):
-            values = value
-        elif isinstance(value, dict):
-            values = (
-                [{"key": key, "value": entry} for key, entry in value.items()]
-                if value
-                else [value]
-            )
-        else:
-            values = [value]
-    try:
-        for index, entry in enumerate(values):
-            encoded_size = len(
-                json.dumps(entry, ensure_ascii=False, default=str).encode("utf-8")
-            )
-            record = _structured_record(
-                entry,
-                "%s#record-%d" % (path.name, index + 1),
-                encoded_size,
-                coverage,
-            )
-            if record is not None:
-                yield record
-    finally:
-        if stream is not None:
-            stream.close()
+        root_record = _known_root_json_record(path)
+    except ValueError:
+        # The ordinary parser owns malformed-input reporting. A recognition
+        # probe must not turn a malformed tail into a different record order.
+        root_record = False
+    if root_record:
+        payload = None
+        try:
+            with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+                payload, provenance, rejection = parse_spooled_json(stream, _TRAINING_TEXT_FIELDS, _METADATA_ONLY_FIELDS)
+            physical_bytes = path.stat().st_size
+            if rejection:
+                coverage.processed_bytes += physical_bytes
+                coverage.reject(path.name + "#record-1", rejection)
+            else:
+                record = _payload_record(payload, path.name + "#record-1", physical_bytes, coverage,
+                    provenance=provenance, source_directory=path.parent)
+                if record is not None:
+                    yield record
+        finally:
+            if payload is not None: payload.close()
+        return
+    # Item-level decoders still materialize one giant scalar/list. Frame each
+    # logical array item/map entry to a lease instead, preserving their order.
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+        chars = BoundedCharacters(stream)
+        root = chars.nonspace()
+        if not root:
+            raise ValueError("empty JSON source")
+        array, mapping = root == "[", root == "{"
+        first = chars.nonspace() if array or mapping else root
+        index = 0
+        accounted_bytes = 0
+        while True:
+            if (array and first == "]") or (mapping and first == "}"):
+                break
+            raw_value = raw_key = wrapped = selected = None
+            try:
+                if mapping:
+                    if first != '"':
+                        raise ValueError("JSON map key is not a string")
+                    raw_key = capture_json_value(chars, first)
+                    if chars.nonspace() != ":":
+                        raise ValueError("JSON map entry is missing its colon")
+                    first = chars.nonspace()
+                raw_value = capture_json_value(chars, first)
+                if not raw_value.path and (raw_key is None or not raw_key.path):
+                    entry = json.loads(raw_value.text)
+                    if raw_key is not None:
+                        entry = {"key": json.loads(raw_key.text), "value": entry}
+                    payload_source = None
+                else:
+                    if raw_key is not None:
+                        builder = TextBuilder()
+                        try:
+                            builder.write('{"key":')
+                            for piece, _ in raw_key.windows(): builder.write(piece)
+                            builder.write(',"value":')
+                            for piece, _ in raw_value.windows(): builder.write(piece)
+                            builder.write("}")
+                            wrapped = builder.finish()
+                        except BaseException:
+                            builder.close()
+                            raise
+                    payload_source = wrapped or raw_value
+                following = chars.nonspace()
+                if array or mapping:
+                    end = "]" if array else "}"
+                    if following not in {",", end}:
+                        raise ValueError("JSON source is missing a comma or container end")
+                elif following:
+                    raise ValueError("JSON source contains trailing content")
+                row_bytes = chars.byte_position - accounted_bytes
+                accounted_bytes = chars.byte_position
+                index += 1
+                name = "%s#record-%d" % (path.name, index)
+                if payload_source is None:
+                    record = _structured_record(entry, name, row_bytes, coverage, source_directory=path.parent)
+                else:
+                    if payload_source.path:
+                        with open(payload_source.path, "r", encoding="utf-8", newline="") as row:
+                            selected, provenance, rejection = parse_spooled_json(row, _TRAINING_TEXT_FIELDS, _METADATA_ONLY_FIELDS)
+                    else:
+                        selected, provenance, rejection = parse_spooled_json(io.StringIO(payload_source.text), _TRAINING_TEXT_FIELDS, _METADATA_ONLY_FIELDS)
+                    if rejection:
+                        coverage.processed_bytes += row_bytes
+                        coverage.reject(name, rejection)
+                        record = None
+                    else:
+                        record = _payload_record(selected, name, row_bytes, coverage, provenance=provenance, source_directory=path.parent)
+                if record is not None:
+                    yield record
+                if not (array or mapping) or following != ",":
+                    break
+                first = chars.nonspace()
+                if first in {"}", "]", ""}:
+                    raise ValueError("JSON source has a trailing comma")
+            finally:
+                for lease in (raw_value, raw_key, wrapped, selected):
+                    if lease is not None:
+                        lease.close()
+        if chars.nonspace():
+            raise ValueError("JSON source contains trailing content")
+        coverage.processed_bytes += max(0, path.stat().st_size - accounted_bytes)
 
 
 def _sqlite_identifier(value: str) -> str:
@@ -1244,6 +1685,7 @@ def _iter_sqlite(
                             "%s#%s-%d" % (path.name, table, row_number),
                             encoded_size,
                             coverage,
+                            source_directory=path.parent,
                         )
                         if record is not None:
                             record.provenance = {
@@ -1273,13 +1715,93 @@ def _metadata_only_columnar_schema(column_names: Iterable[Any]) -> bool:
     return bool(normalized) and normalized.issubset(_METADATA_ONLY_FIELDS)
 
 
+def _iter_columnar_rows(batch: Any) -> Iterator[Dict[str, Any]]:
+    # Keep Arrow's native batch, but never duplicate every row as Python
+    # dictionaries/strings at once. A single scalar (including a nested value)
+    # still needs to fit memory; this is not a bound on native batch decoding.
+    names = batch.schema.names
+    columns = [batch.column(index) for index in range(batch.num_columns)]
+    for row_index in range(batch.num_rows):
+        yield {
+            name: column[row_index].as_py()
+            for name, column in zip(names, columns)
+        }
+
+
+def _serialized_row_bytes(value: Any) -> int:
+    # Match the old json.dumps(...).encode('utf-8') byte accounting without
+    # joining a row-wide serialization or allocating a complete escaped scalar
+    # and its whole UTF-8 copy. Every string is escaped in bounded pieces.
+    return sum(
+        len(piece[offset : offset + 32_768].encode("utf-8"))
+        for piece in _bounded_json_encoding(value)
+        for offset in range(0, len(piece), 32_768)
+    )
+
+
+def _bounded_json_encoding(value, compact=False):
+    comma, colon = (",", ":") if compact else (", ", ": ")
+    if isinstance(value, (str, ColumnarTextValue)):
+        yield '"'
+        pieces = value.chunks() if isinstance(value, ColumnarTextValue) else (
+            value[offset:offset + TEXT_BLOCK_CHARS] for offset in range(0, len(value), TEXT_BLOCK_CHARS)
+        )
+        for piece in pieces:
+            yield json.dumps(piece, ensure_ascii=False)[1:-1]
+        yield '"'
+    elif isinstance(value, Mapping):
+        yield "{"
+        for index, (key, entry) in enumerate(value.items()):
+            if index:
+                yield comma
+            yield from _bounded_json_encoding(str(key), compact)
+            yield colon
+            yield from _bounded_json_encoding(entry, compact)
+        yield "}"
+    elif isinstance(value, (list, tuple)):
+        yield "["
+        for index, entry in enumerate(value):
+            if index:
+                yield comma
+            yield from _bounded_json_encoding(entry, compact)
+        yield "]"
+    else:
+        yield json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _bounded_columnar_rows(batch, arrow):
+    names = batch.schema.names
+    columns = [batch.column(index) for index in range(batch.num_columns)]
+    for row_index in range(batch.num_rows):
+        values = {}
+        for name, column in zip(names, columns):
+            scalar = column[row_index]
+            scalar_type = getattr(scalar, "type", None)
+            if scalar_type is not None and (
+                arrow.types.is_string(scalar_type) or arrow.types.is_large_string(scalar_type)
+                or (hasattr(arrow.types, "is_string_view") and arrow.types.is_string_view(scalar_type))
+            ) and scalar.is_valid:
+                viewed = ColumnarTextValue(scalar)
+                values[name] = viewed if len(viewed.buffer) > INLINE_TEXT_BYTES else scalar.as_py()
+            else:
+                # Nested native values still use whole-scalar as_py. Admission
+                # is explicit and conservative; no universal byte bound is
+                # claimed for this remaining library representation boundary.
+                estimated = int(getattr(column.slice(row_index, 1), "nbytes", 0))
+                require_parser_resources("columnar whole-scalar Python conversion", ram_bytes=estimated * 8)
+                values[name] = scalar.as_py()
+        yield values
+
+
 def _iter_columnar(
     path: Path, format_name: str, coverage: DatasetCoverage
 ) -> Iterator[DatasetRecord]:
-    _require_pyarrow()
+    require_parser_resources("columnar decoder import", ram_bytes=32 * 1024 * 1024)
+    arrow = _require_pyarrow()
     if format_name == "parquet":
         import pyarrow.parquet as parquet  # type: ignore
 
+        admit_parquet_footer(path)
         parquet_file = parquet.ParquetFile(path)
         if _metadata_only_columnar_schema(parquet_file.schema_arrow.names):
             row_count = int(parquet_file.metadata.num_rows)
@@ -1292,56 +1814,79 @@ def _iter_columnar(
             )
             return
         expected_rows = int(parquet_file.metadata.num_rows)
-        try:
-            batches = parquet_file.iter_batches(batch_size=256)
-        except Exception as error:
-            raise DatasetTraversalIncomplete(
-                "Parquet traversal could not start despite a readable row-count footer"
-            ) from error
+        def admitted_batches():
+            for group_index in range(parquet_file.metadata.num_row_groups):
+                admit_parquet_row_group(parquet_file.metadata, group_index)
+                yield from parquet_file.iter_batches(
+                    batch_size=256, row_groups=[group_index], use_threads=False
+                )
+        batches = admitted_batches()
     else:
         import pyarrow.ipc as ipc  # type: ignore
 
-        source = path.open("rb")
+        source = arrow.memory_map(str(path), "r")
+        frame_source = arrow.memory_map(str(path), "r")
         try:
+            file_size = path.stat().st_size
+            dictionary_allocation = 0
+            for frame_kind, estimate in ipc_allocation_frames(frame_source, ipc, file_size):
+                if frame_kind == 2:
+                    dictionary_allocation += estimate
+            require_parser_resources("Arrow IPC dictionary decode", ram_bytes=dictionary_allocation)
+            source.seek(0)
             try:
                 reader = ipc.open_file(source)
-                batches = (reader.get_batch(index) for index in range(reader.num_record_batches))
-            except Exception:
+                file_reader = True
+            except Exception as error:
+                if _parser_resource_failure(error):
+                    raise
                 source.seek(0)
-                batches = ipc.open_stream(source)
-            for batch_index, batch in enumerate(batches):
-                for row_index, value in enumerate(batch.to_pylist()):
-                    encoded_size = len(
-                        json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
-                    )
+                reader = ipc.open_stream(source)
+                file_reader = False
+            batch_index = 0
+            for frame_kind, estimate in ipc_allocation_frames(frame_source, ipc, file_size):
+                if frame_kind != 3:
+                    continue
+                require_parser_resources("Arrow IPC native batch decode", ram_bytes=estimate + dictionary_allocation)
+                batch = reader.get_batch(batch_index) if file_reader else reader.read_next_batch()
+                for row_index, value in enumerate(_bounded_columnar_rows(batch, arrow)):
+                    encoded_size = _serialized_row_bytes(value)
                     record = _structured_record(
                         value,
                         "%s#batch-%d-row-%d"
                         % (path.name, batch_index + 1, row_index + 1),
                         encoded_size,
                         coverage,
+                        source_directory=path.parent,
                     )
                     if record is not None:
                         yield record
+                batch_index += 1
+            if file_reader and batch_index != reader.num_record_batches:
+                raise DatasetTraversalIncomplete("Arrow IPC allocation frames do not exhaust its record batches")
             return
         finally:
             source.close()
+            frame_source.close()
     discovered_before = coverage.discovered_records
     try:
-        for batch_index, batch in enumerate(batches):
-            for row_index, value in enumerate(batch.to_pylist()):
-                encoded_size = len(
-                    json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
-                )
+        logical_row = 0
+        for batch in batches:
+            for value in _bounded_columnar_rows(batch, arrow):
+                encoded_size = _serialized_row_bytes(value)
                 record = _structured_record(
                     value,
-                    "%s#batch-%d-row-%d" % (path.name, batch_index + 1, row_index + 1),
+                    "%s#batch-%d-row-%d" % (path.name, logical_row // 256 + 1, logical_row % 256 + 1),
                     encoded_size,
                     coverage,
+                    source_directory=path.parent,
                 )
                 if record is not None:
                     yield record
+                logical_row += 1
     except Exception as error:
+        if isinstance(error, DatasetResourcePause) or _parser_resource_failure(error):
+            raise
         raise DatasetTraversalIncomplete(
             "Parquet traversal failed before its footer-declared rows were visited"
         ) from error
@@ -1575,6 +2120,8 @@ def _iter_office_archive(
                     )
                 coverage.completed_files += 1
             except Exception as error:
+                if _parser_resource_failure(error):
+                    raise
                 if coverage.discovered_records > discovered_before:
                     coverage.traversal_incomplete = True
                 coverage.reject_file(
@@ -1609,6 +2156,8 @@ def _iter_standalone_compressed(
             )
         coverage.completed_files += 1
     except Exception as error:
+        if _parser_resource_failure(error):
+            raise
         if coverage.discovered_records > discovered_before:
             coverage.traversal_incomplete = True
         coverage.reject_file(
@@ -1740,6 +2289,8 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                             continue
                     coverage.completed_files += 1
                 except Exception as error:
+                    if _parser_resource_failure(error):
+                        raise
                     if coverage.discovered_records > discovered_before:
                         coverage.traversal_incomplete = True
                     coverage.reject_file(
@@ -1797,6 +2348,8 @@ def _iter_archive(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetReco
                     continue
                 coverage.completed_files += 1
             except Exception as error:
+                if _parser_resource_failure(error):
+                    raise
                 if coverage.discovered_records > discovered_before:
                     coverage.traversal_incomplete = True
                 coverage.reject_file(
@@ -1948,6 +2501,7 @@ def _with_shard_provenance(
 def _iter_huggingface_manifest(
     path: Path, coverage: DatasetCoverage, seen: Set[Path]
 ) -> Iterator[DatasetRecord]:
+    require_parser_resources("Hugging Face manifest JSON metadata decode", ram_bytes=path.stat().st_size * 8)
     with path.open("r", encoding="utf-8") as stream:
         value = json.load(stream)
     shards: List[_ManifestShard] = []
@@ -2005,6 +2559,8 @@ def _iter_huggingface_manifest(
                         },
                     )
             except Exception as error:
+                if _parser_resource_failure(error):
+                    raise
                 coverage.reject_file(raw, str(error))
             continue
 
@@ -2067,6 +2623,27 @@ def _iter_pdf(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord]:
 
 
 def iter_dataset_records(
+    path: Path,
+    requested_kind: str = "",
+    coverage: Optional[DatasetCoverage] = None,
+    _seen: Optional[Set[Path]] = None,
+    _committed_sqlite_snapshot_sha256: str = "",
+    _resource_admission=None,
+) -> Iterator[DatasetRecord]:
+    """Visit complete logical records with leases and shared resource admission."""
+    with parser_admission(_resource_admission):
+        for record in _iter_dataset_records_impl(
+            path, requested_kind, coverage, _seen, _committed_sqlite_snapshot_sha256
+        ):
+            leased_payload = record.text_payload
+            try:
+                yield record
+            finally:
+                if leased_payload is not None:
+                    leased_payload.close()
+
+
+def _iter_dataset_records_impl(
     path: Path,
     requested_kind: str = "",
     coverage: Optional[DatasetCoverage] = None,
@@ -2161,6 +2738,13 @@ def iter_dataset_records(
                 )
                 file_rejected = True
     except Exception as error:
+        if isinstance(error, DatasetResourcePause) or _parser_resource_failure(error):
+            state.traversal_incomplete = True
+            if isinstance(error, DatasetResourcePause):
+                raise
+            raise DatasetResourcePause(
+                "dataset decoding reached a physical resource boundary; resume its uncommitted suffix"
+            ) from error
         # A desktop-provided SQLite snapshot is already content-addressed by
         # the authoritative ingestion manifest. Treat a bad declaration as a
         # transaction-integrity failure, not as an ordinary invalid dataset
@@ -2170,13 +2754,18 @@ def iter_dataset_records(
             raise
         if (
             isinstance(error, DatasetTraversalIncomplete)
+            or _parser_resource_failure(error)
             or state.discovered_records > discovered_before
         ):
             state.traversal_incomplete = True
         if not file_rejected:
             state.reject_file(
                 str(target),
-                str(error),
+                (
+                    "dataset parsing ran out of memory; traversal must be resumed"
+                    if isinstance(error, MemoryError)
+                    else str(error)
+                ),
                 already_discovered=True,
             )
             file_rejected = True

@@ -310,9 +310,8 @@ class PersistedSubstrateView:
         ):
             raise ValueError("persisted substrate pointer is invalid")
         store = engine_directory / "substrate"
-        root_pointer = json.loads((store / "manifest.json").read_text("utf-8"))
-        if _canonical_json(root_pointer) != _canonical_json(pointer):
-            raise ValueError("persisted substrate pointer diverges from engine state")
+        # brain.json alone chooses the committed generation. The convenience
+        # pointer can be ahead after an interrupted save and is not authority.
         generation_path = _safe_path(store, generation_relative)
         generation_bytes = _read_bytes(
             generation_path,
@@ -1283,6 +1282,8 @@ def _inspect_assembly(
         "kind": str(record.get("kind", "knowledge")),
         "source": str(record.get("source", "")),
         "confidence": _number(record.get("confidence"), 0.5),
+        "activation": 0.0,
+        "activationObserved": False,
         "importance": _number(record.get("importance")),
         "rehearsals": _count(max(0, int(record.get("rehearsals", 0))), "rehearsals"),
         "createdAt": _timestamp(record.get("created_at")),
@@ -1293,13 +1294,14 @@ def _inspect_assembly(
             else None
         ),
         "sourceLabel": str(record.get("source_label", "")) or None,
-        "retainsSourceText": "source_text" in record,
+        "retainsSourceText": "source_text" in record or record.get("__inspection_retains_source_text") is True,
     }
 
 
 def _synapse_records(
     view: PersistedSubstrateView,
     shards: Optional[Iterable[Mapping[str, Any]]] = None,
+    *, apply_attention: bool = True,
 ) -> Iterator[Dict[str, Any]]:
     fields = (
         "effective_weight",
@@ -1328,9 +1330,9 @@ def _synapse_records(
                 "targetId": str(raw.get("target_id", "")),
                 "kind": str(raw.get("kind", "associates")),
                 "effectiveWeight": effective,
-                "eligibility": view.effective_eligibility(
-                    str(raw.get("id", "")),
-                    float(tensors["eligibility"][index].item()),
+                "eligibility": (
+                    view.effective_eligibility(str(raw.get("id", "")), float(tensors["eligibility"][index].item()))
+                    if apply_attention else float(tensors["eligibility"][index].item())
                 ),
                 "plasticity": float(tensors["plasticity"][index].item()),
                 "stability": float(tensors["stability"][index].item()),
@@ -1480,64 +1482,34 @@ def query_persisted_substrate(
         page, matched, page_bytes, transport_limited = _bounded_page(ordered, offset, page_size)
         response["clusters"] = page
     else:
-        if entity in {"neurons", "assemblies"}:
-            kind = entity
-
-            def records() -> Iterator[Dict[str, Any]]:
-                for shard in view.kind_shards(kind):
-                    payload = view.records(shard)
-                    for raw_record in payload["records"]:
-                        if not isinstance(raw_record, Mapping):
-                            raise ValueError("persisted substrate detail record is invalid")
-                        record = (
-                            _inspect_neuron(view, raw_record)
-                            if kind == "neurons"
-                            else _inspect_assembly(view, raw_record)
-                        )
-                        searchable = "%s %s %s %s" % (
-                            record["id"],
-                            record["label"],
-                            record.get("region", ""),
-                            record.get("sourceLabel", "") or "",
-                        )
-                        if region and str(record.get("region", "")).casefold() != region.casefold():
-                            continue
-                        if search_value and search_value not in searchable.casefold():
-                            continue
-                        yield record
-
-            page, matched, page_bytes, transport_limited = _bounded_page(records(), offset, page_size)
-        else:
-            region_by_id: Dict[str, str] = {}
-            if region:
-                for shard in view.kind_shards("neurons"):
-                    for raw_record in view.records(shard)["records"]:
-                        region_by_id[str(raw_record.get("id", ""))] = str(raw_record.get("region", "semantic"))
-
-            def records() -> Iterator[Dict[str, Any]]:
-                selected_shards = (
-                    _connected_synapse_shards(view, connected_to)
-                    if connected_to
-                    else None
-                )
-                for record in _synapse_records(view, selected_shards):
-                    if connected_to and connected_to not in {record["sourceId"], record["targetId"]}:
-                        continue
-                    if region and region.casefold() not in {
-                        region_by_id.get(record["sourceId"], "unknown").casefold(),
-                        region_by_id.get(record["targetId"], "unknown").casefold(),
-                    }:
-                        continue
-                    searchable = "%s %s %s %s" % (
-                        record["id"], record["sourceId"], record["targetId"], record["kind"]
-                    )
-                    if search_value and search_value not in searchable.casefold():
-                        continue
-                    yield record
-
-            page, matched, page_bytes, transport_limited = _bounded_page(records(), offset, page_size)
+        from .paged_inspection_queries import PagedInspectionIndex
+        query_index = PagedInspectionIndex(view)
+        raw_page, matched = query_index.page(
+            entity, region=region, search=search, connected_to=connected_to,
+            offset=offset, page_size=page_size,
+        )
+        inspected = []
+        for raw_record in raw_page:
+            if entity == "neurons":
+                record = _inspect_neuron(view, raw_record)
+            elif entity == "assemblies":
+                record = _inspect_assembly(view, raw_record)
+                neuron = query_index.neuron(record["id"])
+                if neuron is not None and "activation" in neuron:
+                    record["activation"] = view.effective_activation(neuron)
+                    record["activationObserved"] = True
+            else:
+                record = dict(raw_record)
+                record["eligibility"] = view.effective_eligibility(record["id"], record.get("eligibility"))
+            inspected.append(record)
+        page, _page_matched, page_bytes, transport_limited = _bounded_page(inspected, 0, page_size)
         response[entity] = page
-
+        end = offset + len(page)
+        response.update(matched=matched, returned=len(page), pageBytes=page_bytes,
+                        transportLimited=transport_limited, hasMore=end < matched)
+        if response["hasMore"]:
+            response["nextCursor"] = _cursor(end, view.revision, fingerprint)
+        return response
     end = offset + len(page)
     response["matched"] = matched
     response["returned"] = len(page)

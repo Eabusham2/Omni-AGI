@@ -252,6 +252,7 @@ export class LiveVoiceController {
           ...this.state.capabilities,
           neuralListening: listening,
           neuralVoice: voice,
+          neuralVoiceQuality: measured.voiceQuality,
           bargeIn:
             this.options.synthesis.available ||
             (voice && neural.synthesis?.available === true),
@@ -304,7 +305,7 @@ export class LiveVoiceController {
         error: {
           code: "neural-voice-unavailable",
           message:
-            "Neural voice was requested, but no compatible trained audio-output pack is installed. Platform speech synthesis was not substituted.",
+            "Own waveform output or local playback is unavailable. Platform speech synthesis was not substituted.",
           recoverable: true
         }
       });
@@ -561,7 +562,7 @@ export class LiveVoiceController {
         utterance.turnId
       );
       if (!this.acceptsReply(lifecycle, replyGeneration, utterance.id)) return;
-      const text = result.brainMessage.content.trim();
+      const text = result.brainMessage.content;
       const reply: LiveVoiceReply = {
         utteranceId: utterance.id,
         turnId: utterance.turnId,
@@ -575,7 +576,7 @@ export class LiveVoiceController {
       } catch {
         // Presentation callbacks cannot corrupt the audio state machine.
       }
-      if (!text || !this.outputSynthesis.available) {
+      if (!text.trim() || !this.outputSynthesis.available) {
         this.resetLiveSpeech();
         this.patch({
           phase: "listening",
@@ -663,7 +664,9 @@ export class LiveVoiceController {
       }
       this.synthesisSession = session;
       // Some adapters do not publish a distinct start event.
-      this.patch({ phase: "speaking", synthesis: "speaking" });
+      this.patch(this.outputSynthesis.deferredStart
+        ? { phase: "rendering-audio", synthesis: "preparing" }
+        : { phase: "speaking", synthesis: "speaking" });
     } catch (error) {
       if (!this.acceptsReply(lifecycle, replyGeneration, utterance.id)) return;
       this.patch({
@@ -827,7 +830,9 @@ export class LiveVoiceController {
         return;
       }
       this.synthesisSession = session;
-      this.patch({ phase: "speaking", synthesis: "speaking" });
+      this.patch(this.outputSynthesis.deferredStart
+        ? { phase: "rendering-audio", synthesis: "preparing" }
+        : { phase: "speaking", synthesis: "speaking" });
     } catch (error) {
       if (!this.acceptsReply(lifecycle, replyGeneration, utterance.id)) return;
       this.liveSpeechQueue = [];

@@ -1371,7 +1371,7 @@ describe("EngineSupervisor interruption", () => {
     await supervisor.stop();
   });
 
-  it("preempts post-turn consolidation cooperatively without replacing the warm worker", async () => {
+  it.each(["consolidate_chat_learning", "hardware_projection_profile"] as const)("preempts optional %s cooperatively without replacing the warm worker", async (method) => {
     const worker = new FakeWorker();
     const sendSignal = vi.fn();
     const supervisor = new EngineSupervisor({
@@ -1382,8 +1382,10 @@ describe("EngineSupervisor interruption", () => {
       supervisor as unknown as { child: ChildProcessWithoutNullStreams }
     ).child = worker as unknown as ChildProcessWithoutNullStreams;
     const replay = supervisor.request(
-      "consolidate_chat_learning",
-      { brainId: "warm-brain", jobId: "slow-turn" },
+      method,
+      method === "hardware_projection_profile"
+        ? { device: "cpu", hardwareTier: "personal", ramBudgetBytes: 8 * 1024 ** 3 }
+        : { brainId: "warm-brain", jobId: "slow-turn" },
       ENGINE_REQUEST_NO_DEADLINE,
       undefined,
       "background"
@@ -1408,7 +1410,7 @@ describe("EngineSupervisor interruption", () => {
       id: replayRequest.id,
       error: {
         code: -32800,
-        message: "background chat learning was cancelled",
+        message: "optional background work was cancelled",
         data: { cancelled: true, safeBoundary: true }
       }
     }));

@@ -247,7 +247,7 @@ describe("project integrity", () => {
     expect(voice).toContain("skippedCharacters");
     expect(voice).toContain("LIVE_VOICE_PACE_RATES");
     expect(renderer).toContain("Neural listening");
-    expect(renderer).toContain("Neural voice");
+    expect(renderer).toContain("Own neural voice");
     expect(renderer).toContain("platform STT + TTS");
     expect(types).toContain('kind: "steer"');
     expect(types).toContain("replacesTurnId");
@@ -445,7 +445,7 @@ describe("project integrity", () => {
     const linux = read(".github/workflows/linux.yml");
     const release = read(".github/workflows/release.yml");
 
-    expect(packageDocument.version).toBe("1.1.0");
+    expect(packageDocument.version).toMatch(/^1\.1\.\d+$/);
     expect(packageLock.version).toBe(packageDocument.version);
     expect(packageLock.packages[""]?.version).toBe(packageDocument.version);
     expect(packageDocument.description).toContain("cross-platform");

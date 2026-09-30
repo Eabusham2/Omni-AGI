@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   BrainDocument,
+  ChatGenerationEnd,
   ChatMessage,
   ChatResult,
   ThoughtTrace
@@ -14,12 +15,15 @@ import type {
 export function recordNeuralChat(
   brain: BrainDocument,
   input: string,
-  generatedResponse: string
+  generatedResponse: string,
+  generationEnd?: ChatGenerationEnd
 ): ChatResult {
   const cleanInput = input.replace(/\0/g, "").trim();
   const response = generatedResponse.replace(/\0/g, "").trim();
   if (!cleanInput) throw new Error("A chat message cannot be empty.");
-  if (!response) throw new Error("The neural worker returned an empty response.");
+  if (generationEnd === "no-reply" ? generatedResponse !== "" : !response) {
+    throw new Error("The neural worker returned an invalid response completion.");
+  }
 
   const now = new Date().toISOString();
   const traceId = randomUUID();
@@ -29,7 +33,8 @@ export function recordNeuralChat(
     content: cleanInput,
     createdAt: now,
     runtime: "adaptive-core",
-    status: "complete"
+    status: "complete",
+    ...(generationEnd ? { generationEnd } : {})
   };
   const brainMessage: ChatMessage = {
     id: randomUUID(),
@@ -38,7 +43,8 @@ export function recordNeuralChat(
     createdAt: new Date().toISOString(),
     traceId,
     runtime: "adaptive-core",
-    status: "complete"
+    status: "complete",
+    ...(generationEnd ? { generationEnd } : {})
   };
   brain.messages.push(humanMessage, brainMessage);
 
@@ -58,5 +64,5 @@ export function recordNeuralChat(
       "The authoritative neural worker supplies measured trace data; Electron stores only this presentation record."
   };
   brain.traces.push(trace);
-  return { brain, humanMessage, brainMessage, trace };
+  return { brain, humanMessage, brainMessage, trace, ...(generationEnd ? { generationEnd } : {}) };
 }

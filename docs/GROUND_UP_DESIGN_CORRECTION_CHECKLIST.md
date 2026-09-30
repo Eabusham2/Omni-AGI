@@ -1,10 +1,19 @@
 # Ground-up OmniCortex: corrected design and remaining work
 
-This is the working checklist for the **current source-cleanup goal**, not a
-claim that OmniCortex is already intelligent or that a trained brain has passed
-live acceptance. It is drawn from the complete user-authored project thread,
-read in chronological order through the 26 September 2026 correction. Later
-corrections below take precedence over the older v1 plans wherever they differ.
+Reconciled through 2026-09-30 against
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md). The scoped
+native-only source/GUI/CI/package goal concluded with published **v1.1.0**;
+this document must not reopen that goal or claim a trained brain passed live
+acceptance. It preserves the earlier 26 September checklist as a dated
+checkpoint and separates its design requirements from the later release
+closure and the new uncommitted source corrections. Later user corrections
+take precedence over the older v1 plans wherever they differ.
+
+The audit records 27 release assets and successful all-target run
+`36495422025`, package-source tag `e96f580`, release-workflow commit `bd3ac8e`,
+and only `main` locally/remotely at the audit. Full native corpus/quality
+testing remains user-deferred. New source edits and their focused checks are
+not a commit/push, new packaged release, or proof of useful native recall.
 
 ## What the user actually wants
 
@@ -54,7 +63,7 @@ corrections below take precedence over the older v1 plans wherever they differ.
    image, audio, video, folders, and chat experience—with coverage and truthful
    progress; it must not stop at a small arbitrary idea/chunk count. A small
    tool curriculum is not a broadly capable language model. The user-provided
-   `/Users/eyadabushama/Downloads/ai train/` is reserved for the later full
+   supplied Downloads training folder is reserved for the later full
    training run, not silently consumed now (73–77, 99, 170–173, 539, 547–551).
 7. **Resources and interface must match the real brain.** RAM allocation,
    packed residency, storage spill, training cursor, working-memory size,
@@ -64,11 +73,22 @@ corrections below take precedence over the older v1 plans wherever they differ.
    Windows, macOS, and Linux; mobile may be local or companion (94–95,
    125–170, 179–209, 426–438, 469–507).
 
-## Current goal and order — latest corrections win
+## Closed source/release goal and current correction boundary
 
-The user's latest scope is **source/design cleanup for future ground-up
-Builds** (entries 545–551, 572–587). It replaces the earlier live-test and
-release instructions *for this goal*; it does not erase the product vision.
+The earlier **source/design cleanup for future ground-up Builds** scope
+(entries 545–551, 572–587) deferred brain creation/training and hands-on model
+proof. Later explicit release instructions completed the scoped v1.1.0
+code/GUI/CI/package and repository closure. Neither that closure nor the new
+requirements audit erases the product vision or authorizes another model run.
+
+Current work follows the transcript audit's correction contract. Preserve
+historical accepted checks as closed, retain deferred native quality gates,
+and distinguish each new source fix from publication. The latest clarifications
+are device-theoretical context capacity with physical validation, initial
+training → chat without a blocking quiz, automatic reviewed video-runtime
+setup, and an exact unsanitized saved-instance export.
+
+### Historical cleanup order (retained checkpoint, not a fresh action list)
 
 1. Read the full authored chat log, then keep this request list and status
    current. After a context compaction, reread the raw user messages before
@@ -87,7 +107,14 @@ release instructions *for this goal*; it does not erase the product vision.
    launch a hands-on Falcon memory test, or repeat completed feature tests in
    this goal. The user will initiate the later ground-up training/live goal.
 
-## Current-goal checklist — brain correction still in progress
+## Historical 26 September checklist snapshot
+
+The recorded boxes below describe that earlier checkpoint, not today's
+release disposition. Their unchecked broad design items must not be converted
+into new release/CI/deletion chores. Published v1.1.0 and user-closed engineering
+checks are recorded above; current substantive gaps and uncommitted corrections
+are tracked separately in the transcript audit. In particular, an old unchecked
+source step is not proof that native-only packaging is still unpublished.
 
 - [x] **1. Recover the request.** Read all 595 user-authored text entries in
   the raw project log, including repeats and the final corrections. This pass
@@ -121,20 +148,21 @@ release instructions *for this goal*; it does not erase the product vision.
   gap report. Defer full-folder training and live capability proof until the
   user sends the next goal.
 
-## Evidence and exclusions
+## Current source evidence, retained limitations and exclusions
 
 - The five named app-managed Falcon instances were separately approved for
   permanent deletion (550, 553) and were removed after exact-target checks.
   Their chats/snapshots/neural state are not recoverable through the app.
-- `/Users/eyadabushama/Downloads/ai train/` and `.runtime/bitnet-src` are the
+- The supplied Downloads training folder and `.runtime/bitnet-src` are the
   user's data and research references. They are excluded from cleanup.
 - Current source uses packed-authoritative linear/convolutional/embedding,
   normalization-gain, residual-gain, expert-route, spiking, and sparse-link
   weights. Obsolete floating-master projection classes were removed, and the
   native audit now rejects a new floating trainable parameter. This is
-  **source evidence only** until CI; it does not prove natural recall or a
-  conversational ground-up Build. Existing floating-control checkpoints are
-  intentionally rejected by the strict changed state schema.
+  source enforcement, not proof of natural recall or a conversational
+  ground-up Build. The scoped v1.1.0 code/package CI has completed; newer
+  corrections are not yet packaged or released. Existing floating-control
+  checkpoints are intentionally rejected by the strict changed state schema.
 - The current worker previews an ordinary chat experience before generation,
   but commits fast synapse/working-state changes only after the turn completes;
   dense cortical learning is queued later. This protects cancelled turns, but
@@ -157,9 +185,14 @@ release instructions *for this goal*; it does not erase the product vision.
 - Multi-rank packed training currently fails closed rather than claiming
   synchronized mutations. This is an honest limitation for the later
   distributed training goal, not a completed distributed capability.
-- The old FP32-anchor anti-forgetting path becomes a no-op when no trainable
-  float parameters remain. Packed-weight stability/retention needs an actual
-  replacement before metaplasticity can be claimed for cortical synapses.
+- Current packed projections implement checkpointed **uint8 output-row
+  resistance** through `_PackedRowMetaplasticity`, applied during direct
+  ternary updates. This is a bounded row-level retention mechanism, not a
+  dense FP32 master, Fisher matrix or differentiable weight-anchor penalty.
+  The remaining legacy floating-anchor helpers have no native packed weight
+  parameters to stabilize. Their presence must not be described as the current
+  cortical mechanism. Useful long-run retention/non-forgetting remains
+  deferred native proof; source resistance counters alone do not establish it.
 - **Large-source idea growth is not yet accepted.** The source-size threshold
   that silently sent large datasets into a few shared statistical fields has
   been removed for new transactions: detailed assemblies are selected and
@@ -173,17 +206,28 @@ release instructions *for this goal*; it does not erase the product vision.
   ingestion path now selects detailed learning with a joint `brain.json`
   checkpoint and checks source and shard identity on resume. This is not yet
   a completed large-dataset acceptance result:
-  neuron metadata still resides in RAM, and the writer scans all neuron and
-  assembly records at each checkpoint even though its buffers are bounded.
-  Source-only storage checks do not establish full-corpus throughput or
-  learned recall.
+  neuron metadata and packed vectors have paged v3 source paths, but some
+  idle/inspection/filter operations still materialize total-dependent state,
+  and the writer scans all neuron/assembly records per checkpoint despite
+  bounded buffers. Source-only storage checks do not establish low-I/O
+  full-corpus throughput or learned recall.
 - No claim of consciousness, biological equivalence, guaranteed AGI, perfect
   memory, or fluency from random weights is justified here.
 
-## Product requirements retained for the later training/live goal
+## Current corrections and later native-quality proof
 
-These are not erased by the narrow current goal, but are **not being retested
-or claimed done now**:
+New uncommitted corrections for the disk floor, parser allocation behavior,
+proved-episode raw-token cooling, exact export/recovery state, learned-memory
+parameter accounting and automatic codec provisioning are tracked in the
+transcript audit. Their focused source evidence does not mean all large-record
+decoding is bounded, legacy unlinked context has dynamic cooling, every saved
+recovery point contains all references, or a real codec catalog is available.
+Active-token/core paging, initial cortex scale, multi-rank packed updates,
+dirty checkpoint/recall scaling, full cortical inspection, neural speech and
+mid-generation decision-making remain substantive implementation limits.
+
+The broader requirements below are retained, but existing engineering checks
+are **not being reopened** and useful native quality is **not claimed now**:
 
 - One continuous chat/identity per brain; duplicate, fork, merge preview,
   immutable origin, recovery, `.omni` import/export, and clearly authorized
@@ -207,8 +251,10 @@ or claimed done now**:
   layouts, accessible controls, Queue/Steer/Stop, honest activity state, and
   mobile local/companion support. No confusing origin/memory-mode/personality
   choices in the ordinary Build flow.
-- The future acceptance run must prove natural learned recall after clearing
-  temporary context, competence and tool use from a truly ground-up trained
-  OmniCortex, multimodal training/generation, resource behavior, and release
-  artifacts separately. Current-goal CI is a source check, not this live
-  acceptance. The legacy Falcon run does not satisfy these gates.
+- A later user-initiated native run must establish natural learned recall after
+  clearing temporary context, competence/tool use, meaningful multimodal
+  quality and real resource behavior. The already completed v1.1.0 release is
+  separate evidence; new source fixes are not its published contents. Neither
+  code/worker-health CI nor the legacy Falcon/answer-key runs satisfy native
+  quality gates. Do not repeat historical MCP/media/recovery/device/crawl/UI
+  checks merely because these future model-quality requirements remain.

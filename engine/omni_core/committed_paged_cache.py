@@ -21,8 +21,8 @@ import re
 import sqlite3
 import tempfile
 import uuid
-from contextlib import closing
-from dataclasses import dataclass
+from contextlib import ExitStack, closing
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import quote
@@ -36,12 +36,17 @@ from .paged_assembly_vector_view import PagedAssemblyVectorView
 from .paged_assembly_view import PagedAssemblyView
 from .paged_neuron_metadata import PagedNeuronMetadata
 from .paged_packed_vectors import MAX_EXPORT_ROWS, PagedPackedVectors
+from .paged_dirty_journal import install_generation_journal
+from .authenticated_paged_cache import AuthenticatedCacheSession, cache_session
+from .paged_synapse_endpoints import SynapseEndpointIndex
 from .vsa import (
     LazyPersistedSynapses,
     NeuralSubstrate,
     _load_forward_index,
     _synapse_id_matches_endpoints,
     _unpack_persisted_synapse_weights,
+    _forward_index_entry,
+    _write_forward_index,
 )
 
 
@@ -116,6 +121,13 @@ class _IndexedAssemblyIDs:
     def __iter__(self):
         return self.iter_sorted_ids()
 
+    def ids_sha256(self) -> str:
+        return self.index.ids_sha256()
+
+    @property
+    def ids_checksum_algorithm(self) -> str:
+        return self.index.ids_checksum_algorithm
+
 
 @dataclass(frozen=True)
 class RebuiltPagedCache:
@@ -126,6 +138,100 @@ class RebuiltPagedCache:
     neurons: int
     assemblies: int
     synapses: int
+    _authenticated_session: Optional[AuthenticatedCacheSession] = field(default=None, repr=False, compare=False)
+
+    def adopt_authenticated_session(self, index: PagedAssemblyIndex) -> None:
+        """Transfer only this live verified session, never a persisted key."""
+
+        session = self._authenticated_session
+        if session is None or index.path.resolve() != self.path.resolve():
+            raise ValueError("cache receipt has no transferable live proof session")
+        with index._transaction() as connection:
+            if index._store_id(connection) != session.store_id:
+                raise ValueError("cache session belongs to another store")
+        session.owner = index
+        index._authenticated_cache_session = session
+
+
+def _stage_checked_forward_entry(
+    connection: sqlite3.Connection, descriptor: Mapping[str, Any],
+    records: list[dict[str, Any]], tensors: Mapping[str, torch.Tensor],
+    effective: torch.Tensor,
+) -> None:
+    if tensors["uses"].dtype != torch.int64:
+        raise ValueError("synapse uses are not exact integer counters")
+    endpoints = sorted({str(record[field]) for record in records for field in ("source_id", "target_id")})
+    hot: set[str] = set()
+    for offset in range(0, len(endpoints), 512):
+        window = endpoints[offset:offset + 512]
+        if window:
+            hot.update(row[0] for row in connection.execute(
+                "SELECT assembly_id FROM rebuild_assembly_rows WHERE assembly_id IN (%s)"
+                % ",".join("?" for _ in window), window,
+            ))
+    group = [
+        (record["id"], {**record, "effective_weight": int(effective[position].item()),
+                         "uses": int(tensors["uses"][position].item())})
+        for position, record in enumerate(records)
+    ]
+    entry = _forward_index_entry(descriptor, group, hot)
+    connection.execute(
+        "INSERT INTO rebuild_forward_entries(bucket,part,entry_json) VALUES(?,?,?)",
+        (descriptor["bucket"], descriptor["part"], NeuralSubstrate._canonical_json(entry)),
+    )
+
+
+def _verified_forward_from_staging(
+    verification_path: Path, store: Path, pointer: Mapping[str, Any],
+    expected: Mapping[str, int], generation: Mapping[str, Any], index: PagedAssemblyIndex,
+    descriptors: list[dict[str, Any]],
+    disk_reserve: Optional[Callable[[int, str], Any]],
+    memory_reserve: Optional[Callable[[int, str], Any]],
+) -> dict[str, Any]:
+    """Compare every compact entry to actual checked packed shard contents."""
+
+    membership = _IndexedAssemblyIDs(index)
+    observed = None
+    try:
+        path = store / "forward-index" / "generations" / (pointer["activeGeneration"] + ".json")
+        if path.is_file() and path.stat().st_size <= 8 * 1024 * 1024:
+            _reserve(memory_reserve, 4 * path.stat().st_size + 4096, "forward cache checked read")
+        observed = _load_forward_index(
+            store, generation=pointer["activeGeneration"],
+            generation_manifest_sha256=pointer["generationManifestSha256"],
+            synapse_count=expected["synapses"], records_per_shard=generation["recordsPerShard"],
+            hot_node_ids=membership, descriptors=descriptors,
+        )
+    except (ValueError, OSError):
+        observed = None
+    if observed is not None:
+        with sqlite3.connect(verification_path) as connection:
+            from .paged_forward_index import iter_entries
+            for entry in iter_entries(store, observed):
+                row = connection.execute(
+                    "SELECT entry_json FROM rebuild_forward_entries WHERE bucket=? AND part=?",
+                    (entry["bucket"], entry["part"]),
+                ).fetchone()
+                if row is None or row[0] != NeuralSubstrate._canonical_json(entry):
+                    observed = None
+                    break
+    if observed is not None and observed.get("formatVersion") == 4:
+        return observed
+    def guard(size: int) -> bool:
+        _reserve(disk_reserve, size, "verified forward cache publication")
+        return True
+    with sqlite3.connect(verification_path) as connection:
+        size = connection.execute("SELECT COALESCE(MAX(LENGTH(entry_json)),0) FROM rebuild_forward_entries").fetchone()[0]
+        _reserve(memory_reserve, 4 * int(size) + 4096, "verified bounded forward group reconstruction")
+        entries = (json.loads(row[0]) for row in connection.execute(
+            "SELECT entry_json FROM rebuild_forward_entries ORDER BY bucket,part"
+        ))
+        return _write_forward_index(
+            store, generation=pointer["activeGeneration"],
+            generation_manifest_sha256=pointer["generationManifestSha256"],
+            synapse_count=expected["synapses"], records_per_shard=generation["recordsPerShard"],
+            hot_node_ids=membership, entries=entries, growth_guard=guard, verified_rebuild=True,
+        )
 
 
 def _write_cache_receipt(
@@ -184,12 +290,15 @@ def _read_blob(
         raise CommittedCacheResourcePause("substrate shard exceeds bounded read window")
     _reserve(memory_reserve, 3 * size + 4096, "committed substrate shard read")
     path = NeuralSubstrate._safe_store_path(store, spec["path"])
-    if path.stat().st_size != size:
+    before = path.stat()
+    if before.st_size != size:
         raise ValueError("substrate shard blob size mismatch")
     with path.open("rb") as handle:
         payload = handle.read(size + 1)
     if len(payload) != size or hashlib.sha256(payload).hexdigest() != checksum:
         raise ValueError("substrate shard blob checksum mismatch")
+    from .paged_substrate_writer import remember_verified_blob
+    remember_verified_blob(path, checksum, before=before)
     return payload
 
 
@@ -408,7 +517,7 @@ def rebuild_committed_paged_cache(
     working_disk_reserve = (
         resource_policy.require_disk if resource_policy is not None else disk_reserve
     )
-    with tempfile.TemporaryDirectory(prefix=".paged-cache-rebuild-", dir=cache_directory) as temporary:
+    with tempfile.TemporaryDirectory(prefix=".paged-cache-rebuild-", dir=cache_directory) as temporary, ExitStack() as derived_scope:
         staged_directory = Path(temporary)
         staged_path = staged_directory / "working.sqlite3"
         index = PagedAssemblyIndex(
@@ -417,6 +526,16 @@ def rebuild_committed_paged_cache(
         )
         vectors = index._vectors
         assert isinstance(vectors, PagedPackedVectors)
+        neurons = PagedNeuronMetadata(staged_path, **options)
+        session = cache_session(index, disk_reserve=working_disk_reserve)
+        derived_scope.enter_context(session.blob_scope())
+        endpoint_index = SynapseEndpointIndex(session)
+        index._synapse_endpoint_index = endpoint_index
+        endpoint_index.begin_rebuild()
+        if neuron_shards:
+            from .paged_substrate_writer import _verified_file
+            for spec in (neuron_shards[0]["records"], neuron_shards[0]["tensors"]):
+                _verified_file(store / spec["path"], spec["sha256"], spec["bytes"])
         observed = {kind: 0 for kind in expected}
         for number, descriptor in enumerate(neuron_shards):
             if number == 0:
@@ -436,16 +555,22 @@ def rebuild_committed_paged_cache(
             }:
                 raise ValueError("neuron shard lacks exact packed vector state")
             observed["neurons"] += vectors.import_state(payload["packedVectorState"], tensors)
+            neurons.import_page(_records, max_rows=max_shard_rows,
+                                max_payload_bytes=max_blob_bytes)
             # Drop each shard page before fetching the next one.
             first = None
         verification_path = staged_directory / "verification.sqlite3"
         with sqlite3.connect(verification_path) as connection:
             connection.execute(
                 "CREATE TABLE rebuild_assembly_rows ("
-                "ordinal INTEGER PRIMARY KEY, record_json BLOB NOT NULL)"
+                "ordinal INTEGER PRIMARY KEY,record_json BLOB NOT NULL,assembly_id TEXT NOT NULL UNIQUE)"
             )
             connection.execute(
                 "CREATE TABLE rebuild_synapse_ids (id TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            connection.execute(
+                "CREATE TABLE rebuild_forward_entries (bucket TEXT NOT NULL,part INTEGER NOT NULL,"
+                "entry_json BLOB NOT NULL,PRIMARY KEY(bucket,part)) WITHOUT ROWID"
             )
             for descriptor in assembly_shards:
                 _reserve(
@@ -465,8 +590,8 @@ def rebuild_committed_paged_cache(
                     )
                     clean = {key: value for key, value in record.items() if key != "__persistence_ordinal"}
                     connection.execute(
-                        "INSERT INTO rebuild_assembly_rows(ordinal,record_json) VALUES (?,?)",
-                        (ordinal, NeuralSubstrate._canonical_json(clean)),
+                        "INSERT INTO rebuild_assembly_rows(ordinal,record_json,assembly_id) VALUES (?,?,?)",
+                        (ordinal, NeuralSubstrate._canonical_json(clean), clean["id"]),
                     )
                 observed["assemblies"] += len(records)
             for descriptor in synapse_shards:
@@ -506,6 +631,9 @@ def rebuild_committed_paged_cache(
                         "INSERT INTO rebuild_synapse_ids(id) VALUES (?)", (identifier,)
                     )
                 observed["synapses"] += len(ids)
+                _stage_checked_forward_entry(connection, descriptor, records, tensors, effective)
+                with session.transaction(write=True) as endpoint_connection:
+                    endpoint_index.import_checked_group(endpoint_connection, descriptor, records)
             connection.commit()
 
         if observed != expected:
@@ -537,6 +665,11 @@ def rebuild_committed_paged_cache(
         with sqlite3.connect(verification_path) as connection:
             if connection.execute("SELECT COUNT(*) FROM rebuild_synapse_ids").fetchone()[0] != expected["synapses"]:
                 raise ValueError("synapse shard global ID count mismatch")
+        forward_index = _verified_forward_from_staging(
+            verification_path, store, pointer, expected, generation, index, synapse_shards,
+            working_disk_reserve, memory_reserve,
+        )
+        endpoint_index.finish_rebuild(pointer, synapse_shards, forward_sha256=forward_index["contentSha256"])
         verification_path.unlink()
         with sqlite3.connect(staged_path) as connection:
             if connection.execute("SELECT COUNT(*) FROM progress_checkpoints").fetchone()[0] != 0:
@@ -544,6 +677,7 @@ def rebuild_committed_paged_cache(
         status = index.status()
         if (
             len(vectors) != expected["neurons"]
+            or len(neurons) != expected["neurons"]
             or status["count"] != expected["assemblies"]
             or status["packedVectorRows"] != expected["assemblies"]
         ):
@@ -552,11 +686,15 @@ def rebuild_committed_paged_cache(
         if (engine_path / "brain.json").read_bytes() != brain_bytes:
             raise ValueError("committed brain pointer changed during cache rebuild")
         generation_id = pointer["activeGeneration"]
+        index.ids_sha256()  # Build bounded Merkle paths during recovery, not the next save.
         index.bind_committed_generation(
             generation_id,
             expected_index_revision=status["indexRevision"],
             expected_vector_revision=status["vectorRevision"],
         )
+        neurons.bind_committed_generation(generation_id)
+        install_generation_journal(staged_path, store, pointer,
+                                   disk_reserve=working_disk_reserve)
         index.discard_or_reconcile_uncommitted(generation_id)
         with sqlite3.connect(staged_path) as connection:
             if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
@@ -576,6 +714,9 @@ def rebuild_committed_paged_cache(
             "paged-%s-%s" % (generation_id[:16], uuid.uuid4().hex)
         )
         os.rename(staged_directory, final_directory)
+        index.path = final_directory / "working.sqlite3"
+        vectors.path = index.path
+        neurons.path = index.path
         return RebuiltPagedCache(
             path=final_directory / "working.sqlite3",
             generation_sha256=generation_id,
@@ -584,6 +725,7 @@ def rebuild_committed_paged_cache(
             neurons=expected["neurons"],
             assemblies=expected["assemblies"],
             synapses=expected["synapses"],
+            _authenticated_session=session,
         )
 
 
@@ -678,9 +820,19 @@ class PreparedPagedCache:
         if self._active or self._published or self._closed:
             raise RuntimeError("prepared cache is already active or published")
         self._active = True
+        try:
+            self.authenticated_session = cache_session(self.index, disk_reserve=self.disk_reserve)
+            self._blob_scope = self.authenticated_session.blob_scope()
+            self._blob_scope.__enter__()
+        except BaseException:
+            self._active = False
+            self._closed = True
+            self._temporary.cleanup()
+            raise
         return self
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> bool:
+        self._blob_scope.__exit__(_type, _value, _traceback)
         self._active = False
         self._closed = True
         self._temporary.cleanup()
@@ -757,6 +909,9 @@ def finish_verified_index_from_loaded_vectors(
     vectors = prepared.vectors
     expected = prepared.expected
     staged_path = prepared.path
+    endpoint_index = SynapseEndpointIndex(prepared.authenticated_session)
+    index._synapse_endpoint_index = endpoint_index
+    endpoint_index.begin_rebuild()
     assembly_shards = [
         shard for shard in prepared.generation["shards"]
         if shard["kind"] == "assemblies"
@@ -771,10 +926,14 @@ def finish_verified_index_from_loaded_vectors(
     with sqlite3.connect(verification_path) as connection:
         connection.execute(
             "CREATE TABLE rebuild_assembly_rows ("
-            "ordinal INTEGER PRIMARY KEY, record_json BLOB NOT NULL)"
+            "ordinal INTEGER PRIMARY KEY,record_json BLOB NOT NULL,assembly_id TEXT NOT NULL UNIQUE)"
         )
         connection.execute(
             "CREATE TABLE rebuild_synapse_ids (id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE TABLE rebuild_forward_entries (bucket TEXT NOT NULL,part INTEGER NOT NULL,"
+            "entry_json BLOB NOT NULL,PRIMARY KEY(bucket,part)) WITHOUT ROWID"
         )
         for descriptor in assembly_shards:
             _reserve(
@@ -797,8 +956,8 @@ def finish_verified_index_from_loaded_vectors(
                     if key != "__persistence_ordinal"
                 }
                 connection.execute(
-                    "INSERT INTO rebuild_assembly_rows(ordinal,record_json) VALUES (?,?)",
-                    (ordinal, NeuralSubstrate._canonical_json(clean)),
+                    "INSERT INTO rebuild_assembly_rows(ordinal,record_json,assembly_id) VALUES (?,?,?)",
+                    (ordinal, NeuralSubstrate._canonical_json(clean), clean["id"]),
                 )
             observed_assemblies += len(records)
         for descriptor in synapse_shards:
@@ -838,6 +997,9 @@ def finish_verified_index_from_loaded_vectors(
                     "INSERT INTO rebuild_synapse_ids(id) VALUES (?)", (identifier,)
                 )
             observed_synapses += len(ids)
+            _stage_checked_forward_entry(connection, descriptor, records, tensors, effective)
+            with prepared.authenticated_session.transaction(write=True) as endpoint_connection:
+                endpoint_index.import_checked_group(endpoint_connection, descriptor, records)
         connection.commit()
     if observed_assemblies != expected["assemblies"] or observed_synapses != expected["synapses"]:
         raise ValueError("substrate shard generation count mismatch")
@@ -881,6 +1043,11 @@ def finish_verified_index_from_loaded_vectors(
     with sqlite3.connect(verification_path) as connection:
         if connection.execute("SELECT COUNT(*) FROM rebuild_synapse_ids").fetchone()[0] != expected["synapses"]:
             raise ValueError("synapse shard global ID count mismatch")
+    forward_index = _verified_forward_from_staging(
+        verification_path, store, prepared.pointer, expected, prepared.generation, index,
+        synapse_shards, prepared.disk_reserve, prepared.memory_reserve,
+    )
+    endpoint_index.finish_rebuild(prepared.pointer, synapse_shards, forward_sha256=forward_index["contentSha256"])
     verification_path.unlink()
     with sqlite3.connect(staged_path) as connection:
         if connection.execute("SELECT COUNT(*) FROM progress_checkpoints").fetchone()[0] != 0:
@@ -899,6 +1066,7 @@ def finish_verified_index_from_loaded_vectors(
     if (prepared.engine_path / "brain.json").read_bytes() != prepared.brain_bytes:
         raise ValueError("committed brain pointer changed during cache rebuild")
     generation_id = prepared.pointer["activeGeneration"]
+    index.ids_sha256()
     index.bind_committed_generation(
         generation_id,
         expected_index_revision=status["indexRevision"],
@@ -906,20 +1074,12 @@ def finish_verified_index_from_loaded_vectors(
     )
     if deferred:
         prepared.neurons.bind_committed_generation(generation_id)
+        install_generation_journal(
+            staged_path, store, prepared.pointer, disk_reserve=prepared.disk_reserve,
+        )
     index.discard_or_reconcile_uncommitted(generation_id)
     if deferred:
         membership = _IndexedAssemblyIDs(index)
-        forward_index = _load_forward_index(
-            store,
-            generation=generation_id,
-            generation_manifest_sha256=prepared.pointer["generationManifestSha256"],
-            synapse_count=expected["synapses"],
-            records_per_shard=int(prepared.generation.get("recordsPerShard", 0)),
-            hot_node_ids=membership,
-            descriptors=synapse_shards,
-        )
-        if forward_index is None:
-            raise ValueError("paged cold-load requires a verified forward index")
         loaded_substrate.assemblies = PagedAssemblyView(index)
         loaded_substrate.assembly_vectors = PagedAssemblyVectorView(index, vectors)
         loaded_substrate.invalidate_assembly_index()
@@ -969,6 +1129,7 @@ def finish_verified_index_from_loaded_vectors(
         neurons=expected["neurons"],
         assemblies=expected["assemblies"],
         synapses=expected["synapses"],
+        _authenticated_session=prepared.authenticated_session,
     )
 
 
@@ -1028,6 +1189,16 @@ def _cache_has_clean_binding(database: Path, generation: str) -> bool:
                 "SELECT key,value FROM paged_vector_meta WHERE key IN "
                 "('revision','committed_generation_sha256','committed_revision')"
             ))
+            neuron_tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('paged_neuron_meta','paged_neuron_records')"
+            )}
+            if neuron_tables and len(neuron_tables) != 2:
+                return False
+            neuron_meta = dict(connection.execute(
+                "SELECT key,value FROM paged_neuron_meta WHERE key IN "
+                "('revision','committed_generation_sha256','committed_revision')"
+            )) if neuron_tables else None
     except (OSError, sqlite3.DatabaseError):
         return False
     return (
@@ -1036,6 +1207,10 @@ def _cache_has_clean_binding(database: Path, generation: str) -> bool:
         and index_meta.get("committed_index_revision") == index_meta.get("index_revision")
         and index_meta.get("committed_vector_revision") == vector_meta.get("revision")
         and vector_meta.get("committed_revision") == vector_meta.get("revision")
+        and (neuron_meta is None or (
+            neuron_meta.get("committed_generation_sha256") == generation
+            and neuron_meta.get("committed_revision") == neuron_meta.get("revision")
+        ))
     )
 
 

@@ -17,6 +17,7 @@ import re
 import shutil
 import tempfile
 import time
+import weakref
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping as AbstractMapping, MutableMapping
 from pathlib import Path
@@ -63,7 +64,7 @@ _SYNAPSE_TENSOR_FIELDS = (
 )
 _LAZY_SYNAPSE_LOAD_THRESHOLD = 100_000
 _FORWARD_INDEX_FORMAT = "omni-substrate-forward-index"
-_FORWARD_INDEX_VERSION = 2
+_FORWARD_INDEX_VERSION = 4
 _DYNAMIC_ORDER_BASIS = "substrate-shard-record-sha256-v1"
 _RECALL_GRAPH_CACHE_BYTES = 64 * 1024 * 1024
 _RECALL_GRAPH_EDGE_ESTIMATE = 128
@@ -105,21 +106,21 @@ class _RevisionedNodes(dict):
 
     def __setitem__(self, key: str, value: Dict[str, Any]) -> None:
         super().__setitem__(key, value)
-        self.graph_revision += 1
+        self._changed(key)
 
     def __delitem__(self, key: str) -> None:
         super().__delitem__(key)
-        self.graph_revision += 1
+        self._changed(key)
 
     def clear(self) -> None:
         if self:
             super().clear()
-            self.graph_revision += 1
+            self._changed(None)
 
     def pop(self, key: str, default: Any = _MISSING) -> Any:
         if key in self:
             value = super().pop(key)
-            self.graph_revision += 1
+            self._changed(key)
             return value
         if default is _MISSING:
             raise KeyError(key)
@@ -127,8 +128,14 @@ class _RevisionedNodes(dict):
 
     def popitem(self) -> Tuple[str, Dict[str, Any]]:
         value = super().popitem()
-        self.graph_revision += 1
+        self._changed(value[0])
         return value
+
+    def _changed(self, key: Optional[str] = None) -> None:
+        self.graph_revision += 1
+        observer = getattr(self, "_recall_graph_observer", None)
+        if callable(observer):
+            observer((key,) if key is not None else None, self.graph_revision)
 
     def setdefault(self, key: str, default: Any = None) -> Any:
         if key not in self:
@@ -149,22 +156,29 @@ class _TrackedSynapseRecord(dict):
 
     _FORWARD_FIELDS = frozenset(("source_id", "target_id", "effective_weight"))
 
-    def __init__(self, value: Mapping[str, Any], changed: Callable[[], None]):
+    def __init__(
+        self, value: Mapping[str, Any], changed: Callable[[], None],
+        metadata_changed: Optional[Callable[[], None]] = None,
+    ):
         super().__init__(value)
         self._changed = changed
+        self._metadata_changed = metadata_changed
 
     def __setitem__(self, key: str, value: Any) -> None:
-        changed = key in self._FORWARD_FIELDS and (
-            key not in self or self[key] != value
-        )
+        updated = key not in self or self[key] != value
+        changed = key in self._FORWARD_FIELDS and updated
         super().__setitem__(key, value)
         if changed:
             self._changed()
+        elif updated and self._metadata_changed is not None:
+            self._metadata_changed()
 
     def __delitem__(self, key: str) -> None:
         super().__delitem__(key)
         if key in self._FORWARD_FIELDS:
             self._changed()
+        elif self._metadata_changed is not None:
+            self._metadata_changed()
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         for key, value in dict(*args, **kwargs).items():
@@ -183,13 +197,18 @@ class _TrackedSynapseRecord(dict):
         key, value = super().popitem()
         if key in self._FORWARD_FIELDS:
             self._changed()
+        elif self._metadata_changed is not None:
+            self._metadata_changed()
         return key, value
 
     def clear(self) -> None:
+        updated = bool(self)
         changed = any(key in self for key in self._FORWARD_FIELDS)
         super().clear()
         if changed:
             self._changed()
+        elif updated and self._metadata_changed is not None:
+            self._metadata_changed()
 
     def setdefault(self, key: str, default: Any = None) -> Any:
         if key not in self:
@@ -215,16 +234,19 @@ class _RevisionedSynapses(_RevisionedNodes):
     def __init__(self, values: Optional[Mapping[str, Dict[str, Any]]] = None):
         super().__init__()
         for key, value in (values or {}).items():
-            dict.__setitem__(self, key, self._wrap(value))
+            dict.__setitem__(self, key, self._wrap(key, value))
 
-    def _changed(self) -> None:
+    def _changed(self, key: Optional[str] = None) -> None:
         self.graph_revision += 1
+        observer = getattr(self, "_recall_graph_observer", None)
+        if callable(observer):
+            observer(key, self.graph_revision)
 
-    def _wrap(self, value: Mapping[str, Any]) -> _TrackedSynapseRecord:
-        return _TrackedSynapseRecord(value, self._changed)
+    def _wrap(self, key: str, value: Mapping[str, Any]) -> _TrackedSynapseRecord:
+        return _TrackedSynapseRecord(value, lambda: self._changed(key))
 
     def __setitem__(self, key: str, value: Dict[str, Any]) -> None:
-        super().__setitem__(key, self._wrap(value))
+        super().__setitem__(key, self._wrap(key, value))
 
 
 def _is_nonnegative_int(value: Any) -> bool:
@@ -317,7 +339,20 @@ def _unpack_persisted_synapse_weights(
     return torch.tensor(levels, dtype=torch.int8)
 
 
-def _forward_hot_ids_sha256(values: Iterable[str]) -> str:
+def _forward_hot_ids_sha256(values: Iterable[str], algorithm: Optional[str] = None) -> str:
+    from .paged_assembly_membership import ALGORITHM, checksum_for_ids
+    checksum = getattr(values, "ids_sha256", None)
+    actual_algorithm = getattr(values, "ids_checksum_algorithm", "sha256-sorted-ids-v1")
+    chosen = actual_algorithm if algorithm is None else algorithm
+    if chosen == ALGORITHM:
+        if callable(checksum) and actual_algorithm == chosen:
+            value = checksum()
+            if not _is_sha256(value):
+                raise ValueError("paged hot membership Merkle checksum is invalid")
+            return value
+        return checksum_for_ids(values)
+    if chosen != "sha256-sorted-ids-v1":
+        raise ValueError("forward-index membership checksum algorithm is unsupported")
     sorted_ids = getattr(values, "iter_sorted_ids", None)
     if callable(sorted_ids):
         # A paged assembly index supplies canonical ID order directly. The
@@ -403,60 +438,68 @@ def _write_forward_index(
     hot_node_ids: Iterable[str],
     entries: Sequence[Mapping[str, Any]],
     growth_guard: Optional[Callable[[int], bool]],
+    verified_rebuild: bool = False,
 ) -> Dict[str, Any]:
-    normalized_entries = sorted(
-        [dict(value) for value in entries],
-        key=lambda value: (str(value["bucket"]), int(value["part"])),
-    )
+    from .paged_forward_index import publish_entries
+    normalized_entries = publish_entries(Path(root), entries, growth_guard)
     body = {
-        "format": _FORWARD_INDEX_FORMAT,
-        "formatVersion": _FORWARD_INDEX_VERSION,
+        "format": _FORWARD_INDEX_FORMAT, "formatVersion": _FORWARD_INDEX_VERSION,
         "sourceGeneration": str(generation),
         "sourceGenerationManifestSha256": str(generation_manifest_sha256),
-        "synapseCount": int(synapse_count),
-        "recordsPerShard": int(records_per_shard),
+        "synapseCount": int(synapse_count), "recordsPerShard": int(records_per_shard),
         "hotNodeIdsSha256": _forward_hot_ids_sha256(hot_node_ids),
+        "hotNodeIdsChecksumAlgorithm": getattr(hot_node_ids, "ids_checksum_algorithm", "sha256-sorted-ids-v1"),
         "synapticUses": sum(int(value["synapticUses"]) for value in normalized_entries),
         "shards": normalized_entries,
     }
-    encoded_body = NeuralSubstrate._canonical_json(body)
-    manifest = {
-        **body,
-        "contentSha256": hashlib.sha256(encoded_body).hexdigest(),
-    }
+    encoded = NeuralSubstrate._canonical_json(body)
+    manifest = {**body, "contentSha256": hashlib.sha256(encoded).hexdigest()}
     payload = NeuralSubstrate._canonical_json(manifest)
     if growth_guard is not None and not growth_guard(len(payload) + 4096):
-        raise SubstrateResourcePause(
-            "substrate forward index paused at the host resource reserve"
-        )
+        raise SubstrateResourcePause("derived forward descriptor manifest paused at resource reserve")
     path = _forward_index_path(root, generation)
-    if path.exists():
+    if path.exists() and not verified_rebuild:
         existing = path.read_bytes()
         if existing != payload:
             try:
-                prior = json.loads(existing.decode("utf-8"))
-            except (UnicodeError, json.JSONDecodeError) as error:
-                raise ValueError(
-                    "substrate forward index conflicts with its generation"
-                ) from error
-            if (
-                not isinstance(prior, dict)
-                or prior.get("format") != _FORWARD_INDEX_FORMAT
-                or prior.get("formatVersion") != 1
-                or prior.get("sourceGeneration") != generation
-                or prior.get("sourceGenerationManifestSha256")
-                != generation_manifest_sha256
-            ):
-                raise ValueError(
-                    "substrate forward index conflicts with its generation"
+                prior = json.loads(existing)
+                prior_body = {key: value for key, value in prior.items() if key != "contentSha256"}
+                algorithm_migration = bool(
+                    isinstance(prior, dict) and prior.get("formatVersion") == 4
+                    and prior.get("hotNodeIdsChecksumAlgorithm") in {"sha256-sorted-ids-v1", "sha256-patricia-id-set-v1"}
+                    and prior.get("hotNodeIdsChecksumAlgorithm") != body["hotNodeIdsChecksumAlgorithm"]
                 )
-            # Version 1 is a derived, generation-bound cache without aggregate
-            # use counters. A complete authoritative scan may atomically enrich
-            # it in place; version-2 conflicts still fail closed.
-            atomic_write_bytes(path, payload)
-    else:
-        atomic_write_bytes(path, payload)
+                if (
+                    prior.get("format") != _FORWARD_INDEX_FORMAT
+                    or (prior.get("formatVersion") not in {1, 2, 3} and not algorithm_migration)
+                    or prior.get("sourceGeneration") != generation
+                    or prior.get("sourceGenerationManifestSha256") != generation_manifest_sha256
+                    or prior.get("contentSha256") != hashlib.sha256(NeuralSubstrate._canonical_json(prior_body)).hexdigest()
+                    or prior.get("hotNodeIdsSha256") != _forward_hot_ids_sha256(
+                        hot_node_ids, prior.get("hotNodeIdsChecksumAlgorithm", "sha256-sorted-ids-v1"))
+                ):
+                    raise ValueError("derived forward index conflicts with its generation")
+                if prior["formatVersion"] >= 2:
+                    from .paged_forward_index import iter_entries
+                    if any(prior.get(key) != body[key] for key in ("synapseCount", "recordsPerShard", "synapticUses")):
+                        raise ValueError("derived forward index count conflicts with its generation")
+                    prior_entries = prior.get("shards")
+                    if not isinstance(prior_entries, list) or len(prior_entries) != len(normalized_entries):
+                        raise ValueError("derived forward index group count conflicts")
+                    if prior["formatVersion"] == 4:
+                        matches = prior_entries == normalized_entries
+                    else:
+                        matches = not any(old != new for old, new in zip(prior_entries, iter_entries(Path(root), manifest)))
+                    if not matches:
+                        raise ValueError("derived legacy forward entries conflict")
+            except (TypeError, UnicodeError, json.JSONDecodeError, AttributeError) as error:
+                raise ValueError("derived forward index conflicts with its generation") from error
+        else:
+            return manifest
+    atomic_write_bytes(path, payload)
     return manifest
+
+
 
 
 def _load_forward_index(
@@ -471,6 +514,15 @@ def _load_forward_index(
 ) -> Optional[Dict[str, Any]]:
     path = _forward_index_path(root, generation)
     try:
+        # Large old inline indexes are expendable. Reconstruct their complete
+        # checked entries from bounded canonical source shards into cache v4
+        # rather than allocate a corpus-sized JSON tree. No neural record is
+        # skipped and authoritative v3 generation hashes do not change.
+        if path.stat().st_size > 8 * 1024 * 1024:
+            with path.open("rb") as handle:
+                header = handle.read(4096)
+            if b'"formatVersion":4' not in header:
+                return None
         payload = path.read_bytes()
     except FileNotFoundError:
         return None
@@ -501,7 +553,16 @@ def _load_forward_index(
     legacy_index = index_version == 1
     if (
         value.get("format") != _FORWARD_INDEX_FORMAT
-        or index_version not in {1, _FORWARD_INDEX_VERSION}
+        or type(index_version) is not int
+        or index_version not in {1, 2, 3, _FORWARD_INDEX_VERSION}
+        or (
+            index_version < 3 and "hotNodeIdsChecksumAlgorithm" in value
+        )
+        or (
+            index_version >= 3 and value.get("hotNodeIdsChecksumAlgorithm") not in {
+                "sha256-sorted-ids-v1", "sha256-patricia-id-set-v1",
+            }
+        )
         or value.get("sourceGeneration") != generation
         or not _is_sha256(value.get("sourceGeneration"))
         or value.get("sourceGenerationManifestSha256")
@@ -512,7 +573,9 @@ def _load_forward_index(
         or value.get("recordsPerShard") != int(records_per_shard)
         or not _is_nonnegative_int(value.get("recordsPerShard"))
         or value.get("hotNodeIdsSha256")
-        != _forward_hot_ids_sha256(hot_node_ids)
+        != _forward_hot_ids_sha256(
+            hot_node_ids, value.get("hotNodeIdsChecksumAlgorithm", "sha256-sorted-ids-v1")
+        )
         or not _is_sha256(value.get("hotNodeIdsSha256"))
         or not _is_sha256(value.get("contentSha256"))
         or value.get("contentSha256")
@@ -545,9 +608,20 @@ def _load_forward_index(
             or not _is_sha256(entry.get("recordsSha256"))
             or entry.get("tensorsSha256") != tensor_spec.get("sha256")
             or not _is_sha256(entry.get("tensorsSha256"))
-            or not isinstance(entry.get("forwardRecords"), list)
-            or not isinstance(entry.get("hotLocations"), list)
-            or not isinstance(entry.get("packedEffectiveWeights"), str)
+            or (index_version < 4 and (
+                not isinstance(entry.get("forwardRecords"), list)
+                or not isinstance(entry.get("hotLocations"), list)
+                or not isinstance(entry.get("packedEffectiveWeights"), str)
+            ))
+            or (index_version == 4 and (
+                not isinstance(entry.get("entry"), dict)
+                or not _is_sha256(entry["entry"].get("sha256"))
+                or entry["entry"].get("path") != "forward-index/blobs/%s.json" % entry["entry"].get("sha256", "")
+                or not _is_nonnegative_int(entry["entry"].get("bytes"))
+                or not _is_nonnegative_int(entry.get("forwardCount"))
+                or entry["forwardCount"] > entry["count"]
+                or entry.get("packedBytes") != (entry["forwardCount"] + 3) // 4
+            ))
             or (
                 not legacy_index
                 and not _is_nonnegative_int(entry.get("synapticUses"))
@@ -1565,7 +1639,7 @@ class NeuralSubstrate:
 
         excluded = {str(value) for value in (exclude_ids or [])}
         candidate_vectors = (
-            self.assembly_vectors.items()
+            self._iter_assembly_activities()
             if candidate_ids is None
             else (
                 (identifier, self.assembly_vectors[identifier])
@@ -1822,13 +1896,8 @@ class NeuralSubstrate:
         if not bool(torch.isfinite(normalized).all()):
             raise ValueError("sensory vector must contain only finite values")
         normalized = F.normalize(normalized.reshape(1, -1), dim=-1)[0]
-        nearest = max(
-            (
-                self.space.similarity(normalized, candidate)
-                for candidate in self.assembly_vectors.values()
-            ),
-            default=-1.0,
-        )
+        nearest = max((self.space.similarity(normalized, candidate)
+                       for _identifier, candidate in self._iter_assembly_activities()), default=-1.0)
         record, stored, created = self._store_assembly(
             "sensory:%s:%s" % (clean_kind, clean_fingerprint),
             kind=clean_kind,
@@ -2248,7 +2317,7 @@ class NeuralSubstrate:
                 max(
                     (
                         self.space.similarity(vector, candidate)
-                        for assembly_id, candidate in self.assembly_vectors.items()
+                        for assembly_id, candidate in self._iter_assembly_activities()
                         if assembly_id != record["id"]
                     ),
                     default=-1.0,
@@ -2363,13 +2432,21 @@ class NeuralSubstrate:
         )
         return adjacency, incoming, eligible_edges, inhibitory_edges
 
+    def _iter_assembly_activities(self):
+        if isinstance(self.assemblies, PagedAssemblyView) and isinstance(self.neuron_vectors, PagedPackedVectors):
+            yield from PagedAssemblyVectorProvider(self.assemblies.index, self.neuron_vectors).iter_activities(
+                page_size=self.assemblies.page_size,
+            )
+        else:
+            yield from self.assembly_vectors.items()
+
     def recall_vector(
         self,
         cue: torch.Tensor,
         *,
         workspace_slots: Optional[int] = None,
         record_activity: bool = True,
-    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+    ) -> Tuple[torch.Tensor, Sequence[Dict[str, Any]]]:
         """Recall by similarity followed by recurrent spreading activation.
 
         All assemblies above the adaptive activation floor participate in the
@@ -2380,6 +2457,11 @@ class NeuralSubstrate:
 
         if not self.assembly_vectors:
             return cue, []
+        if (
+            isinstance(self.assemblies, PagedAssemblyView)
+            and isinstance(self.neuron_vectors, PagedPackedVectors)
+        ):
+            return self._recall_vector_paged(cue, workspace_slots=workspace_slots, record_activity=record_activity)
         # The metadata and packed-neuron stores are separate SQLite files in
         # paged mode. Score only assembly IDs through a paired generation
         # provider: an all-neuron scan would mistake ordinary neurons for
@@ -2580,6 +2662,129 @@ class NeuralSubstrate:
             },
         }
         return signal, recalled
+
+    def _recall_vector_paged(
+        self, cue: torch.Tensor, *, workspace_slots: Optional[int], record_activity: bool,
+    ):
+        from .paged_recurrent_spreading import PagedRecurrentState
+        from .paged_recall_graph import PagedRecallGraph
+        provider = PagedAssemblyVectorProvider(self.assemblies.index, self.neuron_vectors)
+        prepared = prepare_exact_paged_similarity(
+            provider, cue, page_size=self.assemblies.page_size, workspace_slots=workspace_slots,
+        )
+        if prepared.summary.positive_count == 0:
+            provider.assert_unchanged(prepared.summary.snapshot_id)
+            return cue, []
+        initial_graph_revision = getattr(self.synapses, "graph_revision", None)
+        initial_neuron_revision = getattr(self.neurons, "graph_revision", None)
+        source_reference = weakref.ref(self)
+        def reserve(size: int, operation: str) -> bool:
+            # Corpus/frontier bytes live on disk, not in an equally large
+            # resident mirror. Charge the actual SQLite write envelope and
+            # only the bounded per-connection RAM window.
+            source = source_reference()
+            if source is None:
+                raise RuntimeError("paged recurrent execution source is closed")
+            index = source.assemblies.index
+            index._reserve_disk(size, operation)
+            index._reserve_memory(320 * 1024, operation)
+            if getattr(index, "_disk_reserve", None) is None:
+                source._check_growth(min(size, 320 * 1024))
+            return True
+        state = PagedRecurrentState(self.assemblies.index.path.parent / "recall", reserve=reserve)
+        try:
+            graph_stamp = (id(self.synapses), id(self.neurons))
+            graph_cached = getattr(self, "_paged_recall_graph", None)
+            if (
+                initial_graph_revision is None or initial_neuron_revision is None
+                or graph_cached is None or graph_cached[0] != graph_stamp
+                or not graph_cached[1].refresh(self.synapses, self.neurons)
+            ):
+                graph = PagedRecallGraph(self.assemblies.index.path.parent / "recall", reserve=reserve)
+                try:
+                    edges = (
+                        self.synapses.iter_effective_edge_records() if isinstance(self.synapses, LazyPersistedSynapses)
+                        else ((str(identifier), str(value["source_id"]), str(value["target_id"]),
+                               self.exact_effective_weight(value.get("effective_weight", 0)))
+                              for identifier, value in self.synapses.items())
+                    )
+                    graph.load(edges, node_exists=lambda identifier: identifier in self.neurons,
+                               synapse_revision=initial_graph_revision, neuron_revision=initial_neuron_revision)
+                except BaseException:
+                    graph.close()
+                    raise
+                if isinstance(self.synapses, (_RevisionedSynapses, LazyPersistedSynapses)):
+                    self.synapses._recall_graph_observer = graph.queue_change
+                if isinstance(self.neurons, (_RevisionedNodes, PagedNeuronMetadata)):
+                    self.neurons._recall_graph_observer = graph.queue_membership_change
+                self._paged_recall_graph = (graph_stamp, graph)
+            else:
+                graph = graph_cached[1]
+            state.use_graph(graph)
+            state.load_seeds((match.assembly_id, float(match.score)) for match in prepared.iter_matches())
+            provider.assert_unchanged(prepared.summary.snapshot_id)
+            state.settle(slots=prepared.summary.workspace_slots, adaptive_floor=prepared.summary.adaptive_floor)
+            signal_sum = F.normalize(cue.float(), dim=0).clone()
+            signal_weight = 1.0
+            for assembly_id, score in state.iter_activation(positive_only=True):
+                vector = self.assembly_vectors.get(assembly_id)
+                if vector is None:
+                    continue
+                weight = max(0.01, score)
+                signal_sum.add_(vector.float(), alpha=weight)
+                signal_weight += weight
+                assembly = self.assembly_by_id.get(assembly_id)
+                if assembly is not None:
+                    state.append_recalled({
+                        "idea_id": assembly_id, "assembly_id": assembly_id, "score": score,
+                        "concept_ids": list(assembly["neuron_ids"]), "neuron_ids": list(assembly["neuron_ids"]),
+                    })
+            provider.assert_unchanged(prepared.summary.snapshot_id)
+            if (
+                getattr(self.synapses, "graph_revision", None) != initial_graph_revision
+                or getattr(self.neurons, "graph_revision", None) != initial_neuron_revision
+            ):
+                raise ValueError("recurrent graph changed before readout")
+            recalled = state.recalled()
+            if record_activity:
+                self.record_recall_activity(recalled)
+            self._last_recall_paged_state = state
+            self._last_recall_rounds = state.rounds
+            self._last_recall_audit = {
+                "rule": "effective-ternary-recurrent-settling", "exactTernaryContribution": True,
+                "latentMagnitudeUsed": False, "eligibleEdges": state.eligible_edges,
+                "inhibitoryEdges": state.inhibitory_edges, "inhibitorySignals": state.inhibitory_signals,
+                "suppressedAssemblies": state.suppressed_seeds, "settledRounds": state.rounds,
+                "convergenceDelta": state.convergence_delta, "damping": 0.52, "fanInNormalization": True,
+                "activeNeuralNodes": state.active_count, "signalRule": "continuous-activity-weighted-mean",
+                "activationByAssembly": {}, "activationStorage": "paged-recurrent-frontier",
+                "activationCount": len(recalled), "allEligibleAssembliesIncluded": True,
+            }
+            return signal_sum / max(signal_weight, 1e-8), recalled
+        except BaseException:
+            state.close()
+            raise
+
+    def release_paged_recall_scratch(self) -> None:
+        """Release disposable graph/frontier files only at runtime shutdown."""
+
+        state = getattr(self, "_last_recall_paged_state", None)
+        graph = getattr(self, "_paged_recall_graph", None)
+        idle = getattr(self, "_paged_idle_selector", None)
+        self._paged_idle_selector = None
+        self._last_recall_paged_state = None
+        self._paged_recall_graph = None
+        if state is not None:
+            state.close()
+        if idle is not None:
+            idle.close()
+        if graph is not None:
+            owner = graph[1]
+            for source in (self.neurons, self.synapses):
+                observer = getattr(source, "_recall_graph_observer", None)
+                if getattr(observer, "__self__", None) is owner:
+                    del source._recall_graph_observer
+            owner.close()
 
     def record_recall_activity(
         self, recalled: Sequence[Mapping[str, Any]]
@@ -3484,6 +3689,7 @@ class NeuralSubstrate:
                     str(record.get("id", ""))
                     for record in self.assemblies
                 ),
+                forward_manifest=published_forward_index,
             )
             lazy_synapses.install_forward_index_manifest(
                 published_forward_index
@@ -3561,6 +3767,7 @@ class NeuralSubstrate:
         cls,
         root: Path,
         pointers: Sequence[Optional[Dict[str, Any]]],
+        *, on_blob_removed: Optional[Callable[[Path], None]] = None,
     ) -> Dict[str, Any]:
         """Reclaim shards unreachable from the active and prior checkpoints.
 
@@ -3597,6 +3804,26 @@ class NeuralSubstrate:
         generations_removed = 0
         blobs_removed = 0
         bytes_reclaimed = 0
+        forward_cache_gc = True
+        retained_forward_blobs: set[str] = set()
+        try:
+            for generation_id in retained_generations:
+                path = _forward_index_path(store, generation_id)
+                value = json.loads(path.read_bytes())
+                body = {key: item for key, item in value.items() if key != "contentSha256"}
+                if value.get("sourceGeneration") != generation_id or value.get("contentSha256") != hashlib.sha256(cls._canonical_json(body)).hexdigest():
+                    raise ValueError("retained derived forward manifest is not checked")
+                if value.get("formatVersion") == 4:
+                    for entry in value["shards"]:
+                        spec = entry["entry"]
+                        relative = "forward-index/blobs/%s.json" % spec["sha256"]
+                        if not _is_sha256(spec["sha256"]) or spec["path"] != relative:
+                            raise ValueError("retained derived forward group reference is invalid")
+                        retained_forward_blobs.add(relative)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            # An optional derived cache cannot veto authoritative neural GC;
+            # nor can a missing/bad retained cache justify deleting its blobs.
+            forward_cache_gc = False
         generations = store / "generations"
         if generations.is_dir():
             for candidate in generations.iterdir():
@@ -3617,6 +3844,8 @@ class NeuralSubstrate:
                     if item.is_file() and not item.is_symlink()
                 )
                 shutil.rmtree(candidate)
+                if on_blob_removed is not None:
+                    on_blob_removed(candidate / "manifest.json")
                 generations_removed += 1
 
         blobs = store / "blobs"
@@ -3635,8 +3864,49 @@ class NeuralSubstrate:
                     continue
                 size = candidate.stat().st_size
                 candidate.unlink()
+                if on_blob_removed is not None:
+                    on_blob_removed(candidate)
                 blobs_removed += 1
                 bytes_reclaimed += size
+
+        if forward_cache_gc:
+            for directory, retained, suffix in (
+                (store / "forward-index" / "generations", {value + ".json" for value in retained_generations}, ".json"),
+                (store / "forward-index" / "blobs", {Path(value).name for value in retained_forward_blobs}, ".json"),
+            ):
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                for candidate in directory.iterdir():
+                    if candidate.name in retained or candidate.is_symlink() or not candidate.is_file() or candidate.suffix != suffix or not _is_sha256(candidate.stem):
+                        continue
+                    size = candidate.stat().st_size
+                    candidate.unlink()
+                    if on_blob_removed is not None:
+                        on_blob_removed(candidate)
+                    blobs_removed += 1
+                    bytes_reclaimed += size
+
+        query_indexes_removed = 0
+        query_directory = store / "inspection" / "query-generations"
+        if query_directory.is_dir() and not query_directory.is_symlink():
+            for candidate in query_directory.iterdir():
+                if candidate.name in retained_generations or not _is_sha256(candidate.name) or candidate.is_symlink() or not candidate.is_dir():
+                    continue
+                try:
+                    manifest = json.loads((candidate / "manifest.json").read_bytes())
+                    files = list(candidate.iterdir())
+                    if manifest.get("format") != "omni-immutable-substrate-query-index" or any(
+                        item.name not in {"manifest.json", "records.sqlite3"} or item.is_symlink() or not item.is_file() for item in files
+                    ):
+                        continue
+                    bytes_reclaimed += sum(item.stat().st_size for item in files)
+                    shutil.rmtree(candidate)
+                    if on_blob_removed is not None:
+                        for item in files:
+                            on_blob_removed(item)
+                    query_indexes_removed += 1
+                except (OSError, ValueError, TypeError):
+                    continue
 
         return {
             "completed": True,
@@ -3645,6 +3915,8 @@ class NeuralSubstrate:
             "generationsRemoved": generations_removed,
             "blobsRemoved": blobs_removed,
             "bytesReclaimed": bytes_reclaimed,
+            "forwardCacheGcCompleted": forward_cache_gc,
+            "queryIndexesRemoved": query_indexes_removed,
         }
 
     @classmethod
@@ -3808,12 +4080,18 @@ class NeuralSubstrate:
                 raise SubstrateResourcePause(
                     "paged cold-load record blob exceeds bounded read window"
                 )
+            record_before = record_path.stat()
             if (
                 cls._file_sha256(record_path)
                 != str(record_spec.get("sha256", ""))
                 or record_path.stat().st_size != int(record_spec.get("bytes", -1))
             ):
                 raise ValueError("substrate record shard checksum mismatch")
+            if paged_vectors is not None:
+                from .paged_substrate_writer import remember_verified_blob
+                remember_verified_blob(
+                    record_path, str(record_spec["sha256"]), before=record_before,
+                )
             payload = json.loads(record_path.read_text("utf-8"))
             records = payload.get("records", [])
             if len(records) != int(shard.get("count", -1)):
@@ -3840,6 +4118,7 @@ class NeuralSubstrate:
                     raise SubstrateResourcePause(
                         "paged cold-load tensor blob exceeds bounded read window"
                     )
+                tensor_before = tensor_path.stat()
                 if (
                     cls._file_sha256(tensor_path)
                     != str(tensor_spec.get("sha256", ""))
@@ -3847,6 +4126,11 @@ class NeuralSubstrate:
                     != int(tensor_spec.get("bytes", -1))
                 ):
                     raise ValueError("substrate tensor shard checksum mismatch")
+                if paged_vectors is not None:
+                    from .paged_substrate_writer import remember_verified_blob
+                    remember_verified_blob(
+                        tensor_path, str(tensor_spec["sha256"]), before=tensor_before,
+                    )
                 tensor_values = load_tensors(tensor_path, device="cpu")
                 if int(generation.get("formatVersion", 0)) == 1:
                     # Native v1 may carry a float shadow. Keep only the
@@ -4153,6 +4437,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         if self.store_version not in _READABLE_SUBSTRATE_STORE_VERSIONS:
             raise ValueError("unsupported neural substrate shard format")
         self.graph_revision = 0
+        self.persistence_revision = 0
         self._descriptors: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self._ordered_keys: List[Tuple[str, int]] = []
         self._ranges: Dict[str, List[Tuple[str, str, Tuple[str, int]]]] = (
@@ -4226,6 +4511,39 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             self._descriptors[key] = descriptor
             self._ordered_keys.append(key)
         self._ordered_keys.sort()
+        if isinstance(forward_index, Mapping) and forward_index.get("formatVersion") == 4:
+            from .paged_forward_index import BlobForwardTopology, EndpointHotLocations
+            topology = BlobForwardTopology(self.root, forward_index["shards"])
+            if set(topology) != set(self._descriptors):
+                raise ValueError("paged forward group coverage differs from source descriptors")
+            for key in self._ordered_keys:
+                descriptor = self._descriptors[key]
+                entry = topology.descriptors[key]
+                first_id, last_id = entry.get("firstId"), entry.get("lastId")
+                if (
+                    not isinstance(first_id, str) or not isinstance(last_id, str) or first_id > last_id
+                    or NeuralSubstrate._bucket("synapses", first_id) != key[0]
+                    or NeuralSubstrate._bucket("synapses", last_id) != key[0]
+                    or entry.get("count") != descriptor["count"]
+                    or entry.get("recordsSha256") != descriptor["records"]["sha256"]
+                    or entry.get("tensorsSha256") != descriptor["tensors"]["sha256"]
+                    or not _is_nonnegative_int(entry.get("synapticUses"))
+                    or not _is_nonnegative_int(entry.get("forwardCount"))
+                    or entry["forwardCount"] > descriptor["count"]
+                    or entry.get("packedBytes") != (entry["forwardCount"] + 3) // 4
+                ):
+                    raise ValueError("paged forward group descriptor binding is invalid")
+                self._range_by_key[key] = (first_id, last_id)
+                self._ranges[key[0]].append((first_id, last_id, key))
+                self._uses_by_shard[key] = entry["synapticUses"]
+                observed += descriptor["count"]
+            for bucket in self._ranges:
+                self._ranges[bucket].sort(key=lambda value: (value[0], value[1], value[2]))
+            if observed != self._base_count or sum(self._uses_by_shard.values()) != forward_index.get("synapticUses"):
+                raise ValueError("paged forward group aggregate diverges")
+            self._forward_by_shard = topology
+            self._hot_locations = EndpointHotLocations(self.root, topology, self._hot_node_ids, forward_index)
+            return
         indexed_entries: Dict[Tuple[str, int], Mapping[str, Any]] = {}
         if isinstance(forward_index, Mapping):
             for value in forward_index.get("shards", []):
@@ -4402,6 +4720,24 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
 
     @property
     def forward_edge_count(self) -> int:
+        descriptors = getattr(self._forward_by_shard, "descriptors", None)
+        if descriptors is not None:
+            total = sum(row["forwardCount"] for row in descriptors.values())
+            # Only changed complete groups are decoded for exact delta stats.
+            keys = {key for key, _index in self._dirty_locations.values()}.union(
+                key for key, _index in self._deleted_locations.values())
+            for key in keys:
+                structures, _packed = self._forward_by_shard[key]
+                nonzero = {row[0] for row in structures}
+                for identifier, (group, index) in self._dirty_locations.items():
+                    if group == key and identifier not in self._deleted_locations:
+                        total += int(bool(NeuralSubstrate.exact_effective_weight(self._dirty[identifier].get("effective_weight", 0)))) - int(index in nonzero)
+                for group, index in self._deleted_locations.values():
+                    if group == key:
+                        total -= int(index in nonzero)
+            total += sum(int(bool(NeuralSubstrate.exact_effective_weight(self._dirty[identifier].get("effective_weight", 0))))
+                         for identifier in self._new_ids)
+            return total
         return sum(1 for _edge in self.iter_effective_edges())
 
     @staticmethod
@@ -4482,6 +4818,75 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         ).hexdigest()
         return values, self._base_count, order_sha256, _DYNAMIC_ORDER_BASIS
 
+    def stream_dynamic_pack_state(self, *, disk_reserve=None, memory_reserve=None):
+        """Same canonical order/hash, with bounded exact-int8 pages only.
+
+        Sparse zero edges remain present. A disk-sorted current delta avoids
+        rescanning all touched IDs for each cold group. No full-edge tensor or
+        ID list is allocated, and source revisions guard the complete stream.
+        """
+
+        from .streamed_ternary import TernaryPackedSource
+        if self._new_ids or self._deleted_locations:
+            raise RuntimeError("lazy substrate must checkpoint structural changes before packing")
+        revision = self.graph_revision, self.persistence_revision
+        digest = hashlib.sha256(b"[")
+        for ordinal, key in enumerate(self._ordered_keys):
+            descriptor = self._descriptors[key]
+            row = {"bucket": key[0], "part": key[1], "count": descriptor["count"],
+                   "recordsSha256": descriptor["records"]["sha256"]}
+            if ordinal:
+                digest.update(b",")
+            digest.update(NeuralSubstrate._canonical_json(row))
+        digest.update(b"]")
+        source_count = self._base_count
+        def require(size, operation):
+            if disk_reserve is not None and disk_reserve(size, operation) is False:
+                raise SubstrateResourcePause("streamed dynamic packing paused at disk reserve")
+            if memory_reserve is not None and memory_reserve(2 * 1024 * 1024, operation) is False:
+                raise SubstrateResourcePause("streamed dynamic packing paused at memory reserve")
+        def pages():
+            import sqlite3
+            if revision != (self.graph_revision, self.persistence_revision):
+                raise ValueError("dynamic source changed before streamed packing")
+            require(65536, "dynamic packed delta scratch")
+            staging = self.root / "staging"
+            if staging.is_symlink():
+                raise ValueError("dynamic packing staging path must not be a symlink")
+            staging.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".dynamic-pack-", dir=staging) as folder:
+                connection = sqlite3.connect(Path(folder) / "delta.sqlite3")
+                try:
+                    connection.execute("PRAGMA journal_mode=OFF")
+                    connection.execute("PRAGMA synchronous=OFF")
+                    connection.execute("PRAGMA cache_size=-256")
+                    connection.execute("PRAGMA temp_store=FILE")
+                    connection.execute("CREATE TABLE delta(bucket TEXT,part INTEGER,position INTEGER,level INTEGER,PRIMARY KEY(bucket,part,position)) WITHOUT ROWID")
+                    for identifier, (key, position) in self._dirty_locations.items():
+                        require(4096, "dynamic packed dirty position")
+                        level = NeuralSubstrate.exact_effective_weight(self._dirty[identifier].get("effective_weight", 0))
+                        connection.execute("INSERT INTO delta VALUES(?,?,?,?)", (*key, position, level))
+                    connection.commit()
+                    seen = 0
+                    for key in self._ordered_keys:
+                        if revision != (self.graph_revision, self.persistence_revision):
+                            raise ValueError("dynamic source changed during streamed packing")
+                        count = int(self._descriptors[key]["count"])
+                        require(4096 + count * 4, "dynamic packed exact group")
+                        values = torch.zeros(count, dtype=torch.int8)
+                        structures, packed = self._forward_by_shard.get(key, ([], b""))
+                        for offset, (position, _identifier, _source, _target) in enumerate(structures):
+                            values[position] = _unpack_ternary_level(packed, offset)
+                        for position, level in connection.execute("SELECT position,level FROM delta WHERE bucket=? AND part=?", key):
+                            values[position] = level
+                        seen += count
+                        yield values
+                    if seen != source_count or revision != (self.graph_revision, self.persistence_revision):
+                        raise ValueError("streamed dynamic packing coverage/source revision differs")
+                finally:
+                    connection.close()
+        return TernaryPackedSource((source_count,), pages), source_count, digest.hexdigest(), _DYNAMIC_ORDER_BASIS
+
     def paging_status(self) -> Dict[str, Any]:
         return {
             "mode": "generation-indexed-content-addressed-lazy-synapses",
@@ -4490,10 +4895,12 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             "persistedColdSynapses": self.persisted_cold_count,
             "forwardEdges": self.forward_edge_count,
             "synapticUses": self.synaptic_use_count,
-            "packedForwardBytes": sum(
-                len(packed)
-                for _structures, packed in self._forward_by_shard.values()
+            "packedForwardBytes": (
+                sum(row["packedBytes"] for row in self._forward_by_shard.descriptors.values())
+                if hasattr(self._forward_by_shard, "descriptors")
+                else sum(len(packed) for _structures, packed in self._forward_by_shard.values())
             ),
+            "forwardTopologyResidency": "paged-immutable-groups" if hasattr(self._forward_by_shard, "descriptors") else "legacy-resident",
             "forwardWeightsPerByte": 4,
             "denseForwardWeightsMaterialized": False,
             "shards": len(self._ordered_keys),
@@ -4519,6 +4926,9 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         self._persisted_forward_index = True
 
     def _persisted_index_entry(self, key: Tuple[str, int]) -> Dict[str, Any]:
+        reused = getattr(self._forward_by_shard, "reused_entry", None)
+        if callable(reused):
+            return reused(key)
         descriptor = self._descriptors[key]
         record_spec = descriptor["records"]
         tensor_spec = descriptor["tensors"]
@@ -4826,7 +5236,8 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         records, tensors = self._read_shard(key)
         restored = _TrackedSynapseRecord(
             self._restore_record(records[index], tensors, index),
-            self._graph_changed,
+            lambda: self._graph_changed(record_id),
+            self._persistence_changed,
         )
         self._dirty[record_id] = restored
         self._dirty_locations[record_id] = location
@@ -4856,15 +5267,15 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                 )
         self._exact_uses(record.get("uses", 0))
         self._dirty[record_id] = _TrackedSynapseRecord(
-            record, self._graph_changed
+            record, lambda: self._graph_changed(record_id), self._persistence_changed
         )
-        self._graph_changed()
+        self._graph_changed(record_id)
 
     def __delitem__(self, record_id: str) -> None:
         if record_id in self._new_ids:
             self._new_ids.remove(record_id)
             self._dirty.pop(record_id, None)
-            self._graph_changed()
+            self._graph_changed(record_id)
             return
         location = self._dirty_locations.get(record_id) or self._locate(record_id)
         if location is None or record_id in self._deleted_locations:
@@ -4877,13 +5288,26 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         self._dirty.pop(record_id, None)
         self._dirty_locations.pop(record_id, None)
         self._deleted_locations[record_id] = location
-        self._graph_changed()
+        self._graph_changed(record_id)
 
-    def _graph_changed(self) -> None:
+    def _graph_changed(self, record_id: Optional[str] = None) -> None:
         self.graph_revision += 1
+        self._persistence_changed()
+        observer = getattr(self, "_recall_graph_observer", None)
+        if callable(observer):
+            observer(record_id, self.graph_revision)
+
+    def _persistence_changed(self) -> None:
+        self.persistence_revision += 1
 
     def iter_effective_edges(self) -> Iterator[Tuple[str, str, int]]:
         """Yield the exact current non-zero graph without paging cold records."""
+
+        for _identifier, source, target, level in self.iter_effective_edge_records():
+            yield source, target, level
+
+    def iter_effective_edge_records(self) -> Iterator[Tuple[str, str, str, int]]:
+        """Include actual edge IDs for exact incremental execution indexing."""
 
         replacements_by_shard: Dict[
             Tuple[str, int], Dict[int, Dict[str, Any]]
@@ -4900,10 +5324,10 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             deleted = deleted_by_shard.get(key, set())
             structures, packed = self._forward_by_shard.get(key, ([], b""))
             if not replacements and not deleted:
-                for offset, (_index, _record_id, source, target) in enumerate(
+                for offset, (_index, record_id, source, target) in enumerate(
                     structures
                 ):
-                    yield source, target, _unpack_ternary_level(packed, offset)
+                    yield record_id, source, target, _unpack_ternary_level(packed, offset)
                 continue
             base = {
                 index: (
@@ -4926,13 +5350,14 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     )
                     if weight:
                         yield (
+                            str(replacement["id"]),
                             str(replacement["source_id"]),
                             str(replacement["target_id"]),
                             weight,
                         )
                     continue
-                _record_id, source, target, weight = base[index]
-                yield source, target, weight
+                record_id, source, target, weight = base[index]
+                yield record_id, source, target, weight
         for record_id, record in self._dirty.items():
             if record_id not in self._new_ids:
                 continue
@@ -4940,7 +5365,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                 record.get("effective_weight", 0)
             )
             if weight:
-                yield str(record["source_id"]), str(record["target_id"]), weight
+                yield record_id, str(record["source_id"]), str(record["target_id"]), weight
 
     def observed_effective_levels(self) -> set[int]:
         levels = {weight for _source, _target, weight in self.iter_effective_edges()}
@@ -5057,6 +5482,27 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         ],
         hot_node_ids: Iterable[str],
     ) -> List[Dict[str, Any]]:
+        if hasattr(self._forward_by_shard, "reused_entry"):
+            hot_ids = (hot_node_ids if callable(getattr(hot_node_ids, "iter_sorted_ids", None))
+                       else {str(value) for value in hot_node_ids if str(value)})
+            prior = self._forward_index_manifest or {}
+            same_membership = _forward_hot_ids_sha256(
+                hot_ids, prior.get("hotNodeIdsChecksumAlgorithm", "sha256-sorted-ids-v1")
+            ) == prior.get("hotNodeIdsSha256")
+            def bounded_entries():
+                for descriptor in descriptors:
+                    key = str(descriptor["bucket"]), int(descriptor["part"])
+                    changed = changed_groups.get(key)
+                    if changed is not None:
+                        yield _forward_index_entry(descriptor, changed, hot_ids)
+                    elif same_membership:
+                        yield self._forward_by_shard.reused_entry(key)
+                    else:
+                        # Legacy callers without the production complete
+                        # endpoint index must faithfully verify/reindex every
+                        # old group when assembly membership changes.
+                        yield _forward_index_entry(descriptor, self._group_records(key), hot_ids)
+            return bounded_entries()
         hot_ids = {str(value) for value in hot_node_ids if str(value)}
         # Index hot locations once.  The previous comprehension lived inside
         # the descriptor loop and therefore rescanned every hot edge for every
@@ -5119,7 +5565,18 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             Tuple[str, int], Sequence[Tuple[str, Mapping[str, Any]]]
         ],
         hot_node_ids: Iterable[str],
+        *, forward_manifest: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        if forward_manifest is not None and forward_manifest.get("formatVersion") == 4:
+            replacement = LazyPersistedSynapses(self.root, descriptors, len(self), self.records_per_shard,
+                                                hot_node_ids, forward_manifest, store_version=_SUBSTRATE_STORE_VERSION)
+            revision, persistence_revision = self.graph_revision, self.persistence_revision
+            observer = getattr(self, "_recall_graph_observer", None)
+            self.__dict__.update(replacement.__dict__)
+            self.graph_revision, self.persistence_revision = revision, persistence_revision
+            if observer is not None:
+                self._recall_graph_observer = observer
+            return
         previous_forward = self._forward_by_shard
         previous_ranges = self._range_by_key
         previous_uses = self._uses_by_shard

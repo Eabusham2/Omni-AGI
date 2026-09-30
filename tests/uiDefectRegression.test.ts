@@ -11,6 +11,11 @@ const chatWorkspaceActivity = readFileSync(
 );
 
 describe("screenshot defect regressions", () => {
+  it("describes context residency without denying real cold-attention spill", () => {
+    expect(app).toContain("hot activity in RAM, cold attention can use the designated pool");
+    expect(app).not.toContain("never paged to storage");
+  });
+
   it("bounds diagnostics at the toast and compact job surfaces", () => {
     expect(app).toContain("const presentedMessage = conciseUiMessage(message)");
     expect(app).toContain("className=\"toast__message\"");
@@ -44,7 +49,7 @@ describe("screenshot defect regressions", () => {
     expect(app).toContain('{draftTokenCount.toLocaleString()} draft · {contextTokenCopy} · {composerTelemetryCopy}');
     expect(app).toContain("utf8DraftTokenCount(input)");
     expect(app).toContain("Enter queues · Ctrl/Cmd Enter steers");
-    expect(app).toContain("Reply complete · Enter sends the next message");
+    expect(app).toContain("Enter to send · Shift Enter for a line break");
     expect(app).toContain("pendingChatOutputPresentation({");
     expect(app).toContain("responseOutputPresentation.label");
     expect(app).toContain("response-token-counter--${responseOutputPresentation.phase}");
@@ -64,7 +69,8 @@ describe("screenshot defect regressions", () => {
     expect(app).not.toContain(
       'current.filter((message) => !message.id.startsWith("pending-"))'
     );
-    expect(app).toMatch(/event\.type === "chat-state"[\s\S]{0,1600}setSending\(false\)/);
+    expect(app).toContain("const finishGeneration = (turnId: string");
+    expect(app).toContain("advanceChatGenerationPhase(previousPhase, event)");
     expect(app).not.toContain(
       "window.omni.chat.cancel(brain.id, turnMetadata.replacesTurnId)"
     );
@@ -72,18 +78,19 @@ describe("screenshot defect regressions", () => {
     expect(styles).toContain(".message--failed .message__content");
   });
 
-  it("keeps a completed reply visible and queue-only while learning commits", () => {
+  it("retains final output independently while its atomic save commits", () => {
     expect(app).toContain('event.type === "chat-phase"');
     expect(app).toContain("const presentation = replyCompleteLearningPresentation(event)");
     expect(app).toMatch(
-      /event\.type === "chat-phase"[\s\S]{0,500}batcher\.flush\(\)[\s\S]{0,300}setReplyCompleteLearning\(presentation\)/
+      /event\.type === "chat-phase"[\s\S]{0,600}finishGeneration\(event\.turnId, event\.createdAt, !event\.turnCommitted\)/
     );
-    expect(app).toContain("replyCompleteLearning?.label");
+    expect(app).toContain("retainUncommittedChatOutput(");
+    expect(app).toContain('event.type === "chat-reply-committed"');
+    expect(app).toContain("Reply complete · save pending, not committed");
     expect(app).toContain('const active = sending || Boolean(activeTurnIdRef.current)');
     expect(app).toMatch(/if \(active\) \{\s*queueCurrentTurn\(\)/);
-    expect(app).toMatch(
-      /event\.type === "chat-state"[\s\S]{0,1500}setReplyCompleteLearning\(null\)[\s\S]{0,500}setSending\(false\)/
-    );
+    expect(app).not.toContain("setReplyCompleteLearning(null)");
+    expect(app).toContain("if (activeTurnIdRef.current !== turnId) return;");
   });
 
   it("preserves chat across navigation and exposes explicit busy-brain choices", () => {
@@ -105,7 +112,8 @@ describe("screenshot defect regressions", () => {
     );
     expect(app).toContain('className="send-button composer__queue-choice"');
     expect(app).toContain("onClick={submitOrdinaryTurn}");
-    expect(app).toContain('className="send-button composer__post-reply-send"');
+    expect(app).toContain('className="chat-tool-status" role="status"');
+    expect(app).toContain("Cancel the exact job in its action details.");
     expect(app).toContain('className="composer__stop-choice"');
     const queueControl = app.indexOf(
       'className="send-button composer__queue-choice"'
@@ -115,7 +123,7 @@ describe("screenshot defect regressions", () => {
       queueControl
     );
     expect(stopControl).toBeGreaterThan(queueControl);
-    expect(app).toContain('replyCompleteLearning && "message__streaming-text--reply-complete"');
+    expect(app).toContain("const showTurnActivity =\n    textTurnVisiblyActive || voicePondering;");
     expect(styles).toMatch(
       /\.message__streaming-text--reply-complete::after\s*\{[^}]*display: none;[^}]*animation: none;/
     );

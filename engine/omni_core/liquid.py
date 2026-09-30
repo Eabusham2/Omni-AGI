@@ -66,9 +66,11 @@ class LTCCell(nn.Module):
         # conductances; softplus still makes the physical coefficients
         # strictly positive. A constant input supplies their shared gain.
         self.leak_logit = BitLinear(1, hidden_size, bias=False, scale=0.25)
-        self.leak_logit.fill_ternary_(-1)
+        if not self.leak_logit._native_loading_checkpoint:
+            self.leak_logit.fill_ternary_(-1)
         self.capacitance_logit = BitLinear(1, hidden_size, bias=False, scale=0.25)
-        self.capacitance_logit.fill_ternary_(0)
+        if not self.capacitance_logit._native_loading_checkpoint:
+            self.capacitance_logit.fill_ternary_(0)
 
     def forward(
         self,

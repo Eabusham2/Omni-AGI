@@ -57,7 +57,7 @@ export function preserveSteeredChatMessage(
   );
 }
 
-export type OptimisticChatTerminalState = "failed" | "cancelled";
+export type OptimisticChatTerminalState = "failed" | "cancelled" | "stopped";
 
 /**
  * A terminal renderer/RPC failure must settle the local receipt, not erase the
@@ -82,7 +82,7 @@ export function settleOptimisticChatTurn(
   turnId: string,
   state: OptimisticChatTerminalState
 ): ChatMessage[] {
-  const candidateIds = new Set([`pending-${turnId}`, `queued-${turnId}`]);
+  const candidateIds = new Set([`pending-${turnId}`, `queued-${turnId}`, `steered-${turnId}`]);
   return messages.map((message) =>
     candidateIds.has(message.id)
       ? { ...message, id: `${state}-${message.id}` }
@@ -134,25 +134,51 @@ export function reconcileCompletedChatSubmission(
   );
 }
 
+/** The ordered main stream correlates a saved result even for legacy message
+ * rows without turnId or a renderer-matching timestamp. Retire only that turn. */
+export function reconcileCompletedChatTurn(
+  optimistic: ChatMessage[],
+  turnId: string,
+  committedHuman: ChatMessage
+): ChatMessage[] {
+  return reconcileOptimisticChatMessages(
+    optimistic.filter((message) => optimisticTurnId(message) !== turnId),
+    [committedHuman]
+  );
+}
+
 export function chatMessageDeliveryState(
   message: ChatMessage
-): ChatDeliveryReceiptState | "pending" | undefined {
+): ChatDeliveryReceiptState | "no-reply" | undefined {
   if (message.deliveryReceipt?.presentationOnly) {
     return message.deliveryReceipt.state;
   }
+  if (message.generationEnd === "steered") return "steered";
+  if (message.generationEnd === "native-stop") return "stopped";
+  if (message.generationEnd === "no-reply") return "no-reply";
   if (message.id.startsWith("failed-")) return "failed";
   if (message.id.startsWith("cancelled-")) return "cancelled";
+  if (message.id.startsWith("stopped-")) return "stopped";
   if (message.id.startsWith("steered-")) return "steered";
   if (message.id.startsWith("queued-")) return "queued";
   if (message.id.startsWith("pending-")) return "pending";
   return undefined;
 }
 
+/** UI metadata, never assistant prose or a claim about the model's intent. */
+export function chatNoReplyPresentation(message: ChatMessage): { label: string; ariaLabel: string } | undefined {
+  if (message.role !== "brain" || message.generationEnd !== "no-reply" || message.content !== "") return undefined;
+  return {
+    label: "No reply · input saved",
+    ariaLabel: "Generation completed without printable assistant text. The human input and measured trace are saved."
+  };
+}
+
 function optimisticTurnId(message: ChatMessage): string | undefined {
   if (message.deliveryReceipt?.presentationOnly) {
     return message.deliveryReceipt.turnId;
   }
-  const normalized = message.id.replace(/^(?:failed-|cancelled-)/, "");
+  const normalized = message.id.replace(/^(?:failed-|cancelled-|stopped-)/, "");
   const prefix = ["pending-", "queued-", "steered-"].find((value) =>
     normalized.startsWith(value)
   );
@@ -196,6 +222,7 @@ export function mergeChatMessagesForPresentation(
     queued: 0,
     pending: 1,
     steered: 2,
+    stopped: 3,
     cancelled: 3,
     failed: 3
   };
@@ -268,15 +295,15 @@ export interface ComposerTurnCapabilities {
 }
 
 /**
- * Steering can only change a response that has not finished generating.
- * Post-reply learning still owns the serial runtime, but new input is
- * presented as an ordinary Send and serialized internally without exposing a
- * misleading Queue or Steer action.
+ * Generation controls end with the final output. Post-reply learning may
+ * still own a serial neural transaction, but the next ordinary Send enters
+ * main's safe ordering without exposing response Stop, Queue or Steer.
  */
 export function composerTurnCapabilities(
   phase: ComposerResponsePhase
 ): ComposerTurnCapabilities {
-  if (phase === "idle") {
+  if (phase === "idle" || phase === "reply-complete-learning" ||
+      phase === "action-result-learning") {
     return {
       turnActive: false,
       queueAvailable: false,

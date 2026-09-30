@@ -35,7 +35,7 @@ describe("cross-workspace chat activity", () => {
     expect(workspaceChatActivityPresentation(saving)).toMatchObject({
       headerLabel: "Reply complete · learning/saving · 2 messages queued",
       showStreamingCursor: false,
-      blocksImmediateBrainActions: true
+      blocksImmediateBrainActions: false
     });
     expect(workspaceChatActivityPresentation({
       ...saving,
@@ -43,9 +43,9 @@ describe("cross-workspace chat activity", () => {
     })).toMatchObject({
       headerLabel: "Action complete · integrating result · 2 messages queued",
       waitingLabel:
-        "The visible action is complete while its result enters neural learning. Return to Conversation to Queue or Steer.",
+        "Completed output stays visible while save/action work runs independently.",
       showStreamingCursor: false,
-      blocksImmediateBrainActions: true
+      blocksImmediateBrainActions: false
     });
   });
 

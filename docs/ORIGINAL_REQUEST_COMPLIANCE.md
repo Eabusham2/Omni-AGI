@@ -12,8 +12,12 @@ auditable statements.
   limited.
 - **Partial**: a safe bounded version exists; the exact wording would overstate
   the implementation.
-- **Open**: final native verification, publication, or repository operation has
-  not happened yet.
+- **Open**: an identified current implementation gap remains. It does not
+  reopen a completed release, repository operation, or user-closed test.
+- **Released**: the scoped v1.1.0 code/UI/package/release gate completed; this
+  is not trained-brain capability evidence.
+- **Deferred proof**: native training/quality evidence was explicitly left for
+  a later user-initiated goal, not failed work in the completed release goal.
 - **Not claimed**: the request is a subjective or scientifically unsupported
   outcome rather than a testable software feature.
 
@@ -22,11 +26,33 @@ The status describes the implemented mechanism unless a row explicitly says
 automated fixtures do not by themselves prove useful model quality, a
 packaged-device workflow, or a current CI/release result. Historical Falcon
 results below are diagnostic evidence, not proof for a new native brain. The
-current cleanup instruction also defers new Build/training; the broader live
-acceptance requirements remain open for the user's later ground-up goal.
+current source-correction instruction also defers new Build/training; the
+broader native-quality requirements remain for the user's later ground-up
+goal. The removed cue-to-answer results are not accepted learning evidence.
 
 This is not a consciousness, human-equivalence, “unaligned AGI,” or
 frontier-quality claim.
+
+## Release, deferred proof, and current source corrections
+
+Reconciled through 2026-09-30 against
+[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md). That audit
+records published [v1.1.0](https://github.com/Eabusham2/Omni-AGI/releases/tag/v1.1.0),
+27 assets including the manifest/checksums, and successful cross-platform run
+[36495422025](https://github.com/Eabusham2/Omni-AGI/actions/runs/36495422025).
+The immutable package-source tag is `e96f580`; the later release-workflow
+commit is `bd3ac8e`. They are not represented as the same revision.
+
+| Scope | Disposition | What it does not establish |
+| --- | --- | --- |
+| Native-only source cleanup, code/GUI contracts, desktop/mobile packaging, merge/branch cleanup and published v1.1.0 | Completed for the released work; recorded local/remote branch state was only `main`. | Every neural test passing, useful trained-native conversation/recall, or a new release of this worktree. |
+| Full-folder native training, coherent recall/generalization, useful media/tools/agents and beneficial recursive improvement | Deferred by the user. | A requirement to create/train/quiz a brain or repeat user-closed feature checks now. |
+| New corrections for candidate v1.1.1 | Source integration and focused checks; exact remaining items are maintained in implementation status. The separate six-target codec runtime is published and hash verified. | Application commit/push, packaged validation/publication, or trained-native capability proof. |
+
+Historical MCP/media/recovery/device/crawl/theme and other accepted engineering
+checks stay historical and closed. Changed paths may need narrow source checks;
+that does not authorize rerunning every old live test. The dated ledger below
+preserves earlier observations, not an active release to-do list.
 
 ## Architecture and brain behavior
 
@@ -43,7 +69,7 @@ frontier-quality claim.
 | Use liquid neural networks | Implemented | CfC is the stable default and LTC is an experimental engine path | `engine/omni_core/liquid.py`; `engine/tests/test_dynamics.py` |
 | Use vector-symbolic architectures | Implemented | VSA/HDC binding, bundling, permutation, distributed assembly formation, and signed recurrent spreading through the authoritative substrate | `engine/omni_core/vsa.py`; `engine/tests/test_memory_modalities.py` |
 | Ideas should connect to parts of ideas, not exist only as token strings | Source mechanism; semantic quality open | Atomic and compositional neurons can form distributed assemblies joined by typed ternary synapses. The existence of those structures does not prove useful concept understanding in a trained native brain | `engine/omni_core/vsa.py`; `engine/tests/test_memory_modalities.py` |
-| Ideas, parameters, and synapses should be “one thing” | Partial | Default chat does not consult the removed cue→answer sequence memory. V3 source gives neuron/assembly identity one packed ternary vector row and typed ternary pathways rather than a separate floating idea vector; dense cortical and sparse substrate structures remain coupled but distinct. New file transactions no longer switch to a small shared statistical field solely because of source size. Useful post-Fresh semantic recall from a trained native brain remains unproved | `engine/omni_core/vsa.py`; `engine/omni_core/brain.py`; `engine/omni_core/distributed_training.py`; `docs/GROUND_UP_DESIGN_CORRECTION_CHECKLIST.md` |
+| Ideas, parameters, and synapses should be “one thing” | Source neural authority unified; native quality deferred | The cue→answer sequence module/decoder bypass was removed; native load/import rejects matching legacy answer state rather than treating it as another recall option. V3 neuron/assembly views share packed learned rows and typed ternary pathways. Cortical and sparse regions are coupled components of one committed neural identity, not separate answer authorities; the accepted unified-substrate plan does not require one literal tensor. New file transactions no longer collapse large inputs solely by size. Useful post-Fresh semantic recall and large-scale operation remain deferred/partial as recorded separately | `engine/omni_core/vsa.py`; `engine/omni_core/brain.py`; `engine/omni_core/distributed_training.py`; `docs/IMPLEMENTATION_STATUS.md` |
 | Understand an experience as a whole, not only token by token | Baseline | A bidirectional global workspace distills the complete available input into shared latents before causal boundary decoding | `engine/omni_core/model.py`; `engine/tests/test_brain.py` |
 | Make behavior fuzzy, noisy, and not perfectly precise | Implemented | State-dependent spike timing, uncertainty, competing branches, organic generation noise, and liquid dynamics | `engine/omni_core/brain.py`; `engine/omni_core/spiking.py` |
 | Let it trace its steps | Implemented | Operational traces record seeds, activations, recalls, routing, branches, actions, and parameter deltas | `engine/omni_core/brain.py`; `tests/actionProtocol.test.ts` |
@@ -61,18 +87,18 @@ frontier-quality claim.
 
 | User request | Status | What current source provides or leaves open | Evidence |
 | --- | --- | --- | --- |
-| Data should become parameters/synapses rather than only temporary context | **Partial; saved-brain proof open** | In desktop transactional chat, the current utterance conditions the reply through temporary neural activity; after a successful decode and before turn completion, it changes sparse latent/ternary synapses and queues dense decoder/bridge/adapter/liquid optimization. Dense module weights do **not** change at that moment. Focused fixtures show queued replay can later change/persist decoder weights, but the saved legacy Nova copy still had eight pending and zero completed replay jobs after the latest live inspection. Its old repeated reply had 1,138 recent-dialogue tokens in the generation trace, so it is not proof of weight-based recall. Correct, paraphrased post-Fresh/restart generation from changed shared weights remains unproved | `engine/omni_core/brain.py`; `engine/tests/test_async_chat_slow_learning.py`; `engine/tests/test_default_chat_no_lookup.py`; `.runtime/live-acceptance/results.md` |
-| Remember everything | Partial | Total Recall can retain exact source bytes; parametric memory is lossy and cannot guarantee perfect recall | `engine/omni_core/brain.py`; `engine/tests/test_release_gates.py` |
+| Data should become parameters/synapses rather than only temporary context | **Partial; native quality proof deferred** | The current utterance first conditions the reply through temporary activity; an accepted turn then changes authoritative packed memory vectors/synapses and queues cortical/bridge/adapter/liquid refinement. The queued stage is not an immediate completed cortical update. The old Nova snapshot recorded eight pending and zero completed replay jobs, and its repeated reply used 1,138 recent-dialogue tokens; those are historical rejected-hybrid observations, not current instance state or native recall proof. Correct, paraphrased post-Fresh/restart generation from changed shared weights remains unproved | `engine/omni_core/brain.py`; `engine/tests/test_async_chat_slow_learning.py`; `engine/tests/test_default_chat_no_lookup.py`; `docs/IMPLEMENTATION_STATUS.md` |
+| Remember everything | Perfect recall not guaranteed | Parametric memory is lossy. An unsanitized backup preserves source bytes already saved, not deleted/unretained material. The later locked ordinary-memory decision superseded the Total Recall chooser; do not reintroduce it as an unfinished requirement | `engine/omni_core/brain.py`; `docs/IMPLEMENTATION_STATUS.md` |
 | Add a real working memory/context window | Partial; >32k/device-theoretical context unimplemented | Recent role-token/sensory context is separate from recurrent/paged items, liquid state, active assemblies, rehearsal, decay, and eviction. Resource planning sizes capacity and native parameter count, but the default active-context ceiling is **32,768 tokens** and current callers do not override it. Manual >32k or multimillion-token raw context is not implemented: exact attention still compares every key, even though an eval-only incremental decoder now caches unchanged prefix state for shorter turns. Merely lifting the UI/planner ceiling would not make 4M practical. The response budget is separately bounded | `architecture/omnicortex-ground-up-v1.json`; `src/main/resourcePlanner.ts`; `src/renderer/src/App.tsx`; `engine/omni_core/model.py`; `engine/omni_core/brain.py`; `tests/resourcePlanner.test.ts`; `engine/tests/test_decoder_incremental.py` |
-| Support short and long timescales | **Mechanism implemented; live slow-weight completion open** | Whole experiences can affect bounded working activity, immediate temporal/episodic synapses, recurrently spreading assemblies, replay, and slow weights. Distinct rows sharing one semantic assembly keep distinct working/afterimage vectors; near-identical repeats merge, and cold pages are not consumed merely because the assembly matches. Latent replay uses nonzero, deterministic, organically weighted admission instead of the former fixed importance cutoff; low-priority rows are sampled, not guaranteed a slow update. The saved legacy Nova copy had eight queued chat replay jobs and zero completed at its last inspection, so it did not prove the slow-weight stage | `engine/omni_core/brain.py`; `engine/omni_core/memory_lifecycle.py`; `engine/omni_core/offload.py`; `engine/tests/test_transient_episode_identity.py`; `engine/tests/test_replay_admission_policy.py`; `engine/tests/test_async_chat_slow_learning.py` |
+| Support short and long timescales | **Mechanism present; native slow-weight/recall proof deferred** | Whole experiences affect working activity, fast packed synapses/vectors, recurrent assemblies and selective slow replay. Exact same-assembly episodes retain distinct afterimages; admission is not a guarantee that every low-priority row completes cortical refinement. The new uncommitted raw-token helper binds proved episode spans to existing lifecycle signals so they can cool even with spare capacity; unlinked legacy tokens remain conservatively capacity-managed. The old Nova queue observation is historical, not native slow-stage proof. Complete persisted Fresh/restart recall and useful retention remain deferred | `engine/omni_core/brain.py`; `engine/omni_core/memory_lifecycle.py`; `engine/omni_core/recent_token_activity.py`; `docs/IMPLEMENTATION_STATUS.md` |
 | Do not paste long-term memory into a hidden prompt | Implemented | Runtime trace asserts no textual memory or tool-schema text injection | `engine/omni_core/brain.py`; `engine/tests/test_brain.py`; `engine/tests/test_tool_schemas.py` |
-| The brain should include initial training, not only what the user later feeds it | Baseline; broad language ability unproven | Build initializes native weights, trains a transparent project-authored tool/action curriculum into the mutable core and substrate, verifies mutation/coverage/ternary receipts, then learns explicitly selected resources before Chat opens. Single-file training rehearses capability trajectories at start/mid/final checkpoints; finite distributed training now has a committed-wave midpoint hook even for runs shorter than its periodic interval. This small curriculum and source schedule are not broad language pretraining or proof of tool competence; coherent conversation still requires data, compute, and live evaluation. A post-fix full constructor has not yet been rerun | `engine/omni_core/ground_up.py`; `engine/omni_core/brain.py`; `engine/omni_core/capability_rehearsal.py`; `engine/omni_core/distributed_training.py`; `engine/tests/test_distributed_runtime.py`; `engine/worker.py` |
+| The brain should include initial training, not only what the user later feeds it | Baseline; broad native ability deferred | Build initializes native packed weights, learns the declared curriculum and selected resources, and opens Chat when initial training finishes, **without a blocking readiness quiz**. Start/mid/final rehearsal hooks exist. The new packed distributed source path has canonical derivative updates, real source replay and resource-derived batches; small primitive/source fixtures do not qualify full native distributed throughput or language quality. Broad trained-native constructor/conversation runs remain deferred | `engine/omni_core/ground_up.py`; `engine/omni_core/capability_rehearsal.py`; `engine/worker.py`; `docs/IMPLEMENTATION_STATUS.md` |
 | Make tool meaning deep neural memory, not a hidden instruction | Partial; live comprehension unproved | The initial curriculum updates native action/route parameters, typed-argument syntax, and substrate assemblies; runtime schemas are structural vectors rather than prose prompt text. Normal chat and idle select concrete tools from the same trained internal neural route; the legacy hashed utterance head is no longer trained by the ground-up curriculum or used as a chat fallback. A checkpointed ternary argument head can form bounded idle queries/objectives and select a single browser operation from neural state only after host-confirmed route-specific grounding; the browser path also requires a grounded no-step example, and idle needs separately grounded full arguments. Syntax-only curriculum training cannot unlock these actions. Other tool payloads still require explicit user values and host validation. Source tests do not prove browser semantic generalization, fully integrated tool understanding, or useful autonomous behavior | `engine/omni_core/model.py`; `engine/omni_core/brain.py`; `engine/omni_core/ground_up.py`; `src/main/chatActionController.ts`; `engine/tests/test_organic_action_arguments.py`; `engine/tests/test_learned_tool_route.py` |
 | Keep an advanced genuinely blank option | Superseded by the later single-origin request | Public Build creates only locally initialized OmniCortex and performs its initial local capability training before Chat. Legacy blank/starter imports are rejected, not relabeled | `src/main/brainService.ts`; `engine/omni_core/config.py`; `engine/worker.py`; `tests/brainService.test.ts` |
 | One chat and one persistent identity per build | Implemented | Each brain owns one durable conversation, lineage, current state, and immutable origin | `src/main/brainRepository.ts`; `src/main/brainService.ts`; `tests/brainRepository.test.ts` |
 | Fork or copy an identity | Implemented | Fork and Duplicate use copy-on-write neural storage and independent lineage | `src/main/brainRepository.ts`; `tests/brainRepository.test.ts` |
 | Put a Duplicate button in the interface | Implemented | Duplicate is available in the Brain Library and active Run workspace | `src/renderer/src/App.tsx`; `tests/projectIntegrity.test.ts` |
-| Export/share the current brain and its original copy | Source-implemented; live Python reload open | `current` and `origin` `.omni` modes are intended to be self-contained; `referenced-local` needs exact blobs in the same repository and is **not** portable. ZIP/ZIP64 carries checksum-bound current/origin tensors, substrate, and packed ternary generations. Exports omit private chat ledgers, pending chat slow-replay jobs, active source-bound ingestion cursors, and cold temporary working-memory pages; the page checkpoint is reset to empty, so import is not an exact conversational or temporary-state continuation. Current/origin substrate JSON is scanned for recognizable secrets, and replay SQLite rows/checkpoints are validated; binary learned weights cannot be certified secret-free. Node round-trip fixtures exist, but post-cleanup export → import → trained Python-worker reload has not passed under the current no-Build instruction | `src/main/brainRepository.ts`; `src/main/portableReplayIntegrity.ts`; `src/main/portableWorkingMemory.ts`; `src/main/streamingZip.ts`; `tests/brainRepository.test.ts`; `docs/OMNI_FORMAT.md` |
+| Export/share the complete current brain and its original copy | Released gap corrected locally; native continuation proof deferred | All modes now preserve unsanitized selected/origin state, ledgers, pending learning, committed cursors/joints, cold pages, source versions/blobs, artifacts and recovery history. Focused storage checks passed; referenced mode still needs its local tensor objects. The OS credential vault remains outside the saved brain. Import is dormant, source-bound jobs are not automatically relocated, missing historical bytes are reported, and unfinished drafts fail export rather than importing as a fake brain. These uncommitted fixes are not in the old published artifacts | `src/main/brainRepository.ts`; `src/main/streamingZip.ts`; `docs/OMNI_FORMAT.md`; `docs/IMPLEMENTATION_STATUS.md` |
 | Remove fixed whole-brain archive limits | Implemented | The former 512 MiB/1 GiB/4,096-entry `.omni` cutoffs are removed. Streaming import/export retains structural and checksum validation, is exercised with 4,105 entries and ZIP64 metadata, and pauses at the real disk reserve | `src/main/streamingZip.ts`; `src/main/brainRepository.ts`; `tests/streamingZip.test.ts`; `docs/OMNI_FORMAT.md` |
 | Restore snapshots and the immutable origin | Implemented | Snapshot, restore, origin preservation, exact substrate-generation copying, and corrupt-shard rejection are covered | `engine/omni_core/persistence.py`; `src/main/brainRepository.ts`; `engine/tests/test_memory_modalities.py`; `tests/brainRepository.test.ts` |
 | Download compatible premade brains from GitHub | Source-implemented for native-compatible assets | Direct data-only `.omni`, recipe, and `.omnipack` assets pass checksum, architecture, native ground-up provenance, and license validation; legacy/Falcon brains are rejected, not converted. A live imported native brain remains unverified | `src/main/catalogInstaller.ts`; `src/main/brainRepository.ts`; `docs/CATALOG_FORMATS.md`; `tests/catalogInstaller.test.ts` |
@@ -82,7 +108,7 @@ frontier-quality claim.
 
 | User request | Status | What current source provides or leaves open | Evidence |
 | --- | --- | --- | --- |
-| Upload a PDF or programming-language reference and train on it | Implemented | PDF and source-code ingestion update neural state and retain provenance according to the selected memory recipe | `src/main/brainService.ts`; `engine/tests/test_release_gates.py` |
+| Upload a PDF or programming-language reference and train on it | Implemented | PDF and source-code ingestion update neural state and retain provenance through the locked ordinary-memory path; no basic recipe chooser is required | `src/main/brainService.ts`; `engine/tests/test_release_gates.py` |
 | Upload ordinary files and datasets | Implemented | General file/dataset pickers exist in Build, Data Studio, and Run/chat | `src/shared/uploadSupport.ts`; `src/renderer/src/App.tsx`; `tests/uploadSupport.test.ts` |
 | Upload images | Implemented | Dedicated image selection exists in Build, Data Studio, and Run/chat | `src/shared/uploadSupport.ts`; `src/renderer/src/App.tsx`; `tests/uploadSupport.test.ts` |
 | Upload audio | Implemented | Dedicated audio selection exists in Build, Data Studio, and Run/chat | `src/shared/uploadSupport.ts`; `src/renderer/src/App.tsx`; `tests/uploadSupport.test.ts` |
@@ -123,7 +149,7 @@ frontier-quality claim.
 | Video generation and input | Source-tested baseline; useful quality open | A trainable factorized liquid-gated video model and local decoding/encoding exist; coherent video has not passed a live native evaluation | `engine/omni_core/modalities.py`; `engine/tests/test_release_gates.py` |
 | Generate/train video with or without synchronized audio | Source-tested baseline; native playback open | Video ingestion admits visual frames and an embedded audio track when present. Generation can disable sound, or decode visual and abstract audio from the same idea, align duration, and mux H.264/AAC MP4; unavailable audio/FFmpeg paths are labeled silent/APNG rather than speech. Native playback, synchronization quality, and large-corpus training remain unproved | `engine/omni_core/brain.py`; `engine/tests/test_brain.py`; `engine/tests/test_live_observation.py`; `engine/tests/test_release_gates.py` |
 | Imagine from an internal idea rather than a hidden text prompt | Source mechanism; usefulness open | Active assembly identifiers can cue modality generation directly; the result's semantic fidelity depends on training not yet proved | `engine/omni_core/brain.py`; `tools/catalog.json` |
-| Imagine organically while writing/talking | Source-tested progressive path; live gate open | A typed imagination action can begin mid-turn and ordered image/audio/video decoder revisions stream while generation runs. Source fixtures check byte hashes, bounded cancellation, and preview replacement; they do not prove a trained brain spontaneously chooses useful media or that a packaged UI displays it smoothly | `engine/omni_core/brain.py`; `engine/omni_core/modalities.py`; `engine/worker.py`; `src/renderer/src/imaginationPresentation.ts`; `engine/tests/test_progressive_imagination.py`; `tests/imaginationPresentation.test.ts`; `tests/actionProtocol.test.ts` |
+| Imagine organically while writing/talking | Generation-bound choice mechanism; useful behavior deferred | The text loop reevaluates learned action heads at safe boundaries, with stable action identities and no creativity prompt. Permitted independent external actions can start while text is composed; native mutations remain serialized. Preview hashes, cancellation and replacement have focused source checks. Useful spontaneous choice and semantic media fidelity require trained-native evidence | `engine/omni_core/brain.py`; `engine/omni_core/modalities.py`; `engine/worker.py`; `src/renderer/src/imaginationPresentation.ts`; `docs/IMPLEMENTATION_STATUS.md` |
 | Make preview generation instantaneous or frontier quality | Not claimed | Preview cadence is bounded by the selected local hardware profile and tiny baseline models | — |
 | Fork subagents, let them work separately, then merge | Source mechanism; useful live task open | Isolated copy-on-write branches can return reviewed assemblies, evidence, files, artifacts, and replay examples without whole-model averaging. Digest/SQLite merge tests cover stale-state rejection, paging, and idempotency, including a 10,050-row fixture; they do not establish a useful autonomous subagent result or a successful live trained-brain merge | `engine/omni_core/brain.py`; `engine/worker.py`; `src/main/brainService.ts`; `src/main/mergeEvidenceStore.ts`; `engine/tests/test_worker.py`; `tests/brainService.test.ts`; `tests/mergeEvidenceStore.test.ts` |
 | Give Full Authority if the user selects it | Implemented | Full can skip per-action confirmation, while the trusted executor still validates and audits the action | `src/main/toolExecutor.ts`; `tests/toolExecutor.test.ts` |
@@ -151,23 +177,23 @@ frontier-quality claim.
 
 | User request | Status | What current source provides or leaves open | Evidence |
 | --- | --- | --- | --- |
-| Native-packaged Windows 11 app with Build and Run | Source-implemented; current package gate open | Electron main/preload isolation, Windows styling, four-stage Build, and one-chat Run workspace are in source. A current-revision Windows package and complete ground-up Build/Run have not been verified | `src/main/index.ts`; `src/preload/index.ts`; `src/renderer/src/App.tsx`; `.github/workflows/windows.yml` |
+| Native-packaged Windows 11 app with Build and Run | Released v1.1.0; trained-native quality deferred | Electron main/preload isolation, four-stage Build and one-chat Run shipped with the scoped Windows package/health gate. This is not a broadly trained native Build/Run proof; newer worktree corrections are not yet packaged | `src/main/index.ts`; `.github/workflows/windows.yml`; `docs/IMPLEMENTATION_STATUS.md` |
 | Make the interface easier for basic users | Implemented | Four stages, checkbox choices, automatic hardware sizing, collapsed diagnostics, and no neural personality controls | `src/renderer/src/App.tsx`; `tests/projectIntegrity.test.ts` |
 | Keep advanced inspection without exposing personality controls | Implemented | Research diagnostics and paged substrate views show measured state | `src/renderer/src/App.tsx`; `tests/stableBrainInspection.test.ts` |
 | Make the Brain Map large enough for the learned substrate | Partial; committed overview is paged | The worker's committed-generation overview uses a cursor-paged aggregate index with no fixed displayed-node ceiling. Region-filtered synapse detail still builds a full neuron-region map, exact matched counts can scan all shards, and a separate in-process path can materialize metadata. Dirty live firing state is not yet a bounded real-time view; these paths must not be presented as fully scalable million-node inspection | `engine/worker.py`; `engine/omni_core/substrate_inspection.py`; `engine/omni_core/brain.py`; `src/renderer/src/App.tsx` |
-| Add macOS support | Implemented packaging; open native gate | Intel and Apple Silicon DMG/ZIP workflows exist; final current-revision native-green evidence is pending | `package.json`; `.github/workflows/macos.yml` |
-| Add Linux support | Implemented packaging; open native gate | x64 and ARM64 AppImage/DEB/tarball workflows exist; final current-revision native-green evidence is pending | `package.json`; `.github/workflows/linux.yml` |
-| Keep Windows x64 and ARM64 support | Implemented packaging; open native gate | NSIS/ZIP workflow exists; Windows ARM64 transparently labels its emulated x64 neural worker while the full native dependency set remains incomplete | `.github/workflows/windows.yml`; `docs/RELEASE.md` |
-| Add an Android companion that uses the same brain | Native client and CI gate defined; current APK/emulator proof open | The API 26+ client uses the opt-in desktop gateway and has unit/API-35 emulator plus debug-signed/release-unsigned APK steps in the workflow. Those configured steps are not a green run or evidence of an installable current-revision APK; this Mac currently has no Java runtime | `mobile/android/`; `src/main/mobileGateway.ts`; `.github/workflows/android.yml`; `tests/mobileGateway.test.ts`; `tests/releasePackaging.test.ts` |
-| Add an iPhone/iPad companion that uses the same brain | Native client and CI gate defined; current IPA/simulator proof open | The SwiftUI client uses Keychain and the paired chat/history/attachment gateway. A prior host Swift protocol smoke covered pair/list/history/NDJSON and upload, but no current-revision simulator, archive, unsigned/custom-signed IPA, or connected-device result is proved. This Mac currently selects Command Line Tools and cannot run `xcodebuild` | `mobile/ios/`; `src/main/mobileGateway.ts`; `.github/workflows/ios.yml`; `scripts/package-ios.sh`; `tests/mobileGateway.test.ts`; `tests/releasePackaging.test.ts` |
-| Name this stable release v1, not v2 | Version metadata implemented; publication open | Product metadata names `v1.1.0`; no current-revision stable release artifact/tag has been verified or published | `package.json`; `package-lock.json`; `scripts/verify-release.mjs` |
+| Add macOS support | Released v1.1.0 | Intel/Apple Silicon DMG/ZIP packages and the scoped native-host gate are recorded in the successful release run; new corrections are not yet packaged | `package.json`; `.github/workflows/macos.yml`; `docs/IMPLEMENTATION_STATUS.md` |
+| Add Linux support | Released v1.1.0 | x64/ARM64 AppImage/DEB/tarball packages and the scoped native-host gate are recorded in the successful release run; trained-brain quality is separate | `package.json`; `.github/workflows/linux.yml`; `docs/IMPLEMENTATION_STATUS.md` |
+| Keep Windows x64 and ARM64 support | Released v1.1.0 with explicit worker boundary | NSIS/ZIP targets completed. Windows ARM64 uses a native shell and honestly labeled emulated x64 worker; this is not a native ARM64 neural dependency-set claim | `.github/workflows/windows.yml`; `docs/RELEASE.md`; `docs/IMPLEMENTATION_STATUS.md` |
+| Add an Android companion that uses the same brain | Released client/scoped CI gate | The API 26+ paired desktop client and APK/emulator release job are recorded as completed. A connected, broadly trained native-brain session remains deferred; an older local JDK limitation is not a blocker for the already published release | `mobile/android/`; `.github/workflows/android.yml`; `docs/IMPLEMENTATION_STATUS.md` |
+| Add an iPhone/iPad companion that uses the same brain | Released client/scoped CI gate | The SwiftUI/Keychain paired desktop client and IPA/simulator release job are recorded as completed. Credential-dependent signing and a connected trained-brain physical-device session are separate; an older local Xcode limitation does not reopen the published release | `mobile/ios/`; `.github/workflows/ios.yml`; `docs/IMPLEMENTATION_STATUS.md` |
+| Name this stable release v1, not v2 | Released v1.1.0 | Stable v1.1.0 is published, not draft/prerelease. The newer uncommitted source fixes are not represented as that release's contents | `package.json`; `docs/IMPLEMENTATION_STATUS.md` |
 | Remove third-party source from the product runtime without losing the original research references | Product-runtime cleanup implemented; references preserved | New Builds do not load BitNet, snnTorch, or NCPS as alternate runtimes. The user's BitNet research checkout remains under `.runtime/bitnet-src`, and reference material must not be described as deleted or disposable; license texts remain in `licenses/` | `docs/GROUND_UP_DESIGN_CLEANUP.md`; `THIRD_PARTY_NOTICES.md`; `licenses/BitNet-MIT.txt`; `licenses/snnTorch-MIT.txt`; `licenses/NCPS-Apache-2.0.txt` |
 | Preserve third-party licensing after deleting those folders | Implemented | Package resources include the preserved MIT and Apache texts and the notice | `package.json`; `THIRD_PARTY_NOTICES.md` |
-| Make every build green | Open | Final current-revision local gates, six desktop architecture jobs, Android emulator/APK job, and iOS simulator/IPA job must still run | — |
-| Merge all verified work to `main` | Open | Repository operation belongs after the final verification sweep | — |
-| Tag and publish `v1.1.0` with checksums | Open | `v1.0.0` is already immutable on an earlier main commit; the guarded workflow must publish the current stable-minor release from a new tag | `.github/workflows/release.yml`; `scripts/verify-release-artifacts.mjs` |
-| Leave only the `main` branch | Open | Delete the feature branch locally/remotely only after verified merge and release | — |
-| Sign and notarize | Open/credential-dependent; source defect fixed | The macOS workflow now materializes a raw/base64 GitHub API-key secret into a validated mode-0600 temporary `.p8` path, unsets the raw secret, and removes the file. No real signing/notarization ran; unsigned artifacts must be labeled honestly | `.github/workflows/release.yml`; `docs/RELEASE.md` |
+| Make every declared release build green | Completed scoped v1.1.0 CI | All declared desktop/mobile, verification and publish jobs completed in run `36495422025`. The code/UI-contract/package/worker-health scope did not train a brain or establish that every neural test passes. New worktree checks/CI are separate | `docs/IMPLEMENTATION_STATUS.md` |
+| Merge all verified released work to `main` | Completed for v1.1.0 | The audit records release-workflow `bd3ac8e` on `main` and immutable package-source tag `e96f580`; no commit/push of the new corrections is claimed | `docs/IMPLEMENTATION_STATUS.md` |
+| Tag and publish `v1.1.0` with checksums | Completed | Published stable release and 27 assets, including manifest/checksums, are recorded. Do not replace its tag or dispatch another release merely because the new audit found a gap | `.github/workflows/release.yml`; `docs/IMPLEMENTATION_STATUS.md` |
+| Leave only the `main` branch | Completed at release audit | The 2026-09-29 audit records only `main` locally/remotely. This is recorded closure, not a new branch-deletion instruction | `docs/IMPLEMENTATION_STATUS.md` |
+| Sign and notarize when credentials are available | Credential-dependent; honestly unsigned accepted | Signing-ready/unsigned artifacts were permitted when secrets were absent. The temporary `.p8` secret handling is a source safeguard, not proof of universal signing/notarization or a reason to reopen the published gate | `.github/workflows/release.yml`; `docs/RELEASE.md`; `docs/IMPLEMENTATION_STATUS.md` |
 
 ## Follow-up verification ledger (historical live evidence; source status updated 2026-09-22)
 
@@ -178,6 +204,12 @@ all features. Rows describing Nova/Falcon runs are historical observations,
 not current saved-brain state or native OmniCortex proof. “Implemented” means
 a source mechanism plus an automated fixture, not a current green test, useful
 model quality, or a packaged live outcome.
+
+Earlier “open/pending” phrases in the recorded observations below are dated
+snapshot dispositions, not current instructions. Later user-closed engineering
+checks and the v1.1.0 release supersede them. Historical multi-rank results used
+the older architecture and do not establish the new packed collective path;
+marker-answer replay does not establish native parameter-based recall.
 
 | Follow-up requirement | Evidence status | Recorded evidence and remaining gap |
 | --- | --- | --- |
@@ -201,7 +233,7 @@ model quality, or a packaged live outcome.
 | Auto light/dark, distinct themes, separate color/layout, and layouts | **Implemented; final matrix rerun open** | System/light/dark, four palettes, four layout styles, four workspace arrangements, Default/Classic Blocky/Colorful/Liquid Glass packs, profiles, and persistence exist in `src/renderer/src/appearance.ts` and `src/renderer/src/appearanceWorkspace.ts`. Unit fixtures are green; the current complete Playwright theme/contrast/layout matrix is not yet final evidence. |
 | Fit all screens and keep the UI performant | **Source-tested; rebuilt visual/performance gate deferred** | Responsive CSS, safe-area/touch targets, navigation persistence, token batching, paged conversation/activity IPC, fixed 120-row chat and 60-row activity windows, safe media handles, and SQLite artifact keyset paging exist. Tests cover 100,000-entry window math, 2,000 messages, and 10,050 each of artifacts, journal rows, and training sources with at most 101 rows read per page. A 10,050-row merge also pauses/resumes through a disk-backed plan without a fixed evidence cap. Quantified browser performance and the 360×640 through 2,560×1,080 Playwright matrix were deferred with the rebuild. |
 | Live voice, device input/perception, Android APK, and iOS IPA | **Source-tested companion architecture; native/live gates open** | Web Speech/TTS voice, neural microphone observation, barge-in cancellation, camera/screen/microphone capture, host input, same-brain gateway, Kotlin/Swift clients, and build workflows have mocked/unit coverage. Mobile is a companion to the desktop brain, not an on-device Studio/model. A current packaged physical microphone/camera/device run, Android emulator/APK artifact, iOS simulator/IPA artifact, and connected trained-brain mobile session have not passed. Android packaging is locally blocked by absent JDK; iOS local simulator/IPA by Command Line Tools without full Xcode. CI job definitions are not green CI evidence. |
-| Test every feature, make CI green, release, merge to `main`, and leave only `main` | **Open** | Current CI is deliberately a code, UI-contract, package, worker-health, and mobile-companion gate; it no longer creates or trains a brain. This prevents long hosted neural-training runs from being mistaken for product acceptance. The separate ground-up training, natural recall, media quality, and all-feature live proof remain open for the next user goal. No current verified release or trained-brain capability claim is established by packaging CI. |
+| Test every feature, make CI green, release, merge to `main`, and leave only `main` | **Later scoped release completed; native quality deferred** | The 2026-09-29 audit records published v1.1.0, successful all-target code/UI-contract/package/worker-health/mobile/publish gates and `main`-only cleanup. Historical user-closed feature checks are not reopened. Full ground-up training, natural recall, useful media/tools and beneficial recursive improvement remain deferred by decision, not failures of that closed release. New uncommitted fixes are not part of its published artifacts. |
 | No hidden behavioral prompt, system-role training, RLHF, DPO, or reward model | **Implemented invariant; quality not implied** | Ground-up curriculum records transparent tool/action examples as neural training, excludes system-role dataset text, and injects neither tool-schema prose nor long-term source prose into the runtime token prompt. Code/tests and the live hybrid trace report no hidden behavioral prompt or runtime RLHF/reward model. Host permission and safety checks remain external and explicit. |
 
 ## Outcome requests that software tests cannot establish
@@ -212,30 +244,43 @@ model quality, or a packaged live outcome.
 | “Replicate the human brain” | Not claimed. LIF, STDP, liquid state, distributed assemblies, working activity, and automatic replay/slow learning are engineering analogies, not a biological replica. |
 | “Mega intelligent human” / “super smart even if slow” | Not claimed. Capability depends on architecture scale, training data, compute, and evaluation; the ground-up baseline and its local capability curriculum are intentionally small. |
 | “Understand the entirety of an idea” | Not provable. Whole-input latent integration and distributed assemblies are implemented, but semantic understanding is an empirical capability question. |
-| “Remember everything” | Not possible from parameters alone. Exact retained source bytes require Total Recall, and even then retrieval and reasoning can fail. |
+| “Remember everything” | Perfect recall from parameters is not guaranteed. Backups preserve already-retained source bytes, not lost or unretained material; correct retrieval/reasoning is still not guaranteed. The canceled Total Recall chooser is not reinstated. |
 | “Think freely” / “build its own ethics” | No hidden persona, RLHF, or preference objective is present, but subjective autonomy or moral agency is not a software acceptance claim. |
 
-## Still-unproved native acceptance gates
+## Deferred native proof and separate current source gaps
 
-The source audit does **not** close these requests. They require a later,
-explicitly authorized ground-up Build/training run and direct results:
+The source/release goal is closed, but it does **not** prove the following
+native-quality requests. They require a later user-initiated Build/training
+goal and direct results, without repeating the already closed engineering
+tests as a new release prerequisite:
 
 - A created, saved, and reloaded native OmniCortex that answers coherently;
   paraphrased recall after Fresh/restart must come from changed neural state,
   without a cue→answer lookup or hidden source/history prompt.
-- A working-memory/context design that can honor a measured device-theoretical
-  Manual maximum above the current 32,768-token ceiling; 4M raw-token context
-  is not provided by today's exact all-keys attention path.
 - Full user-selected text and multimodal corpus coverage with durable receipts,
   useful concept growth beyond the shared statistical field, and measured
   image/audio/video quality (including video with optional synchronized audio).
 - Useful natural and prompt-free tool/research/agent/Ponder/imagination choices,
   correctly materialized arguments, host permissions, and a genuine live task.
-- A trained-brain Duplicate isolation test and self-contained `.omni` export →
-  import → Python-worker reload; `referenced-local` is not the portable mode.
-- Packaged UI, active-mode, voice, theme, responsive/performance and device
-  checks; current green desktop/mobile CI, signed or honestly unsigned
-  artifacts, and an explicitly verified release/merge.
+- Useful retained learning in a saved/reloaded native brain. Historical
+  Duplicate/fork/export/import engineering checks stay closed; the new exact
+  unsanitized state correction has separate source-integrity evidence, and
+  `referenced-local` is not a portable transfer mode.
+- Trained-native physical voice/perception/device behavior and connected-model
+  sessions where configured. This is not a demand to repeat the older closed
+  host/media/theme/device checks or the already completed package release.
 
-The current no-Build cleanup instruction leaves these open; it does not remove
-them from the user's intended final design.
+Current source work is tracked in [implementation status](IMPLEMENTATION_STATUS.md).
+The default 32,768 ceiling is removed; active attention has exact tiled
+RAM-first/storage-backed handling. Packed core paging, dirty publication,
+load-free cortical inspection, own-voice routing and generation-bound action
+choice have focused source checks. Remaining integration concerns are bounded
+slow/inline snapshots, complete sparse diagnostic/action views, distributed
+physical batching and the unresolved default initial-sizing preference.
+These mechanisms do not prove the deferred neural-quality outcomes above.
+
+The codec catalog is no longer empty: the separately published six-target
+runtime binds actual libx264/AAC binaries to reviewed corresponding source,
+build material and licenses, with 43 uploaded hashes verified. This is not
+legal/patent clearance or a neural media-quality result. The application source
+corrections are not yet committed, packaged or published.

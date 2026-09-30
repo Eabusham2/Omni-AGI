@@ -25,6 +25,8 @@ import type {
   StructuredNeuralExperience,
   ToolRouteLearningResult
 } from "./brainService";
+import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
+import { EngineRequestError } from "./engineSupervisor";
 
 export interface ActionChatService {
   chat(
@@ -46,6 +48,14 @@ export interface ActionChatService {
     signal?: AbortSignal
   ): Promise<ToolRouteLearningResult>;
   recordConversationActions?(brainId: string, actions: ActionEvent[]): Promise<void>;
+  cancelInlineImagination?(brainId: string, turnId: string, actionId: string): Promise<{
+    requested: boolean; acknowledged: boolean;
+  }>;
+  onInlineImaginationCancelled?(listener: (event: {
+    brainId: string; turnId: string; actionId: string;
+  }) => void): () => void;
+  onCodecRuntimeSetup?(listener: (event: { brainId: string; turnId: string; actionId: string; message: string }) => void): () => void;
+  steerChat?(brainId: string, turnId: string, successorTurnId: string): Promise<void>;
 }
 
 export interface ActionToolExecutor {
@@ -99,79 +109,47 @@ function serializableToolExperience(action: StructuredAction, output: unknown): 
 export function confirmedArgumentTrainingFields(
   action: StructuredAction
 ): Record<string, unknown> {
-  const toolId = canonicalSystemToolId(action.toolId) ?? action.toolId;
-  const credentialPattern = /\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|authorization|bearer)\s*[:=]|\b(?:sk-[a-z0-9_-]{16,}|ghp_[a-z0-9]{16,})\b/i;
-  if (toolId === "browser.automation" && action.action === "task") {
-    // A completed host invocation may teach an operation kind. Never admit
-    // typed page content or a multi-step program to autonomous supervision.
-    const url = action.arguments.url;
-    const steps = action.arguments.steps;
-    if (typeof url !== "string" || url.length > 16_000 || /[\r\n\0]/.test(url) ||
-        !url.startsWith("https://") || credentialPattern.test(url) ||
-        (steps !== undefined && !Array.isArray(steps))) return {};
-    let parsedUrl: URL;
-    try {
-      parsedUrl = new URL(url);
-    } catch {
-      return {};
+  // Host-confirmed, actual typed payloads teach the native argument head.
+  // Do not erase arbitrary user paths/content/experiences. Only explicit
+  // external credential/transport fields and sensitive browser entry steps
+  // are excluded from this particular autonomous argument-training channel.
+  const transportKeys = new Set([
+    "authorization", "proxyauthorization", "cookie", "setcookie", "headers",
+    "password", "passwd", "apikey", "accesstoken", "refreshtoken", "bearertoken"
+  ]);
+  const clean = (value: unknown, depth = 0): unknown => {
+    if (depth > 32) throw new Error("Typed host payload nesting exceeds the protocol budget.");
+    if (Array.isArray(value)) return value.map((item) => clean(item, depth + 1));
+    if (typeof value === "object" && value !== null) {
+      const object = value as Record<string, unknown>;
+      if (object.sensitive === true) throw new Error("Sensitive host entry is not an autonomous target.");
+      return Object.fromEntries(Object.entries(object).flatMap(([key, item]) => {
+        const normalized = key.replace(/[-_]/g, "").toLowerCase();
+        if (transportKeys.has(normalized)) return [];
+        return [[key, clean(item, depth + 1)]];
+      }));
     }
-    if (parsedUrl.protocol !== "https:" || parsedUrl.username || parsedUrl.password) return {};
-    const selected = Array.isArray(steps) ? steps : [];
-    if (selected.length > 1) return {};
-    if (selected.length === 0) {
-      return {
-        browserOperation: "none",
-        ...(parsedUrl.search || parsedUrl.hash
-          ? {} : { browserActionArguments: { url, steps: [] } })
-      };
+    if (typeof value === "number" && !Number.isFinite(value)) throw new Error("Nonfinite host payload.");
+    return value;
+  };
+  try {
+    const payload = clean(action.arguments) as Record<string, unknown>;
+    if (!action.toolId?.startsWith("mcp.")) {
+      for (const key of ["assemblyIds", "conceptIds", "organic", "recursive", "localPackEnabled", "trainedPackAvailable", "neuralRoute"]) delete payload[key];
     }
-    const step = selected[0];
-    if (typeof step !== "object" || step === null || Array.isArray(step)) return {};
-    const kind = (step as Record<string, unknown>).kind;
-    if (typeof kind !== "string" || ![
-      "click", "type", "press", "wait", "extract", "screenshot", "navigate"
-    ].includes(kind)) return {};
-    if (kind === "type") {
-      // The operation label is safe to learn; entered text is not.
-      return { browserOperation: kind };
+    // Keep user-authored ordinary strings untouched; URL authority credentials
+    // are transport material, not a parameter-learning target.
+    if (typeof payload.url === "string") {
+      const parsed = new URL(payload.url);
+      if (parsed.username || parsed.password) return {};
     }
-    // Keep the kind target independent of operands. For idle argument
-    // training admit only a canonical selector or no-operand screenshot; a
-    // URL query/fragment and arbitrary nested step fields are never copied.
-    if (parsedUrl.search || parsedUrl.hash) return { browserOperation: kind };
-    if (kind === "click") {
-      const selector = (step as Record<string, unknown>).selector;
-      if (typeof selector !== "string" || !selector || selector.length > 2_000 ||
-          /[\r\n\0]/.test(selector) || credentialPattern.test(selector)) {
-        return { browserOperation: kind };
-      }
-      return {
-        browserOperation: kind,
-        browserActionArguments: { url, steps: [{ kind, selector }] }
-      };
-    }
-    if (kind === "screenshot") {
-      return {
-        browserOperation: kind,
-        browserActionArguments: { url, steps: [{ kind }] }
-      };
-    }
-    return { browserOperation: kind };
+    return {
+      typedActionArguments: payload,
+      ...(action.inputSchema ? { inputSchema: action.inputSchema } : {})
+    };
+  } catch {
+    return {};
   }
-  const selectedFields =
-    toolId === "web.search" ? ["query"] :
-      toolId === "agent.fork" ? ["objective"] :
-        toolId === "source.self-modify" ? ["objective", "candidateKind"] : [];
-  return Object.fromEntries(
-    selectedFields.flatMap((key) => {
-      const value = action.arguments[key];
-      return typeof value === "string" &&
-        value.trim().length > 0 && value.length <= 1024 &&
-        !credentialPattern.test(value)
-        ? [[key, value.trim()] as const]
-        : [];
-    })
-  );
 }
 
 function actionFingerprint(action: StructuredAction): string {
@@ -279,6 +257,14 @@ interface ActiveTurn {
   runtimeCancellationFailed?: boolean;
   settled: Promise<void>;
   resolveSettled(): void;
+  actions: Map<string, ActionEvent>;
+  neuralBoundary: Promise<void>;
+  resolveNeuralBoundary(): void;
+  neuralCallStarted: boolean;
+  neuralEnded: boolean;
+  steerSuccessor?: string;
+  earlySteeredYield?: boolean;
+  pendingDrain?: Promise<void>;
 }
 
 interface ActionOutcome {
@@ -286,7 +272,7 @@ interface ActionOutcome {
   output?: unknown;
 }
 
-async function waitForTurnSettlement(
+async function waitForTurnNeuralBoundary(
   predecessor: ActiveTurn,
   signal: AbortSignal
 ): Promise<void> {
@@ -300,7 +286,7 @@ async function waitForTurnSettlement(
   };
   signal.addEventListener("abort", abort, { once: true });
   try {
-    await Promise.race([predecessor.settled, aborted]);
+    await Promise.race([predecessor.neuralBoundary, aborted]);
     signal.throwIfAborted();
   } finally {
     signal.removeEventListener("abort", abort);
@@ -334,6 +320,7 @@ export class ChatActionController extends EventEmitter {
     string,
     { brainId: string; expiresAt: number }
   >();
+  private readonly inlineCancellations = new Map<string, { turn: ActiveTurn; event: ActionEvent }>();
 
   constructor(
     private readonly service: ActionChatService,
@@ -341,6 +328,78 @@ export class ChatActionController extends EventEmitter {
     private readonly evolution: ActionEvolutionController
   ) {
     super();
+    service.onInlineImaginationCancelled?.((ack) => {
+      const key = `${ack.brainId}:${ack.turnId}:${ack.actionId}`;
+      const pending = this.inlineCancellations.get(key);
+      if (pending) this.settleInlineCancellation(key, pending);
+    });
+    service.onCodecRuntimeSetup?.((setup) => {
+      const turn = this.activeTurns.get(setup.turnId);
+      if (!turn || turn.brainId !== setup.brainId) return;
+      const action = [...turn.actions.values()].find((event) => event.neuralActionId === setup.actionId);
+      if (!action || action.cancellationRequested || !["proposed", "running"].includes(action.state)) return;
+      action.statusLabel = setup.message;
+      action.updatedAt = new Date().toISOString();
+      this.publishAction(turn.neuralEnded ? undefined : turn, action);
+    });
+  }
+
+  private settleInlineCancellation(key: string, pending: { turn: ActiveTurn; event: ActionEvent }): void {
+    const { turn, event } = pending;
+    this.inlineCancellations.delete(key);
+    event.cancellationRequested = false;
+    event.inlineGenerationOwned = false;
+    event.state = "stopped";
+    event.statusLabel = "Artifact cancelled · decoder cleanup acknowledged";
+    event.updatedAt = new Date().toISOString();
+    event.error = undefined;
+    this.publishAction(this.activeTurns.has(turn.turnId) ? turn : undefined, event);
+    void this.service.recordConversationActions?.(turn.brainId, [event]).catch(() => undefined);
+  }
+
+  async cancelInlineAction(brainId: string, turnId: string, actionEventId: string): Promise<{
+    actionEvent: ActionEvent; acknowledged: boolean;
+  }> {
+    const turn = this.activeTurns.get(turnId);
+    const event = turn?.actions.get(actionEventId);
+    if (!turn || turn.brainId !== brainId || !event || !event.neuralActionId || !event.inlineGenerationOwned ||
+        event.action.kind !== "imagine" || event.action.toolId !== "modality.imagine" ||
+        !["proposed", "running"].includes(event.state) || !this.service.cancelInlineImagination) {
+      throw new Error("This inline artifact is not owned by the requested active chat turn.");
+    }
+    const key = `${brainId}:${turnId}:${event.neuralActionId}`;
+    event.cancellationRequested = true;
+    event.statusLabel = "Cancelling artifact · waiting for decoder cleanup";
+    event.updatedAt = new Date().toISOString();
+    this.inlineCancellations.set(key, { turn, event });
+    this.publishAction(turn, event);
+    let result: { requested: boolean; acknowledged: boolean };
+    try {
+      result = await this.service.cancelInlineImagination(brainId, turnId, event.neuralActionId);
+    } catch (error) {
+      // A typed ownership refusal means no cancellation was admitted. A
+      // transport timeout is different: its control may still be in flight.
+      if (typeof error === "object" && error !== null && "code" in error &&
+          (error.code === -32602 || error.code === -32600)) {
+        this.inlineCancellations.delete(key);
+        event.cancellationRequested = false;
+        event.updatedAt = new Date().toISOString();
+        this.publishAction(this.activeTurns.has(turnId) ? turn : undefined, event);
+      }
+      throw error;
+    }
+    if (!result.requested) {
+      // A missing correlation is not a cancellation acknowledgement. Keep the
+      // direction/receipt intact and never kill or cancel the containing turn.
+      this.inlineCancellations.delete(key);
+      event.cancellationRequested = false;
+      throw new Error("The worker has not admitted this exact inline artifact cancellation.");
+    }
+    if (result.acknowledged && this.inlineCancellations.has(key)) {
+      this.settleInlineCancellation(key, { turn, event });
+    }
+    return { actionEvent: JSON.parse(JSON.stringify(event)) as ActionEvent,
+      acknowledged: event.state === "stopped" };
   }
 
   isBusy(brainId: string): boolean {
@@ -362,6 +421,7 @@ export class ChatActionController extends EventEmitter {
       | Omit<Extract<ChatStreamEvent, { type: "chat-action" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "modality-preview" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-phase" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
+      | Omit<Extract<ChatStreamEvent, { type: "chat-reply-committed" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-state" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
   ): void {
     const value = {
@@ -376,7 +436,7 @@ export class ChatActionController extends EventEmitter {
   }
 
   private publishAction(turn: ActiveTurn | undefined, event: ActionEvent): void {
-    if (turn) {
+    if (turn && !turn.earlySteeredYield) {
       this.publishStream(turn, {
         type: "chat-action",
         actionEvent: actionEventForTurnStream(event)
@@ -434,9 +494,9 @@ export class ChatActionController extends EventEmitter {
       return undefined;
     }
     const toolId = canonicalSystemToolId(action.toolId) ?? action.toolId;
-    // Only confirmed, bounded query/objective fields train autonomous
-    // argument generation. Never pass file contents, shell commands, source
-    // edits, or opaque MCP payloads into that head.
+    // Actual host-confirmed typed payloads, including complete plans, train
+    // the same native head. Credential/transport material alone is omitted;
+    // ordinary user-authored paths and content are not silently redacted.
     const typedArguments = confirmedArgumentTrainingFields(action);
     return this.service.learnToolRouteOutcome(
       event.brainId,
@@ -522,6 +582,8 @@ export class ChatActionController extends EventEmitter {
           ? value
           : undefined;
       const addExperts = action.arguments.addExperts;
+      const architectureChange = action.arguments.architectureChange === undefined
+        ? undefined : normalizeCompatibleArchitectureMutation(action.arguments.architectureChange);
       const sourceEdits = typedSourceEdits(action.arguments.sourceEdits);
       const hasTypedSourceEdits = Boolean(sourceEdits?.length);
       const modelOwned = action.source === "brain" || action.source === "organic";
@@ -550,7 +612,7 @@ export class ChatActionController extends EventEmitter {
       }
       if (
         modelOwned && candidateKind === "architecture" &&
-        (typeof addExperts !== "number" || !Number.isInteger(addExperts) || addExperts < 1)
+        !architectureChange && (typeof addExperts !== "number" || !Number.isInteger(addExperts) || addExperts < 1)
       ) {
         throw new Error("An architecture candidate needs a typed positive expert-growth amount.");
       }
@@ -577,10 +639,13 @@ export class ChatActionController extends EventEmitter {
             : undefined,
         latentReplay,
         objectives: stringArray(action.arguments.objectives),
+        ...(event.neuralActionId ? {
+          provenance: { source: "same-native-cortex-action", neuralActionId: event.neuralActionId, actionEventId: event.id, chatTurnId: requestId }
+        } : {}),
         ...(hasTypedSourceEdits ? { sourceEdits } : {}),
         architectureChange:
           candidateKind === "architecture"
-            ? {
+            ? architectureChange ?? {
                 mutation: "grow-experts",
                 addExperts:
                   typeof addExperts === "number" ? addExperts : undefined
@@ -627,6 +692,7 @@ export class ChatActionController extends EventEmitter {
           ? await this.tools.execute(invocation, undefined, requestId)
           : await this.tools.execute(invocation);
     event.execution = execution;
+    if (event.cancellationRequested || (event as ActionEvent).state === "stopped") return execution.output;
     event.state = execution.state;
     event.error = execution.error;
     event.updatedAt = execution.finishedAt ?? new Date().toISOString();
@@ -744,6 +810,8 @@ export class ChatActionController extends EventEmitter {
     const settled = new Promise<void>((resolve) => {
       resolveSettled = resolve;
     });
+    let resolveNeuralBoundary!: () => void;
+    const neuralBoundary = new Promise<void>((resolve) => { resolveNeuralBoundary = resolve; });
     const turn: ActiveTurn = {
       brainId,
       turnId,
@@ -752,7 +820,9 @@ export class ChatActionController extends EventEmitter {
       turnMetadata,
       runtimePhase: "pending",
       settled,
-      resolveSettled
+      resolveSettled,
+      actions: new Map(), neuralBoundary, resolveNeuralBoundary,
+      neuralCallStarted: false, neuralEnded: false
     };
     const abortFromCaller = (): void => controller.abort();
     signal?.addEventListener("abort", abortFromCaller, { once: true });
@@ -783,6 +853,8 @@ export class ChatActionController extends EventEmitter {
       action: StructuredAction,
       workerActionId?: string
     ): ActionEvent | undefined => {
+      workerActionId ??= action.actionId;
+      if (workerActionId && workerActions.has(workerActionId)) return workerActions.get(workerActionId);
       const fingerprint = actionFingerprint(action);
       if (seen.has(fingerprint)) {
         return workerActionId ? workerActions.get(workerActionId) : undefined;
@@ -794,10 +866,14 @@ export class ChatActionController extends EventEmitter {
         neuralActionCorrelation(workerActionId)
       );
       events.push(event);
+      turn.actions.set(event.id, event);
       if (workerActionId) workerActions.set(workerActionId, event);
       if (action.kind === "imagine") latestImagination = event;
       this.publishAction(turn, event);
-      const execute = async (): Promise<ActionOutcome> => {
+      const perform = async (): Promise<ActionOutcome> => {
+        // An inline cancellation must not be restarted as the later trusted
+        // host action after the containing text turn commits.
+        if (event.cancellationRequested || event.state === "stopped") return { event };
         let output: unknown;
         try {
           controller.signal.throwIfAborted();
@@ -809,14 +885,23 @@ export class ChatActionController extends EventEmitter {
             input
           );
         } catch (error) {
-          event.state = controller.signal.aborted ? "stopped" : "failed";
-          event.error = error instanceof Error ? error.message : String(error);
-          event.updatedAt = new Date().toISOString();
+          if (!event.cancellationRequested && (event as ActionEvent).state !== "stopped") {
+            event.state = controller.signal.aborted ? "stopped" : "failed";
+            event.error = error instanceof Error ? error.message : String(error);
+            event.updatedAt = new Date().toISOString();
+          }
         }
         this.publishAction(turn, event);
         return { event, output };
       };
+      let execution: Promise<ActionOutcome> | undefined;
+      const execute = (): Promise<ActionOutcome> => execution ??= perform();
       executions.push(execute);
+      // External tool execution uses the trusted tool executor's grants and
+      // durable pre-effect intent gate. Native brain mutations remain queued
+      // on its write boundary; action-result learning below waits for commit.
+      // Imagination retains its worker-owned progressive preview lifecycle.
+      if (workerActionId && action.kind === "tool") void execute();
       return event;
     };
     const consumeNeuralStream = (neural: NeuralChatStreamEvent): void => {
@@ -865,10 +950,22 @@ export class ChatActionController extends EventEmitter {
         queueAction(neural.action, neural.actionId);
         return;
       }
+      if (neural.type === "inline-imagination-started") {
+        const action = workerActions.get(neural.actionId);
+        if (action) {
+          action.inlineGenerationOwned = true;
+          action.state = "running";
+          action.statusLabel = "Preparing inline artifact";
+          action.updatedAt = new Date().toISOString();
+          this.publishAction(turn, action);
+        }
+        return;
+      }
       const action =
         (neural.actionId ? workerActions.get(neural.actionId) : undefined) ??
         latestImagination;
       if (!action) return;
+      if (action.cancellationRequested || action.state === "stopped") return;
       if (action.preview && neural.preview.revision <= action.preview.revision) return;
       action.preview = neural.preview;
       if (neural.preview.progress !== undefined) {
@@ -888,15 +985,14 @@ export class ChatActionController extends EventEmitter {
 
     try {
       if (warmHandoffPredecessor) {
-        // The Python neural runtime is deliberately serial. Keep the typed
-        // Steer turn queued until its predecessor settles on the same warm
-        // worker; steering must not cancel or overwrite the active user turn.
+        // Steer interrupts only the old generation at its next native safe
+        // boundary. Its committed partial reply and independent actions remain.
         const queue: ChatQueueState = {
           position: 1,
           queuedBehind: {
             requestId: warmHandoffPredecessor.turnId,
             owner: "chat",
-            label: "Chat response",
+            label: "Warm neural steering boundary",
             method: "chat",
             brainId,
             turnId: warmHandoffPredecessor.turnId
@@ -910,16 +1006,27 @@ export class ChatActionController extends EventEmitter {
           queue,
           turnMetadata
         });
-        await waitForTurnSettlement(warmHandoffPredecessor, controller.signal);
+        if (!warmHandoffPredecessor.neuralEnded) {
+          warmHandoffPredecessor.steerSuccessor = turnId;
+          if (warmHandoffPredecessor.neuralCallStarted) {
+            await this.service.steerChat?.(brainId, warmHandoffPredecessor.turnId, turnId);
+          }
+        }
+        await waitForTurnNeuralBoundary(warmHandoffPredecessor, controller.signal);
         turn.runtimePhase = "pending";
         turn.queue = undefined;
       }
       controller.signal.throwIfAborted();
+      if (turn.steerSuccessor) {
+        throw new EngineRequestError("Chat yielded to a newer warm steering direction before dispatch.", -32801,
+          { brainId, turnId, steered: true, zeroTokenYield: true, safeBoundary: true, warm: true });
+      }
       this.publishStream(turn, {
         type: "chat-state",
         state: "started",
         turnMetadata
       });
+      turn.neuralCallStarted = true;
       let result = await this.service.chat(
         brainId,
         input,
@@ -929,10 +1036,21 @@ export class ChatActionController extends EventEmitter {
       );
       for (const action of result.proposedActions ?? []) queueAction(action);
 
-      // Typed events and worker-side inline previews publish immediately, but
-      // trusted tool execution/auditing starts only after the neural response
-      // commits. This prevents two whole-brain persistence paths from racing
-      // and losing the original turn while preserving real-time imagination.
+      // service.chat has returned only after its atomic neural/host turn save
+      // (or exact durable receipt reconciliation). Optional artifacts and their
+      // learning must not keep the completed text owned by generation controls.
+      this.publishStream(turn, {
+        type: "chat-reply-committed",
+        humanMessage: result.humanMessage,
+        brainMessage: result.brainMessage,
+        pendingActions: executions.length
+      });
+      turn.neuralEnded = true;
+      turn.resolveNeuralBoundary();
+
+      // Streamed external tools may already be running after their independent
+      // durable intent/permission gate. Await the same memoized execution once;
+      // result learning and whole-brain auditing still use the committed turn.
       for (let index = 0; index < executions.length; index += 1) {
         controller.signal.throwIfAborted();
         const { event, output } = await executions[index]!();
@@ -1008,9 +1126,46 @@ export class ChatActionController extends EventEmitter {
       result.actionEvents = events;
       await this.service.recordConversationActions?.(brainId, events);
       result.turnMetadata = turnMetadata;
-      this.publishStream(turn, { type: "chat-state", state: "complete" });
+      this.publishStream(turn, { type: "chat-state", state: result.generationEnd === "steered" ? "steered" :
+        result.generationEnd === "native-stop" ? "stopped" : result.generationEnd === "no-reply" ? "no-reply" : "complete" });
       return result;
     } catch (error) {
+      if (error instanceof EngineRequestError && [-32801, -32802].includes(error.code ?? 0) &&
+          typeof error.data === "object" && error.data !== null &&
+          ((error.data as Record<string, unknown>).steered === true ||
+           (error.data as Record<string, unknown>).nativeStopped === true) &&
+          (error.data as Record<string, unknown>).brainId === brainId &&
+          (error.data as Record<string, unknown>).turnId === turnId) {
+        turn.earlySteeredYield = true;
+        turn.neuralEnded = true;
+        this.publishStream(turn, { type: "chat-state", state: error.code === -32801 ? "steered" : "stopped" });
+        turn.resolveNeuralBoundary();
+        // Already-started permitted actions keep their own receipts. Their
+        // outcome learning remains serialized, but never delays the successor.
+        turn.pendingDrain = (async () => {
+          for (const execution of executions) {
+            const { event, output } = await execution();
+            if (event.state !== "complete") continue;
+            await this.learnConfirmedToolRoute(event, input, controller.signal).catch(() => undefined);
+            if (this.service.learnStructuredExperience && !["talk", "ponder", "learn"].includes(event.action.kind)) {
+              await this.service.learnStructuredExperience(brainId, {
+                content: serializableToolExperience(event.action, output),
+                name: `Interrupted chat ${event.action.kind} result`,
+                sourceLabel: "chat visible action evidence", license: "Locally observed tool result"
+              }, controller.signal).catch((learningError: unknown) => {
+                event.error = `Action result learning failed: ${String(learningError)}`;
+                event.updatedAt = new Date().toISOString();
+                this.publishAction(undefined, event);
+              });
+            }
+          }
+          await this.service.recordConversationActions?.(brainId, events);
+        })().catch(() => undefined).finally(() => {
+          this.activeTurns.delete(turnId);
+          turn.resolveSettled();
+        });
+        throw error;
+      }
       const cancelled = controller.signal.aborted;
       const cancellationFailed = cancelled && turn.runtimeCancellationFailed === true;
       const failureMessage = error instanceof Error ? error.message : String(error);
@@ -1019,6 +1174,7 @@ export class ChatActionController extends EventEmitter {
       // Finalize every unfinished visible action so recovery never leaves a
       // ghost "In progress" card attached to the abandoned turn.
       for (const event of events) {
+        if (event.cancellationRequested) continue;
         if (!["proposed", "running"].includes(event.state)) continue;
         event.state = cancelled ? "stopped" : "failed";
         if (!cancelled) event.error = failureMessage;
@@ -1051,8 +1207,12 @@ export class ChatActionController extends EventEmitter {
       throw error;
     } finally {
       signal?.removeEventListener("abort", abortFromCaller);
-      this.activeTurns.delete(turnId);
-      turn.resolveSettled();
+      turn.neuralEnded = true;
+      turn.resolveNeuralBoundary();
+      if (!turn.pendingDrain) {
+        this.activeTurns.delete(turnId);
+        turn.resolveSettled();
+      }
     }
   }
 

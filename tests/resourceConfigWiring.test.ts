@@ -35,8 +35,9 @@ describe("resource configuration wiring", () => {
 
     const duplicate = await repository.duplicate(source.id, "Resource duplicate");
     const bundle = join(temporaryRoot, "resource-source.omni");
-    await repository.exportBundle(source.id, bundle);
-    await expect(repository.importBundle(bundle)).rejects.toThrow(/locally initialized OmniCortex origin/i);
+    // This is deliberately an untrained repository fixture, not counterfeit
+    // neural/origin evidence. Resource persistence does not bypass readiness.
+    await expect(repository.exportBundle(source.id, bundle)).rejects.toThrow(/initial learning before exporting/i);
 
     for (const brain of [source, duplicate]) {
       expect(brain.config).toMatchObject({

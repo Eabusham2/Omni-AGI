@@ -64,6 +64,7 @@ import type {
   BrainActiveModeResult,
   BrainSnapshotSummary
 } from "@shared/types";
+import { BRAIN_EXPORT_DISCLOSURE } from "@shared/brainExportDisclosure";
 import {
   EXPERIENCE_UPLOADS,
   type ExperienceUploadKind
@@ -74,10 +75,13 @@ import {
 } from "@shared/trainingTelemetry";
 import type {
   LiveVoicePreferences,
-  LiveVoiceState
+  LiveVoiceState,
+  LiveVoiceSynthesisAdapter,
+  LiveVoiceSynthesisSession
 } from "@shared/liveVoice";
 import { demoSummaries, makeDemoBrain } from "./demo";
 import { EvolutionWorkspace } from "./EvolutionWorkspace";
+import { BrainMapCortex } from "./BrainMapCortex";
 import {
   presentJournalKind,
   presentTraceEvidence,
@@ -107,9 +111,16 @@ import {
 } from "./chatTimelineWindow";
 import { pendingChatOutputPresentation } from "./chatLoadingPresentation";
 import {
-  replyCompleteLearningPresentation,
-  type ReplyCompleteLearningPresentation
+  replyCompleteLearningPresentation
 } from "./chatPhasePresentation";
+import {
+  advanceChatGenerationPhase,
+  reconcileUncommittedChatOutputs,
+  retainUncommittedChatOutput,
+  settleUncommittedChatOutput,
+  type ChatGenerationPhase,
+  type UncommittedChatOutput
+} from "./chatGenerationLifecycle";
 import {
   EMPTY_CHAT_WORKSPACE_ACTIVITY,
   dataActionAvailableDuringTurn,
@@ -136,7 +147,7 @@ import {
   createBrowserLiveVoiceAdapters,
   createOmniLiveVoiceChatAdapter
 } from "./browserLiveVoice";
-import { LiveVoiceController } from "./liveVoiceController";
+import { LiveVoiceController, LIVE_VOICE_PACE_RATES } from "./liveVoiceController";
 import { liveVoiceStatusCopy } from "./liveVoicePresentation";
 import {
   LIVE_VOICE_DELIVERY_MODES,
@@ -149,20 +160,21 @@ import { LivePerceptionPanel } from "./LivePerceptionPanel";
 import {
   clearSubmittedChatDraft,
   chatMessageDeliveryState,
+  chatNoReplyPresentation,
   composerSubmitIntent,
   composerTurnCapabilities,
   isCurrentChatSubmission,
   mergeCommittedChatMessages,
   mergeChatMessagesForPresentation,
   preserveSteeredChatMessage,
-  reconcileCompletedChatSubmission,
+  reconcileCompletedChatTurn,
   reconcileOptimisticChatMessages,
   recoverFailedChatDraft,
-  settleOptimisticChatMessage,
   settleOptimisticChatTurn,
   shouldFollowChatOutput
 } from "./chatTurnPresentation";
 import {
+  chatActionCancellationTarget,
   chatActionSearchActivity,
   chatActionStateLabel,
   chatActionTitle,
@@ -1811,7 +1823,7 @@ function SimpleBuildWizard({
             </div>
             {memoryPlan ? (
               <small className="working-memory-planner__context-floor">
-                Active context stays resident. Auto selected {memoryPlan.context.autoTokens.toLocaleString()} tokens; {memoryPlan.selectedItems.toLocaleString()} colder neural-memory pathways can page to storage.
+                Context uses RAM first; cold attention can use the designated storage pool. Auto selected {memoryPlan.context.autoTokens.toLocaleString()} tokens.
               </small>
             ) : null}
             {memoryPlan ? (
@@ -1848,7 +1860,7 @@ function SimpleBuildWizard({
                         ? `${formatBytes(memoryPlan.context.evidence.selectedContextResidentBytes)} resident`
                         : "Over the resident/model maximum"}
                     </strong>
-                    <small>{memoryPlan.context.selectedTokens.toLocaleString()} tokens · never paged to storage</small>
+                    <small>{memoryPlan.context.selectedTokens.toLocaleString()} tokens · hot activity in RAM, cold attention can use the designated pool</small>
                   </dd>
                 </div>
                 <div>
@@ -1872,7 +1884,7 @@ function SimpleBuildWizard({
               {(
                 [
                   ["auto", "Auto", "Best balance for this device"],
-                  ["extended", "Extended", "More resident context, less shared headroom"],
+                  ["extended", "Extended", "More context, with storage spill when needed"],
                   ["manual", "Manual", "Choose a physically resident window"]
                 ] as const
               ).map(([mode, label, copy]) => (
@@ -1924,7 +1936,7 @@ function SimpleBuildWizard({
                   style={memoryPlan ? contextCapacityBandStyle(memoryPlan) as React.CSSProperties : undefined}
                 />
                 <small id="manual-context-range-explanation">
-                  Floor {memoryPlan?.context.floorTokens.toLocaleString() ?? "checking…"} · Auto {memoryPlan?.context.autoTokens.toLocaleString() ?? "checking…"} · resident/model maximum {memoryPlan?.context.maximumTokens.toLocaleString() ?? "checking…"}.
+                  Baseline {memoryPlan?.context.floorTokens.toLocaleString() ?? "checking…"} · Auto {memoryPlan?.context.autoTokens.toLocaleString() ?? "checking…"} · RAM + storage maximum {memoryPlan?.context.maximumTokens.toLocaleString() ?? "checking…"}.
                   Green marks the measured suitable range; darker or warmer ends need caution. Typed values pass the same live physical and model-limit check.
                 </small>
               </div>
@@ -2770,8 +2782,12 @@ function valueRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function ChatActionCard({ event }: { event: ActionEvent }) {
+function ChatActionCard({ event, onCancel }: {
+  event: ActionEvent;
+  onCancel?: () => Promise<void>;
+}) {
   const [mediaPlaybackFailed, setMediaPlaybackFailed] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const iconByKind: Record<ActionEvent["action"]["kind"], IconName> = {
     talk: "chat",
     tool: "terminal",
@@ -2787,7 +2803,7 @@ function ChatActionCard({ event }: { event: ActionEvent }) {
   const { sourceUrl, mimeType } = imaginationMedia;
   useEffect(() => setMediaPlaybackFailed(false), [sourceUrl]);
   const title = chatActionTitle(event.action);
-  const stateLabel = chatActionStateLabel(event.state);
+  const stateLabel = event.cancellationRequested ? "Cancelling" : chatActionStateLabel(event.state);
   const searchActivity = chatActionSearchActivity(event.action, event.state);
   const argumentsText = Object.keys(event.action.arguments).length
     ? JSON.stringify(event.action.arguments)
@@ -2828,6 +2844,15 @@ function ChatActionCard({ event }: { event: ActionEvent }) {
             <i style={{ width: `${Math.round(event.progress * 100)}%` }} />
             <small>{cleanChatActionStatus(event.statusLabel, event.action)}</small>
           </span>
+        ) : null}
+        {onCancel && event.state === "running" ? (
+          <Button kind="ghost" icon={cancelling || event.cancellationRequested ? "pulse" : "close"}
+            disabled={cancelling || event.cancellationRequested} onClick={() => {
+              setCancelling(true);
+              void onCancel().finally(() => setCancelling(false));
+            }}>
+            {cancelling || event.cancellationRequested ? "Cancelling this action…" : "Cancel this action"}
+          </Button>
         ) : null}
         {preview ? (
           <small
@@ -3073,8 +3098,10 @@ function ChatWorkspace({
   const [conversationPageRevision, setConversationPageRevision] = useState(0);
   const [partialText, setPartialText] = useState("");
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
-  const [replyCompleteLearning, setReplyCompleteLearning] =
-    useState<ReplyCompleteLearningPresentation | null>(null);
+  const [uncommittedOutputs, setUncommittedOutputs] = useState<UncommittedChatOutput[]>([]);
+  const [postReplyWork, setPostReplyWork] = useState<Array<{
+    turnId: string; label: string; ariaLabel: string;
+  }>>([]);
   const [activeTurnStartedAtMs, setActiveTurnStartedAtMs] = useState<number | null>(null);
   const [chatOutputClockMs, setChatOutputClockMs] = useState<number | null>(null);
   const [chatQueue, setChatQueue] = useState<ChatQueueState | null>(null);
@@ -3093,6 +3120,7 @@ function ChatWorkspace({
     useState<WorkspaceTelemetryDelta | undefined>();
   const [inspectorTab, setInspectorTab] = useState<"state" | "runtime">("state");
   const [liveVoiceState, setLiveVoiceState] = useState<LiveVoiceState | null>(null);
+  const [savedReplyVoice, setSavedReplyVoice] = useState<{ messageId: string; phase: "preparing" | "playing" } | null>(null);
   const [liveVoicePreferences, setLiveVoicePreferences] =
     useState<LiveVoicePreferences>(() => {
       try {
@@ -3147,10 +3175,17 @@ function ChatWorkspace({
   const followOutputRef = useRef(true);
   const userTimelineScrollRef = useRef(false);
   const activeTurnIdRef = useRef<string | null>(null);
+  const partialTextRef = useRef("");
+  const generationPhasesRef = useRef(new Map<string, ChatGenerationPhase>());
+  const committedTurnIdsRef = useRef(new Set<string>());
+  const cancelledTurnIdsRef = useRef(new Set<string>());
+  const steeredTurnIdsRef = useRef(new Set<string>());
+  const actionTurnIdsRef = useRef(new Map<string, string>());
+  const currentBrainIdRef = useRef(brain.id);
+  currentBrainIdRef.current = brain.id;
   const chatQueueRef = useRef<ChatQueueState | null>(null);
   const streamSequenceRef = useRef(new Map<string, number>());
   const tokenBatcherRef = useRef<TextFrameBatcher | null>(null);
-  const cancelRequestedRef = useRef(false);
   const textTurnGenerationRef = useRef(0);
   const activeHumanTurnsRef = useRef(new Map<
     string,
@@ -3161,11 +3196,16 @@ function ChatWorkspace({
     new ChatAttachmentOperationGate()
   );
   const liveVoiceControllerRef = useRef<LiveVoiceController | null>(null);
+  const savedReplySynthesisRef = useRef<LiveVoiceSynthesisAdapter | null>(null);
+  const savedReplySessionRef = useRef<LiveVoiceSynthesisSession | null>(null);
+  const savedReplyVoiceGenerationRef = useRef(0);
   const liveVoiceUtteranceRef = useRef<string | null>(null);
   const workspaceSnapshotRef = useRef<WorkspaceSnapshot | null>(null);
   const workspaceRequestRef = useRef(0);
   const onBrainChangeRef = useRef(onBrainChange);
   const onNavigateRef = useRef(onNavigate);
+  const liveVoiceGenerationActive = Boolean(liveVoiceState?.activeUtterance &&
+    generationPhasesRef.current.get(liveVoiceState.activeUtterance.turnId) === "responding");
 
   const refreshWorkspaceSnapshot = useCallback(async (): Promise<void> => {
     const workspace = window.omni?.brain.workspace;
@@ -3302,13 +3342,17 @@ function ChatWorkspace({
       setLiveVoiceState(null);
       return;
     }
-    const adapters = createBrowserLiveVoiceAdapters();
+    const adapters = createBrowserLiveVoiceAdapters(undefined, brain.id);
+    savedReplySynthesisRef.current = adapters.neural?.synthesis ?? null;
     const controller = new LiveVoiceController({
       brainId: brain.id,
       ...adapters,
       preferences: liveVoicePreferences,
       chat: createOmniLiveVoiceChatAdapter(window.omni.chat),
       onAcceptedReply: (reply) => {
+        generationPhasesRef.current.delete(reply.turnId);
+        committedTurnIdsRef.current.delete(reply.turnId);
+        streamSequenceRef.current.delete(reply.turnId);
         setOptimisticHumans((current) =>
           current.filter((message) => message.id !== `pending-voice-${reply.utteranceId}`)
         );
@@ -3333,6 +3377,7 @@ function ChatWorkspace({
       const utterance = state.activeUtterance;
       if (utterance && utterance.id !== liveVoiceUtteranceRef.current) {
         liveVoiceUtteranceRef.current = utterance.id;
+        generationPhasesRef.current.set(utterance.turnId, "responding");
         const utteranceStartedAtMs = Date.parse(utterance.createdAt);
         const measuredStart = Number.isFinite(utteranceStartedAtMs)
           ? utteranceStartedAtMs
@@ -3340,7 +3385,7 @@ function ChatWorkspace({
         setActiveTurnStartedAtMs(measuredStart);
         setChatOutputClockMs(measuredStart);
         tokenBatcherRef.current?.reset();
-        setReplyCompleteLearning(null);
+        partialTextRef.current = "";
         setPartialText("");
         setOptimisticHumans((current) => [
           ...current.filter((message) => !message.id.startsWith("pending-voice-")),
@@ -3352,7 +3397,7 @@ function ChatWorkspace({
           }
         ]);
       }
-      if (utterance) {
+      if (utterance && generationPhasesRef.current.get(utterance.turnId) === "responding") {
         activeTurnIdRef.current = utterance.turnId;
         setActiveTurnId(utterance.turnId);
       } else if (activeTurnIdRef.current?.startsWith("voice-")) {
@@ -3361,7 +3406,7 @@ function ChatWorkspace({
         setActiveTurnId(null);
         setActiveTurnStartedAtMs(null);
         setChatOutputClockMs(null);
-        setReplyCompleteLearning(null);
+        partialTextRef.current = "";
         setPartialText("");
       }
       if (
@@ -3377,6 +3422,11 @@ function ChatWorkspace({
     });
     return () => {
       unsubscribe();
+      savedReplyVoiceGenerationRef.current += 1;
+      savedReplySessionRef.current?.cancel();
+      savedReplySessionRef.current = null;
+      savedReplySynthesisRef.current = null;
+      setSavedReplyVoice(null);
       if (liveVoiceControllerRef.current === controller) {
         liveVoiceControllerRef.current = null;
       }
@@ -3384,6 +3434,51 @@ function ChatWorkspace({
       void controller.dispose();
     };
   }, [brain.id]);
+
+  const playSavedReplyWithOwnVoice = (message: ChatMessage): void => {
+    if (savedReplyVoice?.messageId === message.id) {
+      savedReplyVoiceGenerationRef.current += 1;
+      savedReplySessionRef.current?.cancel();
+      savedReplySessionRef.current = null;
+      setSavedReplyVoice(null);
+      return;
+    }
+    const synthesis = savedReplySynthesisRef.current;
+    if (!synthesis?.available || liveVoiceControllerRef.current?.getState().enabled) {
+      onToast("Own waveform playback is unavailable while live voice is active, or local playback is unavailable.");
+      return;
+    }
+    const generation = ++savedReplyVoiceGenerationRef.current;
+    savedReplySessionRef.current?.cancel();
+    savedReplySessionRef.current = null;
+    setSavedReplyVoice({ messageId: message.id, phase: "preparing" });
+    const done = (): void => {
+      if (savedReplyVoiceGenerationRef.current !== generation) return;
+      savedReplyVoiceGenerationRef.current += 1;
+      savedReplySessionRef.current = null;
+      setSavedReplyVoice(null);
+    };
+    try {
+      const session = synthesis.speak(message.content, {
+        onStart: () => {
+          if (savedReplyVoiceGenerationRef.current === generation) {
+            setSavedReplyVoice({ messageId: message.id, phase: "playing" });
+          }
+        },
+        onEnd: done,
+        onError: (error) => {
+          if (savedReplyVoiceGenerationRef.current !== generation) return;
+          done();
+          onToast(error || "Own waveform playback failed.");
+        }
+      }, { rate: LIVE_VOICE_PACE_RATES[liveVoicePreferences.pace] });
+      if (savedReplyVoiceGenerationRef.current === generation) savedReplySessionRef.current = session;
+      else session.cancel();
+    } catch (error) {
+      done();
+      onToast(error instanceof Error ? error.message : "Own waveform playback failed.");
+    }
+  };
 
   useEffect(() => {
     const stalePreviewId = activePreviewIdRef.current;
@@ -3397,13 +3492,24 @@ function ChatWorkspace({
     setOptimisticHumans([]);
     setSessionCommittedMessages([]);
     setQueuedTurns([]);
+    setUncommittedOutputs([]);
+    setPostReplyWork([]);
+    generationPhasesRef.current.clear();
+    committedTurnIdsRef.current.clear();
+    cancelledTurnIdsRef.current.clear();
+    steeredTurnIdsRef.current.clear();
+    actionTurnIdsRef.current.clear();
+    activeTurnIdRef.current = null;
+    setActiveTurnId(null);
+    setSending(false);
+    partialTextRef.current = "";
+    setPartialText("");
     setActiveTurnStartedAtMs(null);
     setChatOutputClockMs(null);
     setChatQueue(null);
     chatQueueRef.current = null;
     setChatDeliveryStatus("");
     setCancellingTurn(false);
-    setReplyCompleteLearning(null);
     setDatasetPreview(null);
     setLearningJobs([]);
     setTimelineWindow(latestChatTimelineWindow(brain.messages.length));
@@ -3527,17 +3633,136 @@ function ChatWorkspace({
   useEffect(() => {
     if (!window.omni) return;
     const batcher = createTextFrameBatcher(
-      (delta) => setPartialText((current) => current + delta),
+      (delta) => {
+        partialTextRef.current += delta;
+        setPartialText(partialTextRef.current);
+      },
       (callback) => window.requestAnimationFrame(callback),
       (handle) => window.cancelAnimationFrame(handle)
     );
     tokenBatcherRef.current = batcher;
+    const finishGeneration = (turnId: string, createdAt: string, provisional: boolean): void => {
+      if (activeTurnIdRef.current !== turnId) return;
+      batcher.flush();
+      if (provisional) {
+        const content = partialTextRef.current;
+        setUncommittedOutputs((current) => retainUncommittedChatOutput(
+          current, turnId, content, createdAt
+        ));
+      }
+      batcher.reset();
+      partialTextRef.current = "";
+      activeTurnIdRef.current = null;
+      chatQueueRef.current = null;
+      setActiveTurnId(null);
+      setActiveTurnStartedAtMs(null);
+      setChatOutputClockMs(null);
+      setPartialText("");
+      setChatQueue(null);
+      setCancellingTurn(false);
+      setSending(false);
+      setChatDeliveryStatus("");
+    };
     const removeListener = window.omni.chat.onStream((event: ChatStreamEvent) => {
       if (event.brainId !== brain.id) return;
+      const previousPhase = generationPhasesRef.current.get(event.turnId);
+      if (!previousPhase) return;
       const lastSequence = streamSequenceRef.current.get(event.turnId) ?? -1;
       if (event.sequence <= lastSequence) return;
       streamSequenceRef.current.set(event.turnId, event.sequence);
-      if (event.turnId !== activeTurnIdRef.current) return;
+      generationPhasesRef.current.set(event.turnId,
+        advanceChatGenerationPhase(previousPhase, event));
+      // Action/media work has its own lane, including updates from an older
+      // completed reply while a newer text turn owns generation controls.
+      if (event.type === "chat-action") {
+        actionTurnIdsRef.current.set(event.actionEvent.id, event.turnId);
+        setActionEvents((current) => mergeChatActionEvent(current, event.actionEvent));
+        routeStudioAction(event.actionEvent);
+        setToolStatus(
+          event.actionEvent.state === "failed"
+            ? `${chatActionTitle(event.actionEvent.action)} failed: ${cleanChatActionStatus(event.actionEvent.error, event.actionEvent.action)}`
+            : `${chatActionTitle(event.actionEvent.action)}: ${chatActionStateLabel(event.actionEvent.state)}.`
+        );
+        return;
+      }
+      if (event.type === "modality-preview") {
+        setActionEvents((current) => patchChatActionPreview(current, event.actionId, event.preview));
+        return;
+      }
+      if (event.type === "chat-phase") {
+        if (previousPhase === "settled") return;
+        const presentation = replyCompleteLearningPresentation(event);
+        if (!presentation) return;
+        // Freeze the final buffered output before allowing the next ordinary
+        // Send. It remains explicitly uncommitted until the exact saved rows.
+        finishGeneration(event.turnId, event.createdAt, !event.turnCommitted);
+        setPostReplyWork((current) => [
+          ...current.filter((work) => work.turnId !== event.turnId),
+          { turnId: event.turnId, label: presentation.label, ariaLabel: presentation.ariaLabel }
+        ]);
+        void refreshWorkspaceSnapshot();
+        return;
+      }
+      if (event.type === "chat-reply-committed") {
+        committedTurnIdsRef.current.add(event.turnId);
+        setSessionCommittedMessages((current) => mergeCommittedChatMessages(
+          current, [event.humanMessage, event.brainMessage]
+        ).slice(-240));
+        setUncommittedOutputs((current) => reconcileUncommittedChatOutputs(current, event.turnId));
+        setOptimisticHumans((current) => reconcileCompletedChatTurn(current, event.turnId, event.humanMessage));
+        finishGeneration(event.turnId, event.createdAt, false);
+        setPostReplyWork((current) => [
+          ...current.filter((work) => work.turnId !== event.turnId),
+          ...(event.pendingActions > 0 && previousPhase !== "settled" ? [{
+            turnId: event.turnId,
+            label: "Reply saved · action work continues",
+            ariaLabel: "The exact chat turn is saved. Optional action and artifact work continues independently."
+          }] : [])
+        ]);
+        return;
+      }
+      if (event.type === "chat-state" &&
+          ["complete", "steered", "stopped", "no-reply", "failed", "cancelled"].includes(event.state)) {
+        const priorQueue = event.turnId === activeTurnIdRef.current ? chatQueueRef.current : null;
+        const committed = committedTurnIdsRef.current.has(event.turnId);
+        finishGeneration(event.turnId, event.createdAt, !committed && event.state !== "complete");
+        setPostReplyWork((current) => current.filter((work) => work.turnId !== event.turnId));
+        if (event.state === "no-reply" && committed && !activeTurnIdRef.current) {
+          setChatDeliveryStatus("Input saved · generation produced no printable reply.");
+        }
+        if (event.state === "steered") {
+          steeredTurnIdsRef.current.add(event.turnId);
+          void persistDeliveryReceipt(event.turnId, "steered");
+          setOptimisticHumans((current) => preserveSteeredChatMessage(current, event.turnId));
+        }
+        if (event.state === "stopped") {
+          steeredTurnIdsRef.current.add(event.turnId);
+          if (!committed) {
+            void persistDeliveryReceipt(event.turnId, "stopped");
+            setOptimisticHumans((current) => settleOptimisticChatTurn(current, event.turnId, "stopped"));
+            if (!activeTurnIdRef.current) setChatDeliveryStatus("The brain chose to stop before replying; your message remains visible.");
+          }
+        }
+        if (event.state === "failed" || event.state === "cancelled") {
+          const terminalState = event.state;
+          if (!committed) {
+            void persistDeliveryReceipt(event.turnId, terminalState);
+            setOptimisticHumans((current) => settleOptimisticChatTurn(current, event.turnId, terminalState));
+            setUncommittedOutputs((current) => settleUncommittedChatOutput(current, event.turnId, terminalState));
+          }
+          const terminalStatus = committed
+            ? `Reply remains saved; its later action work ${terminalState === "cancelled" ? "was cancelled" : "failed"}.`
+            : event.state === "cancelled"
+              ? chatCancellationStatus(event.cancellation, priorQueue)
+              : `Message not sent: ${conciseUiMessage(event.error, "The local brain could not respond.")}`;
+          // An older work receipt never replaces a newer response's delivery status.
+          if (!activeTurnIdRef.current) setChatDeliveryStatus(terminalStatus);
+          setToolStatus(terminalStatus);
+        }
+        void refreshWorkspaceSnapshot();
+        return;
+      }
+      if (event.turnId !== activeTurnIdRef.current || previousPhase !== "responding") return;
       if (event.type === "chat-state" && event.state === "queued") {
         if (!event.queue) return;
         chatQueueRef.current = event.queue;
@@ -3555,70 +3780,7 @@ function ChatWorkspace({
       } else if (event.type === "chat-token") {
         chatQueueRef.current = null;
         setChatQueue(null);
-        setReplyCompleteLearning(null);
         batcher.push(event.delta);
-      } else if (event.type === "chat-action") {
-        setReplyCompleteLearning(null);
-        setActionEvents((current) =>
-          mergeChatActionEvent(current, event.actionEvent)
-        );
-        routeStudioAction(event.actionEvent);
-        setToolRunning(event.actionEvent.state === "running");
-        setToolStatus(
-          event.actionEvent.state === "failed"
-            ? `${chatActionTitle(event.actionEvent.action)} failed: ${cleanChatActionStatus(event.actionEvent.error, event.actionEvent.action)}`
-            : `${chatActionTitle(event.actionEvent.action)}: ${chatActionStateLabel(event.actionEvent.state)}.`
-        );
-      } else if (event.type === "modality-preview") {
-        setReplyCompleteLearning(null);
-        setActionEvents((current) =>
-          patchChatActionPreview(current, event.actionId, event.preview)
-        );
-      } else if (event.type === "chat-phase") {
-        const presentation = replyCompleteLearningPresentation(event);
-        if (!presentation) return;
-        // The phase follows the final token but can arrive before its animation
-        // frame. Commit that buffered text before changing the visible status.
-        batcher.flush();
-        setReplyCompleteLearning(presentation);
-        void refreshWorkspaceSnapshot();
-      } else if (event.type === "chat-state") {
-        const priorQueue = chatQueueRef.current;
-        chatQueueRef.current = null;
-        setChatQueue(null);
-        setCancellingTurn(false);
-        if (event.state === "failed" || event.state === "cancelled") {
-          const terminalState = event.state;
-          void persistDeliveryReceipt(event.turnId, terminalState);
-          setOptimisticHumans((current) =>
-            settleOptimisticChatTurn(current, event.turnId, terminalState)
-          );
-          const terminalStatus = event.state === "cancelled"
-            ? chatCancellationStatus(event.cancellation, priorQueue)
-            : `Message not sent: ${conciseUiMessage(
-                event.error,
-                "The local brain could not respond."
-              )}`;
-          setChatDeliveryStatus(terminalStatus);
-          setToolStatus(terminalStatus);
-        } else {
-          setChatDeliveryStatus("");
-        }
-        batcher.flush();
-        streamSequenceRef.current.delete(event.turnId);
-        activeHumanTurnsRef.current.delete(event.turnId);
-        activeTurnIdRef.current = null;
-        setActiveTurnId(null);
-        setActiveTurnStartedAtMs(null);
-        setChatOutputClockMs(null);
-        setReplyCompleteLearning(null);
-        setPartialText("");
-        setToolRunning(false);
-        // The ordered terminal frame is the renderer's definitive activity
-        // boundary. IPC result reconciliation can finish afterward without
-        // leaving Responding or Cancel controls stuck on screen.
-        setSending(false);
-        void refreshWorkspaceSnapshot();
       }
     });
     return () => {
@@ -3653,7 +3815,8 @@ function ChatWorkspace({
   ) => {
     const text = (queuedTurn?.text ?? input).trim();
     const steering = turnMetadata?.kind === "steer";
-    if (!text || (!steering && sending) || (!steering && liveVoiceState?.phase === "pondering")) return;
+    if (!text || (!steering && sending) ||
+        (!steering && liveVoiceGenerationActive && liveVoiceState?.phase === "pondering")) return;
     if (!window.omni) {
       if (queuedTurn) {
         setInput((current) => recoverFailedChatDraft(current, text));
@@ -3665,6 +3828,7 @@ function ChatWorkspace({
     const turnId = queuedTurn?.id ?? globalThis.crypto?.randomUUID?.() ??
       `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const createdAt = queuedTurn?.createdAt ?? new Date().toISOString();
+    generationPhasesRef.current.set(turnId, "responding");
     const optimisticHuman: ChatMessage = {
       id: queuedTurn ? `queued-${turnId}` : `pending-${turnId}`,
       role: "human",
@@ -3677,7 +3841,6 @@ function ChatWorkspace({
     chatQueueRef.current = null;
     setChatQueue(null);
     setChatDeliveryStatus("");
-    cancelRequestedRef.current = steering;
     if (!queuedTurn) {
       setInput((current) => clearSubmittedChatDraft(current, text));
     }
@@ -3690,13 +3853,13 @@ function ChatWorkspace({
       ]);
     }
     tokenBatcherRef.current?.reset();
-    streamSequenceRef.current.clear();
+    streamSequenceRef.current.delete(turnId);
     activeTurnIdRef.current = turnId;
     setActiveTurnId(turnId);
     const turnStartedAtMs = Date.now();
     setActiveTurnStartedAtMs(turnStartedAtMs);
     setChatOutputClockMs(turnStartedAtMs);
-    setReplyCompleteLearning(null);
+    partialTextRef.current = "";
     setPartialText("");
     try {
       if (window.omni) {
@@ -3711,14 +3874,13 @@ function ChatWorkspace({
         // cancelling here would intentionally terminate the serial Python
         // worker and force the loaded neural substrate to cold-start again.
         if (!isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) return;
-        cancelRequestedRef.current = false;
         const result = await window.omni.chat.send(
           brain.id,
           text,
           turnId,
           turnMetadata
         );
-        if (!isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) return;
+        if (currentBrainIdRef.current !== brain.id) return;
         // The chat result is authoritative. The separate ledger page can lag
         // behind an atomic background save, so keep these exact messages in
         // this session until the page catches up.
@@ -3728,14 +3890,23 @@ function ChatWorkspace({
             [result.humanMessage, result.brainMessage]
           ).slice(-240)
         );
+        committedTurnIdsRef.current.add(turnId);
+        setUncommittedOutputs((current) => reconcileUncommittedChatOutputs(current, turnId));
         setOptimisticHumans((current) =>
-          reconcileCompletedChatSubmission(
+          reconcileCompletedChatTurn(
             current,
-            optimisticHuman.id,
+            turnId,
             result.humanMessage
           )
         );
-        onBrainChange(result.brain);
+        if (isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) {
+          onBrainChange(result.brain);
+        } else {
+          // Older artifact work may finish after a newer reply was saved. Its
+          // exact messages are retained above, but its older whole document
+          // must not replace the newer counters/trace in the workspace.
+          void window.omni.brain.get(brain.id).then(onBrainChangeRef.current).catch(() => undefined);
+        }
         // Refresh history for older turns and actions, but a transient page
         // read failure must never turn a committed reply into a failed send.
         await loadLatestConversation().catch(() => undefined);
@@ -3776,15 +3947,22 @@ function ChatWorkspace({
         }
       }
     } catch (error) {
-      if (!isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) return;
-      void persistDeliveryReceipt(turnId, "failed", {
+      if (currentBrainIdRef.current !== brain.id) return;
+      if (steeredTurnIdsRef.current.has(turnId)) return;
+      if (committedTurnIdsRef.current.has(turnId)) {
+        setToolStatus(`Reply remains saved; later action work did not finish: ${conciseUiMessage(error)}`);
+        return;
+      }
+      const terminalState = cancelledTurnIdsRef.current.has(turnId) ? "cancelled" : "failed";
+      void persistDeliveryReceipt(turnId, terminalState, {
         content: text,
         createdAt
       });
       if (window.omni) {
         setOptimisticHumans((current) =>
-          settleOptimisticChatMessage(current, optimisticHuman.id, "failed")
+          settleOptimisticChatTurn(current, turnId, terminalState)
         );
+        setUncommittedOutputs((current) => settleUncommittedChatOutput(current, turnId, terminalState));
         // The main process commits the human and neural messages atomically.
         // Reload after failure so any independently completed neural activity
         // is reflected. A matching authoritative human turn reconciles the
@@ -3794,20 +3972,38 @@ function ChatWorkspace({
           setOptimisticHumans((current) =>
             reconcileOptimisticChatMessages(current, latestMessages)
           );
-          onBrainChange(refreshed);
+          if (isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) {
+            onBrainChange(refreshed);
+          }
         }).catch(() => {
           // The existing authoritative document and visible failure receipt
           // remain valid if refresh itself fails.
         });
         // Preserve the newest unsent wording in the composer as well, so the
         // person can retry or edit it without reconstructing the message.
-        setInput((current) => recoverFailedChatDraft(current, text));
+        if (terminalState === "failed" &&
+            isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) {
+          setInput((current) => recoverFailedChatDraft(current, text));
+        }
       }
-      if (!cancelRequestedRef.current || steering) {
+      if (terminalState === "failed" &&
+          isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) {
         onToast(error instanceof Error ? error.message : "The local brain could not respond.");
       }
     } finally {
-      if (!isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) return;
+      if (currentBrainIdRef.current !== brain.id) return;
+      setPostReplyWork((current) => current.filter((work) => work.turnId !== turnId));
+      // Late frames for retired turns are ignored by the stream's known-turn
+      // guard; retain metadata only while its real work/result is outstanding.
+      generationPhasesRef.current.delete(turnId);
+      committedTurnIdsRef.current.delete(turnId);
+      cancelledTurnIdsRef.current.delete(turnId);
+      steeredTurnIdsRef.current.delete(turnId);
+      streamSequenceRef.current.delete(turnId);
+      activeHumanTurnsRef.current.delete(turnId);
+      // Only the matching generation may clear the live composer. Every older
+      // reply still reconciles above, including late committed/cancelled work.
+      if (activeTurnIdRef.current !== turnId) return;
       tokenBatcherRef.current?.reset();
       if (activeTurnIdRef.current) {
         streamSequenceRef.current.delete(activeTurnIdRef.current);
@@ -3816,10 +4012,9 @@ function ChatWorkspace({
       setActiveTurnId(null);
       setActiveTurnStartedAtMs(null);
       setChatOutputClockMs(null);
-      setReplyCompleteLearning(null);
+      partialTextRef.current = "";
       setPartialText("");
       setSending(false);
-      activeHumanTurnsRef.current.delete(turnId);
     }
   };
 
@@ -3831,6 +4026,9 @@ function ChatWorkspace({
     setPendingTool(null);
     setToolRunning(true);
     setToolStatus(`${approval.label} is running through the approved action protocol.`);
+    // Ask-approved executions use the action id (not its original chat turn)
+    // as ToolExecutor correlation. Keep card cancellation exact for that lane.
+    actionTurnIdsRef.current.set(approval.actionEventId, approval.actionEventId);
     try {
       const result = await window.omni.chat.approveAction({
         brainId: brain.id,
@@ -3839,7 +4037,7 @@ function ChatWorkspace({
       });
       setActionEvents((current) => mergeChatActionEvent(current, result.actionEvent));
       await loadLatestConversation();
-      const refreshed = result.brain ?? await window.omni.brain.get(brain.id);
+      const refreshed = await window.omni.brain.get(brain.id);
       onBrainChange(refreshed);
       if (
         result.actionEvent.state === "approval-required" &&
@@ -3873,14 +4071,20 @@ function ChatWorkspace({
   };
 
   const steerCurrentTurn = async (): Promise<void> => {
-    if (cancellingTurn || replyCompleteLearning) return;
+    if (cancellingTurn) return;
     const replacesTurnId = activeTurnIdRef.current;
     if (!replacesTurnId) {
       await send();
       return;
     }
     await persistDeliveryReceipt(replacesTurnId, "steered");
-    activeHumanTurnsRef.current.delete(replacesTurnId);
+    tokenBatcherRef.current?.flush();
+    const emittedPrefix = partialTextRef.current;
+    if (emittedPrefix) {
+      setUncommittedOutputs((current) => retainUncommittedChatOutput(current, replacesTurnId,
+        emittedPrefix, new Date().toISOString()).map((output) => output.turnId === replacesTurnId
+          ? { ...output, state: "steering" } : output));
+    }
     await send({
       kind: "steer",
       replacesTurnId,
@@ -3910,7 +4114,7 @@ function ChatWorkspace({
 
   const submitOrdinaryTurn = (): void => {
     const active = sending || Boolean(activeTurnIdRef.current) ||
-      Boolean(liveVoiceState?.activeUtterance);
+      liveVoiceGenerationActive;
     if (active) {
       queueCurrentTurn();
       return;
@@ -3933,7 +4137,7 @@ function ChatWorkspace({
   };
 
   useEffect(() => {
-    if (sending || liveVoiceState?.activeUtterance || !queuedTurns.length) return;
+    if (sending || liveVoiceGenerationActive || !queuedTurns.length) return;
     const next = queuedTurns[0]!;
     setQueuedTurns((current) =>
       current[0]?.id === next.id
@@ -3941,13 +4145,14 @@ function ChatWorkspace({
         : current.filter((turn) => turn.id !== next.id)
     );
     void send(undefined, next);
-  }, [sending, liveVoiceState?.activeUtterance, queuedTurns]);
+  }, [sending, liveVoiceGenerationActive, queuedTurns]);
 
   const cancelChatTool = async () => {
     if (!window.omni) return;
-    cancelRequestedRef.current = true;
     const activeTurn = activeTurnIdRef.current ?? activeTurnId;
-    let count: number;
+    if (!activeTurn) return;
+    cancelledTurnIdsRef.current.add(activeTurn);
+    let count = 0;
     if (activeTurn) {
       const priorQueue = chatQueueRef.current;
       setCancellingTurn(true);
@@ -3986,7 +4191,7 @@ function ChatWorkspace({
           setActiveTurnId(null);
           setActiveTurnStartedAtMs(null);
           setChatOutputClockMs(null);
-          setReplyCompleteLearning(null);
+          partialTextRef.current = "";
           setPartialText("");
           setSending(false);
           chatQueueRef.current = null;
@@ -4015,7 +4220,7 @@ function ChatWorkspace({
       setActiveTurnId(null);
       setActiveTurnStartedAtMs(null);
       setChatOutputClockMs(null);
-      setReplyCompleteLearning(null);
+      partialTextRef.current = "";
       setPartialText("");
       setSending(false);
       setCancellingTurn(false);
@@ -4023,14 +4228,32 @@ function ChatWorkspace({
       setChatQueue(null);
       activeHumanTurnsRef.current.delete(activeTurn);
       setChatDeliveryStatus("Live voice stopped; the interrupted transcript remains visible.");
-    } else {
-      count = await window.omni.tool.cancel(brain.id);
     }
     setToolStatus(
       count > 0
         ? "Cancellation requested. Partial text and artifacts remain visibly marked in this turn."
         : "No cancellable chat or tool execution is active."
     );
+  };
+
+  const cancelActionJob = async (event: ActionEvent): Promise<void> => {
+    if (!window.omni) return;
+    const target = chatActionCancellationTarget(event, actionTurnIdsRef.current.get(event.id));
+    if (!target) return;
+    try {
+      if (target.kind === "modality-job") {
+        await window.omni.modality.cancel(target.id);
+      } else if (target.kind === "inline-action") {
+        const result = await window.omni.chat.cancelInlineAction(brain.id, target.turnId, target.id);
+        setActionEvents((current) => mergeChatActionEvent(current, result.actionEvent));
+      } else {
+        // ToolExecutor correlates this exact action execution with its turn;
+        // this never aborts the newer text turn or any other turn's artifacts.
+        await window.omni.tool.cancel(brain.id, target.id);
+      }
+    } catch (error) {
+      onToast(conciseUiMessage(error, "This action could not be cancelled."));
+    }
   };
 
   const toggleLiveVoice = async (): Promise<void> => {
@@ -4042,6 +4265,12 @@ function ChatWorkspace({
     if (controller.getState().enabled) {
       await controller.stop();
     } else {
+      // Saved-reply waveform output is an independent job, not a voice turn.
+      // Stop that selected output before opening a microphone/recognizer.
+      savedReplyVoiceGenerationRef.current += 1;
+      savedReplySessionRef.current?.cancel();
+      savedReplySessionRef.current = null;
+      setSavedReplyVoice(null);
       await controller.start();
     }
   };
@@ -4302,15 +4531,15 @@ function ChatWorkspace({
 
   const onComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     const currentTurnActive = sending || Boolean(activeTurnIdRef.current) ||
-      Boolean(liveVoiceState?.activeUtterance);
+      liveVoiceGenerationActive;
     const intent = composerSubmitIntent({
       key: event.key,
       shiftKey: event.shiftKey,
       ctrlKey: event.ctrlKey,
       metaKey: event.metaKey,
       turnActive: currentTurnActive,
-      queueAvailable: currentTurnActive && !replyCompleteLearning,
-      steerAvailable: !replyCompleteLearning && !cancellingTurn
+      queueAvailable: currentTurnActive,
+      steerAvailable: currentTurnActive && !cancellingTurn
     });
     if (intent === "none" || intent === "newline") return;
     event.preventDefault();
@@ -4341,7 +4570,8 @@ function ChatWorkspace({
       authoritative,
       optimisticHumans
     );
-    if (combined.length) return combined;
+    const visible = [...combined, ...uncommittedOutputs.map((output) => output.message)];
+    if (visible.length) return visible;
     return window.omni
       ? []
       : [{
@@ -4352,7 +4582,7 @@ function ChatWorkspace({
           createdAt: brain.createdAt,
           runtime: brain.config.runtime
         }];
-  }, [brain.createdAt, brain.messages, brain.config.runtime, optimisticHumans, persistedMessages, sessionCommittedMessages]);
+  }, [brain.createdAt, brain.messages, brain.config.runtime, optimisticHumans, persistedMessages, sessionCommittedMessages, uncommittedOutputs]);
   const displayedActions = useMemo(() => {
     const merged = new Map(persistedActions.map((event) => [event.id, event]));
     actionEvents.forEach((event) => merged.set(event.id, event));
@@ -4535,7 +4765,7 @@ function ChatWorkspace({
         )
       )
     : null;
-  const voicePondering = liveVoiceState?.phase === "pondering";
+  const voicePondering = liveVoiceGenerationActive && liveVoiceState?.phase === "pondering";
   const textTurnVisiblyActive = Boolean(activeTurnId);
   const pondering = voicePondering || (
     textTurnVisiblyActive &&
@@ -4552,20 +4782,20 @@ function ChatWorkspace({
     ? "Stopping response"
     : chatQueue
       ? `Queued behind ${chatQueue.queuedBehind.label}`
-      : replyCompleteLearning
-        ? replyCompleteLearning.cortexLabel
-        : pondering
+      : pondering
       ? "Pondering"
       : actionRunning
           ? "Running action"
           : textTurnVisiblyActive
             ? "Forming response"
+            : postReplyWork[0]?.label
+              ? postReplyWork[0].label
             : workspaceSnapshot?.learning?.backgroundParameters.lastError &&
                 (workspaceSnapshot.learning.backgroundParameters.pending ?? 0) > 0
               ? "Idle · learning needs attention"
               : "Idle / ready";
   const showTurnActivity =
-    textTurnVisiblyActive || pondering || actionRunning || Boolean(replyCompleteLearning);
+    textTurnVisiblyActive || voicePondering;
   const voiceStatus = liveVoiceState ? liveVoiceStatusCopy(liveVoiceState) : null;
   const showVoiceStatus = Boolean(
     liveVoiceState &&
@@ -4575,10 +4805,10 @@ function ChatWorkspace({
       liveVoiceState.phase === "starting")
   );
   const voiceSettingsLocked = Boolean(liveVoiceState?.activeUtterance);
-  const turnActive = sending || textTurnVisiblyActive || Boolean(liveVoiceState?.activeUtterance);
+  const turnActive = sending || textTurnVisiblyActive || liveVoiceGenerationActive;
   const composerResponsePhase = !turnActive
     ? "idle"
-    : replyCompleteLearning?.phase ?? (partialText ? "generating" : "loading");
+    : partialText ? "generating" : "loading";
   const composerTurn = composerTurnCapabilities(composerResponsePhase);
   const queuedLearningJobCount = learningJobs.filter((job) => job.state === "queued").length +
     (datasetPreview && !["complete", "cancelled", "failed"].includes(datasetPreview.phase) ? 1 : 0);
@@ -4591,21 +4821,20 @@ function ChatWorkspace({
       phase: turnActive
         ? chatQueue
           ? "queued"
-          : replyCompleteLearning
-            ? replyCompleteLearning.phase
-            : "responding"
+          : "responding"
         : "idle",
       ...(chatQueue ? { queue: chatQueue } : {}),
       queuedMessages: queuedTurns.length,
       queuedJobs: queuedLearningJobCount,
-      runningJobs: runningLearningJobCount
+      runningJobs: runningLearningJobCount,
+      postReplyWork: postReplyWork.length
     });
   }, [
     onActivityChange,
     chatQueue,
     queuedLearningJobCount,
     queuedTurns.length,
-    replyCompleteLearning,
+    postReplyWork.length,
     runningLearningJobCount,
     turnActive
   ]);
@@ -4621,10 +4850,10 @@ function ChatWorkspace({
     ? workspaceTelemetryPresentation({
         workspace: workspaceSnapshot,
         delta: workspaceDelta,
-        currentExperience: replyCompleteLearning
-          ? "saving"
-          : turnActive
+        currentExperience: turnActive
             ? "responding"
+            : postReplyWork.length
+              ? "saving"
             : "idle"
       })
     : undefined;
@@ -4771,10 +5000,19 @@ function ChatWorkspace({
                 brainName={brain.name}
                 onToast={onToast}
                 onTrace={() => onNavigate("trace")}
+                onOwnVoice={() => playSavedReplyWithOwnVoice(entry.message)}
+                ownVoicePhase={savedReplyVoice?.messageId === entry.message.id ? savedReplyVoice.phase : undefined}
+                ownVoiceUnavailable={!liveVoiceState?.capabilities.neuralVoice || liveVoiceState.enabled}
+                ownVoiceQuality={liveVoiceState?.capabilities.neuralVoiceQuality}
+                uncommittedOutputState={uncommittedOutputs.find((output) =>
+                  output.message.id === entry.message.id)?.state}
               />
             ) : entry.kind === "action" ? (
               <div className="chat-action-stream" aria-label="Visible chat action">
-                <ChatActionCard event={entry.event} />
+                <ChatActionCard event={entry.event}
+                  onCancel={chatActionCancellationTarget(entry.event,
+                    actionTurnIdsRef.current.get(entry.event.id))
+                    ? () => cancelActionJob(entry.event) : undefined} />
               </div>
             ) : entry.kind === "attachment" ? (
               <div className="chat-action-stream" aria-label="Learned chat attachment">
@@ -4807,9 +5045,8 @@ function ChatWorkspace({
                   <strong>{brain.name}</strong>
                   <span
                     className="pondering-label"
-                    aria-label={replyCompleteLearning?.ariaLabel}
                   >
-                    <i /> {replyCompleteLearning?.label ?? (
+                    <i /> {
                       cancellingTurn
                         ? "Stopping"
                         : chatQueue
@@ -4819,7 +5056,7 @@ function ChatWorkspace({
                             : actionRunning
                               ? "Running action"
                               : "Responding"
-                    )}
+                    }
                   </span>
                   <span
                     className={cx(
@@ -4833,10 +5070,7 @@ function ChatWorkspace({
                 </div>
                 {partialText ? (
                   <p
-                    className={cx(
-                      "message__streaming-text",
-                      replyCompleteLearning && "message__streaming-text--reply-complete"
-                    )}
+                    className="message__streaming-text"
                     aria-live="polite"
                   >
                     {partialText}
@@ -4847,9 +5081,7 @@ function ChatWorkspace({
                     <span />
                     <span />
                     <em>
-                      {replyCompleteLearning
-                        ? replyCompleteLearning.pendingLabel
-                        : cancellingTurn
+                      {cancellingTurn
                           ? "Waiting for neural worker acknowledgement…"
                           : chatQueue
                             ? `Waiting behind ${chatQueue.queuedBehind.label}…`
@@ -4964,8 +5196,8 @@ function ChatWorkspace({
                 <label
                   title={
                     liveVoiceState.capabilities.neuralVoice
-                      ? "Route voice output directly through a trained neural audio-output pack"
-                      : "Requires a compatible trained neural audio-output pack"
+                      ? "Play waveform output from this brain's audio region; intelligible speech is not verified"
+                      : "Requires this brain's audio region and local WAV playback"
                   }
                 >
                   <input
@@ -4980,10 +5212,10 @@ function ChatWorkspace({
                       updateLiveVoicePreferences({ neuralVoice: event.target.checked })
                     }
                   />
-                  Neural voice
+                  Own neural voice
                 </label>
                 <small>
-                  Default uses platform STT + TTS. Neural paths require compatible trained packs and never silently fall back.
+                  Default uses platform STT + TTS. Own neural voice needs speech training; speech quality is not verified. No silent fallback.
                 </small>
               </div>
             </>
@@ -5024,6 +5256,14 @@ function ChatWorkspace({
               ) : null}
             </div>
           ) : null}
+          {postReplyWork.length ? (
+            <div className="chat-tool-status" role="status" aria-live="polite"
+              aria-label={postReplyWork.map((work) => work.ariaLabel).join(" ")}>
+              <span><Icon name="activity" size={15} /></span>
+              <p>{postReplyWork.length === 1 ? postReplyWork[0]!.label :
+                `${postReplyWork.length} completed replies · save/action work continues`}</p>
+            </div>
+          ) : null}
           {toolStatus && (pendingTool || toolRunning || attaching) ? (
             <div className={cx("chat-tool-status", pendingTool && "chat-tool-status--approval")}>
               <span><Icon name={pendingTool ? "warning" : "activity"} size={15} /></span>
@@ -5033,9 +5273,7 @@ function ChatWorkspace({
                   Approve exact action
                 </Button>
               ) : toolRunning ? (
-                <Button kind="primary" icon="close" onClick={() => void cancelChatTool()}>
-                  Cancel
-                </Button>
+                <small>Cancel the exact job in its action details.</small>
               ) : (
                 <button aria-label="Dismiss tool status" onClick={() => setToolStatus("")}>
                   <Icon name="close" size={13} />
@@ -5123,9 +5361,7 @@ function ChatWorkspace({
               <span className="composer__status-copy">
                 <span className="composer__key-hint">
                   {turnActive
-                    ? composerTurn.steerAvailable
-                      ? "Enter queues · Ctrl/Cmd Enter steers · empty input keeps Stop"
-                      : "Reply complete · Enter sends the next message · empty input keeps Stop"
+                    ? "Enter queues · Ctrl/Cmd Enter steers · empty input keeps Stop"
                     : "Enter to send · Shift Enter for a line break"}
                 </span>
                 <span
@@ -5165,16 +5401,6 @@ function ChatWorkspace({
                         <Icon name="chat" size={13} /> <span>Queue</span>
                       </button>
                     </>
-                  ) : null}
-                  {input.trim() && !cancellingTurn && !composerTurn.queueAvailable ? (
-                    <button
-                      className="send-button composer__post-reply-send"
-                      aria-label="Send message"
-                      title="Send now; it will begin automatically after this reply is safely saved"
-                      onClick={submitOrdinaryTurn}
-                    >
-                      <Icon name="send" size={13} /> <span>Send</span>
-                    </button>
                   ) : null}
                   <button
                     className="composer__stop-choice"
@@ -5296,18 +5522,31 @@ function MessageBubble({
   message,
   brainName,
   onToast,
-  onTrace
+  onTrace,
+  onOwnVoice,
+  ownVoicePhase,
+  ownVoiceUnavailable,
+  ownVoiceQuality,
+  uncommittedOutputState
 }: {
   message: ChatMessage;
   brainName: string;
   onToast: (message: string) => void;
   onTrace: () => void;
+  onOwnVoice?: () => void;
+  ownVoicePhase?: "preparing" | "playing";
+  ownVoiceUnavailable?: boolean;
+  ownVoiceQuality?: "needs-speech-training" | "unverified";
+  uncommittedOutputState?: UncommittedChatOutput["state"];
 }) {
   const isBrain = message.role === "brain";
   const deliveryState = chatMessageDeliveryState(message);
   const durableReceipt = message.deliveryReceipt?.presentationOnly === true;
   const queued = deliveryState === "queued";
   const steered = deliveryState === "steered";
+  const stopped = deliveryState === "stopped";
+  const noReply = isBrain && deliveryState === "no-reply";
+  const noReplyPresentation = chatNoReplyPresentation(message);
   const failed = deliveryState === "failed";
   const cancelled = deliveryState === "cancelled";
   const pending = deliveryState === "pending" ||
@@ -5324,7 +5563,9 @@ function MessageBubble({
         cancelled && "message--cancelled"
       )}
       data-turn-state={
-        failed
+        noReply ? "no-reply" : stopped ? "stopped" : uncommittedOutputState
+          ? `output-uncommitted-${uncommittedOutputState}`
+          : failed
           ? "failed"
           : cancelled
             ? "cancelled"
@@ -5348,6 +5589,17 @@ function MessageBubble({
           <time>
             {new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
           </time>
+          {uncommittedOutputState ? (
+            <span className="message-queue-label">
+              {uncommittedOutputState === "saving"
+                ? "Reply complete · save pending, not committed"
+                : uncommittedOutputState === "steering"
+                  ? "Steering · emitted prefix awaiting safe save"
+                : uncommittedOutputState === "cancelled"
+                  ? "Stopped output · not committed"
+                  : "Save failed · output not committed"}
+            </span>
+          ) : null}
           {queued ? (
             <span className="message-queue-label">
               {durableReceipt ? "Queued · not replayed" : "Queued"}
@@ -5356,7 +5608,15 @@ function MessageBubble({
           {deliveryState === "pending" && durableReceipt ? (
             <span className="message-queue-label">Awaiting reply · status unconfirmed</span>
           ) : null}
-          {steered ? <span className="message-queue-label message-steered-label">Steered</span> : null}
+          {steered ? <span className="message-queue-label message-steered-label">
+            {isBrain && message.generationEnd === "steered" ? "Steered · partial reply saved" : "Steered"}
+          </span> : null}
+          {stopped ? <span className="message-queue-label">
+            {message.generationEnd === "native-stop" ? "Brain stopped · partial reply saved" : "Brain stopped before replying"}
+          </span> : null}
+          {noReplyPresentation ? <span className="message-queue-label" aria-label={noReplyPresentation.ariaLabel}>
+            {noReplyPresentation.label}
+          </span> : null}
           {failed ? (
             <span className="message-queue-label message-failed-label">Not sent · retry ready</span>
           ) : null}
@@ -5365,18 +5625,30 @@ function MessageBubble({
           ) : null}
           {isBrain && message.runtime ? <span className="runtime-label">{message.runtime.replace("-", " ")}</span> : null}
         </div>
-        <div className="message__content">{message.content}</div>
+        {noReply ? null : <div className="message__content">{message.content}</div>}
         {isBrain ? (
           <div className="message__actions">
-            <button aria-label="Copy response" onClick={() => void navigator.clipboard?.writeText(message.content)}>
+            {message.content ? <button aria-label="Copy response" onClick={() => void navigator.clipboard?.writeText(message.content)}>
               <Icon name="copy" size={14} />
-            </button>
+            </button> : null}
             <button
               aria-label="Show trace"
               onClick={() => (message.traceId ? onTrace() : onToast("No trace is attached to this message."))}
             >
               <Icon name="trace" size={14} />
             </button>
+            {onOwnVoice && !uncommittedOutputState && !noReply && Boolean(message.content.trim()) ? (
+              <button
+                aria-label={ownVoicePhase ? "Stop own waveform playback" : "Play reply with own neural voice"}
+                title={`${ownVoicePhase === "preparing" ? "Producing waveform · click to cancel" : ownVoicePhase === "playing"
+                  ? "Playing waveform · click to stop" : "Play using this brain's audio region"}. ${ownVoiceQuality === "unverified"
+                  ? "Speech quality not verified" : "Needs speech training; the waveform may not match the words yet"}.`}
+                disabled={ownVoiceUnavailable && !ownVoicePhase}
+                onClick={onOwnVoice}
+              >
+                <Icon name={ownVoicePhase ? "close" : "volume"} size={14} />
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -5486,6 +5758,9 @@ function NeuralParameterCount({
       <span className="neural-parameter-count__detail" aria-hidden="true">
         <b>{accounting.totalNeuralParameters.toLocaleString("en-US")} logical weights and connections</b>
         <span>{accounting.mutableDenseParameters.toLocaleString("en-US")} core weights</span>
+        {(accounting.substrateVectorParameters ?? 0) > 0 && (
+          <span>{accounting.substrateVectorParameters!.toLocaleString("en-US")} learned memory weights</span>
+        )}
         <span>{accounting.dynamicSparseSynapses.toLocaleString("en-US")} grown connections</span>
         <small>One brain; each logical parameter counted once. {accounting.countingRule}</small>
       </span>
@@ -5913,7 +6188,7 @@ function DeviceRuntimeWorkspace({
       setResourceError("");
       void window.omni!.catalog.resourcePlan({
         mode: workingMemoryMode,
-        hardwareTier: detectedHardware.recommendedTier,
+        brainId: brain.id,
         acceleratorAvailable: detectedHardware.gpu.available,
         systemRamMode,
         ...(systemRamMode === "manual" ? { systemRamSharePercent } : {}),
@@ -5943,6 +6218,9 @@ function DeviceRuntimeWorkspace({
       window.clearTimeout(timer);
     };
   }, [
+    brain.id,
+    brain.config.workingMemorySlots,
+    brain.config.nativeArchitecture?.sha256,
     detectedHardware,
     manualContextTokens,
     manualStoragePoolGiB,
@@ -7727,6 +8005,7 @@ interface SubstrateMapNode {
   label: string;
   region?: string;
   activation: number;
+  activationObserved?: boolean;
   importance: number;
   uncertainty: number;
   exposures: number;
@@ -7757,7 +8036,19 @@ function stableMapHash(value: string) {
   return hash >>> 0;
 }
 
-function BrainMapWorkspace({
+function BrainMapWorkspace({ brain, onBack }: { brain: BrainDocument; onBack: () => void }) {
+  const [domain, setDomain] = useState<"substrate" | "cortex">("substrate");
+  return <div>
+    <div className="segmented" role="tablist" aria-label="Brain map domain" style={{ margin: "18px 28px 0" }}>
+      <button role="tab" aria-selected={domain === "substrate"} className={domain === "substrate" ? "is-active" : ""} onClick={() => setDomain("substrate")}>Sparse neural substrate</button>
+      <button role="tab" aria-selected={domain === "cortex"} className={domain === "cortex" ? "is-active" : ""} onClick={() => setDomain("cortex")}>Packed cortical model</button>
+    </div>
+    {domain === "cortex" ? <BrainMapCortex brainId={brain.id} updatedAt={brain.updatedAt} onBack={onBack} />
+      : <SubstrateBrainMapWorkspace brain={brain} onBack={onBack} />}
+  </div>;
+}
+
+function SubstrateBrainMapWorkspace({
   brain,
   onBack
 }: {
@@ -7898,14 +8189,15 @@ function BrainMapWorkspace({
         return substratePage.assemblies
           .filter((assembly) =>
             filter === "all" ||
-            (filter === "active" && assembly.confidence >= 0.5) ||
+            (filter === "active" && assembly.activationObserved === true && (assembly.activation ?? 0) >= 0.5) ||
             (filter === "salient" && assembly.importance >= 0.75)
           )
           .map((assembly) => ({
             id: assembly.id,
             label: assembly.label,
             region: assembly.region,
-            activation: assembly.confidence,
+            activation: assembly.activationObserved === true ? assembly.activation ?? 0 : 0,
+            activationObserved: assembly.activationObserved === true,
             importance: assembly.importance,
             uncertainty: 1 - assembly.confidence,
             exposures: assembly.rehearsals,
@@ -8504,9 +8796,9 @@ function BrainMapWorkspace({
               </div>
               <div className="activation-score">
                 <div style={{ "--score": `${selectedConcept.activation * 360}deg` } as React.CSSProperties}>
-                  <span>{Math.round(selectedConcept.activation * 100)}</span>
+                  <span>{selectedMapNode?.activationObserved === false ? "—" : Math.round(selectedConcept.activation * 100)}</span>
                 </div>
-                <span><strong>Current activation</strong><small>{selectedConcept.lastActivatedAt ? relativeTime(selectedConcept.lastActivatedAt) : selectedConcept.activation > 0.8 ? "Highly active" : "Available"}</small></span>
+                <span><strong>{selectedMapNode?.activationObserved === false ? "Activation unobserved" : "Current activation"}</strong><small>{selectedMapNode?.activationObserved === false ? "No measured firing for this inspection source" : selectedConcept.lastActivatedAt ? relativeTime(selectedConcept.lastActivatedAt) : selectedConcept.activation > 0.8 ? "Highly active" : "Available"}</small></span>
               </div>
               <dl className="inspector-stats">
                 <div><dt>Importance</dt><dd>{Math.round(selectedConcept.importance * 100)}%</dd></div>
@@ -8598,7 +8890,7 @@ function BrainMapWorkspace({
               </div>
               <div className="activation-score">
                 <div style={{ "--score": `${selectedMapNode.activation * 360}deg` } as React.CSSProperties}>
-                  <span>{selectedMapNode.activityOnly ? "—" : Math.round(selectedMapNode.activation * 100)}</span>
+                  <span>{selectedMapNode.activityOnly || selectedMapNode.activationObserved === false ? "—" : Math.round(selectedMapNode.activation * 100)}</span>
                 </div>
                 <span>
                   <strong>{selectedMapNode.activityOnly
@@ -10627,7 +10919,7 @@ function AgentsWorkspace({
               ? "Lightweight local reference"
               : "Portable brain";
         onToast(
-          `${label} exported to ${path}. Private chat, unfinished training, and temporary attention are not included.`
+          `${label} exported to ${path}. Saved content is unsanitized; share only with trusted recipients.`
         );
       }
     } else {
@@ -10642,7 +10934,7 @@ function AgentsWorkspace({
           <span className="eyebrow-text">LINEAGE & COLLABORATION</span>
           <h1>Forks & agents</h1>
           <p>Explore in isolated minds, then merge useful ideas and evidence without averaging identities.</p>
-          <p className="agents-export-disclosure">Portable .omni includes learned neural state and origin, but not private chat, unfinished training, or temporary attention.</p>
+          <p className="agents-export-disclosure">{BRAIN_EXPORT_DISCLOSURE}</p>
         </div>
         <div>
           <Button icon="archive" onClick={() => void exportBrain("referenced")}>Local reference</Button>

@@ -132,7 +132,7 @@ async function canonicalizeReleaseAssetNames(directory, packagedNames, entries) 
   }
 }
 
-function validateWorkerSmoke(smoke, label) {
+function validateWorkerSmoke(smoke, label, expectedVersion) {
   requireValue(smoke?.healthOnly === true, `${label} did not pass health-only smoke.`);
   requireValue(
     smoke?.persistedBrain === false &&
@@ -142,8 +142,8 @@ function validateWorkerSmoke(smoke, label) {
   );
   requireValue(smoke?.protocolVersion === 1, `${label} used an incompatible protocol.`);
   requireValue(
-    typeof smoke?.engineVersion === "string" && smoke.engineVersion.length > 0,
-    `${label} omitted the engine version.`
+    smoke?.engineVersion === expectedVersion,
+    `${label} worker version ${String(smoke?.engineVersion)} does not match release ${expectedVersion}.`
   );
 }
 
@@ -238,8 +238,8 @@ for (const arch of ["x64", "arm64"]) {
       windows.nsis?.neuralAcceptanceTested === false,
     `Windows ${arch} package lacks truthful installed-shell evidence.`
   );
-  validateWorkerSmoke(windows.zip?.rpcSmoke, `Windows ${arch} ZIP worker`);
-  validateWorkerSmoke(windows.nsis?.rpcSmoke, `Windows ${arch} installed worker`);
+  validateWorkerSmoke(windows.zip?.rpcSmoke, `Windows ${arch} ZIP worker`, version);
+  validateWorkerSmoke(windows.nsis?.rpcSmoke, `Windows ${arch} installed worker`, version);
   const windowsSigning = windows.signing;
   requireValue(
     typeof windowsSigning?.expectedSigned === "boolean" &&
@@ -284,7 +284,7 @@ for (const arch of ["x64", "arm64"]) {
       mac.formatValidation?.zip?.extracted === true,
     `macOS ${arch} format validation is incomplete.`
   );
-  validateWorkerSmoke(mac.workerSmoke, `macOS ${arch} worker`);
+  validateWorkerSmoke(mac.workerSmoke, `macOS ${arch} worker`, version);
   requireValue(
     typeof mac.signing?.expectedSigned === "boolean" &&
       typeof mac.signing?.expectedNotarized === "boolean" &&
@@ -356,7 +356,7 @@ for (const arch of ["x64", "arm64"]) {
     linux.formatValidation.deb.architecture === (arch === "arm64" ? "arm64" : "amd64"),
     `Linux ${arch} DEB architecture evidence is incorrect.`
   );
-  validateWorkerSmoke(linux.workerSmoke, `Linux ${arch} worker`);
+  validateWorkerSmoke(linux.workerSmoke, `Linux ${arch} worker`, version);
   requireValue(
     linux.signing?.state === "not-applicable",
     `Linux ${arch} must label code signing as not applicable.`

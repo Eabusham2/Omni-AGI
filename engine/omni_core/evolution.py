@@ -19,13 +19,24 @@ import torch
 from torch.nn import functional as F
 
 from .offload import copy_mutable_state_snapshot
+from .architecture_migration import (
+    assert_architecture_quiescent,
+    file_tensor_inventory,
+    growth_dimensions,
+    isolated_checkpoint_resident_bytes,
+    normalize_architecture_change,
+    preserve_runtime_rng,
+    reseal_native_descriptor,
+    verify_preserved_tensor_prefixes,
+)
+from .bounded_tensor_io import BoundedTensorFile
+from .evolution_anchors import RetentionAnchorFile, save_retention_anchors
 from .persistence import (
-    atomic_save_tensors,
     atomic_write_json,
     copy_substrate_snapshot,
-    load_tensors,
     read_json,
     snapshot_files,
+    snapshot_required_bytes,
 )
 
 
@@ -74,6 +85,22 @@ def _json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _benchmark_payload(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+    payload = {
+        "evaluator": EVALUATOR_VERSION,
+        "capabilityProbes": list(CAPABILITY_PROBES),
+        "parentStateChecksum": manifest["parentStateChecksum"],
+        "anchorTensorSha256": manifest["anchorTensorSha256"],
+        "architecture": manifest["architecture"],
+        "architectureMutation": manifest.get("architectureMutation"),
+    }
+    # Old immutable baselines keep their exact original hash; new candidates
+    # additionally bind complete metadata/context/lineage against tampering.
+    if "parentMetadataSha256" in manifest:
+        payload["parentMetadataSha256"] = manifest["parentMetadataSha256"]
+    return payload
+
+
 def _validate_json(value: Any, label: str) -> Any:
     try:
         serialized = json.dumps(
@@ -88,24 +115,16 @@ def _validate_json(value: Any, label: str) -> Any:
     return json.loads(serialized)
 
 
-def _bundle_tensors(engine_path: Path) -> Dict[str, torch.Tensor]:
-    tensors: Dict[str, torch.Tensor] = {}
-    for filename, prefix in (
-        ("core.safetensors", "core:"),
-        ("plasticity.safetensors", "plasticity:"),
-    ):
-        for name, tensor in load_tensors(engine_path / filename, device="cpu").items():
-            tensors[prefix + name] = tensor.detach().cpu().contiguous()
-    return tensors
-
-
 def _bundle_checksum(engine_path: Path) -> str:
     digest = hashlib.sha256()
-    for name, tensor in sorted(_bundle_tensors(engine_path).items()):
-        digest.update(name.encode("utf-8"))
-        digest.update(str(tuple(tensor.shape)).encode("ascii"))
-        digest.update(str(tensor.dtype).encode("ascii"))
-        digest.update(tensor.numpy().tobytes())
+    for filename, prefix in (("core.safetensors", "core:"), ("plasticity.safetensors", "plasticity:")):
+        reader = BoundedTensorFile(engine_path / filename)
+        for key, spec in reader.specs.items():
+            digest.update((prefix + key).encode("utf-8"))
+            digest.update(str(spec.shape).encode("ascii"))
+            digest.update(str(spec.dtype).encode("ascii"))
+            for chunk in reader.chunks(key):
+                digest.update(chunk.reshape(-1).view(torch.uint8).numpy().tobytes())
     digest.update(b"substrate:")
     digest.update(_substrate_content_checksum(engine_path).encode("ascii"))
     return digest.hexdigest()
@@ -132,17 +151,20 @@ def _substrate_content_checksum(engine_path: Path) -> str:
 
 def _architecture_signature(engine_path: Path) -> Dict[str, Any]:
     metadata = read_json(engine_path / "brain.json")
-    tensors = _bundle_tensors(engine_path)
+    tensors = {
+        prefix + name: spec
+        for filename, prefix in (("core.safetensors", "core:"), ("plasticity.safetensors", "plasticity:"))
+        for name, spec in file_tensor_inventory(engine_path / filename).items()
+    }
     return {
         "fixedTensors": {
             name: {
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
+                "shape": tensor["shape"],
+                "dtype": tensor["dtype"],
             }
             for name, tensor in sorted(tensors.items())
-            # Expert modules are the one stable-v1 architecture extension that
-            # can be instantiated from metadata before strict tensor loading.
-            # Every other core/router shape remains immutable.
+            # Expert inventories are counted separately. All decoder blocks
+            # and router controls have exact declared migration geometries.
             if (
                 (
                     name.startswith("core:")
@@ -156,45 +178,29 @@ def _architecture_signature(engine_path: Path) -> Dict[str, Any]:
         },
         "expertCount": int(metadata.get("expert_count", 0)),
         "expertFormat": "ternary-residual-expert-v1",
+        "layers": int(metadata.get("config", {}).get("n_layers", 0)),
+        "routerNeurons": int(metadata.get("config", {}).get("router_neurons", 0)),
+        "expertRoutingBaselineCount": int(metadata.get("config", {}).get("expert_routing_baseline_count", -1)),
+        "headGeometry": {
+            key: metadata.get("config", {}).get(key)
+            for key in ("d_model", "d_ff", "n_heads", "idea_dim", "vsa_dim")
+        },
+        "protectedGeometry": {
+            key: metadata.get("config", {}).get(key)
+            for key in (
+                "vocab_size", "dropout", "modality_channels", "image_size",
+                "audio_samples", "video_frames", "liquid_mode",
+                "working_memory_slots", "ternary_weights", "spiking_dynamics",
+                "stdp_plasticity", "liquid_dynamics", "vector_symbolic_memory",
+            )
+        },
     }
 
 
 def _normalize_architecture_change(
     value: Optional[Mapping[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    if not value:
-        return None
-    mutation = str(value.get("mutation", ""))
-    if mutation != "grow-experts":
-        raise ValueError(
-            "stable v1 supports only the compatible grow-experts architecture mutation"
-        )
-    unexpected = set(value).difference({"mutation", "addExperts"})
-    if unexpected:
-        raise ValueError(
-            "unsupported architecture mutation fields: %s"
-            % ", ".join(sorted(str(name) for name in unexpected))
-        )
-    raw_count = value.get("addExperts", 1)
-    if isinstance(raw_count, bool):
-        raise ValueError("architecture addExperts must be a positive integer")
-    try:
-        count = int(raw_count)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            "architecture addExperts must be a positive integer"
-        ) from error
-    if count < 1 or count != raw_count:
-        raise ValueError("architecture addExperts must be a positive integer")
-    return {
-        "mutation": "grow-experts",
-        "addExperts": count,
-        "compatibilityBoundary": (
-            "Adds only load-aware ternary residual experts and prototypes; "
-            "decoder width, depth, attention, router, modality, and existing "
-            "tensor shapes remain immutable."
-        ),
-    }
+    return normalize_architecture_change(value)
 
 
 def _architecture_compatible(
@@ -202,7 +208,9 @@ def _architecture_compatible(
     candidate: Mapping[str, Any],
     mutation: Optional[Mapping[str, Any]],
 ) -> bool:
-    if baseline.get("fixedTensors") != candidate.get("fixedTensors"):
+    if baseline.get("headGeometry") != candidate.get("headGeometry"):
+        return False
+    if baseline.get("protectedGeometry") != candidate.get("protectedGeometry"):
         return False
     if (
         baseline.get("expertFormat") != "ternary-residual-expert-v1"
@@ -211,75 +219,114 @@ def _architecture_compatible(
         return False
     before = int(baseline.get("expertCount", -1))
     after = int(candidate.get("expertCount", -1))
+    old_routing = int(baseline.get("expertRoutingBaselineCount", -1))
+    new_routing = int(candidate.get("expertRoutingBaselineCount", -1))
     if mutation is None:
-        return after == before
-    return (
-        mutation.get("mutation") == "grow-experts"
-        and after == before + int(mutation.get("addExperts", 0))
-    )
+        return after == before and old_routing == new_routing and baseline.get("fixedTensors") == candidate.get("fixedTensors")
+    kind = mutation.get("mutation")
+    old, new = dict(baseline.get("fixedTensors", {})), dict(candidate.get("fixedTensors", {}))
+    if kind == "grow-experts":
+        expected_routing = before if old_routing < 0 else old_routing
+        return old == new and new_routing == expected_routing and after == before + int(mutation.get("addExperts", 0))
+    if after != before or old_routing != new_routing:
+        return False
+    if kind == "grow-depth":
+        old_layers = int(baseline.get("layers", 0))
+        count = int(mutation.get("addLayers", 0))
+        template = {name[len("core:decoder.blocks.0."):]: value for name, value in old.items() if name.startswith("core:decoder.blocks.0.")}
+        if not template or int(candidate.get("layers", 0)) != old_layers + count or baseline.get("routerNeurons") != candidate.get("routerNeurons"):
+            return False
+        expected = dict(old)
+        for index in range(old_layers, old_layers + count):
+            expected.update({"core:decoder.blocks.%d.%s" % (index, name): value for name, value in template.items()})
+        return expected == new
+    if kind in {"grow-router", "grow-regions"}:
+        old_count = int(baseline.get("routerNeurons", 0))
+        addition = int(mutation.get("addNeurons", 0)) if kind == "grow-router" else int(mutation.get("addRegions", 0)) * int(mutation.get("neuronsPerRegion", 0))
+        new_count = old_count + addition
+        if int(candidate.get("routerNeurons", 0)) != new_count or baseline.get("layers") != candidate.get("layers") or set(old) != set(new):
+            return False
+        for name, value in old.items():
+            if not name.startswith("plasticity:router."):
+                if new[name] != value:
+                    return False
+                continue
+            if new[name]["dtype"] != value["dtype"]:
+                return False
+            shape = list(value["shape"])
+            if name.endswith("input_projection._packed_forward_weight"):
+                shape[0] = new_count
+            elif name.endswith("input_projection._packed_forward_bias"):
+                shape[1] = (new_count + 3) // 4
+            elif name.endswith("output_projection._packed_forward_weight") or name.endswith("synapses._packed_weights"):
+                shape[1] = (new_count + 3) // 4
+                if name.endswith("synapses._packed_weights"):
+                    shape[0] = new_count
+            elif name.endswith("region_ends"):
+                regions = int(mutation.get("addRegions", 1))
+                if new[name]["shape"] != [shape[0] + regions]:
+                    return False
+                continue
+            elif name.endswith(("synapses.eligibility_accumulator", "synapses.stability", "synapses.uses")):
+                shape = [new_count, new_count]
+            elif name.endswith(("input_projection._row_stability", "population.membrane", "population.spike_count", "synapses.pre_trace", "synapses.post_trace")):
+                shape = [new_count]
+            if new[name]["shape"] != shape:
+                return False
+        return True
+    return False
 
 
 def _tensor_resources(engine_path: Path) -> Dict[str, int]:
-    tensors = _bundle_tensors(engine_path)
-    substrate_files = (
-        [
-            path
-            for path in (engine_path / "substrate").rglob("*")
-            if path.is_file()
-        ]
-        if (engine_path / "substrate").is_dir()
-        else []
-    )
+    specs = [spec for filename in ("core.safetensors", "plasticity.safetensors") for spec in BoundedTensorFile(engine_path / filename).specs.values()]
+    shard_count, shard_bytes = 0, 0
+    if (engine_path / "substrate").is_dir():
+        for path in (engine_path / "substrate").rglob("*"):
+            if path.is_file():
+                shard_count += 1
+                shard_bytes += int(path.stat().st_size)
     return {
-        "tensorCount": len(tensors),
-        "elementCount": sum(int(tensor.numel()) for tensor in tensors.values()),
-        "tensorBytes": sum(
-            int(tensor.numel() * tensor.element_size())
-            for tensor in tensors.values()
-        ),
+        "tensorCount": len(specs),
+        "elementCount": sum(spec.numel for spec in specs),
+        "tensorBytes": sum(spec.byte_count for spec in specs),
         "checkpointBytes": sum(
             int((engine_path / filename).stat().st_size)
             for filename in ("core.safetensors", "plasticity.safetensors")
         )
-        + sum(int(path.stat().st_size) for path in substrate_files),
-        "substrateShardFiles": len(substrate_files),
-        "substrateShardBytes": sum(
-            int(path.stat().st_size) for path in substrate_files
-        ),
+        + shard_bytes,
+        "substrateShardFiles": shard_count,
+        "substrateShardBytes": shard_bytes,
     }
 
 
 def _diff_checksum(baseline_path: Path, candidate_path: Path) -> Tuple[str, float]:
-    baseline = _bundle_tensors(baseline_path)
-    candidate = _bundle_tensors(candidate_path)
     digest = hashlib.sha256()
     squared_norm = 0.0
-    for name in sorted(set(baseline).union(candidate)):
-        left = baseline.get(name)
-        right = candidate.get(name)
-        digest.update(name.encode("utf-8"))
-        if left is None:
-            assert right is not None
-            digest.update(b"added")
-            digest.update(right.contiguous().numpy().tobytes())
-            squared_norm += float(right.float().pow(2).sum().item())
-        elif right is None:
-            digest.update(b"removed")
-            digest.update(left.contiguous().numpy().tobytes())
-            squared_norm += float(left.float().pow(2).sum().item())
-        elif tuple(left.shape) != tuple(right.shape) or left.dtype != right.dtype:
-            # Dynamic substrate/replay state may legitimately change shape.
-            # Architecture compatibility is checked separately.
-            digest.update(b"reshaped")
-            digest.update(str(tuple(left.shape)).encode("ascii"))
-            digest.update(str(tuple(right.shape)).encode("ascii"))
-            digest.update(right.contiguous().numpy().tobytes())
-            squared_norm += float(left.float().pow(2).sum().item())
-            squared_norm += float(right.float().pow(2).sum().item())
-        else:
-            delta = right.float() - left.float()
-            digest.update(delta.contiguous().numpy().tobytes())
-            squared_norm += float(delta.pow(2).sum().item())
+    for filename, prefix in (("core.safetensors", "core:"), ("plasticity.safetensors", "plasticity:")):
+        left_reader, right_reader = BoundedTensorFile(baseline_path / filename), BoundedTensorFile(candidate_path / filename)
+        for key in sorted(set(left_reader.specs).union(right_reader.specs)):
+            left, right = left_reader.specs.get(key), right_reader.specs.get(key)
+            digest.update((prefix + key).encode("utf-8"))
+            if left is None or right is None:
+                reader, tag = (right_reader, b"added") if left is None else (left_reader, b"removed")
+                digest.update(tag)
+                for chunk in reader.chunks(key):
+                    digest.update(chunk.reshape(-1).view(torch.uint8).numpy().tobytes())
+                    squared_norm += float(chunk.float().pow(2).sum().item())
+            elif left.shape != right.shape or left.dtype != right.dtype:
+                digest.update(b"reshaped")
+                digest.update(str(left.shape).encode("ascii"))
+                digest.update(str(right.shape).encode("ascii"))
+                for chunk in right_reader.chunks(key):
+                    digest.update(chunk.reshape(-1).view(torch.uint8).numpy().tobytes())
+                    squared_norm += float(chunk.float().pow(2).sum().item())
+                for chunk in left_reader.chunks(key):
+                    squared_norm += float(chunk.float().pow(2).sum().item())
+            else:
+                for left_chunk, right_chunk in zip(left_reader.chunks(key), right_reader.chunks(key)):
+                    delta = right_chunk.float() - left_chunk.float()
+                    digest.update(delta.numpy().tobytes())
+                    squared_norm += float(delta.pow(2).sum().item())
     baseline_substrate = _substrate_content_checksum(baseline_path)
     candidate_substrate = _substrate_content_checksum(candidate_path)
     digest.update(b"substrate:")
@@ -337,6 +384,16 @@ class NeuralEvolutionManager:
                 raise ValueError("candidate model is missing %s" % filename)
         return model
 
+    def _admit_isolated_load(self, engine_path: Path) -> int:
+        resident = isolated_checkpoint_resident_bytes(engine_path)
+        reading = self.brain.resource_policy.status(estimated_ram_bytes=resident)
+        if reading.get("memoryPressure"):
+            self.brain.core_pager.cool_to_budget(max(0, int(self.brain.core_pager.status()["cpuHeapBytes"]) - resident))
+            reading = self.brain.resource_policy.status(estimated_ram_bytes=resident)
+        if reading.get("memoryPressure"):
+            raise RuntimeError("isolated evolution checkpoint load paused at the shared control-state reserve")
+        return resident
+
     @staticmethod
     def _objective_loss(brain: Any, texts: Sequence[str]) -> float:
         if not texts:
@@ -348,32 +405,41 @@ class NeuralEvolutionManager:
         return sum(losses) / float(len(losses))
 
     @staticmethod
-    def _latent_loss(brain: Any, anchors: torch.Tensor) -> float:
+    def _latent_loss(brain: Any, anchors: RetentionAnchorFile) -> float:
         if anchors.numel() == 0:
             return 0.0
-        values = anchors.to(brain.device)
+        width = int(anchors.shape[1])
+        pager = getattr(brain.decoder, "working_attention_pager", None)
+        compute = int(getattr(pager, "device_tile_budget_bytes", 1_048_576))
+        # Include hidden/normalization/output and transfer lifetimes, not just
+        # the input row. Admission never cuts the corpus to fit a reservation.
+        batch_rows = min(32, compute // max(1, width * 4 * 32))
+        if batch_rows < 1:
+            raise RuntimeError("retention evaluation paused: one idea row exceeds compute reservation")
         brain.idea_adapter.eval()
+        total, elements = 0.0, 0
         with torch.no_grad():
-            return float(F.mse_loss(brain.idea_adapter(values), values).item())
+            for batch in anchors.batches(max_rows=batch_rows, byte_budget=max(width * 4, min(1_048_576, compute // 32)), policy=getattr(brain, "resource_policy", None)):
+                values = batch.to(brain.device)
+                total += float(F.mse_loss(brain.idea_adapter(values), values, reduction="sum").item())
+                elements += values.numel()
+        return total / elements
 
     @classmethod
     def _capability_loss(cls, brain: Any) -> float:
         return cls._objective_loss(brain, CAPABILITY_PROBES)
 
     @staticmethod
-    def _latent_anchors(brain: Any, texts: Sequence[str]) -> torch.Tensor:
-        anchors: List[torch.Tensor] = [
-            value.detach().cpu().reshape(-1) for value in brain.replay
-        ]
-        for text in texts:
-            anchors.append(
-                brain._idea_model_vector(
-                    brain.memory.vector_for_text(text)
-                ).detach().cpu().reshape(-1)
-            )
-        if not anchors:
-            return torch.empty((0, int(brain.config.idea_dim)), dtype=torch.float32)
-        return torch.stack(anchors).float()
+    def _latent_anchors(brain: Any, texts: Sequence[str], path: Path, candidate_id: str) -> RetentionAnchorFile:
+        def rows():
+            yield from brain.replay
+            for text in texts:
+                yield brain._idea_model_vector(brain.memory.vector_for_text(text))
+        return save_retention_anchors(
+            path, rows(), count=len(brain.replay) + len(texts),
+            width=int(brain.config.idea_dim), candidate_id=candidate_id,
+            policy=getattr(brain, "resource_policy", None),
+        )
 
     def _baseline_paths(self, candidate_id: str) -> Tuple[Path, Path]:
         return (
@@ -383,7 +449,7 @@ class NeuralEvolutionManager:
 
     def _load_baseline(
         self, candidate_id: str, record: Mapping[str, Any]
-    ) -> Tuple[Dict[str, Any], torch.Tensor]:
+    ) -> Tuple[Dict[str, Any], RetentionAnchorFile]:
         manifest_path, tensors_path = self._baseline_paths(candidate_id)
         if not manifest_path.is_file() or not tensors_path.is_file():
             raise ValueError("candidate immutable evaluation baseline is missing")
@@ -392,22 +458,8 @@ class NeuralEvolutionManager:
         manifest = read_json(manifest_path)
         if _file_sha256(tensors_path) != manifest.get("anchorTensorSha256"):
             raise ValueError("candidate immutable baseline tensors failed verification")
-        tensors = load_tensors(tensors_path, device="cpu")
-        anchors = tensors.get("retention_anchors")
-        if anchors is None:
-            raise ValueError("candidate retention anchors are missing")
-        expected_benchmark = _json_sha256(
-            {
-                "evaluator": EVALUATOR_VERSION,
-                "capabilityProbes": list(CAPABILITY_PROBES),
-                "parentStateChecksum": manifest["parentStateChecksum"],
-                "anchorTensorSha256": manifest["anchorTensorSha256"],
-                "architecture": manifest["architecture"],
-                "architectureMutation": manifest.get(
-                    "architectureMutation"
-                ),
-            }
-        )
+        anchors = RetentionAnchorFile(tensors_path, expected_width=int(self.brain.config.idea_dim))
+        expected_benchmark = _json_sha256(_benchmark_payload(manifest))
         if expected_benchmark != manifest.get("benchmarkSha256"):
             raise ValueError("candidate immutable benchmark hash failed verification")
         return manifest, anchors
@@ -425,6 +477,7 @@ class NeuralEvolutionManager:
         architecture_change: Optional[Mapping[str, Any]] = None,
         progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        assert_architecture_quiescent(self.brain)
         architecture_mutation = _normalize_architecture_change(
             architecture_change
         )
@@ -460,6 +513,7 @@ class NeuralEvolutionManager:
         self.brain.save()
         parent_parameter_checksum = self.brain.parameter_checksum()
         parent_state_checksum = _bundle_checksum(self.engine_path)
+        parent_metadata_sha256 = _file_sha256(self.engine_path / "brain.json")
         candidate_id, candidate_dir = self.brain._begin_candidate(
             "neural-evolution"
         )
@@ -469,6 +523,7 @@ class NeuralEvolutionManager:
             candidateType=candidate_type,
             parentParameterChecksum=parent_parameter_checksum,
             parentStateChecksum=parent_state_checksum,
+            parentMetadataSha256=parent_metadata_sha256,
             objectives=objective_names,
             provenance=safe_provenance,
             sourceIds=selected_sources,
@@ -491,9 +546,15 @@ class NeuralEvolutionManager:
 
         model_path = candidate_dir / "model"
         model_engine = model_path / "engine"
-        snapshot_files(candidate_dir / "stable", model_engine)
         candidate = None
+        candidate_rng = preserve_runtime_rng(self.brain.device)
+        candidate_rng.__enter__()
         try:
+            stable = candidate_dir / "stable"
+            self.brain.resource_policy.require_disk(snapshot_required_bytes(stable), "isolated evolution working copy")
+            resident_admission = self._admit_isolated_load(stable)
+            self.brain._record_candidate(candidate_dir, isolatedResidentAdmissionBytes=resident_admission)
+            snapshot_files(stable, model_engine)
             # Late import avoids an AdaptiveBrain/evolution import cycle.
             from .brain import AdaptiveBrain
 
@@ -528,7 +589,9 @@ class NeuralEvolutionManager:
                 raise ValueError(
                     "candidate requires texts, retained sourceIds, or latentReplay"
                 )
-            anchors = self._latent_anchors(candidate, clean_texts)
+            self.baselines_path.mkdir(parents=True, exist_ok=True)
+            baseline_manifest_path, baseline_tensor_path = self._baseline_paths(candidate_id)
+            anchors = self._latent_anchors(candidate, clean_texts, baseline_tensor_path, candidate_id)
             if (
                 latent_replay
                 and anchors.numel() == 0
@@ -545,18 +608,6 @@ class NeuralEvolutionManager:
             baseline_retention = self._latent_loss(candidate, anchors)
             baseline_resources = _tensor_resources(candidate_dir / "stable")
             architecture = _architecture_signature(candidate_dir / "stable")
-            self.baselines_path.mkdir(parents=True, exist_ok=True)
-            baseline_manifest_path, baseline_tensor_path = self._baseline_paths(
-                candidate_id
-            )
-            atomic_save_tensors(
-                baseline_tensor_path,
-                {"retention_anchors": anchors},
-                metadata={
-                    "format": "omni-evolution-evaluation-anchors",
-                    "candidate_id": candidate_id,
-                },
-            )
             anchor_sha = _file_sha256(baseline_tensor_path)
             baseline_manifest = {
                 "format": "omni-neural-evolution-baseline",
@@ -567,6 +618,7 @@ class NeuralEvolutionManager:
                 "evaluator": EVALUATOR_VERSION,
                 "parentParameterChecksum": parent_parameter_checksum,
                 "parentStateChecksum": parent_state_checksum,
+                "parentMetadataSha256": parent_metadata_sha256,
                 "objectives": objective_names,
                 "objectiveTextFingerprints": [
                     {
@@ -586,16 +638,7 @@ class NeuralEvolutionManager:
                 "anchorTensorSha256": anchor_sha,
                 "provenanceSha256": _json_sha256(safe_provenance),
             }
-            baseline_manifest["benchmarkSha256"] = _json_sha256(
-                {
-                    "evaluator": EVALUATOR_VERSION,
-                    "capabilityProbes": list(CAPABILITY_PROBES),
-                    "parentStateChecksum": parent_state_checksum,
-                    "anchorTensorSha256": anchor_sha,
-                    "architecture": architecture,
-                    "architectureMutation": architecture_mutation,
-                }
-            )
+            baseline_manifest["benchmarkSha256"] = _json_sha256(_benchmark_payload(baseline_manifest))
             atomic_write_json(baseline_manifest_path, baseline_manifest)
             baseline_manifest_sha = _file_sha256(baseline_manifest_path)
             self.brain._record_candidate(
@@ -608,46 +651,89 @@ class NeuralEvolutionManager:
                 progress(0.15, "Immutable neural baseline captured")
             architecture_result = None
             if architecture_mutation is not None:
-                additions = int(architecture_mutation["addExperts"])
-                hidden = max(16, int(candidate.config.d_ff) // 2)
-                # Expert projections are authoritative packed ternary
-                # synapses. Reserve room for their live codes, an isolated
-                # candidate, a rollback checkpoint, and bounded update
-                # scratch, without charging for nonexistent FP32 masters or
-                # full-sized Adam moments.
-                estimated_parameters = additions * (
-                    2 * int(candidate.config.d_model)
-                    + 3 * int(candidate.config.d_model) * hidden
-                )
-                packed_bytes = (estimated_parameters + 3) // 4
-                estimated_bytes = packed_bytes * 3 + max(
-                    1_048_576,
-                    4 * int(candidate.config.d_model) * hidden,
-                )
+                assert_architecture_quiescent(candidate)
+                candidate.core_pager.flush()
+                kind = architecture_mutation["mutation"]
+                d, ff, old_neurons = int(candidate.config.d_model), int(candidate.config.d_ff), int(candidate.config.router_neurons)
+                old_layers = int(candidate.config.n_layers)
+                new_layers, new_neurons = growth_dimensions(candidate.config, architecture_mutation)
+                if kind == "grow-experts":
+                    additions = int(architecture_mutation["addExperts"])
+                    hidden = max(16, ff // 2)
+                    packed_bytes = (additions * (2 * d + 3 * d * hidden) + 3) // 4
+                    nonweight_transient = additions * 64 * 1024
+                elif kind == "grow-depth":
+                    additions = int(architecture_mutation["addLayers"])
+                    packed_bytes = additions * ((4 * d * d + 3 * d * ff + 3) // 4 + 2 * ((d + 3) // 4))
+                    nonweight_transient = additions * (5 * d + 2 * ff + 64 * 1024)
+                else:
+                    additions = new_neurons - old_neurons
+                    packed_bytes = (2 * d * additions + new_neurons * new_neurons - old_neurons * old_neurons + 3) // 4
+                    # Router timing/stability/use buffers are not packed
+                    # weights. Charge complete new buffers while the old
+                    # instance still exists, including transfer/load margin.
+                    nonweight_transient = 2 * (10 * new_neurons * new_neurons + 16 * new_neurons + 32) + 64 * 1024
+                estimated_bytes = packed_bytes * 3 + nonweight_transient + max(1_048_576, 256 * max(d, ff, new_neurons))
                 if not candidate._allow_substrate_growth(estimated_bytes):
                     raise ValueError(
                         "architecture growth paused at the host resource reserve"
                     )
+                # Packed owner paging does not cover STDP timing/activity or
+                # other ordinary controls. Admit their complete simultaneous
+                # transfer before allocating a larger accelerator population.
+                admission = getattr(candidate.core_pager, "reserve_admission", None)
+                if candidate.device.type != "cpu" and callable(admission):
+                    admission(max(4096, nonweight_transient), candidate.device)
                 expert_count_before = int(candidate.decoder.expert_count)
-                for _ in range(additions):
-                    index = candidate.decoder.grow_expert()
-                    # A newly inserted architecture is function-preserving
-                    # before isolated training. Its residual path begins at
-                    # zero and can then learn inside the candidate overlay.
-                    candidate.decoder.experts[index].network.down.fill_ternary_(0)
+                with preserve_runtime_rng(candidate.device):
+                    if kind == "grow-experts":
+                        if int(candidate.config.expert_routing_baseline_count) < 0:
+                            candidate.config.expert_routing_baseline_count = expert_count_before
+                        for _ in range(additions):
+                            index = candidate.decoder.grow_expert()
+                            candidate.decoder.experts[index].network.down.fill_ternary_(0)
+                    elif kind == "grow-depth":
+                        candidate.decoder.grow_depth(additions)
+                    else:
+                        region_sizes = (int(architecture_mutation["neuronsPerRegion"]),) * int(architecture_mutation["addRegions"]) if kind == "grow-regions" else None
+                        candidate.router.grow_neurons(additions, region_sizes=region_sizes)
+                candidate.config.n_layers = new_layers
+                candidate.config.router_neurons = new_neurons
+                candidate.config.native_architecture = reseal_native_descriptor(candidate.config, architecture_mutation)
+                candidate.config.validate()
+                candidate.core_pager.bind_names((("decoder.", candidate.decoder), ("router.", candidate.router)))
+                runtime = candidate._resource_readings()
+                activity = candidate._working_attention_status()
+                heap = candidate.core_pager.status().get("cpuHeapBytes", 0)
+                candidate._native_residency_baseline_bytes = max(
+                    int(candidate._native_residency_baseline_bytes),
+                    max(0, int(runtime.get("processMemoryBytes") or 0) - int(heap) - int(activity.get("residentBytes", 0))),
+                )
+                candidate.core_pager.refresh_budget(force=True)
+                candidate._configure_working_attention_resources()
                 candidate._replace_optimizer(learning_rate)
                 candidate._sync_stability_state()
+                candidate.save()
+                preservation = {
+                    filename: verify_preserved_tensor_prefixes(candidate_dir / "stable" / filename, model_engine / filename)
+                    for filename in ("core.safetensors", "plasticity.safetensors")
+                }
                 architecture_result = {
                     **architecture_mutation,
                     "expertCountBefore": expert_count_before,
                     "expertCountAfter": int(candidate.decoder.expert_count),
                     "estimatedGrowthBytes": estimated_bytes,
+                    "layersBefore": old_layers, "layersAfter": new_layers,
+                    "routerNeuronsBefore": old_neurons, "routerNeuronsAfter": new_neurons,
+                    "preservedBeforeTraining": preservation,
+                    "normalizationAndHeadGeometryChanged": False,
+                    "qualityVerified": False,
                     "resourceReadings": candidate._resource_readings(),
                 }
                 if progress is not None:
                     progress(
                         0.2,
-                        "Compatible ternary residual expert architecture created",
+                        "Compatible native architecture inserted with old-state byte proof",
                     )
             if clean_texts:
                 def scaled_progress(
@@ -703,8 +789,8 @@ class NeuralEvolutionManager:
                     "mode": "function-preserving-architecture-insertion",
                     "steps": 0,
                     "reason": (
-                        "The zero-residual compatible expert adds capacity "
-                        "without changing blank-brain outputs before future learning."
+                        "Compatible zero-residual/dormant-region capacity inserted "
+                        "with old-state byte preservation; useful improvement remains unverified."
                     ),
                 }
             candidate.save()
@@ -716,6 +802,7 @@ class NeuralEvolutionManager:
             final_capability = self._capability_loss(candidate)
             final_retention = self._latent_loss(candidate, anchors)
             candidate_state_checksum = _bundle_checksum(model_engine)
+            candidate_metadata_sha256 = _file_sha256(model_engine / "brain.json")
             candidate_parameter_checksum = candidate.parameter_checksum()
             diff_sha, diff_norm = _diff_checksum(
                 candidate_dir / "stable", model_engine
@@ -746,8 +833,10 @@ class NeuralEvolutionManager:
                 rejectedAt=_iso_now() if status == "rejected" else None,
                 candidateParameterChecksum=candidate_parameter_checksum,
                 candidateStateChecksum=candidate_state_checksum,
+                candidateMetadataSha256=candidate_metadata_sha256,
                 candidateDiffSha256=diff_sha,
                 candidateDeltaNorm=diff_norm,
+                candidateDeltaNormBasis="encoded-checkpoint-state-diff-not-learning-magnitude",
                 training=training,
                 preliminaryMetrics={
                     "baselineObjectiveLoss": baseline_objective,
@@ -799,8 +888,11 @@ class NeuralEvolutionManager:
             )
             raise
         finally:
-            if candidate is not None:
-                candidate.events.close()
+            try:
+                if candidate is not None:
+                    candidate.close()
+            finally:
+                candidate_rng.__exit__(None, None, None)
 
     def evaluate(self, candidate_id: str) -> Dict[str, Any]:
         candidate_dir, record = self._record(candidate_id)
@@ -812,16 +904,19 @@ class NeuralEvolutionManager:
         baseline, anchors = self._load_baseline(candidate_id, record)
         model_path = self._model_path(candidate_dir)
         from .brain import AdaptiveBrain
-
-        candidate = AdaptiveBrain.load(
-            model_path, expected_brain_id=self.brain.brain_id
-        )
+        self._admit_isolated_load(model_path / "engine")
+        candidate = None
+        candidate_rng = preserve_runtime_rng(self.brain.device)
+        candidate_rng.__enter__()
         try:
+            candidate = AdaptiveBrain.load(model_path, expected_brain_id=self.brain.brain_id)
             model_engine = model_path / "engine"
             state_checksum = _bundle_checksum(model_engine)
             integrity_passed = state_checksum == record.get(
                 "candidateStateChecksum"
             )
+            if record.get("candidateMetadataSha256") is not None:
+                integrity_passed = integrity_passed and _file_sha256(model_engine / "brain.json") == record["candidateMetadataSha256"]
             candidate_architecture = _architecture_signature(model_engine)
             architecture_mutation = baseline.get("architectureMutation")
             architecture_passed = _architecture_compatible(
@@ -921,6 +1016,7 @@ class NeuralEvolutionManager:
                     "architectureMutation"
                 ),
                 "architecture": candidate_architecture,
+                "candidateDeltaNormBasis": record.get("candidateDeltaNormBasis", "legacy-checkpoint-state-diff"),
             }
             evaluation["evaluationSha256"] = _json_sha256(evaluation)
             status = "evaluated" if passed else "rejected"
@@ -952,7 +1048,11 @@ class NeuralEvolutionManager:
                 "status": status,
             }
         finally:
-            candidate.events.close()
+            try:
+                if candidate is not None:
+                    candidate.close()
+            finally:
+                candidate_rng.__exit__(None, None, None)
 
     def list(self) -> Dict[str, Any]:
         candidates: List[Dict[str, Any]] = []
@@ -997,6 +1097,7 @@ class NeuralEvolutionManager:
         }
 
     def promote(self, candidate_id: str) -> Dict[str, Any]:
+        assert_architecture_quiescent(self.brain)
         candidate_dir, record = self._record(candidate_id)
         if record.get("status") == "ready":
             self.evaluate(candidate_id)
@@ -1013,6 +1114,8 @@ class NeuralEvolutionManager:
         if (
             live_parameter_checksum != record.get("parentParameterChecksum")
             or live_state_checksum != record.get("parentStateChecksum")
+            or (record.get("parentMetadataSha256") is not None
+                and _file_sha256(self.engine_path / "brain.json") != record["parentMetadataSha256"])
         ):
             self.brain._record_candidate(
                 candidate_dir,
@@ -1027,6 +1130,10 @@ class NeuralEvolutionManager:
         candidate_state_checksum = _bundle_checksum(model_engine)
         if candidate_state_checksum != record.get("candidateStateChecksum"):
             raise ValueError("candidate checkpoint failed checksum verification")
+        if record.get("candidateMetadataSha256") is not None and _file_sha256(model_engine / "brain.json") != record["candidateMetadataSha256"]:
+            raise ValueError("candidate metadata/context/lineage failed checksum verification")
+        if _architecture_signature(model_engine) != evaluation.get("architecture"):
+            raise ValueError("candidate architecture changed after immutable evaluation")
         self.brain._record_candidate(
             candidate_dir,
             status="promoting",
@@ -1060,6 +1167,7 @@ class NeuralEvolutionManager:
             status="promoted",
             promotedAt=_iso_now(),
             promotedStateChecksum=promoted_checksum,
+            promotedMetadataSha256=_file_sha256(self.engine_path / "brain.json"),
             rollbackAvailable=True,
         )
         candidate_type = str(record.get("candidateType", "neural"))
@@ -1098,12 +1206,14 @@ class NeuralEvolutionManager:
         }
 
     def rollback(self, candidate_id: str, force: bool = False) -> Dict[str, Any]:
+        assert_architecture_quiescent(self.brain)
         candidate_dir, record = self._record(candidate_id)
         if record.get("status") != "promoted":
             raise ValueError("only a promoted candidate can be rolled back")
         current_checksum = _bundle_checksum(self.engine_path)
         expected = str(record.get("promotedStateChecksum", ""))
-        if current_checksum != expected and not force:
+        metadata_changed = record.get("promotedMetadataSha256") is not None and _file_sha256(self.engine_path / "brain.json") != record["promotedMetadataSha256"]
+        if (current_checksum != expected or metadata_changed) and not force:
             raise ValueError(
                 "live brain changed after promotion; explicit force is required"
             )
@@ -1119,6 +1229,8 @@ class NeuralEvolutionManager:
         restored_checksum = _bundle_checksum(self.engine_path)
         if restored_checksum != record.get("parentStateChecksum"):
             raise RuntimeError("rollback point checksum mismatch")
+        if record.get("parentMetadataSha256") is not None and _file_sha256(self.engine_path / "brain.json") != record["parentMetadataSha256"]:
+            raise RuntimeError("rollback point metadata/context/lineage checksum mismatch")
         self.brain._record_candidate(
             candidate_dir,
             status="rolled-back",

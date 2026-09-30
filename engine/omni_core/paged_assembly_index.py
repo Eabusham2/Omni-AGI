@@ -35,6 +35,12 @@ from .paged_packed_vectors import (
     _decoded_row,
 )
 from .paged_vector_scoring import PackedVectorPage, PackedVectorRow
+from .paged_store_counts import (
+    assembly_vector_count, ensure_assembly_vector_count, ensure_row_count, row_count,
+)
+from .paged_assembly_membership import (
+    ALGORITHM as MEMBERSHIP_CHECKSUM_ALGORITHM, ensure_membership_checksum, membership_checksum,
+)
 
 
 _FORMAT = "omni-paged-assembly-index"
@@ -564,6 +570,10 @@ class PagedAssemblyIndex:
                         after_metadata = last_metadata
                     connection.execute("PRAGMA user_version = %d" % _VERSION)
                 self._dimensions = stored_dimensions
+                ensure_row_count(connection, "assembly_records", self._reserve_disk)
+                ensure_membership_checksum(connection, self._reserve_disk)
+                if stored_dimensions is not None:
+                    ensure_assembly_vector_count(connection, self._reserve_disk)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -588,6 +598,8 @@ class PagedAssemblyIndex:
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA temp_store=FILE")
+        from .paged_idle_selection import observe_idle_source_connection
+        observe_idle_source_connection(connection, self.path)
         return connection
 
     @contextmanager
@@ -883,6 +895,26 @@ class PagedAssemblyIndex:
     def get_by_id(self, assembly_id: str) -> Optional[Dict[str, Any]]:
         return self._lookup("assembly_id", assembly_id)
 
+    def get_by_id_with_ordinal(self, assembly_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """Fetch one exact record and its persistence position without a scan."""
+
+        with self._transaction() as connection:
+            size = connection.execute(
+                "SELECT LENGTH(record_json) FROM assembly_records WHERE assembly_id=?",
+                (assembly_id,),
+            ).fetchone()
+            if size is None:
+                return None
+            self._reserve_memory(_READ_OVERHEAD_BYTES + 3 * int(size[0]),
+                                 "assembly ordinal lookup")
+            row = connection.execute(
+                "SELECT sequence,assembly_id,fingerprint,record_json,record_sha256 "
+                "FROM assembly_records WHERE assembly_id=?", (assembly_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("assembly metadata changed during ordinal lookup")
+            return int(row[0]) - 1, self._decode_record(row)
+
     def get_by_fingerprint(self, fingerprint: str) -> Optional[Dict[str, Any]]:
         return self._lookup("fingerprint", fingerprint)
 
@@ -945,10 +977,7 @@ class PagedAssemblyIndex:
             high_water = int(connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) FROM assembly_records"
             ).fetchone()[0])
-            vector_rows = int(connection.execute(
-                "SELECT COUNT(*) FROM assembly_records AS a "
-                "JOIN paged_vector_rows AS v ON v.vector_id=a.assembly_id"
-            ).fetchone()[0])
+            vector_rows = assembly_vector_count(connection)
         return _encode_checked_token({
             "format": _VECTOR_SNAPSHOT_FORMAT,
             "formatVersion": _VERSION,
@@ -1260,9 +1289,16 @@ class PagedAssemblyIndex:
 
     def count(self) -> int:
         with self._transaction() as connection:
-            return int(connection.execute(
-                "SELECT COUNT(*) FROM assembly_records"
-            ).fetchone()[0])
+            return row_count(connection, "assembly_records")
+
+    def ids_sha256(self) -> str:
+        """Versioned exact-ID checksum updated from transaction-held deltas."""
+
+        with self._transaction(write=True) as connection:
+            ensure_membership_checksum(connection)
+            return membership_checksum(connection, self._reserve_disk)
+
+    ids_checksum_algorithm = MEMBERSHIP_CHECKSUM_ALGORITHM
 
     def save_checkpoint(self, name: str, value: Mapping[str, Any]) -> None:
         """Atomically save a source progress cursor without admitting a record."""
@@ -1456,10 +1492,10 @@ class PagedAssemblyIndex:
 
     def status(self) -> Dict[str, Any]:
         with self._transaction() as connection:
-            count, high_water = connection.execute(
-                "SELECT COUNT(*), COALESCE(MAX(sequence), 0) "
-                "FROM assembly_records"
-            ).fetchone()
+            count = row_count(connection, "assembly_records")
+            high_water = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM assembly_records"
+            ).fetchone()[0]
             store_id = self._store_id(connection)
             index_revision = self._index_revision(connection)
             bindings = dict(connection.execute(
@@ -1470,10 +1506,7 @@ class PagedAssemblyIndex:
             if self._dimensions is None:
                 vector_rows, vector_revision = 0, 0
             else:
-                vector_rows = int(connection.execute(
-                    "SELECT COUNT(*) FROM assembly_records AS a "
-                    "JOIN paged_vector_rows AS v ON v.vector_id=a.assembly_id"
-                ).fetchone()[0])
+                vector_rows = assembly_vector_count(connection)
                 vector_revision = self._vector_revision(connection)
             committed_generation = bindings.get("committed_generation_sha256") or None
             dirty = (

@@ -4,6 +4,8 @@ import { dirname, join, resolve } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { EngineHealth } from "../shared/types";
+import { VideoRuntimeUnavailableError, type PreparedVideoRuntime, type VideoRuntimeProgress } from "./videoRuntimeProvisioner";
+import { CodecRuntimeSetupBridge, codecRuntimeChallenge, sameCodecOwner, type CodecRuntimeOwner } from "./codecRuntimeBridge";
 
 const PROTOCOL_VERSION = 1;
 const MAX_PROTOCOL_LINE = 32 * 1024 * 1024;
@@ -13,9 +15,13 @@ const COOPERATIVE_CANCEL_GRACE_MS = 180_000;
 // its fast experience is still uncommitted; Stop gets a short fallback deadline.
 const PRE_OUTPUT_CANCEL_GRACE_MS = 5_000;
 const COOPERATIVE_CANCEL_METHODS = new Set([
+  "hardware_projection_profile",
   "load",
   "chat",
-  "consolidate_chat_learning"
+  "consolidate_chat_learning",
+  "configure_video_runtime",
+  "generate_neural_speech",
+  "generate_modality"
 ]);
 /** Explicit opt-out used only by durable, cancellable multi-day jobs. */
 export const ENGINE_REQUEST_NO_DEADLINE = 0 as const;
@@ -28,6 +34,9 @@ interface PendingRequest {
   reject(error: Error): void;
   timeout?: NodeJS.Timeout;
   cancelRequested?: boolean;
+  codecOwner?: CodecRuntimeOwner;
+  codecSignal?: AbortSignal;
+  codecChallenges?: Set<string>;
   cleanup(): void;
 }
 
@@ -88,6 +97,8 @@ export interface EngineRequestContext {
   jobId?: string;
   turnId?: string;
   onTransition?(transition: EngineActivityTransition): void;
+  /** Main-only safe-boundary admission check; never model-facing input. */
+  beforeDispatch?(): void;
 }
 
 export interface EngineCancellationAcknowledgement {
@@ -95,6 +106,8 @@ export interface EngineCancellationAcknowledgement {
   acknowledged: boolean;
   phase: "queued" | "running" | "not-found";
   workerTerminationAcknowledged: boolean;
+  codecSetupCancellationAcknowledged?: true;
+  artifactCancellationAcknowledged?: true;
 }
 
 /** A request-correlated JSON-RPC failure with the worker's typed data intact. */
@@ -133,6 +146,7 @@ interface RequestReservation {
   readonly turnId?: string;
   readonly controller: AbortController;
   readonly onTransition?: (transition: EngineActivityTransition) => void;
+  readonly beforeDispatch?: () => void;
   readonly externalSignal?: AbortSignal;
   readonly externalAbort?: () => void;
   readonly settled: Promise<void>;
@@ -142,6 +156,9 @@ interface RequestReservation {
   queuedBehind?: EngineActivityReference;
   cancellationPhase?: "queued" | "running";
   workerTerminationAcknowledged: boolean;
+  codecSetupCancellationAcknowledged?: true;
+  artifactCancellationAcknowledged?: true;
+  inlineScopeCancellationRequested?: true;
   dispatched: boolean;
   cancelled: boolean;
 }
@@ -200,6 +217,28 @@ export interface EngineSupervisorOptions {
   workerPath?: string;
   pythonCommand?: string;
   sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
+  videoRuntimeCacheRoot?: string;
+  prepareVideoRuntime?: (
+    signal: AbortSignal,
+    onProgress: (progress: VideoRuntimeProgress) => void
+  ) => Promise<PreparedVideoRuntime>;
+}
+
+/** Health/code checks and text-only jobs never initiate dependency downloads. */
+export function requestNeedsVideoRuntime(method: string, params: Record<string, unknown>): boolean {
+  if (method === "generate_modality") return params.modality === "video";
+  if (method === "ingest") {
+    const path = typeof params.path === "string" ? params.path : "";
+    // These inputs use the existing Pillow/PCM paths, not a video runtime.
+    if (/\.(?:gif|wav|wave|pcm)$/i.test(path)) return false;
+    return params.kind === "video" || params.kind === "audio" ||
+      /\.(?:mp4|webm|mov|mkv|avi|m4v|mp3|m4a|aac|ogg|opus)$/i.test(path);
+  }
+  if (method === "observe_packet") {
+    const mime = typeof params.mimeType === "string" ? params.mimeType.split(";", 1)[0] ?? "" : "";
+    return /^(?:video\/(?:mp4|webm|quicktime|ogg|mp2t|x-matroska)|audio\/(?:webm|ogg|mp4|aac|opus))$/i.test(mime);
+  }
+  return false;
 }
 
 function workerCandidates(options: EngineSupervisorOptions): string[] {
@@ -270,14 +309,14 @@ function inferredActivityOwner(
   priority: EngineRequestPriority,
   workerRole: "neural" | "inspection"
 ): EngineActivityOwner {
-  if (workerRole === "inspection" || method === "query_substrate") return "inspection";
+  if (workerRole === "inspection" || method === "query_substrate" || method === "query_cortex" || method === "query_concept_id_view") return "inspection";
   if (priority === "background" || method === "idle_cycle") return "idle";
   if (method === "create") return "build";
   if (method === "chat" || method === "chat_receipt") return "chat";
   if (method.startsWith("evolution.")) return "evolution";
   if (method === "train") return "training";
   if (method === "ingest") return "ingestion";
-  if (method === "generate_modality") return "modality";
+  if (method === "generate_modality" || method === "generate_neural_speech") return "modality";
   return "system";
 }
 
@@ -312,6 +351,8 @@ export class EngineSupervisor extends EventEmitter {
   private readonly requestReservationsById = new Map<string, RequestReservation>();
   private activeRequest?: RequestReservation;
   private backgroundPreemption?: Promise<void>;
+  private readonly codecBridge: CodecRuntimeSetupBridge;
+  private readonly inlineCodecOwners = new Map<string, { owner: CodecRuntimeOwner; controller: AbortController; child: ChildProcessWithoutNullStreams }>();
 
   constructor(
     options: EngineSupervisorOptions,
@@ -320,6 +361,10 @@ export class EngineSupervisor extends EventEmitter {
     super();
     this.options = options;
     this.workerRole = workerRole;
+    this.codecBridge = new CodecRuntimeSetupBridge(async (signal, progress) => {
+      if (!this.options.prepareVideoRuntime) throw new Error("Trusted pinned codec setup is unavailable in this runtime.");
+      return this.options.prepareVideoRuntime(signal, progress);
+    });
   }
 
   private activityReference(reservation: RequestReservation): EngineActivityReference {
@@ -431,6 +476,7 @@ export class EngineSupervisor extends EventEmitter {
       turnId: context?.turnId,
       controller,
       onTransition: context?.onTransition,
+      beforeDispatch: context?.beforeDispatch,
       externalSignal: signal,
       externalAbort,
       settled,
@@ -499,7 +545,9 @@ export class EngineSupervisor extends EventEmitter {
       requestId,
       acknowledged: reservation.state === "cancelled",
       phase,
-      workerTerminationAcknowledged: reservation.workerTerminationAcknowledged
+      workerTerminationAcknowledged: reservation.workerTerminationAcknowledged,
+      ...(reservation.codecSetupCancellationAcknowledged ? { codecSetupCancellationAcknowledged: true as const } : {}),
+      ...(reservation.artifactCancellationAcknowledged ? { artifactCancellationAcknowledged: true as const } : {})
     };
   }
 
@@ -604,10 +652,13 @@ export class EngineSupervisor extends EventEmitter {
     const child = spawn(candidate.command, args, {
       cwd: direct ? dirname(candidate.command) : dirname(worker as string),
       env: {
-        ...process.env,
+        ...managedWorkerMemoryEnvironment(process.env),
         PYTHONUNBUFFERED: "1",
         OMNI_PROTOCOL_VERSION: String(PROTOCOL_VERSION),
-        OMNI_WORKER_ROLE: this.workerRole
+        OMNI_WORKER_ROLE: this.workerRole,
+        ...(this.options.videoRuntimeCacheRoot
+          ? { OMNI_VIDEO_RUNTIME_CACHE_ROOT: resolve(this.options.videoRuntimeCacheRoot) }
+          : {})
       },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -691,6 +742,12 @@ export class EngineSupervisor extends EventEmitter {
     child: ChildProcessWithoutNullStreams,
     error: Error
   ): void {
+    const retiredRequests = new Set([...this.pending.entries()].filter(([_id, request]) => request.child === child).map(([id]) => id));
+    this.codecBridge.cancel((owner) => retiredRequests.has(owner.requestId));
+    for (const [key, entry] of this.inlineCodecOwners) if (entry.child === child) {
+      entry.controller.abort(new Error("The owning codec worker closed."));
+      this.inlineCodecOwners.delete(key);
+    }
     for (const [id, request] of [...this.pending.entries()]) {
       if (request.child !== child) continue;
       this.pending.delete(id);
@@ -760,6 +817,7 @@ export class EngineSupervisor extends EventEmitter {
         typeof record.params === "object" && record.params !== null
           ? (record.params as EngineEvent)
           : ({ type: "worker-event", data: record.params } satisfies EngineEvent);
+      if (this.handleCodecRuntimeEvent(event)) return;
       const emittedToken = event.type === "chat-token" &&
         typeof event.data === "object" && event.data !== null &&
         typeof (event.data as Record<string, unknown>).delta === "string" &&
@@ -779,6 +837,65 @@ export class EngineSupervisor extends EventEmitter {
       }
       this.emit("event", event);
     }
+  }
+
+  private handleCodecRuntimeEvent(event: EngineEvent): boolean {
+    const data = event.data && typeof event.data === "object" && !Array.isArray(event.data)
+      ? event.data as Record<string, unknown> : undefined;
+    const key = (requestId: string, actionId: string) => `${requestId}:${actionId}`;
+    if (event.type === "inline-imagination-started" && data && typeof data.requestId === "string" &&
+        typeof event.actionId === "string" && /^[a-f0-9]{32}$/.test(event.actionId) && this.child) {
+      const pending = this.pending.get(data.requestId);
+      const owner = pending?.codecOwner;
+      if (pending?.child === this.child && owner && owner.brainId === event.brainId &&
+          owner.streamId === event.streamId && pending.chatStreamId === event.streamId) {
+        this.inlineCodecOwners.set(key(data.requestId, event.actionId), {
+          owner: { ...owner, jobId: "", actionId: event.actionId }, controller: new AbortController(), child: this.child
+        });
+      }
+    }
+    if (event.type === "inline-imagination-finished" || event.type === "inline-imagination-cancelled") {
+      for (const [entryKey, entry] of this.inlineCodecOwners) {
+        if (entry.owner.brainId === event.brainId && entry.owner.streamId === event.streamId && entry.owner.actionId === event.actionId &&
+            (event.type === "inline-imagination-cancelled" || data?.requestId === entry.owner.requestId)) {
+          entry.controller.abort(new Error("This exact inline codec owner ended."));
+          this.inlineCodecOwners.delete(entryKey);
+        }
+      }
+    }
+    if (event.type === "codec-runtime-released") {
+      const owner = codecRuntimeChallenge({ ...data, purpose: "decode-video" });
+      if (owner) {
+        this.codecBridge.release(owner.challengeId, owner);
+        this.pending.get(owner.requestId)?.codecChallenges?.delete(owner.challengeId);
+      }
+      return true;
+    }
+    if (event.type !== "codec-runtime-needed") return false;
+    const challenge = codecRuntimeChallenge(data);
+    const pending = challenge ? this.pending.get(challenge.requestId) : undefined;
+    const direct = challenge && pending && pending.child === this.child && pending.codecOwner && sameCodecOwner(pending.codecOwner, challenge);
+    const inline = challenge ? this.inlineCodecOwners.get(key(challenge.requestId, challenge.actionId)) : undefined;
+    if (!challenge || !this.child || challenge.brainId !== (event.brainId ?? "") || challenge.jobId !== (event.jobId ?? "") ||
+        challenge.streamId !== (event.streamId ?? "") || challenge.actionId !== (event.actionId ?? "") ||
+        (!direct && (!inline || inline.child !== this.child || !sameCodecOwner(inline.owner, challenge)))) {
+      this.emit("diagnostic", "Refused an unowned or malformed worker codec challenge.");
+      return true;
+    }
+    if (direct) pending?.codecChallenges?.add(challenge.challengeId);
+    const signal = direct ? pending?.codecSignal ?? new AbortController().signal : inline!.controller.signal;
+    try {
+      this.codecBridge.accept(challenge, signal, async (receipt) => {
+        if (receipt.outcome === "ready" && !this.options.videoRuntimeCacheRoot) throw new Error("Codec setup has no fixed main-owned cache root.");
+        const ack = await this.rawRequest("resolve_codec_runtime", receipt as unknown as Record<string, unknown>, 10_000, undefined, true) as Record<string, unknown>;
+        if (ack.acknowledged !== true || ack.challengeId !== challenge.challengeId) throw new Error("Worker codec receipt acknowledgement is invalid.");
+      }, (progress) => this.emit("event", {
+        type: "video-runtime-setup", brainId: challenge.brainId, jobId: challenge.jobId,
+        streamId: challenge.streamId, actionId: challenge.actionId, message: progress.message,
+        data: { ...progress, setupOnly: true, requestId: challenge.requestId, challengeId: challenge.challengeId }
+      } satisfies EngineEvent));
+    } catch (error) { this.emit("diagnostic", `Codec challenge failed: ${messageFromError(error)}`); }
+    return true;
   }
 
   private signalCooperativeCancellation(
@@ -804,7 +921,8 @@ export class EngineSupervisor extends EventEmitter {
     method: string,
     params: Record<string, unknown>,
     timeoutMs: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    control = false
   ): Promise<unknown> {
     const child = this.child;
     if (!child || child.killed || child.exitCode !== null || !child.stdin.writable) {
@@ -824,7 +942,9 @@ export class EngineSupervisor extends EventEmitter {
             this.pending.delete(id);
             pending.cleanup();
             pending.reject(new Error(`Worker request "${method}" timed out.`));
-            void this.terminateChild();
+            // A missing artifact-control receipt is not authority to kill the
+            // neural transaction or replace the worker owning a saved reply.
+            if (!control) void this.terminateChild();
           }, timeoutMs);
       const abort = (): void => {
         const pending = this.pending.get(id);
@@ -847,10 +967,51 @@ export class EngineSupervisor extends EventEmitter {
             )
           );
         };
+        const inline = pending.codecOwner?.actionId
+          ? [...this.inlineCodecOwners.values()].find((entry) => entry.child === child &&
+            entry.owner.brainId === pending.codecOwner?.brainId && entry.owner.actionId === pending.codecOwner?.actionId)
+          : undefined;
+        if (method === "generate_modality" && inline) {
+          // A host job can claim a decode whose codec setup is still bound to
+          // its original chat/action scope. Cancel that exact artifact, not the
+          // current brain or the saved reply belonging to the retired text RPC.
+          if (this.activeRequest?.method === method && this.activeRequest.brainId === inline.owner.brainId) {
+            this.activeRequest.inlineScopeCancellationRequested = true;
+          }
+          this.codecBridge.cancel((owner) => sameCodecOwner(owner, inline.owner));
+          void this.rawRequest("cancel_inline_generation", { brainId: inline.owner.brainId,
+            streamId: inline.owner.streamId, neuralActionId: inline.owner.actionId }, 10_000, undefined, true)
+            .catch((error: unknown) => this.emit("diagnostic", `Exact inline cancel control failed: ${messageFromError(error)}`));
+          cancellationTimeout = setTimeout(() => this.emit("diagnostic",
+            "Exact inline artifact cleanup remains pending; its warm worker was not terminated."), COOPERATIVE_CANCEL_GRACE_MS);
+          return;
+        }
+        if (pending.codecChallenges?.size) {
+          // Setup is an out-of-band file operation, not a reason to terminate
+          // the active neural writer. Its handler returns after actual unwind.
+          this.codecBridge.cancel((owner) => owner.requestId === id);
+          cancellationTimeout = setTimeout(() => this.emit("diagnostic",
+            "Owned codec setup cleanup remains pending; its warm worker was not terminated."), COOPERATIVE_CANCEL_GRACE_MS);
+          return;
+        }
+        if ((method === "generate_modality" || method === "generate_neural_speech") && pending.codecOwner) {
+          // Strict flags-only control is portable and names the exact raw RPC,
+          // brain, job and action. It cannot accidentally signal a sibling.
+          void this.rawRequest("cancel_artifact_request", pending.codecOwner as unknown as Record<string, unknown>, 10_000, undefined, true)
+            .catch((error: unknown) => this.emit("diagnostic", `Exact artifact cancel control failed: ${messageFromError(error)}`));
+          cancellationTimeout = setTimeout(() => this.emit("diagnostic",
+            "Exact neural artifact cancellation remains pending; the warm worker was not terminated."), COOPERATIVE_CANCEL_GRACE_MS);
+          return;
+        }
         if (
           COOPERATIVE_CANCEL_METHODS.has(method) &&
           this.signalCooperativeCancellation(child)
         ) {
+          if (method === "generate_modality" || method === "generate_neural_speech") {
+            cancellationTimeout = setTimeout(() => this.emit("diagnostic",
+              "Exact neural artifact cancellation remains pending; the warm worker was not terminated."), COOPERATIVE_CANCEL_GRACE_MS);
+            return;
+          }
           const preOutputChat = method === "chat" &&
             Boolean(pending.chatStreamId) &&
             !pending.chatOutputOrCommitObserved;
@@ -887,6 +1048,9 @@ export class EngineSupervisor extends EventEmitter {
       };
       this.pending.set(id, {
         child,
+        ...(!control ? { codecOwner: { requestId: id, brainId: typeof params.brainId === "string" ? params.brainId : "",
+          jobId: typeof params.jobId === "string" ? params.jobId : "", streamId: typeof params.streamId === "string" ? params.streamId : "",
+          actionId: typeof params.neuralActionId === "string" ? params.neuralActionId : "" }, codecSignal: signal, codecChallenges: new Set<string>() } : {}),
         ...(method === "chat" && typeof params.streamId === "string" && params.streamId
           ? { chatStreamId: params.streamId }
           : {}),
@@ -979,8 +1143,11 @@ export class EngineSupervisor extends EventEmitter {
     priority: EngineRequestPriority = "foreground",
     context?: EngineRequestContext
   ): Promise<T> {
+    if (method === "configure_video_runtime" || method === "resolve_codec_runtime" || method === "cancel_artifact_request") {
+      throw new Error("Video runtime configuration is an internal verified-main operation.");
+    }
     if (
-      (method === "query_substrate" || method === "cancel") &&
+      (method === "query_substrate" || method === "query_cortex" || method === "query_concept_id_view" || method === "cancel") &&
       this.workerRole === "neural"
     ) {
       // Brain Map reads run in their own supervised process. A cold index
@@ -1044,6 +1211,9 @@ export class EngineSupervisor extends EventEmitter {
         this.transitionActivity(reservation, "running");
         try {
           try {
+            if (requestNeedsVideoRuntime(method, params)) {
+              await this.prepareRequestedVideoRuntime(reservation, requestSignal);
+            }
             // Optional background cognition may legitimately spend a long time
             // restoring or evaluating a large local brain. Its caller remains
             // single-flight, and foreground ownership explicitly preempts it;
@@ -1052,6 +1222,7 @@ export class EngineSupervisor extends EventEmitter {
             const effectiveTimeoutMs = priority === "background"
               ? ENGINE_REQUEST_NO_DEADLINE
               : timeoutMs;
+            reservation.beforeDispatch?.();
             reservation.dispatched = true;
             return (await this.rawRequest(
               method,
@@ -1079,6 +1250,19 @@ export class EngineSupervisor extends EventEmitter {
       }
     } catch (error) {
       if (requestSignal.aborted || reservation.cancelled) {
+        if (error instanceof EngineRequestError && error.code === -32800 &&
+            error.data && typeof error.data === "object" &&
+            (error.data as Record<string, unknown>).codecRuntimeCancelled === true &&
+            (error.data as Record<string, unknown>).safeBoundary === true) {
+          reservation.codecSetupCancellationAcknowledged = true;
+        }
+        if (reservation.inlineScopeCancellationRequested && error instanceof EngineRequestError && error.code === -32800) {
+          reservation.artifactCancellationAcknowledged = true;
+        }
+        if (error instanceof EngineRequestError && error.code === -32800 && error.data && typeof error.data === "object" &&
+            (error.data as Record<string, unknown>).modalityCancelled === true && (error.data as Record<string, unknown>).safeBoundary === true) {
+          reservation.artifactCancellationAcknowledged = true;
+        }
         if (
           reservation.cancellationPhase === "running" &&
           reservation.dispatched &&
@@ -1110,6 +1294,49 @@ export class EngineSupervisor extends EventEmitter {
     }
   }
 
+  private async prepareRequestedVideoRuntime(
+    reservation: RequestReservation,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (!this.options.prepareVideoRuntime) return;
+    const onProgress = (progress: VideoRuntimeProgress): void => {
+      // Job owners already expose Stop through this same reservation/signal.
+      // Setup bytes are not misreported as neural-generation progress.
+      this.emit("event", {
+        type: "video-runtime-setup",
+        brainId: reservation.brainId,
+        jobId: reservation.jobId,
+        message: progress.message,
+        data: progress
+      } satisfies EngineEvent);
+    };
+    let prepared: PreparedVideoRuntime;
+    try {
+      prepared = await this.options.prepareVideoRuntime(signal, onProgress);
+    } catch (error) {
+      if (signal.aborted || !(error instanceof VideoRuntimeUnavailableError)) throw error;
+      // An empty vetted catalog does not disable existing GIF/APNG/WAV paths,
+      // masquerade as successful setup, or bypass a hash/license failure.
+      this.emit("diagnostic", error.message);
+      return;
+    }
+    if (signal.aborted) throw new Error("Video runtime setup was cancelled.");
+    if (prepared.state === "external") return;
+    if (!this.options.videoRuntimeCacheRoot || !prepared.artifactSha256 ||
+        !prepared.binarySha256 || !prepared.binarySizeBytes || !prepared.target) {
+      throw new Error("Video runtime preparation did not provide its verified binary identity.");
+    }
+    // Serialize this tiny RPC with the media request. It selects the verified
+    // executable in an already-warm worker without restarting or loading it.
+    await this.rawRequest("configure_video_runtime", {
+      executablePath: prepared.executablePath,
+      artifactSha256: prepared.artifactSha256,
+      binarySha256: prepared.binarySha256,
+      binarySizeBytes: prepared.binarySizeBytes,
+      target: prepared.target
+    }, ENGINE_REQUEST_NO_DEADLINE, signal);
+  }
+
   /**
    * Preempt optional worker activity before a same-brain foreground caller
    * waits on a higher-level repository write lock. Without this early claim,
@@ -1117,6 +1344,26 @@ export class EngineSupervisor extends EventEmitter {
    */
   async claimForeground(): Promise<void> {
     await this.claimForegroundWorker();
+  }
+
+  async cancelInlineGeneration(brainId: string, turnId: string, actionId: string): Promise<{
+    requested: boolean; acknowledged: boolean;
+  }> {
+    if (this.workerRole !== "neural") throw new Error("Inline control requires the neural worker.");
+    this.codecBridge.cancel((owner) => owner.brainId === brainId && owner.streamId === turnId && owner.actionId === actionId);
+    // This narrow flags-only RPC is handled by the worker's stdin reader even
+    // while its one neural dispatch is busy. Never start/reload a brain here.
+    return await this.rawRequest("cancel_inline_generation", {
+      brainId, streamId: turnId, neuralActionId: actionId
+    }, 10_000, undefined, true) as { requested: boolean; acknowledged: boolean };
+  }
+
+  async steerChat(brainId: string, turnId: string, successorTurnId: string): Promise<{
+    requested: boolean; warm: boolean;
+  }> {
+    if (this.workerRole !== "neural") throw new Error("Warm Steer requires the neural worker.");
+    return await this.rawRequest("steer_chat", { brainId, streamId: turnId, successorTurnId },
+      10_000, undefined, true) as { requested: boolean; warm: boolean };
   }
 
   /**
@@ -1361,6 +1608,9 @@ export class EngineSupervisor extends EventEmitter {
       this.emit("diagnostic", diagnostic);
     }
     try {
+      if (typeof child.exitCode === "number" || typeof child.signalCode === "string") {
+        this.emit("worker-closed", { pid: child.pid });
+      }
       if (this.child !== child) return;
       this.lastError = diagnostic;
       this.rejectPendingForChild(child, new Error(diagnostic));
@@ -1441,4 +1691,8 @@ export class EngineSupervisor extends EventEmitter {
     this.terminating = operation;
     return operation;
   }
+}
+/** Trusted launch metadata only; user/renderer environment cannot pick its owner. */
+export function managedWorkerMemoryEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...environment, OMNI_MEMORY_OWNER_PID: String(process.pid) };
 }

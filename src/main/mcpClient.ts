@@ -608,7 +608,7 @@ export class McpClientService {
     await this.rpc(runtime, "initialize", {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: "Omni AGI Studio", version: "1.1.0" }
+      clientInfo: { name: "Omni AGI Studio", version: "1.1.1" }
     }, signal);
     if (runtime.config.transport === "http") {
       await this.httpRpc(runtime, "notifications/initialized", {}, true, signal);

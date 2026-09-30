@@ -1,6 +1,24 @@
 import type { ActionEvent, StructuredAction } from "../../shared/types";
 import { conciseUiMessage } from "./uiPresentation";
 
+export function chatActionCancellationTarget(
+  event: ActionEvent,
+  turnId?: string
+): { kind: "modality-job" | "tool-turn"; id: string } |
+   { kind: "inline-action"; id: string; turnId: string } | undefined {
+  if (event.state !== "running") return undefined;
+  if (event.runtimeJobId) return { kind: "modality-job", id: event.runtimeJobId };
+  if (event.action.kind === "imagine" || event.action.toolId === "modality.imagine") {
+    return turnId && event.inlineGenerationOwned && event.neuralActionId
+      ? { kind: "inline-action", id: event.id, turnId } : undefined;
+  }
+  if (turnId && event.action.toolId && event.action.action && event.action.kind !== "evolve") {
+    return { kind: "tool-turn", id: turnId };
+  }
+  // Never fall back to brain-wide cancellation from an individual action card.
+  return undefined;
+}
+
 const stateLabels: Record<ActionEvent["state"], string> = {
   proposed: "Ready",
   "approval-required": "Needs approval",

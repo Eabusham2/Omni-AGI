@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -12,7 +14,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
+
+from .bounded_tensor_io import atomic_save_tensors_bounded
 
 
 def atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
@@ -69,26 +73,7 @@ def atomic_save_tensors(
     tensors: Mapping[str, torch.Tensor],
     metadata: Dict[str, str] = None,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
-    )
-    os.close(descriptor)
-    os.unlink(temporary_name)
-    safe = {
-        name: tensor.detach().cpu().contiguous()
-        for name, tensor in tensors.items()
-    }
-    if not safe:
-        # safetensors permits an empty mapping; keeping the real file is useful
-        # to exporters and makes the layout invariant.
-        safe = {}
-    try:
-        save_file(safe, temporary_name, metadata=metadata or {})
-        os.replace(temporary_name, str(path))
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+    atomic_save_tensors_bounded(path, tensors, metadata=metadata)
 
 
 def load_tensors(path: Path, device: str = "cpu") -> Dict[str, torch.Tensor]:
@@ -97,13 +82,51 @@ def load_tensors(path: Path, device: str = "cpu") -> Dict[str, torch.Tensor]:
     return load_file(str(path), device=device)
 
 
-def tensor_checksum(tensors: Iterable[torch.Tensor]) -> str:
+def tensor_checksum(tensors: Iterable[torch.Tensor], *, chunk_bytes: int = 4 * 1024 * 1024, reserve=None, on_chunk=None) -> str:
+    if int(chunk_bytes) < 1:
+        raise ValueError("checksum chunk size must be positive")
+    def blocks(value, elements):
+        if value.numel() <= elements:
+            yield value.contiguous().reshape(-1)
+        elif value.is_contiguous():
+            flat = value.reshape(-1)
+            for start in range(0, flat.numel(), elements):
+                yield flat[start:start + elements]
+        else:
+            # Preserve historical logical C-order bytes without materializing
+            # an entire strided GPU owner merely to hash it.
+            tail = math.prod(value.shape[1:])
+            if tail <= elements:
+                rows = max(1, elements // max(1, tail))
+                for start in range(0, value.shape[0], rows):
+                    yield value[start:start + rows].contiguous().reshape(-1)
+            else:
+                for row in value:
+                    yield from blocks(row, elements)
     digest = hashlib.sha256()
     for tensor in tensors:
-        contiguous = tensor.detach().cpu().contiguous()
-        digest.update(str(tuple(contiguous.shape)).encode("ascii"))
-        digest.update(str(contiguous.dtype).encode("ascii"))
-        digest.update(contiguous.numpy().tobytes())
+        value = tensor.detach()
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(str(value.dtype).encode("ascii"))
+        step = max(1, int(chunk_bytes) // value.element_size())
+        if reserve is not None:
+            reserve(min(step, value.numel()) * value.element_size() * 3 + 4096)
+        position = 0
+        for source in blocks(value, step):
+            block = source.to(device="cpu").contiguous()
+            if block.numel() and block.stride(-1) != 1:
+                # A one-element strided view is "contiguous" to PyTorch but
+                # cannot be reinterpreted as bytes until its stride is one.
+                compact = torch.empty((block.numel(),), dtype=block.dtype, device="cpu")
+                compact.copy_(block)
+                block = compact
+            digest.update(memoryview(block.view(torch.uint8).numpy()))
+            if on_chunk is not None:
+                on_chunk(block.numel() * block.element_size())
+            if value.is_contiguous():
+                from .native_core_paging import release_native_tensor_chunk
+                release_native_tensor_chunk(value, position * value.element_size(), block.numel() * value.element_size())
+            position += block.numel()
     return digest.hexdigest()
 
 
@@ -376,6 +399,28 @@ def snapshot_files(source: Path, destination: Path) -> None:
     from .offload import copy_mutable_state_snapshot
 
     copy_mutable_state_snapshot(source, destination)
+    # Structural argument views referenced by saved action/trace records are
+    # operational state, not learned vectors or text context. Preserve their
+    # checked immutable bytes so snapshot history never gains broken refs.
+    from .concept_id_views import IdView
+    views = source / "state" / "concept-id-views"
+    if views.is_dir():
+        if views.is_symlink():
+            raise ValueError("saved concept ID views must not be a symlink")
+        for path in views.iterdir():
+            if path.name.startswith("."):
+                continue
+            if path.is_symlink() or not path.is_file() or not re.fullmatch(r"[a-f0-9]{64}\.jsonl", path.name):
+                raise ValueError("saved concept ID view file is unsafe")
+            with path.open("rb") as handle:
+                header = json.loads(handle.readline(4096))
+            descriptor = {**header, "path": "state/concept-id-views/" + path.name,
+                          "sha256": path.stem, "bytes": path.stat().st_size}
+            IdView(source, descriptor, brain_id=header["brainId"], turn_id=header["turnId"])
+            target = destination / descriptor["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            IdView(destination, descriptor, brain_id=header["brainId"], turn_id=header["turnId"])
     conversation = source / "conversation.sqlite3"
     if conversation.is_file() and not conversation.is_symlink():
         shutil.copy2(str(conversation), str(destination / "conversation.sqlite3"))

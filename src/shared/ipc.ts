@@ -36,6 +36,9 @@ export const IPC = {
     health: "omni:brain:health",
     persistedSubstrateOverview: "omni:brain:persisted-substrate-overview",
     querySubstrate: "omni:brain:query-substrate",
+    queryConceptIds: "omni:brain:query-concept-ids",
+    queryCortex: "omni:brain:query-cortex",
+    cortexActivity: "omni:brain:cortex-activity",
     workspace: "omni:brain:workspace",
     freshAttention: "omni:brain:fresh-attention",
     journalPage: "omni:brain:journal-page"
@@ -43,6 +46,7 @@ export const IPC = {
   chat: {
     send: "omni:chat:send",
     cancel: "omni:chat:cancel",
+    cancelInlineAction: "omni:chat:cancel-inline-action",
     recordDeliveryReceipt: "omni:chat:record-delivery-receipt",
     approveAction: "omni:chat:approve-action",
     list: "omni:chat:list",
@@ -99,6 +103,7 @@ export const IPC = {
     sources: "omni:data:sources"
   },
   modality: {
+    generateSpeech: "omni:modality:generate-speech",
     capabilities: "omni:modality:capabilities",
     artifacts: "omni:modality:artifacts",
     generate: "omni:modality:generate",

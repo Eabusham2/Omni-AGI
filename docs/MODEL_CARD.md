@@ -79,8 +79,17 @@ low-wear or fast whole-corpus training.
 
 Thus "1.58-bit" describes learned ternary weights, **not** the entire
 process's memory footprint. The new control schema is incompatible with older
-floating-control checkpoints; strict loading rejects them. Packed-weight
-retention and single-rank distributed optimizer handling are still under
-source cleanup, and CI has not run on this revision. Full native training
-quality, cold-load speed, GPU/MPS performance, and useful conversation from a
-trained ground-up brain remain unproven until the later live acceptance run.
+floating-control checkpoints; strict loading rejects them. Packed projections
+have source-level checkpointed uint8 output-row resistance, not a resident
+FP32/Fisher/anchor model or proof of non-forgetting. The native packed
+distributed path currently supports a single rank; synchronized multi-rank
+mutation remains an implementation gap.
+
+The scoped v1.1.0 code/UI/package/worker-health and all-target release
+verification completed, as recorded in `docs/IMPLEMENTATION_STATUS.md`.
+It did not train or qualify a native brain. The new uncommitted audit
+corrections and their focused source checks are separate from those published
+artifacts and do not establish current trained-native retention/quality.
+Full native training quality, cold-load speed, GPU/MPS performance and useful
+conversation/recall remain unproved and deferred to a later user-initiated
+goal; no model test is claimed by this documentation correction.

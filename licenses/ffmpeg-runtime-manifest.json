@@ -1,0 +1,337 @@
+{
+  "schemaVersion": 1,
+  "component": "FFmpeg",
+  "artifacts": [
+    {
+      "id": "ffmpeg-9.0.2-win32-x64-r1",
+      "target": "win32-x64",
+      "version": "9.0.2",
+      "license": "GPL-2.0-or-later",
+      "binary": {
+        "fileName": "ffmpeg.exe",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-win32-x64.exe",
+        "sizeBytes": 29606400,
+        "sha256": "c9a35cd92484b0b887132c26f36fd79428d3d3b58155d915e3927d6821bacca1"
+      },
+      "correspondingSource": {
+        "fileName": "ffmpeg-source.tar.xz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-9.0.2-source.tar.xz",
+        "sizeBytes": 12040788,
+        "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      },
+      "buildAndInstallMaterial": {
+        "fileName": "build-material.tar.gz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/build-material-win32-x64.tar.gz",
+        "sizeBytes": 31613,
+        "sha256": "88bbc5db105bc0682c66dda09b3b4d3f2cea08c703e8b4fd1e507997ef7d5736"
+      },
+      "licenseNotices": {
+        "fileName": "LICENSE-NOTICES.txt",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/LICENSE-NOTICES-win32-x64.txt",
+        "sizeBytes": 1368,
+        "sha256": "8ce7ff2788a7a38110ec764d88d8b490780d30f2bdb9ba631bd065b46f087725"
+      },
+      "provenance": {
+        "upstreamReleaseUrl": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+        "buildRepositoryUrl": "https://github.com/Eabusham2/Omni-AGI",
+        "buildCommit": "b3fe50d7fa00401b1821c2a400abf2c162cf04a5",
+        "configuration": "--prefix=/tmp/tmp.VsiwnCNjSd/prefix --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm --extra-ldflags=-static --target-os=mingw32 --arch=x86_64",
+        "linkage": "standalone-cli-static-except-system",
+        "reviewId": "source-distribution-2026-09-30",
+        "reviewedAt": "2026-09-30T06:07:37.327Z",
+        "completeCorrespondingSourceReviewed": true,
+        "allLinkedNonSystemLibrariesReviewed": true,
+        "distributionLicenseReviewed": true
+      },
+      "linkedLibraries": [
+        {
+          "configureFlag": "--enable-libx264",
+          "name": "x264",
+          "license": "GPL-2.0-or-later",
+          "source": {
+            "fileName": "x264-source.tar.gz",
+            "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/x264-win32-x64-source.tar.gz",
+            "sizeBytes": 2213906,
+            "sha256": "de4e0da9c81fe3ad984ad63bc49070952227480c82aae4deae51138a3c9a4d07"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ffmpeg-9.0.2-win32-arm64-r1",
+      "target": "win32-arm64",
+      "version": "9.0.2",
+      "license": "GPL-2.0-or-later",
+      "binary": {
+        "fileName": "ffmpeg.exe",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-win32-arm64.exe",
+        "sizeBytes": 21266432,
+        "sha256": "93c961f4e6bbf62b938acb1fd3b015ebb97ffce9328f66b2f0602e849180f954"
+      },
+      "correspondingSource": {
+        "fileName": "ffmpeg-source.tar.xz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-9.0.2-source.tar.xz",
+        "sizeBytes": 12040788,
+        "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      },
+      "buildAndInstallMaterial": {
+        "fileName": "build-material.tar.gz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/build-material-win32-arm64.tar.gz",
+        "sizeBytes": 31544,
+        "sha256": "21d76d9c45f1e87acd5aa9110cc48cb65b79feb03e839997c1562e7dc86133e3"
+      },
+      "licenseNotices": {
+        "fileName": "LICENSE-NOTICES.txt",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/LICENSE-NOTICES-win32-arm64.txt",
+        "sizeBytes": 1448,
+        "sha256": "704cd0b56b1f1c5093c5eb00212aa22f098c5ee9f6fe567df465ea3609a22c05"
+      },
+      "provenance": {
+        "upstreamReleaseUrl": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+        "buildRepositoryUrl": "https://github.com/Eabusham2/Omni-AGI",
+        "buildCommit": "b3fe50d7fa00401b1821c2a400abf2c162cf04a5",
+        "configuration": "--prefix=/tmp/tmp.MwwScWgCI8/prefix --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm --extra-ldflags=-static --target-os=mingw32 --arch=aarch64 --cc=clang --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --strip=llvm-strip",
+        "linkage": "standalone-cli-static-except-system",
+        "reviewId": "source-distribution-2026-09-30",
+        "reviewedAt": "2026-09-30T06:07:37.327Z",
+        "completeCorrespondingSourceReviewed": true,
+        "allLinkedNonSystemLibrariesReviewed": true,
+        "distributionLicenseReviewed": true
+      },
+      "linkedLibraries": [
+        {
+          "configureFlag": "--enable-libx264",
+          "name": "x264",
+          "license": "GPL-2.0-or-later",
+          "source": {
+            "fileName": "x264-source.tar.gz",
+            "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/x264-win32-arm64-source.tar.gz",
+            "sizeBytes": 2213971,
+            "sha256": "a13feb0deecbae47dd0d4eb8223d3fbc3199ad549101f386de518fa48e029518"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ffmpeg-9.0.2-darwin-x64-r1",
+      "target": "darwin-x64",
+      "version": "9.0.2",
+      "license": "GPL-2.0-or-later",
+      "binary": {
+        "fileName": "ffmpeg",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-darwin-x64",
+        "sizeBytes": 24774584,
+        "sha256": "0ce6ad25246a01870aeeaa5d1085acf878ead6383eb896b8c4325cbf62312b1d"
+      },
+      "correspondingSource": {
+        "fileName": "ffmpeg-source.tar.xz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-9.0.2-source.tar.xz",
+        "sizeBytes": 12040788,
+        "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      },
+      "buildAndInstallMaterial": {
+        "fileName": "build-material.tar.gz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/build-material-darwin-x64.tar.gz",
+        "sizeBytes": 30817,
+        "sha256": "b7e2fb8aee3ccc2593e89023cd8cd3f9f48706f5592db12622de809237c6c493"
+      },
+      "licenseNotices": {
+        "fileName": "LICENSE-NOTICES.txt",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/LICENSE-NOTICES-darwin-x64.txt",
+        "sizeBytes": 1385,
+        "sha256": "e51228e427745a5728c8680497efc9728ede39e2f52e5f1d91a20b58d45d373b"
+      },
+      "provenance": {
+        "upstreamReleaseUrl": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+        "buildRepositoryUrl": "https://github.com/Eabusham2/Omni-AGI",
+        "buildCommit": "5f42ab3e6976d6e9fc3c5b21139eac10a0650155",
+        "configuration": "--prefix=/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/tmp.Hl6ibRIMFB/prefix --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm --extra-ldflags= --enable-pic",
+        "linkage": "standalone-cli-static-except-system",
+        "reviewId": "source-distribution-2026-09-30",
+        "reviewedAt": "2026-09-30T06:07:37.327Z",
+        "completeCorrespondingSourceReviewed": true,
+        "allLinkedNonSystemLibrariesReviewed": true,
+        "distributionLicenseReviewed": true
+      },
+      "linkedLibraries": [
+        {
+          "configureFlag": "--enable-libx264",
+          "name": "x264",
+          "license": "GPL-2.0-or-later",
+          "source": {
+            "fileName": "x264-source.tar.gz",
+            "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/x264-darwin-x64-source.tar.gz",
+            "sizeBytes": 2231973,
+            "sha256": "0f3a297beb6b62fcc817df56ff2c90f9ef1de013bfd160c6380fb6e253eb45c8"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ffmpeg-9.0.2-darwin-arm64-r1",
+      "target": "darwin-arm64",
+      "version": "9.0.2",
+      "license": "GPL-2.0-or-later",
+      "binary": {
+        "fileName": "ffmpeg",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-darwin-arm64",
+        "sizeBytes": 22780040,
+        "sha256": "c67339e8f3c3cda7d8d5f1bd0d5a19d85fcd142b22e53f29eab3bc18120f9ccc"
+      },
+      "correspondingSource": {
+        "fileName": "ffmpeg-source.tar.xz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-9.0.2-source.tar.xz",
+        "sizeBytes": 12040788,
+        "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      },
+      "buildAndInstallMaterial": {
+        "fileName": "build-material.tar.gz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/build-material-darwin-arm64.tar.gz",
+        "sizeBytes": 30800,
+        "sha256": "4840b7612a1c6f2473545929721e97ec1656001418de6c70e5fa1df6314fde79"
+      },
+      "licenseNotices": {
+        "fileName": "LICENSE-NOTICES.txt",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/LICENSE-NOTICES-darwin-arm64.txt",
+        "sizeBytes": 1387,
+        "sha256": "d55348efd6d1fe82b79b54a1c12c7e0ec8baebcfdc7009502a24f0547961684d"
+      },
+      "provenance": {
+        "upstreamReleaseUrl": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+        "buildRepositoryUrl": "https://github.com/Eabusham2/Omni-AGI",
+        "buildCommit": "5f42ab3e6976d6e9fc3c5b21139eac10a0650155",
+        "configuration": "--prefix=/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/tmp.JZSy3bNJoi/prefix --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm --extra-ldflags= --enable-pic",
+        "linkage": "standalone-cli-static-except-system",
+        "reviewId": "source-distribution-2026-09-30",
+        "reviewedAt": "2026-09-30T06:07:37.327Z",
+        "completeCorrespondingSourceReviewed": true,
+        "allLinkedNonSystemLibrariesReviewed": true,
+        "distributionLicenseReviewed": true
+      },
+      "linkedLibraries": [
+        {
+          "configureFlag": "--enable-libx264",
+          "name": "x264",
+          "license": "GPL-2.0-or-later",
+          "source": {
+            "fileName": "x264-source.tar.gz",
+            "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/x264-darwin-arm64-source.tar.gz",
+            "sizeBytes": 2232040,
+            "sha256": "b83a6e7a11e300da0f5654951a392500b2e0bb2b6abfe41bcf0aa1e0ee5b9603"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ffmpeg-9.0.2-linux-x64-r1",
+      "target": "linux-x64",
+      "version": "9.0.2",
+      "license": "GPL-2.0-or-later",
+      "binary": {
+        "fileName": "ffmpeg",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-linux-x64",
+        "sizeBytes": 28945592,
+        "sha256": "40eaffc59c35767ed086d950ef26805ef2b9372f2d1531669c1666a96575cf9e"
+      },
+      "correspondingSource": {
+        "fileName": "ffmpeg-source.tar.xz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-9.0.2-source.tar.xz",
+        "sizeBytes": 12040788,
+        "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      },
+      "buildAndInstallMaterial": {
+        "fileName": "build-material.tar.gz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/build-material-linux-x64.tar.gz",
+        "sizeBytes": 30985,
+        "sha256": "0c5f08e96e0fdb4e7e30b9acf39ec5afaeb6a4ddbba5f070e5d164c292c12c98"
+      },
+      "licenseNotices": {
+        "fileName": "LICENSE-NOTICES.txt",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/LICENSE-NOTICES-linux-x64.txt",
+        "sizeBytes": 1340,
+        "sha256": "0ac4d2ef313a5b442a8a6d5e7bc951a9aedee0244f86644dacc84b2862f0e305"
+      },
+      "provenance": {
+        "upstreamReleaseUrl": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+        "buildRepositoryUrl": "https://github.com/Eabusham2/Omni-AGI",
+        "buildCommit": "5f42ab3e6976d6e9fc3c5b21139eac10a0650155",
+        "configuration": "--prefix=/tmp/tmp.cEYKY9yg78/prefix --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm --extra-ldflags= --enable-pic",
+        "linkage": "standalone-cli-static-except-system",
+        "reviewId": "source-distribution-2026-09-30",
+        "reviewedAt": "2026-09-30T06:07:37.327Z",
+        "completeCorrespondingSourceReviewed": true,
+        "allLinkedNonSystemLibrariesReviewed": true,
+        "distributionLicenseReviewed": true
+      },
+      "linkedLibraries": [
+        {
+          "configureFlag": "--enable-libx264",
+          "name": "x264",
+          "license": "GPL-2.0-or-later",
+          "source": {
+            "fileName": "x264-source.tar.gz",
+            "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/x264-linux-x64-source.tar.gz",
+            "sizeBytes": 2229006,
+            "sha256": "1b5872db1848bdbe5f7e904427ccc568aefa4d4bc9a6ab1349205b2f0d281aba"
+          }
+        }
+      ]
+    },
+    {
+      "id": "ffmpeg-9.0.2-linux-arm64-r1",
+      "target": "linux-arm64",
+      "version": "9.0.2",
+      "license": "GPL-2.0-or-later",
+      "binary": {
+        "fileName": "ffmpeg",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-linux-arm64",
+        "sizeBytes": 25960336,
+        "sha256": "b192e897fa5ce3b987872b67084cb237c91dda0097e3cf7e7c6f9670853ab834"
+      },
+      "correspondingSource": {
+        "fileName": "ffmpeg-source.tar.xz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/ffmpeg-9.0.2-source.tar.xz",
+        "sizeBytes": 12040788,
+        "sha256": "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      },
+      "buildAndInstallMaterial": {
+        "fileName": "build-material.tar.gz",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/build-material-linux-arm64.tar.gz",
+        "sizeBytes": 30149,
+        "sha256": "7706fba7b2e4f455565a2d269814241a9fcf2a52be92884603fe81ee209a3b5b"
+      },
+      "licenseNotices": {
+        "fileName": "LICENSE-NOTICES.txt",
+        "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/LICENSE-NOTICES-linux-arm64.txt",
+        "sizeBytes": 1342,
+        "sha256": "582cd2c253f41c0e8bf6b9551549920cbad48e551a4e8fc9f912494bd8eb4800"
+      },
+      "provenance": {
+        "upstreamReleaseUrl": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
+        "buildRepositoryUrl": "https://github.com/Eabusham2/Omni-AGI",
+        "buildCommit": "5f42ab3e6976d6e9fc3c5b21139eac10a0650155",
+        "configuration": "--prefix=/tmp/tmp.0Y5VrAM164/prefix --pkg-config-flags=--static --disable-autodetect --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-debug --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-devices --enable-indev=lavfi --disable-hwaccels --disable-x86asm --extra-ldflags= --enable-pic",
+        "linkage": "standalone-cli-static-except-system",
+        "reviewId": "source-distribution-2026-09-30",
+        "reviewedAt": "2026-09-30T06:07:37.327Z",
+        "completeCorrespondingSourceReviewed": true,
+        "allLinkedNonSystemLibrariesReviewed": true,
+        "distributionLicenseReviewed": true
+      },
+      "linkedLibraries": [
+        {
+          "configureFlag": "--enable-libx264",
+          "name": "x264",
+          "license": "GPL-2.0-or-later",
+          "source": {
+            "fileName": "x264-source.tar.gz",
+            "url": "https://github.com/Eabusham2/Omni-AGI/releases/download/omni-video-9.0.2-r1/x264-linux-arm64-source.tar.gz",
+            "sizeBytes": 2230143,
+            "sha256": "99044252b0fa960e6373f4721a83e37791055d9748d338be48a681883f6dbeae"
+          }
+        }
+      ]
+    }
+  ],
+  "unavailableTargets": []
+}

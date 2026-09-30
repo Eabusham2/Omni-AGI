@@ -15,6 +15,7 @@ import { IPC } from "../shared/ipc";
 import { BrainRepository, resolveBrainDataRoot } from "./brainRepository";
 import { BrainService, RuntimeJobManager } from "./brainService";
 import { EngineSupervisor } from "./engineSupervisor";
+import { VideoRuntimeProvisioner } from "./videoRuntimeProvisioner";
 import {
   initialLearningBuildProgressEvent,
   registerIpcHandlers
@@ -34,6 +35,7 @@ import {
   allowTrustedStudioMedia
 } from "./mediaPermissionPolicy";
 import { ResourcePlanner } from "./resourcePlanner";
+import { createNativeComputeMeasurementCollector } from "./nativeComputeMeasurement";
 import { BuildResourceSelectionStore } from "./buildResourceSelections";
 import { BuildInitializationCoordinator } from "./buildInitializationCoordinator";
 import { MobileGateway } from "./mobileGateway";
@@ -420,14 +422,22 @@ async function bootstrap(): Promise<void> {
   // Older releases treated every identity as idle-enabled. Collapse that
   // legacy state before any worker or scheduler can acquire a brain.
   await repository.reconcileActiveModeLease();
+  const videoRuntimeCacheRoot = join(app.getPath("userData"), "video-runtime");
   engine = new EngineSupervisor({
     appPath,
-    resourcesPath: process.resourcesPath
+    resourcesPath: process.resourcesPath,
+    videoRuntimeCacheRoot,
+    prepareVideoRuntime: (signal, onProgress) => new VideoRuntimeProvisioner({
+      cacheRoot: videoRuntimeCacheRoot,
+      onProgress
+    }).prepare(signal)
   });
   engine.on("diagnostic", (diagnostic: unknown) => {
     console.error("Neural worker diagnostic:", String(diagnostic));
   });
-  const resourcePlanner = new ResourcePlanner(repository.root);
+  const resourcePlanner = new ResourcePlanner(repository.root, {
+    measurementCollector: createNativeComputeMeasurementCollector(engine)
+  });
   const service = new BrainService(
     repository,
     engine,
@@ -537,6 +547,11 @@ async function bootstrap(): Promise<void> {
     teacher,
     mcp,
     idleCognition,
+    collectHardwareCompute: (profile) => resourcePlanner.measureNativeCompute({
+      device: "cpu",
+      ramBudgetBytes: profile.availableMemoryBytes,
+      hardwareTier: profile.recommendedTier
+    }),
     appPath
   });
   mainWindow = await createWindow();

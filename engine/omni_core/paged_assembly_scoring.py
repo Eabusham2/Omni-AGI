@@ -15,12 +15,15 @@ that two independent SQLite files are an atomic checkpoint.
 from __future__ import annotations
 
 import hashlib
+import torch
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from .paged_assembly_index import PagedAssemblyIndex
 from .paged_packed_vectors import PagedPackedVectors, _decoded_row
 from .paged_vector_scoring import MAX_PAGE_ROWS, PackedVectorPage, PackedVectorRow
+from .paged_store_counts import row_count
+from .packed_vsa_vectors import _decode_exact_row
 
 
 @dataclass(frozen=True)
@@ -56,13 +59,28 @@ class PagedAssemblyVectorProvider:
         self._generation: Optional[_Generation] = None
         self._snapshot_id: Optional[str] = None
 
+    def iter_activities(self, *, page_size: int = 128):
+        """Exact original float activity math; no metadata/per-ID SQL scan."""
+
+        snapshot = self.current_snapshot()
+        cursor = None
+        while True:
+            page = self.page_rows(snapshot, cursor, page_size)
+            for row in page.rows:
+                value = _decode_exact_row(row.packed, self.dimensions).to(torch.float32)
+                norm = value.norm()
+                yield row.assembly_id, value / norm if float(norm) > 0 else value
+            if not page.has_more:
+                break
+            cursor = page.next_cursor
+        self.assert_unchanged(snapshot)
+
     @staticmethod
     def _index_state(connection: Any) -> tuple[str, int, int, int]:
         store_id = PagedAssemblyIndex._store_id(connection)
         revision = PagedAssemblyIndex._index_revision(connection)
-        count, high_water = connection.execute(
-            "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM assembly_records"
-        ).fetchone()
+        count = row_count(connection, "assembly_records")
+        high_water = connection.execute("SELECT COALESCE(MAX(sequence),0) FROM assembly_records").fetchone()[0]
         return store_id, revision, int(count), int(high_water)
 
     @staticmethod
@@ -80,9 +98,8 @@ class PagedAssemblyVectorProvider:
         return _Generation(*index_state, *vector_state)
 
     def _assert_revisions(self, generation: _Generation) -> None:
-        # Full COUNT(*) checks are done at snapshot capture and final commit.
-        # Per-page safety needs only the monotonic store revisions, avoiding a
-        # table-count traversal for every page in a large corpus scan.
+        # Transaction-maintained counters make capture/final checks indexed.
+        # Per-page safety needs only monotonic store revisions.
         with self.index._transaction() as connection:
             if (
                 self.index._store_id(connection),

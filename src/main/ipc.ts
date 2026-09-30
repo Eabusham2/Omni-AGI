@@ -54,7 +54,9 @@ import type {
   McpServerRegistrationRequest,
   ToolRuntimePreferences
 } from "../shared/types";
+import type { CortexQuery, CortexActivityQuery } from "../shared/cortexInspection";
 import { IPC } from "../shared/ipc";
+import { BRAIN_EXPORT_CONFIRMATION_DETAIL } from "../shared/brainExportDisclosure";
 import {
   EXPERIENCE_UPLOADS,
   isExperienceUploadKind,
@@ -96,6 +98,8 @@ export interface IpcDependencies {
   teacher: ApiTeacherTrainingService;
   mcp: McpClientService;
   idleCognition?: Pick<IdleCognitionScheduler, "cancelActive">;
+  /** Main-owned primitive measurement; no renderer model/shape arguments. */
+  collectHardwareCompute?: (profile: HardwareProfile) => Promise<unknown>;
   appPath: string;
 }
 
@@ -201,7 +205,7 @@ function requireChatDeliveryReceipt(value: unknown): ChatDeliveryReceiptRequest 
   if (
     !isRecord(value) ||
     value.schemaVersion !== 1 ||
-    !["pending", "queued", "steered", "cancelled", "failed"].includes(String(value.state)) ||
+    !["pending", "queued", "steered", "stopped", "cancelled", "failed"].includes(String(value.state)) ||
     typeof value.content !== "string" ||
     typeof value.createdAt !== "string" ||
     !Number.isFinite(Date.parse(value.createdAt))
@@ -681,20 +685,17 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     if (!["current", "origin", "private-archive", "referenced"].includes(mode)) {
       throw new Error("Invalid export mode.");
     }
-    if (mode === "private-archive") {
-      const confirmation = await dialog.showMessageBox(senderWindow(event), {
-        type: "warning",
-        title: "Export private training archive?",
-        message: "This export can contain retained source material.",
-        detail:
-          "Tool grants and known credential patterns are removed, and detected credentials in retained text block export. This cannot prove arbitrary weights or binary data are secret-free; inspect the archive before sharing.",
-        buttons: ["Cancel", "Export private archive"],
-        defaultId: 0,
-        cancelId: 0,
-        noLink: true
-      });
-      if (confirmation.response !== 1) return null;
-    }
+    const confirmation = await dialog.showMessageBox(senderWindow(event), {
+      type: "warning",
+      title: "Export saved mind?",
+      message: "This backup preserves private saved content without sanitizing it.",
+      detail: BRAIN_EXPORT_CONFIRMATION_DETAIL,
+      buttons: ["Cancel", "Export backup"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true
+    });
+    if (confirmation.response !== 1) return null;
     const suffix =
       mode === "origin"
         ? "-Origin"
@@ -781,6 +782,9 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   handle(IPC.brain.persistedSubstrateOverview, (_event, id: string) =>
     service.persistedSubstrateOverview(requireId(id))
   );
+  handle(IPC.brain.queryConceptIds, async (_event, id: string, view: unknown, sourceTurnId: string, offset?: number) =>
+    service.queryConceptIds(id, view, sourceTurnId, offset));
+
   handle(IPC.brain.querySubstrate, async (event, id: string, query?: SubstrateQuery) => {
     const brainId = requireId(id);
     if (query !== undefined && !isRecord(query)) {
@@ -800,6 +804,26 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
         substrateQueryControllers.delete(key);
       }
     }
+  });
+  handle(IPC.brain.queryCortex, async (event, id: string, query?: CortexQuery) => {
+    const brainId = requireId(id);
+    if (query !== undefined && !isRecord(query)) throw new Error("Invalid cortical query.");
+    const key = `${event.sender.id}:${brainId}:cortex`;
+    substrateQueryControllers.get(key)?.abort();
+    const controller = new AbortController();
+    substrateQueryControllers.set(key, controller);
+    const abortOnDestroyed = (): void => controller.abort();
+    event.sender.once("destroyed", abortOnDestroyed);
+    try {
+      return await service.queryCortex(brainId, query, controller.signal);
+    } finally {
+      event.sender.removeListener("destroyed", abortOnDestroyed);
+      if (substrateQueryControllers.get(key) === controller) substrateQueryControllers.delete(key);
+    }
+  });
+  handle(IPC.brain.cortexActivity, (_event, id: string, query: CortexActivityQuery) => {
+    if (!isRecord(query)) throw new Error("Invalid cortical activity query.");
+    return service.cortexActivity(requireId(id), query);
   });
   handle(IPC.brain.workspace, (_event, id: string) =>
     service.workspace(requireId(id))
@@ -869,6 +893,10 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       requireChatDeliveryReceipt(receipt)
     );
   });
+  handle(IPC.chat.cancelInlineAction, (_event, id: string, turnId: string, actionEventId: string) =>
+    actions.cancelInlineAction(requireId(id), requireId(turnId, "turn id"),
+      requireId(actionEventId, "action event id"))
+  );
   handle(IPC.chat.approveAction, (_event, value: unknown) => {
     if (!isRecord(value)) throw new Error("Invalid approved chat action request.");
     return actions.approveAction({
@@ -1241,6 +1269,7 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     requireId(request.brainId);
     return jobs.generate(request);
   });
+  handle(IPC.modality.generateSpeech, (_event, request: unknown) => jobs.generateSpeech(request));
   handle(
     IPC.modality.selectInput,
     async (
@@ -1329,7 +1358,12 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
       service.setToolPermission(requireId(brainId), toolId, level)
   );
   handle(IPC.tool.execute, (_event, invocation: ToolInvocation) => tools.execute(invocation));
-  handle(IPC.tool.cancel, (_event, brainId: string) => tools.cancel(requireId(brainId)));
+  handle(IPC.tool.cancel, (_event, brainId: string, requestId?: string) =>
+    tools.cancel(
+      requireId(brainId),
+      typeof requestId === "string" ? requireId(requestId, "tool request id") : undefined
+    )
+  );
   handle(IPC.tool.preferences, () => tools.preferences());
   handle(IPC.tool.setPreferences, (_event, value: ToolRuntimePreferences) => tools.setPreferences(value));
 
@@ -1454,11 +1488,20 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   handle(IPC.catalog.listModalityPacks, (_event, brainId: string) =>
     service.listModalityPacks(requireId(brainId, "brain id"))
   );
-  handle(IPC.catalog.hardwareProfile, () => hardwareProfile());
+  handle(IPC.catalog.hardwareProfile, async () => {
+    const profile = await hardwareProfile();
+    // An unsupported/resource-deferred primitive is not a brain readiness quiz
+    // or a reason to prevent ordinary setup. The collector validates/caches it.
+    // Optional calibration is never a readiness gate for opening Build. Its
+    // background collector defers when the one neural worker is occupied.
+    void dependencies.collectHardwareCompute?.(profile).catch(() => undefined);
+    return profile;
+  });
   handle(IPC.catalog.resourcePlan, async (_event, value: WorkingMemoryPlanRequest) => {
     const request = requireWorkingMemoryPlanRequest(value);
     return service.planWorkingMemory(request, {
-      hardwareTier: request.hardwareTier
+      hardwareTier: request.hardwareTier,
+      brainId: request.brainId
     });
   });
 

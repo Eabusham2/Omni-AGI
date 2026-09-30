@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createReadStream, existsSync } from "node:fs";
+import { normalizeConceptIdView } from "../shared/conceptIdView";
 import {
   lstat,
   mkdir,
@@ -19,6 +20,8 @@ import { availableParallelism, freemem } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import { EventEmitter } from "node:events";
+import { cleanupCancelledInlineStage } from "./inlineCancellationCleanup";
+import { savedRuntimeShape } from "./savedRuntimeShape";
 import { getHeapStatistics } from "node:v8";
 import { DatabaseSync } from "node:sqlite";
 import toolCatalog from "../../tools/catalog.json";
@@ -34,6 +37,8 @@ import type {
   BuildResourceStartRequest,
   BuildRecipe,
   ChatCancellationState,
+  ChatGenerationEnd,
+  ChatNoReplyReason,
   ChatMessage,
   ChatQueueState,
   ChatResult,
@@ -63,6 +68,7 @@ import type {
   LiveObservationSession,
   LiveObservationSessionStartRequest,
   ModalityGenerateRequest,
+  NeuralSpeechGenerateRequest,
   NeuralModalityCapabilities,
   ModalityPreview,
   PersistedSubstrateOverview,
@@ -84,6 +90,7 @@ import type {
   WorkingMemoryPlanRequest,
   WorkingMemoryResourcePlan
 } from "../shared/types";
+import type { CortexPage, CortexQuery, CortexActivityQuery, CortexActivity } from "../shared/cortexInspection";
 import { INLINE_MEDIA_DATA_URL_CHARACTER_LIMIT } from "../shared/mediaTransport";
 import { recordNeuralChat } from "./presentationChat";
 import {
@@ -95,6 +102,7 @@ import {
 } from "./catalogInstaller";
 import { BrainRepository, DEFAULT_TOOL_PERMISSIONS } from "./brainRepository";
 import { withBrainWrite } from "./brainWriteCoordinator";
+import { acquireCrawlSourceLease, releaseCrawlSourceLease } from "./crawlSourceLease";
 import {
   BackgroundRequestDeferredError,
   ENGINE_REQUEST_NO_DEADLINE,
@@ -216,6 +224,26 @@ const CATALOG_ACTION_INPUT_SCHEMAS = new Map<string, Record<string, Record<strin
     )
   ])
 );
+const evolutionInput = CATALOG_ACTION_INPUT_SCHEMAS.get("source.self-modify")?.propose;
+if (evolutionInput) {
+  const properties = evolutionInput.properties as Record<string, Record<string, unknown>>;
+  properties.sourceEdits = {
+    type: "array", items: {
+      type: "object", additionalProperties: false,
+      properties: { path: { type: "string" }, content: { type: "string" }, expectedSha256: { type: ["string", "null"] } },
+      required: ["path", "content", "expectedSha256"]
+    }
+  };
+  properties.architectureChange = {
+    type: "object", required: ["mutation"], additionalProperties: false,
+    properties: {
+      mutation: { type: "string", enum: ["grow-experts", "grow-depth", "grow-router", "grow-regions"] },
+      addExperts: { type: "integer", minimum: 1 }, addLayers: { type: "integer", minimum: 1 },
+      addNeurons: { type: "integer", minimum: 1 }, addRegions: { type: "integer", minimum: 1 },
+      neuronsPerRegion: { type: "integer", minimum: 1 }
+    }
+  };
+}
 
 const LEGACY_SYSTEM_TOOL_ALIASES: Readonly<Record<string, string>> = {
   "windows.files": "system.files",
@@ -334,6 +362,11 @@ interface WorkerChatResult {
     parameter_checksum_before?: string;
     parameter_checksum_after?: string;
     parameter_delta_norm?: number;
+    core_parameter_delta_norm?: number;
+    parameter_delta_scope?: string;
+    substrate_parameter_delta_norm?: null;
+    substrate_parameter_delta_measured?: false;
+    parameter_checksum_scope?: string;
     stdp_update?: number;
     spike_rate?: number;
     train_loss?: number;
@@ -342,6 +375,11 @@ interface WorkerChatResult {
     steps?: Array<{ stage?: string; detail?: string; value?: string }>;
     note?: string;
     attention_epoch?: number;
+    generation_stop_reason?: string;
+    generation_decoder_stop_reason?: string;
+    generation_no_reply_reason?: string | null;
+    generated_token_count?: number;
+    generation_printable_text_characters?: number;
     slow_learning_job?: {
       jobId?: string;
       priority?: number;
@@ -355,6 +393,9 @@ interface WorkerChatResult {
   turnReceipt?: unknown;
   turnCommitted?: boolean;
   idempotentCompletion?: boolean;
+  steered?: boolean;
+  nativeStopped?: boolean;
+  noReply?: boolean;
 }
 
 interface WorkerChatReceiptResult {
@@ -377,6 +418,8 @@ interface WorkerChatReceiptResult {
   substrateGeneration?: string;
   mutableStateGeneration?: string;
   idempotentCompletion?: boolean;
+  generationEnd?: ChatGenerationEnd;
+  noReply?: boolean;
 }
 
 export function chatSlowReplayDelayMs(priority: number): number {
@@ -421,6 +464,7 @@ export type NeuralChatStreamEvent =
       actionId?: string;
       action: StructuredAction;
     }
+  | { type: "inline-imagination-started"; sequence: number; actionId: string }
   | {
       type: "modality-preview";
       sequence: number;
@@ -636,6 +680,9 @@ export async function persistedModalityCapabilities(
       (enabled("vision") && trained("vision")) ||
       (enabled("image") && trained("image"));
     const audioGeneration = enabled("audio") && trained("audio");
+    const pairedCount = training.audio_speech_pairs;
+    const speechPairedExamples = typeof pairedCount === "number" && Number.isSafeInteger(pairedCount) && pairedCount >= 0
+      ? pairedCount : 0;
     const videoGeneration = enabled("video") && trained("video");
     return {
       brainId,
@@ -648,10 +695,13 @@ export async function persistedModalityCapabilities(
       videoGeneration,
       neuralSpeechRecognition: false,
       neuralSpeechSynthesis: false,
+      audioRegionAvailable: enabled("audio"),
+      speechPairedExamples,
+      speechQuality: speechPairedExamples > 0 ? "unverified" as const : "needs-speech-training" as const,
       synchronizedVideoAudioGeneration: videoGeneration && audioGeneration,
       sameBrainSubstrate: true,
       hiddenBehavioralPrompt: false,
-      detail: "Read from the committed same-brain modality training and pack metadata without loading the neural checkpoint. Platform STT/TTS remain separate until a verified speech pack exists."
+      detail: "Read from committed same-brain audio metadata without loading a neural checkpoint. Own waveform output is distinct from platform STT/TTS; speech intelligibility has not been verified."
     };
   } catch {
     return unavailable();
@@ -932,9 +982,9 @@ export function normalizeModalityGenerateRequest(value: unknown): ModalityGenera
   const prompt = record.prompt;
   if (
     prompt !== undefined &&
-    (typeof prompt !== "string" || prompt.length > 1_000_000 || prompt.includes("\0"))
+    (typeof prompt !== "string" || prompt.includes("\0"))
   ) {
-    throw new Error("Modality prompt must be bounded UTF-8 text without NUL bytes.");
+    throw new Error("Modality prompt must be UTF-8 text without NUL bytes; live resource admission applies.");
   }
   const inputPath = record.inputPath;
   if (
@@ -956,6 +1006,8 @@ export function normalizeModalityGenerateRequest(value: unknown): ModalityGenera
   ) {
     throw new Error("Modality concept ids must be bounded text values.");
   }
+  const conceptIdView = record.conceptIdView === undefined ? undefined
+    : normalizeConceptIdView(record.conceptIdView, brainId, record.sourceTurnId);
   const neuralActionId = record.neuralActionId;
   if (
     neuralActionId !== undefined &&
@@ -1066,6 +1118,7 @@ export function normalizeModalityGenerateRequest(value: unknown): ModalityGenera
     modality: modality as ModalityGenerateRequest["modality"],
     ...(typeof prompt === "string" ? { prompt } : {}),
     ...(Array.isArray(rawConceptIds) ? { conceptIds: [...rawConceptIds] as string[] } : {}),
+    ...(conceptIdView ? { conceptIdView, sourceTurnId: conceptIdView.turnId } : {}),
     ...(typeof inputPath === "string" ? { inputPath } : {}),
     ...(settings ? { settings } : {}),
     ...(typeof neuralActionId === "string"
@@ -1292,6 +1345,10 @@ export function normalizeChatEngineEvent(
     return undefined;
   }
   const data = objectRecord(event.data);
+  if (event.type === "inline-imagination-started" && typeof event.actionId === "string" &&
+      /^[a-f0-9]{32}$/i.test(event.actionId)) {
+    return { type: "inline-imagination-started", sequence, actionId: event.actionId };
+  }
   if (event.type === "chat-token") {
     const delta = boundedWorkerText(data?.delta, 64 * 1024);
     return delta ? { type: "chat-token", sequence, delta } : undefined;
@@ -1722,8 +1779,18 @@ function incompleteIngestionReason(
   job: JobRecord,
   output: unknown
 ): string | undefined {
-  if (job.kind !== "ingestion") return undefined;
+  if (job.kind !== "ingestion" && job.kind !== "crawl") return undefined;
   const result = objectRecord(output);
+  if (job.kind === "crawl") {
+    if (!result) return "Web crawling ended without a complete frontier coverage receipt.";
+    if (result.stopped === true) {
+      return "Web crawling paused before complete frontier coverage was committed.";
+    }
+    if (objectRecord(result.coverage)?.complete !== true) {
+      return "Web crawling ended before complete frontier coverage was committed.";
+    }
+    return undefined;
+  }
   if (!result) {
     return "Dataset learning ended without a complete manifest coverage receipt.";
   }
@@ -1992,10 +2059,15 @@ function datasetTransactionKey(
   entryIndex: number,
   epoch: number,
   contentHash: string,
-  policy: PersistedDataIngestionPolicy
+  policy: PersistedDataIngestionPolicy,
+  runId?: string
 ): string {
   return sha256(
-    ["omni-dataset-entry-v1", manifestId, entryIndex, epoch, contentHash, policy].join("\0")
+    [
+      runId ? "omni-dataset-entry-v2" : "omni-dataset-entry-v1",
+      ...(runId ? [runId] : []),
+      manifestId, entryIndex, epoch, contentHash, policy
+    ].join("\0")
   );
 }
 
@@ -2388,6 +2460,30 @@ function receiptAttentionEpoch(...values: unknown[]): number {
   return Number(present[0]);
 }
 
+function generationPresentationEnd(human: Record<string, unknown>, assistant: Record<string, unknown>,
+  trace: Record<string, unknown>, receiptEnd?: unknown): ChatGenerationEnd | undefined {
+  const markers = [human.generation_end, assistant.generation_end, receiptEnd];
+  const disposition = trace.generation_stop_reason === "steered" ? "steered" :
+    trace.generation_stop_reason === "native-action-stop" ? "native-stop" :
+      trace.generation_stop_reason === "no-reply" ? "no-reply" : undefined;
+  if (markers.some((marker) => marker !== undefined && marker !== disposition)) {
+    throw new Error("Committed chat generation disposition is inconsistent.");
+  }
+  if (disposition === "no-reply" && (
+    markers.some((marker) => marker !== "no-reply") ||
+    assistant.content !== "" ||
+    !["no-generated-tokens", "no-decoded-text", "whitespace-only", "no-printable-text"]
+      .includes(String(trace.generation_no_reply_reason)) ||
+    trace.generation_printable_text_characters !== 0 ||
+    !Number.isSafeInteger(trace.generated_token_count) || Number(trace.generated_token_count) < 0 ||
+    (trace.generation_no_reply_reason === "no-generated-tokens") !== (trace.generated_token_count === 0) ||
+    typeof trace.generation_decoder_stop_reason !== "string" || !trace.generation_decoder_stop_reason
+  )) {
+    throw new Error("Committed no-reply disposition is not bound to saved zero-text evidence.");
+  }
+  return disposition;
+}
+
 function validateCommittedChatReceipt(
   value: WorkerChatReceiptResult,
   expected: {
@@ -2440,18 +2536,21 @@ function validateCommittedChatReceipt(
   const traceId = receiptIdentifier(rawTrace.id, "trace");
   const humanContent = human.content;
   const brainContent = assistant.content;
+  const generationEnd = generationPresentationEnd(human, assistant, rawTrace, value.generationEnd);
+  if ((value.noReply === true) !== (generationEnd === "no-reply")) {
+    throw new Error("Committed no-reply flag is not bound to its durable receipt.");
+  }
   if (
     human.role !== "human" ||
     assistant.role !== "brain" ||
     typeof humanContent !== "string" ||
     !humanContent.trim() ||
-    humanContent.length > 1_000_000 ||
     humanContent.includes("\0") ||
     humanContent !== expected.input ||
     sha256(humanContent) !== expected.inputSha256 ||
     typeof brainContent !== "string" ||
-    !brainContent.trim() ||
-    brainContent.length > 1_000_000 ||
+    (generationEnd === "no-reply" ? brainContent !== "" :
+      (!brainContent.length || (!generationEnd && !brainContent.trim()))) ||
     brainContent.includes("\0") ||
     assistant.traceId !== traceId ||
     rawTrace.input_sha256 !== expected.inputSha256 ||
@@ -2530,7 +2629,8 @@ function validateCommittedChatReceipt(
       ...(value.legacyMatched === false ? { turnId: expected.turnId } : {}),
       runtime: "adaptive-core",
       status: "complete",
-      attentionEpoch: epoch
+      attentionEpoch: epoch,
+      ...(generationEnd ? { generationEnd } : {})
     },
     brainMessage: {
       id: brainMessageId,
@@ -2541,7 +2641,8 @@ function validateCommittedChatReceipt(
       traceId,
       runtime: "adaptive-core",
       status: "complete",
-      attentionEpoch: epoch
+      attentionEpoch: epoch,
+      ...(generationEnd ? { generationEnd } : {})
     },
     trace: {
       id: traceId,
@@ -2550,6 +2651,11 @@ function validateCommittedChatReceipt(
       parameter_checksum_before: rawTrace.parameter_checksum_before,
       parameter_checksum_after: value.parameterChecksumAfter,
       parameter_delta_norm: finiteOptional("parameter_delta_norm"),
+      core_parameter_delta_norm: finiteOptional("parameter_delta_norm"),
+      parameter_delta_scope: "decoder, memory_bridge, idea_adapter, liquid only; signed ternary-level/control-value net L2",
+      substrate_parameter_delta_norm: null,
+      substrate_parameter_delta_measured: false,
+      parameter_checksum_scope: "module-registered learned tensors; excludes VSA vectors and sparse substrate edges",
       stdp_update: finiteOptional("stdp_update"),
       spike_rate: finiteOptional("spike_rate"),
       train_loss: finiteOptional("train_loss"),
@@ -2557,7 +2663,12 @@ function validateCommittedChatReceipt(
       ponder_steps: finiteOptional("ponder_steps"),
       steps,
       note: typeof note === "string" ? note.slice(0, 4_000) : undefined,
-      attention_epoch: epoch
+      attention_epoch: epoch,
+      generation_stop_reason: typeof rawTrace.generation_stop_reason === "string" ? rawTrace.generation_stop_reason : undefined,
+      generation_decoder_stop_reason: typeof rawTrace.generation_decoder_stop_reason === "string" ? rawTrace.generation_decoder_stop_reason : undefined,
+      generation_no_reply_reason: typeof rawTrace.generation_no_reply_reason === "string" ? rawTrace.generation_no_reply_reason : undefined,
+      generated_token_count: finiteOptional("generated_token_count"),
+      generation_printable_text_characters: finiteOptional("generation_printable_text_characters")
     },
     inferenceCount,
     plasticityEvents: receiptCount(value.plasticityEvents, "plasticity"),
@@ -2568,7 +2679,7 @@ function validateCommittedChatReceipt(
   };
 }
 
-function validateWorkerChatPresentation(
+export function validateWorkerChatPresentation(
   value: WorkerChatResult,
   expected: {
     turnId: string;
@@ -2600,6 +2711,20 @@ function validateWorkerChatPresentation(
   ) {
     throw new Error("The neural worker returned an invalid committed turn presentation.");
   }
+  const generationEnd = generationPresentationEnd(human, assistant, trace, receipt.generationEnd);
+  if (generationEnd && (human.generation_end !== generationEnd ||
+      assistant.generation_end !== generationEnd || receipt.generationEnd !== generationEnd)) {
+    throw new Error("Neural output is not bound to its durable disposition receipt.");
+  }
+  if ((value.steered === true) !== (generationEnd === "steered")) {
+    throw new Error("The neural worker steering flag is not bound to its saved trace.");
+  }
+  if ((value.nativeStopped === true) !== (generationEnd === "native-stop")) {
+    throw new Error("The neural worker native stop flag is not bound to its saved trace.");
+  }
+  if ((value.noReply === true) !== (generationEnd === "no-reply")) {
+    throw new Error("The neural worker no-reply flag is not bound to its saved trace.");
+  }
   const humanId = receiptIdentifier(human.id, "worker human message");
   const brainMessageId = receiptIdentifier(
     assistant.id,
@@ -2615,6 +2740,8 @@ function validateWorkerChatPresentation(
     human.content !== expected.input ||
     sha256(String(human.content)) !== expected.inputSha256 ||
     assistant.content !== expected.response ||
+    (generationEnd === "no-reply" ? expected.response !== "" :
+      (!expected.response.length || (!generationEnd && !expected.response.trim()))) ||
     trace.input_sha256 !== expected.inputSha256 ||
     typeof receipt.parameterChecksumAfter !== "string" ||
     !/^[a-f0-9]{64}$/.test(receipt.parameterChecksumAfter) ||
@@ -2663,7 +2790,8 @@ function validateWorkerChatPresentation(
       turnId: expected.turnId,
       runtime: "adaptive-core",
       status: "complete",
-      attentionEpoch: epoch
+      attentionEpoch: epoch,
+      ...(generationEnd ? { generationEnd } : {})
     },
     brainMessage: {
       id: brainMessageId,
@@ -2674,7 +2802,8 @@ function validateWorkerChatPresentation(
       traceId,
       runtime: "adaptive-core",
       status: "complete",
-      attentionEpoch: epoch
+      attentionEpoch: epoch,
+      ...(generationEnd ? { generationEnd } : {})
     },
     inferenceCount
   };
@@ -2696,6 +2825,19 @@ function applyWorkerTracePresentation(
   if (typeof trace.attention_epoch === "number") {
     result.trace.attentionEpoch = trace.attention_epoch;
   }
+  const disposition = result.brainMessage.generationEnd;
+  if (disposition || trace.generation_decoder_stop_reason !== undefined || trace.generated_token_count !== undefined) {
+    result.trace.generation = {
+      ...(disposition ? { disposition } : {}),
+      ...(typeof trace.generation_decoder_stop_reason === "string" ? { decoderStopReason: trace.generation_decoder_stop_reason } : {}),
+      ...(Number.isSafeInteger(trace.generated_token_count) && Number(trace.generated_token_count) >= 0
+        ? { generatedTokenCount: trace.generated_token_count } : {}),
+      ...(Number.isSafeInteger(trace.generation_printable_text_characters) && Number(trace.generation_printable_text_characters) >= 0
+        ? { printableTextCharacters: trace.generation_printable_text_characters } : {}),
+      ...(["no-generated-tokens", "no-decoded-text", "whitespace-only", "no-printable-text"].includes(String(trace.generation_no_reply_reason))
+        ? { noReplyReason: trace.generation_no_reply_reason as ChatNoReplyReason } : {})
+    };
+  }
   if (typeof trace.seed === "number") result.trace.seed = trace.seed;
   if (trace.steps) {
     result.trace.steps = trace.steps
@@ -2707,10 +2849,10 @@ function applyWorkerTracePresentation(
   }
   const mutations = [
     typeof trace.parameter_delta_norm === "number"
-      ? `parameter delta ${trace.parameter_delta_norm.toExponential(4)}`
+      ? `core-module net delta ${trace.parameter_delta_norm.toExponential(4)} (VSA/edge net delta unmeasured)`
       : undefined,
     typeof trace.stdp_update === "number"
-      ? `STDP update ${trace.stdp_update.toExponential(4)}`
+      ? `STDP activity ${trace.stdp_update.toExponential(4)}`
       : undefined,
     typeof trace.train_loss === "number"
       ? `loss ${trace.train_loss.toFixed(6)}`
@@ -2721,9 +2863,15 @@ function applyWorkerTracePresentation(
         }`
       : undefined
   ].filter((value): value is string => Boolean(value));
+  result.trace.parameterDiagnostics = {
+    scope: "decoder, memory_bridge, idea_adapter, liquid only",
+    ...(typeof trace.parameter_delta_norm === "number" ? { coreDeltaNorm: trace.parameter_delta_norm } : {}),
+    substrateDeltaNorm: null, substrateDeltaMeasured: false,
+    checksumScope: "module-registered learned tensors; excludes VSA vectors and sparse substrate edges"
+  };
   if (mutations.length > 0) {
     result.trace.steps.push({
-      stage: "verified-neural-mutation",
+      stage: "measured-core-and-stdp-activity",
       detail: mutations.join("; ")
     });
   }
@@ -2758,9 +2906,11 @@ function mergeCommittedChatPresentation(
       existingHuman?.role !== "human" ||
       existingHuman.content !== humanMessage.content ||
       existingHuman.createdAt !== humanMessage.createdAt ||
+      (humanMessage.generationEnd === "no-reply" && existingHuman.generationEnd !== "no-reply") ||
       existingBrain?.role !== "brain" ||
       existingBrain.content !== brainMessage.content ||
       existingBrain.createdAt !== brainMessage.createdAt ||
+      (brainMessage.generationEnd === "no-reply" && existingBrain.generationEnd !== "no-reply") ||
       existingBrain.traceId !== workerTrace.id ||
       existingTrace?.input !== humanMessage.content ||
       Date.parse(existingTrace.createdAt) !== Date.parse(workerTrace.created_at ?? "")
@@ -2812,7 +2962,8 @@ function mergeCommittedChatPresentation(
     result = recordNeuralChat(
       brain,
       humanMessage.content,
-      brainMessage.content
+      brainMessage.content,
+      brainMessage.generationEnd
     );
     result.brain.messages.splice(-2, 2, humanMessage, brainMessage);
     result.humanMessage = humanMessage;
@@ -2947,7 +3098,8 @@ function persistedChatReceipt(
     ...(traceValue ? { traceId: traceValue } : {}),
     ...((value.attention_epoch ?? value.attentionEpoch) !== undefined
       ? { attentionEpoch: value.attention_epoch ?? value.attentionEpoch }
-      : {})
+      : {}),
+    ...(value.generation_end !== undefined ? { generation_end: value.generation_end } : {})
   });
   return {
     format: "omni-chat-turn-receipt-query",
@@ -2968,7 +3120,9 @@ function persistedChatReceipt(
     engineUpdatedAt: String(metadata.updated_at ?? ""),
     substrateGeneration: String(substratePersistence?.activeGeneration ?? ""),
     mutableStateGeneration: String(mutableState?.activeGeneration ?? ""),
-    idempotentCompletion: true
+    idempotentCompletion: true,
+    ...(receipt.generationEnd !== undefined ? { generationEnd: receipt.generationEnd as ChatGenerationEnd } : {}),
+    noReply: receipt.generationEnd === "no-reply"
   };
 }
 
@@ -3745,6 +3899,17 @@ export class BrainService {
   private readonly chatSlowLearningTimers = new Map<string, NodeJS.Timeout>();
   private readonly chatSlowLearningFailures = new Map<string, number>();
   private readonly pausedChatLearning = new Set<string>();
+  private readonly liveChatTurns = new Map<string, {
+    brainId: string; inputSha256: string; chatDispatched: boolean;
+    outputEnded: boolean; steerSuccessor?: string;
+  }>();
+  private readonly inlineCancellationOwners = new Map<string, {
+    brainId: string; turnId: string; actionId: string; pid?: number;
+  }>();
+  private readonly inlineCancellationListeners = new Set<(event: {
+    brainId: string; turnId: string; actionId: string;
+  }) => void>();
+  private inlineCancellationHooksInstalled = false;
   /** Development/live-QA override; never changes a saved brain configuration. */
   private readonly backgroundLearningSuspendedForLaunch =
     process.env.OMNI_SUSPEND_BACKGROUND_LEARNING === "1";
@@ -4020,15 +4185,18 @@ export class BrainService {
     if (!this.resourcePlanner) {
       throw new Error("The live device resource planner is unavailable.");
     }
-    const brain = options.brainId
-      ? await this.repository.get(options.brainId)
+    const scopedBrainId = options.brainId ?? request.brainId;
+    const brain = scopedBrainId
+      ? await this.repository.get(scopedBrainId)
       : undefined;
+    const saved = brain ? await savedRuntimeShape(this.repository.brainDirectory(brain.id), brain.id, brain.config) : undefined;
     return this.resourcePlanner.plan(request, {
-      hardwareTier: options.hardwareTier,
-      config: brain?.config,
+      hardwareTier: brain ? undefined : options.hardwareTier,
+      config: brain ? { ...brain.config, ...saved } : undefined,
       brainDirectory: brain
         ? this.repository.brainDirectory(brain.id)
-        : undefined
+        : undefined,
+      ...(brain ? { admissionScope: "existing-runtime", enforceContextFloor: false } : {})
     });
   }
 
@@ -4104,6 +4272,7 @@ export class BrainService {
 
       let resolvedConfig = this.repository.prepareConfig({
         ...config,
+        ...await savedRuntimeShape(this.repository.brainDirectory(brainId), brainId, current.config),
         // Active Mode has its own single-owner transaction. A broad device
         // settings save must never acquire or release that process lease.
         idleCognition: current.config.idleCognition,
@@ -4130,6 +4299,7 @@ export class BrainService {
           {
             config: resolvedConfig,
             brainDirectory: this.repository.brainDirectory(brainId),
+            admissionScope: "existing-runtime",
             enforceContextFloor: false
           }
         );
@@ -4140,6 +4310,7 @@ export class BrainService {
           ...resolvedConfig,
           contextWindowTokens: plan.context.selectedTokens,
           memoryOffloadBytes: plan.resources.configuredMemorySpillBytes,
+          contextOffloadBudgetBytes: plan.context.evidence.contextOffloadBudgetBytes ?? 0,
           memoryResidentItems: Math.max(1, plan.offload.residentMemoryItems),
           memoryOffloadSlowdownPercent: plan.offload.estimatedSlowdownPercent,
           systemRamMode: plan.resources.systemRamMode,
@@ -4315,6 +4486,7 @@ export class BrainService {
     }
     const resolvedConfig: BrainConfig = {
       ...request.config,
+      nativeArchitecture: memoryPlan.nativeArchitecture,
       // New stable instances have one non-configurable adaptive-retention
       // lifecycle: temporary working activity, durable neural learning, and
       // provenance without a routine verbatim source archive.
@@ -4331,6 +4503,7 @@ export class BrainService {
       workingMemoryMode: memoryMode,
       extendedWorkingMemory: memoryMode === "extended",
       memoryOffloadBytes: memoryPlan.resources.configuredMemorySpillBytes,
+      contextOffloadBudgetBytes: memoryPlan.context.evidence.contextOffloadBudgetBytes ?? 0,
       memoryResidentItems: memoryPlan.offload.residentMemoryItems,
       memoryOffloadSlowdownPercent:
         memoryPlan.offload.estimatedSlowdownPercent,
@@ -4418,6 +4591,7 @@ export class BrainService {
       hardwareTier: resolvedTier,
       modalities,
       origin: "ground-up" as const,
+      nativeArchitecture: memoryPlan.nativeArchitecture,
       storagePath
     };
     let workerSummary: unknown;
@@ -4466,6 +4640,7 @@ export class BrainService {
       hardwareTier: foundation.hardwareTier,
       modalities: foundation.modalities,
       origin: foundation.origin,
+      nativeArchitecture: brain.config.nativeArchitecture,
       storagePath: this.repository.brainDirectory(brainId)
     };
     const workerSummary = onBuildEvent
@@ -4485,6 +4660,43 @@ export class BrainService {
     }
     await this.repository.deduplicateImmutableOrigin(brainId);
     return brain;
+  }
+
+  async queryCortex(brainId: string, query: CortexQuery = {}, signal?: AbortSignal): Promise<CortexPage> {
+    await this.preflightStart(brainId);
+    await this.repository.get(brainId);
+    if (query.entity !== undefined && !["modules", "rows", "elements", "links", "boundaries"].includes(query.entity)) {
+      throw new Error("Invalid cortical inspection entity.");
+    }
+    for (const field of ["row", "offset", "pageSize"] as const) {
+      const value = query[field];
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < (field === "pageSize" ? 1 : 0))) {
+        throw new Error("Invalid cortical inspection range.");
+      }
+    }
+    for (const field of ["moduleId", "group", "search", "cursor"] as const) {
+      const value = query[field];
+      if (value !== undefined && (typeof value !== "string" || value.length > (field === "cursor" ? 2048 : 512))) {
+        throw new Error("Invalid cortical inspection filter.");
+      }
+    }
+    return this.engine.request<CortexPage>("query_cortex", {
+      brainId, storagePath: this.repository.brainDirectory(brainId),
+      query: { entity: query.entity ?? "modules", moduleId: query.moduleId, group: query.group,
+        search: query.search, row: query.row, offset: query.offset, cursor: query.cursor, pageSize: query.pageSize ?? 64 }
+    }, 30_000, signal);
+  }
+
+  async cortexActivity(brainId: string, query: CortexActivityQuery): Promise<CortexActivity> {
+    await this.repository.get(brainId);
+    if (typeof query.module !== "string" || query.module.length > 512 || typeof query.enabled !== "boolean"
+        || (query.start !== undefined && (!Number.isSafeInteger(query.start) || query.start < 0))
+        || (query.count !== undefined && (!Number.isSafeInteger(query.count) || query.count < 1))) {
+      throw new Error("Invalid observed cortical activity viewport.");
+    }
+    return this.engine.request<CortexActivity>("cortex_activity", {
+      brainId, storagePath: this.repository.brainDirectory(brainId), query
+    }, 10_000);
   }
 
   async querySubstrate(
@@ -4564,6 +4776,18 @@ export class BrainService {
           params,
           timeout
         );
+  }
+
+  async queryConceptIds(brainId: string, view: unknown, sourceTurnId: string, offset = 0): Promise<import("../shared/conceptIdView").ConceptIdPage> {
+    const sourceOwner = typeof view === "object" && view !== null && "brainId" in view ? String(view.brainId) : "";
+    const descriptor = normalizeConceptIdView(view, sourceOwner, sourceTurnId);
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid concept ID page offset.");
+    await this.repository.get(brainId);
+    return this.engine.request("query_concept_id_view", {
+      brainId, storagePath: this.repository.brainDirectory(brainId),
+      conceptIdView: descriptor, sourceTurnId, offset,
+      historicalInspection: descriptor.brainId !== brainId
+    }, 600_000);
   }
 
   async persistedSubstrateOverview(
@@ -4857,12 +5081,19 @@ export class BrainService {
     responseTokenBudget?: number
   ): Promise<ChatResult> {
     const message = cleanMessage(input);
+    signal?.throwIfAborted();
+    if (this.liveChatTurns.has(turnId)) throw new Error("This chat turn already owns the neural write boundary.");
+    const ownership = { brainId: id, inputSha256: sha256(message),
+      chatDispatched: false, outputEnded: false } as {
+      brainId: string; inputSha256: string; chatDispatched: boolean;
+      outputEnded: boolean; steerSuccessor?: string;
+    };
+    this.liveChatTurns.set(turnId, ownership);
     let minimumInferenceCount: number | undefined;
     let neuralRequestStarted = false;
-    signal?.throwIfAborted();
-    await this.engine.claimForeground?.();
-    signal?.throwIfAborted();
     try {
+      await this.engine.claimForeground?.();
+      signal?.throwIfAborted();
       return await withBrainWrite(
         this.repository,
         id,
@@ -4885,6 +5116,7 @@ export class BrainService {
         signal
       );
     } catch (error) {
+      if (error instanceof EngineRequestError && [-32801, -32802].includes(error.code ?? 0)) throw error;
       if (minimumInferenceCount !== undefined && neuralRequestStarted) {
         try {
           const reconciled = await this.reconcileCommittedChat(id, {
@@ -4904,7 +5136,90 @@ export class BrainService {
         }
       }
       throw error;
+    } finally {
+      if (this.liveChatTurns.get(turnId) === ownership) this.liveChatTurns.delete(turnId);
     }
+  }
+
+  async steerChat(brainId: string, turnId: string, successorTurnId: string): Promise<void> {
+    const ownership = this.liveChatTurns.get(turnId);
+    if (!ownership || ownership.brainId !== brainId || ownership.outputEnded) return;
+    ownership.steerSuccessor = successorTurnId;
+    // A queued/pre-dispatch turn yields at the main admission boundary. Loading
+    // may finish safely, but Steer never aborts it or starts a replacement PID.
+    if (!ownership.chatDispatched) return;
+    const result = await this.engine.steerChat(brainId, turnId, successorTurnId);
+    if (!result.requested || !result.warm) throw new Error("The worker did not admit the exact warm steering direction.");
+  }
+
+  private chatSteerAdmissionBoundary(brainId: string, turnId: string): void {
+    const ownership = this.liveChatTurns.get(turnId);
+    if (!ownership?.steerSuccessor) return;
+    throw new EngineRequestError("Chat yielded before decoding to a warm steering direction.", -32801, {
+      brainId, turnId, inputSha256: ownership.inputSha256,
+      steered: true, zeroTokenYield: true, safeBoundary: true, warm: true
+    });
+  }
+
+  async cancelInlineImagination(brainId: string, turnId: string, actionId: string): Promise<{
+    requested: boolean; acknowledged: boolean;
+  }> {
+    const key = `${brainId}:${turnId}:${actionId}`;
+    this.inlineCancellationOwners.set(key, { brainId, turnId, actionId, pid: this.engine.pid });
+    try {
+      const result = await this.engine.cancelInlineGeneration(brainId, turnId, actionId);
+      if (!result.requested) this.inlineCancellationOwners.delete(key);
+      return result;
+    } catch (error) {
+      if (error instanceof EngineRequestError && [-32600, -32602].includes(error.code ?? 0)) {
+        this.inlineCancellationOwners.delete(key);
+      }
+      throw error;
+    }
+  }
+
+  onCodecRuntimeSetup(listener: (event: { brainId: string; turnId: string; actionId: string; message: string }) => void): () => void {
+    const handle = (event: EngineEvent): void => {
+      if (event.type === "video-runtime-setup" && event.brainId && event.streamId && event.actionId && event.message) {
+        listener({ brainId: event.brainId, turnId: event.streamId, actionId: event.actionId, message: event.message });
+      }
+    };
+    this.engine.on("event", handle);
+    return () => { this.engine.off("event", handle); };
+  }
+
+  onInlineImaginationCancelled(listener: (event: {
+    brainId: string; turnId: string; actionId: string;
+  }) => void): () => void {
+    this.inlineCancellationListeners.add(listener);
+    const remove = (): void => { this.inlineCancellationListeners.delete(listener); };
+    if (this.inlineCancellationHooksInstalled || typeof this.engine.on !== "function") return remove;
+    this.inlineCancellationHooksInstalled = true;
+    const handle = (event: EngineEvent): void => {
+      const data = objectRecord(event.data);
+      if (event.type !== "inline-imagination-cancelled" ||
+          typeof event.brainId !== "string" || typeof event.streamId !== "string" ||
+          typeof event.actionId !== "string" ||
+          data?.acknowledged !== true || data.cleanupCompleted !== true) return;
+      this.inlineCancellationOwners.delete(`${event.brainId}:${event.streamId}:${event.actionId}`);
+      for (const subscriber of this.inlineCancellationListeners) {
+        subscriber({ brainId: event.brainId, turnId: event.streamId, actionId: event.actionId });
+      }
+    };
+    const closed = ({ pid }: { pid?: number }): void => {
+      for (const [key, owner] of this.inlineCancellationOwners) {
+        if (!pid || owner.pid !== pid) continue;
+        void cleanupCancelledInlineStage(this.repository.brainDirectory(owner.brainId), owner.actionId)
+          .then((cleaned) => {
+            if (!cleaned || this.inlineCancellationOwners.get(key) !== owner) return;
+            this.inlineCancellationOwners.delete(key);
+            for (const subscriber of this.inlineCancellationListeners) subscriber(owner);
+          }).catch(() => undefined); // Cleanup failure is never a false acknowledgement.
+      }
+    };
+    this.engine.on("event", handle);
+    this.engine.on("worker-closed", closed);
+    return remove;
   }
 
   private async reconcileCommittedChat(
@@ -4955,6 +5270,7 @@ export class BrainService {
         receipt.brainMessage,
         receipt.trace
       );
+      if (receipt.brainMessage.generationEnd) result.generationEnd = receipt.brainMessage.generationEnd;
       result.brain.counters.inferenceCount = Math.max(
         result.brain.counters.inferenceCount,
         receipt.inferenceCount
@@ -4990,6 +5306,7 @@ export class BrainService {
     onNeuralRequestStarted?: () => void
   ): Promise<ChatResult> {
     signal?.throwIfAborted();
+    this.chatSteerAdmissionBoundary(id, turnId);
     if (
       responseTokenBudget !== undefined &&
       (!Number.isSafeInteger(responseTokenBudget) || responseTokenBudget < 1)
@@ -5007,6 +5324,10 @@ export class BrainService {
     const toolSchemas = this.neuralToolSchemas(brain);
     const brainDirectory = this.repository.brainDirectory(id);
     const onRuntimeActivity = (transition: EngineActivityTransition): void => {
+      if (transition.method === "chat" && transition.state === "running") {
+        const ownership = this.liveChatTurns.get(turnId);
+        if (ownership) ownership.chatDispatched = true;
+      }
       const normalized = neuralChatRuntimeActivity(transition);
       if (normalized) onStream?.(normalized);
     };
@@ -5031,6 +5352,7 @@ export class BrainService {
       activityContext
     );
     signal?.throwIfAborted();
+    this.chatSteerAdmissionBoundary(id, turnId);
     onNeuralRequestStarted?.();
     const workerResult = await this.engine.requestStream<WorkerChatResult>(
       "chat",
@@ -5048,6 +5370,10 @@ export class BrainService {
       (event) => {
         const normalized = normalizeChatEngineEvent(event, id);
         if (!normalized) return;
+        if (normalized.type === "chat-phase") {
+          const ownership = this.liveChatTurns.get(turnId);
+          if (ownership) ownership.outputEnded = true;
+        }
         if (normalized.type === "modality-preview" && this.mediaArtifacts) {
           const leased = this.mediaArtifacts.leasePreview(
             id,
@@ -5066,11 +5392,17 @@ export class BrainService {
       signal,
       turnId,
       "foreground",
-      activityContext
+      { ...activityContext, beforeDispatch: () => this.chatSteerAdmissionBoundary(id, turnId) }
     );
     signal?.throwIfAborted();
-    const generated = workerText(workerResult);
-    if (!generated) {
+    const noReply = workerResult.noReply === true;
+    if (noReply && [workerResult.text, workerResult.response, workerResult.content]
+      .some((candidate) => candidate !== undefined && candidate !== "")) {
+      throw new Error("No-reply neural completion contains fabricated response text.");
+    }
+    const generated = (workerResult.steered === true || workerResult.nativeStopped === true || noReply) && typeof workerResult.text === "string"
+      ? workerResult.text : workerText(workerResult);
+    if (generated === undefined || (!generated && !noReply)) {
       throw new Error("OmniCortex returned an empty neural response.");
     }
     const authoritativePresentation = validateWorkerChatPresentation(
@@ -5082,6 +5414,9 @@ export class BrainService {
         response: generated
       }
     );
+    if ((workerResult.steered === true || workerResult.nativeStopped === true || noReply) && !authoritativePresentation) {
+      throw new Error("Typed neural completion has no exact durable turn presentation.");
+    }
     const result = authoritativePresentation
       ? mergeCommittedChatPresentation(
           brain,
@@ -5099,6 +5434,9 @@ export class BrainService {
       );
     }
     result.proposedActions = parseModelActions("", workerResult?.actions);
+    if (workerResult.steered === true) result.generationEnd = "steered";
+    if (workerResult.nativeStopped === true) result.generationEnd = "native-stop";
+    if (noReply) result.generationEnd = "no-reply";
     const metrics = workerResult?.metrics;
     if (metrics) {
       if (
@@ -5656,7 +5994,8 @@ export class BrainService {
           entry.index,
           cursor.currentEpoch ?? 0,
           entryContentHash,
-          policy
+          policy,
+          cursor.runId
         );
         try {
           await assertManifestEntryStable(entry);
@@ -5723,6 +6062,7 @@ export class BrainService {
             replayFirstEpoch,
             jobId,
             transactionKey,
+            cursor.runId,
             lastEntryReceipt?.transactionKey === transactionKey
               ? lastEntryReceipt
               : undefined,
@@ -5917,6 +6257,7 @@ export class BrainService {
           lastEntryReceipt = {
             schemaVersion: 1,
             manifestId,
+            ...(cursor.runId ? { runId: cursor.runId } : {}),
             manifestHash: manifest.manifestHash,
             transactionKey,
             entryIndex: entry.index,
@@ -5983,6 +6324,7 @@ export class BrainService {
     forceReplay = false,
     jobId = "",
     transactionKey: string,
+    runId: string | undefined,
     completedReceipt?: DatasetEntryReceipt,
     onWorkerCompleted: (receipt: DatasetEntryReceipt) => Promise<void> = async () =>
       undefined,
@@ -6004,6 +6346,7 @@ export class BrainService {
         forceReplay,
         jobId,
         transactionKey,
+        runId,
         completedReceipt,
         onWorkerCompleted,
         onWorkerProgress,
@@ -6022,6 +6365,7 @@ export class BrainService {
     forceReplay: boolean,
     jobId: string,
     transactionKey: string,
+    runId: string | undefined,
     completedReceipt: DatasetEntryReceipt | undefined,
     onWorkerCompleted: (receipt: DatasetEntryReceipt) => Promise<void>,
     onWorkerProgress: (
@@ -6042,7 +6386,8 @@ export class BrainService {
       entry.index,
       epoch,
       contentHash,
-      policy
+      policy,
+      runId
     );
     if (transactionKey !== expectedTransactionKey) {
       throw new Error("Dataset transaction identity does not match its manifest entry.");
@@ -6057,6 +6402,7 @@ export class BrainService {
     if (receipt) {
       if (
         receipt.manifestId !== manifest.id ||
+        receipt.runId !== runId ||
         receipt.manifestHash !== manifest.manifestHash ||
         receipt.transactionKey !== transactionKey ||
         receipt.entryIndex !== entry.index ||
@@ -6072,6 +6418,7 @@ export class BrainService {
       receipt = {
         schemaVersion: 1,
         manifestId: manifest.id,
+        ...(runId ? { runId } : {}),
         manifestHash: manifest.manifestHash,
         transactionKey,
         entryIndex: entry.index,
@@ -6204,6 +6551,7 @@ export class BrainService {
       receipt = {
         schemaVersion: 1,
         manifestId: manifest.id,
+        ...(runId ? { runId } : {}),
         manifestHash: manifest.manifestHash,
         transactionKey,
         entryIndex: entry.index,
@@ -6387,10 +6735,13 @@ export class BrainService {
     request: IngestWebRequest,
     finalUrl: URL,
     raw: string,
-    contentType: string
+    contentType: string,
+    signal?: AbortSignal,
+    jobId = ""
   ): Promise<IngestResult> {
     return withBrainWrite(this.repository, request.brainId, () =>
-      this.ingestWebContentUnlocked(request, finalUrl, raw, contentType)
+      this.ingestWebContentUnlocked(request, finalUrl, raw, contentType, signal, jobId),
+      signal
     );
   }
 
@@ -6398,55 +6749,65 @@ export class BrainService {
     request: IngestWebRequest,
     finalUrl: URL,
     raw: string,
-    contentType: string
+    contentType: string,
+    signal?: AbortSignal,
+    jobId = ""
   ): Promise<IngestResult> {
     await this.preflightStart(request.brainId);
-    const text = contentType.includes("html") ? htmlToText(raw) : raw.replace(/\0/g, "");
-    const contentHash = sha256(text);
+    let text = contentType.includes("html") ? htmlToText(raw) : raw.replace(/\0/g, "");
+    const webCache = join(this.repository.brainDirectory(request.brainId), "datasets", "web-cache");
+    const lease = await acquireCrawlSourceLease({
+      directory: webCache, url: finalUrl.toString(), kind: "text",
+      contentHash: sha256(text), contentType, extension: ".txt", text,
+    });
+    if (lease.kind !== "text") {
+      throw new Error("This URL has an unfinished binary learning lease; resume its original source first.");
+    }
+    text = await readSpoolText(lease.path, lease.bytes);
+    contentType = lease.contentType;
+    const contentHash = lease.contentHash;
     let brain = await this.repository.get(request.brainId);
+    const policy = request.policy ?? "encode";
+    const quarantined = request.quarantine ?? true;
     const duplicate = await this.repository.trainingSourceByContentHash(
       request.brainId,
       contentHash
     );
-    if (duplicate) {
+    if (duplicate && (quarantined || duplicate.policy !== "archive")) {
+      await releaseCrawlSourceLease(lease);
       return {
         brain,
         source: duplicate,
         warnings: ["This web content was already ingested; no duplicate synapses were created."]
       };
     }
-    const policy = request.policy ?? "encode";
-    const quarantined = request.quarantine ?? true;
     const before = {
       ideas: brain.ideas.length,
       concepts: Object.keys(brain.concepts).length,
       synapses: Object.keys(brain.synapses).length
     };
-    const webCache = join(this.repository.brainDirectory(brain.id), "datasets", "web-cache");
-    const temporaryPath = join(webCache, `${contentHash}.txt`);
-    await mkdir(webCache, { recursive: true });
-    await writeFile(temporaryPath, text, { encoding: "utf8", mode: 0o600 });
     let worker: WorkerIngestResult;
     try {
       worker = await this.engine.request<WorkerIngestResult>(
         "ingest",
         {
+          jobId,
           brainId: brain.id,
           url: finalUrl.toString(),
-          path: temporaryPath,
+          path: lease.path,
           name: finalUrl.toString(),
           kind: "text",
           policy: quarantined ? "archive" : policy,
           quarantine: quarantined,
+          allowReplay: !quarantined && duplicate?.policy === "archive",
           contentHash,
           storagePath: this.repository.brainDirectory(brain.id)
         },
-        86_400_000
+        ENGINE_REQUEST_NO_DEADLINE,
+        signal
       );
     } catch (error) {
       throw crawlResourcePauseFromEngineError(error) ?? error;
-    } finally {
-      await rm(temporaryPath, { force: true });
     }
     synchronizeWorkerSummary(brain, worker);
     const retainRaw =
@@ -6454,10 +6815,10 @@ export class BrainService {
       (brain.config.memoryRecipe ?? "adaptive-retention") === "total-recall" &&
       brain.config.retainSourceText;
     const source: TrainingSource = {
-      id: randomUUID(),
+      id: duplicate?.id ?? randomUUID(),
       name: finalUrl.hostname + finalUrl.pathname,
       kind: "text",
-      bytes: Buffer.byteLength(raw),
+      bytes: lease.bytes,
       learnedIdeas: worker?.source?.learned_ideas ?? brain.ideas.length - before.ideas,
       learnedConcepts:
         worker?.source?.learned_concepts ??
@@ -6482,8 +6843,11 @@ export class BrainService {
       license: "Web source; verify the publisher's terms",
       licenseUrl: finalUrl.toString()
     };
-    brain.trainingSources.push(source);
+    brain.trainingSources = [
+      ...brain.trainingSources.filter((value) => value.id !== source.id), source
+    ];
     brain = await this.repository.save(brain);
+    await releaseCrawlSourceLease(lease);
     return {
       brain,
       source,
@@ -6498,10 +6862,13 @@ export class BrainService {
     finalUrl: URL,
     path: string,
     contentType: string,
-    kind: "image" | "audio" | "video"
+    kind: "image" | "audio" | "video",
+    signal?: AbortSignal,
+    jobId = ""
   ): Promise<IngestResult> {
     return withBrainWrite(this.repository, request.brainId, () =>
-      this.ingestCrawledMediaUnlocked(request, finalUrl, path, contentType, kind)
+      this.ingestCrawledMediaUnlocked(request, finalUrl, path, contentType, kind, signal, jobId),
+      signal
     );
   }
 
@@ -6510,16 +6877,31 @@ export class BrainService {
     finalUrl: URL,
     path: string,
     contentType: string,
-    kind: "image" | "audio" | "video"
+    kind: "image" | "audio" | "video",
+    signal?: AbortSignal,
+    jobId = ""
   ): Promise<IngestResult> {
     await this.preflightStart(request.brainId);
-    const contentHash = await hashFile(path);
+    const lease = await acquireCrawlSourceLease({
+      directory: join(this.repository.brainDirectory(request.brainId), "datasets", "web-cache"),
+      url: finalUrl.toString(), kind, contentHash: await hashFile(path), contentType,
+      extension: extname(path) || `.${kind}`, sourcePath: path,
+    });
+    if (lease.kind === "text") {
+      throw new Error("This URL has an unfinished text learning lease; resume its original source first.");
+    }
+    const contentHash = lease.contentHash;
+    kind = lease.kind;
+    contentType = lease.contentType;
     let brain = await this.repository.get(request.brainId);
+    const policy = request.policy ?? "encode";
+    const quarantined = request.quarantine ?? true;
     const duplicate = await this.repository.trainingSourceByContentHash(
       request.brainId,
       contentHash
     );
-    if (duplicate) {
+    if (duplicate && (quarantined || duplicate.policy !== "archive")) {
+      await releaseCrawlSourceLease(lease);
       return {
         brain,
         source: duplicate,
@@ -6528,9 +6910,7 @@ export class BrainService {
         ]
       };
     }
-    const policy = request.policy ?? "encode";
-    const quarantined = request.quarantine ?? true;
-    const fileInfo = await stat(path);
+    const fileInfo = await stat(lease.path);
     const before = {
       ideas: brain.ideas.length,
       concepts: Object.keys(brain.concepts).length,
@@ -6541,17 +6921,20 @@ export class BrainService {
       worker = await this.engine.request<WorkerIngestResult>(
         "ingest",
         {
+          jobId,
           brainId: brain.id,
           url: finalUrl.toString(),
-          path,
+          path: lease.path,
           name: finalUrl.toString(),
           kind,
           policy: quarantined ? "archive" : policy,
           quarantine: quarantined,
+          allowReplay: !quarantined && duplicate?.policy === "archive",
           contentHash,
           storagePath: this.repository.brainDirectory(brain.id)
         },
-        86_400_000
+        ENGINE_REQUEST_NO_DEADLINE,
+        signal
       );
     } catch (error) {
       throw crawlResourcePauseFromEngineError(error) ?? error;
@@ -6569,7 +6952,7 @@ export class BrainService {
     const preserveBlob = quarantined ||
       (memoryRecipe === "total-recall" && brain.config.retainSourceText);
     const source: TrainingSource = {
-      id: randomUUID(),
+      id: duplicate?.id ?? randomUUID(),
       name: basename(finalUrl.pathname) || `${finalUrl.hostname}-${kind}`,
       kind: effectiveKind,
       bytes: fileInfo.size,
@@ -6588,14 +6971,16 @@ export class BrainService {
       rawTextRetained: false,
       contentHash,
       blobHash: preserveBlob
-        ? await this.repository.storeFileAsBlob(path)
+        ? await this.repository.storeFileAsBlob(lease.path)
         : undefined,
       policy: quarantined ? "archive" : policy,
       provenanceUrl: finalUrl.toString(),
       license: "Web media source; verify the publisher's terms",
       licenseUrl: finalUrl.toString()
     };
-    brain.trainingSources.push(source);
+    brain.trainingSources = [
+      ...brain.trainingSources.filter((value) => value.id !== source.id), source
+    ];
     brain.journal = [
       ...(brain.journal ?? []),
       {
@@ -6612,6 +6997,7 @@ export class BrainService {
       }
     ];
     brain = await this.repository.save(brain);
+    await releaseCrawlSourceLease(lease);
     return {
       brain,
       source,
@@ -6628,7 +7014,9 @@ export class BrainService {
   async crawlWeb(
     request: WebCrawlRequest,
     cancelled: () => boolean = () => false,
-    progress: (value: number, message: string) => void = () => undefined
+    progress: (value: number, message: string) => void = () => undefined,
+    cancellationSignal?: AbortSignal,
+    jobId = ""
   ): Promise<WebCrawlResult> {
     request = {
       ...request,
@@ -6677,7 +7065,10 @@ export class BrainService {
         let rules: string[] = [];
         try {
           const robotsUrl = new URL("/robots.txt", url.origin);
-          const signal = AbortSignal.timeout(30_000);
+          const timeout = AbortSignal.timeout(30_000);
+          const signal = cancellationSignal
+            ? AbortSignal.any([timeout, cancellationSignal])
+            : timeout;
           const robotsResponse = await safeFetch(
             robotsUrl,
             {
@@ -6769,7 +7160,10 @@ export class BrainService {
               await assertSafeRemoteUrl(pageUrl, { allowLoopback });
               let response: Response | undefined;
               for (let attempt = 0; attempt < 3; attempt += 1) {
-                const signal = AbortSignal.timeout(120_000);
+                const timeout = AbortSignal.timeout(120_000);
+                const signal = cancellationSignal
+                  ? AbortSignal.any([timeout, cancellationSignal])
+                  : timeout;
                 response = await safeFetch(
                   pageUrl,
                   {
@@ -6810,7 +7204,11 @@ export class BrainService {
                 await response.body?.cancel("crawl response was not successful").catch(
                   () => undefined
                 );
-                throw new Error(`HTTP ${response.status}`);
+                if (response.status >= 400 && response.status < 500 &&
+                    ![408, 429].includes(response.status)) {
+                  throw new CrawlPolicyError(`HTTP ${response.status}: source rejected`);
+                }
+                throw new Error(`HTTP ${response.status}: source must be retried`);
               }
               const finalUrl = new URL(response.url);
               await assertSafeRemoteUrl(finalUrl, { allowLoopback });
@@ -6868,9 +7266,9 @@ export class BrainService {
             break;
           }
           if ("error" in page) {
-            if (page.resourcePaused) {
+            if (!page.skipped) {
               stopped = true;
-              frontier.recordWarning(page.entry.url, page.error);
+              frontier.recordWarning(page.entry.url, page.error || "Crawl fetch failed before ingestion.");
               await retryAndClean(fetched.slice(index));
               break;
             }
@@ -6891,11 +7289,13 @@ export class BrainService {
                   page.finalUrl,
                   page.bodyPath,
                   page.contentType,
-                  page.mediaKind
+                  page.mediaKind,
+                  cancellationSignal,
+                  jobId
                 )
               : await (async (): Promise<IngestResult> => {
                   if (!isCrawledText(page.contentType, page.finalUrl)) {
-                    throw new Error(
+                    throw new CrawlPolicyError(
                       `Unsupported crawled content type ${
                         page.contentType || "(missing)"
                       }`
@@ -6906,7 +7306,9 @@ export class BrainService {
                     ingestRequest,
                     page.finalUrl,
                     raw,
-                    page.contentType
+                    page.contentType,
+                    cancellationSignal,
+                    jobId
                   );
                 })();
             if (recentResults.length >= CRAWL_DIAGNOSTIC_WINDOW) {
@@ -6945,9 +7347,12 @@ export class BrainService {
               warnings: result.warnings
             });
           } catch (error) {
-            if (error instanceof CrawlResourcePause) {
+            if (!(error instanceof CrawlPolicyError)) {
               stopped = true;
-              frontier.recordWarning(page.entry.url, error.message);
+              frontier.recordWarning(
+                page.entry.url,
+                error instanceof Error ? error.message : String(error)
+              );
               await retryAndClean(fetched.slice(index));
               break;
             }
@@ -8133,10 +8538,12 @@ export class RuntimeJobManager extends EventEmitter {
       request.brainId,
       request.manifestId
     );
-    const policy: PersistedDataIngestionPolicy =
-      persisted.lastEntryReceipt?.policy === "consolidate"
-        ? "consolidate"
-        : "encode";
+    const policy = persisted.lastEntryReceipt?.policy;
+    if (!policy) {
+      throw new Error(
+        "Resuming this dataset requires its original ingestion policy; no completed entry records it yet."
+      );
+    }
     return this.startIngestionWithPolicy(
       { ...request, resume: true },
       policy,
@@ -8341,7 +8748,12 @@ export class RuntimeJobManager extends EventEmitter {
     if (request.policy !== undefined) {
       requireNewDataIngestionPolicy(request.policy);
     }
-    const job = this.createJob(request.brainId, "crawl", "Crawling quarantined web sources");
+    const job = this.createJob(
+      request.brainId, "crawl",
+      (request.quarantine ?? true)
+        ? "Crawling quarantined web sources"
+        : "Crawling web sources for neural learning"
+    );
     this.launch(job, () =>
       this.service.crawlWeb(
         request,
@@ -8352,7 +8764,9 @@ export class RuntimeJobManager extends EventEmitter {
           job.label = message;
           job.updatedAt = new Date().toISOString();
           this.publish(job);
-        }
+        },
+        this.cancellationControllers.get(job.id)?.signal,
+        job.id
       )
     );
     return { ...job };
@@ -8378,6 +8792,44 @@ export class RuntimeJobManager extends EventEmitter {
         3_600_000,
         signal
       );
+      return output;
+    });
+    return { ...job };
+  }
+
+  generateSpeech(value: unknown): RuntimeJob {
+    const input = objectRecord(value);
+    if (!input || typeof input.brainId !== "string" || typeof input.requestId !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.brainId) ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.requestId) ||
+        typeof input.text !== "string" || !input.text.trim() || input.text.includes("\0") ||
+        (input.rate !== undefined &&
+          (typeof input.rate !== "number" || !Number.isFinite(input.rate) || input.rate <= 0))) {
+      throw new Error("Invalid same-brain speech waveform request.");
+    }
+    const request: NeuralSpeechGenerateRequest = {
+      brainId: input.brainId, requestId: input.requestId, text: input.text,
+      rate: typeof input.rate === "number" ? input.rate : 1
+    };
+    const job = this.createJob(request.brainId, "audio", "Producing same-brain speech waveform");
+    job.speechRequestId = request.requestId;
+    this.publish(job);
+    this.launch(job, async () => {
+      await this.service.preflightStart(request.brainId);
+      const output = await this.engine.request("generate_neural_speech", {
+        jobId: job.id, brainId: request.brainId, speechRequestId: request.requestId,
+        text: request.text, rate: request.rate,
+        storagePath: this.service.repository.brainDirectory(request.brainId)
+      }, ENGINE_REQUEST_NO_DEADLINE, this.cancellationControllers.get(job.id)?.signal);
+      const artifact = objectRecord(output), speech = objectRecord(artifact?.speech);
+      if (artifact?.brainId !== request.brainId || artifact?.modality !== "audio" ||
+          artifact?.mimeType !== "audio/wav" || speech?.requestId !== request.requestId ||
+          speech?.source !== "same-brain-audio-region" || speech?.sameBrain !== true ||
+          speech?.textConditioned !== true || speech?.externalModelUsed !== false ||
+          speech?.intelligibilityVerified !== false ||
+          speech?.textSha256 !== createHash("sha256").update(request.text, "utf8").digest("hex")) {
+        throw new Error("The generated waveform is not bound to this exact same-brain speech request.");
+      }
       return output;
     });
     return { ...job };
@@ -8890,14 +9342,20 @@ export class RuntimeJobManager extends EventEmitter {
     const controller = this.cancellationControllers.get(job.id);
     controller?.abort(new Error(`Runtime job ${job.id} was cancelled.`));
     try {
-      if (job.kind !== "crawl" && !preparationOnly) {
+      if (!preparationOnly) {
         const termination = await this.engine.cancelRequest(job.id);
         if (termination.phase !== "not-found" && !termination.acknowledged) {
           throw new Error(`Runtime job ${job.id} did not acknowledge cancellation.`);
         }
         if (
           termination.phase === "running" &&
-          !termination.workerTerminationAcknowledged
+          !termination.workerTerminationAcknowledged &&
+          termination.codecSetupCancellationAcknowledged !== true &&
+          termination.artifactCancellationAcknowledged !== true &&
+          // Own-voice generation returns only after its selected cooperative
+          // safe boundary. Acknowledged speech cancellation need not kill the
+          // warm worker (or the already-saved reply that supplied the text).
+          !job.speechRequestId
         ) {
           throw new Error(
             `Runtime worker for ${job.id} did not acknowledge process termination.`
@@ -8905,7 +9363,7 @@ export class RuntimeJobManager extends EventEmitter {
         }
       }
       await operation;
-      if (job.kind !== "crawl" && !preparationOnly) {
+      if (!preparationOnly) {
         const acknowledgement = await this.engine.request<Record<string, unknown>>(
           "cancel",
           {
@@ -8923,7 +9381,7 @@ export class RuntimeJobManager extends EventEmitter {
             owner:
               job.kind === "training"
                 ? "training"
-                : job.kind === "ingestion"
+                : job.kind === "ingestion" || job.kind === "crawl"
                   ? "ingestion"
                   : "modality",
             label: `Acknowledging ${job.kind} cancellation`,

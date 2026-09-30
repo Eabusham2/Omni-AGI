@@ -645,7 +645,7 @@ describe("LiveVoiceController", () => {
     expect(neuralStop).toHaveBeenCalledOnce();
   });
 
-  it("uses neural speech only when a compatible adapter explicitly verifies it", async () => {
+  it("uses own waveform output only when a same-brain adapter explicitly exposes it", async () => {
     const neuralSpeak = vi.fn((_text, handlers: LiveVoiceSynthesisHandlers) => {
       handlers.onStart();
       return { cancel: vi.fn() };
@@ -654,7 +654,8 @@ describe("LiveVoiceController", () => {
       inspect: vi.fn(async () => ({
         listening: false,
         voice: true,
-        detail: "Verified intelligible neural speech fixture."
+        voiceQuality: "needs-speech-training" as const,
+        detail: "Native waveform fixture. Speech quality is not verified."
       })),
       startListening: vi.fn(async () => ({ stop: vi.fn() })),
       synthesis: {
@@ -669,7 +670,7 @@ describe("LiveVoiceController", () => {
     });
 
     await voice.controller.start();
-    voice.handlers().onFinal({ transcript: "speak through verified neural output" });
+    voice.handlers().onFinal({ transcript: "use the connected native waveform output" });
     await vi.waitFor(() => expect(neuralSpeak).toHaveBeenCalledOnce());
     expect(voice.synthesis.speak).not.toHaveBeenCalled();
     expect(neuralSpeak).toHaveBeenCalledWith(
@@ -677,6 +678,31 @@ describe("LiveVoiceController", () => {
       expect.any(Object),
       { rate: 1 }
     );
+  });
+
+  it("waits for actual deferred audio playback without reopening text generation", async () => {
+    let speechHandlers!: LiveVoiceSynthesisHandlers;
+    const nativeCancel = vi.fn();
+    const native: LiveVoiceNeuralAdapter = {
+      inspect: vi.fn(async () => ({ listening: false, voice: true, voiceQuality: "unverified" as const, detail: "Waveform only; speech quality not verified." })),
+      startListening: vi.fn(async () => ({ stop: vi.fn() })),
+      synthesis: { available: true, deferredStart: true, cancel: nativeCancel,
+        speak: vi.fn((_text, handlers) => { speechHandlers = handlers; return { cancel: nativeCancel }; }) }
+    };
+    const voice = harness({ preferences: preferences({ neuralVoice: true, deliveryMode: "buffered" }), neural: native,
+      send: vi.fn(async () => result("  exact stored reply  ")) });
+    await voice.controller.start();
+    voice.handlers().onFinal({ transcript: "plain utterance" });
+    await vi.waitFor(() => expect(voice.controller.getState().phase).toBe("rendering-audio"));
+    expect(voice.controller.getState().synthesis).toBe("preparing");
+    expect(voice.controller.getState().lastReply?.text).toBe("  exact stored reply  ");
+    expect(native.synthesis!.speak).toHaveBeenCalledWith("  exact stored reply  ", expect.any(Object), { rate: 1 });
+    expect(voice.synthesis.speak).not.toHaveBeenCalled();
+    speechHandlers.onStart();
+    expect(voice.controller.getState().phase).toBe("speaking");
+    speechHandlers.onEnd();
+    expect(voice.controller.getState().phase).toBe("listening");
+    await voice.controller.dispose();
   });
 
   it("closes a microphone stream that resolves after voice was stopped", async () => {

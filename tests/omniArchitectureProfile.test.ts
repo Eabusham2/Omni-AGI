@@ -3,6 +3,7 @@ import {
   defaultGroundUpWorkingMemoryItems,
   groundUpArchitectureProfile
 } from "../src/main/omniArchitectureProfile";
+import { nativeCoreInventory } from "../src/main/nativeCoreInventory";
 import {
   GIB,
   ResourcePlanner,
@@ -108,19 +109,21 @@ describe("ground-up OmniCortex architecture accounting", () => {
     });
 
     const nativePlan = await planner.plan(
-      { mode: "auto" },
-      { hardwareTier: "personal" }
+      { mode: "auto", storagePoolMode: "manual", storagePoolBytes: String(32 * GIB) },
+      { hardwareTier: "personal", nativeSizingMode: "physical-capacity" }
     );
-    expect(nativePlan.allowed).toBe(true);
+    expect(nativePlan.allowed, JSON.stringify(nativePlan.blockers)).toBe(true);
     expect(nativePlan.architecture).toMatchObject({
       origin: "ground-up-random-initialization",
       externalPretrainedWeights: false,
-      exactLogicalParameterCount: 1_301_695,
       workingMemoryItems: nativePlan.selectedItems
     });
+    expect(nativePlan.nativeArchitecture?.shape.dModel).toBeGreaterThan(64);
+    const exact = nativeCoreInventory(nativePlan.nativeArchitecture!.shape);
+    expect(nativePlan.architecture!.exactLogicalParameterCount).toBe(exact.logicalParameters);
     expect(nativePlan.resources).toMatchObject({
-      modelBytes: 1_504_282,
-      modelParameterCount: 1_301_695,
+      modelBytes: nativePlan.architecture!.checkpointTensorBytes,
+      modelParameterCount: exact.logicalParameters,
       modelParameterCountBasis: "architecture-logical-neural-elements",
       modelStorageBasis: "packed-weights-plus-nonweight-state-reserve"
     });

@@ -22,8 +22,9 @@ export interface ReplyCompleteLearningPresentation {
   cortexLabel: "Learning & saving reply" | "Integrating action result";
   ariaLabel: string;
   preserveAssistantOutput: true;
-  allowQueuedInput: true;
-  allowParallelSend: false;
+  allowNextSend: true;
+  /** Accepting a next Send never means two concurrent neural mutations. */
+  parallelNeuralMutation: false;
   turnCommitted: boolean;
 }
 
@@ -54,8 +55,8 @@ export function replyCompleteLearningPresentation(
       ariaLabel:
         "The reply and visible action are complete. The chat turn is committed; the brain is learning the action result as structured neural experience.",
       preserveAssistantOutput: true,
-      allowQueuedInput: true,
-      allowParallelSend: false,
+      allowNextSend: true,
+      parallelNeuralMutation: false,
       turnCommitted: true
     };
   }
@@ -73,8 +74,8 @@ export function replyCompleteLearningPresentation(
     ariaLabel:
       "Reply generation is complete. The brain is learning and saving this experience; the turn is not committed yet.",
     preserveAssistantOutput: true,
-    allowQueuedInput: true,
-    allowParallelSend: false,
+    allowNextSend: true,
+    parallelNeuralMutation: false,
     turnCommitted: false
   };
 }

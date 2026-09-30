@@ -125,7 +125,8 @@ function datasetEntryTransactionKey(receipt: DatasetEntryReceipt): string {
   return createHash("sha256")
     .update(
       [
-        "omni-dataset-entry-v1",
+        receipt.runId ? "omni-dataset-entry-v2" : "omni-dataset-entry-v1",
+        ...(receipt.runId ? [receipt.runId] : []),
         receipt.manifestId,
         receipt.entryIndex,
         receipt.epoch,
@@ -794,6 +795,8 @@ export class DatasetManifestStore {
       receipt.manifestHash !== manifest.manifestHash ||
       !validSha256(receipt.transactionKey) ||
       !validSha256(receipt.contentHash) ||
+      (receipt.runId !== undefined &&
+        (typeof receipt.runId !== "string" || !SAFE_ID.test(receipt.runId))) ||
       !["encode", "consolidate", "pretrain", "archive"].includes(
         receipt.policy,
       ) ||
@@ -896,6 +899,8 @@ export class DatasetManifestStore {
       value.manifestHash !== manifest.manifestHash ||
       cursor?.schemaVersion !== 1 ||
       cursor.manifestId !== manifest.id ||
+      (cursor.runId !== undefined &&
+        (typeof cursor.runId !== "string" || !SAFE_ID.test(cursor.runId))) ||
       coverage?.schemaVersion !== 1 ||
       coverage.manifestId !== manifest.id ||
       typeof value.updatedAt !== "string" ||
@@ -981,6 +986,9 @@ export class DatasetManifestStore {
       throw new Error("Dataset completion state is inconsistent.");
     }
     if (value.lastEntryReceipt) {
+      if (value.lastEntryReceipt.runId !== cursor.runId) {
+        throw new Error("Dataset receipt belongs to a different learning run.");
+      }
       this.validateReceipt(value.lastEntryReceipt, manifest, requestedEpochs);
     }
     const { contentSha256: _checksum, ...body } = value;
@@ -1679,6 +1687,7 @@ export class DatasetManifestStore {
       {
         schemaVersion: 1,
         manifestId,
+        runId: randomUUID(),
         currentEpoch: 0,
         requestedEpochs: epochs,
         nextEntry: 0,

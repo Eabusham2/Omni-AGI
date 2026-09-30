@@ -21,6 +21,7 @@ export type LiveVoicePhase =
   | "listening"
   | "pondering"
   | "speaking"
+  | "rendering-audio"
   | "stopping"
   | "unavailable"
   | "error";
@@ -47,9 +48,10 @@ export interface LiveVoiceCapabilities {
   fullDuplex: boolean;
   /** A speech-start event can synchronously stop the local speech queue. */
   bargeIn: boolean;
-  /** Direct trained-modality paths; never aliases for platform STT/TTS. */
+  /** Direct same-brain paths; never aliases for platform STT/TTS. */
   neuralListening: boolean;
   neuralVoice: boolean;
+  neuralVoiceQuality?: "needs-speech-training" | "unverified";
   recognitionDetail?: string;
   neuralDetail?: string;
 }
@@ -92,7 +94,7 @@ export interface LiveVoiceState {
   preferences: LiveVoicePreferences;
   capture: "idle" | "requesting" | "active" | "error";
   recognition: "unavailable" | "idle" | "listening" | "error";
-  synthesis: "unavailable" | "idle" | "speaking" | "error";
+  synthesis: "unavailable" | "idle" | "preparing" | "speaking" | "error";
   interimTranscript: string;
   activeUtterance?: LiveVoiceUtterance;
   lastUtterance?: LiveVoiceUtterance;
@@ -140,8 +142,9 @@ export interface LiveVoiceCaptureAdapter {
 export interface LiveVoiceNeuralCapabilityStatus {
   /** Raw microphone audio can enter trained assemblies/STDP in this brain. */
   listening: boolean;
-  /** A verified intelligible neural speech decoder is installed. */
+  /** Same-brain waveform rendering is connected; intelligibility is separate. */
   voice: boolean;
+  voiceQuality?: "needs-speech-training" | "unverified";
   detail: string;
 }
 
@@ -149,7 +152,7 @@ export interface LiveVoiceNeuralCapabilityStatus {
  * Optional direct neural audio path. Listening is a same-brain sensory stream,
  * not an alias for speech recognition. A platform transcript may still be
  * used at the language boundary. Neural speech output is exposed only when an
- * adapter can truthfully render intelligible speech.
+ * adapter connects the same brain audio region; unverified quality is explicit.
  */
 export interface LiveVoiceNeuralAdapter {
   inspect(brainId: string): Promise<LiveVoiceNeuralCapabilityStatus>;
@@ -182,6 +185,7 @@ export interface LiveVoiceSynthesisHandlers {
 
 export interface LiveVoiceSynthesisAdapter {
   readonly available: boolean;
+  readonly deferredStart?: boolean;
   speak(
     text: string,
     handlers: LiveVoiceSynthesisHandlers,

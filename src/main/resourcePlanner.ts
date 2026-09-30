@@ -13,9 +13,18 @@ import type {
 } from "../shared/types";
 import {
   defaultGroundUpWorkingMemoryItems,
+  capacityDerivedNativeArchitectureProfile,
+  ramFirstNativeArchitectureProfile,
+  balancedMeasuredNativeArchitectureProfile,
   groundUpArchitectureProfile,
   type GroundUpArchitectureProfile
 } from "./omniArchitectureProfile";
+import {
+  validateNativeProjectionComputeProfile,
+  type NativeComputeMeasurementCollector,
+  type NativeComputeMeasurementRequest,
+  type NativeProjectionComputeProfile
+} from "./nativeComputeMeasurement";
 import {
   adaptiveDiskReserve,
   calculateDiskSpaceReport
@@ -45,6 +54,7 @@ export interface ResourceSnapshot {
   availableMemoryBytes: number;
   diskTotalBytes: number;
   diskFreeBytes: number;
+  diskBlockSizeBytes?: number;
 }
 
 export interface StorageBenchmark {
@@ -61,6 +71,8 @@ export interface ResourcePlannerDependencies {
   readResources?: () => Promise<ResourceSnapshot>;
   benchmark?: () => Promise<StorageBenchmark>;
   now?: () => Date;
+  /** Explicit main hardware-profiling dependency; never a renderer override. */
+  measurementCollector?: NativeComputeMeasurementCollector;
 }
 
 export function parseLinuxMemoryInfo(text: string): {
@@ -247,13 +259,6 @@ async function measuredSystemMemory(): Promise<{
   };
 }
 
-const AUTO_MEMORY_ITEMS_BY_TIER: Record<HardwareTier, number> = {
-  micro: defaultGroundUpWorkingMemoryItems("micro"),
-  personal: defaultGroundUpWorkingMemoryItems("personal"),
-  gpu: defaultGroundUpWorkingMemoryItems("gpu"),
-  workstation: defaultGroundUpWorkingMemoryItems("workstation")
-};
-
 const AUTO_SYSTEM_RAM_SHARE_BY_TIER: Record<HardwareTier, number> = {
   micro: 55,
   personal: 65,
@@ -272,9 +277,9 @@ export const CONTEXT_FLOOR_TOKENS_BY_TIER: Record<HardwareTier, number> = {
   workstation: 16_384
 };
 
-// This is a product-level v1 active-context ceiling, not a capability copied
-// from an upstream model. Rotary tables are native, lazy OmniCortex state.
-export const DEFAULT_MODEL_CONTEXT_LIMIT_TOKENS = 32_768;
+// Native rotary positions and streamed attention have no product window cap.
+// JSON/token indexes remain exact safe integers; physical admission is lower.
+export const DEFAULT_MODEL_CONTEXT_LIMIT_TOKENS = Number.MAX_SAFE_INTEGER;
 const CONTEXT_TOKEN_QUANTUM = 256;
 
 const CONTEXT_MODEL_SHAPE_BY_TIER: Record<
@@ -373,6 +378,9 @@ export function planWorkingMemory(input: {
   modelContextLimitTokens?: number;
   modelHiddenSize?: number;
   modelLayers?: number;
+  /** Saved learned latent geometry, independent of runtime context mode. */
+  modelWorkspaceSlots?: number;
+  fixedWorkingMemoryItems?: number;
   /**
    * Existing device-wide Auto reservation. Auto may grow this ceiling but
    * must not silently shrink it when a later settings preflight does not have
@@ -446,13 +454,17 @@ export function planWorkingMemory(input: {
     1,
     safeWhole(input.modelLayers ?? contextShape.layers)
   );
-  // K and V per layer in two-byte runtime precision, plus the current hidden
-  // activation. The 4 KiB floor conservatively covers chunked attention score
-  // and allocator overhead; cold recurrent pages are counted independently.
-  const estimatedKvActivationBytesPerToken = Math.max(
-    4_096,
-    modelLayers * modelHiddenSize * 4 + modelHiddenSize * 2
-  );
+  // Packed learned weights are ternary; attention activations are float32.
+  // Two K/V arrays per layer are paged independently from transient tiles.
+  const estimatedKvActivationBytesPerToken = modelLayers * modelHiddenSize * 8;
+  const residentTokenBytesPerToken = 96;
+  // Conservative Python descriptor/path/checksum allowance, not tensor bytes.
+  // The worker coalesces incremental tails into bounded 256-token pages.
+  let pageTokens = 256;
+  let contextMetadataBytesPerToken = Math.ceil(2048 * 2 * modelLayers / pageTokens);
+  let residentIndexBytesPerToken = residentTokenBytesPerToken + contextMetadataBytesPerToken;
+  const workspaceSlots = input.modelWorkspaceSlots ?? architectureProfile?.workspaceLatents ?? 8;
+  let workspaceResidentBytes = Math.ceil(4 * workspaceSlots * (2 * modelHiddenSize + 1));
   const modelContextLimitTokens = Math.max(
     8,
     safeWhole(
@@ -497,15 +509,13 @@ export function planWorkingMemory(input: {
     256,
     modelContextLimitTokens
   );
-  const minimumContextWorkspaceBytes = Math.max(
-    128 * MIB,
-    estimatedKvActivationBytesPerToken *
-      minimumFoundationContextTokens *
-      2
-  );
+  const minimumContextWorkspaceBytes = Math.max(8 * MIB,
+    workspaceResidentBytes + minimumFoundationContextTokens *
+      (estimatedKvActivationBytesPerToken + residentIndexBytesPerToken));
   const contextFloorWorkspaceBytes = Math.max(
     minimumContextWorkspaceBytes,
-    contextFloorTokens * estimatedKvActivationBytesPerToken * 2
+    workspaceResidentBytes + contextFloorTokens *
+      (estimatedKvActivationBytesPerToken + residentIndexBytesPerToken)
   );
   // Slow storage receives more of the already-safe RAM pool so Auto avoids
   // paging. This is still bounded by the OS reserve and the live free pool.
@@ -555,26 +565,56 @@ export function planWorkingMemory(input: {
   );
   const minimumResidentFoundationBytes =
     BASE_RUNTIME_MEMORY_BYTES + minimumLayerResidencyBytes;
-  const fullResidentWithFloorFits =
-    fullFoundationRuntimeBytes + contextFloorWorkspaceBytes <= safeRamBytes;
-  const planningFoundationResidentBytes = fullResidentWithFloorFits
-    ? fullFoundationRuntimeBytes
-    : minimumResidentFoundationBytes;
+  // Match the worker's one shared post-baseline 55/30/15 envelope. Full packed
+  // core residency is preferred; cold core and K/V can spill independently.
+  const residualRamBytes = Math.max(0, safeRamBytes - BASE_RUNTIME_MEMORY_BYTES);
+  const transferBudgetBytes = Math.floor(residualRamBytes * 0.15);
+  pageTokens = Math.max(1, Math.min(256, Math.floor(transferBudgetBytes / Math.max(1, 16 * modelHiddenSize))));
+  contextMetadataBytesPerToken = Math.ceil(2048 * 2 * modelLayers / pageTokens);
+  residentIndexBytesPerToken = residentTokenBytesPerToken + contextMetadataBytesPerToken;
+  const querySlotsPerChunk = Math.max(1, Math.min(256, workspaceSlots,
+    Math.floor(transferBudgetBytes / Math.max(1, 64 * modelHiddenSize))));
+  workspaceResidentBytes += Math.ceil(workspaceSlots / querySlotsPerChunk) * 8192 + 4096 * modelLayers;
+  const diskBlockSizeBytes = Math.max(4096, safeWhole(resources.diskBlockSizeBytes ?? 16384));
+  const pagedKvBytesPerToken = estimatedKvActivationBytesPerToken + Math.ceil(2 * modelLayers * diskBlockSizeBytes / pageTokens);
+  const plannedResidentModelBytes = Math.min(estimatedResidentModelBytes,
+    Math.max(minimumLayerResidencyBytes, Math.floor(residualRamBytes * 0.55)));
+  const planningFoundationResidentBytes = BASE_RUNTIME_MEMORY_BYTES + plannedResidentModelBytes;
   const safeRamAfterModelBytes = Math.max(
     0,
     safeRamBytes - planningFoundationResidentBytes
   );
-  const contextMaximumTokens = Math.min(
-    modelContextLimitTokens,
-    safeWhole(
-      safeRamAfterModelBytes /
-        Math.max(1, estimatedKvActivationBytesPerToken * 2)
-    )
-  );
-  // Fast storage cannot hold live attention state, but it can page colder
-  // replay/assembly pages and therefore lets Auto devote more of the remaining
-  // resident envelope to active context. Accelerator availability similarly
-  // reduces CPU-side contention without assuming unmeasured VRAM capacity.
+  const contextResidentBudgetBytes = Math.max(0, Math.min(
+    safeRamAfterModelBytes - Math.floor(residualRamBytes * 0.15),
+    Math.floor(residualRamBytes * 0.30)
+  ));
+  const trainingSourceBytes = safeWhole(request.trainingSourceBytes ?? 0);
+  const trainingScratchBytes = Math.max(512 * MIB,
+    Math.ceil(trainingSourceBytes * 0.1), Math.ceil(modelBytes * 0.5));
+  const requestedItemReserve = safeWhole(Number(positiveIntegerText(request.requestedItems) ?? 0));
+  const baseGrowthHeadroomBytes = Math.max(2 * GIB, Math.ceil(modelBytes * 1.2),
+    Math.ceil(requestedItemReserve * DISK_BYTES_PER_MEMORY_ITEM * 0.5));
+  const plannedModelSpillBytes = Math.max(0, estimatedResidentModelBytes - plannedResidentModelBytes);
+  const plannedCoreScratchBytes = plannedModelSpillBytes > 0
+    ? Math.max(64 * MIB, Math.ceil(plannedModelSpillBytes * 1.25) + 8 * MIB) : 0;
+  const maximumStoragePoolBytes = Math.max(0, resources.diskFreeBytes - diskReserveBytes);
+  const storagePoolMode = request.storagePoolMode ?? "auto";
+  const requestedStoragePoolText = positiveIntegerText(request.storagePoolBytes);
+  const boundedStoragePoolCapacity = storagePoolMode === "manual"
+    ? Math.min(maximumStoragePoolBytes, safeWhole(Number(requestedStoragePoolText ?? 0)))
+    : maximumStoragePoolBytes;
+  const contextSpillCapacityBytes = Math.max(0, boundedStoragePoolCapacity
+    - (admissionScope === "existing-runtime" ? checkpointHeadroomBytes
+      : fixedBuildWriteBytes + trainingScratchBytes + baseGrowthHeadroomBytes + plannedCoreScratchBytes));
+  const contextResidentWorkingBytes = Math.max(0, contextResidentBudgetBytes - workspaceResidentBytes);
+  const storageBackedContextMaximumTokens = Math.min(modelContextLimitTokens,
+    safeWhole(contextResidentWorkingBytes / Math.max(1, residentIndexBytesPerToken)),
+    safeWhole(contextSpillCapacityBytes / Math.max(1, pagedKvBytesPerToken)));
+  const residentContextMaximumTokens = Math.min(modelContextLimitTokens,
+    safeWhole(contextResidentWorkingBytes / Math.max(1, estimatedKvActivationBytesPerToken + residentIndexBytesPerToken)));
+  const contextMaximumTokens = Math.max(residentContextMaximumTokens, storageBackedContextMaximumTokens);
+  // Auto favors RAM on slow drives. Extended may use the explicitly budgeted
+  // attention spill, but storage bandwidth never masquerades as RAM capacity.
   const autoContextRamFraction = Math.min(
     0.82,
     Math.max(
@@ -592,12 +632,15 @@ export function planWorkingMemory(input: {
     return Math.floor(bounded / CONTEXT_TOKEN_QUANTUM) * CONTEXT_TOKEN_QUANTUM;
   };
   const measuredAutoContext = quantizeContext(
-    safeRamAfterModelBytes * autoContextRamFraction /
-      (estimatedKvActivationBytesPerToken * 2)
+    contextResidentWorkingBytes * autoContextRamFraction /
+      (estimatedKvActivationBytesPerToken + residentIndexBytesPerToken)
   );
-  const autoContextTokens = contextMaximumTokens < contextFloorTokens
-    ? contextMaximumTokens
-    : Math.max(contextFloorTokens, measuredAutoContext);
+  const declaredResidentBaseline = architectureProfile?.nativeArchitecture?.sizing.selectionMode === "ram-first-headroom-default"
+    ? safeWhole(Number(architectureProfile.nativeArchitecture.sizing.baselineContextTokens)) : 0;
+  const autoContextTokens = residentContextMaximumTokens < contextFloorTokens
+    ? residentContextMaximumTokens
+    : Math.max(contextFloorTokens, Math.min(residentContextMaximumTokens,
+        Math.max(measuredAutoContext, declaredResidentBaseline)));
   const extendedContextTokens = quantizeContext(
     Math.max(
       autoContextTokens,
@@ -622,18 +665,16 @@ export function planWorkingMemory(input: {
       : request.mode === "extended"
         ? extendedContextTokens
         : autoContextTokens;
-  const selectedContextResidentBytes = Math.max(
-    minimumContextWorkspaceBytes,
-    selectedContextTokens * estimatedKvActivationBytesPerToken * 2
-  );
-  const residentModelBudgetBytes = Math.max(
-    0,
-    safeRamBytes - BASE_RUNTIME_MEMORY_BYTES - selectedContextResidentBytes
-  );
-  const residentModelBytes = Math.min(
-    estimatedResidentModelBytes,
-    Math.max(minimumLayerResidencyBytes, residentModelBudgetBytes)
-  );
+  const selectedContextIndexBytes = selectedContextTokens * residentIndexBytesPerToken;
+  const selectedContextKvBytes = selectedContextTokens * estimatedKvActivationBytesPerToken;
+  const selectedContextKvResidentBytes = Math.min(selectedContextKvBytes,
+    Math.max(0, contextResidentWorkingBytes - selectedContextIndexBytes));
+  const selectedContextSpillBytes = Math.max(0, selectedContextKvBytes - selectedContextKvResidentBytes);
+  // Reserve backing for the whole declared window so live RAM pressure can
+  // demote its cold pages without silently shrinking the saved context.
+  const contextOffloadBudgetBytes = selectedContextTokens * pagedKvBytesPerToken;
+  const selectedContextResidentBytes = workspaceResidentBytes + selectedContextIndexBytes + selectedContextKvResidentBytes;
+  const residentModelBytes = plannedResidentModelBytes;
   const residentFoundationBytes =
     BASE_RUNTIME_MEMORY_BYTES + residentModelBytes;
   const modelSpillBytes = Math.max(
@@ -648,29 +689,31 @@ export function planWorkingMemory(input: {
           Math.ceil(modelBytes * 1.25) + 64 * MIB
         )
     : 0;
+  const ramBytesPerMemoryItem = Math.max(RAM_BYTES_PER_MEMORY_ITEM, 4 * modelHiddenSize + 512);
+  const diskBytesPerMemoryItem = Math.max(DISK_BYTES_PER_MEMORY_ITEM, 4 * modelHiddenSize + 512);
   const residentMemoryBytes = Math.max(
     0,
-    safeRamBytes - residentFoundationBytes - selectedContextResidentBytes
+    safeRamBytes - residentFoundationBytes - selectedContextResidentBytes - transferBudgetBytes
   );
   const diskForPagedMemoryBytes = Math.max(
     0,
-    usableDiskAfterReserveBytes - modelOffloadScratchBytes
+    Math.min(usableDiskAfterReserveBytes, boundedStoragePoolCapacity - fixedBuildWriteBytes)
+      - modelOffloadScratchBytes - contextOffloadBudgetBytes - trainingScratchBytes - baseGrowthHeadroomBytes
   );
   const residentItems = safeWhole(
-    residentMemoryBytes / RAM_BYTES_PER_MEMORY_ITEM
+    residentMemoryBytes / ramBytesPerMemoryItem
   );
   const pagedItems = safeWhole(
-    diskForPagedMemoryBytes / DISK_BYTES_PER_MEMORY_ITEM
+    diskForPagedMemoryBytes / diskBytesPerMemoryItem
   );
   const sliderMaximumItems = safeWhole(residentItems + pagedItems);
 
-  const autoTarget = Math.min(
-    sliderMaximumItems,
-    AUTO_MEMORY_ITEMS_BY_TIER[hardwareTier]
-  );
+  const autoFastActivityBytes = Math.floor(contextResidentBudgetBytes * 0.20);
+  const autoTarget = Math.min(residentItems, Math.max(1,
+    safeWhole(autoFastActivityBytes / (ramBytesPerMemoryItem + 2 * modelHiddenSize + 1))));
   const extendedTarget = Math.min(
     sliderMaximumItems,
-    AUTO_MEMORY_ITEMS_BY_TIER[hardwareTier] * 4
+    Math.max(autoTarget, Math.floor(autoTarget * 1.5))
   );
   const requestedText = positiveIntegerText(request.requestedItems);
   const requestedFits =
@@ -686,7 +729,11 @@ export function planWorkingMemory(input: {
       )
     )
   );
-  const selectedItems =
+  const fixedItems = input.fixedWorkingMemoryItems;
+  if (fixedItems !== undefined && (!Number.isSafeInteger(fixedItems) || fixedItems < 1)) {
+    throw new Error("Saved learned workspace capacity is invalid.");
+  }
+  const selectedItems = fixedItems ?? (
     request.mode === "manual"
       ? request.requestedItems === undefined
         ? derivedManualItems
@@ -695,30 +742,24 @@ export function planWorkingMemory(input: {
           : 0
       : request.mode === "extended"
         ? extendedTarget
-        : autoTarget;
+        : autoTarget);
   const memorySpillItems = Math.max(0, selectedItems - residentItems);
-  const memorySpillBytes = memorySpillItems * DISK_BYTES_PER_MEMORY_ITEM;
+  const memorySpillBytes = memorySpillItems * diskBytesPerMemoryItem;
   const configuredMemorySpillBytes =
-    modelOffloadScratchBytes + memorySpillBytes;
-  const offloadRequired = modelSpillBytes > 0 || memorySpillItems > 0;
-  const trainingSourceBytes = safeWhole(request.trainingSourceBytes ?? 0);
+    modelOffloadScratchBytes + memorySpillBytes + selectedContextSpillBytes;
+  const offloadRequired = modelSpillBytes > 0 || memorySpillItems > 0 || selectedContextSpillBytes > 0;
   // Source datasets remain referenced in place; this is transactional replay,
   // staging, and recovery space sized from the selected corpus rather than a
   // duplicate of every source byte.
-  const trainingScratchBytes = Math.max(
-    512 * MIB,
-    Math.ceil(trainingSourceBytes * 0.1),
-    Math.ceil(modelBytes * 0.5)
-  );
   const futureGrowthHeadroomBytes = Math.max(
-    2 * GIB,
-    Math.ceil(modelBytes * 1.2),
+    baseGrowthHeadroomBytes,
     Math.ceil(selectedItems * DISK_BYTES_PER_MEMORY_ITEM * 0.5)
   );
   const requiredStoragePoolBytes = safeWhole(
     fixedBuildWriteBytes +
       modelOffloadScratchBytes +
       memorySpillBytes +
+      contextOffloadBudgetBytes +
       trainingScratchBytes +
       futureGrowthHeadroomBytes
   );
@@ -731,7 +772,7 @@ export function planWorkingMemory(input: {
       modelBytes: initialModelWriteBytes,
       checkpointBytes: checkpointWriteBytes,
       maximumWorkingMemorySpillBytes:
-        admissionScope === "existing-runtime" ? 0 : memorySpillBytes,
+        admissionScope === "existing-runtime" ? 0 : memorySpillBytes + contextOffloadBudgetBytes,
       futureGrowthBytes:
         admissionScope === "existing-runtime" ? 0 : futureGrowthHeadroomBytes,
       operationWriteBytes: admissionScope === "existing-runtime"
@@ -739,12 +780,6 @@ export function planWorkingMemory(input: {
         : modelOffloadScratchBytes + trainingScratchBytes
     }
   });
-  const maximumStoragePoolBytes = Math.max(
-    0,
-    resources.diskFreeBytes - diskReserveBytes
-  );
-  const storagePoolMode = request.storagePoolMode ?? "auto";
-  const requestedStoragePoolText = positiveIntegerText(request.storagePoolBytes);
   const minimumStoragePoolBytes = safeWhole(input.minimumStoragePoolBytes ?? 0);
   const manualStoragePoolValid =
     storagePoolMode !== "manual" || requestedStoragePoolText !== undefined;
@@ -805,6 +840,7 @@ export function planWorkingMemory(input: {
       (request.requestedItems !== undefined ||
         request.requestedContextTokens !== undefined));
   const itemSelectionFits =
+    fixedItems !== undefined ? fixedItems <= sliderMaximumItems :
     request.mode !== "manual" ||
     request.requestedItems === undefined ||
     (requestedFits && selectedItems > 0 && selectedItems <= sliderMaximumItems);
@@ -840,12 +876,12 @@ export function planWorkingMemory(input: {
   }
   if (!minimumLiveFoundationFits) {
     blockers.push(
-      "The Omni RAM envelope cannot keep one complete neural layer, the selected active context, and the runtime resident at the same time. Increase the RAM cap or reduce active context; storage cannot replace this minimum live tier."
+      "The Omni RAM envelope cannot keep the live neural tile, context indexes and runtime resident. Increase the RAM cap or reduce context; cold attention and packed core pages may use the designated storage pool."
     );
   }
   if (enforceContextFloor && contextMaximumTokens < contextFloorTokens) {
     blockers.push(
-      `This live RAM envelope cannot keep the ${contextFloorTokens.toLocaleString()}-token device baseline resident after the model and runtime (resident maximum ${contextMaximumTokens.toLocaleString()} tokens).`
+      `The RAM and designated storage pool cannot fit the ${contextFloorTokens.toLocaleString()}-token device baseline (physical maximum ${contextMaximumTokens.toLocaleString()} tokens).`
     );
   }
   if (!manualValid) {
@@ -857,7 +893,7 @@ export function planWorkingMemory(input: {
   }
   if (!contextSelectionFits) {
     blockers.push(
-      `The requested active context cannot stay resident on this device (safe/model maximum ${contextMaximumTokens.toLocaleString()} tokens).`
+      `The requested active context cannot fit RAM plus the designated storage pool (physical/model maximum ${contextMaximumTokens.toLocaleString()} tokens).`
     );
   } else if (
     request.mode === "manual" &&
@@ -865,7 +901,7 @@ export function planWorkingMemory(input: {
     selectedContextTokens < contextFloorTokens
   ) {
     const message =
-      `This context is below the ${contextFloorTokens.toLocaleString()}-token baseline measured for this device.`;
+      `This context is below the ${contextFloorTokens.toLocaleString()}-token device baseline.`;
     if (enforceContextFloor) blockers.push(message);
     else warnings.push(`${message} It is retained only for checkpoint compatibility.`);
   }
@@ -885,7 +921,7 @@ export function planWorkingMemory(input: {
     Math.min(1, benchmark.storageBytesPerSecond / benchmark.memoryBytesPerSecond)
   );
   const offloadedFraction = offloadRequired
-    ? (modelSpillBytes + memorySpillBytes) /
+    ? (modelSpillBytes + memorySpillBytes + selectedContextSpillBytes) /
       Math.max(
         1,
         fullFoundationRuntimeBytes +
@@ -983,7 +1019,7 @@ export function planWorkingMemory(input: {
     selectedContextTokens > suitableContextMaximum
   ) {
     warnings.push(
-      "This active context is above the measured green range. It remains resident, but leaves less RAM for training, media, agents, and hot neural patterns."
+      "This context is above the resource-derived green range. Cold attention may use storage and leave less capacity for training, media and hot neural patterns."
     );
   }
   // The bounded packed-update block needs real training RAM. Activation
@@ -1001,7 +1037,7 @@ export function planWorkingMemory(input: {
     safeRamBytes -
       residentFoundationBytes -
       selectedContextResidentBytes -
-      Math.min(selectedItems, residentItems) * RAM_BYTES_PER_MEMORY_ITEM -
+      Math.min(selectedItems, residentItems) * ramBytesPerMemoryItem -
       additionalTrainingStateBytes
   );
   const requestedWindowTokens = TRAINING_WINDOW_BY_TIER[hardwareTier];
@@ -1073,14 +1109,29 @@ export function planWorkingMemory(input: {
       suitableMinimumTokens: contextFloorTokens,
       suitableMaximumTokens: suitableContextMaximum,
       evidence: {
-        source: "live-device-model-measurement",
+        source: "measured-device-theoretical-allocation",
+        modelHiddenSize,
+        modelLayers,
+        estimatedResidentMemoryItemBytes: ramBytesPerMemoryItem,
+        estimatedPagedMemoryItemBytes: diskBytesPerMemoryItem,
+        reservedTrainingTransferBytes: transferBudgetBytes,
         modelContextLimitTokens,
         safeRamAfterModelBytes,
-        contextResidentBudgetBytes: safeRamAfterModelBytes,
+        contextResidentBudgetBytes,
         estimatedKvActivationBytesPerToken,
-        contextWorkspaceMultiplier: 2,
+        contextWorkspaceMultiplier: 1,
         minimumContextWorkspaceBytes,
         selectedContextResidentBytes,
+        selectedContextSpillBytes,
+        contextOffloadBudgetBytes,
+        residentContextMaximumTokens,
+        contextSpillCapacityBytes,
+        residentTokenBytesPerToken,
+        contextMetadataBytesPerToken,
+        workspaceResidentBytes,
+        pageTokens,
+        pagedKvBytesPerToken,
+        diskBlockSizeBytes,
         acceleratorAvailable,
         storageClass,
         measuredStorageBytesPerSecond: benchmark.storageBytesPerSecond,
@@ -1133,6 +1184,7 @@ export function planWorkingMemory(input: {
       modelSpillBytes,
       modelOffloadScratchBytes,
       memorySpillBytes,
+      contextSpillBytes: selectedContextSpillBytes,
       estimatedSlowdownPercent,
       benchmark: {
         measuredAt: benchmark.measuredAt,
@@ -1146,7 +1198,7 @@ export function planWorkingMemory(input: {
       unit: "recurrent-paged-memory-item",
       denseAttentionClaim: false,
       contextFloorTokens,
-      contextPagedToStorage: false,
+      contextPagedToStorage: selectedContextSpillBytes > 0,
       capacityPersistsAcrossPressure: true,
       storagePoolShareRule: "largest-brain-not-sum",
       hotRamPriority: [
@@ -1159,7 +1211,8 @@ export function planWorkingMemory(input: {
         "cold scratch trail",
         "replay batches",
         "cold metaplasticity metadata",
-        "inactive working patterns"
+        "inactive working patterns",
+        "cold attention K/V pages"
       ]
     },
     training: {
@@ -1184,7 +1237,8 @@ async function defaultResourceSnapshot(path: string): Promise<ResourceSnapshot> 
   return {
     ...memory,
     diskTotalBytes: disk.blocks * disk.bsize,
-    diskFreeBytes: disk.bavail * disk.bsize
+    diskFreeBytes: disk.bavail * disk.bsize,
+    diskBlockSizeBytes: disk.bsize
   };
 }
 
@@ -1278,6 +1332,8 @@ interface CheckpointModelProfile {
   hardwareTier?: HardwareTier;
   modelHiddenSize?: number;
   modelLayers?: number;
+  modelWorkspaceSlots?: number;
+  workingMemoryItems?: number;
 }
 
 async function checkpointModelProfile(
@@ -1290,6 +1346,7 @@ async function checkpointModelProfile(
         hardware_tier?: unknown;
         d_model?: unknown;
         n_layers?: unknown;
+        working_memory_slots?: unknown;
       };
     };
     const recordedTier = String(metadata.config?.hardware_tier ?? "");
@@ -1306,6 +1363,7 @@ async function checkpointModelProfile(
     for (const path of paths) total += (await stat(path)).size;
     const hidden = Number(metadata.config?.d_model);
     const layers = Number(metadata.config?.n_layers);
+    const items = Number(metadata.config?.working_memory_slots);
     return {
       ...(total > 0 ? { modelBytes: total } : {}),
       ...(hardwareTier ? { hardwareTier } : {}),
@@ -1314,6 +1372,9 @@ async function checkpointModelProfile(
         : {}),
       ...(Number.isSafeInteger(layers) && layers > 0
         ? { modelLayers: layers }
+        : {}),
+      ...(Number.isSafeInteger(items) && items > 0
+        ? { workingMemoryItems: items, modelWorkspaceSlots: Math.max(8, Math.floor(items / 4)) }
         : {})
     };
   } catch {
@@ -1343,6 +1404,15 @@ export class ResourcePlanner {
       : boundedStorageBenchmark(this.root, now);
   }
 
+  async measureNativeCompute(request: NativeComputeMeasurementRequest): Promise<NativeProjectionComputeProfile | undefined> {
+    try {
+      const profile = await this.dependencies.measurementCollector?.(request);
+      return profile ? validateNativeProjectionComputeProfile(profile) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   async plan(
     request: WorkingMemoryPlanRequest,
     options: {
@@ -1354,9 +1424,14 @@ export class ResourcePlanner {
       modelContextLimitTokens?: number;
       modelHiddenSize?: number;
       modelLayers?: number;
+      modelWorkspaceSlots?: number;
+      fixedWorkingMemoryItems?: number;
       minimumStoragePoolBytes?: number;
       admissionScope?: "capacity" | "existing-runtime";
       enforceContextFloor?: boolean;
+      nativeSizingMode?: "ram-first" | "physical-capacity" | "balanced-measured";
+      nativeComputeDevice?: string;
+      nativePrimitiveWorkBudgetMicroseconds?: number;
     } = {}
   ): Promise<WorkingMemoryResourcePlan> {
     const checkpoint = options.brainDirectory
@@ -1365,6 +1440,7 @@ export class ResourcePlanner {
     const hardwareTier =
       options.hardwareTier ??
       checkpoint.hardwareTier ??
+      options.config?.nativeArchitecture?.hardwareTier ??
       tierForConfig(options.config);
     const systemRamMode = request.systemRamMode ?? options.config?.systemRamMode ?? "auto";
     const systemRamSharePercent = request.systemRamSharePercent ??
@@ -1391,6 +1467,10 @@ export class ResourcePlanner {
       modelContextLimitTokens: options.modelContextLimitTokens,
       modelHiddenSize: options.modelHiddenSize ?? checkpoint.modelHiddenSize,
       modelLayers: options.modelLayers ?? checkpoint.modelLayers,
+      modelWorkspaceSlots: options.modelWorkspaceSlots ?? checkpoint.modelWorkspaceSlots ??
+        (options.brainDirectory && options.config ? options.config.nativeArchitecture?.shape.workspaceLatents ?? Math.max(8, Math.floor(options.config.workingMemorySlots / 4)) : undefined),
+      fixedWorkingMemoryItems: options.fixedWorkingMemoryItems ?? checkpoint.workingMemoryItems ??
+        (options.brainDirectory ? options.config?.workingMemorySlots : undefined),
       minimumStoragePoolBytes:
         options.minimumStoragePoolBytes ??
         (storagePoolMode === "auto"
@@ -1409,6 +1489,20 @@ export class ResourcePlanner {
       });
     }
 
+    if (options.brainDirectory && options.config) {
+      // A saved identity without materialized size facts is not authorization
+      // to size/reseal a fresh recommended-tier cortex. Use its existing
+      // explicit descriptor, or its legacy recorded tier/item geometry.
+      const descriptor = options.config.nativeArchitecture;
+      const legacy = groundUpArchitectureProfile(hardwareTier, options.config.workingMemorySlots);
+      return planWorkingMemory({
+        ...sharedInput,
+        modelBytes: descriptor ? descriptor.inventory.packedWeightBytes + descriptor.inventory.staticNonweightTensorBytes : legacy.checkpointTensorBytes,
+        modelHiddenSize: descriptor?.shape.dModel ?? sharedInput.modelHiddenSize ?? legacy.dModel,
+        modelLayers: descriptor?.shape.layers ?? sharedInput.modelLayers ?? legacy.layers,
+      });
+    }
+
     // Before construction there is no checkpoint to stat. Resolve the exact
     // project-owned parameter inventory from the same tier/workspace contract
     // the worker is required to instantiate. A second pass makes constrained
@@ -1418,12 +1512,57 @@ export class ResourcePlanner {
       hardwareTier,
       options.config
     );
+    const bootstrap = planWorkingMemory({ ...sharedInput,
+      architectureProfile: groundUpArchitectureProfile(hardwareTier, profileItems),
+      modelBytes: groundUpArchitectureProfile(hardwareTier, profileItems).checkpointTensorBytes });
+    if (request.mode !== "manual" && bootstrap.selectedItems > 0) profileItems = bootstrap.selectedItems;
+    const sizingInput = {
+      hardwareTier,
+      selectedSystemRamBudgetBytes: bootstrap.resources.systemRamBudgetBytes,
+      runtimeBaselineReserveBytes: bootstrap.resources.runtimeOverheadBytes,
+      selectedStoragePoolBytes: bootstrap.resources.sharedStoragePoolBytes,
+      measuredStorageBytesPerSecond: sharedInput.benchmark.storageBytesPerSecond,
+      estimatedTrainingSourceBytes: bootstrap.resources.trainingSourceBytes,
+      acceleratorAvailable: sharedInput.acceleratorAvailable ?? false,
+      liquidMode: "cfc" as const
+    };
+    const baselineReferenceShape = CONTEXT_MODEL_SHAPE_BY_TIER[hardwareTier];
+    const baselineResidual = Math.max(0, sizingInput.selectedSystemRamBudgetBytes - sizingInput.runtimeBaselineReserveBytes);
+    const baselineActivityPartition = Math.floor(baselineResidual * 0.30);
+    const baselineContextTokens = Math.max(CONTEXT_FLOOR_TOKENS_BY_TIER[hardwareTier],
+      Math.floor(baselineActivityPartition * 0.70 /
+        (8 * baselineReferenceShape.hiddenSize * baselineReferenceShape.layers + 96 + 16 * baselineReferenceShape.layers) / 256) * 256);
+    const baselineResidentItems = Math.max(1, Math.floor(baselineActivityPartition * 0.20 /
+      (Math.max(4096, 4 * baselineReferenceShape.hiddenSize + 512) + 2 * baselineReferenceShape.hiddenSize + 1)));
+    // User selected RAM-first headroom, not a primitive-time ceiling. Optional
+    // experiments remain main-only; they cannot silently become Auto policy.
+    const workBudget = options.nativePrimitiveWorkBudgetMicroseconds;
+    const hasWorkBudget = Number.isSafeInteger(workBudget) && Number(workBudget) > 0;
+    const measured = options.nativeSizingMode === "balanced-measured" && hasWorkBudget
+      ? await this.measureNativeCompute({ device: options.nativeComputeDevice ?? "cpu",
+          ramBudgetBytes: bootstrap.resources.systemRamBudgetBytes, hardwareTier })
+      : undefined;
+    let measurementWarning = options.nativeSizingMode === "balanced-measured" && (!hasWorkBudget || !measured)
+      ? "Optional packed-primitive measurement/work budget is unavailable; the shipped native shape policy remains available. No neural throughput or quality is claimed."
+      : undefined;
+    const freshProfile = (items: number): GroundUpArchitectureProfile => {
+      const input = { ...sizingInput, workingMemoryItems: items,
+        estimatedNeuralGrowthReserveBytes: bootstrap.resources.futureGrowthHeadroomBytes,
+        trainingScratchReserveBytes: bootstrap.resources.trainingScratchBytes };
+      if (options.nativeSizingMode === "physical-capacity") return capacityDerivedNativeArchitectureProfile(input);
+      if (options.nativeSizingMode === "balanced-measured" && measured && hasWorkBudget) {
+        const candidate = balancedMeasuredNativeArchitectureProfile(input, measured, workBudget!);
+        if (candidate.nativeArchitecture?.sizing.fitsPrimitiveWorkProxyBudget !== false) return candidate;
+        measurementWarning = "The explicit primitive-work proxy budget does not admit the minimum candidate shape; the shipped native policy is retained, not blocked. This is not a measured neural-latency result.";
+      }
+      return ramFirstNativeArchitectureProfile({ ...input, baselineContextTokens,
+        baselineResidentWorkingMemoryItems: request.mode === "auto" ? items : Math.min(items, baselineResidentItems) });
+    };
     let planned: WorkingMemoryResourcePlan | undefined;
-    for (let pass = 0; pass < 3; pass += 1) {
-      const architectureProfile = groundUpArchitectureProfile(
-        hardwareTier,
-        profileItems
-      );
+    const seenItems: number[] = [];
+    for (let pass = 0; pass < 8; pass += 1) {
+      seenItems.push(profileItems);
+      const architectureProfile = freshProfile(profileItems);
       planned = planWorkingMemory({
         ...sharedInput,
         modelBytes: architectureProfile.checkpointTensorBytes,
@@ -1431,6 +1570,15 @@ export class ResourcePlanner {
         modelLayers: architectureProfile.layers,
         architectureProfile
       });
+      if (architectureProfile.nativeArchitecture) {
+        const fits = architectureProfile.nativeArchitecture.sizing.fitsPolicyTarget !== false;
+        planned = { ...planned, nativeArchitecture: architectureProfile.nativeArchitecture,
+          allowed: planned.allowed && fits,
+          blockers: fits ? planned.blockers : [...planned.blockers, "The minimum native shape does not fit the selected core/storage sizing reserve."],
+          warnings: [...planned.warnings,
+            "Native counts are exact shape inventory; resource/work reserves and any primitive-to-wide-shape extrapolation are estimates, not neural throughput or quality proof.",
+            ...(measurementWarning ? [measurementWarning] : [])] };
+      }
       if (
         planned.selectedItems < 1 ||
         planned.selectedItems === profileItems
@@ -1439,6 +1587,21 @@ export class ResourcePlanner {
       }
       profileItems = planned.selectedItems;
     }
-    return planned!;
+    // Integer Auto feedback can alternate by a few items. Resolve once to
+    // the lowest observed safe selection and recompute the *same* exact shape
+    // used by the worker, instead of returning a descriptor for another count.
+    const stableItems = Math.max(1, Math.min(...seenItems, planned!.selectedItems));
+    const architectureProfile = freshProfile(stableItems);
+    const stable = planWorkingMemory({ ...sharedInput,
+      request: { ...sharedInput.request, mode: "manual", requestedItems: String(stableItems) },
+      modelBytes: architectureProfile.checkpointTensorBytes, modelHiddenSize: architectureProfile.dModel,
+      modelLayers: architectureProfile.layers, architectureProfile });
+    const fits = architectureProfile.nativeArchitecture?.sizing.fitsPolicyTarget !== false;
+    return { ...stable, mode: request.mode,
+      allowed: stable.allowed && fits,
+      blockers: fits ? stable.blockers : [...stable.blockers, "The minimum native shape does not fit the selected core/storage sizing reserve."],
+      nativeArchitecture: architectureProfile.nativeArchitecture,
+      warnings: [...stable.warnings, "Auto item rounding was stabilized before sealing the exact native shape.",
+        ...(measurementWarning ? [measurementWarning] : [])] };
   }
 }

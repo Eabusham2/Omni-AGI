@@ -60,6 +60,7 @@ from .model import (
     TERNARY_PROJECTION_TYPES,
 )
 from .spiking import STDPSynapses
+from .streamed_ternary import TernaryPackedSource, packed_rows_source, dense_source, source_chunks, tensor_digest, verify_file
 
 
 FORMAT_NAME = "omni-packed-ternary"
@@ -90,7 +91,7 @@ class TernaryTensorSpec:
     """One exact-ternary tensor and its post-projection floating scale."""
 
     name: str
-    values: torch.Tensor
+    values: Union[torch.Tensor, TernaryPackedSource]
     scale: float = 1.0
     kind: str = "projection"
     source_dtype: Optional[str] = None
@@ -104,7 +105,7 @@ class VerifiedTernaryBundle:
     tensors: Dict[str, torch.Tensor]
 
 
-DynamicSynapse = Union[TernaryTensorSpec, torch.Tensor, nn.Module]
+DynamicSynapse = Union[TernaryTensorSpec, TernaryPackedSource, torch.Tensor, nn.Module]
 ModuleRoots = Union[nn.Module, Mapping[str, nn.Module]]
 
 
@@ -274,20 +275,20 @@ def _module_spec(root_name: str, module_name: str, module: nn.Module) -> Ternary
         raise TernaryCoverageError("%s has no effective ternary weight" % name)
 
     if supported_synapse:
-        source = getattr(module, "weights")
+        source = module._packed_weights
         return TernaryTensorSpec(
             name=_qualified_name(root_name, module_name, "weights"),
-            values=effective_weight(),
+            values=packed_rows_source(source, (int(module.post_neurons), int(module.pre_neurons))),
             scale=1.0,
             kind="dynamic-synapse",
-            source_dtype=str(source.dtype).replace("torch.", ""),
+            source_dtype="packed-2bit",
         )
 
     if not isinstance(module, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
         raise TernaryCoverageError("projection lacks authoritative packed storage")
     return TernaryTensorSpec(
         name=_qualified_name(root_name, module_name, "weight"),
-        values=effective_weight(),
+        values=packed_rows_source(module._packed_forward_weight, tuple(module.ternary_weight_shape)),
         scale=float(module._packed_forward_scale.item()),
         kind="projection",
         source_dtype="packed-2bit",
@@ -343,12 +344,12 @@ def collect_module_ternary_tensors(
                     raise TernaryCoverageError(
                         "duplicate eligible tensor name: %s" % bias_name
                     )
-                bias_levels = module.effective_bias()
-                if bias_levels is None:
+                packed_bias = module._packed_forward_bias
+                if packed_bias is None:
                     raise TernaryCoverageError("%s has no packed bias" % bias_name)
                 collected[bias_name] = TernaryTensorSpec(
                     name=bias_name,
-                    values=bias_levels,
+                    values=packed_rows_source(packed_bias, tuple(module.ternary_bias_shape)),
                     scale=float(module._packed_forward_scale.item()),
                     kind="projection",
                     source_dtype="packed-2bit",
@@ -365,6 +366,8 @@ def collect_module_ternary_tensors(
                     "dynamic synapse mapping key does not match its tensor spec"
                 )
             spec = source
+        elif isinstance(source, TernaryPackedSource):
+            spec = TernaryTensorSpec(name=name, values=source, kind="dynamic-synapse", source_dtype="packed-2bit")
         elif isinstance(source, torch.Tensor):
             spec = TernaryTensorSpec(
                 name=name,
@@ -398,7 +401,7 @@ def collect_module_ternary_tensors(
 def inspect_module_ternary_layout(
     roots: ModuleRoots,
     *,
-    dynamic_synapses: Mapping[str, torch.Tensor],
+    dynamic_synapses: Mapping[str, Union[torch.Tensor, TernaryPackedSource]],
 ) -> Dict[str, Tuple[Tuple[int, ...], str]]:
     """Inspect eligible names and shapes without evaluating accelerator weights.
 
@@ -451,7 +454,7 @@ def inspect_module_ternary_layout(
     for name, source in dynamic_synapses.items():
         if not isinstance(name, str) or not name or "\0" in name:
             raise TernaryCoverageError("dynamic synapse names must be non-empty strings")
-        if not isinstance(source, torch.Tensor) or name in layout:
+        if not isinstance(source, (torch.Tensor, TernaryPackedSource)) or name in layout:
             raise TernaryCoverageError("%s is not a unique dynamic tensor" % name)
         layout[name] = (tuple(int(value) for value in source.shape), "dynamic-synapse")
     return dict(sorted(layout.items()))
@@ -529,31 +532,44 @@ def export_ternary_shards(
     shard_entries = []
     for index, name in enumerate(sorted(specs)):
         spec = specs[name]
-        exact = _exact_ternary(spec.values, name=name)
-        packed = encode_ternary_2bit(exact)
-        packed_hash = _sha256(packed)
-        filename = "ternary-%05d-%s.bin" % (index, packed_hash[:16])
-        _atomic_write(destination / filename, packed)
+        source = spec.values if isinstance(spec.values, TernaryPackedSource) else dense_source(spec.values)
+        logical_digest = tensor_digest(source.shape)
+        packed_digest = hashlib.sha256()
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".ternary-stream-", dir=destination)
+        byte_length = 0
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                for block in source_chunks(source, logical_digest=logical_digest):
+                    handle.write(block)
+                    packed_digest.update(block)
+                    byte_length += len(block)
+                handle.flush()
+                os.fsync(handle.fileno())
+            packed_hash = packed_digest.hexdigest()
+            filename = "ternary-%05d-%s.bin" % (index, packed_hash[:16])
+            os.replace(temporary_name, destination / filename)
+        finally:
+            Path(temporary_name).unlink(missing_ok=True)
         entry = {
             "name": name,
             "kind": spec.kind,
-            "shape": [int(value) for value in exact.shape],
+            "shape": [int(value) for value in source.shape],
             "dtype": "int8",
             "sourceDtype": spec.source_dtype
             or str(spec.values.dtype).replace("torch.", ""),
             "scale": float(spec.scale),
-            "numel": int(exact.numel()),
+            "numel": source.numel(),
             "shard": filename,
             "byteOffset": 0,
-            "byteLength": len(packed),
+            "byteLength": byte_length,
             "packedSha256": packed_hash,
-            "tensorSha256": _tensor_sha256(exact),
+            "tensorSha256": logical_digest.hexdigest(),
         }
         entries.append(entry)
         shard_entries.append(
             {
                 "file": filename,
-                "byteLength": len(packed),
+                "byteLength": byte_length,
                 "sha256": packed_hash,
             }
         )
@@ -747,26 +763,27 @@ def verify_ternary_shards(
         if entry.get("byteOffset") != 0:
             raise TernaryIntegrityError("%s has an unsupported shard offset" % name)
         path = _safe_shard_path(destination, filename)
-        payload = path.read_bytes()
         shard = shard_table[filename]
-        payload_hash = _sha256(payload)
         expected_length = (count + 3) // 4
         if (
             entry.get("byteLength") != expected_length
             or shard.get("byteLength") != expected_length
-            or len(payload) != expected_length
+            or path.stat().st_size != expected_length
         ):
             raise TernaryIntegrityError("%s shard length mismatch" % name)
+        payload_hash, decoded_hash = verify_file(path, shape)
         if (
             entry.get("packedSha256") != payload_hash
             or shard.get("sha256") != payload_hash
         ):
             raise TernaryIntegrityError("%s shard checksum mismatch" % name)
-        decoded = decode_ternary_2bit(payload, shape)
-        if entry.get("tensorSha256") != _tensor_sha256(decoded):
+        if entry.get("tensorSha256") != decoded_hash:
             raise TernaryIntegrityError("%s decoded tensor checksum mismatch" % name)
         if retained is None or name in retained:
-            tensors[name] = decoded
+            # Explicit legacy retention materializes a requested tensor.
+            # Production validation uses retain_names=(), and compares exact
+            # streamed hashes without a complete decoded sparse/core copy.
+            tensors[name] = decode_ternary_2bit(path.read_bytes(), shape)
         names.append(name)
         used_shards.add(filename)
 

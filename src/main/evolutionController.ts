@@ -27,6 +27,8 @@ import {
   EVOLUTION_POLICY_SHA256,
   EVOLUTION_TEST_NAMES
 } from "./evolutionPolicy";
+import { persistAuthorizedToolIntent } from "./toolIntentJournal";
+import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
 
 export type EvolutionLimitationKind =
   | "prediction-error"
@@ -514,8 +516,8 @@ export class EvolutionController {
         available: Boolean(this.engine),
         protocol: this.engine ? "evolution.*" : undefined,
         reason: this.engine
-          ? "Supports only resource-checked growth of load-compatible ternary residual experts with exact checkpoint rollback."
-          : "The supervised neural worker is unavailable. Arbitrary width, depth, and tensor-shape migration remains unsupported."
+          ? "Supports resource-checked zero-residual depth/expert insertion and dormant router/region expansion with exact old-state preservation and rollback. Width/head geometry migration is not implemented."
+          : "The supervised neural worker is unavailable."
       }
     ];
   }
@@ -836,6 +838,10 @@ export class EvolutionController {
     if (kind !== "source" && request.sourceEdits !== undefined) {
       throw new Error("sourceEdits are valid only for isolated source candidates.");
     }
+    // Reject a revoked/Off capability before creating even an experimental
+    // archive. Per-operation checks remain in the existing source/worker
+    // pipelines and promotion still uses the immutable evaluator policies.
+    await this.assertWorkerPermission(request.brainId, "experiment");
     return kind === "source"
       ? this.startSource(
           { ...request, sourceEdits },
@@ -933,7 +939,11 @@ export class EvolutionController {
           hypothesis: initial.hypothesis,
           limitationEvidence: initial.limitations,
           evaluatorPolicySha256: EVOLUTION_POLICY_SHA256,
-          ...(sourceEdits === undefined ? {} : { sourceEdits })
+          ...(sourceEdits === undefined ? {} : { sourceEdits }),
+          ...(typeof request.provenance?.neuralActionId === "string"
+            ? { neuralActionId: request.provenance.neuralActionId } : {}),
+          ...(typeof request.provenance?.chatTurnId === "string"
+            ? { chatTurnId: request.provenance.chatTurnId } : {})
         }
       }, undefined, ids.run);
     } catch (error) {
@@ -1050,24 +1060,11 @@ export class EvolutionController {
     const objectives = cleanStringArray(request.objectives, "objectives");
     const architectureChange =
       kind === "architecture"
-        ? request.architectureChange ?? {
+        ? normalizeCompatibleArchitectureMutation(request.architectureChange ?? {
             mutation: "grow-experts" as const,
             addExperts: 1
-          }
+          })
         : undefined;
-    if (
-      architectureChange &&
-      (
-        architectureChange.mutation !== "grow-experts" ||
-        (architectureChange.addExperts !== undefined &&
-          (!Number.isSafeInteger(architectureChange.addExperts) ||
-            architectureChange.addExperts < 1))
-      )
-    ) {
-      throw new Error(
-        "Stable v1 architecture evolution supports only a positive grow-experts mutation."
-      );
-    }
     const epochs = request.epochs ?? 1;
     if (!Number.isSafeInteger(epochs) || epochs < 1) {
       throw new Error("Evolution epochs must be a positive integer.");
@@ -1180,6 +1177,16 @@ export class EvolutionController {
     this.activeRuns.set(ids.run, request.brainId);
     try {
       policy = await this.assertWorkerPermission(request.brainId, "experiment");
+      const permissionRecord = (await this.repository.get(request.brainId)).toolPermissions?.find((value) => value.toolId === "source.self-modify");
+      await persistAuthorizedToolIntent(this.repository.brainDirectory(request.brainId), {
+        brainId: request.brainId, toolId: "source.self-modify", action: "experiment",
+        arguments: {
+          candidateKind: kind, objective, texts, sourceIds, epochs,
+          architectureChange, provenance,
+          neuralActionId: provenance.neuralActionId, chatTurnId: provenance.chatTurnId
+        }
+      }, { id: ids.run, requestId: ids.run, startedAt: now, permission: policy, permissionRevision: JSON.stringify(permissionRecord ?? { level: policy }) });
+      await this.assertWorkerPermission(request.brainId, "experiment");
       proposal = await this.workerRequest<Record<string, unknown>>(
         "evolution.propose",
         request.brainId,

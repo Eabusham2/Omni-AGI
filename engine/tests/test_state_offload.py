@@ -281,6 +281,24 @@ class DurableStateOffloadTests(unittest.TestCase):
         self.assertEqual(status["diskReserveBytes"], 20 * GIB)
         self.assertEqual(status["mandatoryFreeDiskBytes"], 20 * GIB)
 
+    def test_small_or_unmeasured_disk_keeps_twenty_gib_floor(self):
+        for disk_total in (0, 16 * GIB, 64 * GIB, 500 * GIB):
+            with self.subTest(disk_total=disk_total):
+                self.assertEqual(
+                    ResourcePolicy._adaptive_disk_reserve(disk_total), 20 * GIB
+                )
+        reading = ResourceReading(
+            total_memory_bytes=4 * GIB,
+            available_memory_bytes=3 * GIB,
+            process_memory_bytes=0,
+            disk_total_bytes=16 * GIB,
+            disk_free_bytes=15 * GIB,
+        )
+        policy = ResourcePolicy(self.root, reading_provider=lambda: reading)
+        status = policy.status()
+        self.assertEqual(status["diskReserveBytes"], 20 * GIB)
+        self.assertTrue(status["paused"])
+
     def test_system_ram_envelope_counts_existing_process_memory_without_collapsing(self):
         reading = ResourceReading(
             total_memory_bytes=16 * GIB,
@@ -378,7 +396,7 @@ class DurableStateOffloadTests(unittest.TestCase):
             trainable_parameter_bytes=0,
             activation_bytes_per_token=MIB,
             resource_mode="manual",
-            manual_ram_budget_bytes=350 * MIB,
+            manual_ram_budget_bytes=300 * MIB,
         )
 
         # The raw headroom fits three samples. Three does not divide the
@@ -446,7 +464,7 @@ class DurableStateOffloadTests(unittest.TestCase):
                 self.assertEqual(status["hardwareTier"], tier)
                 self.assertEqual(status["systemRamSharePercent"], expected)
 
-    def test_auto_expands_for_safe_model_allocation_but_manual_cap_blocks(self):
+    def test_auto_recommendation_and_manual_share_are_ceilings_not_allocation_escalation(self):
         reading = ResourceReading(
             total_memory_bytes=16 * GIB,
             available_memory_bytes=13 * GIB,
@@ -466,9 +484,8 @@ class DurableStateOffloadTests(unittest.TestCase):
         ).status(estimated_ram_bytes=estimate)
 
         self.assertEqual(automatic["systemRamMode"], "auto")
-        self.assertGreater(automatic["systemRamSharePercent"], 65.0)
-        self.assertLessEqual(automatic["systemRamSharePercent"], 90.0)
-        self.assertFalse(automatic["memoryPressure"])
+        self.assertEqual(automatic["systemRamSharePercent"], 65.0)
+        self.assertTrue(automatic["memoryPressure"])
         self.assertEqual(manual["systemRamSharePercent"], 65.0)
         self.assertTrue(manual["memoryPressure"])
 

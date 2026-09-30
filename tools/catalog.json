@@ -213,7 +213,7 @@
       "defaultGrant": "off",
       "actions": {
         "propose": {
-          "input": { "objective": "string", "candidateKind": "string?", "addExperts": "number?", "tests": "string[]?" },
+          "input": { "objective": "string", "candidateKind": "string?", "addExperts": "number?", "architectureChange": "object?", "tests": "string[]?", "sourceEdits": "object[]?", "texts": "string[]?", "sourceIds": "string[]?", "latentReplay": "boolean?", "epochs": "number?", "learningRate": "number?", "objectives": "string[]?" },
           "output": { "worktree": "string", "diff": "string", "checks": "array" }
         },
         "diff": {

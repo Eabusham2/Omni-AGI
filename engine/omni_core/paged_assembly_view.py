@@ -26,6 +26,7 @@ from .paged_assembly_index import (
     _packed_payload,
     _record_payload,
 )
+from .paged_store_counts import row_count
 
 
 def _read_only(value: Any) -> Any:
@@ -60,9 +61,10 @@ class PagedAssemblyView:
         # The index exposes no deletion. A gap means an external writer has
         # broken the position-to-sequence mapping; never shift positions.
         with self.index._transaction() as connection:
-            count, high_water = connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM assembly_records"
-            ).fetchone()
+            count = row_count(connection, "assembly_records")
+            high_water = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM assembly_records"
+            ).fetchone()[0]
         if int(count) != int(high_water):
             raise ValueError("assembly insertion sequence has a gap")
         return int(count)

@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
+from .paged_store_counts import ensure_row_count, row_count
 from .packed_vsa_vectors import (
     FORMAT as SHARD_FORMAT,
     FORMAT_VERSION as SHARD_FORMAT_VERSION,
@@ -277,6 +278,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                     ("committed_revision", "-1"),
                 ),
             )
+            ensure_row_count(connection, "paged_vector_rows", reserve_disk)
             return chosen_seed, chosen_deadband
         rows = dict(connection.execute("SELECT key,value FROM paged_vector_meta"))
         if (
@@ -324,6 +326,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                 "INSERT INTO paged_vector_meta(key,value) VALUES "
                 "('committed_revision','-1')"
             )
+        ensure_row_count(connection, "paged_vector_rows", reserve_disk)
         return stored_seed, stored_deadband
 
     def _connect(self) -> sqlite3.Connection:
@@ -333,6 +336,8 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA temp_store=FILE")
+        from .paged_idle_selection import observe_idle_source_connection
+        observe_idle_source_connection(connection, self.path)
         return connection
 
     @contextmanager
@@ -534,9 +539,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
 
     def __len__(self) -> int:
         with self._transaction() as connection:
-            return int(connection.execute(
-                "SELECT COUNT(*) FROM paged_vector_rows"
-            ).fetchone()[0])
+            return row_count(connection, "paged_vector_rows")
 
     @property
     def storage_bytes(self) -> int:
@@ -968,9 +971,10 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
 
     def current_snapshot(self) -> str:
         with self._transaction() as connection:
-            count, high_water = connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM paged_vector_rows"
-            ).fetchone()
+            count = row_count(connection, "paged_vector_rows")
+            high_water = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM paged_vector_rows"
+            ).fetchone()[0]
             revision = self.revision_in_connection(connection)
             store_id = self.store_id_in_connection(connection)
         return _token({
@@ -1107,9 +1111,10 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
 
     def status(self) -> dict[str, Any]:
         with self._transaction() as connection:
-            count, high_water = connection.execute(
-                "SELECT COUNT(*),COALESCE(MAX(sequence),0) FROM paged_vector_rows"
-            ).fetchone()
+            count = row_count(connection, "paged_vector_rows")
+            high_water = connection.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM paged_vector_rows"
+            ).fetchone()[0]
             store_id = self.store_id_in_connection(connection)
             revision = self.revision_in_connection(connection)
             committed_generation, committed_revision = (

@@ -1,6 +1,6 @@
 {
   "name": "omni-agi-studio",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "A cross-platform studio for building persistent, adaptive OmniCortex research models.",
   "main": "out/main/index.js",
   "author": "Omni-AGI contributors",
@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "npm run test:node && npm run test:python",
     "test:node": "vitest run",
-    "test:node:ci": "vitest run tests/actionProtocol.test.ts tests/brainProvenancePresentation.test.ts tests/buildResourceSelections.test.ts tests/chatLoadingPresentation.test.ts tests/engineSupervisor.test.ts tests/mediaProtocol.test.ts tests/mobileTlsIdentity.test.ts tests/mobileTransportSecurity.test.ts tests/packagedCompliance.test.ts tests/platformChrome.test.ts tests/projectIntegrity.test.ts tests/releasePackaging.test.ts tests/releaseRuntimeCompatibility.test.ts tests/resourcePlanRequest.test.ts tests/resourcePlanner.test.ts tests/shutdownIpcLifecycle.test.ts tests/uiDefectRegression.test.ts tests/uiVisualIntegrity.test.ts --maxWorkers=2 --testTimeout=30000",
+    "test:node:ci": "vitest run tests/actionProtocol.test.ts tests/brainProvenancePresentation.test.ts tests/buildResourceSelections.test.ts tests/chatLoadingPresentation.test.ts tests/engineSupervisor.test.ts tests/mediaProtocol.test.ts tests/mobileTlsIdentity.test.ts tests/mobileTransportSecurity.test.ts tests/packagedCompliance.test.ts tests/platformChrome.test.ts tests/projectIntegrity.test.ts tests/releasePackaging.test.ts tests/releaseRuntimeCompatibility.test.ts tests/resourcePlanRequest.test.ts tests/resourcePlanner.test.ts tests/ramFirstNativeSizing.test.ts tests/shutdownIpcLifecycle.test.ts tests/uiDefectRegression.test.ts tests/uiVisualIntegrity.test.ts tests/chatNoReplyCompletion.test.ts tests/codecRuntimeBridge.test.ts tests/conceptIdViews.test.ts tests/cortexViewerContracts.test.ts tests/evolutionIntentAuthority.test.ts tests/nativeArchitectureMath.test.ts tests/nativeComputeMeasurement.test.ts tests/managedWorkerMemory.test.ts tests/neuralSpeechProduction.test.ts tests/runtimeSettingsShape.test.ts tests/savedToolIntents.test.ts tests/toolIntentJournal.test.ts tests/inlineCancellationTransport.test.ts tests/steeredReceiptPresentation.test.ts tests/architectureMutation.test.ts tests/crawlSourceLease.test.ts tests/crawlCompletionContract.test.ts tests/videoRuntimeManifestLineEndings.test.ts tests/videoRuntimeProvisioner.test.ts tests/videoRuntimeSupervisor.test.ts tests/warmSteerBoundary.test.ts --maxWorkers=2 --testTimeout=30000",
     "test:python": "node scripts/run-python-tests.mjs",
     "test:python:portable": "python -m unittest discover -s engine/tests -p \"test_*.py\" -v",
     "train:distributed": "python3 -m torch.distributed.run --standalone --nproc-per-node=gpu engine/distributed_train.py train",
@@ -99,26 +99,26 @@
         "from": "tools",
         "to": "tools"
       },
-    {
-      "from": "engine-dist/omni-engine",
-      "to": "engine-runtime"
-    },
-    {
-      "from": "LICENSE.md",
-      "to": "licenses/LICENSE.md"
-    },
-    {
-      "from": "COMMERCIAL_LICENSE.md",
-      "to": "licenses/COMMERCIAL_LICENSE.md"
-    },
-    {
-      "from": "licenses",
-      "to": "licenses"
-    },
-    {
-      "from": "THIRD_PARTY_NOTICES.md",
-      "to": "licenses/THIRD_PARTY_NOTICES.md"
-    }
+      {
+        "from": "engine-dist/omni-engine",
+        "to": "engine-runtime"
+      },
+      {
+        "from": "LICENSE.md",
+        "to": "licenses/LICENSE.md"
+      },
+      {
+        "from": "COMMERCIAL_LICENSE.md",
+        "to": "licenses/COMMERCIAL_LICENSE.md"
+      },
+      {
+        "from": "licenses",
+        "to": "licenses"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "licenses/THIRD_PARTY_NOTICES.md"
+      }
     ],
     "win": {
       "icon": "build/icon.svg",

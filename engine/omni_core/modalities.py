@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .config import OmniConfig
+from .packed_collective_hooks import packed_row_owner
 from .media_planning import (
     MediaOutputPlan,
     MediaPlanError,
@@ -182,11 +183,13 @@ class _PackedTernaryTableRead(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, trigger: torch.Tensor, owner: "PackedTernaryTable") -> torch.Tensor:
-        del trigger
         ctx.owner = owner
         projection = owner.projection
-        levels = projection.effective_weight().transpose(0, 1)
-        return levels.float() * projection._packed_forward_scale
+        device = (projection._native_compute_device
+                  if projection._native_core_pager is not None else trigger.device)
+        with projection._packed_residency_scope(device):
+            levels = projection.effective_weight().transpose(0, 1)
+            return levels.float() * projection._packed_forward_scale
 
     @staticmethod
     def backward(ctx, gradient: torch.Tensor):  # type: ignore[override]
@@ -222,6 +225,11 @@ class PackedTernaryTable(nn.Module):
 
     @torch.no_grad()
     def learn_from_gradient(self, gradient: torch.Tensor) -> int:
+        with self.projection._packed_residency_scope(gradient.device), packed_row_owner(self.projection):
+            return self._learn_from_gradient_impl(gradient)
+
+    @torch.no_grad()
+    def _learn_from_gradient_impl(self, gradient: torch.Tensor) -> int:
         if tuple(gradient.shape) != (self.rows, self.dimensions):
             raise ValueError("ternary table gradient shape is invalid")
         if not bool(torch.isfinite(gradient).all()):
@@ -244,8 +252,12 @@ class PackedTernaryTable(nn.Module):
                 transposed[start:end],
                 rate,
                 projection._packed_forward_scale,
+                row_stability=projection._row_stability,
+                stability_strength=projection._packed_stability_strength,
             )
         projection._packed_validated_version = int(packed._version)
+        if changed and projection._packed_stability_strength > 0.0:
+            projection._pending_stability_events += 1
         return changed
 
 

@@ -86,6 +86,13 @@ class PagedHotNodeIds:
     def __iter__(self) -> Iterator[str]:
         return self.iter_sorted_ids()
 
+    def ids_sha256(self) -> str:
+        return self.view.index.ids_sha256()
+
+    @property
+    def ids_checksum_algorithm(self) -> str:
+        return self.view.index.ids_checksum_algorithm
+
 
 class BoundedSynapseShardPlan:
     """Stream v3 descriptors with no all-changed-groups materialization.
@@ -111,6 +118,7 @@ class BoundedSynapseShardPlan:
         verify_reusable: Optional[
             Callable[[Mapping[str, Any], str], None]
         ] = None,
+        endpoint_plan: Optional[Any] = None,
     ) -> None:
         if type(records_per_shard) is not int or not 1 <= records_per_shard <= 512:
             raise ValueError("synapse shard size must be between 1 and 512")
@@ -121,6 +129,7 @@ class BoundedSynapseShardPlan:
         self.write_tensor_blob = write_tensor_blob
         self.disk_reserve = disk_reserve
         self.verify_reusable = verify_reusable
+        self.endpoint_plan = endpoint_plan
         self.descriptors: list[dict[str, Any]] = []
         self.forward_entries: list[dict[str, Any]] = []
         self._index_manifest: Optional[dict[str, Any]] = None
@@ -131,6 +140,7 @@ class BoundedSynapseShardPlan:
         self._committed = False
         self._initial_count = len(substrate.synapses)
         self._initial_revision = getattr(substrate.synapses, "graph_revision", None)
+        self._initial_persistence_revision = getattr(substrate.synapses, "persistence_revision", None)
         self._initial_state_revision = substrate.state_revision
         self._lazy = (
             substrate.synapses
@@ -153,10 +163,14 @@ class BoundedSynapseShardPlan:
             self._lazy is not None
             and (
                 self._lazy._forward_index_manifest is None
+                or self._lazy._forward_index_manifest.get("hotNodeIdsChecksumAlgorithm")
+                != getattr(self._hot_ids, "ids_checksum_algorithm", "sha256-sorted-ids-v1")
                 or self._lazy._forward_index_manifest.get("hotNodeIdsSha256")
                 != self._hot_ids_sha256
             )
         )
+        if endpoint_plan is not None and endpoint_plan.full_forward_rebuild:
+            self._reindex_unchanged = True
 
     def _reserve(self, size: int, operation: str) -> None:
         if self.disk_reserve is None:
@@ -172,6 +186,8 @@ class BoundedSynapseShardPlan:
             or getattr(self.substrate.synapses, "graph_revision", None)
             != self._initial_revision
             or self.substrate.state_revision != self._initial_state_revision
+            or getattr(self.substrate.synapses, "persistence_revision", None)
+            != self._initial_persistence_revision
         ):
             raise ValueError("synapses changed while writing checkpoint shards")
 
@@ -391,9 +407,9 @@ class BoundedSynapseShardPlan:
                 [record for _record_id, record in group], self._region_lookup(group)
             ),
         }
-        self.forward_entries.append(
-            _forward_index_entry(descriptor, group, self._hot_lookup(group))
-        )
+        self._append_forward_entry(_forward_index_entry(descriptor, group, self._hot_lookup(group)))
+        if self.endpoint_plan is not None:
+            self.endpoint_plan.stage_group(descriptor, group)
         return descriptor
 
     def _iter_resident(self, connection: sqlite3.Connection) -> Iterator[dict[str, Any]]:
@@ -433,6 +449,8 @@ class BoundedSynapseShardPlan:
                         group = lazy._group_records(last)
                         if group:
                             yield self._write_group(bucket, last[1], group, lazy._descriptors[last])
+                        elif self.endpoint_plan is not None:
+                            self.endpoint_plan.stage_deleted(last)
                     else:
                         yield self._emit_reused(lazy, last)
                 last = current
@@ -450,6 +468,8 @@ class BoundedSynapseShardPlan:
                         pending = next(additions, None)
                     if group:
                         yield self._write_group(bucket, last[1], group, lazy._descriptors[last])
+                    elif self.endpoint_plan is not None:
+                        self.endpoint_plan.stage_deleted(last)
                 else:
                     yield self._emit_reused(lazy, last)
             part = last[1] + 1 if last is not None else 0
@@ -467,17 +487,27 @@ class BoundedSynapseShardPlan:
         self, lazy: LazyPersistedSynapses, key: tuple[str, int]
     ) -> dict[str, Any]:
         descriptor = self._verified_reusable(lazy._descriptors[key])
-        if self._reindex_unchanged:
+        if self._reindex_unchanged and (
+            self.endpoint_plan is None or self.endpoint_plan.requires_reindex(key)
+        ):
             # A newly formed assembly can become an endpoint of an old edge.
             # Keep immutable shard bytes but rebuild its hot-location index
             # from one verified bounded page instead of trusting stale IDs.
             group = lazy._group_records(key)
-            self.forward_entries.append(
-                _forward_index_entry(descriptor, group, self._hot_lookup(group))
-            )
+            self._append_forward_entry(_forward_index_entry(descriptor, group, self._hot_lookup(group)))
+            if self.endpoint_plan is not None:
+                self.endpoint_plan.reindexed_groups += 1
         else:
             self.forward_entries.append(lazy._persisted_index_entry(key))
         return descriptor
+
+    def _append_forward_entry(self, entry: Mapping[str, Any]) -> None:
+        from .paged_forward_index import publish_entries, ReusedForwardEntry
+        def guard(size: int) -> bool:
+            self._reserve(size, "bounded derived forward group")
+            return True
+        descriptor = publish_entries(self.root, (entry,), guard)[0]
+        self.forward_entries.append(ReusedForwardEntry(self.root, descriptor))
 
     def iter_descriptors(self) -> Iterator[dict[str, Any]]:
         if self._started:
@@ -524,6 +554,7 @@ class BoundedSynapseShardPlan:
             hot_node_ids=hot_node_ids,
             entries=self.forward_entries,
             growth_guard=guard,
+            verified_rebuild=bool(self.endpoint_plan is not None and self.endpoint_plan.full_forward_rebuild),
         )
         self._index_manifest = manifest
         replacement = LazyPersistedSynapses(
@@ -539,6 +570,7 @@ class BoundedSynapseShardPlan:
             if self._lazy is not None
             else getattr(self.substrate.synapses, "graph_revision", 0)
         )
+        replacement.persistence_revision = getattr(self.substrate.synapses, "persistence_revision", 0)
         self._next_lazy = replacement
         return dict(manifest)
 
@@ -564,5 +596,14 @@ class BoundedSynapseShardPlan:
             or self._next_lazy is None
         ):
             raise RuntimeError("synapse generation was not prepared for commit")
+        previous = self.substrate.synapses
         self.substrate.synapses = self._next_lazy
+        cached = getattr(self.substrate, "_paged_recall_graph", None)
+        if cached is not None and cached[0] == (id(previous), id(self.substrate.neurons)):
+            graph = cached[1]
+            if graph.refresh(self._next_lazy, self.substrate.neurons):
+                self._next_lazy._recall_graph_observer = graph.queue_change
+                self.substrate._paged_recall_graph = ((id(self._next_lazy), id(self.substrate.neurons)), graph)
+            else:
+                self.substrate._paged_recall_graph = None
         self._committed = True

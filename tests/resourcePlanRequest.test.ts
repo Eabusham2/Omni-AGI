@@ -31,6 +31,8 @@ describe("working-memory resource request boundary", () => {
   });
 
   it.each([
+    { mode: "auto", brainId: "../different-brain" },
+    { mode: "auto", brainId: 42 },
     { mode: "auto", storagePoolMode: "fixed" },
     { mode: "auto", storagePoolBytes: 30 },
     { mode: "auto", trainingSourceBytes: -1 },

@@ -187,7 +187,7 @@ class IngestionScheduleV3Tests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.validate_schedule({**self.schedule, **change})
 
-    def test_training_counts_have_only_positive_signed_64_protocol_bounds(self):
+    def test_training_counts_have_signed_64_bounds_and_two_position_label_floor(self):
         large = {
             **self.schedule,
             "physicalBatchRecords": (1 << 63) - 1,
@@ -198,10 +198,13 @@ class IngestionScheduleV3Tests(unittest.TestCase):
         self.assertEqual(
             self.validate_schedule(large, schedule_sha256(large)), large
         )
-        small = {**self.schedule, "trainingSequenceTokens": 1}
+        small = {**self.schedule, "trainingSequenceTokens": 2}
         self.assertEqual(
             self.validate_schedule(small, schedule_sha256(small)), small
         )
+        one_position = {**self.schedule, "trainingSequenceTokens": 1}
+        with self.assertRaises(ValueError):
+            self.validate_schedule(one_position, schedule_sha256(one_position))
         for field in (
             "physicalBatchRecords", "gradientAccumulation",
             "trainingSequenceTokens", "checkpointRecords",

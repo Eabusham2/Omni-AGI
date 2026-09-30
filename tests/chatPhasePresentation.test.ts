@@ -25,8 +25,8 @@ describe("post-reply learning presentation", () => {
       ariaLabel:
         "Reply generation is complete. The brain is learning and saving this experience; the turn is not committed yet.",
       preserveAssistantOutput: true,
-      allowQueuedInput: true,
-      allowParallelSend: false,
+      allowNextSend: true,
+      parallelNeuralMutation: false,
       turnCommitted: false
     });
     expect(presented).not.toHaveProperty("percent");
@@ -45,8 +45,8 @@ describe("post-reply learning presentation", () => {
       ariaLabel:
         "The reply and visible action are complete. The chat turn is committed; the brain is learning the action result as structured neural experience.",
       preserveAssistantOutput: true,
-      allowQueuedInput: true,
-      allowParallelSend: false,
+      allowNextSend: true,
+      parallelNeuralMutation: false,
       turnCommitted: true
     });
   });

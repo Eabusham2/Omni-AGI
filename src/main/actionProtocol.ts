@@ -28,9 +28,11 @@ function argumentsObject(value: unknown): Record<string, unknown> {
 }
 
 function boundedText(value: unknown, maximum: number): string {
-  return typeof value === "string"
-    ? value.replace(/\0/g, "").trim().slice(0, maximum)
-    : "";
+  if (typeof value !== "string" || value.includes("\0")) return "";
+  const text = value.trim();
+  // A malformed identifier must not silently become a different authorized
+  // tool/action merely because its prefix fits the protocol byte envelope.
+  return text.length <= maximum ? text : "";
 }
 
 export function normalizeStructuredAction(
@@ -48,13 +50,23 @@ export function normalizeStructuredAction(
     typeof candidate.confidence === "number" && Number.isFinite(candidate.confidence)
       ? Math.max(0, Math.min(1, candidate.confidence))
       : undefined;
+  const actionId = typeof candidate.actionId === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(candidate.actionId)
+    ? candidate.actionId : undefined;
+  const metadata = {
+    ...(actionId ? { actionId } : {}),
+    ...(record(candidate.inputSchema) ? { inputSchema: record(candidate.inputSchema)! } : {}),
+    ...(typeof candidate.selectionPhase === "string" ? { selectionPhase: candidate.selectionPhase } : {}),
+    ...(typeof candidate.selectionStep === "number" && Number.isInteger(candidate.selectionStep)
+      ? { selectionStep: candidate.selectionStep } : {}),
+  };
 
   if (["talk", "ponder", "learn", "stop"].includes(kind)) {
     return {
       kind,
       source,
       arguments: argumentsObject(candidate.arguments),
-      confidence
+      confidence,
+      ...metadata
     };
   }
 
@@ -77,7 +89,8 @@ export function normalizeStructuredAction(
     toolId: rawToolId,
     action: rawAction,
     arguments: argumentsObject(candidate.arguments),
-    confidence
+    confidence,
+    ...metadata
   };
 }
 

@@ -767,7 +767,7 @@ class OrganicMemoryLifecycle:
         rehearsals: int,
         scores: Mapping[str, float],
         signals: Mapping[str, float],
-    ) -> None:
+    ) -> str:
         flat = vector.detach().cpu().float().reshape(-1)
         for index, item in enumerate(self.afterimage_items):
             if str(item.get("assemblyId", "")) != assembly_id:
@@ -805,7 +805,8 @@ class OrganicMemoryLifecycle:
                     "inactiveCycles": 0,
                 }
             )
-            return
+            item["id"] = str(item.get("id", "")) or uuid.uuid4().hex
+            return str(item["id"])
         self.afterimage_vectors.append(flat)
         self.afterimage_items.append(
             {
@@ -832,6 +833,7 @@ class OrganicMemoryLifecycle:
                 "inactiveCycles": 0,
             }
         )
+        return str(self.afterimage_items[-1]["id"])
 
     def settle(
         self,
@@ -949,6 +951,7 @@ class OrganicMemoryLifecycle:
             memory.decay(continuous_decay, synapses=related_synapses)
             router.synapses.decay_unused(continuous_decay * 0.45)
 
+        afterimage_id = ""
         record = record_index.get(assembly_id)
         if record is not None:
             self._write_assembly_scores(
@@ -966,7 +969,7 @@ class OrganicMemoryLifecycle:
                     signals=signals,
                     timestamp=self.last_settled_at,
                 )
-            self._admit_afterimage(
+            afterimage_id = self._admit_afterimage(
                 vector,
                 assembly_id=assembly_id,
                 source=source,
@@ -1041,6 +1044,7 @@ class OrganicMemoryLifecycle:
                 str(recurring.get("assemblyId", "")) if recurring else ""
             ),
             "afterimageCount": len(self.afterimage_items),
+            "afterimageId": afterimage_id,
         }
 
     def state_tensors(self, prefix: str = "memory_lifecycle.") -> Dict[str, torch.Tensor]:
