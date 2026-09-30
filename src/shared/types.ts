@@ -2625,8 +2625,9 @@ export interface EvolutionStartRequest {
   /**
    * Edit-free requests default to a substrate overlay. Source candidates are
    * accepted only with exact typed sourceEdits. Neural, data, substrate, and
-   * compatible expert-growth architecture candidates use isolated worker-owned
-   * safe-tensor overlays. Incompatible tensor-shape migration remains rejected.
+   * architecture candidates use isolated worker-owned safe-tensor overlays.
+   * Width/head changes require retained-state migration, training, held-out
+   * evaluation and a promotion decision tied to that exact evaluated state.
    */
   candidateKind?: "source" | "neural" | "data" | "substrate" | "architecture";
   texts?: string[];
@@ -2645,7 +2646,16 @@ export interface EvolutionStartRequest {
     | { mutation: "grow-experts"; addExperts?: number }
     | { mutation: "grow-depth"; addLayers?: number }
     | { mutation: "grow-router"; addNeurons?: number }
-    | { mutation: "grow-regions"; addRegions?: number; neuronsPerRegion: number };
+    | { mutation: "grow-regions"; addRegions?: number; neuronsPerRegion: number }
+    | { mutation: "resize-width"; dModel: number; feedForward?: number; nHeads?: number }
+    | { mutation: "repartition-heads"; nHeads: number };
+  /** Explicit real-data holdouts for an isolated width/head candidate. The
+   * protected evaluator, not a generated score, decides promotion. */
+  geometryHoldouts?: {
+    token: Array<{ path: string; records: number }>;
+    modality: Array<{ path: string; kind: "image" | "audio" | "video"; conditionText: string }>;
+    tool: Array<{ path: string; records: number }>;
+  };
 }
 
 export interface EvolutionApprovalRequest {

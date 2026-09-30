@@ -2760,6 +2760,20 @@ interface PendingChatTool extends ChatToolCommand {
   approvalExpiresAt?: string;
 }
 
+function pendingChatToolFromAction(event: ActionEvent): PendingChatTool | null {
+  if (event.state !== "approval-required" || !event.execution?.approvalToken ||
+      !event.action.toolId || !event.action.action) return null;
+  return {
+    label: `${chatActionTitle(event.action)} proposed in chat`,
+    source: event.action.source === "human" ? "human" : "brain",
+    actionEventId: event.id,
+    invocation: {toolId: event.action.toolId, action: event.action.action,
+      arguments: event.action.arguments},
+    approvalToken: event.execution.approvalToken,
+    approvalExpiresAt: event.execution.approvalExpiresAt
+  };
+}
+
 interface QueuedChatTurn {
   id: string;
   text: string;
@@ -2784,12 +2798,14 @@ function valueRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function ChatActionCard({ event, onCancel }: {
+function ChatActionCard({ event, onCancel, onApprove }: {
   event: ActionEvent;
   onCancel?: () => Promise<void>;
+  onApprove?: () => Promise<void>;
 }) {
   const [mediaPlaybackFailed, setMediaPlaybackFailed] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [approving, setApproving] = useState(false);
   const iconByKind: Record<ActionEvent["action"]["kind"], IconName> = {
     talk: "chat",
     tool: "terminal",
@@ -2854,6 +2870,16 @@ function ChatActionCard({ event, onCancel }: {
               void onCancel().finally(() => setCancelling(false));
             }}>
             {cancelling || event.cancellationRequested ? "Cancelling this action…" : "Cancel this action"}
+          </Button>
+        ) : null}
+        {onApprove && pendingChatToolFromAction(event) ? (
+          <Button kind="primary" icon={approving ? "pulse" : "check"}
+            disabled={approving || event.cancellationRequested}
+            onClick={() => {
+              setApproving(true);
+              void onApprove().finally(() => setApproving(false));
+            }}>
+            {approving ? "Approving this action…" : "Approve exact action"}
           </Button>
         ) : null}
         {preview ? (
@@ -3089,6 +3115,7 @@ function ChatWorkspace({
   const [datasetPreview, setDatasetPreview] = useState<DatasetPreviewProgress | null>(null);
   const [learningJobs, setLearningJobs] = useState<RuntimeJob[]>([]);
   const [pendingTool, setPendingTool] = useState<PendingChatTool | null>(null);
+  const approvingActionIdsRef = useRef(new Set<string>());
   const [approvalClock, setApprovalClock] = useState(() => Date.now());
   const [toolStatus, setToolStatus] = useState("");
   const [toolRunning, setToolRunning] = useState(false);
@@ -3600,24 +3627,9 @@ function ChatWorkspace({
           ? `${chatActionTitle(event.action)} failed: ${cleanChatActionStatus(event.error, event.action)}`
           : `${chatActionTitle(event.action)}: ${chatActionStateLabel(event.state)}.`
       );
-      if (
-        event.state === "approval-required" &&
-        event.execution?.approvalToken &&
-        event.action.toolId &&
-        event.action.action
-      ) {
-        setPendingTool({
-          label: `${chatActionTitle(event.action)} proposed in chat`,
-          source: event.action.source === "human" ? "human" : "brain",
-          actionEventId: event.id,
-          invocation: {
-            toolId: event.action.toolId,
-            action: event.action.action,
-            arguments: event.action.arguments
-          },
-          approvalToken: event.execution.approvalToken,
-          approvalExpiresAt: event.execution.approvalExpiresAt
-        });
+      const pending = pendingChatToolFromAction(event);
+      if (pending) {
+        setPendingTool(pending);
       } else if (["complete", "failed", "stopped"].includes(event.state)) {
         setPendingTool((current) =>
           current?.actionEventId === event.id ? null : current
@@ -3680,6 +3692,13 @@ function ChatWorkspace({
         actionTurnIdsRef.current.set(event.actionEvent.id, event.turnId);
         setActionEvents((current) => mergeChatActionEvent(current, event.actionEvent));
         routeStudioAction(event.actionEvent);
+        setToolRunning(event.actionEvent.state === "running");
+        const pending = pendingChatToolFromAction(event.actionEvent);
+        if (pending) {
+          setPendingTool(pending);
+        } else if (["complete", "failed", "stopped"].includes(event.actionEvent.state)) {
+          setPendingTool((current) => current?.actionEventId === event.actionEvent.id ? null : current);
+        }
         setToolStatus(
           event.actionEvent.state === "failed"
             ? `${chatActionTitle(event.actionEvent.action)} failed: ${cleanChatActionStatus(event.actionEvent.error, event.actionEvent.action)}`
@@ -4026,12 +4045,17 @@ function ChatWorkspace({
     }
   };
 
-  const approvePendingTool = async () => {
-    if (!pendingTool || sending || toolRunning || !window.omni) return;
-    const approval = pendingTool;
+  const approvePendingTool = async (selected: PendingChatTool | null = pendingTool) => {
+    if (!selected || cancellingTurn || !window.omni || approvingActionIdsRef.current.has(selected.actionEventId)) return;
+    const approval = selected;
+    if (approval.approvalExpiresAt && Date.now() >= Date.parse(approval.approvalExpiresAt)) {
+      onToast("This action's approval expired. Ask the brain to propose it again.");
+      return;
+    }
+    approvingActionIdsRef.current.add(approval.actionEventId);
     // The token is single-use. Disarm the visible control before awaiting so a
     // double click cannot dispatch the same approved action twice.
-    setPendingTool(null);
+    setPendingTool((current) => current?.actionEventId === approval.actionEventId ? null : current);
     setToolRunning(true);
     setToolStatus(`${approval.label} is running through the approved action protocol.`);
     // Ask-approved executions use the action id (not its original chat turn)
@@ -4074,6 +4098,7 @@ function ChatWorkspace({
       setPendingTool(approval);
       onToast(error instanceof Error ? error.message : "The approved tool could not run.");
     } finally {
+      approvingActionIdsRef.current.delete(approval.actionEventId);
       setToolRunning(false);
     }
   };
@@ -5010,7 +5035,9 @@ function ChatWorkspace({
                 <ChatActionCard event={entry.event}
                   onCancel={chatActionCancellationTarget(entry.event,
                     actionTurnIdsRef.current.get(entry.event.id))
-                    ? () => cancelActionJob(entry.event) : undefined} />
+                    ? () => cancelActionJob(entry.event) : undefined}
+                  onApprove={pendingChatToolFromAction(entry.event)
+                    ? () => approvePendingTool(pendingChatToolFromAction(entry.event)) : undefined} />
               </div>
             ) : entry.kind === "attachment" ? (
               <div className="chat-action-stream" aria-label="Learned chat attachment">
@@ -5267,7 +5294,7 @@ function ChatWorkspace({
               <span><Icon name={pendingTool ? "warning" : "activity"} size={15} /></span>
               <p>{toolStatus}{pendingTool?.approvalExpiresAt ? ` · ${Math.max(0, Math.ceil((Date.parse(pendingTool.approvalExpiresAt) - approvalClock) / 1_000))}s` : ""}</p>
               {pendingTool ? (
-                <Button kind="primary" icon="check" disabled={sending} onClick={() => void approvePendingTool()}>
+                <Button kind="primary" icon="check" disabled={cancellingTurn} onClick={() => void approvePendingTool()}>
                   Approve exact action
                 </Button>
               ) : toolRunning ? (

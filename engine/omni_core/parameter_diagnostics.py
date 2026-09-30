@@ -86,7 +86,7 @@ class ParameterDeltaJournal:
         "packedUnit": "signed-ternary-level", "floatingUnit": "native-residual-control-value",
         "substrateDeltaMeasured": False, "includesVsaVectors": False, "includesSparseEdges": False}
 
-    def __init__(self, roots, *, directory, reserve_ram, reserve_disk, include_state=False):
+    def __init__(self, roots, *, directory, reserve_ram, reserve_disk, include_state=False, resource_policy=None):
         self.roots = tuple(roots)
         self.directory = Path(directory)
         self.reserve_ram, self.reserve_disk = reserve_ram, reserve_disk
@@ -94,6 +94,9 @@ class ParameterDeltaJournal:
         self.private_directory = None
         self.closed = False
         self.include_state = bool(include_state)
+        self.resource_policy = resource_policy
+        self._disk_quota = None
+        self._sidecar_quotas = []
         self.original = self.inventory()
         self.by_module = {(id(item["module"]), item["name"]): item for item in self.original.values() if item["kind"] == "packed"}
         controls = [item for item in self.original.values() if item["kind"] == "control"]
@@ -150,10 +153,16 @@ class ParameterDeltaJournal:
         self.reserve_disk(131072, "sparse core diagnostic journal metadata")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.private_directory = Path(tempfile.mkdtemp(prefix="core-delta-", dir=str(self.directory)))
-        self.database = sqlite3.connect(str(self.private_directory / "changed.sqlite"))
+        path = self.private_directory / "changed.sqlite"
+        reserve = getattr(self.resource_policy, "reserve_spill", None)
+        self._disk_quota = reserve(131072, "core diagnostic journal metadata") if callable(reserve) else None
+        if self._disk_quota is not None: self._disk_quota.bind_path(path)
+        self.database = sqlite3.connect(str(path))
         self.database.execute("PRAGMA cache_size=-64")
         self.database.execute("PRAGMA journal_mode=DELETE")
         self.database.execute("CREATE TABLE original (owner TEXT, block INTEGER, positions BLOB, codes BLOB, PRIMARY KEY(owner,block)) WITHOUT ROWID")
+        self.database.commit()
+        if self._disk_quota is not None: self._disk_quota.commit(path=path)
 
     def before_write(self, module, target, replacement, start):
         if self.closed:
@@ -188,8 +197,25 @@ class ParameterDeltaJournal:
                 positions = array.array("H", indices).tobytes()
                 codes = bytes(saved[index] for index in indices)
                 self.reserve_disk(16384 + (len(positions) + len(codes)) * 3, "first-original changed core bytes")
-                self.database.execute("INSERT OR REPLACE INTO original VALUES (?,?,?,?)", (item["key"], block, positions, codes))
-                self.database.commit()
+                reserve = getattr(self.resource_policy, "reserve_spill", None)
+                growth = reserve(65536 + (len(positions) + len(codes)) * 3, "first-original changed bytes") if callable(reserve) else None
+                sidecar = reserve(65536 + (len(positions) + len(codes)) * 3, "diagnostic SQLite transaction") if callable(reserve) else None
+                path = self.private_directory / "changed.sqlite"
+                if growth is not None: growth.bind_path(path)
+                if sidecar is not None:
+                    sidecar.bind_path(self.private_directory / "changed.sqlite-journal")
+                try:
+                    self.database.execute("INSERT OR REPLACE INTO original VALUES (?,?,?,?)", (item["key"], block, positions, codes))
+                    self.database.commit()
+                    if growth is not None:
+                        growth.commit(path=path)
+                        self._disk_quota = growth
+                finally:
+                    if sidecar is not None:
+                        sidecar.release()
+                        if (self.private_directory / "changed.sqlite-journal").exists():
+                            self._sidecar_quotas.append(sidecar)
+                    if growth is not None: growth.release()
             position += count
             from .native_core_paging import release_native_tensor_chunk
             release_native_tensor_chunk(self.current(item), absolute, count)
@@ -299,5 +325,7 @@ class ParameterDeltaJournal:
             for name in ("changed.sqlite", "changed.sqlite-journal"):
                 (self.private_directory / name).unlink(missing_ok=True)
             self.private_directory.rmdir()
+        if self._disk_quota is not None: self._disk_quota.release()
+        for quota in self._sidecar_quotas: quota.release()
         self.original.clear()
         self.by_module.clear()

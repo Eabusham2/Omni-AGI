@@ -4,6 +4,7 @@ import { createReadStream, existsSync } from "node:fs";
 import { normalizeConceptIdView } from "../shared/conceptIdView";
 import { chatInputCapacity, cleanChatInput } from "../shared/chatInput";
 import type { TemporarySteeringContext } from "./temporarySteeringContext";
+import { createChatToolObservation, type ChatToolObservationReceipt } from "./chatToolObservation";
 import {
   lstat,
   mkdir,
@@ -103,6 +104,7 @@ import {
   validateBuildRecipe
 } from "./catalogInstaller";
 import { BrainRepository, DEFAULT_TOOL_PERMISSIONS } from "./brainRepository";
+import type { SharedRamSelection, SharedResourceRegistry } from "./sharedResourceRegistry";
 import { withBrainWrite } from "./brainWriteCoordinator";
 import { acquireCrawlSourceLease, releaseCrawlSourceLease } from "./crawlSourceLease";
 import {
@@ -3926,7 +3928,8 @@ export class BrainService {
     readonly repository: BrainRepository,
     readonly engine: EngineSupervisor,
     readonly resourcePlanner?: ResourcePlanner,
-    readonly mediaArtifacts?: MediaArtifactRegistry
+    readonly mediaArtifacts?: MediaArtifactRegistry,
+    readonly sharedResources?: SharedResourceRegistry
   ) {
     this.datasets = new DatasetManifestStore((brainId) =>
       this.repository.brainDirectory(brainId)
@@ -4198,9 +4201,15 @@ export class BrainService {
     });
   }
 
-  async preflightStart(brainId: string): Promise<WorkingMemoryResourcePlan | undefined> {
+  async preflightStart(
+    brainId: string,
+    options: { selectActiveRuntime?: boolean } = {}
+  ): Promise<WorkingMemoryResourcePlan | undefined> {
+    this.sharedResources?.requireSynchronized();
     if (!this.resourcePlanner) return undefined;
     const brain = await this.repository.get(brainId);
+    this.sharedResources?.observeSaved(brain.id, brain.config.storagePoolBytes);
+    this.sharedResources?.requireSynchronized();
     const plan = await this.resourcePlanner.plan(
       {
         // Startup must validate the persisted selection, not silently resize
@@ -4222,6 +4231,11 @@ export class BrainService {
     );
     if (!plan.allowed) {
       throw new Error(`This mind cannot start safely: ${plan.blockers.join(" ")}`);
+    }
+    if (options.selectActiveRuntime !== false) {
+      this.sharedResources?.selectActiveRuntime(
+        brain.id, brain.config.storagePoolBytes, plan.resources.systemRamBudgetBytes
+      );
     }
     return plan;
   }
@@ -4277,6 +4291,7 @@ export class BrainService {
         systemRamSharePercent:
           config.systemRamMode === "manual" ? config.systemRamSharePercent : 0
       });
+      let selectedRamBudget: number | undefined;
       if (this.resourcePlanner) {
         const plan = await this.resourcePlanner.plan(
           {
@@ -4304,6 +4319,7 @@ export class BrainService {
         if (!plan.allowed) {
           throw new Error(`These device settings are not safe: ${plan.blockers.join(" ")}`);
         }
+        selectedRamBudget = plan.resources.systemRamBudgetBytes;
         resolvedConfig = this.repository.prepareConfig({
           ...resolvedConfig,
           contextWindowTokens: plan.context.selectedTokens,
@@ -4323,11 +4339,24 @@ export class BrainService {
       }
 
       const storagePath = this.repository.brainDirectory(brainId);
-      await this.engine.request(
-        "update_config",
-        { brainId, config: resolvedConfig, storagePath },
-        300_000
-      );
+      this.sharedResources?.observeSaved(current.id, current.config.storagePoolBytes);
+      this.sharedResources?.requireSynchronized();
+      let resourceSelection: SharedRamSelection | undefined;
+      if (selectedRamBudget !== undefined) {
+        resourceSelection = this.sharedResources?.selectActiveRuntime(
+          brainId, current.config.storagePoolBytes, selectedRamBudget
+        );
+      }
+      try {
+        await this.engine.request(
+          "update_config",
+          { brainId, config: resolvedConfig, storagePath },
+          300_000
+        );
+      } catch (error) {
+        if (resourceSelection) this.sharedResources?.rollbackSelection(resourceSelection);
+        throw error;
+      }
       try {
         const updated = {
           ...current,
@@ -4338,11 +4367,16 @@ export class BrainService {
       } catch (error) {
         // The worker persists its own config, so restore it if the desktop
         // document's atomic commit unexpectedly fails.
-        await this.engine.tryRequest(
-          "update_config",
-          { brainId, config: current.config, storagePath },
-          300_000
-        );
+        try {
+          await this.engine.tryRequest(
+            "update_config",
+            { brainId, config: current.config, storagePath },
+            300_000
+          );
+        } finally {
+          this.sharedResources?.observeSaved(current.id, current.config.storagePoolBytes);
+          if (resourceSelection) this.sharedResources?.rollbackSelection(resourceSelection);
+        }
         throw error;
       }
     });
@@ -4453,6 +4487,10 @@ export class BrainService {
     if (!this.resourcePlanner) {
       throw new Error("New Build requires live resource preflight.");
     }
+    // Fail before creating an initializing document when an earlier committed
+    // registry declaration has not synchronized. A second atomic selection
+    // still occurs immediately before the worker's first create request.
+    this.sharedResources?.requireSynchronized();
     const memoryPlan = await this.resourcePlanner.plan(
       {
         mode: memoryMode,
@@ -4592,28 +4630,29 @@ export class BrainService {
       nativeArchitecture: memoryPlan.nativeArchitecture,
       storagePath
     };
-    let workerSummary: unknown;
-    if (onBuildEvent) {
-      workerSummary = await this.engine.requestStream(
-        "create",
-        createParams,
-        onBuildEvent,
-        300_000
-      );
-    } else {
-      workerSummary = await this.engine.request(
-        "create",
-        createParams,
-        300_000
-      );
+    // Initial materialization is a worker admission too. Select the approved
+    // ceiling before its first RPC, rather than waiting for the next chat or
+    // resume preflight to establish the shared policy.
+    const resourceSelection = this.sharedResources?.selectActiveRuntime(
+      brain.id,
+      brain.config.storagePoolBytes,
+      memoryPlan.resources.systemRamBudgetBytes
+    );
+    try {
+      const workerSummary = onBuildEvent
+        ? await this.engine.requestStream("create", createParams, onBuildEvent, 300_000)
+        : await this.engine.request("create", createParams, 300_000);
+      if (synchronizeWorkerSummary(brain, workerSummary)) {
+        brain = await this.repository.save(brain);
+      }
+      // The live checkpoint remains independently writable, while an immutable
+      // recovery origin can be shared by content hash across its own lineage.
+      await this.repository.deduplicateImmutableOrigin(brain.id);
+      return brain;
+    } catch (error) {
+      if (resourceSelection) this.sharedResources?.rollbackSelection(resourceSelection);
+      throw error;
     }
-    if (synchronizeWorkerSummary(brain, workerSummary)) {
-      brain = await this.repository.save(brain);
-    }
-    // The live checkpoint remains independently writable, while an immutable
-    // recovery origin can be shared by content hash across its own lineage.
-    await this.repository.deduplicateImmutableOrigin(brain.id);
-    return brain;
   }
 
   /**
@@ -5087,7 +5126,8 @@ export class BrainService {
     onStream?: (event: NeuralChatStreamEvent) => void,
     turnId: string = randomUUID(),
     responseTokenBudget?: number,
-    temporarySteeringContext?: TemporarySteeringContext
+    temporarySteeringContext?: TemporarySteeringContext,
+    toolObservationWaitMs?: number
   ): Promise<ChatResult> {
     const message = cleanMessage(input);
     signal?.throwIfAborted();
@@ -5142,7 +5182,8 @@ export class BrainService {
             () => {
               neuralRequestStarted = true;
             },
-            temporarySteeringContext
+            temporarySteeringContext,
+            toolObservationWaitMs
           );
         },
         signal
@@ -5182,6 +5223,16 @@ export class BrainService {
     if (!ownership.chatDispatched) return;
     const result = await this.engine.steerChat(brainId, turnId, successorTurnId);
     if (!result.requested || !result.warm) throw new Error("The worker did not admit the exact warm steering direction.");
+  }
+
+  async observeChatActionResult(brainId: string, turnId: string, event: ActionEvent,
+    output: unknown): Promise<ChatToolObservationReceipt | undefined> {
+    const owner = this.liveChatTurns.get(turnId);
+    if (!owner || owner.brainId !== brainId || !owner.chatDispatched || owner.outputEnded || owner.steerSuccessor) return undefined;
+    const observation = createChatToolObservation(brainId, turnId, event, output,
+      (bytes) => hasTextMemoryHeadroom(bytes) && freemem() - memoryReserveBytes() >= bytes);
+    if (!observation) return undefined;
+    return this.engine.observeChatAction(observation);
   }
 
   private chatSteerAdmissionBoundary(brainId: string, turnId: string): void {
@@ -5336,7 +5387,8 @@ export class BrainService {
     turnId: string = randomUUID(),
     responseTokenBudget?: number,
     onNeuralRequestStarted?: () => void,
-    temporarySteeringContext?: TemporarySteeringContext
+    temporarySteeringContext?: TemporarySteeringContext,
+    toolObservationWaitMs?: number
   ): Promise<ChatResult> {
     signal?.throwIfAborted();
     this.chatSteerAdmissionBoundary(id, turnId);
@@ -5345,6 +5397,10 @@ export class BrainService {
       (!Number.isSafeInteger(responseTokenBudget) || responseTokenBudget < 1)
     ) {
       throw new Error("Response token budget must be a positive safe integer.");
+    }
+    if (toolObservationWaitMs !== undefined && (!Number.isSafeInteger(toolObservationWaitMs) ||
+        toolObservationWaitMs < 1_000 || toolObservationWaitMs > 3_600_000)) {
+      throw new Error("Tool observation wait is outside the trusted runtime preference range.");
     }
     const brain = await this.repository.get(id);
     if (brain.readiness.state !== "ready") {
@@ -5397,6 +5453,7 @@ export class BrainService {
         onlineLearning: brain.config.onlineLearning,
         storagePath: brainDirectory,
         ...(temporarySteeringContext ? { temporarySteeringContext } : {}),
+        ...(toolObservationWaitMs === undefined ? {} : { toolObservationWaitMs }),
         ...(responseTokenBudget === undefined
           ? {}
           : { maxNewTokens: responseTokenBudget })

@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
+from collections.abc import Sequence as SequenceView
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -342,6 +343,92 @@ class ColumnarTextValue:
         for offset in range(0, len(self.buffer), TEXT_BLOCK_CHARS):
             digest.update(self.buffer[offset:offset + TEXT_BLOCK_CHARS])
         return {"sha256": digest.hexdigest(), "bytes": len(self.buffer)}
+
+
+class ColumnarSequence(SequenceView):
+    """A lazy Arrow list/map view, not a row-sized Python list."""
+    def __init__(self, scalar, arrow):
+        self.values, self.arrow = scalar.values, arrow
+        self.is_map = arrow.types.is_map(scalar.type)
+
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            raise TypeError("columnar sequence slices must be traversed, not copied")
+        if index < 0: index += len(self)
+        if not 0 <= index < len(self): raise IndexError(index)
+        value = self.values[index]
+        if self.is_map:
+            return (_columnar_value(value[0], self.arrow), _columnar_value(value[1], self.arrow))
+        return _columnar_value(value, self.arrow)
+
+
+class ColumnarMapping(Mapping):
+    """Retain native struct children until each child is actually visited."""
+    def __init__(self, scalar, arrow):
+        self.scalar, self.arrow = scalar, arrow
+
+    def __iter__(self):
+        return iter(self.scalar)
+
+    def __len__(self):
+        return self.scalar.type.num_fields
+
+    def __getitem__(self, key):
+        return _columnar_value(self.scalar[key], self.arrow)
+
+
+class ColumnarBinaryValue:
+    """Bounded original byte-literal encoding, without a giant bytes copy."""
+    def __init__(self, scalar):
+        self.buffer = memoryview(scalar.as_buffer()).cast("B")
+
+    def literal_chunks(self):
+        # Match bytes repr's quotation choice without materializing bytes.
+        has_single, has_double = False, False
+        for value in self.buffer:
+            has_single |= value == 39
+            has_double |= value == 34
+            if has_single and has_double: break
+        quote = '"' if has_single and not has_double else "'"
+        yield "b" + quote
+        pending = []
+        for value in self.buffer:
+            if value == ord(quote) or value == 92: piece = "\\" + chr(value)
+            elif value == 9: piece = "\\t"
+            elif value == 10: piece = "\\n"
+            elif value == 13: piece = "\\r"
+            elif 32 <= value < 127: piece = chr(value)
+            else: piece = "\\x%02x" % value
+            pending.append(piece)
+            if len(pending) >= TEXT_BLOCK_CHARS:
+                yield "".join(pending)
+                pending = []
+        if pending: yield "".join(pending)
+        yield quote
+
+
+def _columnar_value(scalar, arrow):
+    if not scalar.is_valid: return None
+    kind = scalar.type
+    if arrow.types.is_dictionary(kind) or arrow.types.is_union(kind):
+        return _columnar_value(scalar.value, arrow)
+    if arrow.types.is_struct(kind): return ColumnarMapping(scalar, arrow)
+    if any(test(kind) for test in (arrow.types.is_list, arrow.types.is_large_list,
+                                   arrow.types.is_fixed_size_list, arrow.types.is_map)):
+        return ColumnarSequence(scalar, arrow)
+    if arrow.types.is_string(kind) or arrow.types.is_large_string(kind) or \
+            (hasattr(arrow.types, "is_string_view") and arrow.types.is_string_view(kind)):
+        viewed = ColumnarTextValue(scalar)
+        return viewed if len(viewed.buffer) > INLINE_TEXT_BYTES else scalar.as_py()
+    if arrow.types.is_binary(kind) or arrow.types.is_large_binary(kind) or arrow.types.is_fixed_size_binary(kind):
+        return ColumnarBinaryValue(scalar)
+    # Numeric/time/null leaves are small native scalars. Unknown extension
+    # types still need explicit admission; do not pretend all decoders are bounded.
+    require_parser_resources("columnar scalar leaf conversion", ram_bytes=512)
+    return scalar.as_py()
 
 
 @dataclass
@@ -1009,7 +1096,9 @@ def _training_value(
             # second giant joined transcript/list of literal target copies,
             # and never lose supervision just because its text is spooled.
             size_hint = 0
-            if isinstance(messages, list):
+            if isinstance(messages, ColumnarSequence):
+                size_hint = INLINE_TEXT_BYTES + 1
+            elif isinstance(messages, list):
                 for message in messages:
                     content = message.get("content") if isinstance(message, Mapping) else None
                     size_hint += (len(content) * 4 if isinstance(content, str) else 0) + 64
@@ -1023,10 +1112,12 @@ def _training_value(
                         content = message.get("content") if isinstance(message, Mapping) else None
                         role = str(message.get("role", "")) if isinstance(message, Mapping) else "invalid"
                         payload = None
-                        if isinstance(content, str):
+                        if isinstance(content, (str, ColumnarTextValue)):
                             builder = TextBuilder(clean="strip")
                             try:
-                                builder.write(content)
+                                if isinstance(content, ColumnarTextValue):
+                                    for piece in content.chunks(): builder.write(piece)
+                                else: builder.write(content)
                                 payload = builder.finish()
                             except BaseException:
                                 builder.close()
@@ -1741,7 +1832,12 @@ def _serialized_row_bytes(value: Any) -> int:
 
 def _bounded_json_encoding(value, compact=False):
     comma, colon = (",", ":") if compact else (", ", ": ")
-    if isinstance(value, (str, ColumnarTextValue)):
+    if isinstance(value, ColumnarBinaryValue):
+        yield '"'
+        for piece in value.literal_chunks():
+            yield json.dumps(piece, ensure_ascii=False)[1:-1]
+        yield '"'
+    elif isinstance(value, (str, ColumnarTextValue)):
         yield '"'
         pieces = value.chunks() if isinstance(value, ColumnarTextValue) else (
             value[offset:offset + TEXT_BLOCK_CHARS] for offset in range(0, len(value), TEXT_BLOCK_CHARS)
@@ -1758,7 +1854,7 @@ def _bounded_json_encoding(value, compact=False):
             yield colon
             yield from _bounded_json_encoding(entry, compact)
         yield "}"
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, (list, tuple, ColumnarSequence)):
         yield "["
         for index, entry in enumerate(value):
             if index:
@@ -1776,20 +1872,7 @@ def _bounded_columnar_rows(batch, arrow):
         values = {}
         for name, column in zip(names, columns):
             scalar = column[row_index]
-            scalar_type = getattr(scalar, "type", None)
-            if scalar_type is not None and (
-                arrow.types.is_string(scalar_type) or arrow.types.is_large_string(scalar_type)
-                or (hasattr(arrow.types, "is_string_view") and arrow.types.is_string_view(scalar_type))
-            ) and scalar.is_valid:
-                viewed = ColumnarTextValue(scalar)
-                values[name] = viewed if len(viewed.buffer) > INLINE_TEXT_BYTES else scalar.as_py()
-            else:
-                # Nested native values still use whole-scalar as_py. Admission
-                # is explicit and conservative; no universal byte bound is
-                # claimed for this remaining library representation boundary.
-                estimated = int(getattr(column.slice(row_index, 1), "nbytes", 0))
-                require_parser_resources("columnar whole-scalar Python conversion", ram_bytes=estimated * 8)
-                values[name] = scalar.as_py()
+            values[name] = _columnar_value(scalar, arrow)
         yield values
 
 

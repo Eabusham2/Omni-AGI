@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import type {
   EvolutionApprovalRequest,
   EvolutionCandidate,
@@ -361,6 +361,47 @@ function cleanStringArray(value: unknown, label: string): string[] | undefined {
     .filter(Boolean);
 }
 
+export function cleanGeometryHoldouts(value: unknown): NonNullable<EvolutionStartRequest["geometryHoldouts"]> {
+  const holdouts = recordValue(value);
+  if (Object.keys(holdouts).sort().join(",") !== "modality,token,tool") {
+    throw new Error("Geometry evaluation requires selected token, modality, and tool holdouts.");
+  }
+  const selectedPath = (value: unknown): string => {
+    if (typeof value !== "string" || !isAbsolute(value) || value.includes("\0")) {
+      throw new Error("Geometry holdouts require absolute selected source paths.");
+    }
+    return value;
+  };
+  const counted = (category: "token" | "tool") => {
+    const entries = holdouts[category];
+    if (!Array.isArray(entries) || !entries.length) {
+      throw new Error(`Geometry ${category} holdouts must contain real selected files.`);
+    }
+    return entries.map((entry: unknown) => {
+      const row = recordValue(entry);
+      if (Object.keys(row).sort().join(",") !== "path,records" ||
+          !Number.isSafeInteger(row.records) || Number(row.records) < 1) {
+        throw new Error(`Geometry ${category} holdout declaration is invalid.`);
+      }
+      return { path: selectedPath(row.path), records: Number(row.records) };
+    });
+  };
+  if (!Array.isArray(holdouts.modality) || !holdouts.modality.length) {
+    throw new Error("Geometry modality holdouts must contain real selected media.");
+  }
+  const modality = holdouts.modality.map((entry: unknown) => {
+    const row = recordValue(entry);
+    if (Object.keys(row).sort().join(",") !== "conditionText,kind,path" ||
+        !["image", "audio", "video"].includes(String(row.kind)) ||
+        typeof row.conditionText !== "string" || !row.conditionText.trim()) {
+      throw new Error("Geometry modality holdout declaration is invalid.");
+    }
+    return { path: selectedPath(row.path), kind: row.kind as "image" | "audio" | "video",
+      conditionText: row.conditionText };
+  });
+  return { token: counted("token"), modality, tool: counted("tool") };
+}
+
 function cleanSourceEdits(value: unknown): EvolutionSourceEdit[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) {
@@ -477,7 +518,8 @@ export class EvolutionController {
    * Architecture evolution is deliberately narrower than arbitrary tensor
    * reshaping: it may add resource-checked zero-residual depth/experts and
    * dormant router/region capacity while preserving the existing function.
-   * Width/head geometry migrations remain unsupported and fail explicitly.
+   * Width/head geometry now uses isolated candidates, followed by training,
+   * independent held-out evaluation and an exact promotion approval.
    */
   candidateRoutes(): EvolutionCandidateRoute[] {
     return [
@@ -516,7 +558,7 @@ export class EvolutionController {
         available: Boolean(this.engine),
         protocol: this.engine ? "evolution.*" : undefined,
         reason: this.engine
-          ? "Supports resource-checked zero-residual depth/expert insertion and dormant router/region expansion with exact old-state preservation and rollback. Width/head geometry migration is not implemented."
+          ? "Supports compatible depth/expert/router/region growth. Width/head changes prepare an isolated candidate; training, independent evaluation and exact approval are required before promotion."
           : "The supervised neural worker is unavailable."
       }
     ];
@@ -1065,6 +1107,14 @@ export class EvolutionController {
             addExperts: 1
           })
         : undefined;
+    const geometryChange = architectureChange?.mutation === "resize-width" ||
+      architectureChange?.mutation === "repartition-heads";
+    if (!geometryChange && request.geometryHoldouts !== undefined) {
+      throw new Error("Geometry holdouts apply only to isolated width/head candidates.");
+    }
+    const geometryHoldouts = geometryChange
+      ? cleanGeometryHoldouts(request.geometryHoldouts)
+      : undefined;
     const epochs = request.epochs ?? 1;
     if (!Number.isSafeInteger(epochs) || epochs < 1) {
       throw new Error("Evolution epochs must be a positive integer.");
@@ -1183,6 +1233,7 @@ export class EvolutionController {
         arguments: {
           candidateKind: kind, objective, texts, sourceIds, epochs,
           architectureChange, provenance,
+          ...(geometryHoldouts ? { geometryHoldouts } : {}),
           neuralActionId: provenance.neuralActionId, chatTurnId: provenance.chatTurnId
         }
       }, { id: ids.run, requestId: ids.run, startedAt: now, permission: policy, permissionRevision: JSON.stringify(permissionRecord ?? { level: policy }) });
@@ -1199,6 +1250,7 @@ export class EvolutionController {
           latentReplay,
           objectives,
           architectureChange,
+          ...(geometryHoldouts ? { geometryHoldouts } : {}),
           provenance: {
             ...provenance,
             runtimeRequestId: ids.run,
@@ -1913,10 +1965,34 @@ export class EvolutionController {
 
     let promoted: Record<string, unknown>;
     try {
+      // Only this trusted approve path constructs the promotion proof. Its
+      // source permission is reread after evaluation, so a revoked grant
+      // cannot be used from a stale candidate card.
+      const currentPermission = await this.assertWorkerPermission(request.brainId, "promote");
+      const architectureMutation = recordValue(candidate.workerSnapshot?.architectureMutation);
+      const geometry = candidate.candidateKind === "architecture" &&
+        ["resize-width", "repartition-heads"].includes(outputString(architectureMutation, "mutation") ?? "");
+      // Auto can promote compatible neural overlays, but a geometry change is
+      // an architecture replacement. It needs this explicit Ask approval path
+      // or current Full Authority; Auto must never be upgraded to Ask here.
+      if (geometry && !["ask", "full"].includes(currentPermission)) {
+        throw new Error("Architecture geometry promotion requires Ask approval or Full Authority.");
+      }
+      const geometryAuthorization = geometry ? {
+        mode: currentPermission === "full" ? "full-authority" : "ask",
+        approved: true,
+        candidateId: candidate.workerCandidateId,
+        evaluationSha256,
+        candidateStateChecksum: candidate.workerCandidateStateChecksum
+      } : undefined;
+      if (geometry && !isSha256(evaluationSha256)) {
+        throw new Error("The isolated geometry candidate lacks current permission or a sealed evaluation.");
+      }
       promoted = await this.workerRequest(
         "evolution.promote",
         request.brainId,
-        { candidateId: candidate.workerCandidateId },
+        { candidateId: candidate.workerCandidateId,
+          ...(geometryAuthorization ? { geometryAuthorization } : {}) },
         timeout
       );
     } catch (error) {

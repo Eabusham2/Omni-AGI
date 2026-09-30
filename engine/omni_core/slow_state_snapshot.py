@@ -81,8 +81,11 @@ class SlowStateSnapshot(dict):
         Path(directory).mkdir(parents=True, exist_ok=True)
         self.directory = Path(tempfile.mkdtemp(prefix="slow-integrity-", dir=str(directory)))
         self.path = self.directory / "state.safetensors"
+        reserve_spill = getattr(policy, "reserve_spill", None)
+        self._state_quota = None
         try:
-            atomic_save_tensors_bounded(self.path, tensors, metadata={"format": "omni-slow-integrity-snapshot"})
+            self._state_quota = reserve_spill(byte_count + len(tensors) * 4096 + 131072, "slow mutation integrity state") if callable(reserve_spill) else None
+            atomic_save_tensors_bounded(self.path, tensors, metadata={"format": "omni-slow-integrity-snapshot"}, spill_lease=self._state_quota)
             self.reader = BoundedTensorFile(self.path)
         except BaseException:
             self.close()
@@ -90,7 +93,7 @@ class SlowStateSnapshot(dict):
         try:
             self.journal = ParameterDeltaJournal(tuple(modules.items()), directory=Path(directory) / "changed-bytes",
                 reserve_ram=lambda size: self.admit(size, "slow first-original byte rollback journal"),
-                reserve_disk=policy.require_disk, include_state=True)
+                reserve_disk=policy.require_disk, include_state=True, resource_policy=policy)
         except BaseException:
             self.close()
             raise
@@ -159,6 +162,7 @@ class SlowStateSnapshot(dict):
         self.closed = True
         if hasattr(self, "journal"): self.journal.close()
         if hasattr(self, "path"): self.path.unlink(missing_ok=True)
+        if getattr(self, "_state_quota", None) is not None: self._state_quota.release()
         if hasattr(self, "directory") and self.directory.exists(): self.directory.rmdir()
         self._controls.clear()
         self._module_keys.clear()

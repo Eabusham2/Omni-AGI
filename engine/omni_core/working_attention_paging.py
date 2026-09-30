@@ -1,9 +1,11 @@
 """Exact tiled attention and a bounded RAM-first, spill-backed activity pool.
 
 These are ephemeral neural activations, never model weights or a saved-answer
-lookup. Files are private raw tensor pages with checksums; no pickle, mmap of a
-whole context, or unbounded accelerator KV tensor is used. Context capacity and
-the size of a compute tile are deliberately independent.
+lookup. Files are private raw tensor pages with checksums; no pickle or
+unbounded accelerator KV tensor is used. CPU saved activations can expose a
+private file-backed virtual tensor without a full anonymous restore allocation;
+attention reads and transfers remain bounded. Context capacity and compute-tile
+size are deliberately independent.
 """
 
 from __future__ import annotations
@@ -12,11 +14,12 @@ import bisect
 import contextvars
 import hashlib
 import math
+import mmap
 import os
 import time
 import uuid
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -85,6 +88,39 @@ class _ActivityPage:
     digest: Optional[str] = None
     verified_stat: Optional[Tuple[int, int, int, int]] = None
     allocated_size: int = 0
+    quota_lease: Any = None
+
+
+class _OwnedSpillLease:
+    """Independent image lifetime; pager.close cannot credit a live backing."""
+    def __init__(self, pager, size, shared):
+        self.pager, self.shared = pager, shared
+        self.key, self.path = uuid.uuid4().hex, None
+        pager._owned_spill_leases[self.key] = int(size)
+
+    def bind_path(self, path):
+        self.path = Path(path)
+        if self.shared is not None:
+            self.shared.bind_path(path)
+        return self
+
+    def commit(self, actual_allocated_bytes=None, *, path=None, promised_bytes=0):
+        self.bind_path(path)
+        stat = self.path.stat()
+        allocated = max(int(actual_allocated_bytes or 0), int(getattr(stat, "st_blocks", 0)) * 512, int(promised_bytes))
+        others = sum(self.pager._owned_spill_leases.values()) - self.pager._owned_spill_leases[self.key]
+        if self.pager._allocated_spill_bytes + others + allocated > self.pager.scratch_budget_bytes:
+            self.pager._pause("owned saved activity image exceeds designated spill pool")
+        if self.shared is not None:
+            self.shared.commit(allocated, path=self.path, promised_bytes=promised_bytes)
+        self.pager._owned_spill_leases[self.key] = allocated
+        return self
+
+    def release(self):
+        if self.shared is not None:
+            self.shared.release()
+        if self.path is None or not self.path.exists():
+            self.pager._owned_spill_leases.pop(self.key, None)
 
 
 class WorkingAttentionPager:
@@ -115,6 +151,7 @@ class WorkingAttentionPager:
         self.resource_policy = resource_policy
         self.compute_device = torch.device("cpu") if compute_device is None else compute_device
         self._pages: Dict[str, _ActivityPage] = {}
+        self._owned_spill_leases: Dict[str, int] = {}
         self._hot: OrderedDict[str, None] = OrderedDict()
         self._resident_bytes = 0
         self._spill_bytes = 0
@@ -162,14 +199,15 @@ class WorkingAttentionPager:
             "deviceTileBudgetBytes": self.device_tile_budget_bytes,
             "residentBudgetExcludesBoundedTransfers": True,
             "residentBytes": self._resident_bytes,
-            "spillBytes": self._allocated_spill_bytes,
+            "spillBytes": self._allocated_spill_bytes + sum(self._owned_spill_leases.values()),
+            "ownedSpillBytes": sum(self._owned_spill_leases.values()),
             "logicalSpillBytes": self._spill_bytes,
             "filesystemAllocationUnitBytes": self._allocation_unit,
             "livePages": len(self._pages),
             "pageMetadataEstimatedBytes": len(self._pages) * 2048,
             "pageMetadataEstimatePerTensorPageBytes": 2048,
             "spillDirectory": str(self.directory),
-            "contextPagedToStorage": self._allocated_spill_bytes > 0,
+            "contextPagedToStorage": self._allocated_spill_bytes + sum(self._owned_spill_leases.values()) > 0,
             "exactCausalAttention": True,
             "trainingBackward": "exact-first-order-recomputed-tile-gradients",
             "trainingFullOutputs": "resource-admitted-bounded-windows",
@@ -258,7 +296,7 @@ class WorkingAttentionPager:
 
     def _admit_write(self, size: int) -> None:
         allocated = math.ceil(int(size) / self._allocation_unit) * self._allocation_unit
-        if self._allocated_spill_bytes + allocated > self.scratch_budget_bytes:
+        if self._allocated_spill_bytes + sum(self._owned_spill_leases.values()) + allocated > self.scratch_budget_bytes:
             self._pause(
                 "working activity spill pool is full; context was not truncated",
                 requiredAdditionalSpillBytes=allocated,
@@ -269,20 +307,38 @@ class WorkingAttentionPager:
         if free is not None and int(free) - self._writes_since_policy - allocated <= reserve:
             self._pause("working activity spill paused at disk reserve", resource=status)
 
+    def reserve_owned_spill(self, size: int, operation: str = "saved activity image"):
+        self.check_cancelled()
+        self._admit_write(size)
+        allocated = math.ceil(int(size) / self._allocation_unit) * self._allocation_unit
+        reserve = getattr(self.resource_policy, "reserve_spill", None)
+        shared = reserve(allocated, operation) if callable(reserve) else None
+        return _OwnedSpillLease(self, allocated, shared)
+
     def _spill(self, page: _ActivityPage) -> None:
         if page.path is None:
             self.check_cancelled()
             self._admit_write(page.size)
             self.directory.mkdir(parents=True, exist_ok=True)
             path = self.directory / (page.identifier + ".activity")
+            reserve = getattr(self.resource_policy, "reserve_spill", None)
+            promised = math.ceil(page.size / self._allocation_unit) * self._allocation_unit
+            quota = reserve(promised, "working activity page") if callable(reserve) else None
+            if quota is not None:
+                quota.bind_path(path)
             assert page.tensor is not None
             # Each payload is one admitted page, never the complete context.
-            payload = page.tensor.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+            flat = page.tensor.contiguous().reshape(-1)
+            if flat.numel() and flat.stride(0) != 1:
+                flat = flat.clone(memory_format=torch.contiguous_format)
+            payload = flat.view(torch.uint8).numpy().tobytes()
             try:
                 with path.open("xb") as handle:
                     handle.write(payload)
             except BaseException:
                 path.unlink(missing_ok=True)
+                if quota is not None:
+                    quota.release()
                 raise
             stat = path.stat()
             blocks = getattr(stat, "st_blocks", None)
@@ -295,6 +351,14 @@ class WorkingAttentionPager:
                 path.unlink(missing_ok=True)
                 self._pause("physical activity-page allocation exceeds the spill pool; context was not truncated")
             page.path = path
+            if quota is not None:
+                try:
+                    quota.commit(allocated, path=path)
+                except BaseException:
+                    path.unlink(missing_ok=True)
+                    quota.release()
+                    raise
+            page.quota_lease = quota
             page.digest = hashlib.sha256(payload).hexdigest()
             page.allocated_size = allocated
             self._spill_bytes += page.size
@@ -330,13 +394,15 @@ class WorkingAttentionPager:
             self._policy_at = 0.0
             if self._resource_status(size).get("memoryPressure"):
                 self._pause("activity page transfer paused at live RAM reserve")
-        page = _ActivityPage(
-            uuid.uuid4().hex,
-            tuple(int(value) for value in tensor.shape),
-            tensor.dtype,
-            int(size),
-            tensor.detach().to(device="cpu", copy=True).contiguous(),
-        )
+        reserve_ram = getattr(self.resource_policy, "reserve_ram", None)
+        reservation = reserve_ram(size, "working activity hot page") if callable(reserve_ram) else nullcontext()
+        with reservation as held:
+            page = _ActivityPage(
+                uuid.uuid4().hex, tuple(int(value) for value in tensor.shape), tensor.dtype, int(size),
+                tensor.detach().to(device="cpu", copy=True).contiguous(),
+            )
+            if held is not None:
+                held.mark_allocated(size)
         self._pages[page.identifier] = page
         self._hot[page.identifier] = None
         self._resident_bytes += page.size
@@ -422,6 +488,8 @@ class WorkingAttentionPager:
             self._resident_bytes -= page.size
         if page.path is not None:
             page.path.unlink(missing_ok=True)
+            if page.quota_lease is not None:
+                page.quota_lease.release()
             self._spill_bytes -= page.size
             self._allocated_spill_bytes -= page.allocated_size
             # Resource free-space samples include existing files. Signed
@@ -581,8 +649,124 @@ class PagedTensorSequence:
             pass
 
 
+@contextmanager
+def _saved_activity_scratch(
+    pager: WorkingAttentionPager, size: int, operation: str
+) -> Iterator[None]:
+    """Hold one bounded transfer, not the complete restored CPU activation."""
+    pager.admit_compute(size, operation, device=torch.device("cpu"))
+    reserve = getattr(pager.resource_policy, "reserve_ram", None)
+    if callable(reserve):
+        with reserve(size, operation):
+            yield
+    else:
+        yield
+
+
+class _SavedActivityImage:
+    """An immutable private image kept alive by its exported tensor storage.
+
+    It deliberately is not a normal pager page: pager.close() may retire the
+    saved graph while a tensor/view from an unpack operation is still alive.
+    The spill reservation is released only after the actual file is removed.
+    """
+
+    def __init__(
+        self,
+        pager: WorkingAttentionPager,
+        path: Path,
+        size: int,
+        digest: str,
+        lease: Any,
+    ):
+        self.pager = pager
+        self.path = path
+        self.size = int(size)
+        self.digest = digest
+        self.lease = lease
+        self.verified_stat: Optional[Tuple[int, int, int, int]] = None
+        self._closed = False
+
+    def verify(self) -> None:
+        self.pager.check_cancelled()
+        stat = self.path.stat()
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        if stat.st_size != self.size:
+            raise ValueError("saved activation image checksum or size mismatch")
+        if signature == self.verified_stat:
+            return
+        digest = hashlib.sha256()
+        block_bytes = max(1, min(256 * 1024, self.pager.device_tile_budget_bytes // 8))
+        with _saved_activity_scratch(self.pager, block_bytes * 2, "saved activation image verification"):
+            with self.path.open("rb", buffering=0) as handle:
+                while True:
+                    self.pager.check_cancelled()
+                    payload = handle.read(block_bytes)
+                    if not payload:
+                        break
+                    digest.update(payload)
+                    self.pager._metrics["bytesRead"] += len(payload)
+                    self.pager._metrics["largestReadBytes"] = max(
+                        self.pager._metrics["largestReadBytes"], len(payload)
+                    )
+        if digest.hexdigest() != self.digest:
+            raise ValueError("saved activation image checksum or size mismatch")
+        self.verified_stat = signature
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        # Mappings own this object. Its final close therefore happens after
+        # their OS mappings close, including on Windows where open mappings
+        # can prevent unlink. Never credit quota merely for dropping a tensor.
+        self.path.unlink(missing_ok=True)
+        self.lease.release()
+        self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # A failed removal remains charged by the independent spill lease;
+            # resource telemetry must not describe those bytes as free.
+            self.pager._metrics["savedActivationImageCleanupFailures"] = (
+                self.pager._metrics.get("savedActivationImageCleanupFailures", 0) + 1
+            )
+
+
+class _SavedActivityMapping(mmap.mmap):
+    """Writable-private CPU storage: mutations never rewrite the saved image."""
+
+    def __new__(cls, descriptor: int, size: int, owner: _SavedActivityImage):
+        result = super().__new__(cls, descriptor, size, access=mmap.ACCESS_COPY)
+        result._image_owner = owner
+        return result
+
+    def __init__(self, descriptor: int, size: int, owner: _SavedActivityImage):
+        # mmap construction takes place in __new__; keep extra owner arguments
+        # away from the platform mmap constructor.
+        pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Tensor storage owns the buffer until its last view is released.
+            # An explicit caller-owned exported buffer is not forcibly closed.
+            pass
+        finally:
+            self._image_owner = None
+
+
 class SavedActivityTensor:
-    """Lossless, page-bounded saved activation owned by an autograd graph."""
+    """Lossless bounded saved pages with file-backed CPU restoration.
+
+    A restored CPU tensor owns a private virtual mapping, not a complete new
+    anonymous allocation. Ordinary downstream tensor operators can still
+    require full outputs/gradients or fault resident pages; their admissions
+    remain the calling operator's responsibility. Accelerator restoration
+    retains an explicit complete-device-tensor minimum.
+    """
 
     def __init__(self, pager: WorkingAttentionPager, tensor: torch.Tensor):
         self.pager = pager
@@ -590,20 +774,32 @@ class SavedActivityTensor:
         self.dtype = tensor.dtype
         self.device = tensor.device
         self.numel = tensor.numel()
+        self.element_size = tensor.element_size()
         self.pages: List[str] = []
+        self._restore_image: Optional[_SavedActivityImage] = None
+        self._closed = False
         # A noncontiguous reshape can allocate a complete accelerator copy.
         # Recursively slice in logical row-major order *before* flattening.
         max_elements = max(1, pager.device_tile_budget_bytes // (4 * tensor.element_size()))
 
+        def flat_chunk(value: torch.Tensor) -> torch.Tensor:
+            result = value.contiguous().reshape(-1)
+            # PyTorch regards a singleton dimension as contiguous even when
+            # its stride is not one. A raw dtype-byte view still requires unit
+            # stride; normalize only this already bounded chunk.
+            if result.numel() and result.stride(0) != 1:
+                result = result.clone(memory_format=torch.contiguous_format)
+            return result
+
         def bounded_chunks(value: torch.Tensor) -> Iterator[torch.Tensor]:
             if value.numel() <= max_elements:
-                yield value.contiguous().reshape(-1)
+                yield flat_chunk(value)
                 return
             per_row = math.prod(value.shape[1:])
             if per_row <= max_elements:
                 rows = max(1, max_elements // max(1, per_row))
                 for start in range(0, value.shape[0], rows):
-                    yield value[start:start + rows].contiguous().reshape(-1)
+                    yield flat_chunk(value[start:start + rows])
             else:
                 for index in range(value.shape[0]):
                     yield from bounded_chunks(value[index])
@@ -615,22 +811,116 @@ class SavedActivityTensor:
             self.close()
             raise
 
+    def _cpu_image(self) -> _SavedActivityImage:
+        if self._restore_image is not None:
+            self._restore_image.verify()
+            return self._restore_image
+        size = self.numel * self.element_size
+        lease = self.pager.reserve_owned_spill(size, "saved activation CPU image")
+        path = self.pager.directory / (uuid.uuid4().hex + ".saved-activation")
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            lease.bind_path(path)
+            self.pager.directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb", buffering=0) as handle:
+                for identifier in self.pages:
+                    self.pager.check_cancelled()
+                    page_metadata = self.pager._pages[identifier]
+                    with _saved_activity_scratch(
+                        self.pager, page_metadata.size * 4, "bounded saved activation CPU image transfer"
+                    ):
+                        page = self.pager.read_page(identifier).reshape(-1)
+                        payload = memoryview(page.view(torch.uint8).numpy())
+                        if written + payload.nbytes > size:
+                            raise ValueError("saved activation pages exceed the exact tensor size")
+                        count = handle.write(payload)
+                        if count != payload.nbytes:
+                            raise OSError("saved activation image had a short bounded write")
+                        digest.update(payload)
+                        written += count
+                        self.pager._metrics["largestReadBytes"] = max(
+                            self.pager._metrics["largestReadBytes"], count
+                        )
+                        del payload, page
+                if written != size:
+                    raise ValueError("saved activation pages do not cover the exact tensor size")
+                handle.flush()
+            stat = path.stat()
+            blocks = getattr(stat, "st_blocks", None)
+            allocated = (
+                max(size, int(blocks) * 512)
+                if blocks is not None
+                else math.ceil(size / self.pager._allocation_unit) * self.pager._allocation_unit
+            )
+            lease.commit(actual_allocated_bytes=allocated, path=path)
+            image = _SavedActivityImage(self.pager, path, size, digest.hexdigest(), lease)
+            image.verified_stat = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            self._restore_image = image
+            self.pager._metrics["savedActivationImageBytesWritten"] = (
+                self.pager._metrics.get("savedActivationImageBytesWritten", 0) + size
+            )
+            return image
+        except BaseException:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                self.pager._metrics["savedActivationImageCleanupFailures"] = (
+                    self.pager._metrics.get("savedActivationImageCleanupFailures", 0) + 1
+                )
+            finally:
+                # A bound spill lease adopts an existing failed-cleanup file,
+                # rather than crediting its bytes as though unlink succeeded.
+                lease.release()
+            raise
+
     def restore(self, device: Optional[torch.device] = None) -> torch.Tensor:
-        target = self.device if device is None else device
-        size = self.numel * torch.empty((), dtype=self.dtype).element_size()
-        self.pager.admit_compute(size, "bounded saved-activation restore", device=target)
+        self.pager.check_cancelled()
+        if self._closed:
+            raise RuntimeError("cannot restore a released saved activation")
+        target = torch.device(self.device if device is None else device)
+        size = self.numel * self.element_size
+        if target.type == "cpu":
+            if self.numel == 0:
+                return torch.empty(self.shape, dtype=self.dtype, device=target)
+            image = self._cpu_image()
+            with image.path.open("rb") as handle:
+                mapping = _SavedActivityMapping(handle.fileno(), size, image)
+            # torch.frombuffer retains the actual mapping object through its
+            # storage deleter, so all derived views also retain file ownership.
+            # A byte storage view also preserves dtypes for which frombuffer's
+            # scalar dispatch is unavailable (for example newer float8 types).
+            result = torch.frombuffer(mapping, dtype=torch.uint8, count=size).view(self.dtype)
+            self.pager._metrics["cpuSavedActivationMappingCount"] = (
+                self.pager._metrics.get("cpuSavedActivationMappingCount", 0) + 1
+            )
+            return result.reshape(self.shape)
+        self.pager.admit_compute(size, "saved activation complete accelerator tensor minimum", device=target)
         result = torch.empty(self.numel, dtype=self.dtype, device=target)
         offset = 0
         for identifier in self.pages:
-            page = self.pager.read_page(identifier).reshape(-1)
-            result[offset:offset + page.numel()].copy_(page.to(device=target))
-            offset += page.numel()
+            metadata = self.pager._pages[identifier]
+            with _saved_activity_scratch(self.pager, metadata.size * 4, "bounded saved activation accelerator transfer"):
+                page = self.pager.read_page(identifier).reshape(-1)
+                if offset + page.numel() > self.numel:
+                    raise ValueError("saved activation pages exceed the exact tensor size")
+                result[offset:offset + page.numel()].copy_(page.to(device=target))
+                offset += page.numel()
+        if offset != self.numel:
+            raise ValueError("saved activation pages do not cover the exact tensor size")
         return result.reshape(self.shape)
 
     def close(self) -> None:
+        if self._closed:
+            return
         for identifier in self.pages:
             self.pager.release_page(identifier)
         self.pages.clear()
+        # Returned tensor storage, not this saved hook or pager, decides the
+        # immutable image lifetime. Dropping this reference does not unmap it.
+        self._restore_image = None
+        self._closed = True
 
     def __del__(self) -> None:
         try:

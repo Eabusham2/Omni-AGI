@@ -233,6 +233,7 @@ class NativeCorePager:
         reserve_admission: Optional[Callable[[int, torch.device], Any]] = None,
         resource_pause: Optional[Callable[[str, dict[str, Any]], BaseException]] = None,
         budget_provider: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+        resource_policy: Optional[Any] = None,
         chunk_bytes: int = TRANSFER_BYTES,
     ):
         self.directory = Path(directory)
@@ -242,6 +243,8 @@ class NativeCorePager:
         self.reserve_admission = reserve_admission
         self.resource_pause = resource_pause
         self.budget_provider = budget_provider
+        self.shared_resource_policy = resource_policy
+        self._quota_leases: dict[Path, Any] = {}
         self.chunk_bytes = max(8, int(chunk_bytes))
         self._owners: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._map_by_pointer: dict[int, Any] = {}
@@ -346,7 +349,16 @@ class NativeCorePager:
             self.reserve_disk(byte_count + promised, "native packed model spill")
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / (uuid.uuid4().hex + ".packed-page")
-        descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        reserve = getattr(self.shared_resource_policy, "reserve_spill", None)
+        quota = reserve(((byte_count + 65535) // 65536) * 65536, "native packed model spill") if callable(reserve) else None
+        if quota is not None:
+            quota.bind_path(path)
+        try:
+            descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except BaseException:
+            if quota is not None:
+                quota.release()
+            raise
         try:
             if hasattr(os, "posix_fallocate"):
                 os.posix_fallocate(descriptor, 0, byte_count)
@@ -356,8 +368,20 @@ class NativeCorePager:
         except BaseException:
             os.close(descriptor)
             path.unlink(missing_ok=True)
+            if quota is not None:
+                quota.release()
             raise
         os.close(descriptor)
+        if quota is not None:
+            try:
+                quota.commit(path=path, promised_bytes=byte_count, retain_open_backing=True)
+            except BaseException:
+                mapping.close()
+                path.unlink(missing_ok=True)
+                quota.release()
+                raise
+            self._quota_leases[path] = quota
+            weakref.finalize(mapping, quota.backing_closed)
         self._owned_files.add(path)
         owner.maps[name] = _Map(path, mapping, byte_count)
         self._mapping_handles.append((weakref.ref(mapping), byte_count, path))
@@ -375,15 +399,21 @@ class NativeCorePager:
             owner = self._owners.setdefault(module, _Owner())
             byte_count = math.prod(shape)
             if self._heap_bytes() + byte_count <= self.cpu_hot_bytes:
-                value = torch.empty(shape, dtype=torch.uint8)
+                reserve_ram = getattr(self.shared_resource_policy, "reserve_ram", None)
+                lease = reserve_ram(byte_count, "native packed hot owner") if callable(reserve_ram) else nullcontext()
+                with lease as held:
+                    value = torch.empty(shape, dtype=torch.uint8)
+                    if fill is not None:
+                        value.fill_(fill)
+                    if held is not None:
+                        held.mark_allocated(byte_count)
             else:
                 value = self._map_tensor(owner, name, shape, torch.uint8)
                 self._spill_bytes += byte_count
             owner.cold[name] = value
-            if fill is not None:
+            if fill is not None and name in owner.maps:
                 value.fill_(fill)
-                if name in owner.maps:
-                    owner.maps[name].dirty = True
+                owner.maps[name].dirty = True
             return value
 
     def attach(self, module: torch.nn.Module, *, loaded: bool) -> None:
@@ -536,9 +566,14 @@ class NativeCorePager:
                     self.reserve_admission(required, device)
                 admitted: dict[str, torch.Tensor] = {}
                 try:
-                    for name, value in owner.cold.items():
-                        admitted[name] = torch.empty_like(value, device=device)
-                        self._copy_bounded(value, admitted[name])
+                    reserve_ram = getattr(self.shared_resource_policy, "reserve_ram", None)
+                    reservation = reserve_ram(required, "native unified-memory packed admission") if callable(reserve_ram) and device.type != "cuda" else nullcontext()
+                    with reservation as held:
+                        for name, value in owner.cold.items():
+                            admitted[name] = torch.empty_like(value, device=device)
+                            self._copy_bounded(value, admitted[name])
+                        if held is not None:
+                            held.mark_allocated(required)
                 except BaseException:
                     admitted.clear()
                     raise
@@ -685,6 +720,9 @@ class NativeCorePager:
             # tensors remain valid, and residue is surfaced at close/status.
             return False
         self._owned_files.discard(path)
+        quota = self._quota_leases.pop(path, None)
+        if quota is not None:
+            quota.release()
         return True
 
     def promote_hot_to_budget(self) -> None:
@@ -708,8 +746,13 @@ class NativeCorePager:
                         continue
                     if self.reserve_admission is not None:
                         self.reserve_admission(byte_count, torch.device("cpu"))
-                    target = torch.empty_like(source, device="cpu")
-                    self._copy_bounded(source, target)
+                    reserve_ram = getattr(self.shared_resource_policy, "reserve_ram", None)
+                    reservation = reserve_ram(byte_count, "native cold-to-hot packed promotion") if callable(reserve_ram) else nullcontext()
+                    with reservation as held:
+                        target = torch.empty_like(source, device="cpu")
+                        self._copy_bounded(source, target)
+                        if held is not None:
+                            held.mark_allocated(byte_count)
                     owner.cold[name] = target
                     module._buffers[name] = target
                     del owner.maps[name]

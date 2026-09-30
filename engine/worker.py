@@ -264,6 +264,7 @@ class ChatSteeringState:
     successor_id: str = ""
     request_id: str = ""
     claimed: bool = False
+    observation_inbox: Optional[Any] = None
 
 
 @dataclass
@@ -505,10 +506,30 @@ class Worker:
 
     def dispatch_control(self, request: Any) -> Dict[str, Any]:
         if self.worker_role != "neural" or not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or \
-                request.get("method") not in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request"} or \
+                request.get("method") not in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action"} or \
                 not isinstance(request.get("id"), (str, int)) or not isinstance(request.get("params"), dict):
             raise RpcFault(-32600, "invalid flags-only worker control request")
         params = request["params"]
+        if request["method"] == "observe_chat_action":
+            brain_id = self._brain_id(params)
+            stream_id = params.get("streamId")
+            with self._steering_lock:
+                session = self._chat_steering.get((brain_id, stream_id))
+                if session is None or session.observation_inbox is None or session.requested.is_set() or self._cooperative_cancel.is_set():
+                    raise RpcFault(-32602, "tool observation does not own an open live chat")
+                from stdio_request_admission import retain_request_allocation
+                allocation = retain_request_allocation(request)
+                try:
+                    result = session.observation_inbox.offer(params.get("observation"), allocation)
+                    if not result.get("accepted") or result.get("duplicate"):
+                        if allocation is not None: allocation.release()
+                except (ValueError, UnicodeError) as error:
+                    if allocation is not None: allocation.release()
+                    raise RpcFault(-32602, str(error)) from error
+                except BaseException:
+                    if allocation is not None: allocation.release()
+                    raise
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
         if request["method"] == "cancel_artifact_request":
             with self._active_request_lock:
                 owner = getattr(self, "_artifact_request_owner", None)
@@ -1443,6 +1464,31 @@ class Worker:
             raise RpcFault(-32800, str(error), {"hardwareMeasurementCancelled": True, "safeBoundary": True}) from error
         except NeuralStateResourcePause as error:
             return {"available": False, "reason": "hardware-measurement-memory-admission", "status": error.status}
+
+    def _stdio_resource_policy(self):
+        """Read-only trusted global quota; never load/mutate a brain to parse RPC."""
+        policy = getattr(self, "_protocol_resource_policy", None)
+        if policy is None:
+            from omni_core.offload import ResourcePolicy
+            policy = self._protocol_resource_policy = ResourcePolicy(
+                self._default_root(), system_ram_share_percent=100,
+                include_accelerator_memory=False,
+                shared_resource_owner_id="stdio:%d" % os.getpid(),
+            )
+        return policy
+
+    def reserve_stdio_memory(self, byte_count: int, operation: str):
+        return self._stdio_resource_policy().reserve_ram(byte_count, operation)
+
+    def stdio_memory_headroom(self):
+        status = self._stdio_resource_policy().status()
+        if not status.get("ramAdmissionVerified"):
+            return 0
+        return max(0, min(
+            int(status["systemRamBudgetBytes"]) - int(status.get("admissionResidentMemoryBytes") or 0)
+            - int((status.get("sharedQuota") or {}).get("ramEscrowBytes", 0)),
+            int(status.get("availableMemoryBytes") or 0) - int(status.get("ramReserveBytes") or 0),
+        ))
 
     def configure_video_runtime(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -2415,6 +2461,7 @@ class Worker:
             return self._chat(params, request_id, session.requested.is_set)
         finally:
             with self._steering_lock:
+                if session.observation_inbox is not None: session.observation_inbox.close()
                 self._chat_steering.pop(key, None)
 
     def _chat(self, params: Dict[str, Any], request_id: Optional[str],
@@ -2447,6 +2494,18 @@ class Worker:
         sequence_lock = threading.Lock()
         inline_records: List[InlineGeneration] = []
         turn_id = stream_id or str(request_id or uuid.uuid4().hex)
+        from omni_core.chat_tool_observation import ChatToolObservationInbox
+        wait_ms = params.get("toolObservationWaitMs", 30_000)
+        if type(wait_ms) is not int or not 0 <= wait_ms <= (1 << 53) - 1:
+            raise RpcFault(-32602, "tool observation wait must be a nonnegative safe integer")
+        observation_inbox = ChatToolObservationInbox(brain.brain_id, turn_id,
+            lambda size: not brain.resource_policy.status(estimated_ram_bytes=size).get("memoryPressure"),
+            cancelled=lambda: self._cooperative_cancel.is_set() or bool(steer_check is not None and steer_check()),
+            wait_seconds=wait_ms / 1000.0,
+            reserve_parse=brain.resource_policy.reserve_ram)
+        with self._steering_lock:
+            session = self._chat_steering.get((brain.brain_id, turn_id))
+            if session is not None: session.observation_inbox = observation_inbox
         input_sha256 = hashlib.sha256(
             value.replace("\x00", "").strip().encode("utf-8")
         ).hexdigest()
@@ -2485,6 +2544,7 @@ class Worker:
                     raw_action = payload.get("action")
                     action = raw_action if isinstance(raw_action, dict) else None
                     action_id = str(payload.get("actionId", ""))
+                    if action is not None: observation_inbox.register(action_id, action)
                     self.notify(
                         "chat-action",
                         brain_id=brain.brain_id,
@@ -2509,6 +2569,7 @@ class Worker:
                         data={"preview": preview_value},
                     )
                 elif kind == "phase":
+                    observation_inbox.close()
                     if payload != {
                         "phase": "reply-complete-learning",
                         "replyComplete": True,
@@ -2580,6 +2641,7 @@ class Worker:
                 cancel_check=self._cooperative_cancel.is_set,
                 steer_check=steer_check,
                 temporary_steering_context=params.get("temporarySteeringContext"),
+                tool_observation_provider=observation_inbox,
             )
         except ChatGenerationCancelled as error:
             # The model raises this only at a pre-commit boundary. Preserve
@@ -3814,6 +3876,9 @@ class Worker:
             raise RpcFault(
                 -32602, "params.architectureChange must be an object"
             )
+        geometry_holdouts = params.get("geometryHoldouts")
+        if geometry_holdouts is not None and not isinstance(geometry_holdouts, dict):
+            raise RpcFault(-32602, "params.geometryHoldouts must be a typed object")
         try:
             result = NeuralEvolutionManager(brain).propose(
                 texts=texts,
@@ -3828,6 +3893,7 @@ class Worker:
                 objectives=objectives,
                 provenance=provenance,
                 architecture_change=architecture,
+                geometry_holdouts=geometry_holdouts,
                 progress=progress,
             )
         except ValueError as error:
@@ -3864,8 +3930,9 @@ class Worker:
             raise RpcFault(-32602, "params.candidateId is required")
         brain = self._get(params)
         try:
-            result = NeuralEvolutionManager(brain).promote(candidate_id)
-        except ValueError as error:
+            result = NeuralEvolutionManager(brain).promote(candidate_id,
+                geometry_authorization=params.get("geometryAuthorization"))
+        except (ValueError, PermissionError) as error:
             raise RpcFault(-32602, str(error)) from error
         previous = self.brains.pop(brain.brain_id, None)
         if previous is not None:

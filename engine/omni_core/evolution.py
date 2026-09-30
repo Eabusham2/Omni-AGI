@@ -20,15 +20,22 @@ from torch.nn import functional as F
 
 from .offload import copy_mutable_state_snapshot
 from .architecture_migration import (
+    architecture_mutation_policy,
     assert_architecture_quiescent,
     file_tensor_inventory,
     growth_dimensions,
+    geometry_candidate_config,
+    geometry_candidate_manifest,
     isolated_checkpoint_resident_bytes,
     normalize_architecture_change,
     preserve_runtime_rng,
     reseal_native_descriptor,
+    validate_geometry_candidate_manifest,
+    verify_geometry_checkpoint_migration,
     verify_preserved_tensor_prefixes,
 )
+from .native_architecture import validate_native_architecture
+from .registered_geometry_holdouts import load_registered_geometry_holdouts, register_geometry_holdouts
 from .bounded_tensor_io import BoundedTensorFile
 from .evolution_anchors import RetentionAnchorFile, save_retention_anchors
 from .persistence import (
@@ -98,6 +105,9 @@ def _benchmark_payload(manifest: Mapping[str, Any]) -> Dict[str, Any]:
     # additionally bind complete metadata/context/lineage against tampering.
     if "parentMetadataSha256" in manifest:
         payload["parentMetadataSha256"] = manifest["parentMetadataSha256"]
+    for key in ("geometryRetentionPolicy", "geometryMigration", "geometryHoldouts"):
+        if key in manifest:
+            payload[key] = manifest[key]
     return payload
 
 
@@ -113,6 +123,107 @@ def _validate_json(value: Any, label: str) -> Any:
     except (TypeError, ValueError) as error:
         raise ValueError("%s must contain JSON-safe finite values" % label) from error
     return json.loads(serialized)
+
+
+def _utf8_fingerprint(text: str) -> Dict[str, Any]:
+    digest, count = hashlib.sha256(), 0
+    for start in range(0, len(text), 65536):
+        block = text[start:start + 65536].encode("utf-8")
+        digest.update(block); count += len(block)
+    return {"sha256": digest.hexdigest(), "utf8Bytes": count}
+
+
+def _geometry_training_complete(training, *, epochs, fingerprints, latent_replay,
+    insertion_parameter_checksum, candidate_parameter_checksum):
+    """A migration/receipt alone is never evidence of completed native learning."""
+    if not isinstance(training, Mapping) or training.get("promoted") is not True:
+        return False
+    if (type(training.get("steps")) is not int or training["steps"] < 1
+        or any(training.get(flag) for flag in ("disabled", "cancelled", "canceled", "paused", "incomplete", "resourcePaused"))
+        or training.get("status") in {"paused", "cancelled", "canceled", "partial", "failed"}
+        or training.get("mode") == "function-preserving-architecture-insertion"):
+        return False
+    if fingerprints:
+        sequence = training.get("trainingSequenceTokens")
+        if (type(sequence) is not int or sequence < 2 or type(training.get("epochs")) is not int or training["epochs"] != epochs
+            or type(training.get("samples")) is not int or training["samples"] != len(fingerprints)
+            or training["steps"] != epochs * sum(item["utf8Bytes"] // (sequence - 1) + 1 for item in fingerprints)):
+            return False
+    elif not latent_replay or training["steps"] != epochs or type(training.get("replayExamples")) is not int or training["replayExamples"] < 1:
+        return False
+    loss = training.get("meanLoss")
+    if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+        return False
+    for checksum in (insertion_parameter_checksum, candidate_parameter_checksum):
+        if not isinstance(checksum, str) or len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum):
+            return False
+    return (training.get("parameterChecksumBefore") == insertion_parameter_checksum
+        and training.get("parameterChecksumAfter") == candidate_parameter_checksum
+        and insertion_parameter_checksum != candidate_parameter_checksum)
+
+
+def _geometry_holdout_metrics(candidate, fingerprints, expected_benchmark_sha256=None, cancel_check=None):
+    registered = load_registered_geometry_holdouts(candidate.engine_path, cancelled=cancel_check)
+    measure = getattr(candidate, "evaluate_isolated_geometry_holdouts", None)
+    if not callable(measure):
+        from .geometry_holdout_evaluation import evaluate_isolated_geometry_holdouts
+        measure = lambda **kwargs: evaluate_isolated_geometry_holdouts(candidate, **kwargs)
+    value = _validate_json(measure(excluded_text_sha256=[item["sha256"] for item in fingerprints],
+        expected_benchmark_sha256=expected_benchmark_sha256, registered_manifest=registered,
+        cancelled=cancel_check), "native geometry holdouts")
+    if (not isinstance(value, Mapping) or set(value) != {"format", "formatVersion", "benchmarkSha256", "token", "modality", "tool", "resources"}
+        or value["format"] != "omni-native-geometry-holdouts" or type(value["formatVersion"]) is not int or value["formatVersion"] != 1):
+        raise ValueError("native geometry held-out measurement schema is invalid")
+    digest = value["benchmarkSha256"]
+    if (not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
+        or digest != registered["benchmarkSha256"]
+        or expected_benchmark_sha256 is not None and digest != expected_benchmark_sha256):
+        raise ValueError("native geometry held-out benchmark identity changed")
+    for category in ("token", "modality", "tool"):
+        metric = value[category]
+        if (not isinstance(metric, Mapping) or set(metric) != {"sourceSha256", "loss", "examples", "heldOut", "trainingOverlapCount"}
+            or metric["heldOut"] is not True or type(metric["trainingOverlapCount"]) is not int or metric["trainingOverlapCount"] != 0
+            or type(metric["examples"]) is not int or metric["examples"] < 1
+            or isinstance(metric["loss"], bool) or not isinstance(metric["loss"], (int, float))
+            or not math.isfinite(metric["loss"]) or metric["loss"] < 0):
+            raise ValueError("geometry " + category + " holdout is missing, overlapped, empty or nonfinite")
+        source_sha = metric["sourceSha256"]
+        if (not isinstance(source_sha, str) or len(source_sha) != 64 or any(character not in "0123456789abcdef" for character in source_sha)
+            or source_sha in {item["sha256"] for item in fingerprints}):
+            raise ValueError("geometry " + category + " holdout source identity is invalid or part of training")
+        if (source_sha != registered["categories"][category]["sourceSha256"]
+            or metric["examples"] != registered["categories"][category]["examples"]):
+            raise ValueError("geometry " + category + " holdout did not traverse every registered record")
+    after = load_registered_geometry_holdouts(candidate.engine_path, cancelled=cancel_check)
+    if after != registered:
+        raise ValueError("registered geometry holdout data changed during native evaluation")
+    resources = value["resources"]
+    if (not isinstance(resources, Mapping) or set(resources) != {"withinSelectedEnvelope", "peakManagedMemoryBytes", "peakAcceleratorMemoryBytes"}
+        or type(resources["withinSelectedEnvelope"]) is not bool
+        or type(resources["peakManagedMemoryBytes"]) is not int or resources["peakManagedMemoryBytes"] < 1
+        or type(resources["peakAcceleratorMemoryBytes"]) is not int or resources["peakAcceleratorMemoryBytes"] < 0):
+        raise ValueError("geometry holdout lacks measured resource-envelope evidence")
+    return value
+
+
+def _geometry_holdout_checks(baseline, candidate):
+    limits = {"token": 1.05, "modality": 1.10, "tool": 1.05}
+    checks = {}
+    for category, tolerance in limits.items():
+        old, new = baseline[category], candidate[category]
+        checks["heldOut" + category.title()] = (old["sourceSha256"] == new["sourceSha256"]
+            and old["examples"] == new["examples"] and new["loss"] <= old["loss"] * tolerance + 1e-6)
+    checks["heldOutResources"] = candidate["resources"]["withinSelectedEnvelope"] is True
+    return checks
+
+
+def _geometry_promotion_authorized(authorization, candidate_id, evaluation, state_checksum):
+    return (isinstance(authorization, Mapping)
+        and set(authorization) == {"mode", "approved", "candidateId", "evaluationSha256", "candidateStateChecksum"}
+        and authorization["mode"] in {"ask", "full-authority"} and authorization["approved"] is True
+        and authorization["candidateId"] == candidate_id
+        and authorization["evaluationSha256"] == evaluation.get("evaluationSha256")
+        and authorization["candidateStateChecksum"] == state_checksum)
 
 
 def _bundle_checksum(engine_path: Path) -> str:
@@ -176,6 +287,7 @@ def _architecture_signature(engine_path: Path) -> Dict[str, Any]:
                 or name.startswith("plasticity:router.")
             )
         },
+        "tensorInventory": {name: {"shape": tensor["shape"], "dtype": tensor["dtype"]} for name, tensor in sorted(tensors.items())},
         "expertCount": int(metadata.get("expert_count", 0)),
         "expertFormat": "ternary-residual-expert-v1",
         "layers": int(metadata.get("config", {}).get("n_layers", 0)),
@@ -207,7 +319,31 @@ def _architecture_compatible(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
     mutation: Optional[Mapping[str, Any]],
+    geometry_inventory: Optional[Mapping[str, Any]] = None,
 ) -> bool:
+    if mutation is not None and mutation.get("mutation") in {"resize-width", "repartition-heads"}:
+        try:
+            before_geometry = {key: baseline["headGeometry"][key] for key in ("d_model", "d_ff", "n_heads", "idea_dim")}
+            proposed = geometry_candidate_config(before_geometry, mutation)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (any(candidate.get("headGeometry", {}).get(key) != proposed[key] for key in proposed)
+            or baseline.get("headGeometry", {}).get("vsa_dim") != candidate.get("headGeometry", {}).get("vsa_dim")
+            or baseline.get("protectedGeometry") != candidate.get("protectedGeometry")
+            or any(baseline.get(key) != candidate.get(key) for key in ("expertCount", "expertFormat", "layers", "routerNeurons", "expertRoutingBaselineCount"))
+            or not isinstance(geometry_inventory, Mapping)):
+            return False
+        old, new = baseline.get("tensorInventory"), candidate.get("tensorInventory")
+        if not isinstance(old, Mapping) or not isinstance(new, Mapping) or set(old) != set(new) or set(geometry_inventory) - set(old):
+            return False
+        for name, source in old.items():
+            owner = geometry_inventory.get(name)
+            if owner is None:
+                if source != new[name]: return False
+            elif (not isinstance(owner, Mapping) or source != {"shape": owner.get("oldShape"), "dtype": owner.get("dtype")}
+                or new[name] != {"shape": owner.get("newShape"), "dtype": owner.get("dtype")}):
+                return False
+        return True
     if baseline.get("headGeometry") != candidate.get("headGeometry"):
         return False
     if baseline.get("protectedGeometry") != candidate.get("protectedGeometry"):
@@ -405,15 +541,23 @@ class NeuralEvolutionManager:
         return sum(losses) / float(len(losses))
 
     @staticmethod
-    def _latent_loss(brain: Any, anchors: RetentionAnchorFile) -> float:
+    def _latent_loss(brain: Any, anchors: RetentionAnchorFile, common_width: Optional[int] = None) -> float:
         if anchors.numel() == 0:
             return 0.0
         width = int(anchors.shape[1])
+        target_width = int(getattr(getattr(brain, "config", None), "idea_dim", width))
+        if common_width is None and target_width != width:
+            raise ValueError("retention geometry changed without a declared coordinate comparison policy")
+        declared_common = width if common_width is None else int(common_width)
+        if not 1 <= declared_common <= min(width, target_width):
+            raise ValueError("retention comparison exceeds the shared idea coordinate geometry")
+        reference_width = min(width, target_width)
+        resident_width = max(width, target_width)
         pager = getattr(brain.decoder, "working_attention_pager", None)
         compute = int(getattr(pager, "device_tile_budget_bytes", 1_048_576))
         # Include hidden/normalization/output and transfer lifetimes, not just
         # the input row. Admission never cuts the corpus to fit a reservation.
-        batch_rows = min(32, compute // max(1, width * 4 * 32))
+        batch_rows = min(32, compute // max(1, resident_width * 4 * 32))
         if batch_rows < 1:
             raise RuntimeError("retention evaluation paused: one idea row exceeds compute reservation")
         brain.idea_adapter.eval()
@@ -421,7 +565,17 @@ class NeuralEvolutionManager:
         with torch.no_grad():
             for batch in anchors.batches(max_rows=batch_rows, byte_budget=max(width * 4, min(1_048_576, compute // 32)), policy=getattr(brain, "resource_policy", None)):
                 values = batch.to(brain.device)
-                total += float(F.mse_loss(brain.idea_adapter(values), values, reduction="sum").item())
+                inputs = values
+                if target_width != width:
+                    inputs = torch.zeros((values.shape[0], target_width), dtype=values.dtype, device=values.device)
+                    inputs[:, :min(width, target_width)].copy_(values[:, :min(width, target_width)])
+                output = brain.idea_adapter(inputs)
+                # Score every original parent coordinate. Narrowed-away axes
+                # reconstruct as zero and contribute their full residual;
+                # newly added zero coordinates never dilute the denominator.
+                total += float(F.mse_loss(output[:, :reference_width], values[:, :reference_width], reduction="sum").item())
+                if reference_width < width:
+                    total += float(values[:, reference_width:].square().sum().item())
                 elements += values.numel()
         return total / elements
 
@@ -458,11 +612,140 @@ class NeuralEvolutionManager:
         manifest = read_json(manifest_path)
         if _file_sha256(tensors_path) != manifest.get("anchorTensorSha256"):
             raise ValueError("candidate immutable baseline tensors failed verification")
-        anchors = RetentionAnchorFile(tensors_path, expected_width=int(self.brain.config.idea_dim))
+        anchor_width = manifest.get("architecture", {}).get("headGeometry", {}).get("idea_dim", self.brain.config.idea_dim)
+        anchors = RetentionAnchorFile(tensors_path, expected_width=int(anchor_width))
         expected_benchmark = _json_sha256(_benchmark_payload(manifest))
         if expected_benchmark != manifest.get("benchmarkSha256"):
             raise ValueError("candidate immutable benchmark hash failed verification")
         return manifest, anchors
+
+    def _require_isolated_candidate(self, candidate, model_engine):
+        if (candidate is self.brain or Path(candidate.engine_path).resolve() != Path(model_engine).resolve()
+            or Path(model_engine).resolve() == Path(self.engine_path).resolve()):
+            raise RuntimeError("geometry/evolution operations require an isolated loaded candidate, never the live parent")
+
+    def _prepare_geometry_candidate(self, candidate, candidate_id, candidate_dir, model_engine,
+        mutation, baseline_manifest, baseline_manifest_path, cancel_check=None):
+        self._require_isolated_candidate(candidate, model_engine)
+        assert_architecture_quiescent(candidate)
+        apply = getattr(candidate, "apply_isolated_geometry_candidate", None)
+        if not callable(apply):
+            raise RuntimeError("isolated native geometry migration is unavailable; no candidate success was recorded")
+        canonical = {key: value for key, value in mutation.items() if key != "compatibilityBoundary"}
+        result = apply(canonical, candidate_id, cancelled=cancel_check)
+        if (not isinstance(result, Mapping) or result.get("mutation") != canonical
+            or result.get("functionPreserved") is not False
+            or any(not isinstance(result.get(key), Mapping) for key in ("oldGeometry", "newGeometry", "tensorProofs", "ownerInventory"))):
+            raise ValueError("isolated geometry callback lacks exact mutation/owner migration evidence")
+        candidate.save()
+        stable = candidate_dir / "stable"
+        old_metadata, new_metadata = read_json(stable / "brain.json"), read_json(model_engine / "brain.json")
+        old_config, new_config = old_metadata["config"], new_metadata["config"]
+        old_geometry = {key: old_config[key] for key in ("d_model", "d_ff", "n_heads", "idea_dim")}
+        new_geometry = {key: new_config[key] for key in old_geometry}
+        if dict(result["oldGeometry"]) != old_geometry or dict(result["newGeometry"]) != new_geometry:
+            raise ValueError("geometry callback geometry does not match the actual parent/candidate metadata")
+        parent_descriptor = validate_native_architecture(old_config.get("native_architecture"))
+        candidate_descriptor = validate_native_architecture(new_config.get("native_architecture"))
+        root_sha = parent_descriptor.get("evolutionLineage", {}).get("rootArchitectureSha256", parent_descriptor["sha256"])
+        manifest = geometry_candidate_manifest(candidate_id=candidate_id,
+            parent_metadata_sha256=baseline_manifest["parentMetadataSha256"],
+            parent_architecture_sha256=parent_descriptor["sha256"], root_architecture_sha256=root_sha,
+            candidate_architecture_sha256=candidate_descriptor["sha256"], mutation=canonical,
+            old_geometry=old_geometry, new_geometry=new_geometry, tensor_proofs=result["tensorProofs"],
+            owner_inventory=result["ownerInventory"])
+        if not _architecture_compatible(baseline_manifest["architecture"], _architecture_signature(model_engine),
+            canonical, manifest["ownerInventory"]):
+            raise ValueError("geometry candidate changed unavailable or undeclared architecture owners")
+        insertion = candidate_dir / "geometry-insertion"
+        self.brain.resource_policy.require_disk(snapshot_required_bytes(model_engine), "immutable geometry insertion evidence")
+        snapshot_files(model_engine, insertion)
+        proof = verify_geometry_checkpoint_migration(stable, insertion, manifest)
+        manifest_path = candidate_dir / "geometry-migration.json"
+        atomic_write_json(manifest_path, manifest)
+        seal = {"manifestSha256": _file_sha256(manifest_path),
+            "insertionStateChecksum": _bundle_checksum(insertion),
+            "insertionMetadataSha256": _file_sha256(insertion / "brain.json"),
+            "insertionParameterChecksum": candidate.parameter_checksum()}
+        baseline_manifest["geometryMigration"] = seal
+        baseline_manifest["benchmarkSha256"] = _json_sha256(_benchmark_payload(baseline_manifest))
+        atomic_write_json(baseline_manifest_path, baseline_manifest)
+        architecture_result = {**mutation, "functionPreserved": False,
+            "normalizationAndHeadGeometryChanged": True, "qualityVerified": False,
+            "preservedBeforeTraining": proof, "geometryMigration": seal,
+            "geometryMigrationManifest": "geometry-migration.json",
+            "geometryInsertionCheckpoint": "geometry-insertion/",
+            "geometryRetentionPolicy": baseline_manifest["geometryRetentionPolicy"]}
+        self.brain._record_candidate(candidate_dir,
+            architectureMutation=architecture_result, baselineManifestSha256=_file_sha256(baseline_manifest_path),
+            benchmarkSha256=baseline_manifest["benchmarkSha256"], geometryMigration=seal)
+        return architecture_result
+
+    def _load_geometry_migration(self, candidate_dir, record, baseline):
+        seal = baseline.get("geometryMigration")
+        if (not isinstance(seal, Mapping) or set(seal) != {"manifestSha256", "insertionStateChecksum", "insertionMetadataSha256", "insertionParameterChecksum"}
+            or record.get("geometryMigration") != seal):
+            raise ValueError("geometry candidate lost its independently bound insertion/training seal")
+        manifest_path, insertion = candidate_dir / "geometry-migration.json", candidate_dir / "geometry-insertion"
+        if _file_sha256(manifest_path) != seal["manifestSha256"]:
+            raise ValueError("geometry migration manifest failed immutable verification")
+        parent = read_json(candidate_dir / "stable" / "brain.json")
+        if (_file_sha256(candidate_dir / "stable" / "brain.json") != baseline["parentMetadataSha256"]
+            or _bundle_checksum(candidate_dir / "stable") != baseline["parentStateChecksum"]):
+            raise ValueError("geometry immutable parent snapshot changed")
+        parent_descriptor = validate_native_architecture(parent["config"].get("native_architecture"))
+        root_sha = parent_descriptor.get("evolutionLineage", {}).get("rootArchitectureSha256", parent_descriptor["sha256"])
+        manifest = validate_geometry_candidate_manifest(read_json(manifest_path),
+            parent_metadata_sha256=baseline["parentMetadataSha256"], root_architecture_sha256=root_sha)
+        if (manifest["candidateId"] != record["id"] or manifest["parentArchitectureSha256"] != parent_descriptor["sha256"]
+            or manifest["mutation"] != {key: item for key, item in baseline["architectureMutation"].items() if key != "compatibilityBoundary"}
+            or _file_sha256(insertion / "brain.json") != seal["insertionMetadataSha256"]
+            or _bundle_checksum(insertion) != seal["insertionStateChecksum"]):
+            raise ValueError("geometry insertion checkpoint does not bind its exact native parent/candidate")
+        descriptor = validate_native_architecture(read_json(insertion / "brain.json")["config"].get("native_architecture"))
+        if descriptor["sha256"] != manifest["candidateArchitectureSha256"]:
+            raise ValueError("geometry insertion architecture identity changed")
+        verify_geometry_checkpoint_migration(candidate_dir / "stable", insertion, manifest)
+        return manifest
+
+    def _load_geometry_training(self, candidate_id, candidate_dir, record, baseline):
+        path = self.baselines_path / (candidate_id + ".trained.json")
+        if not path.is_file() or _file_sha256(path) != record.get("geometryTrainingMeasurementSha256"):
+            raise ValueError("geometry candidate lacks independently bound completed training measurements")
+        value = read_json(path)
+        body = {key: item for key, item in value.items() if key != "contentSha256"}
+        if (value.get("format") != "omni-isolated-geometry-trained-measurement" or value.get("formatVersion") != 1
+            or value.get("candidateId") != candidate_id or _json_sha256(body) != value.get("contentSha256")
+            or value.get("benchmarkSha256") != baseline["benchmarkSha256"]
+            or value.get("geometryManifestSha256") != baseline["geometryMigration"]["manifestSha256"]
+            or value.get("functionPreserved") is not False or value.get("training") != record.get("training")):
+            raise ValueError("geometry training measurement identity or receipt was altered")
+        model_engine = self._model_path(candidate_dir) / "engine"
+        if (value.get("candidateStateChecksum") != _bundle_checksum(model_engine)
+            or value.get("candidateMetadataSha256") != _file_sha256(model_engine / "brain.json")
+            or value.get("candidateParameterChecksum") != record.get("candidateParameterChecksum")):
+            raise ValueError("geometry trained measurement no longer binds the actual checkpoint")
+        if not _geometry_training_complete(value["training"], epochs=record["epochs"],
+            fingerprints=baseline["objectiveTextFingerprints"], latent_replay=record.get("latentReplay", False),
+            insertion_parameter_checksum=baseline["geometryMigration"]["insertionParameterChecksum"],
+            candidate_parameter_checksum=value["candidateParameterChecksum"]):
+            raise ValueError("geometry candidate did not finish real requested native training")
+        return value
+
+    def _load_geometry_evaluation(self, candidate_id, record):
+        path = self.baselines_path / (candidate_id + ".evaluation.json")
+        if not path.is_file() or _file_sha256(path) != record.get("evaluationFileSha256"):
+            raise ValueError("geometry promotion requires independently recorded actual evaluation evidence")
+        evaluation = read_json(path)
+        if (evaluation != record.get("evaluation") or evaluation.get("passed") is not True
+            or _json_sha256({key: value for key, value in evaluation.items() if key != "evaluationSha256"}) != evaluation.get("evaluationSha256")
+            or any(evaluation.get("checks", {}).get(key) is not True for key in (
+                "integrity", "architectureCompatible", "geometryMigrationVerified", "trainingCompleted",
+                "resources", "ternaryCoverage", "objectiveNonRegression", "capabilityRetention", "neuralRetention", "changed"))):
+            raise ValueError("geometry evaluation/promotion gates are incomplete or were altered")
+        if any(evaluation.get("checks", {}).get(key) is not True for key in ("heldOutToken", "heldOutModality", "heldOutTool", "heldOutResources")):
+            raise ValueError("geometry evaluation lacks passing held-out token/modality/tool/resource metrics")
+        return evaluation
 
     def propose(
         self,
@@ -476,11 +759,17 @@ class NeuralEvolutionManager:
         provenance: Optional[Mapping[str, Any]] = None,
         architecture_change: Optional[Mapping[str, Any]] = None,
         progress: Optional[Any] = None,
+        cancel_check: Optional[Any] = None,
+        geometry_holdouts: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         assert_architecture_quiescent(self.brain)
         architecture_mutation = _normalize_architecture_change(
             architecture_change
         )
+        geometry_change = architecture_mutation is not None and architecture_mutation_policy(architecture_mutation)["geometryChanges"]
+        if geometry_holdouts is not None:
+            if not geometry_change: raise ValueError("explicit geometry holdouts are scoped to geometry candidates")
+            register_geometry_holdouts(self.brain, geometry_holdouts, cancelled=cancel_check)
         candidate_type = (
             "architecture" if architecture_mutation is not None else "neural"
         )
@@ -561,6 +850,7 @@ class NeuralEvolutionManager:
             candidate = AdaptiveBrain.load(
                 model_path, expected_brain_id=self.brain.brain_id
             )
+            self._require_isolated_candidate(candidate, model_engine)
             source_lookup = {
                 str(source.get("id")): source
                 for source in candidate.training_sources
@@ -581,6 +871,8 @@ class NeuralEvolutionManager:
                 )
             # Stable de-duplication preserves caller order.
             clean_texts = list(dict.fromkeys(clean_texts))
+            if geometry_change and not clean_texts and not latent_replay:
+                raise ValueError("geometry candidates require real text training or nonempty native latent replay")
             if (
                 not clean_texts
                 and not latent_replay
@@ -595,17 +887,29 @@ class NeuralEvolutionManager:
             if (
                 latent_replay
                 and anchors.numel() == 0
-                and architecture_mutation is None
+                and (architecture_mutation is None or geometry_change)
             ):
                 raise ValueError("latent replay is unavailable because replay is empty")
+
+            common_width, geometry_retention = None, None
+            if geometry_change:
+                old_geometry = {key: getattr(candidate.config, key) for key in ("d_model", "d_ff", "n_heads", "idea_dim")}
+                new_geometry = geometry_candidate_config(old_geometry, architecture_mutation)
+                old_width, new_width = int(old_geometry["idea_dim"]), int(new_geometry["idea_dim"])
+                common_width = min(old_width, new_width)
+                geometry_retention = {"basis": "all-parent-idea-coordinates-with-explicit-missing-axis-residual", "parentWidth": old_width,
+                    "candidateWidth": new_width, "comparedWidth": common_width,
+                    "unmappedParentCoordinates": old_width - common_width, "newCoordinates": new_width - common_width,
+                    "newInputCoordinates": "zero", "missingCoordinateResidual": "squared-reference-against-zero",
+                    "scoredParentCoordinates": old_width, "allAnchorRowsCompared": True, "functionPreserved": False}
 
             baseline_objective = (
                 self._objective_loss(candidate, clean_texts)
                 if clean_texts
-                else self._latent_loss(candidate, anchors)
+                else self._latent_loss(candidate, anchors, common_width)
             )
             baseline_capability = self._capability_loss(candidate)
-            baseline_retention = self._latent_loss(candidate, anchors)
+            baseline_retention = self._latent_loss(candidate, anchors, common_width)
             baseline_resources = _tensor_resources(candidate_dir / "stable")
             architecture = _architecture_signature(candidate_dir / "stable")
             anchor_sha = _file_sha256(baseline_tensor_path)
@@ -620,13 +924,7 @@ class NeuralEvolutionManager:
                 "parentStateChecksum": parent_state_checksum,
                 "parentMetadataSha256": parent_metadata_sha256,
                 "objectives": objective_names,
-                "objectiveTextFingerprints": [
-                    {
-                        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                        "utf8Bytes": len(text.encode("utf-8")),
-                    }
-                    for text in clean_texts
-                ],
+                "objectiveTextFingerprints": [_utf8_fingerprint(text) for text in clean_texts],
                 "sourceIds": selected_sources,
                 "baselineObjectiveLoss": baseline_objective,
                 "baselineCapabilityLoss": baseline_capability,
@@ -638,6 +936,11 @@ class NeuralEvolutionManager:
                 "anchorTensorSha256": anchor_sha,
                 "provenanceSha256": _json_sha256(safe_provenance),
             }
+            if geometry_retention is not None:
+                baseline_manifest["geometryRetentionPolicy"] = geometry_retention
+                baseline_manifest["geometryHoldouts"] = _geometry_holdout_metrics(candidate, baseline_manifest["objectiveTextFingerprints"], cancel_check=cancel_check)
+                if candidate.parameter_checksum() != parent_parameter_checksum:
+                    raise ValueError("geometry baseline evaluator mutated authoritative neural parameters")
             baseline_manifest["benchmarkSha256"] = _json_sha256(_benchmark_payload(baseline_manifest))
             atomic_write_json(baseline_manifest_path, baseline_manifest)
             baseline_manifest_sha = _file_sha256(baseline_manifest_path)
@@ -650,7 +953,12 @@ class NeuralEvolutionManager:
             if progress is not None:
                 progress(0.15, "Immutable neural baseline captured")
             architecture_result = None
-            if architecture_mutation is not None:
+            if geometry_change:
+                architecture_result = self._prepare_geometry_candidate(candidate, candidate_id, candidate_dir, model_engine,
+                    architecture_mutation, baseline_manifest, baseline_manifest_path, cancel_check=cancel_check)
+                if progress is not None:
+                    progress(0.2, "Isolated geometry migrated exactly; training and evaluation remain required")
+            elif architecture_mutation is not None:
                 assert_architecture_quiescent(candidate)
                 candidate.core_pager.flush()
                 kind = architecture_mutation["mutation"]
@@ -784,6 +1092,8 @@ class NeuralEvolutionManager:
                     ),
                 )
             else:
+                if geometry_change:
+                    raise ValueError("geometry insertion is not training; the requested native learner is unavailable")
                 training = {
                     "promoted": True,
                     "mode": "function-preserving-architecture-insertion",
@@ -797,10 +1107,10 @@ class NeuralEvolutionManager:
             final_objective = (
                 self._objective_loss(candidate, clean_texts)
                 if clean_texts
-                else self._latent_loss(candidate, anchors)
+                else self._latent_loss(candidate, anchors, common_width)
             )
             final_capability = self._capability_loss(candidate)
-            final_retention = self._latent_loss(candidate, anchors)
+            final_retention = self._latent_loss(candidate, anchors, common_width)
             candidate_state_checksum = _bundle_checksum(model_engine)
             candidate_metadata_sha256 = _file_sha256(model_engine / "brain.json")
             candidate_parameter_checksum = candidate.parameter_checksum()
@@ -815,11 +1125,30 @@ class NeuralEvolutionManager:
             ]
             changed = candidate_state_checksum != parent_state_checksum
             training_promoted = bool(training.get("promoted", False))
+            if geometry_change:
+                training_promoted = _geometry_training_complete(training, epochs=epochs,
+                    fingerprints=baseline_manifest["objectiveTextFingerprints"], latent_replay=bool(latent_replay),
+                    insertion_parameter_checksum=baseline_manifest["geometryMigration"]["insertionParameterChecksum"],
+                    candidate_parameter_checksum=candidate_parameter_checksum)
+            training_measurement_sha = None
+            if geometry_change and training_promoted:
+                measurement = {"format": "omni-isolated-geometry-trained-measurement", "formatVersion": 1,
+                    "candidateId": candidate_id, "benchmarkSha256": baseline_manifest["benchmarkSha256"],
+                    "geometryManifestSha256": baseline_manifest["geometryMigration"]["manifestSha256"],
+                    "candidateStateChecksum": candidate_state_checksum, "candidateMetadataSha256": candidate_metadata_sha256,
+                    "candidateParameterChecksum": candidate_parameter_checksum, "training": training,
+                    "candidateObjectiveLoss": final_objective, "candidateCapabilityLoss": final_capability,
+                    "candidateRetentionLoss": final_retention, "functionPreserved": False}
+                measurement["contentSha256"] = _json_sha256(measurement)
+                measurement_path = self.baselines_path / (candidate_id + ".trained.json")
+                atomic_write_json(measurement_path, measurement)
+                training_measurement_sha = _file_sha256(measurement_path)
             status = "ready" if training_promoted and changed and not unsafe_files else "rejected"
             rejection = ""
             if not training_promoted:
                 rejection = str(
-                    training.get("rejection", "isolated training did not pass")
+                    training.get("rejection") or ("geometry candidate did not complete the requested native learning/parameter update"
+                        if geometry_change else "isolated training did not pass")
                 )
             elif not changed:
                 rejection = "candidate produced no neural-state change"
@@ -838,6 +1167,7 @@ class NeuralEvolutionManager:
                 candidateDeltaNorm=diff_norm,
                 candidateDeltaNormBasis="encoded-checkpoint-state-diff-not-learning-magnitude",
                 training=training,
+                **({"geometryTrainingMeasurementSha256": training_measurement_sha} if geometry_change else {}),
                 preliminaryMetrics={
                     "baselineObjectiveLoss": baseline_objective,
                     "candidateObjectiveLoss": final_objective,
@@ -877,7 +1207,8 @@ class NeuralEvolutionManager:
                 },
             )
             if progress is not None:
-                progress(1.0, "Isolated neural candidate ready")
+                progress(1.0 if status == "ready" else 0.85,
+                    "Isolated neural candidate ready" if status == "ready" else "Isolated candidate rejected: " + rejection)
             return result
         except Exception as error:
             self.brain._record_candidate(
@@ -889,7 +1220,8 @@ class NeuralEvolutionManager:
             raise
         finally:
             try:
-                if candidate is not None:
+                if (candidate is not None and candidate is not self.brain
+                    and Path(candidate.engine_path).resolve() == model_engine.resolve()):
                     candidate.close()
             finally:
                 candidate_rng.__exit__(None, None, None)
@@ -902,6 +1234,8 @@ class NeuralEvolutionManager:
                 % record.get("status")
             )
         baseline, anchors = self._load_baseline(candidate_id, record)
+        architecture_mutation = baseline.get("architectureMutation")
+        geometry_change = architecture_mutation is not None and architecture_mutation_policy(architecture_mutation)["geometryChanges"]
         model_path = self._model_path(candidate_dir)
         from .brain import AdaptiveBrain
         self._admit_isolated_load(model_path / "engine")
@@ -911,6 +1245,7 @@ class NeuralEvolutionManager:
         try:
             candidate = AdaptiveBrain.load(model_path, expected_brain_id=self.brain.brain_id)
             model_engine = model_path / "engine"
+            self._require_isolated_candidate(candidate, model_engine)
             state_checksum = _bundle_checksum(model_engine)
             integrity_passed = state_checksum == record.get(
                 "candidateStateChecksum"
@@ -918,11 +1253,21 @@ class NeuralEvolutionManager:
             if record.get("candidateMetadataSha256") is not None:
                 integrity_passed = integrity_passed and _file_sha256(model_engine / "brain.json") == record["candidateMetadataSha256"]
             candidate_architecture = _architecture_signature(model_engine)
-            architecture_mutation = baseline.get("architectureMutation")
+            geometry_manifest, geometry_training = None, None
+            if geometry_change:
+                geometry_manifest = self._load_geometry_migration(candidate_dir, record, baseline)
+                geometry_training = self._load_geometry_training(candidate_id, candidate_dir, record, baseline)
+                descriptor = validate_native_architecture(read_json(model_engine / "brain.json")["config"].get("native_architecture"))
+                if (descriptor["sha256"] != geometry_manifest["candidateArchitectureSha256"]
+                    or candidate.parameter_checksum() != geometry_training["candidateParameterChecksum"]):
+                    raise ValueError("geometry trained neural/architecture identity changed before evaluation")
+                geometry_holdouts = _geometry_holdout_metrics(candidate, baseline["objectiveTextFingerprints"],
+                    expected_benchmark_sha256=baseline["geometryHoldouts"]["benchmarkSha256"])
             architecture_passed = _architecture_compatible(
                 baseline["architecture"],
                 candidate_architecture,
                 architecture_mutation,
+                geometry_manifest["ownerInventory"] if geometry_manifest is not None else None,
             )
             resources = _tensor_resources(model_engine)
             baseline_bytes = int(baseline["resources"]["tensorBytes"])
@@ -940,6 +1285,9 @@ class NeuralEvolutionManager:
                     and memory_free < max(384 * 1024 * 1024, growth_bytes * 4)
                 )
             )
+            if geometry_change:
+                admission = candidate.resource_policy.status()
+                resource_passed = not admission.get("memoryPressure", True) and not admission.get("diskPressure", True)
             resources["growthBytes"] = growth_bytes
             resources["host"] = resource_readings
             audit = candidate._ternary_audit()
@@ -948,11 +1296,14 @@ class NeuralEvolutionManager:
                 and not audit.get("violations")
             )
             capability_loss = self._capability_loss(candidate)
-            retention_loss = self._latent_loss(candidate, anchors)
+            common_width = baseline.get("geometryRetentionPolicy", {}).get("comparedWidth")
+            retention_loss = self._latent_loss(candidate, anchors, common_width)
+            if geometry_change and candidate.parameter_checksum() != geometry_training["candidateParameterChecksum"]:
+                raise ValueError("geometry evaluator mutated authoritative neural parameters")
             preliminary = record.get("preliminaryMetrics", {})
             baseline_objective = float(baseline["baselineObjectiveLoss"])
             objective_loss = float(
-                preliminary.get("candidateObjectiveLoss", math.inf)
+                geometry_training["candidateObjectiveLoss"] if geometry_training is not None else preliminary.get("candidateObjectiveLoss", math.inf)
             )
             objective_passed = (
                 math.isfinite(objective_loss)
@@ -979,6 +1330,10 @@ class NeuralEvolutionManager:
                 "neuralRetention": retention_passed,
                 "changed": changed,
             }
+            if geometry_change:
+                checks["geometryMigrationVerified"] = geometry_manifest is not None
+                checks["trainingCompleted"] = geometry_training is not None
+                checks.update(_geometry_holdout_checks(baseline["geometryHoldouts"], geometry_holdouts))
             passed = all(checks.values())
             failures = [name for name, value in checks.items() if not value]
             metrics = {
@@ -1018,12 +1373,24 @@ class NeuralEvolutionManager:
                 "architecture": candidate_architecture,
                 "candidateDeltaNormBasis": record.get("candidateDeltaNormBasis", "legacy-checkpoint-state-diff"),
             }
+            if geometry_change:
+                evaluation.update(functionPreserved=False, geometryRetentionPolicy=baseline["geometryRetentionPolicy"],
+                    geometryHoldouts=geometry_holdouts,
+                    geometryManifestSha256=baseline["geometryMigration"]["manifestSha256"],
+                    geometryTrainingMeasurementSha256=record["geometryTrainingMeasurementSha256"],
+                    candidateStateChecksum=state_checksum, candidateMetadataSha256=_file_sha256(model_engine / "brain.json"))
             evaluation["evaluationSha256"] = _json_sha256(evaluation)
+            evaluation_file_sha = None
+            if geometry_change:
+                evaluation_path = self.baselines_path / (candidate_id + ".evaluation.json")
+                atomic_write_json(evaluation_path, evaluation)
+                evaluation_file_sha = _file_sha256(evaluation_path)
             status = "evaluated" if passed else "rejected"
             self.brain._record_candidate(
                 candidate_dir,
                 status=status,
                 evaluation=evaluation,
+                **({"evaluationFileSha256": evaluation_file_sha} if geometry_change else {}),
                 reason=(
                     ""
                     if passed
@@ -1047,9 +1414,15 @@ class NeuralEvolutionManager:
                 **evaluation,
                 "status": status,
             }
+        except Exception as error:
+            if geometry_change:
+                self.brain._record_candidate(candidate_dir, status="rejected",
+                    reason="geometry evaluation failed: %s" % error, rejectedAt=_iso_now())
+            raise
         finally:
             try:
-                if candidate is not None:
+                if (candidate is not None and candidate is not self.brain
+                    and Path(candidate.engine_path).resolve() == (model_path / "engine").resolve()):
                     candidate.close()
             finally:
                 candidate_rng.__exit__(None, None, None)
@@ -1096,7 +1469,7 @@ class NeuralEvolutionManager:
             "reason": final_reason,
         }
 
-    def promote(self, candidate_id: str) -> Dict[str, Any]:
+    def promote(self, candidate_id: str, *, geometry_authorization: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         assert_architecture_quiescent(self.brain)
         candidate_dir, record = self._record(candidate_id)
         if record.get("status") == "ready":
@@ -1109,6 +1482,22 @@ class NeuralEvolutionManager:
         evaluation = record.get("evaluation", {})
         if not evaluation.get("passed"):
             raise ValueError("candidate evaluation did not pass")
+        mutation = record.get("architectureMutation")
+        geometry_change = isinstance(mutation, Mapping) and mutation.get("mutation") in {"resize-width", "repartition-heads"}
+        if geometry_change:
+            baseline, _ = self._load_baseline(candidate_id, record)
+            self._load_geometry_migration(candidate_dir, record, baseline)
+            self._load_geometry_training(candidate_id, candidate_dir, record, baseline)
+            evaluation = self._load_geometry_evaluation(candidate_id, record)
+            registered = load_registered_geometry_holdouts(self._model_path(candidate_dir) / "engine")
+            if registered["benchmarkSha256"] != baseline["geometryHoldouts"]["benchmarkSha256"]:
+                raise ValueError("registered geometry evaluation data changed before promotion")
+            if (evaluation.get("benchmarkSha256") != baseline["benchmarkSha256"]
+                or evaluation.get("geometryManifestSha256") != baseline["geometryMigration"]["manifestSha256"]
+                or evaluation.get("geometryTrainingMeasurementSha256") != record["geometryTrainingMeasurementSha256"]):
+                raise ValueError("geometry evaluation does not bind its exact benchmark/migration/training identity")
+            if not _geometry_promotion_authorized(geometry_authorization, candidate_id, evaluation, record["candidateStateChecksum"]):
+                raise PermissionError("geometry promotion requires Ask approval or Full Authority bound to this passing evaluated candidate")
         live_parameter_checksum = self.brain.parameter_checksum()
         live_state_checksum = _bundle_checksum(self.engine_path)
         if (

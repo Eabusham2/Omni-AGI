@@ -211,6 +211,7 @@ describe("EvolutionController", () => {
   }
 
   it("durably archives isolated candidates and stopping without deleting evidence", async () => {
+    await setEvolutionPermission("ask");
     const tools: EvolutionToolExecutor = {
       execute: vi.fn(async (invocation) =>
         execution(
@@ -361,6 +362,7 @@ describe("EvolutionController", () => {
   });
 
   it("forwards typed source edits and archives their authored hash lineage", async () => {
+    await setEvolutionPermission("ask");
     const sourceEdits = [
       {
         path: "src/cache-policy.ts",
@@ -576,6 +578,7 @@ describe("EvolutionController", () => {
   });
 
   it("rejects an evaluator result that claims an empty source candidate passed", async () => {
+    await setEvolutionPermission("ask");
     const execute = vi.fn(async (invocation: ToolInvocation) => {
       if (invocation.action === "propose") {
         return execution(
@@ -811,24 +814,21 @@ describe("EvolutionController", () => {
       },
       { request: offRequest } as unknown as EngineSupervisor
     );
-    const disabled = await offController.start({
+    await expect(offController.start({
       brainId: brain.id,
       objective: "Attempt neural evolution while disabled",
       candidateKind: "neural",
       latentReplay: true
-    });
-    expect(disabled).toMatchObject({
-      state: "failed",
-      error: expect.stringMatching(/disabled/i)
-    });
+    })).rejects.toThrow(/disabled/i);
     expect(offRequest).not.toHaveBeenCalled();
-    const disabledArchitecture = await offController.start({
+    await expect(offController.start({
       brainId: brain.id,
       objective: "Grow one compatible expert while disabled",
       candidateKind: "architecture",
       texts: ["disabled architecture fixture"]
-    });
-    expect(disabledArchitecture.state).toBe("failed");
+    })).rejects.toThrow(/disabled/i);
+    expect(await offController.listCandidates(brain.id)).toEqual([]);
+    await setEvolutionPermission("auto");
     await expect(
       offController.start({
         brainId: brain.id,
@@ -841,7 +841,6 @@ describe("EvolutionController", () => {
       })
     ).rejects.toThrow(/positive grow-experts/i);
 
-    await setEvolutionPermission("auto");
     let status = "ready";
     const request = vi.fn(
       async (
@@ -1128,6 +1127,7 @@ describe("EvolutionController", () => {
   });
 
   it("records evaluations, consumes exact promotion approval, and rolls back by commit", async () => {
+    await setEvolutionPermission("ask");
     let proposal = 0;
     const execute = vi.fn(async (invocation: ToolInvocation): Promise<ToolExecutionResult> => {
       if (invocation.action === "propose") {
@@ -1280,6 +1280,7 @@ describe("EvolutionController", () => {
       summary: "Resource timeout under memory pressure."
     });
     await repository.save(current);
+    await setEvolutionPermission("ask");
 
     const tools: EvolutionToolExecutor = {
       execute: vi.fn(async (invocation) =>
@@ -1322,6 +1323,7 @@ describe("EvolutionController", () => {
   });
 
   it("rejects evaluator identity drift and never attempts promotion", async () => {
+    await setEvolutionPermission("ask");
     const execute = vi.fn(async (invocation: ToolInvocation): Promise<ToolExecutionResult> => {
       if (invocation.action === "propose") {
         return execution(
@@ -1366,6 +1368,7 @@ describe("EvolutionController", () => {
   });
 
   it("persists permission and setup failures instead of claiming an experiment started", async () => {
+    await setEvolutionPermission("ask");
     const controller = new EvolutionController(repository, {
       execute: vi.fn(async (invocation) =>
         execution(

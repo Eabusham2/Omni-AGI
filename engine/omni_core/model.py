@@ -4741,6 +4741,7 @@ class OmniDecoder(nn.Module):
         use_cache: bool = True,
         activity_callback: Optional[Callable[[torch.Tensor, int, float], Any]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
+        conditioning_callback: Optional[Callable[[Optional[torch.Tensor], int], Any]] = None,
     ) -> Tuple[torch.Tensor, List[float]]:
         if input_ids.ndim != 2 or input_ids.shape[1] < 1:
             raise ValueError("generation input must be a non-empty [batch, sequence]")
@@ -4768,6 +4769,7 @@ class OmniDecoder(nn.Module):
                     noise, seed, printable_only, token_callback, cancelled,
                     use_cache=use_cache, _cache_owner=owner,
                     activity_callback=activity_callback, steer_check=steer_check,
+                    conditioning_callback=conditioning_callback,
                 )
         except WorkingAttentionCancelled:
             # Cancellation before any sample or prefill mutation.
@@ -4797,6 +4799,7 @@ class OmniDecoder(nn.Module):
         _cache_owner: Optional[List[Optional[_DecoderInferenceCache]]] = None,
         activity_callback: Optional[Callable[[torch.Tensor, int, float], Any]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
+        conditioning_callback: Optional[Callable[[Optional[torch.Tensor], int], Any]] = None,
     ) -> Tuple[torch.Tensor, List[float]]:
         """Sample from the decoder with invocation-local inference state.
 
@@ -4823,14 +4826,37 @@ class OmniDecoder(nn.Module):
         last_text_boundary = int(input_ids.shape[1])
         emission_start = last_text_boundary
         token_budget = max(1, int(max_new_tokens))
+        self.last_generation_tool_observations = []
+        resumed_conditioning = None
 
-        for step in range(token_budget):
+        while generated.shape[1] - input_ids.shape[1] < token_budget:
+            step = int(generated.shape[1] - input_ids.shape[1])
             if steer_check is not None and steer_check():
                 self.last_generation_stop_reason = "steered"
                 break
             if cancelled():
                 self.last_generation_stop_reason = "cancelled"
                 break
+            pending_observation_bindings = []
+            if conditioning_callback is not None or resumed_conditioning is not None:
+                conditioning = resumed_conditioning or conditioning_callback(memory_bias, step)
+                resumed_conditioning = None
+                if isinstance(conditioning, Mapping) and "memoryBias" in conditioning:
+                    refined = conditioning["memoryBias"]
+                    if not isinstance(refined, torch.Tensor) or refined.ndim not in {1, 2} or \
+                            refined.device != input_ids.device or not bool(torch.isfinite(refined).all()) or \
+                            (memory_bias is not None and refined.shape[-1] != memory_bias.shape[-1]) or \
+                            (refined.ndim == 2 and refined.shape[0] not in {1, input_ids.shape[0]}):
+                        raise ValueError("live observation supplied invalid native conditioning")
+                    pending_observation_bindings = list(conditioning.get("observationBindings", []))
+                    if not pending_observation_bindings or any(not isinstance(item, Mapping) or
+                            not isinstance(item.get("observationId"), str) for item in pending_observation_bindings):
+                        raise ValueError("live observation conditioning lacks its exact bindings")
+                    memory_bias = refined.detach()
+                    if inference_cache is not None:
+                        inference_cache.close()
+                        inference_cache = None
+                        if _cache_owner is not None: _cache_owner[0] = None
             window = generated[:, -self.config.max_seq_len :]
             try:
                 if use_cache:
@@ -4853,6 +4879,11 @@ class OmniDecoder(nn.Module):
             except WorkingAttentionCancelled:
                 self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
                 break
+            # Proof follows actual forward use, not inbox ACK/adoption. Even
+            # EOS now receives this observation before it is sampled.
+            for binding in pending_observation_bindings:
+                self.last_generation_tool_observations.append({**dict(binding),
+                    "generationStep": int(step), "tokenOffset": int(step), "nativeDecodingUsed": True})
             if self.last_generation_cache_mode == "not-started":
                 self.last_generation_cache_mode = cache_mode
             elif self.last_generation_cache_mode != cache_mode:
@@ -4918,6 +4949,16 @@ class OmniDecoder(nn.Module):
             if steer_check is not None and steer_check():
                 self.last_generation_stop_reason = "steered"
                 break
+            await_evidence = getattr(conditioning_callback, "wait_for_evidence", None)
+            if bool((token == 2).all()) and callable(await_evidence):
+                # Only natural EOS waits for already requested world evidence.
+                # Explicit human/native Stop was checked above and is immediate.
+                resumed_conditioning = await_evidence(memory_bias, step)
+                if isinstance(resumed_conditioning, Mapping) and "memoryBias" in resumed_conditioning:
+                    # The speculative EOS is not published or counted. Same
+                    # exact prefix resumes under real observation conditioning.
+                    continue
+                resumed_conditioning = None
             entropies.append(entropy_value)
             generated = torch.cat([generated, token], dim=1)
             if text_boundaries is not None:

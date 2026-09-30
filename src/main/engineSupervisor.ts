@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { EngineHealth } from "../shared/types";
 import { VideoRuntimeUnavailableError, type PreparedVideoRuntime, type VideoRuntimeProgress } from "./videoRuntimeProvisioner";
 import { CodecRuntimeSetupBridge, codecRuntimeChallenge, sameCodecOwner, type CodecRuntimeOwner } from "./codecRuntimeBridge";
+import { observationReceipt, type ChatToolObservation, type ChatToolObservationReceipt } from "./chatToolObservation";
 
 const PROTOCOL_VERSION = 1;
 const MAX_PROTOCOL_LINE = 32 * 1024 * 1024;
@@ -216,6 +217,8 @@ export interface EngineSupervisorOptions {
   resourcesPath?: string;
   workerPath?: string;
   pythonCommand?: string;
+  /** Trusted app-owned path shared by neural and inspection worker children. */
+  sharedResourceLedgerPath?: string;
   sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
   videoRuntimeCacheRoot?: string;
   prepareVideoRuntime?: (
@@ -652,7 +655,7 @@ export class EngineSupervisor extends EventEmitter {
     const child = spawn(candidate.command, args, {
       cwd: direct ? dirname(candidate.command) : dirname(worker as string),
       env: {
-        ...managedWorkerMemoryEnvironment(process.env),
+        ...managedWorkerMemoryEnvironment(process.env, this.options.sharedResourceLedgerPath),
         PYTHONUNBUFFERED: "1",
         OMNI_PROTOCOL_VERSION: String(PROTOCOL_VERSION),
         OMNI_WORKER_ROLE: this.workerRole,
@@ -1366,6 +1369,23 @@ export class EngineSupervisor extends EventEmitter {
       10_000, undefined, true) as { requested: boolean; warm: boolean };
   }
 
+  async observeChatAction(observation: ChatToolObservation): Promise<ChatToolObservationReceipt> {
+    if (this.workerRole !== "neural") throw new Error("Live action observations require the neural worker.");
+    const active = this.activeRequest;
+    if (!active || active.method !== "chat" || active.brainId !== observation.brainId ||
+        active.turnId !== observation.turnId || active.cancelled || active.controller.signal.aborted) {
+      return { brainId: observation.brainId, turnId: observation.turnId, observationId: observation.observationId,
+        accepted: false, reason: "turn-not-active" };
+    }
+    // Deposit structured evidence through the reader, not behind the neural
+    // RPC that needs to consume it. A missing control ACK never kills/reloads
+    // that worker; ordinary Stop/Steer remains the current turn's authority.
+    const receipt = await this.rawRequest("observe_chat_action", {
+      brainId: observation.brainId, streamId: observation.turnId, observation
+    }, 10_000, undefined, true);
+    return observationReceipt(receipt, observation);
+  }
+
   /**
    * Ask one optional background operation to stop without waiting behind the
    * worker's serial RPC queue. The existing cooperative cancellation path
@@ -1693,6 +1713,16 @@ export class EngineSupervisor extends EventEmitter {
   }
 }
 /** Trusted launch metadata only; user/renderer environment cannot pick its owner. */
-export function managedWorkerMemoryEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return { ...environment, OMNI_MEMORY_OWNER_PID: String(process.pid) };
+export function managedWorkerMemoryEnvironment(
+  environment: NodeJS.ProcessEnv,
+  sharedResourceLedgerPath?: string
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...environment, OMNI_MEMORY_OWNER_PID: String(process.pid) };
+  // An inherited shell/renderer variable cannot redirect app quota accounting.
+  delete result.OMNI_SHARED_RESOURCE_LEDGER;
+  if (sharedResourceLedgerPath !== undefined) {
+    if (!isAbsolute(sharedResourceLedgerPath)) throw new Error("Shared resource ledger must be an absolute trusted path.");
+    result.OMNI_SHARED_RESOURCE_LEDGER = resolve(sharedResourceLedgerPath);
+  }
+  return result;
 }

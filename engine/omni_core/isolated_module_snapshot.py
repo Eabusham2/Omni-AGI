@@ -63,6 +63,7 @@ class IsolatedModuleSnapshot:
             policy.require_disk(packed - low + len(tensors) * 4096 + 131072, "isolated same-brain cold packed modality state")
         self.pager = NativeCorePager(Path(directory), cpu_hot_bytes=low, accelerator_hot_bytes=0,
             reserve_disk=policy.require_disk, chunk_bytes=self.chunk_bytes,
+            resource_policy=policy,
             reserve_admission=lambda size, _device: self.admit(size, "isolated modality transfer"))
         try:
             source_pagers = {getattr(module, "_native_core_pager", None) for module in modules.values()} - {None}

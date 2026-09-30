@@ -15,9 +15,33 @@ The full license texts ship with packaged applications under `resources/licenses
 ## Runtime dependencies
 
 Electron, React, Vite, TypeScript, Ajv (MIT; local JSON Schema validation),
-Python, PyTorch, NumPy, safetensors, and PDF parsing dependencies retain their
+Python, PyTorch, NumPy, safetensors, JSON Schema, and PDF parsing dependencies retain their
 respective upstream licenses. Exact dependency versions are recorded in
-`package-lock.json` and `engine/requirements.txt`.
+`package-lock.json`, `engine/requirements.txt`, and the target-specific,
+hash-locked worker closures in `engine/locks/`.
+
+### Native JSON Schema validation
+
+The Python worker uses these MIT-licensed packages to validate structured
+action/tool schemas. Frozen-worker builds explicitly collect their modules,
+the bundled JSON Schema specification documents, and the target-specific
+`rpds` extension. These are validation libraries, not model weights or an
+external AI backend. No optional `jsonschema` format extras are installed by
+the reviewed engine locks.
+
+| Package | Reviewed release and source | Preserved license |
+| --- | --- | --- |
+| attrs | [26.1.0](https://pypi.org/project/attrs/26.1.0/) | `licenses/attrs-MIT.txt` |
+| jsonschema | [4.26.0](https://pypi.org/project/jsonschema/4.26.0/) | `licenses/jsonschema-MIT.txt` |
+| jsonschema-specifications | [2025.9.1](https://pypi.org/project/jsonschema-specifications/2025.9.1/) | `licenses/jsonschema-specifications-MIT.txt` |
+| referencing | [0.37.0](https://pypi.org/project/referencing/0.37.0/) | `licenses/referencing-MIT.txt` |
+| rpds-py | [0.30.0](https://pypi.org/project/rpds-py/0.30.0/) | `licenses/rpds-py-MIT.txt` |
+
+The four pure-Python packages use exact universal-wheel SHA-256 hashes.
+`rpds-py` uses a reviewed CPython 3.11 wheel hash for each supported worker
+architecture; Windows ARM64 packaging continues to use its explicitly labeled
+emulated x64 worker. The installed upstream license texts above are preserved
+verbatim and flow into the existing desktop/mobile legal payload verifiers.
 
 The Android companion includes Kotlin and AndroidX runtime components under
 the Apache License 2.0. The iOS companion uses platform Swift and Apple SDK

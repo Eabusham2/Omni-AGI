@@ -45,6 +45,7 @@ class ManagedMemorySample:
     error: Optional[str] = None
     sample_duration_ms: float = 0.0
     sample_age_seconds: float = 0.0
+    sample_started_ns: Optional[int] = None
 
 
 def parse_posix_process_table(payload: bytes) -> ProcessTable:
@@ -205,6 +206,7 @@ class ManagedProcessMemorySampler:
             if self._sample is not None and now - self._at < SAMPLE_INTERVAL_SECONDS:
                 return ManagedMemorySample(**{**self._sample.__dict__, "cached": True, "sample_age_seconds": max(0.0, now - self._at)})
             try:
+                sample_started_ns = time.time_ns()
                 if self.invalid_owner:
                     raise ValueError("managed process memory owner is invalid")
                 table = self.provider() if self.provider is not None else (_windows_table() if os.name == "nt" else _posix_table())
@@ -212,7 +214,7 @@ class ManagedProcessMemorySampler:
             except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
                 sample = ManagedMemorySample(None, None, self.root_pid, 0, False, self.scope,
                     error="managed process family residency unavailable; admission must pause")
-            sample = ManagedMemorySample(**{**sample.__dict__, "sample_duration_ms": max(0.0, (self.now() - now) * 1000)})
+            sample = ManagedMemorySample(**{**sample.__dict__, "sample_duration_ms": max(0.0, (self.now() - now) * 1000), "sample_started_ns": sample_started_ns})
             self._sample, self._at = sample, now
             return sample
 

@@ -52,14 +52,14 @@ describe("native release Python compatibility", () => {
       { cwd: resolve("."), encoding: "utf8" }
     );
     expect(verification.status, verification.stderr || verification.stdout).toBe(0);
-    expect(verification.stdout).toContain("Verified 5 engine locks (134 target package pins).");
+    expect(verification.stdout).toContain("Verified 5 engine locks (159 target package pins).");
 
     for (const [target, packageCount] of Object.entries({
-      "linux-aarch64": 26,
-      "linux-x86_64": 26,
-      "macos-arm64": 27,
-      "macos-x86_64": 27,
-      "windows-x86_64": 28
+      "linux-aarch64": 31,
+      "linux-x86_64": 31,
+      "macos-arm64": 32,
+      "macos-x86_64": 32,
+      "windows-x86_64": 33
     })) {
       const lock = read(`engine/locks/${target}-py311.lock`);
       expect(lock).toContain("--require-hashes");
@@ -83,6 +83,27 @@ describe("native release Python compatibility", () => {
       expect(build).toContain("install-engine-lock.py");
       expect(build).toContain("--verify-only");
       expect(build).not.toContain("pyinstaller>=");
+      for (const module of ["jsonschema", "jsonschema_specifications", "referencing", "attrs", "rpds"]) {
+        expect(build).toContain(`--collect-all ${module}`);
+      }
+    }
+  });
+
+  it("preserves every schema dependency license in the canonical legal payload", () => {
+    const notices = read("THIRD_PARTY_NOTICES.md");
+    for (const [name, copyright] of Object.entries({
+      attrs: "Hynek Schlawack and the attrs contributors",
+      jsonschema: "2013 Julian Berman",
+      "jsonschema-specifications": "2022 Julian Berman",
+      referencing: "2022 Julian Berman",
+      "rpds-py": "2023 Julian Berman"
+    })) {
+      const license = `licenses/${name}-MIT.txt`;
+      expect(notices).toContain(license);
+      expect(notices).toContain(`https://pypi.org/project/${name}/`);
+      expect(read(license)).toContain(copyright);
+      expect(read(license)).toContain("Permission is hereby granted");
+      expect(read(license)).toContain("THE SOFTWARE IS PROVIDED");
     }
   });
 

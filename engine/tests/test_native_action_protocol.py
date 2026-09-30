@@ -174,7 +174,8 @@ class NativeActionProtocolFixtures(unittest.TestCase):
     def test_live_action_callback_evaluates_heads_but_only_visible_invocation_emits_once(self):
         brain = AdaptiveBrain.__new__(AdaptiveBrain)
         brain.device = torch.device("cpu")
-        brain.config = SimpleNamespace(max_seq_len=8192, vocab_size=261, online_learning=True, idle_cognition=True)
+        brain.config = SimpleNamespace(max_seq_len=8192, vocab_size=261, online_learning=True, idle_cognition=True,
+                                       working_memory_slots=8)
         kind = "tool"
         observed = []
 
@@ -218,7 +219,8 @@ class NativeActionProtocolFixtures(unittest.TestCase):
         }
         brain = AdaptiveBrain.__new__(AdaptiveBrain)
         brain.device = torch.device("cpu")
-        brain.config = SimpleNamespace(max_seq_len=8192, recursive_improvement=True, online_learning=True, idle_cognition=True)
+        brain.config = SimpleNamespace(max_seq_len=8192, recursive_improvement=True, online_learning=True, idle_cognition=True,
+                                       working_memory_slots=8)
         brain.decoder = SimpleNamespace(action_argument_head=argument_method_fixture(payload, "source.self-modify", "propose"))
         schemas = [{"id": "source.self-modify", "actions": ["propose"], "grant": "ask", "inputSchema": {
             "type": "object", "properties": {

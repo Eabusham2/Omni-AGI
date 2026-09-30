@@ -17,7 +17,8 @@ import type {
   RuntimeJob,
   StructuredAction,
   ToolExecutionResult,
-  ToolInvocation
+  ToolInvocation,
+  ToolRuntimePreferences
 } from "../shared/types";
 import type {
   ConfirmedToolRouteOutcome,
@@ -28,6 +29,7 @@ import type {
 import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
 import { EngineRequestError } from "./engineSupervisor";
 import { inheritTemporarySteeringContext, type TemporarySteeringContext } from "./temporarySteeringContext";
+import type { ChatToolObservationReceipt } from "./chatToolObservation";
 
 export interface ActionChatService {
   chat(
@@ -37,9 +39,12 @@ export interface ActionChatService {
     onStream?: (event: NeuralChatStreamEvent) => void,
     turnId?: string,
     responseTokenBudget?: number,
-    temporarySteeringContext?: TemporarySteeringContext
+    temporarySteeringContext?: TemporarySteeringContext,
+    toolObservationWaitMs?: number
   ): Promise<ChatResult>;
   currentChatAttentionEpoch?(brainId: string): Promise<number>;
+  observeChatActionResult?(brainId: string, turnId: string, event: ActionEvent,
+    output: unknown): Promise<ChatToolObservationReceipt | undefined>;
   idleCycle?(brainId: string, minimumIdleSeconds?: number): Promise<IdleCycleResult>;
   learnStructuredExperience?(
     brainId: string,
@@ -63,6 +68,7 @@ export interface ActionChatService {
 }
 
 export interface ActionToolExecutor {
+  preferences?(): ToolRuntimePreferences;
   execute(
     invocation: ToolInvocation,
     onProgress?: (job: RuntimeJob) => void,
@@ -106,7 +112,7 @@ function serializableToolExperience(action: StructuredAction, output: unknown): 
     `action: ${action.action ?? action.kind}`,
     `requested-by: ${action.source}`,
     "result:",
-    serialized.slice(0, 48_000)
+    serialized
   ].join("\n");
 }
 
@@ -266,12 +272,15 @@ interface ActiveTurn {
   resolveNeuralBoundary(): void;
   neuralCallStarted: boolean;
   neuralEnded: boolean;
+  outputClosed?: boolean;
   steerSuccessor?: string;
   earlySteeredYield?: boolean;
   neuralSteered?: boolean;
   input: string;
   attentionEpoch?: number;
   temporarySteeringContext?: TemporarySteeringContext;
+  observationOffers: Set<string>;
+  approvalLearningActions: Set<string>;
   pendingDrain?: Promise<void>;
 }
 
@@ -452,6 +461,25 @@ export class ChatActionController extends EventEmitter {
       return;
     }
     this.publish(event);
+  }
+
+  private async offerLiveToolObservation(turn: ActiveTurn | undefined, event: ActionEvent, output: unknown): Promise<void> {
+    if (!turn || turn.neuralEnded || turn.outputClosed || turn.steerSuccessor || turn.controller.signal.aborted ||
+        event.action.kind !== "tool" || event.state !== "complete" || event.cancellationRequested || !event.neuralActionId) return;
+    const key = `${event.id}:${event.execution?.id ?? ""}`;
+    if (turn.observationOffers.has(key)) return;
+    turn.observationOffers.add(key);
+    try {
+      // Reader admission is not consumption. Neither it nor a late rejection
+      // changes text, creates another conversation row, or executes a tool.
+      await this.service.observeChatActionResult?.(turn.brainId, turn.turnId, event, output);
+    } catch (error) {
+      if (event.state !== "complete" || event.cancellationRequested) return;
+      event.statusLabel = "Action complete · live observation not admitted; result retained for learning";
+      event.error = `Live result observation: ${error instanceof Error ? error.message : String(error)}`;
+      event.updatedAt = new Date().toISOString();
+      this.publishAction(turn, event);
+    }
   }
 
   private prunePendingApprovedActions(): void {
@@ -748,6 +776,12 @@ export class ChatActionController extends EventEmitter {
     let learned = false;
     let learningError: string | undefined;
     if (event.state === "complete") {
+      const turn = [...this.activeTurns.values()].find((candidate) => candidate.brainId === event.brainId && candidate.actions.has(event.id));
+      // The exact approved execution owns its result/learning. The earlier
+      // approval-required memo outcome must not later learn undefined output
+      // or duplicate this independently confirmed receipt.
+      turn?.approvalLearningActions.add(event.id);
+      await this.offerLiveToolObservation(turn, event, output);
       event.statusLabel = "Action complete · integrating result";
       event.updatedAt = new Date().toISOString();
       this.publish(event);
@@ -830,7 +864,8 @@ export class ChatActionController extends EventEmitter {
       settled,
       resolveSettled,
       actions: new Map(), neuralBoundary, resolveNeuralBoundary,
-      neuralCallStarted: false, neuralEnded: false, input
+      neuralCallStarted: false, neuralEnded: false, input,
+      observationOffers: new Set(), approvalLearningActions: new Set()
     };
     const abortFromCaller = (): void => controller.abort();
     signal?.addEventListener("abort", abortFromCaller, { once: true });
@@ -899,6 +934,7 @@ export class ChatActionController extends EventEmitter {
             event.updatedAt = new Date().toISOString();
           }
         }
+        await this.offerLiveToolObservation(turn, event, output);
         this.publishAction(turn, event);
         return { event, output };
       };
@@ -944,6 +980,7 @@ export class ChatActionController extends EventEmitter {
         return;
       }
       if (neural.type === "chat-phase") {
+        turn.outputClosed = true;
         this.publishStream(turn, {
           type: "chat-phase",
           phase: neural.phase,
@@ -1039,6 +1076,10 @@ export class ChatActionController extends EventEmitter {
         state: "started",
         turnMetadata
       });
+      const approvalSeconds = this.tools.preferences?.().approvalTimeoutSeconds;
+      if (approvalSeconds !== undefined && (!Number.isSafeInteger(approvalSeconds) || approvalSeconds < 1 || approvalSeconds > 3_600)) {
+        throw new Error("Tool observation wait requires the valid 1–3,600 second runtime approval preference.");
+      }
       turn.neuralCallStarted = true;
       let result = await this.service.chat(
         brainId,
@@ -1047,7 +1088,8 @@ export class ChatActionController extends EventEmitter {
         consumeNeuralStream,
         turnId,
         undefined,
-        turn.temporarySteeringContext
+        turn.temporarySteeringContext,
+        approvalSeconds === undefined ? undefined : approvalSeconds * 1_000
       );
       for (const action of result.proposedActions ?? []) queueAction(action);
 
@@ -1071,6 +1113,7 @@ export class ChatActionController extends EventEmitter {
         controller.signal.throwIfAborted();
         const { event, output } = await executions[index]!();
         if (event.state !== "complete") continue;
+        if (turn.approvalLearningActions.has(event.id)) continue;
         if (["talk", "ponder", "learn"].includes(event.action.kind)) continue;
         // The user-authored chat turn is already committed. Learn the visible
         // action result through the typed neural-ingestion path instead of
@@ -1163,6 +1206,7 @@ export class ChatActionController extends EventEmitter {
           for (const execution of executions) {
             const { event, output } = await execution();
             if (event.state !== "complete") continue;
+            if (turn.approvalLearningActions.has(event.id)) continue;
             await this.learnConfirmedToolRoute(event, input, controller.signal).catch(() => undefined);
             if (this.service.learnStructuredExperience && !["talk", "ponder", "learn"].includes(event.action.kind)) {
               await this.service.learnStructuredExperience(brainId, {

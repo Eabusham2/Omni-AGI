@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 import uuid
+import tempfile
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from .persistence import (
     read_json,
 )
 from .managed_process_memory import default_managed_process_sampler
+from .shared_resource_ledger import SharedResourceLedger, SharedQuotaPause
 
 
 GIB = 1024 ** 3
@@ -70,6 +72,7 @@ class ResourceReading:
     managed_memory_cached: bool = False
     managed_memory_sample_duration_ms: float = 0.0
     managed_memory_sample_age_seconds: float = 0.0
+    managed_memory_sample_started_ns: Optional[int] = None
 
 
 _MAC_FOOTPRINT_CACHE_SECONDS = 1.0
@@ -487,6 +490,32 @@ def _accelerator_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
     return None, None, None
 
 
+class _PolicyResourceLease:
+    def __init__(self, lease, operation, status):
+        self._lease, self.operation, self.status = lease, operation, status
+
+    def _call(self, name, *args, **kwargs):
+        try:
+            return getattr(self._lease, name)(*args, **kwargs)
+        except SharedQuotaPause as error:
+            raise NeuralStateResourcePause(self.operation + ": " + str(error),
+                {**self.status, "sharedQuota": error.status, "paused": True, "recoverable": True}) from error
+
+    def bind_path(self, path):
+        self._call("bind_path", path); return self
+
+    def mark_allocated(self, actual_bytes=None):
+        self._call("mark_allocated", actual_bytes); return self
+
+    def commit(self, actual_allocated_bytes=None, **kwargs):
+        self._call("commit", actual_allocated_bytes, **kwargs); return self
+
+    def release(self): return self._call("release")
+    def backing_closed(self): return self._call("backing_closed")
+    def __enter__(self): return self
+    def __exit__(self, kind, value, traceback): return self._call("__exit__", kind, value, traceback)
+
+
 class ResourcePolicy:
     """Resolve adaptive RAM/disk reserves and make preflight decisions."""
 
@@ -501,6 +530,9 @@ class ResourcePolicy:
         hardware_tier: str = "personal",
         reading_provider: Optional[Callable[[], ResourceReading]] = None,
         include_accelerator_memory: bool = True,
+        shared_resource_owner_id: Optional[str] = None,
+        shared_storage_pool_bytes: int = 0,
+        shared_ledger: Optional[SharedResourceLedger] = None,
     ):
         self.probe_path = Path(probe_path)
         self.configured_ram_reserve = max(0, int(ram_reserve_bytes))
@@ -515,6 +547,66 @@ class ResourcePolicy:
         self.hardware_tier = hardware_tier
         self.reading_provider = reading_provider
         self.include_accelerator_memory = bool(include_accelerator_memory)
+        self.shared_resource_owner_id = shared_resource_owner_id or str(self.probe_path.absolute())
+        self.shared_storage_pool_bytes = max(0, int(shared_storage_pool_bytes))
+        self._shared_ledger_instance = shared_ledger
+        self._shared_owner_registered = False
+
+    @property
+    def shared_ledger(self) -> SharedResourceLedger:
+        if self._shared_ledger_instance is None:
+            configured = os.environ.get("OMNI_SHARED_RESOURCE_LEDGER")
+            path = Path(configured) if configured else Path(tempfile.gettempdir()) / ("omni-resource-ledger-%d" % os.getpid()) / "quota.sqlite3"
+            self._shared_ledger_instance = SharedResourceLedger(path)
+        if not self._shared_owner_registered:
+            self._shared_ledger_instance.register_owner(self.shared_resource_owner_id, self.shared_storage_pool_bytes,
+                preserve_existing_pool=self.shared_storage_pool_bytes == 0)
+            self._shared_owner_registered = True
+        return self._shared_ledger_instance
+
+    def configure_shared_resources(self, *, owner_id: str, storage_pool_bytes: int):
+        self.shared_resource_owner_id = owner_id
+        self.shared_storage_pool_bytes = max(0, int(storage_pool_bytes))
+        self.shared_ledger.register_owner(owner_id, self.shared_storage_pool_bytes)
+        self._shared_owner_registered = True
+
+    @staticmethod
+    def _observed_memory_epoch(status):
+        # Use the START of the known cached family sample, never retire RAM
+        # escrow merely because a later caller read an old cached result.
+        return status.get("managedMemorySampleStartedNs")
+
+    def reserve_ram(self, estimated_bytes: int, operation: str = "native RAM allocation"):
+        status = self.status(estimated_ram_bytes=estimated_bytes)
+        if status["memoryPressure"]:
+            raise NeuralStateResourcePause(operation + " paused at selected RAM ceiling", status)
+        try:
+            lease = self.shared_ledger.reserve(self.shared_resource_owner_id, "ram", max(0, int(estimated_bytes)),
+                ram_budget_bytes=status["systemRamBudgetBytes"], observed_ram_bytes=status["admissionResidentMemoryBytes"],
+                observed_ns=self._observed_memory_epoch(status), verified=status["ramAdmissionVerified"])
+            return _PolicyResourceLease(lease, operation, status)
+        except SharedQuotaPause as error:
+            raise NeuralStateResourcePause(operation + ": " + str(error), {**status, "sharedQuota": error.status}) from error
+
+    def reserve_spill(self, estimated_bytes: int, operation: str = "native spill allocation", allocation_key=None):
+        status = self.require_disk(estimated_bytes, operation)
+        try:
+            ledger = self.shared_ledger
+            # Legacy standalone CLI has no main registry and zero means Auto,
+            # not a zero-byte HDD pool. Resolve its physical allowance once;
+            # never overwrite a trusted app registry or another larger owner.
+            if not os.environ.get("OMNI_SHARED_RESOURCE_LEDGER") and self.shared_storage_pool_bytes == 0:
+                quota = ledger.status()
+                if quota["largestConfiguredPoolBytes"] == 0:
+                    available = max(0, int(status["diskFreeBytes"]) - int(status["diskReserveBytes"]))
+                    ledger.register_owner(self.shared_resource_owner_id, available)
+            lease = ledger.reserve(self.shared_resource_owner_id, "spill", max(0, int(estimated_bytes)))
+            return _PolicyResourceLease(lease, operation, status)
+        except SharedQuotaPause as error:
+            raise NeuralStateResourcePause(operation + ": " + str(error), {**status, "sharedQuota": error.status}) from error
+
+    def reconcile_shared_owner(self, *, max_entries: int = 256, after_identity: str = ""):
+        return self.shared_ledger.reconcile_owner(self.shared_resource_owner_id, max_entries=max_entries, after_identity=after_identity)
 
     def readings(self) -> ResourceReading:
         if self.reading_provider is not None:
@@ -561,6 +653,7 @@ class ResourcePolicy:
             managed_memory_cached=managed.cached,
             managed_memory_sample_duration_ms=managed.sample_duration_ms,
             managed_memory_sample_age_seconds=managed.sample_age_seconds,
+            managed_memory_sample_started_ns=managed.sample_started_ns,
         )
 
     @staticmethod
@@ -693,6 +786,13 @@ class ResourcePolicy:
             0, system_ram_budget - current_omni_available
         )
         unknown_ram = (not accounting_verified or reading.total_memory_bytes is None or available is None)
+        quota = None
+        if self._shared_ledger_instance is not None or os.environ.get("OMNI_SHARED_RESOURCE_LEDGER"):
+            quota = self.shared_ledger.status(observed_ns=reading.managed_memory_sample_started_ns, verified=accounting_verified)
+            if quota["globalRamCeilingBytes"] is not None:
+                system_ram_budget = min(system_ram_budget, int(quota["globalRamCeilingBytes"]))
+            if projected_process_memory is not None:
+                projected_process_memory += int(quota["ramEscrowBytes"])
         memory_pressure = bool(
             unknown_ram
             or
@@ -717,13 +817,15 @@ class ResourcePolicy:
             "managedMemorySampleCached": reading.managed_memory_cached,
             "managedMemorySampleDurationMs": reading.managed_memory_sample_duration_ms,
             "managedMemorySampleAgeSeconds": reading.managed_memory_sample_age_seconds,
+            "managedMemorySampleStartedNs": reading.managed_memory_sample_started_ns,
             "managedMemoryCacheIntervalSeconds": 1.0,
             "memoryAccountingBasis": accounting_basis,
             "memoryAccountingVerified": accounting_verified,
             "ramAdmissionVerified": not unknown_ram,
             "ramCapMechanism": "cooperative-measured-family-plus-estimated-allocation-admission",
             "hardRssIsolation": False,
-            "crossProcessAtomicReservation": False,
+            "crossProcessAtomicReservation": quota is not None,
+            "sharedQuota": quota,
             "osPhysicalPagePinning": False,
             "acceleratorTotalMemoryBytes": (
                 reading.accelerator_total_memory_bytes

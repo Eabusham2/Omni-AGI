@@ -7,13 +7,56 @@ compares the latest agreed requirements with source, distinguishes partial
 implementation from deferred proof, and does not reopen canceled choices or
 user-closed tests.
 
-Review date: 30 September 2026. Baseline: application source `5b15e22` plus
-workflow-only `b35cc7d`. Changes recorded below are a local follow-up, not the
-contents of an installed package or the existing application tag. No GitHub CI,
-new release, native brain creation/training, model quiz, or live model/UI run is
-part of this repeat audit. Cancellation of the pending release workflow was
-requested at the user's latest instruction; this pass did not redispatch or
-monitor it. A local commit is the requested handoff.
+## Active implementation continuation
+
+The user rejected stopping with the findings still open. The `da64cd5` audit
+commit is a checkpoint, not completion of the ensure/fix task. The checked
+items below mean that an implementation path is present in this working tree,
+not that a trained brain, GUI session, or GitHub CI has passed. The main task
+must record affected source/control verification separately. Its later commit/
+GitHub instruction supersedes the earlier local-only handoff; CI, release and
+package work remain out of scope.
+
+- [x] Cooperative, cross-process atomic RAM reservations through
+  `shared_resource_ledger.py`, `offload.py` and the trusted desktop registry;
+  `hardRssIsolation=False` remains an explicit physical/platform limit.
+- [x] Shared spill-pool lease/physical-file ledger for the integrated core,
+  attention, router and rollback/snapshot writers, with bounded reconciliation;
+  native writers outside these paths are not thereby universally proved bounded.
+- [x] Tiled recurrent multiplication and exact tiled STDP over paged router
+  controls in `spiking.py` and `router_state_paging.py`.
+- [x] File-backed CPU saved-activation restoration in
+  `working_attention_paging.py`; accelerator tensors and downstream compute
+  outputs retain admitted whole-tensor minima.
+- [x] Lazy nested Arrow values in the production `_bounded_columnar_rows()`
+  path; native batch/decompression allocation is still estimate-admitted,
+  not an allocator-enforced hard bound.
+- [x] Isolated width/head candidate migration, protected parent state and
+  mandatory recorded training/held-out evaluation gates in
+  `architecture_migration.py`, `geometry_candidate_application.py` and
+  `evolution.py`; no candidate benefit has been measured here.
+- [x] Remove a duplicate cortical checksum pass and preserve bounded exact
+  integrity/delta operations; required full-byte verification remains I/O.
+- [x] Actual host-result, typed same-turn observation transport into unfinished
+  native decoding; inbox acceptance alone is not neural use.
+- [x] Reviewed `jsonschema` validation with recursive local references and
+  no implicit remote retrieval or product depth cap; unavailable external
+  references fail closed.
+- [ ] Resolve the unanswered automatic self-experience policy before changing
+  it. Trained-native context/scratch/learned-state movement is deferred proof,
+  not a model run authorized for this pass.
+
+These are scoped source findings, not full AGI, trained recall, resource peaks,
+or screenshot/GUI proof. No model/app/CI run is asserted by this update.
+
+Review date: 30 September 2026. The original repeat-audit baseline was
+application source `5b15e22` plus workflow-only `b35cc7d`; the source status
+above and below additionally inspects the current, uncommitted continuation.
+None of that is an installed package or an application tag. No GitHub CI, new
+release, native brain creation/training, model quiz, or live model/UI run is
+part of this recheck. The earlier release workflow was canceled and this pass
+did not redispatch or monitor it. The later user request asks for verification
+and a GitHub commit/push, but still excludes CI, release and package work.
 
 ## Agreement authority and read coverage
 
@@ -59,8 +102,9 @@ Later corrections override earlier plans. The final decisions are:
 - Auto uses total selected device RAM, leaves speed headroom and avoids normal
   spill with other apps closed; the selected RAM percentage is a ceiling, with
   compression/spill permitted: U0170 and the explicit U0643 clarification.
-- Code comparison and local commit now; no GitHub CI or application publication
-  for this pass: U0646 overrides the earlier U0642 release instruction.
+- At the historical audit cutoff, code comparison and local commit without
+  GitHub CI/application publication: U0646 overrode U0642. The later direct
+  GitHub commit/push request changes the handoff, not the CI/release exclusion.
 - Older context yields room through the existing memory process; never crop a
   new message or silently enlarge the selected window. If the new message
   itself is larger, block Send: the actual overflow answer U0648.
@@ -70,7 +114,7 @@ Starter/Blank choices, a blocking tool quiz, personality sliders or Falcon
 compatibility. The limitations below are not permission to silently change the
 design or substitute a less capable mechanism.
 
-## Detailed remaining implementation limits
+## Historical gaps and current source boundaries
 
 ### 1. The RAM percentage is not an instantaneous hard usage limit
 
@@ -79,53 +123,69 @@ clarifies “doesnt use more ram thsn thaat percent,” while allowing compressi
 and spill.
 Your exact U0130 wording also says “this also effects everything.”
 
-Present: fixed Auto/manual allowance, managed-process-family sampling,
-conservative unknown readings, resource admission and reclaim-or-pause.
+Current source: [`shared_resource_ledger.py`](../engine/omni_core/shared_resource_ledger.py)
+atomically escrows cooperating RAM allocations in SQLite;
+[`offload.py`](../engine/omni_core/offload.py) combines that escrow with verified
+managed-family residency, and
+[`sharedResourceRegistry.ts`](../src/main/sharedResourceRegistry.ts) publishes
+the trusted selected ceiling. The sample epoch prevents a cached reading from
+prematurely releasing newly allocated escrow. `crossProcessAtomicReservation`
+is now true when the shared ledger is active.
 
-Remaining: [`offload.py`](../engine/omni_core/offload.py) explicitly reports
-`hardRssIsolation=False` and `crossProcessAtomicReservation=False`.
-[`managed_process_memory.py`](../engine/omni_core/managed_process_memory.py)
-caches readings for up to one second. Native allocations or concurrent owners
-can overshoot between checks. Correct budget arithmetic is not the strict
-never-exceed guarantee requested. Stronger aggregate enforcement needs an
-explicit cross-process reservation strategy and platform-specific isolation
-where supported; physical pinning is not the solution the user selected.
+Residual boundary: [`managed_process_memory.py`](../engine/omni_core/managed_process_memory.py)
+still caches readings for up to one second and the policy still reports
+`hardRssIsolation=False`. Cooperative reservations reduce races among covered
+allocations; they cannot prevent untracked native/driver allocation or impose
+universal OS RSS isolation. No strict never-exceed measurement is claimed.
 
-### 2. The designated spill pool lacks one aggregate runtime write quota
+### 2. Aggregate spill quota is implemented for integrated writers, not all native writes
 
 Request: U0113/U0170 reserve model, full context, training and future growth;
 U0190 says multiple identities share the largest pool rather than reserving it
 repeatedly.
 U0190: “if u have multiple ais, use the largest one to prevent multple storage use.”
 
-Present: shared-pool planning and attention's own spill allowance.
+Current source: [`shared_resource_ledger.py`](../engine/omni_core/shared_resource_ledger.py)
+charges pending reservations and durable physical file identities against the
+largest registered pool, reconciles missing/dead owners and deduplicates known
+hardlinks. [`native_core_paging.py`](../engine/omni_core/native_core_paging.py),
+[`working_attention_paging.py`](../engine/omni_core/working_attention_paging.py),
+[`router_state_paging.py`](../engine/omni_core/router_state_paging.py),
+[`slow_state_snapshot.py`](../engine/omni_core/slow_state_snapshot.py) and
+[`parameter_diagnostics.py`](../engine/omni_core/parameter_diagnostics.py)
+now use spill leases through `ResourcePolicy.reserve_spill()`; desktop saved
+brain declarations flow through `sharedResourceRegistry.ts`. The separate
+20-GiB free-space floor remains in force.
 
-Remaining: core mapping in
-[`native_core_paging.py`](../engine/omni_core/native_core_paging.py) calls the
-physical disk-reserve callback; the callback bound in `brain.py` is
-`ResourcePolicy.require_disk()`, not an aggregate `storage_pool_bytes` quota.
-Core, attention and rollback allocations do not share one atomic actual-pool
-ledger. The 20-GiB free-space floor does not substitute for the selected pool
-boundary. A shared, lease-safe allocation ledger must charge/release all those
-owners without counting immutable shared files twice.
+Residual boundary: the ledger accounts for integrated writers and registered
+file identities, not a measured guarantee for every possible external/native
+write or filesystem-level copy-on-write sharing. Its status conservatively
+counts unverified COW files. Failures must pause without treating unremoved
+backing files as freed pool space.
 
-### 3. The recurrent router is not fully paged or block sparse
+The current desktop startup also reconciles app-managed saved UUID owners
+against the library before worker launch: a crashed deletion cannot leave an
+absent brain's oversized pool declaration active. This never credits Python
+leases or backing files, and invalid committed owner declarations fail closed.
+
+### 3. The recurrent router is tiled and paged, but not block sparse
 
 Request: U0159 explicitly includes the model itself in spill; accepted U0042
 describes block-sparse connections; U0101/U0170 require growth without resident
 whole-brain materialization or misleading low-memory claims.
 U0159: “not just training use storage also like the model itself when it doesnt all fit on ram.”
 
-Present: packed recurrent synaptic storage and admitted bounded checkpoint
-loads, with real LIF/STDP.
+Current source: [`spiking.py`](../engine/omni_core/spiking.py) now uses bounded
+tiles for recurrent multiplication, exact causal/anti-causal STDP, decay and
+explicit inspection. [`router_state_paging.py`](../engine/omni_core/router_state_paging.py)
+backs packed synapses and dense control matrices with paged state and a bounded
+mutation journal; [`brain.py`](../engine/omni_core/brain.py) reports
+`routerControlStatePaging=True` on load. All logical edges still participate:
+this is tiled dense semantics, not a new block-sparse topology.
 
-Remaining: [`spiking.py`](../engine/omni_core/spiking.py) still allocates dense
-eligibility, stability and usage matrices. `effective_weight()` decodes a whole
-matrix for recurrent multiplication, and STDP constructs whole outer-product
-temporaries. The loader truthfully reports `routerControlStatePaging=False`.
-These are not floating learned masters, but they are real total-dependent RAM
-and decode costs. The full recurrent/control path still needs bounded sparse
-or tiled execution/storage rather than relying only on packed cortical paging.
+Residual boundary: hot spike/trace vectors and a tile remain resident;
+full-matrix inspection is explicitly refused above one tile. This source path
+does not prove a trained large router's memory peak or throughput.
 
 ### 4. Saved activation paging does not make every computation pageable
 
@@ -133,16 +193,17 @@ Request: U0125–U0129/U0159/U0170 ask for low-RAM training and storage overflow
 not merely a larger context slider.
 U0125: “when i tried training i ran out of memorey so see if u can fix that.”
 
-Present: exact tiled attention/KV storage and bounded training windows visit the
-selected targets; cold state is stored in pages.
-
-Remaining: `PagedSavedActivation.restore()` in
+Current source: `SavedActivityTensor.restore()` in
 [`working_attention_paging.py`](../engine/omni_core/working_attention_paging.py)
-allocates the entire restored tensor after admission. Arbitrary full outputs
-and some nonweight/sensory/recurrent minima must still fit compute RAM or pause.
-Large paged inference context is not unrestricted full-context training. This
-does not mean records are intentionally skipped; it limits what can execute at
-once and which cases can continue through drive spill alone.
+builds a verified, leased file image in bounded page transfers and returns a
+CPU tensor backed by a private mapping, avoiding a complete new anonymous CPU
+copy. Saved-page lifetime remains tied to mapping ownership.
+
+Residual boundary: accelerator restoration still allocates an admitted full
+device tensor. Downstream operators can demand complete outputs/gradients and
+fault mapped pages into RAM. Large paged inference context remains distinct
+from unrestricted full-context training; a resource pause is not completed
+dataset traversal.
 
 ### 5. Some native and nested dataset values still require whole allocation
 
@@ -152,17 +213,18 @@ whole.
 U0172: “fix it skiping rest of trainijg.” Resource rejection must remain visibly
 incomplete, not masquerade as complete traversal.
 
-Present: leased streaming text/scalars, exact supervision windows/cursors,
-native predecode admission and incomplete coverage on resource failure.
+Current source: [`datasets.py`](../engine/omni_core/datasets.py) now represents
+nested list/map/struct children lazily in `_bounded_columnar_rows()` and
+traverses selected content with bounded encoding/text leases. That production
+Parquet/Arrow ingestion path no longer makes a whole nested `as_py()` row copy.
+The older `_iter_columnar_rows()` helper still contains `as_py()` but has no
+production call site in this module.
 
-Remaining: `_bounded_columnar_rows()` in
-[`datasets.py`](../engine/omni_core/datasets.py) still calls `as_py()` for nested
-values after an estimate. Arrow dictionaries/native decompression and some
-speech-conditioning values may allocate whole buffers. The
-[`columnar_admission.py`](../engine/omni_core/columnar_admission.py) estimates
-are explicitly not allocator hard caps. Thus universal whole-value avoidance
-and protection against process-killing native OOM are not implemented. Existing
-streaming fixes must not be described as solving every format's decoder.
+Residual boundary: PyArrow batch/dictionary/decompression and unknown extension
+leaf allocations still depend on the estimates in
+[`columnar_admission.py`](../engine/omni_core/columnar_admission.py), not an
+allocator hard cap. Speech and other native formats retain their own minima.
+No universal native-OOM immunity or completed full-dataset run is claimed.
 
 ### 6. Architecture evolution has a defined compatibility boundary
 
@@ -170,15 +232,21 @@ Request: U0038, accepted U0042 and U0096 retain recursive model/data/source/
 architecture improvement, not merely manually added residual experts.
 U0038: “Make sure it has recursive self improvement too.”
 
-Present: protected source worktrees, neural/data/substrate candidates,
-compatible depth/expert/router/region growth, lineage, evaluation and rollback.
+Current source: [`architecture_migration.py`](../engine/omni_core/architecture_migration.py)
+now declares explicit `resize-width` and `repartition-heads` operations and
+bounded coordinate-copy plans. [`geometry_candidate_application.py`](../engine/omni_core/geometry_candidate_application.py)
+applies them only in an isolated candidate, checks parent ownership/aliases,
+and preserves the original durable activity bytes. [`evolution.py`](../engine/omni_core/evolution.py)
+requires recorded training, registered real held-out token/modality/tool and
+resource measurements, a passing immutable evaluation and explicit geometry
+authorization before promotion.
 
-Remaining: [`architecture_migration.py`](../engine/omni_core/architecture_migration.py)
-supports four compatible operation families and explicitly rejects width/head
-geometry migration. Source-edit capability does not itself provide a general
-state-preserving tensor migration system. The restriction is honest, but not
-unrestricted architecture evolution. No whole-identity averaging or padding
-shortcut should replace the missing migration.
+Residual boundary: changed normalization, head partitioning and RoPE make
+function preservation false. Newly introduced coordinates require actual
+learning, and no beneficial real candidate or unrestricted arbitrary geometry
+migration has been demonstrated by this source review. The registered evaluator
+uses all selected video frames but does not separately score embedded video
+audio; that narrower boundary is not presented as full audiovisual quality.
 
 ### 7. Total-dependent integrity and scoring work remains
 
@@ -186,19 +254,20 @@ Request: U0127–U0129/U0191/U0412/U0461 ask for efficient operation, avoiding
 excessive drive work and long small-turn delays.
 U0127: “not to cook ssd and slow down mutch”; U0191: “its way to slow for its size.”
 
-Present: changed-group checkpoint publication, bounded reads, lazy structural
-views, indexed lookup and changed-byte rollback avoid many previous RAM/I/O
-spikes.
+Current source: [`brain.py`](../engine/omni_core/brain.py) reuses an already
+verified slow/cortical checksum for the same owners instead of immediately
+hashing them twice. Router checksums now stream exact historical decoded
+bytes without a whole decoded matrix; changed-byte journals and bounded
+snapshots remain in [`parameter_diagnostics.py`](../engine/omni_core/parameter_diagnostics.py)
+and [`slow_state_snapshot.py`](../engine/omni_core/slow_state_snapshot.py).
 
-Remaining: exact core hashes still read all learned core bytes;
-`parameter_checksum()` and `_slow_parameter_checksum()` in `brain.py` use
-`tensor_checksum()`. Exhaustive semantic scoring may still visit the whole
-brain, and independent inline-media snapshots copy the selected region. These
-are bounded in scratch RAM, not constant-time or constant-I/O. A 10+ TPS or
-20-second cold-start claim is not established. Removing integrity checks to
-make a flattering speed claim would be a downgrade, not completion.
+Residual boundary: `parameter_checksum()` and `_slow_parameter_checksum()`
+still perform required total-byte integrity reads; exhaustive semantic
+scoring may visit the whole learned state, and an inline-media snapshot copies
+its selected region. Scratch-RAM bounds do not make these constant-I/O or
+establish 10+ TPS or a 20-second cold start. Integrity checks are retained.
 
-### 8. Tool results do not yet inform the same unfinished text reply
+### 8. Typed tool results can condition the same unfinished reply; live competence is unproved
 
 Request: the original in-chat tools requirement, accepted U0042's natural
 action head and U0098 require the brain to use its actions on the go. U0512
@@ -206,35 +275,42 @@ explicitly rejects fact/answer stores as the learning substitute.
 U0098: “ai should be able to use internet or all of its actions/tools onthe go
 aslong as its permited by aceess.”
 
-Present: a generation-bound native action can start an independently owned,
-permissioned host tool while text is still running. Its visible result is then
-learned through the real structured-experience path.
+Current source: [`chatActionController.ts`](../src/main/chatActionController.ts)
+offers the completed, permissioned host execution while its turn still owns
+unfinished output. [`chatToolObservation.ts`](../src/main/chatToolObservation.ts),
+[`worker.py`](../engine/worker.py) and
+[`chat_tool_observation.py`](../engine/omni_core/chat_tool_observation.py)
+bind/validate the exact brain, turn, native action, execution and result.
+[`brain.py`](../engine/omni_core/brain.py) encodes the actual result into native
+conditioning, and [`model.py`](../engine/omni_core/model.py) invalidates stale
+cache state before subsequent forward use; the trace distinguishes inbox
+acceptance from `nativeDecodingUsed`. Natural EOS can wait for an already
+requested result within the configured wait, without forcing a reply.
 
-Remaining: `ChatActionController` in
-[`chatActionController.ts`](../src/main/chatActionController.ts) awaits and
-learns external results after the text turn commits. The result cannot yet
-change that unfinished text reply or drive another same-turn decision. A true
-typed observation/resume protocol is needed. Restoring the removed fake second
-human message, answer replay, or hidden prose prompt would violate the agreed
-design rather than close this gap. This is an integration limit, not a claim
-that an untrained action head can already use every tool intelligently.
+Residual boundary: late, canceled or resource-paused observations need not
+affect that turn; completed results still follow the ordinary durable learning
+path. This is no evidence that an untrained action head chooses useful tools
+or composes another useful same-turn decision. No fake human turn, answer
+replay or hidden prose prompt is added.
 
 ### 9. Typed tool schemas have a compatibility boundary
 
 Request: accepted U0042 and subsequent MCP/browser requirements retain genuine
 structured schemas and model-produced arguments, not hard-coded word triggers.
 
-Present: the action argument route preserves nested properties, supported
-combinators and local nonrecursive references. Unsupported assertions are
-rejected rather than silently weakening validation.
-
-Remaining: `structural_schema()` and `validate_structural_value()` in
+Current source: [`schema_validation.py`](../engine/omni_core/schema_validation.py)
+uses the reviewed `jsonschema` validators, preserves assertion structure and
+recursive local references, and validates host-exact safe integers. The
 [`native_action_protocol.py`](../engine/omni_core/native_action_protocol.py)
-are an explicit subset, not complete JSON Schema support. Nonlocal/recursive
-references, unsupported asserting keywords and structure beyond depth 32 fail
-closed. A tool with such a schema may not be invocable through the learned
-generic route. Do not relabel user-closed historical MCP fixtures as failed;
-they exercised supported schemas, not universal conformance.
+wrapper no longer imposes a product depth-32 or enum-product cap. The
+dependency is pinned in [`requirements.txt`](../engine/requirements.txt) and
+platform locks; this source update does not claim the locked installation was
+run in every target environment.
+
+Residual boundary: no unpermissioned network/file reference retrieval is
+performed. An unavailable external dialect/reference fails closed; physical
+interpreter recursion pressure is a recoverable pause, not silently weakened
+validation. Historical user-closed MCP fixtures retain their recorded status.
 
 ## Memory movement checked in source
 
@@ -320,7 +396,7 @@ true facts, or should current independent-evidence requirements remain? No
 answer has been received at this report's cutoff. The current policy is
 preserved, not declared user-approved or quietly replaced.
 
-## New source defects corrected in this pass
+## Source defects corrected in the earlier scoped pass
 
 - Foreground slow-replay admission scanned all assemblies just to find the
   current ID. It now uses `assembly_by_id`, including the paged exact index,
@@ -340,9 +416,10 @@ preserved, not declared user-approved or quietly replaced.
   novelty when no activation observations existed. It now reports no observed
   value in that case; a real mean is labeled as a mean of observed values, not
   the percentage of the entire brain firing.
-- The evolution-controller comment still called compatible depth/router
-  changes unsupported after their implementation. The comment now matches the
-  actual remaining width/head restriction.
+- The evolution-controller comment had still called compatible depth/router
+  changes unsupported after their implementation. It was corrected to match
+  the width/head restriction at that earlier baseline; the current isolated
+  geometry candidate path described above supersedes that restriction.
 - The host's unrelated 100,000-character ceiling and native current-message
   suffix crop are removed. Exact UTF-8 capacity checks block a message that
   cannot fit, preserving the draft and running before new neural work. A
@@ -365,13 +442,13 @@ These are code findings, not blanket behavior passes.
 
 | Requirement group | Current path | What is not claimed |
 | --- | --- | --- |
-| Own brain and mandatory ternary learning | Native origin/architecture validation; packed linear, embedding, convolution, controls, liquid/router and shared substrate rows; legacy answer/foundation payload rejection. | Broad fluency, 1.58 bits for every runtime byte, or fully packed/tiled recurrent execution. |
+| Own brain and mandatory ternary learning | Native origin/architecture validation; packed linear, embedding, convolution, controls, liquid/router and shared substrate rows; tiled/paged recurrent router execution; legacy answer/foundation payload rejection. | Broad fluency, 1.58 bits for every runtime byte, or a measured large-router memory peak. |
 | Spiking, liquid, VSA and whole-input processing | LIF/timed STDP, CfC/internal LTC, binding/bundling, causal global workspace and connected assemblies. | Human-equivalent cognition, consciousness or achieved AGI. |
-| Growth and anti-forgetting | Resource-admitted regions/assemblies/experts, packed row resistance, recurrence/replay and no arbitrary idea eviction. | Perfect non-forgetting or unrestricted tensor-geometry migration. |
+| Growth and anti-forgetting | Resource-admitted regions/assemblies/experts, packed row resistance, recurrence/replay, no arbitrary idea eviction, and isolated width/head candidates behind training/evaluation gates. | Perfect non-forgetting, function preservation after geometry change, or unrestricted arbitrary migration. |
 | Initial and whole-dataset learning | Required initial curriculum/selected-data progress; no first-chat quiz; start/mid/end capability rehearsal; exact committed coverage and resume. | A bundled broadly pretrained brain or a completed current full-folder run. |
-| Uploads and formats | Chat/Build/Data file/folder/media pickers; PDF, EPUB, Office/OpenDocument, HTML, code, CSV/JSON, Parquet/Arrow, archives/WebDataset, SQLite and remote manifests. | Every historical native-picker condition or universal native-decoder RAM bounds. |
+| Uploads and formats | Chat/Build/Data file/folder/media pickers; PDF, EPUB, Office/OpenDocument, HTML, code, CSV/JSON, Parquet/Arrow with lazy nested values, archives/WebDataset, SQLite and remote manifests. | Every historical native-picker condition or universal native-decoder RAM bounds. |
 | Web and teacher learning | Persistent paced same-site frontier, parallel fetch, stop/resume, external/robots/quarantine settings; explicit OpenAI/Claude/Gemini teachers. | An unperformed paid-provider call or pretrained weights silently becoming the resident AI. |
-| Natural tools and MCP | Neural action/argument schemas, typed generic/MCP/browser payloads, result observation, permissions, settings awareness and configurable approval window. | Useful unseen-tool judgment, complete JSON Schema compatibility or same-turn result-fed continuation. |
+| Natural tools and MCP | Neural action/argument schemas, standards-based local JSON Schema validation, typed generic/MCP/browser payloads, same-turn actual-result observation into native decoding, permissions, settings awareness and configurable approval window. | Useful unseen-tool judgment, implicit remote schema retrieval, or trained same-turn tool competence. |
 | Ponder and spontaneous actions | Always-available learned selection, repeated per-prefix Ponder and generation-bound text/action conditioning, no backend persona prompt/slash-only dependency. | That the untrained brain reliably chooses when pondering or tool use is useful. |
 | Same-brain media and voice | Shared idea/sensory/motor regions, progressive image/audio/video, cancellation/gallery, paired own-speech conditioning; STT/TTS default and independent neural input/output ticks. | Meaningful imagination, intelligible neural speech, real-time quality at arbitrary resolution or a different hidden media assistant. |
 | Live perception and devices | Permissioned camera/screen/microphone, source/resource-derived quality/FPS, priorities, snapshots/native/current/custom bursts, keys/pointer/scroll. | A new physical-device or driver-specific test in this audit. |
@@ -380,7 +457,7 @@ These are code findings, not blanket behavior passes.
 | Viewer | Paged sparse map plus packed cortical byte/range/token-path drilldown, search/back/zoom/continuation and observed-only activation coverage. | A complete semantic explanation of thought or a new visual screenshot audit. |
 | Setup and appearance | Data-first four stages, one ordinary memory policy, no personality/Starter controls; Default/Classic/Colorful/Liquid Glass, layout/profile CRUD/dice, Auto light/dark and Apple fresh defaults. | Every viewport, hover/highlight, scrolling and overlap condition freshly observed here. |
 | Identity/storage/portability | Immutable origin, isolated COW fork/duplicate, reviewed merges, three-confirmation delete, complete unsanitized saved state and recovery references. | Process cloning, arbitrary external-data relocation or reconstructing already-missing historical files. |
-| Recursive improvement | Isolated typed candidates, protected evaluators/origin/permissions, lineage/archive, approved or authorized promotion and rollback. | Demonstrated beneficial or meta-recursive intelligence improvement. |
+| Recursive improvement | Isolated typed candidates including width/head geometry, protected evaluators/origin/permissions, real registered geometry holdout gates, lineage/archive, approved or authorized promotion and rollback. | Demonstrated beneficial or meta-recursive intelligence improvement. |
 | Cross-platform product | Windows/macOS/Linux x64/ARM64 package routes; Android/iOS companions to the same identity; PolyForm/commercial and third-party notices. | Local phone training, new signed binaries without credentials, or a new application release in this pass. |
 
 ## Deferred proof and closed or replaced work
@@ -407,14 +484,14 @@ brain-training hosted CI. The v1.1.0 and separate codec releases remain
 historical completed work. The newly canceled application CI/release is excluded
 from this local handoff, not added as an unmet gate.
 
-## Verification for this repeat audit
+## Verification recorded for the earlier repeat audit
 
 Only affected constructor-free/helper/controller checks and static verification
 are authorized. No test result below is a trained-model capability verdict.
 The completed-turn fixture creates only an isolated presentation repository;
 it starts no neural worker, model or app and touches no user-saved instance.
 
-Verified in this pass:
+Verified in that earlier scoped pass, before the current source continuation:
 
 - Replay-index fixtures: 2 passed.
 - Current-message capacity/idempotence fixtures: 5 passed.
@@ -425,20 +502,33 @@ Verified in this pass:
   temporary Steer controller: 4 passed; reduced-context completed-receipt
   recovery: 1 passed, with the other 8 historical receipt cases intentionally
   skipped in that focused invocation.
-- Earlier affected source-only GUI checks in this same pass: 13 defect
+- Affected source-only GUI checks in that earlier pass: 13 defect
   contracts, 9 visual/CSS contracts and 12 no-reply presentation contracts
   passed. They were not rerun just to increase a progress count. Static CSS
   checks are not screenshot or computer-use verification.
-- Both Node and renderer TypeScript checks passed. Syntax compilation of every
-  changed Python source/test and `git diff --check` passed before staging.
+- Both Node and renderer TypeScript checks passed then. Syntax compilation of
+  the Python sources/tests changed in that pass and `git diff --check` passed
+  before its staging; this is not a fresh check of the present working tree.
 
 Repeated executions are not counted as new coverage: the distinct totals are
 29 Python and 47 TypeScript contract checks. The scripted token loop uses
 programmed logits and tiny control tensors, not learned forward inference.
 No corpus training, brain quiz, native quality run, app/UI launch, kernel
-benchmark, new GitHub CI, push or application release occurred for this pass.
+benchmark, new GitHub CI, push or application release occurred in that earlier
+pass. This sentence does not report the current commit/push outcome.
 
-The nine implementation limits above remain documented findings. This audit
-is complete as a request-to-source comparison and scoped correction handoff;
-it is not a claim that every feature is fully implemented or biologically
-equivalent. Deferred native qualification stays separate from source debt.
+The nine historical implementation gaps above now have specific source
+follow-ups and residual physical/behavioral boundaries. The prior audit is a
+request-to-source comparison and scoped correction handoff, not a claim that
+every feature is fully implemented or biologically equivalent. The checks
+listed here predate the current continuation; its affected validation and
+commit/push outcome must be reported by the main task, not inferred from
+these earlier counts. Deferred native and GUI qualification stay separate.
+
+In the current continuation, before the user's instruction to stop checks,
+100 selected Python source/fixture checks, 41 selected desktop checks and 15
+evolution-controller fixtures passed; both TypeScript projects and all five
+engine dependency-lock manifests also passed their focused checks. The final
+geometry registration/evaluator corrections and portable-holdout wiring were
+committed without rerunning those checks at the user's explicit direction.
+No native model, full dataset, app session, CI, package or release was run.

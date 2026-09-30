@@ -167,6 +167,7 @@ interface SavedSnapshotSummary extends BrainSnapshotSummary {
 
 function safeSnapshotContinuationPath(path: string): string {
   if (path !== "engine/state/working-memory.sqlite3" &&
+    !/^engine\/evaluation\/(?:geometry-holdouts\.json|data\/[a-f0-9]{32}(?:\.[A-Za-z0-9_-]+)?)$/.test(path) &&
     !/^engine\/state\/concept-id-views\/[a-f0-9]{64}\.jsonl$/.test(path) &&
     !/^engine\/operational-tool-intents\/[a-f0-9-]{36}\.json$/i.test(path) &&
     !/^engine\/state\/ingestion-joint\/generations\/[a-f0-9]{32}\/(?:manifest\.json|packed-vector-index\.sqlite3)$/.test(path)) {
@@ -1739,6 +1740,59 @@ function savedEngineState(contents: Buffer): Uint8Array {
   return contents;
 }
 
+/** Carry only the exact protected real-data references sealed in engine state. */
+async function savedGeometryHoldoutFiles(
+  state: unknown,
+  engineDirectory: string
+): Promise<Map<string, string>> {
+  const files = new Map<string, string>();
+  if (!isRecord(state) || state.geometry_holdout_registration == null) return files;
+  const registration = state.geometry_holdout_registration;
+  if (!isRecord(registration) || registration.format !== "omni-geometry-holdout-registration" ||
+    registration.formatVersion !== 1 || registration.manifestPath !== "evaluation/geometry-holdouts.json" ||
+    typeof registration.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(registration.manifestSha256)) {
+    throw new Error("Saved geometry holdout registration is invalid.");
+  }
+  const evaluation = join(engineDirectory, "evaluation");
+  const data = join(evaluation, "data");
+  for (const directory of [evaluation, data]) {
+    const info = await lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Saved geometry holdout directory is unsafe.");
+  }
+  const manifest = join(evaluation, "geometry-holdouts.json");
+  const manifestInfo = await lstat(manifest);
+  if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink() ||
+    await fileSha256(manifest) !== registration.manifestSha256) {
+    throw new Error("Saved geometry holdout manifest is missing or changed.");
+  }
+  const declaration: unknown = JSON.parse(await readFile(manifest, "utf8"));
+  if (!isRecord(declaration) || declaration.format !== "omni-registered-geometry-holdouts" ||
+    declaration.formatVersion !== 1 || !isRecord(declaration.categories) ||
+    Object.keys(declaration.categories).sort().join(",") !== "modality,token,tool") {
+    throw new Error("Saved geometry holdout manifest is invalid.");
+  }
+  files.set("evaluation/geometry-holdouts.json", manifest);
+  for (const category of ["token", "modality", "tool"] as const) {
+    const entries = declaration.categories[category];
+    if (!Array.isArray(entries) || !entries.length) throw new Error("Saved geometry holdout category is empty.");
+    for (const entry of entries) {
+      if (!isRecord(entry) || typeof entry.path !== "string" ||
+        !/^evaluation\/data\/[a-f0-9]{32}(?:\.[A-Za-z0-9_-]+)?$/.test(entry.path) ||
+        typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256) ||
+        !Number.isSafeInteger(entry.records) || Number(entry.records) < 1 || files.has(entry.path)) {
+        throw new Error("Saved geometry holdout file declaration is invalid.");
+      }
+      const source = join(engineDirectory, ...entry.path.split("/"));
+      const info = await lstat(source);
+      if (!info.isFile() || info.isSymbolicLink() || await fileSha256(source) !== entry.sha256) {
+        throw new Error("Saved geometry holdout file is missing or changed.");
+      }
+      files.set(entry.path, source);
+    }
+  }
+  return files;
+}
+
 /** Preserve the active v3 cursor's committed joint generation, not orphan stages. */
 async function savedJointGenerationFiles(
   state: unknown,
@@ -2917,11 +2971,48 @@ export function resolveBrainDataRoot(
   return join(base, "brains");
 }
 
+export interface BrainRepositoryCommitObserver {
+  saved?(declaration: { brainId: string; storagePoolBytes: number }): void | Promise<void>;
+  removed?(brainId: string): void | Promise<void>;
+  error?(operation: "saved" | "removed", brainId: string, error: unknown): void;
+}
+
 export class BrainRepository {
   readonly root: string;
 
-  constructor(root: string) {
+  constructor(root: string, private readonly commitObserver?: BrainRepositoryCommitObserver) {
     this.root = resolve(root);
+  }
+
+  private async observeCommittedBrain(brain: BrainDocument): Promise<void> {
+    try {
+      await this.commitObserver?.saved?.({
+        brainId: brain.id,
+        storagePoolBytes: brain.config.storagePoolBytes
+      });
+    } catch (error) {
+      this.observeCommitError("saved", brain.id, error);
+    }
+  }
+
+  private async observeRemovedBrain(brainId: string): Promise<void> {
+    try {
+      await this.commitObserver?.removed?.(brainId);
+    } catch (error) {
+      this.observeCommitError("removed", brainId, error);
+    }
+  }
+
+  private observeCommitError(operation: "saved" | "removed", brainId: string, error: unknown): void {
+    // A resource observer is not checkpoint authority. The file has already
+    // committed/been removed, so a handler failure must not make a caller retry
+    // the neural mutation or mistake a confirmed deletion for an intact mind.
+    try {
+      this.commitObserver?.error?.(operation, brainId, error);
+      console.warn(`Committed brain ${operation} observer pending for ${brainId}:`, error);
+    } catch {
+      // Even a diagnostic failure cannot roll back a completed filesystem fact.
+    }
   }
 
   async initialize(): Promise<void> {
@@ -3035,6 +3126,7 @@ export class BrainRepository {
         throw new Error(`Managed beta brain "${id}" is not a directory.`);
       }
       await rm(targetPath, { recursive: true, force: false });
+      await this.observeRemovedBrain(id);
       deleted.push(id);
     }
     return deleted;
@@ -3593,6 +3685,13 @@ export class BrainRepository {
       paths.push(`engine/${relative}`);
       hashes.push(hash);
     }
+    for (const [relative, source] of await savedGeometryHoldoutFiles(metadata, sourceEngine)) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      await this.linkBlobTo(hash, join(destinationEngine, ...relative.split("/")), operation);
+      paths.push(`engine/${relative}`);
+      hashes.push(hash);
+    }
     return { paths, hashes };
   }
 
@@ -3807,6 +3906,10 @@ export class BrainRepository {
       }
       for (const [relative, path] of await savedConceptIdViewFiles(source!)) {
         await addPath(path, join(destination!, ...relative.split("/")), "historical structural argument view", true);
+      }
+      const sourceState = JSON.parse(await readFile(join(source!, "brain.json"), "utf8")) as unknown;
+      for (const [relative, path] of await savedGeometryHoldoutFiles(sourceState, source!)) {
+        await addPath(path, join(destination!, ...relative.split("/")), "registered geometry holdout", true);
       }
     }
 
@@ -4600,6 +4703,7 @@ export class BrainRepository {
       mode: 0o600
     });
     const created = clone(await this.compactActivityDocument(brain, false, true));
+    await this.observeCommittedBrain(created);
     return normalizedConfig.idleCognition
       ? (await this.setActiveMode(id, true)).brain
       : created;
@@ -4779,6 +4883,7 @@ export class BrainRepository {
     if (touch) normalized.updatedAt = new Date().toISOString();
     normalized.name = normalized.config.name.trim() || normalized.name;
     await atomicWrite(this.documentPath(normalized.id), JSON.stringify(normalized, null, 2));
+    await this.observeCommittedBrain(normalized);
     return clone(await this.compactActivityDocument(normalized, false, true));
   }
 
@@ -5108,7 +5213,9 @@ export class BrainRepository {
         fork.name,
         storageOperation
       );
-      return clone(await this.get(fork.id));
+      const completed = clone(await this.get(fork.id));
+      await this.observeCommittedBrain(completed);
+      return completed;
     } catch (error) {
       await removeTreeWithRetry(directory);
       throw error;
@@ -5149,6 +5256,7 @@ export class BrainRepository {
       }
 
       await rm(exactPath, { recursive: true, force: false });
+      await this.observeRemovedBrain(id);
       const reclaimed = await this.collectUnreferencedBlobs().catch(() => ({
         removedSharedBlobs: 0,
         reclaimedBytes: 0
@@ -5168,6 +5276,7 @@ export class BrainRepository {
     if (!(await pathExists(source))) return false;
     const trashName = `${requireSafeId(id)}-${Date.now()}`;
     await rename(source, join(this.root, ".trash", trashName));
+    await this.observeRemovedBrain(id);
     return true;
   }
 
@@ -6005,6 +6114,11 @@ export class BrainRepository {
         ...(plasticityExists ? { sourcePath: plasticityPath } : { contents: plasticityFallback })
       }
     };
+    const currentGeometryState = JSON.parse(Buffer.from(engineState).toString("utf8")) as unknown;
+    for (const [relative, sourcePath] of await savedGeometryHoldoutFiles(currentGeometryState, engineDirectory)) {
+      const name = `geometry/current/${relative}`;
+      entries[name] = { name, sourcePath };
+    }
     const includeSavedSourceBlob = async (source: TrainingSource): Promise<void> => {
       if (source.rawTextRetained || source.rawText !== undefined) rawEpisodesPresent = true;
       if (!source.blobHash || entries[`blobs/${source.blobHash}`]) return;
@@ -6185,6 +6299,12 @@ export class BrainRepository {
       name: "origin/state/engine.json",
       contents: immutableState
     };
+    const originGeometryEngine = immutableStateExists ? immutableEngine : engineDirectory;
+    const originGeometryState = JSON.parse(Buffer.from(immutableState).toString("utf8")) as unknown;
+    for (const [relative, sourcePath] of await savedGeometryHoldoutFiles(originGeometryState, originGeometryEngine)) {
+      const name = `geometry/origin/${relative}`;
+      entries[name] = { name, sourcePath };
+    }
     entries["origin/tensors/core.safetensors"] = {
       name: "origin/tensors/core.safetensors",
       ...(references
@@ -7631,6 +7751,26 @@ export class BrainRepository {
           join(directory, "engine", "origin", "brain.json")
         );
       }
+      for (const [scope, state, destinationEngine] of [
+        ["current", engineValue, join(directory, "engine")],
+        ["origin", originEngineValue, join(directory, "engine", "origin")]
+      ] as const) {
+        const prefix = `geometry/${scope}/`;
+        const declared = [...names].filter((name) => name.startsWith(prefix));
+        for (const name of declared) {
+          const relative = name.slice(prefix.length);
+          if (relative !== "evaluation/geometry-holdouts.json" &&
+            !/^evaluation\/data\/[a-f0-9]{32}(?:\.[A-Za-z0-9_-]+)?$/.test(relative)) {
+            throw new Error("The .omni geometry holdout path is invalid.");
+          }
+          await materializeFile(entryPath(name), join(destinationEngine, ...relative.split("/")), false);
+        }
+        const verified = await savedGeometryHoldoutFiles(state, destinationEngine);
+        if (verified.size !== declared.length ||
+          [...verified.keys()].some((relative) => !names.has(`${prefix}${relative}`))) {
+          throw new Error("The .omni geometry holdout data does not match its sealed registration.");
+        }
+      }
       for (const path of names) {
         if (!path.startsWith("blobs/")) continue;
         const expected = path.slice("blobs/".length);
@@ -7664,7 +7804,9 @@ export class BrainRepository {
       // The host document is the final identity commit record. Reserved
       // directories without it are not visible as half-installed brains.
       await atomicWrite(this.documentPath(imported.id), importedDocument);
-      return clone(await this.get(imported.id));
+      const completed = clone(await this.get(imported.id));
+      await this.observeCommittedBrain(completed);
+      return completed;
     } catch (error) {
       await removeTreeWithRetry(directory);
       throw error;

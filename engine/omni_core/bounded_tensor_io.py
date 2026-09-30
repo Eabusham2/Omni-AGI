@@ -113,6 +113,8 @@ class BoundedTensorFile:
                 # without a pager and to avoid a module dependency cycle.
                 from .native_core_paging import release_native_tensor_chunk
                 release_native_tensor_chunk(target, start, count)
+                from .router_state_paging import release_router_tensor_chunk
+                release_router_tensor_chunk(target, start, count)
                 if on_chunk is not None:
                     on_chunk(name, start, count)
 
@@ -215,6 +217,7 @@ def atomic_save_tensors_bounded(
     chunk_bytes: int = TRANSFER_BYTES,
     on_chunk: Optional[Callable[[torch.Tensor, int, int], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    spill_lease: Any = None,
 ) -> None:
     """Write the standard safe-tensor wire format without a whole CPU clone.
 
@@ -259,6 +262,8 @@ def atomic_save_tensors_bounded(
     encoded += b" " * ((-len(encoded)) % 8)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    if spill_lease is not None:
+        spill_lease.bind_path(Path(temporary))
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(struct.pack("<Q", len(encoded)))
@@ -276,11 +281,16 @@ def atomic_save_tensors_bounded(
                         handle.write(memoryview(block.view(torch.uint8).numpy()))
                         from .native_core_paging import release_native_tensor_chunk
                         release_native_tensor_chunk(value, start * value.element_size(), (end - start) * value.element_size())
+                        from .router_state_paging import release_router_tensor_chunk
+                        release_router_tensor_chunk(value, start * value.element_size(), (end - start) * value.element_size())
                         if on_chunk is not None:
                             on_chunk(value, start * value.element_size(), (end - start) * value.element_size())
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, str(path))
+        if spill_lease is not None:
+            spill_lease.bind_path(path)
+            spill_lease.commit(path=path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

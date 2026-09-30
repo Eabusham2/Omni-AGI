@@ -47,6 +47,7 @@ from .committed_paged_cache import (
     prepare_committed_paged_cache,
 )
 from .config import OmniConfig, safe_rounded_storage_bytes_per_second
+from .router_state_paging import RouterStatePager
 from .native_action_protocol import (
     NativeActionEmissionLedger,
     observed_argument_schema,
@@ -376,6 +377,8 @@ class AdaptiveBrain:
             system_ram_share_percent=config.system_ram_share_percent,
             storage_bytes_per_second=config.storage_bytes_per_second,
             hardware_tier=config.hardware_tier,
+            shared_resource_owner_id=self.brain_id,
+            shared_storage_pool_bytes=config.storage_pool_bytes,
         )
         self.state_store = MutableStateStore(
             self.engine_path / "state", self.brain_id, self.resource_policy
@@ -493,6 +496,7 @@ class AdaptiveBrain:
             cpu_hot_bytes=initial_core_budget["liveCoreHotBytes"],
             accelerator_hot_bytes=initial_core_budget["acceleratorCoreHotBytes"],
             reserve_disk=self.resource_policy.require_disk,
+            resource_policy=self.resource_policy,
             reserve_admission=reserve_core_admission,
             budget_provider=core_budget_provider,
             resource_pause=lambda message, paging: NeuralStateResourcePause(
@@ -504,6 +508,13 @@ class AdaptiveBrain:
                 },
             ),
         )
+        router_budget = self._router_state_budget({})
+        self.router_state_pager = RouterStatePager(
+            self._live_paging_cache_directory / "router",
+            hot_bytes=router_budget["hotBytes"], tile_bytes=router_budget["tileBytes"],
+            journal_ram_bytes=router_budget["journalRamBytes"], resource_policy=self.resource_policy,
+            budget_provider=self._router_state_budget,
+        )
         with self.core_pager.construction(from_checkpoint=_loading_checkpoint):
             self.decoder = OmniDecoder(config).to(self.device)
             self.memory_bridge = BitLinear(config.vsa_dim, config.idea_dim, bias=True).to(
@@ -514,31 +525,28 @@ class AdaptiveBrain:
                 nn.SiLU(),
                 BitLinear(config.idea_dim * 2, config.idea_dim, bias=True),
             ).to(self.device)
-            # The dense timing/usage/stability matrices are real nonweight
-            # state, not pageable projection trits. Admit their one final
-            # destination before allocation; load will not create a second
-            # full source map. Includes LIF/traces/counters, active-prefix and
-            # the initial region endpoint plus exact row-padded STDP codes.
+            # Matrices stay exact but can be paged. Only hot LIF/timing vectors
+            # and one admitted tile are intrinsically resident destinations.
             router_neurons = int(config.router_neurons)
             reserve_core_admission(
-                10 * router_neurons * router_neurons + 16 * router_neurons + 32
-                + router_neurons * ((router_neurons + 3) // 4),
+                16 * router_neurons + 32 + router_budget["tileBytes"],
                 self.device,
             )
-            self.router = AssociativeSpikingRouter(
-                config.idea_dim,
-                config.router_neurons,
-                leak=config.membrane_leak,
-                threshold=config.firing_threshold,
-                learning_rate=config.stdp_learning_rate,
-                tau_pre=config.stdp_tau_pre,
-                tau_post=config.stdp_tau_post,
-                a_plus=config.stdp_a_plus,
-                a_minus=config.stdp_a_minus,
-                metaplasticity_rate=(
-                    config.metaplasticity_rate if config.metaplasticity else 0.0
-                ),
-            ).to(self.device)
+            with self.router_state_pager.construction(loading=_loading_checkpoint):
+                self.router = AssociativeSpikingRouter(
+                    config.idea_dim,
+                    config.router_neurons,
+                    leak=config.membrane_leak,
+                    threshold=config.firing_threshold,
+                    learning_rate=config.stdp_learning_rate,
+                    tau_pre=config.stdp_tau_pre,
+                    tau_post=config.stdp_tau_post,
+                    a_plus=config.stdp_a_plus,
+                    a_minus=config.stdp_a_minus,
+                    metaplasticity_rate=(
+                        config.metaplasticity_rate if config.metaplasticity else 0.0
+                    ),
+                ).to(self.device)
             self.liquid = LiquidController(
                 config.idea_dim,
                 mode=config.liquid_mode,
@@ -663,6 +671,7 @@ class AdaptiveBrain:
         self.installed_modality_packs: List[Dict[str, Any]] = []
         # Every build uses the native, randomly initialized core.
         self.ground_up_training_manifest: Optional[Dict[str, Any]] = None
+        self.geometry_holdout_registration: Optional[Dict[str, Any]] = None
         self.packed_ternary_manifest: Optional[Dict[str, Any]] = None
         self._starter_action_language_cache: Optional[torch.Tensor] = None
         self._starter_action_internal_cache: Optional[torch.Tensor] = None
@@ -700,6 +709,16 @@ class AdaptiveBrain:
             readings, baseline_bytes=self._native_residency_baseline_bytes,
             current_core_heap_bytes=heap,
         )
+        neurons = max(0, int(getattr(self.config, "router_neurons", 0)))
+        matrix_bytes = 10 * neurons * neurons + neurons * ((neurons + 3) // 4)
+        # The router shares, rather than duplicates, the one cortical hot pool.
+        # Very large recurrent state leaves room for cortical owners and spills
+        # the remainder; this is a cache budget, not a neuron cardinality cap.
+        router_reserve = min(matrix_bytes, budget["corePartitionBytes"] // 2)
+        budget["routerCoreReservationBytes"] = router_reserve
+        budget["sharedCorePartitionBytes"] = budget["corePartitionBytes"]
+        budget["corePartitionBytes"] -= router_reserve
+        budget["liveCoreHotBytes"] = min(budget["liveCoreHotBytes"], budget["corePartitionBytes"])
         free = readings.get("acceleratorFreeMemoryBytes")
         total = readings.get("acceleratorTotalMemoryBytes")
         if device.type == "cuda" and isinstance(free, int):
@@ -717,6 +736,17 @@ class AdaptiveBrain:
             hot = 0
         budget["acceleratorCoreHotBytes"] = max(0, int(hot))
         return budget
+
+    def _router_state_budget(self, paging: Mapping[str, Any]) -> Dict[str, int]:
+        budget = self._native_core_budget_for_device(self.core_pager.status())
+        available = max(0, int(self.resource_policy.status().get("availableSafeRamBytes") or 0))
+        owned = int(paging.get("cpuHeapBytes", 0)) + int(paging.get("mappedHotRetainedBytesEstimate", 0))
+        transfer = max(0, int(budget["trainingTransferPartitionBytes"]))
+        if transfer < 1408:
+            raise NeuralStateResourcePause("one exact recurrent tile requires physical scratch RAM", {"requiredBytes": 1408})
+        tile = min(4 * 1024 * 1024, transfer // 2 if transfer >= 2816 else transfer)
+        return {"hotBytes": min(budget["routerCoreReservationBytes"], available + owned),
+                "tileBytes": tile, "journalRamBytes": max(0, transfer - tile)}
 
     @staticmethod
     def _native_state_tensors(value: Any) -> Iterator[torch.Tensor]:
@@ -759,6 +789,9 @@ class AdaptiveBrain:
             for root in self._trainable_modules() for module in root.modules()
         ):
             raise NeuralStateResourcePause("backend migration requires a quiescent neural operation boundary", {**status, "paused": True})
+        router_pager = getattr(self, "router_state_pager", None)
+        if router_pager is not None and router_pager.status()["activeOperations"]:
+            raise NeuralStateResourcePause("backend migration awaits the active router boundary", {"paused": True})
         # An already-hot owner is still bound to the selected RAM ceiling.
         # Reclaim eligible cached/scratch state before permitting any new
         # neural operation, even when no backend transfer will take place.
@@ -866,6 +899,8 @@ class AdaptiveBrain:
         return dict(self._native_backend_residency)
 
     def close(self) -> None:
+        router_pager = getattr(self, "router_state_pager", None)
+        if router_pager is not None: router_pager.close()
         working_pager = getattr(self, "working_attention_pager", None)
         if working_pager is not None:
             working_pager.close()
@@ -898,7 +933,9 @@ class AdaptiveBrain:
         baseline = max(
             256 * 1024 * 1024,
             int(readings.get("admissionResidentMemoryBytes", readings.get("processMemoryBytes")) or 0)
-            - int(core_status.get("cpuHeapBytes", 0)) - old_resident,
+            - int(core_status.get("cpuHeapBytes", 0)) - old_resident
+            - int(self.router_state_pager.status().get("cpuHeapBytes", 0))
+            - int(self.router_state_pager.status().get("mappedHotRetainedBytesEstimate", 0)),
         )
         residual = max(0, selected - baseline)
         available = max(0, int(readings.get("availableSafeRamBytes") or 0))
@@ -4434,7 +4471,8 @@ class AdaptiveBrain:
                 value.numel() * value.element_size()
                 for value in brain.router.state_dict(keep_vars=True).values()
             ),
-            "routerControlStatePaging": False,
+            "routerControlStatePaging": True,
+            "routerStatePaging": brain.router_state_pager.status(),
             "checkpointWritableMapped": False,
         }
         if "state.liquid" in plastic:
@@ -4740,6 +4778,11 @@ class AdaptiveBrain:
             dict(stored_ground_up_manifest)
             if isinstance(stored_ground_up_manifest, Mapping)
             else None
+        )
+        registered_holdouts = metadata.get("geometry_holdout_registration")
+        brain.geometry_holdout_registration = (
+            dict(registered_holdouts)
+            if isinstance(registered_holdouts, Mapping) else None
         )
         stored_packed_manifest = metadata.get("packed_ternary_manifest")
         brain.packed_ternary_manifest = (
@@ -5086,7 +5129,17 @@ class AdaptiveBrain:
             "peakTransferBytes": max(core_reader.peak_transfer_bytes, plastic_reader.peak_transfer_bytes),
             "plasticityAuxiliaryBytesRead": plastic.destination_bytes_read,
         })
+        from .geometry_candidate_application import install_geometry_runtime_views
+        install_geometry_runtime_views(brain)
         return brain
+
+    def apply_isolated_geometry_candidate(
+        self, change: Mapping[str, Any], candidate_id: str,
+        *, cancelled: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        from .geometry_candidate_application import apply_isolated_geometry_candidate
+        return apply_isolated_geometry_candidate(self, change, candidate_id,
+                                                  cancelled=cancelled)
 
     def _begin_candidate(self, kind: str) -> Tuple[str, Path]:
         candidate_id = uuid.uuid4().hex
@@ -6131,7 +6184,9 @@ class AdaptiveBrain:
         mutable_pointer_before = copy.deepcopy(self.mutable_state_manifest)
         substrate_pointer_before = copy.deepcopy(self.memory.persistence_manifest)
         before = str(snapshot["checksum"])
-        cortical_before = self._cortical_parameter_checksum()
+        # Both helpers hash exactly the same cortical module owners. Reuse
+        # the verified snapshot digest instead of reading every byte twice.
+        cortical_before = before
         module_checksums_before = {
             name: tensor_checksum(module.parameters())
             for name, module in self._slow_transaction_modules().items()
@@ -6179,7 +6234,7 @@ class AdaptiveBrain:
                     "background chat learning was cancelled"
                 )
             after = self._slow_parameter_checksum()
-            cortical_after = self._cortical_parameter_checksum()
+            cortical_after = after
             module_checksums_after = {
                 name: tensor_checksum(module.parameters())
                 for name, module in self._slow_transaction_modules().items()
@@ -6764,6 +6819,7 @@ class AdaptiveBrain:
             "modality_training": self.modality_training,
             "installed_modality_packs": self.installed_modality_packs,
             "ground_up_training_manifest": self.ground_up_training_manifest,
+            "geometry_holdout_registration": self.geometry_holdout_registration,
             "packed_ternary_manifest": self.packed_ternary_manifest,
             "substrate": self.memory.metadata(include_records=False),
             "mutable_state": self.mutable_state_manifest,
@@ -6832,6 +6888,7 @@ class AdaptiveBrain:
     ) -> None:
         self.updated_at = _iso_now()
         self.engine_path.mkdir(parents=True, exist_ok=True)
+        self.router_state_pager.flush()
         self._drain_packed_stability_events()
         self._ensure_optimizer_resident()
         if not reuse_substrate_generation and not isinstance(self.memory.assemblies, PagedAssemblyView):
@@ -7690,7 +7747,8 @@ class AdaptiveBrain:
     def _parameter_copy(self) -> ParameterDeltaJournal:
         roots = [(name, getattr(self, name)) for name in ParameterDeltaJournal.scope["modules"]]
         return ParameterDeltaJournal(roots, directory=self._live_paging_cache_directory / "core-diagnostics",
-            reserve_ram=self._reserve_core_diagnostic_state, reserve_disk=self.resource_policy.require_disk)
+            reserve_ram=self._reserve_core_diagnostic_state, reserve_disk=self.resource_policy.require_disk,
+            resource_policy=self.resource_policy)
 
     def _parameter_delta_norm(self, before: Sequence[torch.Tensor]) -> float:
         if isinstance(before, ParameterDeltaJournal):
@@ -8305,14 +8363,7 @@ class AdaptiveBrain:
         return [self.tokenizer.bos_id] + history + current, history
 
     def _fast_synapse_checksum(self) -> str:
-        return tensor_checksum(
-            [
-                self.router.synapses.weights,
-                self.router.synapses.stability,
-                self.router.synapses.uses,
-                self.router.synapses.plasticity_events,
-            ]
-        )
+        return self.router.synapses.checksum_with_controls()
 
     def _fresh_attention_result(
         self,
@@ -11539,7 +11590,7 @@ class AdaptiveBrain:
         active_vector = recalled_vector if recalled else cue
         idea = self._idea_model_vector(active_vector).detach()
         parameter_before = self.parameter_checksum()
-        synapse_before = tensor_checksum([self.router.synapses.weights])
+        synapse_before = self.router.synapses.decoded_weight_checksum()
         stdp = self.router.apply_feedback(idea, sign)
         slow_learning: Optional[Dict[str, float]] = None
         if direction == "up" and self.config.online_learning:
@@ -11583,7 +11634,7 @@ class AdaptiveBrain:
             self.router.synapses.plasticity_events.item()
         )
         parameter_after = self.parameter_checksum()
-        synapse_after = tensor_checksum([self.router.synapses.weights])
+        synapse_after = self.router.synapses.decoded_weight_checksum()
         record = {
             "id": uuid.uuid4().hex,
             "createdAt": _iso_now(),
@@ -13299,6 +13350,51 @@ class AdaptiveBrain:
         return scores, actions
 
     @torch.no_grad()
+    def _generation_observation_callback(self, provider):
+        """Current external evidence enters shared native vectors, not prose."""
+        def integrate(current, observations):
+            bindings = []
+            refined = current
+            try:
+                for observation in observations:
+                    text = observation["payloadJson"]
+                    try:
+                        # Every byte enters one bounded window. CfC keeps the
+                        # accumulated world state across windows; one huge
+                        # result never creates a whole-value label/tensor list.
+                        recurrent = self.liquid_state.detach() if self.config.liquid_dynamics else None
+                        candidate = refined
+                        for offset in range(0, len(text), 16_384):
+                            part = text[offset:offset + 16_384]
+                            with self.resource_policy.reserve_ram(len(part) * 128 + 131072,
+                                                                  "native tool observation encoding"):
+                                cue = self._idea_model_vector(self.memory.vector_for_text(part))
+                                if self.config.liquid_dynamics:
+                                    recurrent, controls = self.liquid(cue, state=recurrent, elapsed=1.0)
+                                    retention = controls["retention"].reshape(-1, 1).clamp(0, 1)
+                                    merged = recurrent if candidate is None else (1 - retention) * candidate + retention * recurrent
+                                else:
+                                    merged = cue if candidate is None else F.normalize(candidate + cue, dim=-1)
+                                candidate = self.idea_adapter(merged).detach()
+                    except NeuralStateResourcePause:
+                        # The complete event remains eligible for owned durable
+                        # learning; a resource pause never aborts the reply.
+                        continue
+                    refined = candidate
+                    bindings.append({key: observation[key] for key in ("observationId", "payloadSha256", "neuralActionId",
+                        "actionEventId", "executionId", "toolId", "action", "completedAt")})
+            finally:
+                for observation in observations:
+                    release = getattr(observation, "release", None)
+                    if callable(release): release()
+            return {"memoryBias": refined, "observationBindings": bindings} if bindings else {}
+        def callback(current, step):
+            return integrate(current, provider())
+        if callable(getattr(provider, "wait_pending", None)):
+            callback.wait_for_evidence = lambda current, step: integrate(current, provider.wait_pending())
+        return callback
+
+    @torch.no_grad()
     def _generation_activity_callback(
         self,
         *,
@@ -13786,6 +13882,7 @@ class AdaptiveBrain:
         cancel_check: Optional[Callable[[], bool]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
         temporary_steering_context: Optional[Mapping[str, Any]] = None,
+        tool_observation_provider: Optional[Callable[[], Sequence[Mapping[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         clean = text.replace("\x00", "").strip()
         if not clean:
@@ -14322,9 +14419,16 @@ class AdaptiveBrain:
                 cancelled=cancel_check,
                 activity_callback=replay_activity,
                 steer_check=steer_check,
+                conditioning_callback=self._generation_observation_callback(tool_observation_provider)
+                    if tool_observation_provider is not None else None,
             )
             cancellation_boundary()
-            if getattr(self.decoder, "last_generation_stop_reason", "") != "steered" and not torch.equal(replayed, generated):
+            observation_uses = list(getattr(self.decoder, "last_generation_tool_observations", []))
+            comparison_end = prompt_ids.shape[1] + min((int(item["generationStep"]) for item in observation_uses),
+                                                       default=max(replayed.shape[1], generated.shape[1]))
+            replay_matches = torch.equal(replayed[:, :comparison_end], generated[:, :comparison_end]) if observation_uses \
+                else torch.equal(replayed, generated)
+            if getattr(self.decoder, "last_generation_stop_reason", "") != "steered" and not replay_matches:
                 raise RuntimeError(
                     "deterministic selected-branch replay diverged"
                 )
@@ -14900,6 +15004,8 @@ class AdaptiveBrain:
             "tool_schema_channel": (
                 "substrate-capability-embedding" if normalized_tools else "none"
             ),
+            "tool_observations_used": list(getattr(self.decoder, "last_generation_tool_observations", [])),
+            "tool_observation_channel": "typed-current-experience-to-native-vector; no token-prompt injection",
             "memory_injection": self.config.memory_injection,
             "working_memory_channel": (
                 "recurrent-vector"
@@ -21161,10 +21267,10 @@ class AdaptiveBrain:
             "ideas": len(self.memory.ideas),
             "synapses": len(self.memory.relations)
             + int(
-                self.router.synapses.effective_weight().ne(0).sum().item()
+                self.router.synapses.active_synapse_count()
             ),
             "activeSynapses": int(
-                self.router.synapses.effective_weight().ne(0).sum().item()
+                self.router.synapses.active_synapse_count()
             ),
             "plasticityEvents": int(
                 self.router.synapses.plasticity_events.item()
@@ -21408,10 +21514,15 @@ class AdaptiveBrain:
                 system_ram_share_percent=self.config.system_ram_share_percent,
                 storage_bytes_per_second=self.config.storage_bytes_per_second,
                 hardware_tier=self.config.hardware_tier,
+                shared_resource_owner_id=self.brain_id,
+                shared_storage_pool_bytes=self.config.storage_pool_bytes,
             )
             self.state_store.policy = self.resource_policy
             self.replay.policy = self.resource_policy
             self.paged_working_memory.policy = self.resource_policy
+            self.core_pager.shared_resource_policy = self.resource_policy
+            self.core_pager.reserve_disk = self.resource_policy.require_disk
+            self.router_state_pager.resource_policy = self.resource_policy
         if any(value in changed for value in {
             "max_seq_len", "system_ram_share_percent", "storage_bytes_per_second",
             "memory_offload_bytes", "memory_resident_items", "storage_pool_bytes",

@@ -25,6 +25,7 @@ INPUT_PATTERN = re.compile(
 )
 
 AUDITED_PACKAGES = {
+    "attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py",
     "altgraph",
     "cffi",
     "filelock",
@@ -97,6 +98,11 @@ TARGET_PYTHON_VERSIONS = {
 }
 
 COMMON_PINS = {
+    "attrs": "26.1.0",
+    "jsonschema": "4.26.0",
+    "jsonschema-specifications": "2025.9.1",
+    "referencing": "0.37.0",
+    "rpds-py": "0.30.0",
     "altgraph": "0.17.5",
     "cffi": "2.1.1",
     "filelock": "3.29.0",
@@ -125,7 +131,27 @@ COMMON_PINS = {
     "typing-extensions": "4.15.0",
 }
 
+# Reviewed against each exact release's official PyPI JSON metadata. All four
+# pure packages select their py3-none-any wheel; rpds-py selects the target's
+# cp311-cp311 compiled wheel, not an sdist or another architecture's binary.
+# This offline check prevents a well-formed but substituted lock hash from
+# silently changing the native schema-validator dependency closure.
+SCHEMA_UNIVERSAL_WHEEL_HASHES = {
+    "attrs": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309",
+    "jsonschema": "d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce",
+    "jsonschema-specifications": "98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe",
+    "referencing": "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231",
+}
+SCHEMA_RPDS_WHEEL_HASHES = {
+    "linux-aarch64": "422c3cb9856d80b09d30d2eb255d0754b23e090034e1deb4083f8004bd0761e4",
+    "linux-x86_64": "33f559f3104504506a44bb666b93a33f5d33133765b0c216a5bf2f1e1503af89",
+    "macos-arm64": "dc4f992dfe1e2bc3ebc7444f6c7051b4bc13cd8e33e43511e8ffd13bf407010d",
+    "macos-x86_64": "a2bffea6a4ca9f01b3f8e548302470306689684e61602aa3d141e34da06cf425",
+    "windows-x86_64": "a51033ff701fca756439d641c0ad09a41d9242fa69121c7d8769604a0a629825",
+}
+
 BASE_PACKAGES = {
+    "attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py",
     "altgraph",
     "cffi",
     "filelock",
@@ -162,6 +188,7 @@ TARGET_PACKAGES = {
 }
 
 RUNTIME_INPUT_PACKAGES = {
+    "attrs", "jsonschema", "jsonschema-specifications", "referencing", "rpds-py",
     "ijson",
     "imageio",
     "imageio-ffmpeg",
@@ -214,6 +241,7 @@ def parse_lock(path: Path) -> dict[str, str]:
         raise RuntimeError(f"Engine lock is missing: {path}")
     options: set[str] = set()
     pins: dict[str, str] = {}
+    wheel_hashes: dict[str, str] = {}
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -230,6 +258,7 @@ def parse_lock(path: Path) -> dict[str, str]:
         if name in pins:
             raise RuntimeError(f"{path}:{line_number} duplicates {name}.")
         pins[name] = match.group("version")
+        wheel_hashes[name] = match.group("hash")
 
     required_options = {
         "--require-hashes",
@@ -265,6 +294,13 @@ def parse_lock(path: Path) -> dict[str, str]:
             raise RuntimeError(
                 f"{path} must pin {name}=={version}, found {pins.get(name)!r}."
             )
+    reviewed_schema_hashes = {
+        **SCHEMA_UNIVERSAL_WHEEL_HASHES,
+        "rpds-py": SCHEMA_RPDS_WHEEL_HASHES[target],
+    }
+    for name, digest in reviewed_schema_hashes.items():
+        if wheel_hashes.get(name) != digest:
+            raise RuntimeError(f"{path} must select the reviewed {target} schema wheel for {name}.")
     return pins
 
 

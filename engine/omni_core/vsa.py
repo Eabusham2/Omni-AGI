@@ -47,7 +47,10 @@ from .substrate_inspection import (
 )
 
 
-_WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_+\-'.]{1,95}")
+# The same learned substrate must be reachable from short identifiers,
+# non-English scripts, symbols, and emoji. This pattern is an indexing
+# boundary for idea assemblies, not a language/answer rule or neuron cap.
+_WORD = re.compile(r"\w+(?:[+.'-]\w+)*|[^\w\s]+", re.UNICODE)
 _SEGMENT = re.compile(r"(?<=[.!?])\s+|\n+")
 _SUBSTRATE_STORE_FORMAT = "omni-substrate-shards"
 _SUBSTRATE_STORE_VERSION = 3
@@ -1250,7 +1253,7 @@ class NeuralSubstrate:
         words = [
             match.group(0).lower().strip(".'") for match in _WORD.finditer(text)
         ]
-        words = [word for word in words if len(word) >= 2]
+        words = [word for word in words if word]
         # ``dict`` preserves first occurrence.  This stays O(n) for records
         # with many unique atoms; the prior ``words.index`` sort was O(n²).
         ordered_atoms = list(dict.fromkeys(words))
@@ -1287,7 +1290,7 @@ class NeuralSubstrate:
         return [
             word
             for match in _WORD.finditer(text)
-            if len(word := match.group(0).lower().strip(".'")) >= 2
+            if (word := match.group(0).lower().strip(".'"))
         ]
 
     @classmethod

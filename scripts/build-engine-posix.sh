@@ -59,6 +59,11 @@ rm -rf -- "${DIST_ROOT}" "${WORK_ROOT}"
   --collect-all safetensors \
   --collect-all imageio_ffmpeg \
   --collect-all soundfile \
+  --collect-all jsonschema \
+  --collect-all jsonschema_specifications \
+  --collect-all referencing \
+  --collect-all attrs \
+  --collect-all rpds \
   "${WORKER}"
 
 # Keep imageio-ffmpeg's BSD wrapper, but do not convey the separately licensed

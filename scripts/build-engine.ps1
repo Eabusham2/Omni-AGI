@@ -50,6 +50,11 @@ if (Test-Path $WorkRoot) {
   --collect-all safetensors `
   --collect-all imageio_ffmpeg `
   --collect-all soundfile `
+  --collect-all jsonschema `
+  --collect-all jsonschema_specifications `
+  --collect-all referencing `
+  --collect-all attrs `
+  --collect-all rpds `
   $Worker
 if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller failed with exit code $LASTEXITCODE"

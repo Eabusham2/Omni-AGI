@@ -126,6 +126,8 @@ def tensor_checksum(tensors: Iterable[torch.Tensor], *, chunk_bytes: int = 4 * 1
             if value.is_contiguous():
                 from .native_core_paging import release_native_tensor_chunk
                 release_native_tensor_chunk(value, position * value.element_size(), block.numel() * value.element_size())
+                from .router_state_paging import release_router_tensor_chunk
+                release_router_tensor_chunk(value, position * value.element_size(), block.numel() * value.element_size())
             position += block.numel()
     return digest.hexdigest()
 

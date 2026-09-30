@@ -35,6 +35,7 @@ import {
   allowTrustedStudioMedia
 } from "./mediaPermissionPolicy";
 import { ResourcePlanner } from "./resourcePlanner";
+import { SharedResourceRegistry } from "./sharedResourceRegistry";
 import { createNativeComputeMeasurementCollector } from "./nativeComputeMeasurement";
 import { BuildResourceSelectionStore } from "./buildResourceSelections";
 import { BuildInitializationCoordinator } from "./buildInitializationCoordinator";
@@ -74,6 +75,7 @@ let disposeIpc: (() => void) | undefined;
 let engine: EngineSupervisor | undefined;
 let brainRepository: BrainRepository | undefined;
 let brainService: BrainService | undefined;
+let sharedResources: SharedResourceRegistry | undefined;
 let idleCognition: IdleCognitionScheduler | undefined;
 let backgroundRuntime: BackgroundRuntimeController | undefined;
 let mobileGateway: MobileGateway | undefined;
@@ -411,7 +413,14 @@ async function showOrCreateMainWindow(): Promise<void> {
 async function bootstrap(): Promise<void> {
   if (process.platform === "win32") app.setAppUserModelId("ai.omniagi.studio");
   const appPath = app.getAppPath();
-  const repository = new BrainRepository(resolveBrainDataRoot(app.getPath("userData")));
+  sharedResources = new SharedResourceRegistry(
+    join(app.getPath("userData"), "shared-resources.sqlite3")
+  );
+  const registry = sharedResources;
+  const repository = new BrainRepository(resolveBrainDataRoot(app.getPath("userData")), {
+    saved: ({ brainId, storagePoolBytes }) => registry.observeSaved(brainId, storagePoolBytes),
+    removed: (brainId) => registry.observeRemoved(brainId)
+  });
   brainRepository = repository;
   await repository.initialize();
   mediaArtifacts = new MediaArtifactRegistry((brainId) =>
@@ -422,10 +431,20 @@ async function bootstrap(): Promise<void> {
   // Older releases treated every identity as idle-enabled. Collapse that
   // legacy state before any worker or scheduler can acquire a brain.
   await repository.reconcileActiveModeLease();
+  // Register inactive saved identities too. The shared limit is MAX(pool),
+  // never one independent pool multiplied by the number of instances.
+  const savedBrains = await repository.list();
+  registry.reconcileSavedOwners(savedBrains.map((summary) => summary.id));
+  for (const summary of savedBrains) {
+    const saved = await repository.get(summary.id, false);
+    registry.observeSaved(saved.id, saved.config.storagePoolBytes);
+  }
+  registry.requireSynchronized();
   const videoRuntimeCacheRoot = join(app.getPath("userData"), "video-runtime");
   engine = new EngineSupervisor({
     appPath,
     resourcesPath: process.resourcesPath,
+    sharedResourceLedgerPath: registry.ledgerPath,
     videoRuntimeCacheRoot,
     prepareVideoRuntime: (signal, onProgress) => new VideoRuntimeProvisioner({
       cacheRoot: videoRuntimeCacheRoot,
@@ -442,7 +461,8 @@ async function bootstrap(): Promise<void> {
     repository,
     engine,
     resourcePlanner,
-    mediaArtifacts
+    mediaArtifacts,
+    registry
   );
   brainService = service;
   // Startup repeats the same physical preflight as Build. A mind that no
@@ -458,7 +478,7 @@ async function bootstrap(): Promise<void> {
         error instanceof Error ? error.message : error
       );
     });
-    await service.preflightStart(summary.id).catch((error: unknown) => {
+    await service.preflightStart(summary.id, { selectActiveRuntime: false }).catch((error: unknown) => {
       console.warn(
         `Resource preflight blocked ${summary.id}:`,
         error instanceof Error ? error.message : error
