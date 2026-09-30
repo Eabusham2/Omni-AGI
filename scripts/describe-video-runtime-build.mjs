@@ -14,7 +14,9 @@ await mkdir(materials);
 for (const name of ['scripts/build-video-runtime.sh', 'scripts/describe-video-runtime-build.mjs', '.github/workflows/video-runtime.yml']) await copyFile(name, join(materials, basename(name)));
 for (const name of ['x264-config.mak', 'ffmpeg-config.mak', 'buildconf.txt', 'version.txt', 'source-signature-status.txt', 'GPL-2.0.txt', 'x264-COPYING.txt']) await copyFile(join(output, name), join(materials, name));
 await writeFile(join(materials, 'BUILD-INSTRUCTIONS.txt'), 'Rebuild on the named native target using the dependency versions recorded by CI. Run bash scripts/build-video-runtime.sh TARGET from the matching tagged Omni source checkout. Scripts are MIT licensed. Application setup never executes these scripts. FFmpeg upstream source is unmodified; x264 includes its generated configuration header and pinned shallow public git history so version.sh reproduces the exact identity. Paths in config.mak describe the ephemeral CI build root and may be adjusted when rebuilding.\n');
-execFileSync('tar', ['-czf', join(output, `build-material-${target}.tar.gz`), '-C', output, 'build-material']);
+// Relative archive names avoid MSYS GNU tar interpreting Windows drive
+// prefixes as a remote host. The process cwd is set by Node's native API.
+execFileSync('tar', ['-czf', `build-material-${target}.tar.gz`, 'build-material'], { cwd: output });
 const files = [];
 for (const name of (await readdir(output)).sort()) {
   if (name === 'build-material' || name === 'build-receipt.json' || name === 'SHA256SUMS.txt' || name === 'codec-smoke.mp4') continue;
