@@ -34,14 +34,17 @@ case "$target" in
   win32-arm64) export CC=clang; extra_ldflags=(--extra-ldflags=-static); x264_host=(--host=aarch64-w64-mingw32); ffmpeg_host=(--target-os=mingw32 --arch=aarch64 --cc=clang) ;;
 esac
 cd "$build_root/x264"
-./configure --prefix="$build_root/prefix" --enable-static --disable-shared --disable-cli --disable-asm "${extra_ldflags[@]}" "${x264_host[@]}"
+./configure --prefix="$build_root/prefix" --enable-static --disable-cli --disable-asm --disable-opencl "${extra_ldflags[@]}" "${x264_host[@]}"
 make -j "$jobs"
 make install
 # Include the exact source tree and generated version header; no private app files.
 git archive --format=tar --prefix=x264/ "$x264_commit" -o "$build_root/x264-source.tar"
 mkdir -p "$build_root/source"
 tar -xf "$build_root/x264-source.tar" -C "$build_root/source"
-cp version.h "$build_root/source/x264/version.h"
+# x264 generates x264_config.h, not version.h. Retain the pinned shallow
+# public git history so version.sh can reproduce its exact build identity.
+cp x264_config.h "$build_root/source/x264/x264_config.h"
+cp -R .git "$build_root/source/x264/.git"
 cp config.mak "$output/x264-config.mak"
 cd "$build_root/ffmpeg-$ffmpeg_version"
 export PKG_CONFIG_PATH="$build_root/prefix/lib/pkgconfig"
