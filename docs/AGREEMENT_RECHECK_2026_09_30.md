@@ -1,5 +1,12 @@
 # OmniCortex agreement and implementation recheck
 
+**Current follow-up:** the source at `20e36ee` was pushed to `main`. The later
+[current agreement remainder](AGREEMENT_REMAINDER_2026_09_30.md) supersedes
+current-status wording below. It records additional concrete source gaps and
+the appended chronological messages; source presence is not full completion.
+The old continuation boxes preserve their original scoped evidence and do not
+mean every agreement is now met.
+
 The repeat review found real remaining implementation limits. The current code
 contains the intended native ternary learning mechanisms, but neither that fact
 nor source tests establish that everything works like a human brain. This report
@@ -288,8 +295,10 @@ acceptance from `nativeDecodingUsed`. Natural EOS can wait for an already
 requested result within the configured wait, without forcing a reply.
 
 Residual boundary: late, canceled or resource-paused observations need not
-affect that turn; completed results still follow the ordinary durable learning
-path. This is no evidence that an untrained action head chooses useful tools
+affect that turn. The later source review found that ordinary chat failure/Stop
+lacks the completed-result learning drain present on zero-token Steer/native
+Stop; completed results are therefore not unconditionally guaranteed to enter
+durable learning. This is no evidence that an untrained action head chooses useful tools
 or composes another useful same-turn decision. No fake human turn, answer
 replay or hidden prose prompt is added.
 
