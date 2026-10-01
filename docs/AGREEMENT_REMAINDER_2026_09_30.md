@@ -1,5 +1,9 @@
 # Current agreement audit and remaining implementation
 
+See the [current full agreement ledger](CURRENT_AGREEMENT_LEDGER.md) for the
+whole grouped request register and latest bounded follow-through, not merely
+the twelve historical findings below.
+
 **Implementation follow-up:** the user requested fixes after this report.
 The [implementation closeout](AGREEMENT_IMPLEMENTATION_2026_09_30.md) records
 the resulting mechanisms and verification. R1–R12 are checked off there at

@@ -7,6 +7,11 @@ Later decisions remain authoritative; canceled settings and closed historical
 tests are not restored. This document records implementation and scoped code
 verification, not a new trained-brain qualification.
 
+The [current full agreement ledger](CURRENT_AGREEMENT_LEDGER.md) reconciles the
+whole grouped inventory, canceled choices, historical bug closures and deferred
+qualification, rather than only R1–R12. Its bounded follow-through records the
+additional distributed rehearsal, packed-change reporting and agent fixes.
+
 ## Implemented corrections
 
 - [x] **R1: ongoing input and memory handoff.** Received input now learns into
@@ -57,7 +62,8 @@ verification, not a new trained-brain qualification.
 - [x] **R7: middle capability rehearsal for long single records.** Actual
   committed in-record progress can trigger middle rehearsal when the finite
   record-count midpoint is absent. Resume state prevents repeat rehearsal.
-  Source: `online_replay.py` and ingestion checkpoints in `brain.py`.
+  Source: `online_replay.py`, ingestion checkpoints in `brain.py`, and the
+  distributed committed-window rehearsal/cursor publication follow-through.
 - [x] **R8: owned evaluation storage transactions.** Copies reserve aggregate
   spill before writing, retain committed files and clean uncommitted copies
   after quota/hash/cancel/save failures. Source: `registered_geometry_holdouts.py`
@@ -138,6 +144,12 @@ Completed focused checks:
   overlaps earlier surface checks and is not added to a claimed unique total.
 - Both TypeScript projects passed after the UI/evaluation follow-through.
   Affected Python compilation and whitespace checks also passed.
+- The later whole-inventory follow-through passed three constructor-free
+  distributed-window storage/controller checks, two packed reporting checks
+  and five new agent host-stub checks. This closes distributed single-record
+  middle rehearsal, truthful packed module reports and ordinary permissioned
+  child actions without synthetic answer/count/task clipping. Existing tests
+  and deferred native qualification were not restarted.
 
 These counts are separate selected runs, not a full-suite or trained-brain
 result. Earlier overlapping checks are not added again to inflate coverage.

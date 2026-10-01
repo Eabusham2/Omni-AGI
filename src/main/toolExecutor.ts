@@ -29,8 +29,11 @@ import type {
   RuntimeJob,
   ToolPermissionLevel,
   ToolRuntimePreferences,
-  ModalityGenerationSettings
+  ModalityGenerationSettings,
+  ChatResult
 } from "../shared/types";
+import { requireDiskWrite } from "./diskSpace";
+import type { BrainStorageOperationHooks } from "./brainStorageOperations";
 import {
   assertSafeRemoteUrl,
   readResponseBounded,
@@ -81,11 +84,6 @@ const MAX_PROCESS_OUTPUT = 2 * 1024 * 1024;
 const MAX_WEB_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_EDIT_TOTAL_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_EDIT_COUNT = 256;
-// Subagents report a focused result into the parent workspace. Their response
-// length is deliberately independent of the brain's much larger working-memory
-// context so hardware-scaled context growth does not multiply CPU latency for
-// every isolated fork.
-const SUBAGENT_RESPONSE_TOKENS = 96;
 
 const SOURCE_TEXT_EXTENSIONS = new Set([
   ".c",
@@ -619,6 +617,12 @@ export function parsePublicSearchRss(value: string, limit = 10): PublicSearchRes
 }
 
 export class ToolExecutor {
+  private agentChatRunner?: (brainId: string, objective: string, signal: AbortSignal, turnId: string) => Promise<ChatResult>;
+
+  /** Trusted main composition only; no renderer setter or behavior prompt. */
+  setAgentChatRunner(runner: NonNullable<ToolExecutor["agentChatRunner"]>): void {
+    this.agentChatRunner = runner;
+  }
   private readonly approvals = new Map<string, Approval>();
   private readonly activeExecutions = new Map<
     string,
@@ -1805,42 +1809,48 @@ export class ToolExecutor {
   ): Promise<unknown> {
     assertToolActive(signal);
     if (action !== "start") throw new Error("Unknown subagent action.");
-    const objective = argumentString(args, "objective", 20_000);
-    const requestedWorkers =
-      typeof args.workers === "number" && Number.isFinite(args.workers)
-        ? Math.round(args.workers)
-        : 1;
-    const workers = Math.max(1, Math.min(4, requestedWorkers));
+    if (typeof args.objective !== "string" || !args.objective.trim() || args.objective.includes("\0")) throw new Error("An exact nonempty subagent objective is required.");
+    const objective = args.objective;
+    const workers = args.workers === undefined ? 1 : args.workers;
+    if (typeof workers !== "number" || !Number.isSafeInteger(workers) || workers < 1) throw new Error("Subagent workers must be a positive safe integer.");
+    const run = this.agentChatRunner;
+    if (!run) throw new Error("Trusted agent action runner is unavailable; no fork was created.");
+    const storage: BrainStorageOperationHooks = { signal,
+      checkpoint: async () => { assertToolActive(signal); },
+      checkDisk: async (directory, bytes) => { assertToolActive(signal); const report = await requireDiskWrite(directory, { operationWriteBytes: bytes }); assertToolActive(signal); return report; } };
     const jobId = randomUUID();
     const forks = [];
     for (let index = 0; index < workers; index += 1) {
+      assertToolActive(signal);
+      await this.service.preflightStart(brainId, { selectActiveRuntime: false });
       assertToolActive(signal);
       const suffix = workers > 1 ? ` ${index + 1}` : "";
       forks.push(
         await this.service.repository.fork(
           brainId,
-          `${basename(objective).slice(0, 52) || "Subagent"}${suffix} branch`
+          `${basename(objective).slice(0, 52) || "Subagent"}${suffix} branch`,
+          storage
         )
       );
     }
     const results = [];
     for (const fork of forks) {
       assertToolActive(signal);
-      const result = await this.service.chat(
+      const result = await run(
         fork.id,
         objective,
         signal,
-        undefined,
-        undefined,
-        SUBAGENT_RESPONSE_TOKENS
+        randomUUID()
       );
       assertToolActive(signal);
       results.push({
         forkId: fork.id,
         response: result.brainMessage.content,
         traceId: result.trace.id,
-        concepts: Object.keys(result.brain.concepts).length,
-        synapses: Object.keys(result.brain.synapses).length
+        humanMessageId: result.humanMessage.id,
+        brainMessageId: result.brainMessage.id,
+        ...(result.generationEnd ? { generationEnd: result.generationEnd } : {}),
+        actionEvents: result.actionEvents ?? []
       });
     }
     return {
@@ -1848,6 +1858,7 @@ export class ToolExecutor {
       forkIds: forks.map((fork) => fork.id),
       objective,
       state: "complete",
+      executionMode: "serial",
       results,
       mergePolicy: "ideas-evidence-replay-only"
     };

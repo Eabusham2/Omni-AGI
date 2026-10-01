@@ -560,6 +560,7 @@ def _due_distributed_rehearsal_phase(
     completed_epochs: int,
     next_global_ordinal: int,
     final: bool = False,
+    active_record_window: bool = False,
 ) -> Optional[str]:
     completed_waves, total_waves = _finite_wave_progress(
         record_count=record_count,
@@ -568,6 +569,14 @@ def _due_distributed_rehearsal_phase(
         completed_epochs=completed_epochs,
         next_global_ordinal=next_global_ordinal,
     )
+    # One logical record can contain many genuine learner waves. Its record
+    # midpoint is absent, but an already-learned nonfinal window is a real
+    # middle boundary. The schedule receipt is published with that exact
+    # cursor/native generation, so restart cannot repeat this fallback.
+    if (total_waves == 1 and active_record_window and not final
+        and state.start_completed and not state.middle_completed and not state.final_completed
+        and committed_global_waves > 0):
+        return "middle"
     return due_rehearsal_phase(
         state,
         policy,
@@ -576,6 +585,32 @@ def _due_distributed_rehearsal_phase(
         completed_finite_waves=completed_waves,
         total_finite_waves=total_waves,
     )
+
+
+def _rehearse_bound_native_cursors(brain, cursors, state, *, phase, global_steps, policy):
+    """Rehearse only within the full native/cursor publication transaction.
+
+    Never alter source positions or target accounting. Partial-record middle
+    learning is permitted only after a real completed learner wave; the caller
+    must save/publish the returned schedule and complete native state together.
+    A failure leaves the previous published generation authoritative.
+    """
+    before = [cursor.to_dict() for cursor in cursors]
+    boundary_sha = _canonical_sha256(before)
+    active = [item["recordWindow"] for item in before if "recordWindow" in item]
+    if active and (phase != "middle" or global_steps <= state.last_periodic_wave
+        or not any(item["completedWindows"] > 0 for item in active)):
+        raise RuntimeError("active-record rehearsal requires completed labelled-window progress")
+    if any(item["optimizerStepsCompleted"] != global_steps for item in before):
+        raise ValueError("capability rehearsal cursor does not bind the completed global learner wave")
+    receipt = rehearse_capabilities(brain, phase=phase, committed_global_waves=global_steps,
+        policy=policy, baseline_minimum_probability=state.baseline_minimum_probability)
+    if _canonical_sha256([cursor.to_dict() for cursor in cursors]) != boundary_sha:
+        raise RuntimeError("capability rehearsal changed source/window cursor accounting")
+    receipt = {**receipt, "committedCursorBoundary": {"rankCursorsSha256": boundary_sha,
+        "globalOptimizerSteps": global_steps, "activeRecordWindows": len(active),
+        "publication": "full-native-and-unchanged-cursors"}}
+    return advance_schedule_state(state, receipt)
 
 
 @dataclass(frozen=True)
@@ -2557,13 +2592,9 @@ class DistributedGroundUpTrainer:
                     raise ValueError("canonical source replay cursor did not exhaust its requested prefix")
                 next_schedule = schedule_state
                 if rehearsal_phase is not None:
-                    if any(cursor.record_window is not None for cursor in cursors):
-                        raise RuntimeError("architecture/capability rehearsal cannot mutate an active record transaction")
-                    receipt = rehearse_capabilities(brain, phase=rehearsal_phase,
-                        committed_global_waves=global_steps,
-                        policy=CapabilityRehearsalPolicy(periodic_global_waves=self.options.capability_rehearsal_waves),
-                        baseline_minimum_probability=schedule_state.baseline_minimum_probability)
-                    next_schedule = advance_schedule_state(schedule_state, receipt)
+                    next_schedule = _rehearse_bound_native_cursors(brain, cursors, schedule_state,
+                        phase=rehearsal_phase, global_steps=global_steps,
+                        policy=CapabilityRehearsalPolicy(periodic_global_waves=self.options.capability_rehearsal_waves))
                 next_media = merge_media_training_state(media_training_state, media_reports)
                 seal = make_distributed_training_seal(manifest_sha256=manifest.content_sha256,
                     topology_sha256=native_topology_sha256(brain), training_policy_sha256=self._training_policy_sha256(),
@@ -3190,7 +3221,8 @@ class DistributedGroundUpTrainer:
             )
 
             def phase_at_completed_wave(
-                *, completed_epochs: int, next_global_ordinal: int, final: bool = False
+                *, completed_epochs: int, next_global_ordinal: int, final: bool = False,
+                active_record_window: bool = False,
             ) -> Optional[str]:
                 return _due_distributed_rehearsal_phase(
                     schedule_state,
@@ -3202,6 +3234,7 @@ class DistributedGroundUpTrainer:
                     completed_epochs=completed_epochs,
                     next_global_ordinal=next_global_ordinal,
                     final=final,
+                    active_record_window=active_record_window,
                 )
 
             def admit_source(stage, ram_bytes, disk_bytes):
@@ -3372,9 +3405,11 @@ class DistributedGroundUpTrainer:
                     group_complete = all(value.next_global_ordinal >= wave_end and value.record_window is None for value in cursors)
                     rehearsal_phase = phase_at_completed_wave(
                         completed_epochs=epoch,
-                        next_global_ordinal=wave_end) if group_complete else None
+                        next_global_ordinal=wave_end if group_complete else wave_start,
+                        active_record_window=any(value.record_window is not None for value in cursors))
                     if (
-                        group_complete or global_steps % self.options.checkpoint_steps == 0
+                        group_complete or rehearsal_phase is not None
+                        or global_steps % self.options.checkpoint_steps == 0
                     ):
                         (
                             dynamic_high_water,

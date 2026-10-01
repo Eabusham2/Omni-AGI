@@ -535,6 +535,12 @@ async function bootstrap(): Promise<void> {
   );
   const evolution = new EvolutionController(repository, tools, engine);
   const actions = new ChatActionController(service, tools, evolution);
+  tools.setAgentChatRunner(async (brainId, objective, signal, turnId) => {
+    const cancel = (): void => { actions.cancel(brainId, turnId); tools.cancel(brainId, turnId); };
+    signal.addEventListener("abort", cancel, { once: true });
+    try { return await actions.send(brainId, objective, signal, turnId); }
+    finally { signal.removeEventListener("abort", cancel); }
+  });
   mobileGateway = new MobileGateway(
     repository,
     service,

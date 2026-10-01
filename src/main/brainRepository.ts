@@ -5141,7 +5141,7 @@ export class BrainRepository {
     operation?: BrainStorageOperationHooks
   ): Promise<BrainDocument> {
     return withBrainWrite(this, id, () =>
-      this.copyOnWriteClone(id, name, "fork", operation)
+      this.copyOnWriteClone(id, name, "fork", operation), operation?.signal
     );
   }
 

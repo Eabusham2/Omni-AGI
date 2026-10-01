@@ -1,5 +1,9 @@
 # Omni AGI Studio implementation status
 
+The [current full agreement ledger](CURRENT_AGREEMENT_LEDGER.md) is the newest
+grouped inventory. It separates implemented source, historically closed work,
+superseded choices and user-deferred learned capability without reopening them.
+
 Latest source continuation: the user requested implementation of the audit
 findings. [Agreement implementation closeout](AGREEMENT_IMPLEMENTATION_2026_09_30.md)
 records the fixes, the actual allocation-budget choice and scoped verification.

@@ -1,5 +1,9 @@
 # OmniCortex agreement and implementation recheck
 
+The [current full agreement ledger](CURRENT_AGREEMENT_LEDGER.md) is the newest
+whole-inventory disposition. Compatible assistant additions stay; canceled or
+replaced requests and user-closed/deferred checks are not reopened.
+
 The [implementation closeout](AGREEMENT_IMPLEMENTATION_2026_09_30.md) supersedes
 the open source-difference status recorded in this historical recheck and its
 subsequent audit. Trained native qualification remains user-deferred.

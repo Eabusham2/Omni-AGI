@@ -6261,7 +6261,7 @@ class AdaptiveBrain:
         # the verified snapshot digest instead of reading every byte twice.
         cortical_before = before
         module_checksums_before = {
-            name: tensor_checksum(module.parameters())
+            name: tensor_checksum(self._learned_parameter_tensors((module,)))
             for name, module in self._slow_transaction_modules().items()
         }
         try:
@@ -6322,7 +6322,7 @@ class AdaptiveBrain:
             after = self._slow_parameter_checksum()
             cortical_after = after
             module_checksums_after = {
-                name: tensor_checksum(module.parameters())
+                name: tensor_checksum(self._learned_parameter_tensors((module,)))
                 for name, module in self._slow_transaction_modules().items()
             }
             updated_modules = sorted(
