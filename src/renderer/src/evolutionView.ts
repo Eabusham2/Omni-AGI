@@ -26,6 +26,8 @@ export interface EvolutionStartOptions {
   recursive: boolean;
   candidateKind: EvolutionCandidateKind;
   sourceIds: string[];
+  architectureChange?: EvolutionStartRequest["architectureChange"];
+  geometryHoldouts?: EvolutionStartRequest["geometryHoldouts"];
 }
 
 export function buildEvolutionStartRequest(
@@ -47,10 +49,20 @@ export function buildEvolutionStartRequest(
   ) {
     request.latentReplay = true;
   } else if (options.candidateKind === "architecture") {
-    request.architectureChange = {
+    request.architectureChange = options.architectureChange ?? {
       mutation: "grow-experts",
       addExperts: 1
     };
+    const geometry = ["resize-width", "repartition-heads"].includes(request.architectureChange.mutation);
+    if (geometry) {
+      request.latentReplay = true;
+    }
+  }
+  // Optional declarations replace the protected registration; omission reuses
+  // that identity's existing real holdouts. The worker fails closed if absent.
+  if (options.candidateKind !== "source" && options.geometryHoldouts) {
+    request.geometryHoldouts = options.geometryHoldouts;
+    request.objectives = ["language-prediction", "modality-reconstruction", "typed-tool-prediction", "retention"];
   }
   return request;
 }

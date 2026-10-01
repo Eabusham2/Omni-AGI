@@ -268,7 +268,9 @@ class VectorQuantizer(nn.Module):
         super().__init__()
         self.codebook = PackedTernaryTable(codes, dimensions, scale=0.08)
 
-    def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_with_indices(
+        self, latents: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if latents.ndim < 3:
             raise ValueError("quantizer expects [batch, channels, ...]")
         batch, channels = latents.shape[:2]
@@ -287,7 +289,60 @@ class VectorQuantizer(nn.Module):
         )
         quantized = flat + (quantized - flat).detach()
         output = quantized.transpose(1, 2).reshape(batch, channels, *spatial)
-        return output, commitment
+        return output, commitment, indices.reshape(batch, *spatial)
+
+    def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        quantized, commitment, _indices = self.encode_with_indices(latents)
+        return quantized, commitment
+
+
+def _codec_token_logits(predicted: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """Project a learned latent onto actual packed-codebook IDs, with no new head."""
+    if (predicted.ndim != 3 or codebook.ndim != 2 or
+            predicted.shape[1] != codebook.shape[1]):
+        raise ValueError("audio codec token projection has incompatible shapes")
+    tokens = predicted.transpose(1, 2).float()
+    codes = codebook.to(device=predicted.device, dtype=torch.float32)
+    # The token-independent squared norm of the prediction cancels in softmax.
+    # Keeping the remaining exact squared-distance terms bounds the projection
+    # to the same residual-VQ table used by the waveform decoder.
+    return (2.0 * tokens @ codes.t() - codes.square().sum(dim=-1)) * (
+        16.0 / math.sqrt(max(1, predicted.shape[1]))
+    )
+
+
+def _codec_token_loss(
+    predicted: torch.Tensor,
+    first_ids: torch.Tensor,
+    residual_ids: torch.Tensor,
+    first_quantized: torch.Tensor,
+    first_codebook: torch.Tensor,
+    residual_codebook: torch.Tensor,
+    unknown: torch.Tensor,
+) -> torch.Tensor:
+    """Train both actual code IDs only where their target vectors were hidden."""
+    if (first_ids.shape != residual_ids.shape or first_ids.shape != unknown.shape or
+            predicted.shape[0] != first_ids.shape[0] or
+            predicted.shape[-1] != first_ids.shape[-1] or
+            first_quantized.shape != predicted.shape or
+            not bool(unknown.any())):
+        raise ValueError("audio codec token targets or mask are invalid")
+    first_logits = _codec_token_logits(predicted, first_codebook.detach())
+    residual_logits = _codec_token_logits(
+        predicted - first_quantized.detach(), residual_codebook.detach()
+    )
+    return (
+        F.cross_entropy(first_logits[unknown], first_ids[unknown])
+        + F.cross_entropy(residual_logits[unknown], residual_ids[unknown])
+    )
+
+
+def _sample_codec_ids(logits: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    if logits.ndim != 3 or logits.shape[-1] < 2 or not bool(torch.isfinite(logits).all()):
+        raise ValueError("audio codec token logits are invalid")
+    batch, length, choices = logits.shape
+    probabilities = F.softmax(logits.float(), dim=-1).reshape(batch * length, choices)
+    return torch.multinomial(probabilities, 1, generator=generator).reshape(batch, length)
 
 
 class TinyVisionEncoder(nn.Module):
@@ -588,10 +643,23 @@ class TinyAudioCodec(nn.Module):
         if waveform.ndim == 2:
             waveform = waveform.unsqueeze(1)
         latent = self.encoder(waveform)
-        first, loss_a = self.quantizer_a(latent)
-        residual, loss_b = self.quantizer_b(latent - first.detach())
+        first, loss_a, first_ids = self.quantizer_a.encode_with_indices(latent)
+        residual, loss_b, residual_ids = self.quantizer_b.encode_with_indices(
+            latent - first.detach()
+        )
         quantized = first + residual
-        predicted_tokens = self.token_generator(quantized, idea, timestep=0.0)
+        # Prefix teacher forcing exposes only earlier real codec vectors. The
+        # unknown suffix is zero, so predicting its IDs cannot simply copy the
+        # target vectors through the noncausal latent transformer.
+        length = quantized.shape[-1]
+        prefix_lengths = torch.randint(0, length, (quantized.shape[0],), device=latent.device)
+        unknown = torch.arange(length, device=latent.device)[None, :] >= prefix_lengths[:, None]
+        known = (~unknown).unsqueeze(1)
+        predicted_tokens = self.token_generator(quantized.detach() * known, idea, timestep=0.0)
+        token_loss = _codec_token_loss(
+            predicted_tokens, first_ids, residual_ids, first,
+            self.quantizer_a.codebook(), self.quantizer_b.codebook(), unknown,
+        )
         reconstruction = self.decoder(
             quantized
             + self.idea_projection(idea).view_as(quantized) * 0.1
@@ -600,10 +668,12 @@ class TinyAudioCodec(nn.Module):
         embedding = F.normalize(
             self.encoder_projection(latent.mean(dim=-1)), dim=-1
         )
-        loss = F.mse_loss(reconstruction, waveform) + 0.05 * (loss_a + loss_b)
+        loss = (F.mse_loss(reconstruction, waveform)
+                + 0.05 * (loss_a + loss_b) + 0.15 * token_loss)
         return {
             "reconstruction": reconstruction,
             "embedding": embedding,
+            "token_loss": token_loss,
             "loss": loss,
         }
 
@@ -628,44 +698,47 @@ class TinyAudioCodec(nn.Module):
         maximum_previews: Optional[int] = None,
     ) -> torch.Tensor:
         _check_cancelled(cancel_check)
-        latent = self.idea_projection(idea).view(
-            idea.shape[0], self.channels, self.latent_samples
+        codebook_a = self.quantizer_a.codebook().to(dtype=idea.dtype)
+        codebook_b = self.quantizer_b.codebook().to(dtype=idea.dtype)
+        latent = torch.zeros(
+            idea.shape[0], self.channels, self.latent_samples,
+            device=idea.device, dtype=idea.dtype,
         )
-        noise = torch.randn(
-            latent.shape,
-            generator=generator,
-            device=latent.device,
-            dtype=latent.dtype,
-        )
-        latent = latent + 0.18 * noise
-        total_steps = 3
+        continuous_condition = self.idea_projection(idea).view_as(latent)
+        total_steps = min(3, self.latent_samples)
         preview_steps = _preview_steps(total_steps, maximum_previews)
+        filled = 0
+        predicted = torch.zeros_like(latent)
 
         def decode_codec(value: torch.Tensor) -> torch.Tensor:
-            first, _loss_a = self.quantizer_a(value)
-            residual, _loss_b = self.quantizer_b(value - first.detach())
-            return self.decoder(first + residual).squeeze(1)
+            # The sampled residual-VQ IDs own the waveform. This small learned
+            # continuous residual retains the existing shared-idea route.
+            return self.decoder(value + 0.1 * continuous_condition + 0.05 * predicted).squeeze(1)
 
         for index in range(total_steps):
             _check_cancelled(cancel_check)
-            predicted = self.token_generator(
-                latent, idea, timestep=1.0 - index / float(total_steps)
+            end = math.ceil(self.latent_samples * float(index + 1) / float(total_steps))
+            predicted = self.token_generator(latent, idea, timestep=0.0)
+            first_logits = _codec_token_logits(predicted[:, :, filled:end], codebook_a)
+            first_ids = _sample_codec_ids(first_logits, generator)
+            first = F.embedding(first_ids, codebook_a).transpose(1, 2)
+            residual_logits = _codec_token_logits(
+                predicted[:, :, filled:end] - first, codebook_b
             )
-            latent = 0.8 * latent + 0.2 * predicted
+            residual_ids = _sample_codec_ids(residual_logits, generator)
+            residual = F.embedding(residual_ids, codebook_b).transpose(1, 2)
+            latent[:, :, filled:end] = first + residual
+            filled = end
             if preview_callback is not None and index in preview_steps:
                 decoded = decode_codec(latent)
                 # Publish only the prefix that has become visible at this
-                # codec revision. The WAV therefore grows in real duration;
-                # silence is never fabricated for samples not yet presented.
+                # sampled-code revision. No unsampled suffix is presented as
+                # a fabricated silence or completed waveform.
                 visible_samples = max(
                     1,
                     min(
                         decoded.shape[-1],
-                        math.ceil(
-                            decoded.shape[-1]
-                            * float(index + 1)
-                            / float(total_steps)
-                        ),
+                        math.ceil(decoded.shape[-1] * filled / self.latent_samples),
                     ),
                 )
                 preview_callback(

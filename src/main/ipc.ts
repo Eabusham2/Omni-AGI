@@ -418,9 +418,11 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
   });
 
   handle(IPC.brain.list, () => repository.list());
-  handle(IPC.brain.get, (_event, id: string) =>
-    service.getReconciledBrain(requireId(id))
-  );
+  handle(IPC.brain.get, async (_event, id: string) => {
+    const brain = await service.getReconciledBrain(requireId(id));
+    if (brain.readiness.state === "ready") service.selectCompletedActionLearningOwner(brain.id);
+    return brain;
+  });
   handle(IPC.brain.create, async (event, request: CreateBrainRequest) => {
     if (!isRecord(request) || !isRecord(request.config)) throw new Error("Invalid build request.");
     if (

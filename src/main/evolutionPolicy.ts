@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
  * implementation, immutable-origin repository, or tests that existed when the
  * candidate was forked.
  */
-export const EVOLUTION_EVALUATOR_VERSION = 1;
+export const EVOLUTION_EVALUATOR_VERSION = 2;
 
 export const EVOLUTION_TEST_NAMES = ["typecheck", "unit", "build"] as const;
 
@@ -21,6 +21,12 @@ export const EVOLUTION_PROTECTED_PATHS = [
   "src/main/index.ts",
   "src/main/ipc.ts",
   "src/preload/index.ts",
+  "engine/omni_core/evolution.py",
+  "engine/omni_core/paired_geometry_statistics.py",
+  "engine/omni_core/geometry_holdout_evaluation.py",
+  "engine/omni_core/registered_geometry_holdouts.py",
+  "engine/omni_core/evolution_anchors.py",
+  "engine/omni_core/architecture_migration.py",
   "package.json",
   "package-lock.json",
   "scripts/build-engine.ps1",
@@ -50,13 +56,46 @@ const POLICY_DOCUMENT = {
   benchmarkDomains: EVOLUTION_BENCHMARK_DOMAINS,
   baseline: "authorized-parent-commit",
   candidateBoundary: "isolated-git-worktree",
-  promotion: "exact-diff-and-evaluator-hash",
+  promotion: "exact-diff-and-evaluator-hash-with-observed-paired-benefit",
   rollback: "exact-promotion-and-first-parent"
 };
 
 export const EVOLUTION_POLICY_SHA256 = createHash("sha256")
   .update(JSON.stringify(POLICY_DOCUMENT))
   .digest("hex");
+
+/** Fixed functional checks are evidence of their result, not neural quality. */
+export function sourceImprovementEvidence(baseline: unknown, candidate: unknown) {
+  const parse = (input: unknown) => {
+    const pairs = new Map<string, boolean>();
+    if (!Array.isArray(input)) return pairs;
+    for (const raw of input) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const value = raw as Record<string, unknown>;
+      if (!EVOLUTION_TEST_NAMES.includes(value.name as typeof EVOLUTION_TEST_NAMES[number])) continue;
+      if (pairs.has(String(value.name)) || typeof value.passed !== "boolean" ||
+          !Number.isSafeInteger(value.exitCode) ||
+          (value.passed ? value.exitCode !== 0 : ![1, 2].includes(Number(value.exitCode)))) {
+        return new Map<string, boolean>();
+      }
+      pairs.set(String(value.name), value.passed);
+    }
+    return pairs;
+  };
+  const before = parse(baseline), after = parse(candidate);
+  const complete = EVOLUTION_TEST_NAMES.every(name => before.has(name) && after.has(name));
+  const improvedChecks = complete ? EVOLUTION_TEST_NAMES.filter(name => !before.get(name) && after.get(name)) : [];
+  const regressions = complete ? EVOLUTION_TEST_NAMES.filter(name => before.get(name) && !after.get(name)) : [];
+  return {
+    method: "paired-immutable-functional-checks" as const,
+    allRequiredPairs: complete,
+    improvedChecks,
+    regressions,
+    passed: complete && improvedChecks.length > 0 && regressions.length === 0,
+    neuralQualityEstablished: false,
+    timingBenefitEstablished: false
+  };
+}
 
 export function isProtectedEvolutionPath(
   path: string,

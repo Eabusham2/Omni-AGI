@@ -9,6 +9,7 @@ import json
 
 from .record_window_wave import validate_record_window_cursor
 from .text_spool import bounded_json_sha256
+from .sparse_router_state import canonical_module_walk
 
 
 FIELDS = {"format", "formatVersion", "manifestSha256", "topologySha256", "trainingPolicySha256",
@@ -97,7 +98,7 @@ def native_topology_sha256(brain):
     roots = ("decoder", "memory_bridge", "idea_adapter", "router", "liquid", "modalities")
     for root_name in roots:
         root = getattr(brain, root_name)
-        for name, module in root.named_modules():
+        for name, module in canonical_module_walk(root, resource_policy=getattr(brain, "resource_policy", None)):
             row = {"name": root_name + ("." + name if name else ""), "type": type(module).__name__}
             for role in ("_parameters", "_buffers"):
                 row[role] = [[key, list(tensor.shape), str(tensor.dtype)] for key, tensor in sorted(getattr(module, role).items())

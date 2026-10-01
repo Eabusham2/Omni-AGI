@@ -2,6 +2,7 @@
 import sys
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ class ChatSteeringTests(unittest.TestCase):
         # An inert namespace intentionally has no decoder/parameters/memory.
         # The actual method must yield before any neural work can be touched.
         owner = SimpleNamespace(brain_id="brain", completed_chat_turns=[],
+            config=SimpleNamespace(max_seq_len=256),
             _validated_chat_turn_id=AdaptiveBrain._validated_chat_turn_id)
         result = AdaptiveBrain.chat(owner, "original input", turn_id="old", steer_check=lambda: True)
         self.assertTrue(result["zeroTokenYield"])
@@ -77,6 +79,7 @@ class ChatSteeringTests(unittest.TestCase):
     def test_zero_yield_worker_path_does_not_reload_or_invent_committed_response(self):
         worker = self.worker()
         brain = SimpleNamespace(brain_id="brain", conversation=SimpleNamespace(summary=lambda: {}),
+            resource_policy=SimpleNamespace(status=lambda **_: {"memoryPressure": False}, reserve_ram=lambda *_: nullcontext()),
             chat=lambda *_args, **_kwargs: {"steered": True, "zeroTokenYield": True, "turnCommitted": False})
         worker._get = lambda _params: brain
         worker._restore_committed_brain_after_failed_chat = lambda *_args, **_kwargs: self.fail("warm yield reloaded the brain")

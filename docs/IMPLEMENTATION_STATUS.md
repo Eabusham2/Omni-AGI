@@ -1,7 +1,14 @@
 # Omni AGI Studio implementation status
 
+Latest source continuation: the user requested implementation of the audit
+findings. [Agreement implementation closeout](AGREEMENT_IMPLEMENTATION_2026_09_30.md)
+records the fixes, the actual allocation-budget choice and scoped verification.
+Application publication and trained native qualification have not been
+restarted. This is a source-only continuation at the same application version.
+
 The application source version is **v1.1.1**. Source corrections were committed
-and pushed to `main` at `20e36ee`; the immutable application tag remains at
+and pushed to `main` at `20e36ee`; the follow-up closes the source differences
+identified at `bbd89b9`. The immutable application tag remains at
 `5b15e22`. This is not a newly published application package. The user excluded
 GitHub CI, packaging, release and additional checks from that closeout. Existing
 v1.1.0 and the separate codec release remain unchanged. Neural training and
@@ -9,16 +16,16 @@ capability qualification stay deferred.
 
 See the [current agreement remainder](AGREEMENT_REMAINDER_2026_09_30.md) and
 [repeat agreement recheck](AGREEMENT_RECHECK_2026_09_30.md) for the current
-request-to-code comparison. **The mechanism table is not a claim that all source
-gaps are closed.** Shared RAM/spill reservations, router tiling/paging, CPU saved
-activation mappings, same-turn typed tool observations, local recursive JSON
-Schema validation and isolated width/head candidates are now source paths.
-Surviving gaps include missing failed-turn result learning, media-preview chat
-blocking, delayed Ask imagination, natural geometry access, promotion criteria,
-single-record rehearsal, evaluation-copy accounting/portability, decorative
-activity claims, dense router topology and cooperative native allocation bounds.
-Two memory/audio design choices remain unanswered. Replaced settings and
-user-closed historical checks are not reintroduced as tasks.
+request-to-code comparison. The follow-up closes R1–R12 at source level:
+received-input learning before decoding, exhaustive queued cortical handoff,
+durable action-outcome learning, independent media completion, permissioned
+Ask imagination, natural/UI geometry access, observed improvement requirements,
+single-record middle rehearsal, transactional evaluation copies, complete native
+continuation portability, truthful activity presentation, block-sparse recurrence
+and cooperative allocation guards. Own speech/Ponder experiences and discrete
+audio codes participate in that same identity. Replaced settings and user-closed
+historical checks are not reintroduced as tasks. **These source mechanisms and
+selected fixtures do not qualify a trained brain's intelligence or useful recall.**
 
 ## Verified source corrections
 
@@ -31,16 +38,16 @@ user-closed historical checks are not reintroduced as tasks.
 | Weight diagnostics | First-original changed-byte journals and final-byte comparisons; exact bounded checksums and admitted batch rollback storage. | Constructor-free fixtures; net delta covers the measured core, not a fabricated whole-substrate count. |
 | Snapshot resources | Changed-learned-byte slow rollback with exact control baselines; CPU RAM-first isolated media state with cold spill and real job lifetime. | Storage/control fixtures; full selected-region isolation and exact checksum reads remain real costs. |
 | Runtime settings | Saved current geometry remains fixed while runtime context, RAM and storage refresh pager budgets. | Saved-shape/controller fixtures; no live neural run. |
-| RAM ceiling and spill pool | Fixed Auto/manual share, managed-family accounting, atomic cross-process RAM/spill leases and largest-pool declarations; router controls now tiled/paged. | Cooperative admission, not hard OS RSS isolation. Model-owned geometry registration still bypasses aggregate spill leases. |
+| RAM ceiling and spill pool | Fixed Auto/manual share, fresh managed-family sampling, active-operation guards, atomic cross-process RAM/spill leases and largest-pool declarations; recurrent state is block-sparse and paged. | User-selected cooperative admission/reclaim/spill/pause, not universal hard OS RSS isolation. Evaluation copies participate in the pool. |
 | Continuous activity | Exact episode-linked cooling, salience/reuse/interference and persistent neural state, without routine retrieved source-text injection. | Source/helper checks; useful recall requires trained-native proof. |
-| Chat | Warm safe-boundary Steer with exact unfinished-human carry, full-current-input admission, independent artifact cancellation, completed-text reconciliation and honest no-reply receipts. | Controller/transport/ledger fixtures; no silent current-input crop or fabricated response, no live latency proof. |
+| Chat | Warm safe-boundary Steer, full-current-input admission, independent input-learning receipts before decoding, independent artifact cancellation, completed-text reconciliation and honest no-reply receipts. | Controller/transport/ledger fixtures; Stop preserves admitted input without a fake answer; no silent crop, no live latency proof. |
 | Data | Streaming text/scalar leases, exact target windows, immutable source leases, transaction identity and resumable coverage. | Parser/storage/stubs; native decompression has explicit admission, not universal RSS isolation. |
 | Distributed updates | Canonical packed derivatives, actual source replay, shared fast/slow state seals and capacity-derived physical microbatches with real accumulation. | Tiny collectives and constructor-free source stubs; full native multi-GPU throughput/quality remains deferred. |
-| Actions | Same-cortex argument head, local recursive JSON Schema validation, generation-bound voluntary action/Ponder conditioning, typed actual-result observations and pre-effect auditing. | Useful unseen-tool competence is deferred. Ordinary failure/Stop result learning and Ask media timing remain source gaps; external schema references are not fetched implicitly. |
-| Voice | Same-brain conditioned audio generation and exact paired speech supervision; platform STT/TTS remain defaults. | Route/pairing/resampling fixtures; intelligibility and long utterances unqualified. |
+| Actions | Same-cortex argument head, local recursive JSON Schema validation, generation-bound voluntary action/Ponder conditioning, typed actual-result observations, durable completed-evidence learning and pre-effect auditing. | Failure/Stop does not replay effects; Ask uses warm owned control. Useful unseen-tool competence is deferred; external schema references are not fetched implicitly. |
+| Voice | Same-brain conditioned discrete residual-VQ code prediction and waveform generation, exact paired speech supervision; platform STT/TTS remain defaults. | Code/route/pairing/resampling fixtures; intelligibility and long utterances unqualified. |
 | Inspection | Load-free packed cortical drilldown, cursor/range virtualization, actual selected trits and observed-only activity coverage. | Byte/tensor/renderer contracts; static links are computation relationships, not explanations of thought. |
 | Sparse readout | Paged graph/frontier, exact idle queries and full lazy neural readout; bounded host pages with complete structural action references. | Storage/math/protocol fixtures; exhaustive scoring may still cost O(brain size). |
-| Evolution | Permissioned learned source edits, compatible growth, isolated width/head migration and real-data registration/evaluation with lineage and protected rollback. | Natural/UI geometry access and statistically supported/meta-recursive promotion criteria remain incomplete; beneficial native improvement is unproven. |
+| Evolution | Permissioned learned source edits, compatible growth, natural/UI width/head candidates, protected paired native-loss benefit, concrete source-check gain, observed recursive reassessment, lineage and rollback. | Every native promotion requires passing paired evidence; no gain is inferred from changed bytes or one timing. Beneficial native generations and statistical meta-recursive improvement remain unproven. |
 | Portability | Complete unsanitized saved-instance state, recovery references, inert historical action intents and explicit incomplete-history reports. | Files/SQLite/bundle fixtures; external CLI run folders are not automatically included. |
 
 ## Independent video runtime release
@@ -55,10 +62,11 @@ This is neither an application release nor evidence of AI-generated media qualit
 
 ## Current source handoff
 
-- The preceding source closeout was pushed as `20e36ee`. The following
-  transcript/code audit records the concrete remaining differences in the
-  current remainder document. No new checks, model/app run, CI, package or
-  release are part of this review.
+- The preceding source closeout was pushed as `20e36ee`. The subsequent
+  `bbd89b9` audit is preserved as history; its source findings are closed by the
+  implementation follow-up. Scoped constructor-free/controller checks are
+  recorded there. No new supplied-corpus training, app, CI, package or release
+  is part of this closeout.
 
 Current-input overflow follows the actual user answer: older raw prompt words
 yield room while previously learned/scratch influence remains; a new message

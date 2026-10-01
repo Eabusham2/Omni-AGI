@@ -8,6 +8,7 @@ import type {
   BrainDocument,
   EvolutionCandidate,
   EvolutionRun,
+  EvolutionStartRequest,
   ToolPermissionLevel
 } from "@shared/types";
 import { Icon } from "./icons";
@@ -208,9 +209,17 @@ export function EvolutionWorkspace({
   onOpenPermissions,
   onToast
 }: EvolutionWorkspaceProps) {
+  const savedWidth = brain.config.nativeArchitecture?.shape.dModel ?? 0;
+  const savedHeads = brain.config.nativeArchitecture?.shape.nHeads ?? 0;
+  const savedFeedForward = brain.config.nativeArchitecture?.shape.feedForward ?? 0;
   const [objective, setObjective] = useState("");
   const [kind, setKind] = useState<EvolutionCandidateKind>("substrate");
   const [recursive, setRecursive] = useState(true);
+  const [architectureOperation, setArchitectureOperation] = useState<"grow-experts" | "resize-width" | "repartition-heads">("grow-experts");
+  const [width, setWidth] = useState(savedWidth);
+  const [heads, setHeads] = useState(savedHeads);
+  const [feedForward, setFeedForward] = useState(savedFeedForward);
+  const [holdoutJson, setHoldoutJson] = useState("");
   const [candidates, setCandidates] = useState<EvolutionCandidate[]>([]);
   const [knownRuns, setKnownRuns] = useState<EvolutionRun[]>([]);
   const [loading, setLoading] = useState(Boolean(window.omni));
@@ -230,6 +239,14 @@ export function EvolutionWorkspace({
     () => groupEvolutionRuns(candidates, knownRuns),
     [candidates, knownRuns]
   );
+
+  useEffect(() => {
+    // Candidate controls start at this identity's actual saved geometry,
+    // never a tiny hard-coded replacement or another brain's stale draft.
+    setWidth(savedWidth);
+    setHeads(savedHeads);
+    setFeedForward(savedFeedForward);
+  }, [brain.id, savedWidth, savedHeads, savedFeedForward]);
 
   const reload = useCallback(async (quiet = false) => {
     if (!window.omni) {
@@ -280,7 +297,14 @@ export function EvolutionWorkspace({
           candidateKind: kind,
           // Keep the Run view bounded. An empty explicit selection routes the
           // data candidate through worker-owned memory rehearsal.
-          sourceIds: []
+          sourceIds: [],
+          architectureChange: kind !== "architecture" ? undefined : architectureOperation === "grow-experts"
+            ? { mutation: "grow-experts", addExperts: 1 }
+            : architectureOperation === "resize-width"
+              ? { mutation: "resize-width", dModel: width, nHeads: heads, feedForward }
+              : { mutation: "repartition-heads", nHeads: heads },
+          geometryHoldouts: holdoutJson.trim()
+            ? JSON.parse(holdoutJson) as NonNullable<EvolutionStartRequest["geometryHoldouts"]> : undefined
         })
       );
       setKnownRuns((current) => [
@@ -433,6 +457,29 @@ export function EvolutionWorkspace({
                 </label>
               );
             })}
+          </fieldset>
+          {kind === "architecture" ? <fieldset className="evolution-geometry">
+            <legend>Isolated architecture operation</legend>
+            <label><span>Operation</span><select value={architectureOperation}
+              onChange={(event) => setArchitectureOperation(event.target.value as typeof architectureOperation)}>
+              <option value="grow-experts">Compatible expert growth</option>
+              <option value="resize-width">Candidate width / feed-forward resize</option>
+              <option value="repartition-heads">Candidate attention-head repartition</option>
+            </select></label>
+            {architectureOperation !== "grow-experts" ? <>
+              {architectureOperation === "resize-width" ? <>
+                <label><span>Width</span><input type="number" min={1} value={width || ""} onChange={(event) => setWidth(Number(event.target.value))} /></label>
+                <label><span>Feed-forward width</span><input type="number" min={1} value={feedForward || ""} onChange={(event) => setFeedForward(Number(event.target.value))} /></label>
+              </> : null}
+              <label><span>Attention heads</span><input type="number" min={1} value={heads || ""} onChange={(event) => setHeads(Number(event.target.value))} /></label>
+            </> : null}
+          </fieldset> : null}
+          <fieldset className="evolution-geometry">
+            <legend>Protected native improvement evaluation</legend>
+            <label><span>Real held-out files (JSON declarations)</span><textarea rows={8} value={holdoutJson}
+                onChange={(event) => setHoldoutJson(event.target.value)}
+                placeholder={'{"token":[{"path":"/absolute/text.jsonl","records":20}],"modality":[{"path":"/absolute/heldout.wav","kind":"audio","conditionText":"literal recorded utterance"}],"tool":[{"path":"/absolute/tools.jsonl","records":20}]}'} /></label>
+            <small>Leave blank to reuse this brain's protected registered holdouts; otherwise use absolute selected paths and actual record counts. Token JSONL: {"{text:string}"}. Tool JSONL: {"{context,schemas,expectedIndex,arguments}"}. Every native candidate stays isolated and requires statistically supported benefit in an agreed objective plus preserved other domains/resources. Missing or insufficient observations cannot authorize promotion. Width/head changes also require Ask or Full Authority.</small>
           </fieldset>
           <p className="evolution-route-note">
             Source candidates enter through exact hash-bound typed edit actions

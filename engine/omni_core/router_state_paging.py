@@ -198,6 +198,8 @@ class RouterStatePager:
         self.journal_ram_bytes = max(0, int(journal_ram_bytes))
         self.policy, self.budget_provider, self.cancelled = resource_policy, budget_provider, cancelled
         self._entries: dict[tuple[int, str], _Backing] = {}
+        self._mapped_entries: dict[int, _Backing] = {}
+        self._heap_owned_bytes = 0
         self._lock = threading.RLock()
         self._active = 0
         self._closed = False
@@ -207,6 +209,15 @@ class RouterStatePager:
         self._hot_page_bytes = 0
         self._mapping_handles = []
         self._journals = weakref.WeakSet()
+
+    @property
+    def resource_policy(self):
+        """Same writable policy binding as other native/activity pagers."""
+        return self.policy
+
+    @resource_policy.setter
+    def resource_policy(self, value):
+        self.policy = value
 
     def check(self):
         if self._closed:
@@ -239,6 +250,21 @@ class RouterStatePager:
         if hasattr(lease, "mark_allocated"):
             lease.mark_allocated(int(amount))
 
+    def _register_entry(self, entry):
+        key = (id(entry.owner), entry.name)
+        prior = self._entries.get(key)
+        if prior is not None and prior.path is None:
+            self._heap_owned_bytes -= prior.logical
+        self._entries[key] = entry
+        if entry.path is None:
+            self._heap_owned_bytes += entry.logical
+
+    def _remove_entry(self, key):
+        entry = self._entries.pop(key, None)
+        if entry is not None and entry.path is None:
+            self._heap_owned_bytes -= entry.logical
+        return entry
+
     @contextmanager
     def construction(self, *, loading: bool = False):
         prior = set(self._entries)
@@ -247,7 +273,7 @@ class RouterStatePager:
             yield self
         except BaseException:
             for key in tuple(set(self._entries) - prior):
-                entry = self._entries.pop(key)
+                entry = self._remove_entry(key)
                 entry.owner._buffers[entry.name] = None
                 self._retire(entry)
             raise
@@ -283,7 +309,7 @@ class RouterStatePager:
             raise RuntimeError("router buffer is already registered with this pager")
         count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
         entry = _Backing(owner, name, count, loaded=not loading)
-        self._entries[id(owner), name] = entry
+        self._register_entry(entry)
         try:
             value = None
             # The pending entry is already included in heap_bytes(). Do not
@@ -310,7 +336,7 @@ class RouterStatePager:
             entry.version = int(value._version)
             return value
         except BaseException:
-            self._entries.pop((id(owner), name), None)
+            self._remove_entry((id(owner), name))
             self._retire(entry)
             raise
 
@@ -320,13 +346,18 @@ class RouterStatePager:
         lease = self.spill(allocation_upper_bound, "mutable router/control backing", path)
         descriptor = None
         mapping = None
+        was_current_heap = False
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             os.ftruncate(descriptor, entry.logical)
             mapping = mmap.mmap(descriptor, entry.logical, access=mmap.ACCESS_WRITE)
             value = torch.frombuffer(mapping, dtype=dtype).reshape(shape)
+            was_current_heap = self._entries.get((id(entry.owner), entry.name)) is entry and entry.path is None
+            if was_current_heap:
+                self._heap_owned_bytes -= entry.logical
             entry.path, entry.mapping, entry.lease = path, mapping, lease
             entry.pointer = value.untyped_storage().data_ptr()
+            self._mapped_entries[entry.pointer] = entry
             _MAPPED[value.untyped_storage().data_ptr()] = self
             self._mapping_handles.append((weakref.ref(mapping), entry.logical, path))
             if lease is not None:
@@ -337,6 +368,9 @@ class RouterStatePager:
         except BaseException:
             if entry.pointer:
                 _MAPPED.pop(entry.pointer, None)
+                self._mapped_entries.pop(entry.pointer, None)
+            if was_current_heap:
+                self._heap_owned_bytes += entry.logical
             entry.path = entry.mapping = entry.lease = None
             entry.pointer = 0
             # Do not force-close a tensor-exported map on a failed commit.
@@ -360,11 +394,11 @@ class RouterStatePager:
                 os.close(descriptor)
 
     def heap_bytes(self):
-        return sum(entry.logical for entry in self._entries.values() if entry.path is None)
+        return self._heap_owned_bytes
 
     def release_chunk(self, value, start: int, count: int):
         pointer = value.untyped_storage().data_ptr()
-        entry = next((entry for entry in self._entries.values() if entry.mapping is not None and entry.pointer == pointer), None)
+        entry = self._mapped_entries.get(pointer)
         if entry is None:
             return
         granularity = mmap.ALLOCATIONGRANULARITY
@@ -397,12 +431,14 @@ class RouterStatePager:
             for row in range(r0, r1):
                 self.release_chunk(value, (row * value.shape[1] + a) * value.element_size(), (b - a) * value.element_size())
 
-    def finish_owner_load(self, owner):
-        for entry in self._entries.values():
-            if entry.owner is owner:
+    def finish_owner_load(self, owner, *, flush=True):
+        for name in MATRIX_FIELDS:
+            entry = self._entries.get((id(owner), name))
+            if entry is not None:
                 entry.loaded = True
                 entry.version = int(getattr(owner, entry.name)._version)
-        self.flush()
+        if flush:
+            self.flush()
 
     def _observe_mutations(self):
         for entry in self._entries.values():
@@ -434,7 +470,7 @@ class RouterStatePager:
             source = getattr(entry.owner, entry.name)
             pending = _Backing(entry.owner, entry.name, entry.logical, loaded=entry.loaded)
             target = self._map(pending, tuple(source.shape), source.dtype)
-            self._entries[id(entry.owner), entry.name] = pending
+            self._register_entry(pending)
             try:
                 step = max(1, min(TRANSFER_BYTES, self.tile_bytes // 8) // source.element_size())
                 for start in range(0, source.numel(), step):
@@ -445,7 +481,7 @@ class RouterStatePager:
                     # Do not retain an additional mmap hot working set here.
                     self._evict_hot(0)
             except BaseException:
-                self._entries[id(entry.owner), entry.name] = entry
+                self._register_entry(entry)
                 self._retire(pending)
                 raise
             entry.owner._buffers[entry.name] = target
@@ -477,22 +513,41 @@ class RouterStatePager:
             replacement = _Backing(entry.owner, entry.name, entry.logical, loaded=True,
                                    version=int(target._version))
             entry.owner._buffers[entry.name] = target
-            self._entries[id(entry.owner), entry.name] = replacement
+            self._register_entry(replacement)
             self._retire(entry)
 
     def release_owner(self, owner):
         """Retire an exact replaced population only after all jobs quiesce."""
         if self._active:
             raise RuntimeError("router owner retirement requires all operations to finish")
-        for key, entry in tuple(self._entries.items()):
-            if entry.owner is owner:
+        for name in MATRIX_FIELDS:
+            entry = self._remove_entry((id(owner), name))
+            if entry is not None:
                 owner._buffers[entry.name] = None
-                self._entries.pop(key)
                 self._retire(entry)
+
+    def discard_unpublished_owner(self, owner):
+        """Unwind only a newly staged sparse block under the operation lock.
+
+        Existing owners may not be retired during an update. A sparse update
+        marks its newly allocated block unpublished until its transaction
+        commits; failed admission can therefore retire it without touching a
+        previously learned connection or another operation's tensor exports.
+        """
+        with self._lock:
+            if not getattr(owner, "_router_unpublished", False):
+                raise RuntimeError("only an unpublished router block may be discarded during an operation")
+            for name in MATRIX_FIELDS:
+                entry = self._remove_entry((id(owner), name))
+                if entry is not None:
+                    owner._buffers[name] = None
+                    self._retire(entry)
 
     def status(self):
         self._mapping_handles = [handle for handle in self._mapping_handles if handle[0]() is not None]
         return {"mode": "ram-first-tiled-router-mutable-controls", "cpuHeapBytes": self.heap_bytes(),
+                "registeredFieldOwners": len(self._entries) // len(MATRIX_FIELDS),
+                "registeredStateBytes": sum(entry.logical for entry in self._entries.values()),
                 "mappedLogicalBytes": sum(entry.logical for entry in self._entries.values() if entry.path),
                 "mappedAllocatedBytes": sum(allocated_bytes(entry.path, entry.logical) for entry in self._entries.values() if entry.path),
                 "mappedPromisedBytes": sum(promised_bytes(entry.logical) for entry in self._entries.values() if entry.path),
@@ -508,10 +563,12 @@ class RouterStatePager:
     def _retire(self, entry):
         if entry.pointer:
             _MAPPED.pop(entry.pointer, None)
-        for key, (cached, length) in tuple(self._hot_ranges.items()):
-            if cached is entry:
-                del self._hot_ranges[key]
-                self._hot_page_bytes -= length + 128
+            self._mapped_entries.pop(entry.pointer, None)
+        if entry.pointer:
+            for position in range(0, entry.logical, mmap.ALLOCATIONGRANULARITY):
+                cached = self._hot_ranges.pop((entry.pointer, position), None)
+                if cached is not None:
+                    self._hot_page_bytes -= cached[1] + 128
         if entry.path is not None:
             try:
                 entry.path.unlink(missing_ok=True)
@@ -531,6 +588,8 @@ class RouterStatePager:
             entry.owner._buffers[entry.name] = None
             self._retire(entry)
         self._entries.clear()
+        self._mapped_entries.clear()
+        self._heap_owned_bytes = 0
         self._hot_ranges.clear(); self._hot_page_bytes = 0
         self._closed = True
         try:
@@ -543,6 +602,8 @@ class RouterStatePager:
 class RouterMutationJournal:
     """Bounded old-byte blocks, RAM-first and sparse dirty-tile disk fallback."""
     def __init__(self, owner, pager: Optional[RouterStatePager], *, ram_bytes: int):
+        from .parameter_diagnostics import active_diagnostic_scopes
+        self._diagnostic_scopes = active_diagnostic_scopes()
         self.owner, self.pager, self.ram_limit = owner, pager, max(0, int(ram_bytes))
         self.records = []
         self.ram_used = 0
@@ -555,8 +616,16 @@ class RouterMutationJournal:
         if pager is not None:
             pager._journals.add(self)
 
+    def _resolve(self, name):
+        # Sparse blocks use their registered, stable module path. Resolve the
+        # current buffer on replay instead of retaining an old heap/mmap alias.
+        if "." in name:
+            path, field = name.rsplit(".", 1)
+            return getattr(self.owner.get_submodule(path), field)
+        return getattr(self.owner, name)
+
     def _capture(self, name, r0, r1, c0=None, c1=None):
-        source = getattr(self.owner, name)
+        source = self._resolve(name)
         view = source.reshape(1) if source.ndim == 0 else source[r0:r1] if c0 is None else source[r0:r1, c0:c1]
         amount = view.numel() * view.element_size() + 256
         if self.pager is not None and amount > self.pager.tile_bytes + 256:
@@ -620,11 +689,26 @@ class RouterMutationJournal:
 
     def _restore(self, record):
         name, r0, r1, c0, c1, value = record
-        target = getattr(self.owner, name)
+        target = self._resolve(name)
         view = target.reshape(1) if target.ndim == 0 else target[r0:r1] if c0 is None else target[r0:r1, c0:c1]
         if view.shape != value.shape or view.dtype != value.dtype:
             raise RuntimeError("router rollback target geometry changed")
-        view.copy_(value.to(device=view.device))
+        if target.dtype == torch.uint8:
+            from .parameter_diagnostics import packed_diagnostic_restore
+            module = self.owner.get_submodule(name.rsplit(".", 1)[0]) if "." in name else self.owner
+            if target.ndim == 2 and c0 is not None:
+                for row in range(r0, r1):
+                    piece = value[row-r0].reshape(-1)
+                    with packed_diagnostic_restore(module, target, piece,
+                            start=row*target.shape[1]+c0, captured_scopes=self._diagnostic_scopes):
+                        target[row, c0:c1].copy_(piece.to(target.device))
+            else:
+                start = 0 if target.ndim == 0 else r0 * math.prod(target.shape[1:])
+                with packed_diagnostic_restore(module, target, value.reshape(-1),
+                        start=start, captured_scopes=self._diagnostic_scopes):
+                    view.copy_(value.to(device=view.device))
+        else:
+            view.copy_(value.to(device=view.device))
 
     @torch.no_grad()
     def rollback(self):

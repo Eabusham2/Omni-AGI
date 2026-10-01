@@ -158,6 +158,7 @@ from .optimizers import (
 from .parameter_diagnostics import ParameterDeltaJournal, diagnostic_call
 from .slow_state_snapshot import SlowStateSnapshot, slow_snapshot_lifetime, admit_snapshot_metadata
 from .persistence import (
+    BoundedChecksumSource,
     EventLog,
     atomic_save_tensors,
     atomic_write_json,
@@ -169,6 +170,7 @@ from .persistence import (
     tensor_checksum,
 )
 from .spiking import AssociativeSpikingRouter
+from .sparse_router_state import canonical_module_walk
 from .ternary_packing import (
     collect_module_ternary_tensors,
     export_module_ternary_shards,
@@ -176,6 +178,7 @@ from .ternary_packing import (
     verify_ternary_shards,
 )
 from .tokenizer import ByteTokenizer
+from .online_replay import initial_replay_cursor, validate_replay_cursor, replay_window, rehearsal_due
 from .vsa import LazyPersistedSynapses, NeuralSubstrate, SubstrateResourcePause
 
 
@@ -636,6 +639,7 @@ class AdaptiveBrain:
         self.completed_ingestions: List[Dict[str, Any]] = []
         self.distributed_training_seal: Optional[Dict[str, Any]] = None
         self.completed_chat_turns: List[Dict[str, Any]] = []
+        self.accepted_chat_inputs: List[Dict[str, Any]] = []
         # Every accepted turn enters fast episodic neural state. Slow replay
         # jobs are checkpointed beside that state so cortical consolidation
         # can be preempted/retried without loss or duplicate optimizer steps.
@@ -710,7 +714,9 @@ class AdaptiveBrain:
             current_core_heap_bytes=heap,
         )
         neurons = max(0, int(getattr(self.config, "router_neurons", 0)))
-        matrix_bytes = 10 * neurons * neurons + neurons * ((neurons + 3) // 4)
+        synapses = getattr(getattr(self, "router", None), "synapses", None)
+        sparse_status = synapses.sparse_state_status() if synapses is not None and hasattr(synapses, "sparse_state_status") else {}
+        matrix_bytes = int(sparse_status.get("allocatedStateBytes", 0)) + int(sparse_status.get("metadataBytesEstimate", 0)) + 16 * neurons
         # The router shares, rather than duplicates, the one cortical hot pool.
         # Very large recurrent state leaves room for cortical owners and spills
         # the remainder; this is a cache budget, not a neuron cardinality cap.
@@ -1028,7 +1034,7 @@ class AdaptiveBrain:
                 if identity not in seen:
                     seen.add(identity)
                     yield parameter
-            for child in root.modules():
+            for _path, child in canonical_module_walk(root):
                 packed_tensors = getattr(
                     child, "authoritative_packed_tensors", None
                 )
@@ -2145,7 +2151,7 @@ class AdaptiveBrain:
         previous = self.engine_path / (".origin-%s.previous" % uuid.uuid4().hex)
         replaced_previous = False
         try:
-            snapshot_files(self.engine_path, temporary)
+            snapshot_files(self.engine_path, temporary, resource_policy=self.resource_policy)
             shutil.copytree(
                 self.engine_path / "packed-ternary",
                 temporary / "packed-ternary",
@@ -2502,6 +2508,14 @@ class AdaptiveBrain:
         }
 
     @torch.enable_grad()
+    def _check_neural_learning_boundary(self, operation: str) -> None:
+        cancellation = getattr(self, "_learning_cancel_check", None)
+        if cancellation is not None and cancellation():
+            raise ChatGenerationCancelled(operation + " was preempted at a neural boundary")
+        pressure = getattr(getattr(self, "resource_policy", None), "check_active_pressure", None)
+        if callable(pressure):
+            pressure(operation, reclaim=getattr(self, "_release_training_allocator_cache", None))
+
     def _train_tool_route_head(
         self,
         trajectories: Sequence[Mapping[str, Any]],
@@ -2570,6 +2584,7 @@ class AdaptiveBrain:
         internal_confidence = 0.0
         try:
             for _ in range(max(1, int(maximum_steps))):
+                AdaptiveBrain._check_neural_learning_boundary(self, "tool-route-learning")
                 optimizer.zero_grad(set_to_none=True)
                 loss = F.cross_entropy(
                     head.forward_internal(internal_states), labels
@@ -2699,6 +2714,7 @@ class AdaptiveBrain:
         try:
             head.train()
             for _ in range(3 if grounded else 1):
+                AdaptiveBrain._check_neural_learning_boundary(self, "tool-argument-learning")
                 for state, features, arguments, _route_index in samples:
                     optimizer.zero_grad(set_to_none=True)
                     pager = self.decoder._working_pager()
@@ -2749,6 +2765,7 @@ class AdaptiveBrain:
         self, *, utterance: str, tool_id: str, action: str,
         outcome: str, source: str, event_id: str = "",
         arguments: Optional[Mapping[str, Any]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """Learn a trusted host episode with its original human request.
 
@@ -2773,15 +2790,26 @@ class AdaptiveBrain:
                 return {"processed": True, "applied": False, "duplicate": True,
                         "ready": bool(head.internal_training_steps.item()),
                         "steps": 0}
-        snapshot = {name: value.detach().clone() for name, value in head.state_dict().items()}
-        argument_head = getattr(self.decoder, "action_argument_head", None)
-        argument_snapshot = (
-            {
-                name: value.detach().clone()
-                for name, value in argument_head.state_dict().items()
-            }
-            if argument_head is not None else None
-        )
+        previous_cancel = getattr(self, "_learning_cancel_check", None)
+        self._learning_cancel_check = cancel_check or previous_cancel
+        rollback_lease = None
+        try:
+            AdaptiveBrain._check_neural_learning_boundary(self, "tool-outcome-learning")
+            head_state = head.state_dict()
+            argument_head = getattr(self.decoder, "action_argument_head", None)
+            argument_state = argument_head.state_dict() if argument_head is not None else {}
+            rollback_bytes = sum(value.numel() * value.element_size()
+                for value in (*head_state.values(), *argument_state.values()))
+            reserve = getattr(getattr(self, "resource_policy", None), "reserve_ram", None)
+            if callable(reserve):
+                rollback_lease = reserve(rollback_bytes + 8192, "tool-outcome rollback state")
+            snapshot = {name: value.detach().clone() for name, value in head_state.items()}
+            argument_snapshot = {name: value.detach().clone() for name, value in argument_state.items()} if argument_head is not None else None
+        except BaseException:
+            self._learning_cancel_check = previous_cancel
+            if rollback_lease is not None:
+                rollback_lease.release()
+            raise
         before_steps = self.counters["training_steps"]
         try:
             result = self._train_tool_route_head(
@@ -2910,13 +2938,17 @@ class AdaptiveBrain:
             if event_key is not None:
                 head.experience_event_keys = torch.cat(
                     (head.experience_event_keys, event_key[None]), dim=0
-                )[-256:]
+                )
         except BaseException:
             head.load_state_dict(snapshot)
             if argument_head is not None and argument_snapshot is not None:
                 argument_head.load_state_dict(argument_snapshot)
             self.counters["training_steps"] = before_steps
             raise
+        finally:
+            self._learning_cancel_check = previous_cancel
+            if rollback_lease is not None:
+                rollback_lease.release()
         return {
             **result,
             "processed": True, "applied": True, "duplicate": False,
@@ -4455,7 +4487,8 @@ class AdaptiveBrain:
             (brain.modalities, "modalities."),
         ):
             load_module_bounded(module, core_reader, prefix, overrides=repaired_controls)
-        load_module_bounded(brain.router, plastic_reader, "router.")
+        router_migration = brain.router.synapses.load_recurrent_state_bounded(plastic_reader, "router.synapses.")
+        load_module_bounded(brain.router, plastic_reader, "router.", excluded_prefixes=("synapses.",))
         brain.core_pager.finish_load()
         brain.core_pager.bind_names((
             ("decoder.", brain.decoder), ("memory_bridge.", brain.memory_bridge),
@@ -4472,6 +4505,8 @@ class AdaptiveBrain:
                 for value in brain.router.state_dict(keep_vars=True).values()
             ),
             "routerControlStatePaging": True,
+            "routerSparseState": brain.router.synapses.sparse_state_status(),
+            "routerNativeMigration": router_migration,
             "routerStatePaging": brain.router_state_pager.status(),
             "checkpointWritableMapped": False,
         }
@@ -4689,6 +4724,21 @@ class AdaptiveBrain:
         brain.completed_chat_turns = cls._validated_completed_chat_turns(
             metadata.get("completed_chat_turns")
         )
+        accepted = metadata.get("accepted_chat_inputs", [])
+        if not isinstance(accepted, list):
+            raise ValueError("accepted chat input references are invalid")
+        brain.accepted_chat_inputs = []
+        for value in accepted:
+            if (not isinstance(value, Mapping) or value.get("committed") is not True
+                or not isinstance(value.get("turnId"), str) or not value["turnId"]
+                or not cls._sha256_identifier(value.get("inputSha256"))
+                or not isinstance(value.get("humanMessageId"), str) or not value["humanMessageId"]
+                or not isinstance(value.get("afterimageId"), str)
+                or not isinstance(value.get("createdAt"), str)
+                or type(value.get("attentionEpoch")) is not int or value["attentionEpoch"] < 0
+                or ("slowJobId" in value and not cls._sha256_identifier(value["slowJobId"]))):
+                raise ValueError("accepted chat input receipt is invalid")
+            brain.accepted_chat_inputs.append(dict(value))
         raw_completed_chat_slow = metadata.get(
             "completed_chat_slow_learning", []
         )
@@ -4711,6 +4761,13 @@ class AdaptiveBrain:
             and isinstance(item.get("humanMessageId"), str)
             and bool(item.get("humanMessageId"))
         ]
+        for record in brain.pending_chat_slow_learning:
+            record["replayCursor"] = validate_replay_cursor(record.get("replayCursor"))
+            if record.get("evidenceRole", "human") not in {"human", "brain"}:
+                raise ValueError("pending replay evidence role is invalid")
+            passes = record.get("completedReplayPasses", 0)
+            if type(passes) is not int or passes < 0:
+                raise ValueError("pending replay pass count is invalid")
         brain.fresh_attention_boundary = (
             cls._validated_fresh_attention_boundary(
                 metadata.get("fresh_attention_boundary")
@@ -4851,7 +4908,10 @@ class AdaptiveBrain:
         optimizer_recovery = brain._repair_optimizer_for_core_recovery(
             repaired_core_masks
         )
-        loaded_parameter_checksum = brain.parameter_checksum()
+        current_loaded_parameter_checksum = brain.parameter_checksum()
+        dense_router_migrated = bool(router_migration.get("legacyDenseMigration"))
+        loaded_parameter_checksum = (brain._legacy_router_parameter_checksum(plastic_reader)
+            if dense_router_migrated else current_loaded_parameter_checksum)
         for active_checkpoint in brain.ingestion_checkpoints.values():
             if active_checkpoint.get("formatVersion") == 3:
                 if core_recovery_records:
@@ -4934,6 +4994,13 @@ class AdaptiveBrain:
                 raise ValueError(
                     "ingestion checkpoint does not match its committed generation"
                 )
+        if dense_router_migrated:
+            # Verify old cursor bindings against the byte-exact original
+            # layout, then publish only its storage representation change.
+            # Record/window positions and immutable origin remain unchanged.
+            for active_checkpoint in brain.ingestion_checkpoints.values():
+                active_checkpoint["neuralStateChecksum"] = current_loaded_parameter_checksum
+            brain.save()
         packed_path = engine_path / "packed-ternary"
         if (
             not core_recovery_records
@@ -5151,7 +5218,7 @@ class AdaptiveBrain:
         )
         try:
             candidate_dir.mkdir(parents=True, exist_ok=False)
-            snapshot_files(self.engine_path, candidate_dir / "stable")
+            snapshot_files(self.engine_path, candidate_dir / "stable", resource_policy=self.resource_policy)
             atomic_write_json(
                 candidate_dir / "candidate.json",
                 {
@@ -6036,12 +6103,11 @@ class AdaptiveBrain:
         input_sha256: str,
         human_message_id: str,
         experience: Mapping[str, Any],
+        evidence_role: str = "human",
     ) -> Optional[Dict[str, Any]]:
         """Queue one idempotent cortical replay after fast chat admission."""
 
-        if not (
-            self.config.online_learning and int(self.config.online_steps) > 0
-        ):
+        if int(self.config.online_steps) <= 0:
             return None
         job_id = hashlib.sha256(
             (
@@ -6105,6 +6171,8 @@ class AdaptiveBrain:
         interference = max(
             0.0, min(1.0, float(signals.get("interference", 0.0)))
         )
+        if evidence_role not in {"human", "brain"}:
+            raise ValueError("chat replay must name an observed message role")
         record = {
             "format": "omni-chat-slow-learning-job",
             "formatVersion": 1,
@@ -6112,6 +6180,10 @@ class AdaptiveBrain:
             "turnId": turn_id,
             "inputSha256": input_sha256,
             "humanMessageId": human_message_id,
+            "evidenceRole": evidence_role,
+            "afterimageId": str(settling.get("afterimageId", "")),
+            "replayCursor": initial_replay_cursor(),
+            "completedReplayPasses": 0,
             "queuedAt": _iso_now(),
             "onlineSteps": int(self.config.online_steps),
             "priority": priority,
@@ -6155,11 +6227,11 @@ class AdaptiveBrain:
                     requested and requested in self.completed_chat_slow_learning
                 ),
             }
-        record = max(
+        record = min(
             candidates,
             key=lambda item: (
-                float(item.get("priority", 0.0)),
-                str(item.get("queuedAt", "")),
+                str(item.get("lastProgressAt", item.get("queuedAt", ""))),
+                -float(item.get("priority", 0.0)),
             ),
         )
         selected_job_id = str(record["jobId"])
@@ -6170,7 +6242,7 @@ class AdaptiveBrain:
         )
         if (
             not isinstance(message, Mapping)
-            or message.get("role") != "human"
+            or message.get("role") != record.get("evidenceRole", "human")
             or hashlib.sha256(
                 str(message.get("content", "")).encode("utf-8")
             ).hexdigest()
@@ -6178,6 +6250,7 @@ class AdaptiveBrain:
         ):
             raise RuntimeError("queued chat replay evidence is unavailable")
         text = str(message["content"])
+        full_neural_before = self.parameter_checksum()
         snapshot = self._snapshot_slow_transaction_state()
         pending_before = list(self.pending_chat_slow_learning)
         completed_before = list(self.completed_chat_slow_learning)
@@ -6204,10 +6277,19 @@ class AdaptiveBrain:
                     optimizer_groups, learning_rates
                 ):
                     group["lr"] = learning_rate * replay_strength
+                values, next_cursor, pass_complete = replay_window(
+                    text, record.get("replayCursor"),
+                    max(2, min(self.config.max_seq_len, self._runtime_training_max_seq_len)),
+                    self.tokenizer,
+                )
+                if len(values) < 2:
+                    raise RuntimeError("queued replay contains no new causal targets")
+                ids = torch.tensor([values], dtype=torch.long, device=self.device)
                 training = self._optimize_experience(
                     text,
                     cue,
-                    steps=max(1, int(record.get("onlineSteps", 1))),
+                    steps=1,
+                    window_source=lambda: iter((ids,)),
                 )
                 if cancel_check is not None and cancel_check():
                     raise ChatGenerationCancelled(
@@ -6218,12 +6300,16 @@ class AdaptiveBrain:
                     optimizer_groups, learning_rates
                 ):
                     group["lr"] = learning_rate
+            passes = int(record.get("completedReplayPasses", 0)) + int(pass_complete)
+            job_complete = passes >= max(1, int(record.get("onlineSteps", 1)))
+            progressed = {**record, "replayCursor": initial_replay_cursor() if pass_complete else next_cursor,
+                          "completedReplayPasses": passes, "lastProgressAt": _iso_now()}
             grew = self._maybe_grow(
                 float(record.get("novelty", 0.0)) * replay_strength,
                 self._idea_model_vector(cue)[0],
-            )
+            ) if job_complete else False
             calibration = None
-            if self._can_retain_native_action_policy():
+            if job_complete and self._can_retain_native_action_policy():
                 calibration = self._calibrate_starter_action_policy(
                     max_steps=96,
                     minimum_steps=0,
@@ -6245,19 +6331,25 @@ class AdaptiveBrain:
                 if checksum != module_checksums_before[name]
             )
             self.pending_chat_slow_learning = [
-                item
+                progressed if item.get("jobId") == selected_job_id and not job_complete else item
                 for item in self.pending_chat_slow_learning
-                if item.get("jobId") != selected_job_id
+                if item.get("jobId") != selected_job_id or not job_complete
             ]
-            self.completed_chat_slow_learning.append(selected_job_id)
+            if job_complete:
+                self.completed_chat_slow_learning.append(selected_job_id)
             self.completed_chat_slow_learning = (
                 self.completed_chat_slow_learning[
                     -COMPLETED_CHAT_SLOW_LEARNING:
                 ]
             )
+            self._cool_recent_dialogue()
             result = {
                 "brainId": self.brain_id,
                 "processed": True,
+                "jobComplete": job_complete,
+                "replayTargetsVisited": len(values) - 1,
+                "completedReplayPasses": passes,
+                "replayCursor": progressed["replayCursor"],
                 "jobId": selected_job_id,
                 "turnId": str(record.get("turnId", "")),
                 "priority": float(record.get("priority", 0.0)),
@@ -6283,7 +6375,7 @@ class AdaptiveBrain:
             }
             # Queue removal, completed tombstone, weights, optimizer moments,
             # and stability tensors become authoritative in one generation.
-            self.save()
+            self._save_observed_neural_boundary(full_neural_before, selected_job_id)
             try:
                 self.events.append(
                     "chat-slow-learning-complete",
@@ -6308,13 +6400,11 @@ class AdaptiveBrain:
                 committed_pointer = committed.get("mutable_state")
                 job_committed = (
                     isinstance(committed_ids, list)
-                    and selected_job_id in committed_ids
                     and isinstance(committed_pending, list)
-                    and not any(
-                        isinstance(item, Mapping)
-                        and item.get("jobId") == selected_job_id
-                        for item in committed_pending
-                    )
+                    and ((job_complete and selected_job_id in committed_ids and not any(
+                        isinstance(item, Mapping) and item.get("jobId") == selected_job_id
+                        for item in committed_pending)) or (not job_complete and any(
+                        isinstance(item, Mapping) and item == progressed for item in committed_pending)))
                     and committed_pointer == self.mutable_state_manifest
                 )
             except (OSError, ValueError, TypeError):
@@ -6801,6 +6891,7 @@ class AdaptiveBrain:
             "completed_chat_turns": self.completed_chat_turns[
                 -COMPLETED_CHAT_TURN_RECEIPTS:
             ],
+            "accepted_chat_inputs": self.accepted_chat_inputs,
             "completed_chat_slow_learning": self.completed_chat_slow_learning[
                 -COMPLETED_CHAT_SLOW_LEARNING:
             ],
@@ -7737,6 +7828,31 @@ class AdaptiveBrain:
             reserve=self._reserve_core_diagnostic_state,
         )
 
+    def _legacy_router_parameter_checksum(self, reader: BoundedTensorFile) -> str:
+        """Verify a native dense checkpoint without expanding sparse zeros."""
+        name = "router.synapses._packed_weights"
+        spec = reader.specs[name]
+        owner = self.router.synapses
+        descendants = {id(child) for child in owner.modules() if child is not owner}
+        def sources():
+            seen = set()
+            for root in self._trainable_modules():
+                for parameter in root.parameters():
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter)); yield parameter
+                for _path, child in canonical_module_walk(root):
+                    if child is owner:
+                        yield BoundedChecksumSource(spec.shape, spec.dtype, lambda: reader.chunks(name))
+                        continue
+                    if id(child) in descendants:
+                        continue
+                    getter = getattr(child, "authoritative_packed_tensors", None)
+                    if callable(getter):
+                        for value in getter():
+                            if id(value) not in seen:
+                                seen.add(id(value)); yield value
+        return tensor_checksum(sources(), reserve=self._reserve_core_diagnostic_state)
+
     def _reserve_core_diagnostic_state(self, byte_count):
         status = self.resource_policy.status(estimated_ram_bytes=int(byte_count))
         if status["memoryPressure"]:
@@ -8289,6 +8405,8 @@ class AdaptiveBrain:
             self.recent_token_context,
             self.memory_lifecycle.afterimage_items,
             self.memory_lifecycle.cycle,
+            protected_episode_ids={str(record.get("afterimageId", ""))
+                for record in self.pending_chat_slow_learning if record.get("afterimageId")},
         )
         removed = before - len(self.recent_token_context)
         self.counters["context_token_evictions"] += removed
@@ -9336,6 +9454,7 @@ class AdaptiveBrain:
         steps: int,
         learning_rate: Optional[float] = None,
         commit_stability: bool = True,
+        window_source: Optional[Callable[[], Iterator[torch.Tensor]]] = None,
     ) -> Dict[str, float]:
         if learning_rate is not None:
             optimizer = self._new_optimizer(learning_rate)
@@ -9353,7 +9472,7 @@ class AdaptiveBrain:
         self.idea_adapter.train()
         self.liquid.train()
         for _ in range(max(1, int(steps))):
-            for ids in self.tokenizer.window_tensors(
+            for ids in (window_source() if window_source is not None else self.tokenizer.window_tensors(
                 text,
                 self.device,
                 max_length=min(
@@ -9362,7 +9481,8 @@ class AdaptiveBrain:
                 ),
                 add_bos=True,
                 add_eos=True,
-            ):
+            )):
+                AdaptiveBrain._check_neural_learning_boundary(self, "experience-learning")
                 if ids.shape[1] < 2:
                     continue
                 if optimizer is self._optimizer:
@@ -13407,6 +13527,7 @@ class AdaptiveBrain:
         seed: int,
         emit: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        self_activity_observer: Optional[Callable[[torch.Tensor, Mapping[str, Any]], None]] = None,
     ) -> Callable[[torch.Tensor, int, float], Dict[str, Any]]:
         """Reevaluate native action heads from every actual prefix state.
 
@@ -13453,6 +13574,8 @@ class AdaptiveBrain:
                             "completedInTurn": True, "ponderTrace": ponder_trace,
                         }
                         refined_memory = cue
+                        if self_activity_observer is not None:
+                            self_activity_observer(cue, ponder_trace)
                     if emit is not None:
                         emit("action", {"actionId": registered["actionId"], "action": registered})
                     stop = stop or action.get("kind") == "stop"
@@ -13793,6 +13916,95 @@ class AdaptiveBrain:
             "stateLengthHead": "hardware-and-organic-state-v1",
         }
 
+    def _accepted_input_receipt(self, turn_id: str, input_sha256: str) -> Optional[Dict[str, Any]]:
+        key = hashlib.sha256((self.brain_id + "\0" + turn_id + "\0accepted-input-v1").encode()).hexdigest()
+        receipt = next((item for item in self.accepted_chat_inputs if item.get("turnId") == turn_id), None)
+        if receipt is None:
+            trace = self.conversation.payload_by_id("trace", key)
+            receipt = trace.get("inputAccepted") if isinstance(trace, Mapping) else None
+        if receipt is None:
+            return None
+        if (not isinstance(receipt, Mapping) or receipt.get("turnId") != turn_id
+            or receipt.get("inputSha256") != input_sha256 or receipt.get("committed") is not True):
+            raise ValueError("accepted input identity conflicts with this retry")
+        message = self.conversation.payload_by_id("message", str(receipt.get("humanMessageId", "")))
+        if (not isinstance(message, Mapping) or message.get("role") != "human"
+            or message.get("turn_id") != turn_id
+            or hashlib.sha256(str(message.get("content", "")).encode()).hexdigest() != input_sha256):
+            raise RuntimeError("accepted input has no matching observed human message")
+        return dict(receipt)
+
+    def _save_observed_neural_boundary(self, before: str, source_id: str) -> None:
+        """Keep a paused data cursor while an independently observed act learns."""
+        previous = copy.deepcopy(self.ingestion_checkpoints)
+        previous_joint = copy.deepcopy(self.ingestion_joint_generation)
+        after = self.parameter_checksum()
+        for checkpoint in self.ingestion_checkpoints.values():
+            if checkpoint.get("neuralStateChecksum") != before:
+                raise RuntimeError("observed experience began outside the committed data cursor")
+            checkpoint["neuralStateChecksum"] = after
+        try:
+            self.save()
+        except BaseException:
+            try:
+                committed = read_json(self.engine_path / "brain.json")
+                committed_same = (committed.get("ingestion_checkpoints", {}) == self.ingestion_checkpoints
+                    and committed.get("mutable_state") == self.mutable_state_manifest
+                    and committed.get("accepted_chat_inputs", []) == self.accepted_chat_inputs)
+            except (OSError, ValueError, TypeError):
+                committed_same = False
+            if not committed_same:
+                self.ingestion_checkpoints = previous
+                self.ingestion_joint_generation = previous_joint
+            raise
+
+    def learn_action_result(
+        self, evidence_id: str, execution_id: str, evidence_path: str,
+        evidence_sha256: str, provenance: Mapping[str, Any], progress: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Learn completed observed effects with the existing atomic cursor.
+
+        The source completion receipt survives lost acknowledgements. Retrying
+        this method learns no second copy and never executes the tool again.
+        """
+        if not self._sha256_identifier(evidence_id) or not self._sha256_identifier(evidence_sha256):
+            raise ValueError("completed action evidence identity is invalid")
+        try:
+            uuid.UUID(execution_id)
+        except (ValueError, AttributeError, TypeError) as error:
+            raise ValueError("completed action execution identity is invalid") from error
+        if (not isinstance(provenance, Mapping)
+            or provenance.get("format") != "omni-completed-action-result-v1"
+            or not all(isinstance(provenance.get(key), str) and provenance[key]
+                for key in ("actionEventId", "toolId", "action", "completedAt"))):
+            raise ValueError("completed action provenance is invalid")
+        base = Path(self.engine_path).absolute()
+        directory = base / "action-result-learning" / "evidence"
+        expected = directory / (evidence_id + ".jsonl")
+        if Path(evidence_path).absolute() != expected:
+            raise ValueError("completed action evidence must be its exact owned spool")
+        for component in (base, base / "action-result-learning", directory):
+            if component.is_symlink() or not component.is_dir():
+                raise ValueError("completed action evidence directory is unsafe")
+        if expected.is_symlink() or not expected.is_file() or expected.stat().st_size < 1:
+            raise ValueError("completed action evidence is unavailable")
+        result = self.ingest(
+            path=str(expected), name="action-result-" + evidence_id, kind="jsonl",
+            policy="pretrain", expected_hash=evidence_sha256, allow_replay=False,
+            transaction_key=evidence_id, progress=progress,
+        )
+        source = result.get("source", {})
+        receipt = source.get("completionReceipt", {}) if isinstance(source, Mapping) else {}
+        if (not isinstance(receipt, Mapping) or not self._sha256_identifier(receipt.get("transactionId"))
+            or receipt.get("contentHash") != evidence_sha256):
+            raise RuntimeError("completed action learning has no atomic source receipt")
+        return {"brainId": self.brain_id, "evidenceId": evidence_id, "executionId": execution_id,
+                "evidenceSha256": evidence_sha256, "processed": not bool(result.get("duplicate")),
+                "duplicate": bool(result.get("duplicate")), "committed": True,
+                "sourceIdentity": receipt.get("sourceIdentity"),
+                "commitSequence": source.get("record_batch_commits", result.get("recordRecovery", {}).get("batchCommits", 0)),
+                "source": source, "metrics": result["metrics"] if "metrics" in result else self.metrics()}
+
     def _completed_chat_result(
         self, receipt: Mapping[str, Any]
     ) -> Dict[str, Any]:
@@ -13883,6 +14095,7 @@ class AdaptiveBrain:
         steer_check: Optional[Callable[[], bool]] = None,
         temporary_steering_context: Optional[Mapping[str, Any]] = None,
         tool_observation_provider: Optional[Callable[[], Sequence[Mapping[str, Any]]]] = None,
+        chat_control_callback: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         clean = text.replace("\x00", "").strip()
         if not clean:
@@ -13897,7 +14110,20 @@ class AdaptiveBrain:
             if 0xD800 <= point <= 0xDFFF:
                 raise ValueError("chat input is not valid Unicode scalar text")
             current_input_tokens += 1 if point < 0x80 else 2 if point < 0x800 else 3 if point < 0x10000 else 4
+        original_cancel_check = cancel_check
+        if chat_control_callback is not None:
+            def checked_cancel() -> bool:
+                chat_control_callback()
+                pressure = getattr(self.resource_policy, "check_active_pressure", None)
+                if callable(pressure):
+                    pressure("chat", reclaim=self._release_training_allocator_cache)
+                return bool(original_cancel_check is not None and original_cancel_check())
+            cancel_check = checked_cancel
+
         def cancellation_boundary() -> None:
+            pressure = getattr(getattr(self, "resource_policy", None), "check_active_pressure", None)
+            if callable(pressure):
+                pressure("chat", reclaim=self._release_training_allocator_cache)
             if cancel_check is not None and cancel_check():
                 raise ChatGenerationCancelled("chat generation was cancelled")
 
@@ -13936,6 +14162,18 @@ class AdaptiveBrain:
                     "inputSha256": input_sha256, "steered": True,
                     "nativeStopped": False, "zeroTokenYield": True,
                     "turnCommitted": False, "text": "", "response": "", "actions": []}
+        # One exact, checkpointed window gives existing experience a fair
+        # cortical turn even during a continuous stream of foreground chats.
+        # Resource pressure preserves its cursor; it never fabricates learning
+        # success or changes the selected working-memory capacity.
+        prior_replay = None
+        if self.config.online_learning and self.pending_chat_slow_learning:
+            try:
+                prior_replay = self.consolidate_pending_chat_learning(cancel_check=cancel_check)
+            except NeuralStateResourcePause as paused_replay:
+                prior_replay = {"processed": False, "paused": True,
+                                "pending": len(self.pending_chat_slow_learning),
+                                "reason": str(paused_replay)}
         temporary_user_inputs, temporary_input_audit = temporary_steering_inputs(temporary_steering_context,
             brain_id=self.brain_id, turn_id=turn_id, attention_epoch=self._attention_epoch(), policy=self.resource_policy)
         requested_generation_tokens = (
@@ -13946,6 +14184,19 @@ class AdaptiveBrain:
         before_checksum = self.parameter_checksum()
         before_parameters = self._parameter_copy()
         normalized_tools = self._normalize_tool_schemas(tool_schemas)
+        ponder_activity_vector = None
+        ponder_activity_passes = 0
+
+        def observe_self_activity(vector: torch.Tensor, observation: Mapping[str, Any]) -> None:
+            nonlocal ponder_activity_vector, ponder_activity_passes
+            # A bounded neural working mixture records the actual performed
+            # recurrence. It contains no invented words or answer sequence.
+            current = vector.detach()
+            if ponder_activity_vector is None:
+                ponder_activity_vector = current.clone()
+            else:
+                ponder_activity_vector = F.normalize(ponder_activity_vector + current, dim=-1).detach()
+            ponder_activity_passes += int(observation.get("passes", 0))
 
         cue = self.memory.vector_for_text(clean)
         # Default speech is conditioned by the shared neural substrate and
@@ -13973,13 +14224,39 @@ class AdaptiveBrain:
                 importance=0.7,
             )
 
-        if transactional_generation:
-            # A cancelled decode must not admit an incomplete turn to memory.
+        admitted_input = self._accepted_input_receipt(turn_id, input_sha256) if transactional_generation and turn_id else None
+        admitted_human_message = None
+        if transactional_generation and turn_id:
+            if admitted_input is None:
+                experience = commit_fast_experience()
+                admitted_human_message = {"id": uuid.uuid4().hex, "role": "human", "content": clean,
+                    "created_at": _iso_now(), "attention_epoch": self._attention_epoch(), "turn_id": turn_id,
+                    "input_accepted_before_reply": True}
+                self.messages.append(admitted_human_message)
+                job = self._enqueue_chat_slow_learning(turn_id=turn_id, input_sha256=input_sha256,
+                    human_message_id=admitted_human_message["id"], experience=experience) if defer_slow_learning else None
+                admitted_input = {"turnId": turn_id, "inputSha256": input_sha256,
+                    "humanMessageId": admitted_human_message["id"],
+                    "afterimageId": str(experience["memory_settling"].get("afterimageId", "")),
+                    "createdAt": admitted_human_message["created_at"], "attentionEpoch": self._attention_epoch(),
+                    "committed": True, **({"slowJobId": job["jobId"]} if job else {})}
+                self.accepted_chat_inputs = [admitted_input]
+                receipt_key = hashlib.sha256((self.brain_id + "\0" + turn_id + "\0accepted-input-v1").encode()).hexdigest()
+                self.traces.append({"id": receipt_key, "created_at": admitted_human_message["created_at"],
+                    "attention_epoch": self._attention_epoch(), "kind": "chat-input-accepted", "inputAccepted": admitted_input})
+                self._save_observed_neural_boundary(before_checksum, receipt_key)
+            else:
+                admitted_human_message = self.conversation.payload_by_id("message", admitted_input["humanMessageId"])
+                experience = self._preview_chat_experience(clean, cue, recalled)
+            if stream_callback is not None:
+                stream_callback("input-accepted", dict(admitted_input))
+        elif transactional_generation:
             experience = self._preview_chat_experience(clean, cue, recalled)
         else:
             # Preserve the original organic path for mutable/associative chat:
             # valid fast activity participates in its own action decision.
             experience = commit_fast_experience()
+        response_boundary_checksum = self.parameter_checksum() if admitted_input is not None else before_checksum
         recall_model = self._idea_model_vector(recalled_vector)
         tool_model = self._tool_schema_vector(normalized_tools)
         working_model = self._working_memory_vector()
@@ -14212,6 +14489,7 @@ class AdaptiveBrain:
                     noise=organic_noise,
                     cancel_check=cancel_check,
                 )
+                observe_self_activity(internal_memory, native_ponder_trace)
             except Exception:
                 self.decoder.train(decoder_training_before_generation)
                 raise
@@ -14405,6 +14683,7 @@ class AdaptiveBrain:
                 action_cue=action_cue, ledger=emission_ledger,
                 seed=int(selected["seed"]), emit=stream_callback,
                 cancel_check=cancel_check,
+                self_activity_observer=observe_self_activity,
             )
             replayed, replay_entropies = (prompt_ids, []) if private_generation_steered else self.decoder.generate(
                 prompt_ids,
@@ -14497,12 +14776,12 @@ class AdaptiveBrain:
                 raise
 
         cancellation_boundary()
-        if transactional_generation:
+        if transactional_generation and admitted_input is None:
             # Generation and the visible stream have succeeded. The exact
             # fast experience can now enter substrate/STDP/working memory;
             # slow shared-representation learning remains transactional below.
             experience = commit_fast_experience()
-            self.current_context = pending_current_context
+        self.current_context = pending_current_context
 
         generation_elapsed_seconds = max(
             1e-9, time.perf_counter() - generation_started_at
@@ -14511,18 +14790,11 @@ class AdaptiveBrain:
             float(generated_token_count) / generation_elapsed_seconds
         )
 
-        # A brain's own same-turn output is not independent teaching evidence.
-        # The full user experience always learns, while generated speech must
-        # receive later feedback/evidence before it can become a target. This
-        # prevents fluent mistakes and native-model nonsense from reinforcing
-        # themselves without imposing a behavioral preference objective.
-        generated_response_supervision_eligible = False
-        generated_response_exclusion_reason = (
-            "no-printable-generated-output" if no_reply else
-            "truncated-neural-or-token-budget-response"
-            if generation_budget_truncated
-            else "same-turn-generated-output-awaits-independent-evidence"
-        )
+        # Own speech is an observed act with self provenance. Learning the act
+        # does not attach an independent factual endorsement, reward label or
+        # behavioral instruction to its contents.
+        generated_response_supervision_eligible = bool(response.strip())
+        generated_response_exclusion_reason = "none" if generated_response_supervision_eligible else "no-observed-output"
         own_training = None
         if (
             self.config.learn_from_own_messages
@@ -14535,6 +14807,17 @@ class AdaptiveBrain:
                 source_label="self-response",
                 steps=0,
                 importance=0.35,
+            )
+        own_ponder_training = None
+        if ponder_activity_vector is not None and ponder_activity_passes > 0:
+            fingerprint = hashlib.sha256(
+                ponder_activity_vector.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+            own_ponder_training = self._admit_sensory_embedding(
+                ponder_activity_vector, kind="self-ponder", source_name="Performed Ponder activity",
+                fingerprint=fingerprint, experience_source="self-ponder",
+                child_ids=[str(experience.get("assembly_id", experience["idea_id"]))],
+                importance=float(experience["memory_settling"].get("salience", 0.35)),
             )
         pair_training = None
         # The unconditional fast update above already admitted the complete
@@ -14703,7 +14986,7 @@ class AdaptiveBrain:
         delta_norm = self._parameter_delta_norm(before_parameters)
         self.counters["inference_count"] += 1
         now = _iso_now()
-        user_message = {
+        user_message = admitted_human_message or {
             "id": uuid.uuid4().hex,
             "role": "human",
             "content": clean,
@@ -14720,9 +15003,12 @@ class AdaptiveBrain:
             **({"turn_id": turn_id} if turn_id else {}),
         }
         if disposition:
-            user_message["generation_end"] = disposition
+            if admitted_human_message is None:
+                user_message["generation_end"] = disposition
             assistant_message["generation_end"] = disposition
-        self.messages.extend([user_message, assistant_message])
+        if admitted_human_message is None:
+            self.messages.append(user_message)
+        self.messages.append(assistant_message)
         queued_slow_learning = None
         if defer_slow_learning:
             queued_slow_learning = self._enqueue_chat_slow_learning(
@@ -14734,6 +15020,13 @@ class AdaptiveBrain:
             if queued_slow_learning is not None:
                 slow_mutation_requested = True
                 slow_mutation_stage = "queued-background"
+            if own_training is not None:
+                self._enqueue_chat_slow_learning(
+                    turn_id=(turn_id or str(user_message["id"])) + ":self",
+                    input_sha256=hashlib.sha256(response.encode("utf-8")).hexdigest(),
+                    human_message_id=str(assistant_message["id"]),
+                    experience=own_training, evidence_role="brain",
+                )
         self._append_recent_dialogue(
             clean, response,
             afterimage_id=str(experience["memory_settling"].get("afterimageId", "")),
@@ -14944,10 +15237,18 @@ class AdaptiveBrain:
             "long_term_source_text_injected": False,
             "generated_response_supervision": {
                 "eligible": generated_response_supervision_eligible,
-                "policy": "independent-evidence-required",
+                "policy": "observed-self-experience-with-provenance",
                 "selfExperienceApplied": own_training is not None,
                 "dialogueUpdateApplied": pair_training is not None,
                 "exclusionReason": generated_response_exclusion_reason,
+            },
+            "prior_experience_replay": prior_replay,
+            "input_accepted_before_reply": admitted_input is not None,
+            "self_ponder_experience": None if own_ponder_training is None else {
+                "assemblyId": own_ponder_training["assemblyId"],
+                "performedPasses": ponder_activity_passes,
+                "source": "self-ponder", "independentFactualEndorsement": False,
+                "rawThoughtTextStored": False,
             },
             "tool_schema_text_injected": False,
             "hidden_prompt_text_expanded": False,
@@ -15178,7 +15479,7 @@ class AdaptiveBrain:
                 -COMPLETED_CHAT_TURN_RECEIPTS:
             ]
         try:
-            self.save()
+            self._save_observed_neural_boundary(response_boundary_checksum, turn_id or str(user_message["id"]))
         except Exception:
             if turn_receipt is not None:
                 self.completed_chat_turns = [
@@ -18824,29 +19125,13 @@ class AdaptiveBrain:
             flush_streaming_local()
             coverage_snapshot = coverage.as_dict()
             commit_sequence += 1
-            finite_middle = capability_rehearsal_cadence.get("middleWave")
-            middle_due = bool(
-                capability_rehearsal_enabled
-                and (
-                    (
-                        capability_rehearsal_cadence["mode"]
-                        == "finite-midpoint"
-                        and finite_middle is not None
-                        and committed_records > last_committed_record_cursor
-                        and committed_records // int(learning_schedule["checkpointRecords"]) == int(finite_middle)
-                        and capability_rehearsal_state.last_periodic_wave == 0
-                    )
-                    or (
-                        capability_rehearsal_cadence["mode"]
-                        == "indefinite-periodic"
-                        and due_rehearsal_phase(
-                            capability_rehearsal_state,
-                            capability_rehearsal_policy,
-                            committed_global_waves=commit_sequence,
-                        )
-                        == "middle"
-                    )
-                )
+            middle_due = capability_rehearsal_enabled and rehearsal_due(
+                capability_rehearsal_cadence, committed_records=committed_records,
+                previous_records=last_committed_record_cursor, committed_windows=commit_sequence,
+                active_window=window is not None,
+                last_middle_wave=capability_rehearsal_state.last_periodic_wave,
+                periodic_due=due_rehearsal_phase(capability_rehearsal_state,
+                    capability_rehearsal_policy, committed_global_waves=commit_sequence) == "middle",
             )
             if middle_due:
                 capability_receipt = rehearse_capabilities(
@@ -21219,7 +21504,7 @@ class AdaptiveBrain:
         clean_label = SAFE_NAME.sub("-", label.strip()).strip(".-")[:48] or "snapshot"
         snapshot_id = "%s-%s" % (clean_label, uuid.uuid4().hex[:12])
         destination = self.engine_path / "snapshots" / snapshot_id
-        snapshot_files(self.engine_path, destination)
+        snapshot_files(self.engine_path, destination, resource_policy=self.resource_policy)
         shutil.copytree(
             self.engine_path / "packed-ternary",
             destination / "packed-ternary",

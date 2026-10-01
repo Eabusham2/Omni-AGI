@@ -642,7 +642,7 @@ def reseal_native_descriptor(config: Any, mutation: Mapping[str, Any]) -> Option
         shape["dModel"] = int(config.d_model)
         shape["feedForward"] = int(config.d_ff)
         shape["nHeads"] = int(config.n_heads)
-    result["inventory"] = native_core_inventory(shape)
+    result["inventory"] = native_core_inventory(shape, result.get("sizing", {}).get("routerStorageLayout"))
     old_lineage = previous.get("evolutionLineage", {})
     history = list(old_lineage.get("mutations", ()))
     normalized = normalize_architecture_change({key: value for key, value in mutation.items() if key != "compatibilityBoundary"})
@@ -687,7 +687,7 @@ def validate_compatible_architecture_lineage(descriptor: Mapping[str, Any], orig
         or any(type(value) is not int or not 1 <= value <= (1 << 53) - 1
             for key, value in root["shape"].items() if key != "liquidMode")):
         raise ValueError("native compatible architecture root shape is invalid")
-    root["inventory"] = native_core_inventory(root["shape"])
+    root["inventory"] = native_core_inventory(root["shape"], root.get("sizing", {}).get("routerStorageLayout"))
     root["sha256"] = native_architecture_sha256(root)
     root = validate_native_architecture(root)
     if root["sha256"] != lineage["rootArchitectureSha256"]:
@@ -717,7 +717,7 @@ def validate_compatible_architecture_lineage(descriptor: Mapping[str, Any], orig
             step["shape"]["nHeads"] = canonical.get("nHeads", step["shape"]["nHeads"])
         elif canonical["mutation"] == "repartition-heads":
             step["shape"]["nHeads"] = canonical["nHeads"]
-        step["inventory"] = native_core_inventory(step["shape"])
+        step["inventory"] = native_core_inventory(step["shape"], step.get("sizing", {}).get("routerStorageLayout"))
         geometry_history = any(item["mutation"] in {"resize-width", "repartition-heads"} for item in history)
         step["evolutionLineage"] = {
             "format": "omni-native-candidate-architecture-lineage" if geometry_history else "omni-compatible-architecture-lineage",

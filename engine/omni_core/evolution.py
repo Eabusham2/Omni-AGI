@@ -12,6 +12,7 @@ import json
 import math
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -36,6 +37,7 @@ from .architecture_migration import (
 )
 from .native_architecture import validate_native_architecture
 from .registered_geometry_holdouts import load_registered_geometry_holdouts, register_geometry_holdouts
+from .paired_geometry_statistics import paired_improvement_statistics, file_sha as paired_file_sha
 from .bounded_tensor_io import BoundedTensorFile
 from .evolution_anchors import RetentionAnchorFile, save_retention_anchors
 from .persistence import (
@@ -162,7 +164,7 @@ def _geometry_training_complete(training, *, epochs, fingerprints, latent_replay
         and insertion_parameter_checksum != candidate_parameter_checksum)
 
 
-def _geometry_holdout_metrics(candidate, fingerprints, expected_benchmark_sha256=None, cancel_check=None):
+def _geometry_holdout_metrics(candidate, fingerprints, expected_benchmark_sha256=None, cancel_check=None, score_path=None):
     registered = load_registered_geometry_holdouts(candidate.engine_path, cancelled=cancel_check)
     measure = getattr(candidate, "evaluate_isolated_geometry_holdouts", None)
     if not callable(measure):
@@ -170,8 +172,8 @@ def _geometry_holdout_metrics(candidate, fingerprints, expected_benchmark_sha256
         measure = lambda **kwargs: evaluate_isolated_geometry_holdouts(candidate, **kwargs)
     value = _validate_json(measure(excluded_text_sha256=[item["sha256"] for item in fingerprints],
         expected_benchmark_sha256=expected_benchmark_sha256, registered_manifest=registered,
-        cancelled=cancel_check), "native geometry holdouts")
-    if (not isinstance(value, Mapping) or set(value) != {"format", "formatVersion", "benchmarkSha256", "token", "modality", "tool", "resources"}
+        cancelled=cancel_check, score_path=score_path), "native geometry holdouts")
+    if (not isinstance(value, Mapping) or set(value) != {"format", "formatVersion", "benchmarkSha256", "token", "modality", "tool", "resources", "pairedScores"}
         or value["format"] != "omni-native-geometry-holdouts" or type(value["formatVersion"]) is not int or value["formatVersion"] != 1):
         raise ValueError("native geometry held-out measurement schema is invalid")
     digest = value["benchmarkSha256"]
@@ -203,17 +205,22 @@ def _geometry_holdout_metrics(candidate, fingerprints, expected_benchmark_sha256
         or type(resources["peakManagedMemoryBytes"]) is not int or resources["peakManagedMemoryBytes"] < 1
         or type(resources["peakAcceleratorMemoryBytes"]) is not int or resources["peakAcceleratorMemoryBytes"] < 0):
         raise ValueError("geometry holdout lacks measured resource-envelope evidence")
+    paired = value["pairedScores"]
+    if (score_path is None or not isinstance(paired, Mapping) or paired.get("path") != Path(score_path).name
+        or paired.get("sha256") != paired_file_sha(score_path)
+        or paired.get("records") != sum(value[key]["examples"] for key in ("token", "modality", "tool"))):
+        raise ValueError("geometry heldout lacks protected complete paired native-loss observations")
     return value
 
 
-def _geometry_holdout_checks(baseline, candidate):
-    limits = {"token": 1.05, "modality": 1.10, "tool": 1.05}
+def _geometry_holdout_checks(baseline, candidate, *, statistics=None):
     checks = {}
-    for category, tolerance in limits.items():
+    for category in ("token", "modality", "tool"):
         old, new = baseline[category], candidate[category]
         checks["heldOut" + category.title()] = (old["sourceSha256"] == new["sourceSha256"]
-            and old["examples"] == new["examples"] and new["loss"] <= old["loss"] * tolerance + 1e-6)
+            and old["examples"] == new["examples"] and new["loss"] <= old["loss"] + 1e-12 * max(1., abs(old["loss"])))
     checks["heldOutResources"] = candidate["resources"]["withinSelectedEnvelope"] is True
+    checks["statisticallySupportedImprovement"] = isinstance(statistics, Mapping) and statistics.get("passed") is True
     return checks
 
 
@@ -224,6 +231,28 @@ def _geometry_promotion_authorized(authorization, candidate_id, evaluation, stat
         and authorization["candidateId"] == candidate_id
         and authorization["evaluationSha256"] == evaluation.get("evaluationSha256")
         and authorization["candidateStateChecksum"] == state_checksum)
+
+
+def measured_process_comparison(*, passed, wall_seconds, statistics=None, parent=None):
+    """Actual evaluator outcome/cost, never a prose or synthetic meta gain."""
+    gain = max((statistics["domains"][name]["relativeGain"]
+        for name in statistics["supportedObjectiveDomains"]), default=0.) if statistics is not None else None
+    value = {"format": "omni-measured-improvement-process", "formatVersion": 1,
+        "completedCandidates": 1, "evaluatorSuccesses": int(passed), "wallSeconds": wall_seconds,
+        "nativeQualityGainMeasured": gain is not None, "nativeRelativeGain": gain,
+        "gainPerWallSecond": gain / wall_seconds if gain is not None and wall_seconds > 0 else None,
+        "metaImprovementEstablished": False, "reason": "one candidate does not establish a better improvement process"}
+    if isinstance(parent, Mapping) and parent.get("format") == value["format"]:
+        previous = parent.get("gainPerWallSecond")
+        current = value["gainPerWallSecond"]
+        value.update(previousEvaluatorSuccessRate=parent["evaluatorSuccesses"] / max(1, parent["completedCandidates"]),
+            currentEvaluatorSuccessRate=float(passed), previousWallSeconds=parent["wallSeconds"],
+            wallCostRatio=wall_seconds / parent["wallSeconds"] if parent["wallSeconds"] > 0 else None,
+            gainPerCostImproved=current > previous if isinstance(previous, (int, float)) and isinstance(current, (int, float)) else None,
+            completedCandidates=parent["completedCandidates"] + 1,
+            evaluatorSuccesses=parent["evaluatorSuccesses"] + int(passed),
+            reason="actual parent/child success and cost compared; statistical process benefit remains unestablished")
+    return value
 
 
 def _bundle_checksum(engine_path: Path) -> str:
@@ -659,7 +688,7 @@ class NeuralEvolutionManager:
             raise ValueError("geometry candidate changed unavailable or undeclared architecture owners")
         insertion = candidate_dir / "geometry-insertion"
         self.brain.resource_policy.require_disk(snapshot_required_bytes(model_engine), "immutable geometry insertion evidence")
-        snapshot_files(model_engine, insertion)
+        snapshot_files(model_engine, insertion, resource_policy=self.brain.resource_policy)
         proof = verify_geometry_checkpoint_migration(stable, insertion, manifest)
         manifest_path = candidate_dir / "geometry-migration.json"
         atomic_write_json(manifest_path, manifest)
@@ -732,19 +761,46 @@ class NeuralEvolutionManager:
             raise ValueError("geometry candidate did not finish real requested native training")
         return value
 
-    def _load_geometry_evaluation(self, candidate_id, record):
+    def _load_native_evaluation(self, candidate_id, record):
         path = self.baselines_path / (candidate_id + ".evaluation.json")
         if not path.is_file() or _file_sha256(path) != record.get("evaluationFileSha256"):
-            raise ValueError("geometry promotion requires independently recorded actual evaluation evidence")
+            raise ValueError("native promotion requires independently recorded actual evaluation evidence")
         evaluation = read_json(path)
         if (evaluation != record.get("evaluation") or evaluation.get("passed") is not True
             or _json_sha256({key: value for key, value in evaluation.items() if key != "evaluationSha256"}) != evaluation.get("evaluationSha256")
             or any(evaluation.get("checks", {}).get(key) is not True for key in (
-                "integrity", "architectureCompatible", "geometryMigrationVerified", "trainingCompleted",
+                "integrity", "architectureCompatible",
                 "resources", "ternaryCoverage", "objectiveNonRegression", "capabilityRetention", "neuralRetention", "changed"))):
-            raise ValueError("geometry evaluation/promotion gates are incomplete or were altered")
-        if any(evaluation.get("checks", {}).get(key) is not True for key in ("heldOutToken", "heldOutModality", "heldOutTool", "heldOutResources")):
-            raise ValueError("geometry evaluation lacks passing held-out token/modality/tool/resource metrics")
+            raise ValueError("native evaluation/promotion gates are incomplete or were altered")
+        if any(evaluation.get("checks", {}).get(key) is not True for key in ("heldOutToken", "heldOutModality", "heldOutTool", "heldOutResources", "statisticallySupportedImprovement")):
+            raise ValueError("native evaluation lacks statistically supported held-out benefit and preservation")
+        return evaluation
+
+    def _load_geometry_evaluation(self, candidate_id, record):
+        evaluation = self._load_native_evaluation(candidate_id, record)
+        if any(evaluation["checks"].get(key) is not True for key in ("geometryMigrationVerified", "trainingCompleted")):
+            raise ValueError("geometry evaluation/promotion migration or training gates are incomplete")
+        return evaluation
+
+    def _verify_native_promotion_evidence(self, candidate_id, candidate_dir, record, baseline):
+        evaluation = self._load_native_evaluation(candidate_id, record)
+        if ("geometryHoldouts" not in baseline or "geometryHoldouts" not in evaluation
+            or evaluation.get("benchmarkSha256") != baseline["benchmarkSha256"]
+            or evaluation.get("candidateStateChecksum") != record.get("candidateStateChecksum")
+            or evaluation.get("candidateMetadataSha256") != record.get("candidateMetadataSha256")):
+            raise ValueError("native evaluation does not bind its exact baseline and candidate identity")
+        registered = load_registered_geometry_holdouts(self._model_path(candidate_dir) / "engine")
+        if registered["benchmarkSha256"] != baseline["geometryHoldouts"]["benchmarkSha256"]:
+            raise ValueError("registered native evaluation data changed before promotion")
+        observed = paired_improvement_statistics(
+            self.baselines_path / (candidate_id + ".paired-baseline.jsonl"),
+            self.baselines_path / (candidate_id + ".paired-candidate.jsonl"),
+            baseline["geometryHoldouts"]["pairedScores"], evaluation["geometryHoldouts"]["pairedScores"],
+            objectives=baseline["objectives"])
+        if observed != evaluation.get("pairedStatistics") or observed["passed"] is not True:
+            raise ValueError("native promotion lost its exact statistically supported paired observations")
+        if not all(_geometry_holdout_checks(baseline["geometryHoldouts"], evaluation["geometryHoldouts"], statistics=observed).values()):
+            raise ValueError("native promotion lacks held-out benefit, retention or resource preservation")
         return evaluation
 
     def propose(
@@ -761,15 +817,20 @@ class NeuralEvolutionManager:
         progress: Optional[Any] = None,
         cancel_check: Optional[Any] = None,
         geometry_holdouts: Optional[Mapping[str, Any]] = None,
+        recursive_parent_candidate_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        proposal_started = time.monotonic()
         assert_architecture_quiescent(self.brain)
         architecture_mutation = _normalize_architecture_change(
             architecture_change
         )
         geometry_change = architecture_mutation is not None and architecture_mutation_policy(architecture_mutation)["geometryChanges"]
         if geometry_holdouts is not None:
-            if not geometry_change: raise ValueError("explicit geometry holdouts are scoped to geometry candidates")
             register_geometry_holdouts(self.brain, geometry_holdouts, cancelled=cancel_check)
+        # The legacy field name is retained for saved-instance compatibility;
+        # real heldouts and statistical benefit are required for EVERY native
+        # candidate, including unchanged-geometry replay and compatible growth.
+        load_registered_geometry_holdouts(self.engine_path, cancelled=cancel_check)
         candidate_type = (
             "architecture" if architecture_mutation is not None else "neural"
         )
@@ -788,14 +849,14 @@ class NeuralEvolutionManager:
             str(value)
             for value in (
                 objectives
-                or (
-                    ["latent-replay", "retention", "capability"]
-                    if latent_replay and not clean_texts
-                    else ["language-prediction", "retention", "capability"]
-                )
+                or ["language-prediction", "modality-reconstruction", "typed-tool-prediction", "retention", "capability"]
             )
         ]
         safe_provenance = _validate_json(dict(provenance or {}), "provenance")
+        if recursive_parent_candidate_id is not None:
+            _directory, recursive_parent = self._record(recursive_parent_candidate_id)
+            if recursive_parent.get("status") != "promoted":
+                raise ValueError("recursive process comparison requires a promoted recorded parent")
 
         # Save first so the parent checksum and rollback point describe the
         # complete live neural state, including fast synapses and replay.
@@ -819,6 +880,7 @@ class NeuralEvolutionManager:
             epochs=epochs,
             learningRate=learning_rate,
             latentReplay=bool(latent_replay),
+            recursiveParentCandidateId=recursive_parent_candidate_id,
             architectureCandidate={
                 "supported": architecture_mutation is not None,
                 "mutation": architecture_mutation,
@@ -843,7 +905,7 @@ class NeuralEvolutionManager:
             self.brain.resource_policy.require_disk(snapshot_required_bytes(stable), "isolated evolution working copy")
             resident_admission = self._admit_isolated_load(stable)
             self.brain._record_candidate(candidate_dir, isolatedResidentAdmissionBytes=resident_admission)
-            snapshot_files(stable, model_engine)
+            snapshot_files(stable, model_engine, resource_policy=self.brain.resource_policy)
             # Late import avoids an AdaptiveBrain/evolution import cycle.
             from .brain import AdaptiveBrain
 
@@ -938,9 +1000,10 @@ class NeuralEvolutionManager:
             }
             if geometry_retention is not None:
                 baseline_manifest["geometryRetentionPolicy"] = geometry_retention
-                baseline_manifest["geometryHoldouts"] = _geometry_holdout_metrics(candidate, baseline_manifest["objectiveTextFingerprints"], cancel_check=cancel_check)
-                if candidate.parameter_checksum() != parent_parameter_checksum:
-                    raise ValueError("geometry baseline evaluator mutated authoritative neural parameters")
+            baseline_manifest["geometryHoldouts"] = _geometry_holdout_metrics(candidate, baseline_manifest["objectiveTextFingerprints"], cancel_check=cancel_check,
+                score_path=self.baselines_path / (candidate_id + ".paired-baseline.jsonl"))
+            if candidate.parameter_checksum() != parent_parameter_checksum:
+                raise ValueError("native baseline evaluator mutated authoritative neural parameters")
             baseline_manifest["benchmarkSha256"] = _json_sha256(_benchmark_payload(baseline_manifest))
             atomic_write_json(baseline_manifest_path, baseline_manifest)
             baseline_manifest_sha = _file_sha256(baseline_manifest_path)
@@ -1167,6 +1230,7 @@ class NeuralEvolutionManager:
                 candidateDeltaNorm=diff_norm,
                 candidateDeltaNormBasis="encoded-checkpoint-state-diff-not-learning-magnitude",
                 training=training,
+                proposalWallSeconds=time.monotonic() - proposal_started,
                 **({"geometryTrainingMeasurementSha256": training_measurement_sha} if geometry_change else {}),
                 preliminaryMetrics={
                     "baselineObjectiveLoss": baseline_objective,
@@ -1227,6 +1291,7 @@ class NeuralEvolutionManager:
                 candidate_rng.__exit__(None, None, None)
 
     def evaluate(self, candidate_id: str) -> Dict[str, Any]:
+        evaluation_started = time.monotonic()
         candidate_dir, record = self._record(candidate_id)
         if record.get("status") not in {"ready", "evaluated"}:
             raise ValueError(
@@ -1261,8 +1326,16 @@ class NeuralEvolutionManager:
                 if (descriptor["sha256"] != geometry_manifest["candidateArchitectureSha256"]
                     or candidate.parameter_checksum() != geometry_training["candidateParameterChecksum"]):
                     raise ValueError("geometry trained neural/architecture identity changed before evaluation")
-                geometry_holdouts = _geometry_holdout_metrics(candidate, baseline["objectiveTextFingerprints"],
-                    expected_benchmark_sha256=baseline["geometryHoldouts"]["benchmarkSha256"])
+            if "geometryHoldouts" not in baseline:
+                raise ValueError("archived native candidate lacks protected paired baseline evidence; propose a new candidate")
+            geometry_holdouts = _geometry_holdout_metrics(candidate, baseline["objectiveTextFingerprints"],
+                expected_benchmark_sha256=baseline["geometryHoldouts"]["benchmarkSha256"],
+                score_path=self.baselines_path / (candidate_id + ".paired-candidate.jsonl"))
+            paired_statistics = paired_improvement_statistics(
+                self.baselines_path / (candidate_id + ".paired-baseline.jsonl"),
+                self.baselines_path / (candidate_id + ".paired-candidate.jsonl"),
+                baseline["geometryHoldouts"]["pairedScores"], geometry_holdouts["pairedScores"],
+                objectives=baseline["objectives"])
             architecture_passed = _architecture_compatible(
                 baseline["architecture"],
                 candidate_architecture,
@@ -1333,7 +1406,7 @@ class NeuralEvolutionManager:
             if geometry_change:
                 checks["geometryMigrationVerified"] = geometry_manifest is not None
                 checks["trainingCompleted"] = geometry_training is not None
-                checks.update(_geometry_holdout_checks(baseline["geometryHoldouts"], geometry_holdouts))
+            checks.update(_geometry_holdout_checks(baseline["geometryHoldouts"], geometry_holdouts, statistics=paired_statistics))
             passed = all(checks.values())
             failures = [name for name, value in checks.items() if not value]
             metrics = {
@@ -1372,25 +1445,34 @@ class NeuralEvolutionManager:
                 ),
                 "architecture": candidate_architecture,
                 "candidateDeltaNormBasis": record.get("candidateDeltaNormBasis", "legacy-checkpoint-state-diff"),
+                "geometryHoldouts": geometry_holdouts,
+                "pairedStatistics": paired_statistics,
+                "candidateStateChecksum": state_checksum,
+                "candidateMetadataSha256": _file_sha256(model_engine / "brain.json"),
             }
             if geometry_change:
                 evaluation.update(functionPreserved=False, geometryRetentionPolicy=baseline["geometryRetentionPolicy"],
-                    geometryHoldouts=geometry_holdouts,
                     geometryManifestSha256=baseline["geometryMigration"]["manifestSha256"],
-                    geometryTrainingMeasurementSha256=record["geometryTrainingMeasurementSha256"],
-                    candidateStateChecksum=state_checksum, candidateMetadataSha256=_file_sha256(model_engine / "brain.json"))
+                    geometryTrainingMeasurementSha256=record["geometryTrainingMeasurementSha256"])
+            parent_process = None
+            parent_id = record.get("recursiveParentCandidateId")
+            if isinstance(parent_id, str):
+                _parent_directory, parent_record = self._record(parent_id)
+                parent_evaluation = self._load_native_evaluation(parent_id, parent_record) if parent_record.get("evaluationFileSha256") else {}
+                parent_process = parent_evaluation.get("processMeasurement")
+            evaluation["processMeasurement"] = measured_process_comparison(passed=passed,
+                wall_seconds=float(record.get("proposalWallSeconds", 0.)) + time.monotonic() - evaluation_started,
+                statistics=paired_statistics, parent=parent_process)
             evaluation["evaluationSha256"] = _json_sha256(evaluation)
-            evaluation_file_sha = None
-            if geometry_change:
-                evaluation_path = self.baselines_path / (candidate_id + ".evaluation.json")
-                atomic_write_json(evaluation_path, evaluation)
-                evaluation_file_sha = _file_sha256(evaluation_path)
+            evaluation_path = self.baselines_path / (candidate_id + ".evaluation.json")
+            atomic_write_json(evaluation_path, evaluation)
+            evaluation_file_sha = _file_sha256(evaluation_path)
             status = "evaluated" if passed else "rejected"
             self.brain._record_candidate(
                 candidate_dir,
                 status=status,
                 evaluation=evaluation,
-                **({"evaluationFileSha256": evaluation_file_sha} if geometry_change else {}),
+                evaluationFileSha256=evaluation_file_sha,
                 reason=(
                     ""
                     if passed
@@ -1415,9 +1497,8 @@ class NeuralEvolutionManager:
                 "status": status,
             }
         except Exception as error:
-            if geometry_change:
-                self.brain._record_candidate(candidate_dir, status="rejected",
-                    reason="geometry evaluation failed: %s" % error, rejectedAt=_iso_now())
+            self.brain._record_candidate(candidate_dir, status="rejected",
+                reason="native evaluation failed: %s" % error, rejectedAt=_iso_now())
             raise
         finally:
             try:
@@ -1484,14 +1565,12 @@ class NeuralEvolutionManager:
             raise ValueError("candidate evaluation did not pass")
         mutation = record.get("architectureMutation")
         geometry_change = isinstance(mutation, Mapping) and mutation.get("mutation") in {"resize-width", "repartition-heads"}
+        baseline, _ = self._load_baseline(candidate_id, record)
+        evaluation = self._verify_native_promotion_evidence(candidate_id, candidate_dir, record, baseline)
         if geometry_change:
-            baseline, _ = self._load_baseline(candidate_id, record)
             self._load_geometry_migration(candidate_dir, record, baseline)
             self._load_geometry_training(candidate_id, candidate_dir, record, baseline)
             evaluation = self._load_geometry_evaluation(candidate_id, record)
-            registered = load_registered_geometry_holdouts(self._model_path(candidate_dir) / "engine")
-            if registered["benchmarkSha256"] != baseline["geometryHoldouts"]["benchmarkSha256"]:
-                raise ValueError("registered geometry evaluation data changed before promotion")
             if (evaluation.get("benchmarkSha256") != baseline["benchmarkSha256"]
                 or evaluation.get("geometryManifestSha256") != baseline["geometryMigration"]["manifestSha256"]
                 or evaluation.get("geometryTrainingMeasurementSha256") != record["geometryTrainingMeasurementSha256"]):

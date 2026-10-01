@@ -172,6 +172,7 @@ import {
   reconcileCompletedChatTurn,
   reconcileOptimisticChatMessages,
   recoverFailedChatDraft,
+  receivedChatInputFailureStatus,
   settleOptimisticChatTurn,
   shouldFollowChatOutput
 } from "./chatTurnPresentation";
@@ -1044,9 +1045,8 @@ function LibraryPage({
 
         {visible.length > 0 ? (
           <div className="brain-grid">
-            {visible.map((brain, index) => {
+            {visible.map((brain) => {
               const meta = recipeMeta.find((recipe) => recipe.id === brain.preset) ?? recipeMeta[0]!;
-              const activity = index === 0 ? [25, 48, 39, 72, 55, 86, 68, 92, 76, 95, 83, 100] : [20, 31, 52, 44, 67, 38, 62, 71, 58, 79, 68, 73];
               const provenance = brainProvenancePresentation({
                 provenance: brain.provenance,
                 adaptation: brain.adaptation
@@ -1113,11 +1113,6 @@ function LibraryPage({
                       <span>{provenance.compactLabel}</span>
                     </p>
                   ) : null}
-                  <div className="mini-activity" aria-label="Recent neural activity">
-                    {activity.map((height, barIndex) => (
-                      <span key={barIndex} style={{ height: `${height}%` }} />
-                    ))}
-                  </div>
                   {isPristineBrainSummary(brain) ? (
                     <div className="brain-card__stats brain-card__stats--empty">
                       <span>
@@ -2615,11 +2610,6 @@ function WorkspaceShell({
             </button>
           ) : null}
           <div className="workspace-header__activity">
-            <span className="signal-bars">
-              {[35, 70, 45, 88, 62].map((height, index) => (
-                <i key={index} style={{ height: `${height}%` }} />
-              ))}
-            </span>
             <span>
               <small>Runtime</small>
               <strong>{health}</strong>
@@ -3207,6 +3197,7 @@ function ChatWorkspace({
   const partialTextRef = useRef("");
   const generationPhasesRef = useRef(new Map<string, ChatGenerationPhase>());
   const committedTurnIdsRef = useRef(new Set<string>());
+  const receivedInputTurnIdsRef = useRef(new Set<string>());
   const cancelledTurnIdsRef = useRef(new Set<string>());
   const steeredTurnIdsRef = useRef(new Set<string>());
   const actionTurnIdsRef = useRef(new Map<string, string>());
@@ -3525,6 +3516,7 @@ function ChatWorkspace({
     setPostReplyWork([]);
     generationPhasesRef.current.clear();
     committedTurnIdsRef.current.clear();
+    receivedInputTurnIdsRef.current.clear();
     cancelledTurnIdsRef.current.clear();
     steeredTurnIdsRef.current.clear();
     actionTurnIdsRef.current.clear();
@@ -3688,6 +3680,13 @@ function ChatWorkspace({
         advanceChatGenerationPhase(previousPhase, event));
       // Action/media work has its own lane, including updates from an older
       // completed reply while a newer text turn owns generation controls.
+      if (event.type === "chat-input-accepted") {
+        receivedInputTurnIdsRef.current.add(event.turnId);
+        setSessionCommittedMessages(current => mergeCommittedChatMessages(current, [event.humanMessage]).slice(-240));
+        setOptimisticHumans(current => reconcileCompletedChatTurn(current, event.turnId, event.humanMessage));
+        // Input receipt never closes/reopens generation or fabricates a reply.
+        return;
+      }
       if (event.type === "chat-action") {
         actionTurnIdsRef.current.set(event.actionEvent.id, event.turnId);
         setActionEvents((current) => mergeChatActionEvent(current, event.actionEvent));
@@ -3746,6 +3745,7 @@ function ChatWorkspace({
           ["complete", "steered", "stopped", "no-reply", "failed", "cancelled"].includes(event.state)) {
         const priorQueue = event.turnId === activeTurnIdRef.current ? chatQueueRef.current : null;
         const committed = committedTurnIdsRef.current.has(event.turnId);
+        const received = receivedInputTurnIdsRef.current.has(event.turnId);
         finishGeneration(event.turnId, event.createdAt, !committed && event.state !== "complete");
         setPostReplyWork((current) => current.filter((work) => work.turnId !== event.turnId));
         if (event.state === "no-reply" && committed && !activeTurnIdRef.current) {
@@ -3766,13 +3766,14 @@ function ChatWorkspace({
         }
         if (event.state === "failed" || event.state === "cancelled") {
           const terminalState = event.state;
-          if (!committed) {
+          if (!committed && !received) {
             void persistDeliveryReceipt(event.turnId, terminalState);
             setOptimisticHumans((current) => settleOptimisticChatTurn(current, event.turnId, terminalState));
             setUncommittedOutputs((current) => settleUncommittedChatOutput(current, event.turnId, terminalState));
           }
           const terminalStatus = committed
             ? `Reply remains saved; its later action work ${terminalState === "cancelled" ? "was cancelled" : "failed"}.`
+            : received ? receivedChatInputFailureStatus(terminalState)
             : event.state === "cancelled"
               ? chatCancellationStatus(event.cancellation, priorQueue)
               : `Message not sent: ${conciseUiMessage(event.error, "The local brain could not respond.")}`;
@@ -3981,7 +3982,7 @@ function ChatWorkspace({
         return;
       }
       const terminalState = cancelledTurnIdsRef.current.has(turnId) ? "cancelled" : "failed";
-      void persistDeliveryReceipt(turnId, terminalState, {
+      if (!receivedInputTurnIdsRef.current.has(turnId)) void persistDeliveryReceipt(turnId, terminalState, {
         content: text,
         createdAt
       });
@@ -3996,6 +3997,10 @@ function ChatWorkspace({
         // local failure receipt; otherwise that receipt remains visibly failed.
         await window.omni.brain.get(brain.id).then(async (refreshed) => {
           const latestMessages = await loadLatestConversation();
+          if (latestMessages.some(message => message.role === "human" && message.turnId === turnId && message.inputReceipt?.committed)) {
+            receivedInputTurnIdsRef.current.add(turnId);
+            if (isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) setChatDeliveryStatus(receivedChatInputFailureStatus(terminalState));
+          }
           setOptimisticHumans((current) =>
             reconcileOptimisticChatMessages(current, latestMessages)
           );
@@ -4008,7 +4013,7 @@ function ChatWorkspace({
         });
         // Preserve the newest unsent wording in the composer as well, so the
         // person can retry or edit it without reconstructing the message.
-        if (terminalState === "failed" &&
+        if (terminalState === "failed" && !receivedInputTurnIdsRef.current.has(turnId) &&
             isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) {
           setInput((current) => recoverFailedChatDraft(current, text));
         }
@@ -4024,6 +4029,7 @@ function ChatWorkspace({
       // guard; retain metadata only while its real work/result is outstanding.
       generationPhasesRef.current.delete(turnId);
       committedTurnIdsRef.current.delete(turnId);
+      receivedInputTurnIdsRef.current.delete(turnId);
       cancelledTurnIdsRef.current.delete(turnId);
       steeredTurnIdsRef.current.delete(turnId);
       streamSequenceRef.current.delete(turnId);
@@ -5597,7 +5603,7 @@ function MessageBubble({
         cancelled && "message--cancelled"
       )}
       data-turn-state={
-        noReply ? "no-reply" : stopped ? "stopped" : uncommittedOutputState
+        noReply ? "no-reply" : stopped ? "stopped" : !isBrain && message.inputReceipt?.committed ? "received" : uncommittedOutputState
           ? `output-uncommitted-${uncommittedOutputState}`
           : failed
           ? "failed"
@@ -5623,6 +5629,7 @@ function MessageBubble({
           <time>
             {new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
           </time>
+          {!isBrain && message.inputReceipt?.committed ? <span className="message-queue-label">Received</span> : null}
           {uncommittedOutputState ? (
             <span className="message-queue-label">
               {uncommittedOutputState === "saving"

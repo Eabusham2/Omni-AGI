@@ -43,6 +43,25 @@ def active_diagnostic_scopes():
     return tuple(id(journal) for journal in _OBSERVERS.get())
 
 
+def register_sparse_zero_owner(parent, key, block):
+    """Explicit absent-zero -> registered block boundary, before any write."""
+    registered = []
+    try:
+        for journal in _OBSERVERS.get():
+            if journal.register_sparse_zero_owner(parent, key, block):
+                registered.append(journal)
+    except BaseException:
+        for journal in reversed(registered):
+            journal.retire_sparse_zero_owner(parent, key, block)
+        raise
+
+
+def retire_sparse_zero_owner(parent, key, block):
+    """Undo only explicitly recorded absent-zero births after exact rollback."""
+    for journal in _OBSERVERS.get():
+        journal.retire_sparse_zero_owner(parent, key, block)
+
+
 @contextmanager
 def packed_diagnostic_restore(module, target, replacement, *, start=0, captured_scopes=()):
     """A same-operation rollback needs no new diagnostic original bytes.
@@ -98,6 +117,9 @@ class ParameterDeltaJournal:
         self._disk_quota = None
         self._sidecar_quotas = []
         self.original = self.inventory()
+        self._sparse_containers = {id(module): ((prefix + "." + path).rstrip("."), module)
+            for prefix, root in self.roots for path, module in root.named_modules()
+            if getattr(module, "packed_synapse_container", False)}
         self.by_module = {(id(item["module"]), item["name"]): item for item in self.original.values() if item["kind"] == "packed"}
         controls = [item for item in self.original.values() if item["kind"] == "control"]
         metadata_bytes = 1024 + len(self.original) * 1024
@@ -133,7 +155,41 @@ class ParameterDeltaJournal:
                     key = prefix + "." + path + "." + name
                     result[key] = {"kind": "packed", "key": key, "module": module, "name": name,
                         "shape": tuple(value.shape), "elements": value.numel()}
+                    if getattr(module, "_router_sparse_block", False) and name == "_packed_weights":
+                        result[key]["logical_columns"] = int(module.columns)
         return result
+
+    def register_sparse_zero_owner(self, parent, key, block):
+        binding = self._sparse_containers.get(id(parent))
+        if binding is None:
+            return False  # This metric may deliberately exclude the router.
+        if (self.closed or binding[1] is not parent or not getattr(block, "_router_sparse_block", False)
+                or not getattr(block, "_router_unpublished", False) or not getattr(block, "_router_loaded", False)
+                or key not in parent.blocks or parent.blocks[key] is not block):
+            raise RuntimeError("diagnostic sparse birth has no trusted implicit-zero ownership boundary")
+        packed = block._packed_weights
+        if not bool(packed.eq(0x55).all()):
+            raise RuntimeError("a new sparse diagnostic owner must begin at exact zero trits")
+        path = binding[0] + ".blocks." + key + "._packed_weights"
+        if path in self.original:
+            raise RuntimeError("diagnostic sparse birth reuses a still-owned path")
+        self.reserve_ram(2048)
+        item = {"kind": "packed", "key": path, "module": block, "name": "_packed_weights",
+                "shape": tuple(packed.shape), "elements": packed.numel(), "logical_columns": block.columns,
+                "implicit_zero_birth": True, "birth_parent": parent, "birth_key": key}
+        self.original[path] = item
+        self.by_module[id(block), "_packed_weights"] = item
+        self.mark_version(item)
+        return True
+
+    def retire_sparse_zero_owner(self, parent, key, block):
+        item = self.by_module.get((id(block), "_packed_weights"))
+        if item is None or not item.get("implicit_zero_birth"):
+            return
+        if item["birth_parent"] is not parent or item["birth_key"] != key:
+            raise RuntimeError("diagnostic sparse retirement changed its immutable birth binding")
+        del self.by_module[id(block), "_packed_weights"]
+        del self.original[item["key"]]
 
     @staticmethod
     def current(item):
@@ -174,6 +230,11 @@ class ParameterDeltaJournal:
         after = replacement.detach().reshape(-1)
         if target.dtype != torch.uint8 or replacement.dtype != torch.uint8 or start < 0 or start + after.numel() > current.numel():
             raise ValueError("core diagnostic write range is invalid")
+        if item.get("implicit_zero_birth"):
+            # The entire original code is known, so it needs no old-byte file.
+            # Versions are still tracked; final actual codes, not proposed
+            # writes or cumulative flips, determine the exact net delta.
+            return item
         position = 0
         while position < after.numel():
             absolute = start + position
@@ -235,10 +296,14 @@ class ParameterDeltaJournal:
         return self.database.execute("SELECT block,positions,codes FROM original WHERE owner=? ORDER BY block", (key,))
 
     @staticmethod
-    def _packed_square(now, prior):
+    def _packed_square(now, prior, *, positions=None, logical_columns=None):
         total = 0
         for shift in (0, 2, 4, 6):
             delta = ((now.to(torch.int16) >> shift) & 3) - ((prior.to(torch.int16) >> shift) & 3)
+            if positions is not None and logical_columns is not None and logical_columns % 4:
+                row_bytes = (logical_columns + 3) // 4
+                valid = (positions % row_bytes != row_bytes-1) | (shift//2 < logical_columns % 4)
+                delta = delta * valid.to(delta.dtype)
             total += int(delta.to(torch.int64).square().sum().item())
         return total
 
@@ -262,6 +327,8 @@ class ParameterDeltaJournal:
                 continue
             value = self.current(item).reshape(-1)
             if original is None:
+                if getattr(item["module"], "_router_sparse_block", False):
+                    raise RuntimeError("sparse diagnostic owner appeared without an explicit implicit-zero birth")
                 for start in range(0, value.numel(), BLOCK_BYTES):
                     self.reserve_ram(min(BLOCK_BYTES, value.numel() - start) * 48 + 131072)
                     block = value[start:start + BLOCK_BYTES].detach().to(device="cpu")
@@ -272,15 +339,24 @@ class ParameterDeltaJournal:
             observed = original["observed"]
             if observed[0] == id(self.current(item)) and observed[1] != int(self.current(item)._version):
                 raise RuntimeError("core diagnostic observed a packed write outside its before-write journal")
-            if observed[0] != id(self.current(item)) and getattr(item["module"], "_native_core_pager", None) is None:
+            if observed[0] != id(self.current(item)) and getattr(item["module"], "_native_core_pager", None) is None and getattr(item["module"], "_router_state_pager", None) is None:
                 raise RuntimeError("core diagnostic observed an unregistered packed target replacement")
+            if original.get("implicit_zero_birth"):
+                for start in range(0, value.numel(), BLOCK_BYTES):
+                    count = min(BLOCK_BYTES, value.numel()-start)
+                    self.reserve_ram(count * 64 + 131072)
+                    block = value[start:start+count].detach().to(device="cpu")
+                    total += self._packed_square(block, torch.full_like(block, 0x55),
+                        positions=torch.arange(start, start+count), logical_columns=original["logical_columns"])
+                continue
             for block, encoded_positions, codes in self._rows(key):
                 self.reserve_ram(BLOCK_BYTES * 192 + 131072)
                 indices = array.array("H")
                 indices.frombytes(encoded_positions)
                 offsets = torch.tensor(indices, dtype=torch.int64)
                 selected = value[block * BLOCK_BYTES:block * BLOCK_BYTES + BLOCK_BYTES].index_select(0, offsets.to(value.device)).detach().cpu()
-                total += self._packed_square(selected, torch.tensor(list(codes), dtype=torch.uint8))
+                total += self._packed_square(selected, torch.tensor(list(codes), dtype=torch.uint8),
+                    positions=offsets + block*BLOCK_BYTES, logical_columns=original.get("logical_columns"))
                 from .native_core_paging import release_native_tensor_chunk
                 release_native_tensor_chunk(self.current(item), block * BLOCK_BYTES, min(BLOCK_BYTES, value.numel() - block * BLOCK_BYTES))
         missing = set(self.original) - set(current)
@@ -292,7 +368,7 @@ class ParameterDeltaJournal:
         """Restore only actual first-original byte changes, resolving live names."""
         if not self.include_state: raise RuntimeError("diagnostic-only journal is not a rollback owner")
         for item in self.original.values():
-            if item["kind"] != "packed": continue
+            if item["kind"] != "packed" or item.get("implicit_zero_birth"): continue
             target = self.current(item)
             if tuple(target.shape) != item["shape"]: raise RuntimeError("rollback packed topology did not restore")
             flat = target.reshape(-1)
@@ -312,6 +388,13 @@ class ParameterDeltaJournal:
                 for observer, descriptor in touched: observer.mark_version(descriptor)
                 from .native_core_paging import release_native_tensor_chunk
                 release_native_tensor_chunk(target, block * BLOCK_BYTES, min(BLOCK_BYTES, target.numel() - block * BLOCK_BYTES))
+        # These blocks did not exist at the snapshot boundary. Restoring only
+        # their bytes would leave invented learned/control owners behind.
+        while True:
+            birth = next((item for item in self.original.values() if item.get("implicit_zero_birth")), None)
+            if birth is None:
+                break
+            birth["birth_parent"]._sparse_state.retire_rollback_birth(birth["birth_key"], birth["module"])
 
     def close(self):
         if self.closed:
@@ -329,3 +412,4 @@ class ParameterDeltaJournal:
         for quota in self._sidecar_quotas: quota.release()
         self.original.clear()
         self.by_module.clear()
+        self._sparse_containers.clear()

@@ -20,6 +20,8 @@ const COOPERATIVE_CANCEL_METHODS = new Set([
   "load",
   "chat",
   "consolidate_chat_learning",
+  "learn_action_result",
+  "learn_tool_route_outcome",
   "configure_video_runtime",
   "generate_neural_speech",
   "generate_modality"
@@ -1384,6 +1386,49 @@ export class EngineSupervisor extends EventEmitter {
       brainId: observation.brainId, streamId: observation.turnId, observation
     }, 10_000, undefined, true);
     return observationReceipt(receipt, observation);
+  }
+
+  async authorizeInlineImagination(params: Record<string, unknown>): Promise<{ accepted: boolean }> {
+    if (this.workerRole !== "neural") throw new Error("Inline authorization requires the neural worker.");
+    const result = await this.rawRequest("authorize_inline_imagination", params, 10_000, undefined, true) as Record<string, unknown>;
+    if (!result || typeof result.accepted !== "boolean" || result.accepted &&
+      (result.brainId !== params.brainId || result.streamId !== params.streamId || result.neuralActionId !== params.neuralActionId)) {
+      throw new Error("Inline authorization receipt has a different artifact owner.");
+    }
+    return result as { accepted: boolean };
+  }
+
+  async awaitInlineArtifact(params: Record<string, unknown>, signal?: AbortSignal): Promise<boolean> {
+    if (typeof params.neuralActionId !== "string") return false;
+    let owned: { streamId?: string } | undefined;
+    try {
+      while (true) {
+        signal?.throwIfAborted();
+        const state = await this.rawRequest("inline_generation_status", params, 10_000, undefined, true) as {
+          exists: boolean; brainId?: string; neuralActionId?: string; started?: boolean; ready?: boolean; cancelled?: boolean; streamId?: string;
+        };
+        if (!state || typeof state.exists !== "boolean" || state.exists &&
+          (state.brainId !== params.brainId || state.neuralActionId !== params.neuralActionId ||
+           typeof state.streamId !== "string" || typeof state.ready !== "boolean" || typeof state.cancelled !== "boolean")) {
+          throw new Error("Inline artifact status has a different owned request.");
+        }
+        if (!state.exists) return false;
+        owned = state;
+        if (state.cancelled) throw new Error("This exact inline artifact was cancelled.");
+        if (state.ready) return true;
+        await new Promise<void>((resolve, reject) => {
+          const stop = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", stop); reject(new Error("Inline artifact wait cancelled.")); };
+          const timer = setTimeout(() => { signal?.removeEventListener("abort", stop); resolve(); }, 100);
+          signal?.addEventListener("abort", stop, { once: true });
+          if (signal?.aborted) stop();
+        });
+      }
+    } catch (error) {
+      if (signal?.aborted && owned?.streamId && typeof params.brainId === "string") {
+        await this.cancelInlineGeneration(params.brainId, owned.streamId, String(params.neuralActionId)).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   /**

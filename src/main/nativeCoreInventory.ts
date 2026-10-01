@@ -10,13 +10,15 @@ export interface NativeArchitectureShape {
   liquidMode: "cfc" | "ltc";
 }
 
-export function nativeCoreInventory(shape: NativeArchitectureShape) {
+export function nativeCoreInventory(shape: NativeArchitectureShape, routerStorageLayout?: "block-sparse-v1") {
+  if (routerStorageLayout !== undefined && routerStorageLayout !== "block-sparse-v1") throw new Error("Unsupported native router storage layout.");
+  const sparse = routerStorageLayout === "block-sparse-v1";
   const { dModel: d, layers, feedForward: ff, vsaDimensions: vsa,
     routerNeurons: router, modalityChannels: channels, workspaceLatents: workspace,
     vocabSize: vocab, videoFrames: frames } = shape;
   const side = Math.floor(shape.imageSize / 4), audio = Math.floor(shape.audioSamples / 4);
   const counts = { logicalParameters: 0, projectionParameters: 0, tableParameters: 0,
-    routerSynapseParameters: router * router, packedWeightBytes: 0,
+    routerSynapseParameters: sparse ? 0 : router * router, packedWeightBytes: 0,
     resistanceBytes: 0, packedOwners: 0, maximumProjectionBytes: 0 };
   function matrix(width: number, rows: number, bias = 0, table = false, repeat = 1) {
     const parameters = width * rows + bias;
@@ -64,11 +66,11 @@ export function nativeCoreInventory(shape: NativeArchitectureShape) {
   linear(2 * channels, channels, true, 2);
   convolution(channels, channels, 16, true); convolution(channels, 3, 16, true);
   convolution(3, channels, 16); convolution(channels, channels, 16); linear(channels, d, true); linear(d, 3, true);
-  counts.logicalParameters += router * router;
-  counts.packedWeightBytes += router * Math.ceil(router / 4);
+  counts.logicalParameters += counts.routerSynapseParameters;
+  if (!sparse) counts.packedWeightBytes += router * Math.ceil(router / 4);
   const gainAndRateBytes = 8 * counts.packedOwners;
   // STDP counters plus active-prefix and initial region-end controls.
-  const routerNonweightTensorBytes = 10 * router * router + 16 * router + 32;
+  const routerNonweightTensorBytes = (sparse ? 0 : 10 * router * router) + 16 * router + 32 + (sparse ? 40 : 0);
   const freshRouteControlBytes = 4096 + 24 + 16;
   const liquidStateBytes = 4 * d;
   return { ...counts, gainAndRateBytes, routerNonweightTensorBytes, freshRouteControlBytes,
@@ -139,7 +141,9 @@ export function validateNativeArchitectureDescriptor(value: unknown): NativeArch
       || shape.workspaceLatents !== Math.max(8, Math.floor(shape.workingMemoryItems / 4))) {
     throw new Error("Native architecture dimensions violate the constructor contract.");
   }
-  const exact = nativeCoreInventory(shape);
+  const layout = value.sizing.routerStorageLayout;
+  if (layout !== undefined && layout !== "block-sparse-v1") throw new Error("Unsupported native router storage layout.");
+  const exact = nativeCoreInventory(shape, layout as "block-sparse-v1" | undefined);
   if (Object.keys(inventoryValue).length !== Object.keys(exact).length
       || Object.entries(exact).some(([key, count]) => !Number.isSafeInteger(count) || inventoryValue[key] !== count)) {
     throw new Error("Native architecture exact inventory does not match its shape.");

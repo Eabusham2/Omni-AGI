@@ -27,6 +27,11 @@ export function recoverFailedChatDraft(
   return currentDraft.trim() ? currentDraft : submittedText;
 }
 
+/** A received experience stays received even when its unfinished reply fails. */
+export function receivedChatInputFailureStatus(state: "failed" | "cancelled"): string {
+  return state === "cancelled" ? "Input received and saved · reply stopped." : "Input received and saved · reply did not finish.";
+}
+
 /**
  * Clear only the draft that was actually submitted. A cancellation, voice
  * shutdown, or slow IPC acknowledgement may settle after the person has

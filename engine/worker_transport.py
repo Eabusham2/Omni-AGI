@@ -196,7 +196,7 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
                     continue
                 receipt = RequestAllocationReceipt([raw_lease, decode_lease])
                 if isinstance(request, dict): request = AdmittedRequest(request, receipt)
-                if isinstance(request, dict) and request.get("method") in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action"}:
+                if isinstance(request, dict) and request.get("method") in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status"}:
                     # dispatch_control validates the exact ownership tuple and
                     # cannot execute/load/save a brain or alter chat cancellation.
                     dispatch(request, receipt, control=True)

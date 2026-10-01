@@ -265,6 +265,10 @@ class ChatSteeringState:
     request_id: str = ""
     claimed: bool = False
     observation_inbox: Optional[Any] = None
+    imagination_actions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    approved_imagination: List[str] = field(default_factory=list)
+    generation_open: bool = True
+    imagination_grant: str = "off"
 
 
 @dataclass
@@ -289,6 +293,9 @@ class InlineGeneration:
     execution_device: str = "unknown"
     authoritative_accelerator_isolated: bool = False
     snapshot_state: Optional[Any] = None
+    snapshot_started: bool = False
+    authorized_execution_id: str = ""
+    host_waiting: bool = False
 
 
 @dataclass
@@ -364,6 +371,7 @@ class Worker:
             "chat": self.chat,
             "consolidate_chat_learning": self.consolidate_chat_learning,
             "learn_tool_route_outcome": self.learn_tool_route_outcome,
+            "learn_action_result": self.learn_action_result,
             "chat_receipt": self.chat_receipt,
             "conversation_page": self.conversation_page,
             "train": self.train,
@@ -484,6 +492,8 @@ class Worker:
             "load",
             "chat",
             "consolidate_chat_learning",
+            "learn_action_result",
+            "learn_tool_route_outcome",
             "configure_video_runtime",
             "generate_neural_speech",
             "generate_modality",
@@ -491,6 +501,14 @@ class Worker:
             return False
         self._cooperative_cancel.set()
         return True
+
+    def _request_cancel_check(self, request_id: Optional[str]) -> Callable[[], bool]:
+        identifier = str(request_id or "")
+        def check() -> bool:
+            with self._active_request_lock:
+                active = self._active_request
+                return bool(active is not None and active[1] == identifier and self._cooperative_cancel.is_set())
+        return check
 
     def _acknowledge_inline_cancellation(self, record: InlineGeneration) -> None:
         with self._inline_lock:
@@ -506,10 +524,27 @@ class Worker:
 
     def dispatch_control(self, request: Any) -> Dict[str, Any]:
         if self.worker_role != "neural" or not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or \
-                request.get("method") not in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action"} or \
+                request.get("method") not in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status"} or \
                 not isinstance(request.get("id"), (str, int)) or not isinstance(request.get("params"), dict):
             raise RpcFault(-32600, "invalid flags-only worker control request")
         params = request["params"]
+        if request["method"] == "inline_generation_status":
+            brain_id = self._brain_id(params)
+            action_id = self._valid_inline_action_id(params.get("neuralActionId"))
+            if not action_id: raise RpcFault(-32602, "invalid inline status ownership")
+            with self._inline_lock:
+                record = self._inline_generations.get((brain_id, action_id))
+                if record is None: result = {"exists": False}
+                else:
+                    if record.signature != self._inline_signature(params): raise RpcFault(-32602, "inline status changed the owned artifact request")
+                    record.host_waiting = True
+                    result = {"exists": True, "brainId": brain_id, "neuralActionId": action_id,
+                        "streamId": record.stream_id, "started": record.snapshot_started,
+                        "ready": bool(record.future is not None and record.future.done()), "cancelled": record.cancelled}
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        if request["method"] == "authorize_inline_imagination":
+            result = self._authorize_inline_imagination(params)
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
         if request["method"] == "observe_chat_action":
             brain_id = self._brain_id(params)
             stream_id = params.get("streamId")
@@ -571,11 +606,55 @@ class Worker:
                 raise RpcFault(-32602, "artifact publication has already started; no inline cancellation was admitted")
             record.cancelled = True
             record.first_preview.set()
+            if record.future is None and not record.snapshot_started:
+                record.finished.set()
             if record.future is not None and record.future.cancel():
                 record.finished.set()
         self._acknowledge_inline_cancellation(record)
         return {"jsonrpc": "2.0", "id": request["id"], "result": {
             "requested": True, "acknowledged": record.cancellation_notified}}
+
+    def _authorize_inline_imagination(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        brain_id = self._brain_id(params); stream_id = params.get("streamId")
+        action_id = self._valid_inline_action_id(params.get("neuralActionId"))
+        execution_id, raw = params.get("executionId"), params.get("argumentsJson")
+        if not action_id or not isinstance(stream_id, str) or not isinstance(execution_id, str) or not re.fullmatch(r"[a-f0-9-]{36}", execution_id, re.I) or not isinstance(raw, str):
+            raise RpcFault(-32602, "invalid approved imagination ownership")
+        with self._steering_lock:
+            session = self._chat_steering.get((brain_id, stream_id))
+            if session is None or not session.generation_open or session.requested.is_set() or self._cooperative_cancel.is_set(): return {"accepted": False, "reason": "turn-output-closed"}
+            action = session.imagination_actions.get(action_id)
+            if action is None: raise RpcFault(-32602, "approved imagination was not emitted by this native turn")
+            if session.imagination_grant in {"auto", "full"}: return {"accepted": False, "reason": "already-owned-auto-inline"}
+            if session.imagination_grant != "ask": raise RpcFault(-32602, "this native turn has no Ask imagination capability")
+            brain = self.brains.get(brain_id)
+            if brain is None: raise RpcFault(-32602, "approved imagination has no warm brain owner")
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if digest != params.get("argumentSha256"): raise RpcFault(-32602, "approved imagination argument checksum changed")
+            args = json.loads(raw)
+            if not isinstance(args, dict) or args.get("neuralActionId") != action_id or args.get("chatTurnId") != stream_id or self._inline_signature(args) != self._inline_signature(action["arguments"]):
+                raise RpcFault(-32602, "approved imagination changed its exact native operands")
+            directory = brain.engine_path / "operational-tool-intents"
+            expected = directory / (execution_id + ".json")
+            if Path(str(params.get("intentPath", ""))).absolute() != expected.absolute() or brain.engine_path.is_symlink() or directory.is_symlink() or expected.is_symlink() or not expected.is_file():
+                raise RpcFault(-32602, "approved imagination has no exact owned authorization intent")
+            with brain.resource_policy.reserve_ram(expected.stat().st_size * 12, "approved inline authorization receipt"):
+                receipt = read_json(expected)
+            if receipt.get("format") != "omni-authorized-tool-intent" or receipt.get("formatVersion") != 1 or receipt.get("state") != "authorized-before-side-effects" or \
+                    receipt.get("id") != execution_id or receipt.get("brainId") != brain_id or receipt.get("requestId") != params.get("requestId") or \
+                    receipt.get("toolId") != "modality.imagine" or receipt.get("action") != "generate" or \
+                    receipt.get("argumentSha256") != digest or receipt.get("chatTurnId") != stream_id or receipt.get("neuralActionId") != action_id or \
+                    receipt.get("permission") not in {"ask", "auto", "full"}:
+                raise RpcFault(-32602, "approved imagination authorization intent does not match")
+            with self._inline_lock:
+                record = self._inline_generations.get((brain_id, action_id))
+                if record is None: raise RpcFault(-32602, "approved imagination reservation is unavailable")
+                if record.cancelled: raise RpcFault(-32800, "this exact artifact was cancelled")
+                if record.authorized_execution_id and record.authorized_execution_id != execution_id:
+                    raise RpcFault(-32602, "this artifact already has another execution owner")
+                record.authorized_execution_id = execution_id
+                if not record.snapshot_started and action_id not in session.approved_imagination: session.approved_imagination.append(action_id)
+            return {"accepted": True, "started": record.snapshot_started, "brainId": brain_id, "streamId": stream_id, "neuralActionId": action_id}
 
     def reserve_chat_steering(self, request: Dict[str, Any]) -> None:
         if self.worker_role != "neural" or request.get("method") != "chat":
@@ -715,6 +794,10 @@ class Worker:
             for key, record in list(self._inline_generations.items()):
                 if record.created_at > cutoff:
                     continue
+                # A live selected-region job has no arbitrary wall-time
+                # expiry. Age only retires an unused, settled cache record.
+                if record.authorized_execution_id or record.host_waiting or record.snapshot_started and not record.finished.is_set():
+                    continue
                 record.cancelled = True
                 if record.future is not None:
                     record.future.cancel()
@@ -787,7 +870,7 @@ class Worker:
         key = (brain.brain_id, action_id)
         with self._inline_lock:
             existing = self._inline_generations.get(key)
-            if existing is not None:
+            if existing is not None and (existing.snapshot_started or existing.cancelled):
                 return existing
 
         # Capture the idea and a private copy of the modality parameters on the
@@ -801,7 +884,7 @@ class Worker:
             brain.engine_path / ".inline-imagination" / action_id
         ).resolve()
         staging_parent = (brain.engine_path / ".inline-imagination").resolve()
-        record = InlineGeneration(brain_id=brain.brain_id, action_id=action_id,
+        record = existing or InlineGeneration(brain_id=brain.brain_id, action_id=action_id,
                                   stream_id=stream_id, signature=signature,
                                   staging_root=staging_root, events=DeferredEventLog())
         gateway = getattr(self, "_codec_gateway", None)
@@ -809,6 +892,7 @@ class Worker:
         codec_owner = CodecOwner(parent_owner.request_id, brain.brain_id, "", stream_id, action_id) if parent_owner else None
         with self._inline_lock:
             self._inline_generations[key] = record
+            record.snapshot_started = True
         def finish() -> None:
             record.finished.set()
             self._acknowledge_inline_cancellation(record)
@@ -1004,7 +1088,7 @@ class Worker:
         with record.preview_emit_lock:
             with self._inline_lock:
                 if record.signature != signature:
-                    return None
+                    raise RpcFault(-32602, "owned inline artifact operands changed; it must not be regenerated")
                 if record.cancelled:
                     raise RpcFault(-32800, "this inline artifact was cancelled; it must not be regenerated")
                 record.job_id = job_id
@@ -1022,7 +1106,9 @@ class Worker:
                     data={"preview": latest_preview},
                 )
         if future is None:
-            return None
+            raise RpcFault(-32602, "owned Ask artifact has not reached its authorized snapshot boundary")
+        if not future.done():
+            raise RpcFault(-32020, "owned inline artifact is still an independent job; neural dispatch never waits for its decoder", {"artifactPending": True})
 
         try:
             try:
@@ -2416,14 +2502,31 @@ class Worker:
                     for receipt in receipts
                 )
             )
-            if not turn_committed and isinstance(prior_ledger_head, Mapping):
+            accepted = committed.get("accepted_chat_inputs", [])
+            accepted_receipt = next((receipt for receipt in accepted if isinstance(receipt, Mapping)
+                and receipt.get("turnId") == turn_id and receipt.get("inputSha256") == input_sha256), None) if isinstance(accepted, list) else None
+            rollback_head = None
+            if accepted_receipt is not None:
+                rollback_head = committed.get("conversation")
+                if not isinstance(rollback_head, Mapping): return False
+                ledger = NeuralConversationLedger(storage / "engine" / "conversation.sqlite3", brain_id)
+                try:
+                    human = ledger.payload_by_id("message", str(accepted_receipt.get("humanMessageId", "")))
+                    if (not isinstance(human, Mapping) or human.get("role") != "human"
+                        or human.get("input_accepted_before_reply") is not True or human.get("turn_id") != turn_id
+                        or not isinstance(human.get("content"), str)
+                        or hashlib.sha256(human["content"].encode("utf-8")).hexdigest() != input_sha256): return False
+                finally: ledger.close()
+            elif not turn_committed and isinstance(prior_ledger_head, Mapping):
+                rollback_head = prior_ledger_head
+            if rollback_head is not None:
                 ledger = NeuralConversationLedger(
                     storage / "engine" / "conversation.sqlite3", brain_id
                 )
                 try:
                     ledger.truncate_after_head(
-                        int(prior_ledger_head["headSequence"]),
-                        str(prior_ledger_head["headSha256"]),
+                        int(rollback_head["headSequence"]),
+                        str(rollback_head["headSha256"]),
                     )
                 finally:
                     ledger.close()
@@ -2463,6 +2566,11 @@ class Worker:
             with self._steering_lock:
                 if session.observation_inbox is not None: session.observation_inbox.close()
                 self._chat_steering.pop(key, None)
+                for action_id in session.imagination_actions:
+                    with self._inline_lock:
+                        record = self._inline_generations.get((brain_id, action_id))
+                        if record is not None and not record.snapshot_started and not record.cancelled:
+                            self._inline_generations.pop((brain_id, action_id), None)
 
     def _chat(self, params: Dict[str, Any], request_id: Optional[str],
               steer_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
@@ -2522,6 +2630,9 @@ class Worker:
             ),
             "off",
         )
+        with self._steering_lock:
+            session = self._chat_steering.get((brain.brain_id, turn_id))
+            if session is not None: session.imagination_grant = imagination_grant
 
         def stream(kind: str, payload: Dict[str, Any]) -> None:
             nonlocal sequence
@@ -2540,10 +2651,27 @@ class Worker:
                         sequence=sequence,
                         data={"delta": str(payload.get("delta", ""))},
                     )
+                elif kind == "input-accepted":
+                    if (payload.get("turnId") != turn_id or payload.get("inputSha256") != input_sha256
+                        or payload.get("committed") is not True or not isinstance(payload.get("humanMessageId"), str)
+                        or not isinstance(payload.get("afterimageId"), str)):
+                        raise RuntimeError("neural input admission has a different human/turn owner")
+                    self.notify("chat-input-accepted", brain_id=brain.brain_id, stream_id=stream_id,
+                        sequence=sequence, data=dict(payload))
                 elif kind == "action":
                     raw_action = payload.get("action")
                     action = raw_action if isinstance(raw_action, dict) else None
                     action_id = str(payload.get("actionId", ""))
+                    if action is not None and action.get("kind") == "imagine":
+                        with self._steering_lock:
+                            session = self._chat_steering.get((brain.brain_id, turn_id))
+                            if session is not None: session.imagination_actions[action_id] = copy.deepcopy(action)
+                        with self._inline_lock:
+                            key = (brain.brain_id, action_id)
+                            if imagination_grant == "ask" and key not in self._inline_generations:
+                                self._inline_generations[key] = InlineGeneration(brain_id=brain.brain_id, action_id=action_id,
+                                    stream_id=turn_id, signature=self._inline_signature(action["arguments"]),
+                                    staging_root=(brain.engine_path / ".inline-imagination" / action_id).resolve(), events=DeferredEventLog())
                     if action is not None: observation_inbox.register(action_id, action)
                     self.notify(
                         "chat-action",
@@ -2569,6 +2697,9 @@ class Worker:
                         data={"preview": preview_value},
                     )
                 elif kind == "phase":
+                    with self._steering_lock:
+                        session = self._chat_steering.get((brain.brain_id, turn_id))
+                        if session is not None: session.generation_open = False
                     observation_inbox.close()
                     if payload != {
                         "phase": "reply-complete-learning",
@@ -2621,6 +2752,24 @@ class Worker:
                 if record is not None and record not in inline_records:
                     inline_records.append(record)
 
+        def chat_control_tick() -> None:
+            with self._steering_lock:
+                session = self._chat_steering.get((brain.brain_id, turn_id))
+                pending = list(session.approved_imagination) if session is not None else []
+                if session is not None: session.approved_imagination.clear()
+            for identifier in pending:
+                action = session.imagination_actions[identifier]
+                if self._cooperative_cancel.is_set() or session.requested.is_set():
+                    with self._inline_lock:
+                        record = self._inline_generations.get((brain.brain_id, identifier))
+                        if record is not None:
+                            record.cancelled = True; record.finished.set(); self._acknowledge_inline_cancellation(record)
+                    continue
+                record = self._start_inline_generation(brain, identifier, turn_id, action,
+                    lambda current, preview: stream("preview", {"actionId": current.action_id, "jobId": current.job_id, "preview": preview}),
+                    lambda current: stream("inline-started", {"actionId": current.action_id}))
+                if record is not None and record not in inline_records: inline_records.append(record)
+
         try:
             result = brain.chat(
                 value,
@@ -2642,6 +2791,7 @@ class Worker:
                 steer_check=steer_check,
                 temporary_steering_context=params.get("temporarySteeringContext"),
                 tool_observation_provider=observation_inbox,
+                chat_control_callback=chat_control_tick,
             )
         except ChatGenerationCancelled as error:
             # The model raises this only at a pre-commit boundary. Preserve
@@ -2677,14 +2827,9 @@ class Worker:
             if result.get("text") != "" or result.get("turnCommitted") is not True:
                 raise RuntimeError("no-reply must be an exact committed zero-text completion")
 
-        # A streamed Auto/Full imagination action normally publishes at least one
-        # real decoder preview before the chat RPC resolves. Longer generation
-        # continues concurrently and becomes the same typed tool job/artifact.
-        for record in ([] if result.get("steered") is True or result.get("nativeStopped") is True else inline_records):
-            while not record.first_preview.wait(timeout=0.05):
-                future = record.future
-                if future is None or future.done():
-                    break
+        # The owned text/fast-state receipt is already committed. Artifact
+        # preview/codec work has an independent lifetime and must not hold the
+        # neural RPC/write boundary after that receipt is ready.
         self.notify(
             "brain-mutated",
             brain_id=brain.brain_id,
@@ -2745,6 +2890,21 @@ class Worker:
         )
         return result
 
+    def learn_action_result(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        brain = self._get(params)
+        for key in ("evidenceId", "evidenceSha256"):
+            if not isinstance(params.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", params[key]):
+                raise RpcFault(-32602, "completed action evidence hash is invalid")
+        if not isinstance(params.get("executionId"), str) or not re.fullmatch(r"[a-f0-9-]{36}", params["executionId"], re.I):
+            raise RpcFault(-32602, "completed action execution identity is invalid")
+        def progress(value: Dict[str, Any]) -> None:
+            if self._cooperative_cancel.is_set():
+                raise ChatGenerationCancelled("independent evidence learning paused at a committed boundary")
+            self.notify("action-result-learning-progress", brain_id=brain.brain_id, job_id=params["evidenceId"], data=value)
+        return brain.learn_action_result(evidence_id=params["evidenceId"], execution_id=params["executionId"],
+            evidence_path=params.get("evidencePath"), evidence_sha256=params["evidenceSha256"],
+            provenance=params.get("provenance"), progress=progress)
+
     def learn_tool_route_outcome(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
@@ -2755,7 +2915,6 @@ class Worker:
         never used as a route target. The brain owns event-id idempotency.
         """
 
-        del request_id
         brain = self._get(params)
         try:
             result = brain.learn_tool_route_experience(
@@ -2770,6 +2929,7 @@ class Worker:
                     if isinstance(params.get("arguments"), dict)
                     else None
                 ),
+                cancel_check=self._request_cancel_check(request_id),
             )
             if bool(result.get("applied")):
                 brain.save()
@@ -3667,6 +3827,8 @@ class Worker:
         brain, job_id, progress = self._job(
             params, request_id, "modality-generation"
         )
+        if params.get("inlineClaimRequired") is True and (brain.brain_id, self._valid_inline_action_id(params.get("neuralActionId"))) not in self._inline_generations:
+            raise RpcFault(-32602, "owned inline artifact is unavailable; it must not be regenerated")
         try:
             inline_result = self._claim_inline_generation(brain, params, job_id)
         except NeuralStateResourcePause as error:
@@ -3894,6 +4056,7 @@ class Worker:
                 provenance=provenance,
                 architecture_change=architecture,
                 geometry_holdouts=geometry_holdouts,
+                recursive_parent_candidate_id=params.get("recursiveParentCandidateId"),
                 progress=progress,
             )
         except ValueError as error:
@@ -4213,6 +4376,8 @@ class Worker:
             "load",
             "chat",
             "consolidate_chat_learning",
+            "learn_action_result",
+            "learn_tool_route_outcome",
             "configure_video_runtime",
             "generate_neural_speech",
             "generate_modality",
@@ -4226,7 +4391,7 @@ class Worker:
             # Serialized neural dispatch is a quiescent migration boundary.
             # State/inspection/export requests do not move execution devices.
             if self.worker_role == "neural" and method in {
-                "chat", "consolidate_chat_learning", "learn_tool_route_outcome",
+                "chat", "consolidate_chat_learning", "learn_tool_route_outcome", "learn_action_result",
                 "train", "ingest", "generate_modality", "generate_neural_speech", "idle_cycle", "feedback",
                 "observe_packet", "evolution.evaluate", "evolution_evaluate",
             }:
@@ -4235,7 +4400,11 @@ class Worker:
                 if callable(prepare):
                     prepare(operation=method, quiescent=True)
             gateway = getattr(self, "_codec_gateway", None)
-            with gateway.scope(owner, lambda: self._cooperative_cancel.is_set() or bool(owner.job_id and owner.job_id in self.cancelled_jobs)) if gateway else nullcontext():
+            loaded = getattr(self, "brains", {}).get(str(params.get("brainId", "")))
+            policy = getattr(loaded, "resource_policy", None)
+            active = getattr(policy, "active_operation", None)
+            with (active(method) if callable(active) else nullcontext()), \
+                    (gateway.scope(owner, lambda: self._cooperative_cancel.is_set() or bool(owner.job_id and owner.job_id in self.cancelled_jobs)) if gateway else nullcontext()):
                 result = handler(params, correlated_id or None)
         except CodecRuntimeCancelled as error:
             raise RpcFault(-32800, str(error), {"codecRuntimeCancelled": True, "safeBoundary": True}) from error

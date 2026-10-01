@@ -119,7 +119,8 @@ describe("ground-up OmniCortex architecture accounting", () => {
       workingMemoryItems: nativePlan.selectedItems
     });
     expect(nativePlan.nativeArchitecture?.shape.dModel).toBeGreaterThan(64);
-    const exact = nativeCoreInventory(nativePlan.nativeArchitecture!.shape);
+    const exact = nativeCoreInventory(nativePlan.nativeArchitecture!.shape,
+      nativePlan.nativeArchitecture!.sizing.routerStorageLayout as "block-sparse-v1" | undefined);
     expect(nativePlan.architecture!.exactLogicalParameterCount).toBe(exact.logicalParameters);
     expect(nativePlan.resources).toMatchObject({
       modelBytes: nativePlan.architecture!.checkpointTensorBytes,

@@ -11,14 +11,17 @@ import json
 from typing import Any, Mapping
 
 
-def native_core_inventory(shape: Mapping[str, Any]) -> dict[str, int]:
+def native_core_inventory(shape: Mapping[str, Any], router_storage_layout=None) -> dict[str, int]:
+    if router_storage_layout not in {None, "block-sparse-v1"}:
+        raise ValueError("unsupported native router storage layout")
+    sparse = router_storage_layout == "block-sparse-v1"
     d, layers, ff = (int(shape[key]) for key in ("dModel", "layers", "feedForward"))
     vsa, router, channels = (int(shape[key]) for key in ("vsaDimensions", "routerNeurons", "modalityChannels"))
     workspace = int(shape["workspaceLatents"])
     side, audio, frames = int(shape["imageSize"]) // 4, int(shape["audioSamples"]) // 4, int(shape["videoFrames"])
     vocab = int(shape.get("vocabSize", 261))
     counts = {"logicalParameters": 0, "projectionParameters": 0, "tableParameters": 0,
-              "routerSynapseParameters": router * router, "packedWeightBytes": 0,
+              "routerSynapseParameters": 0 if sparse else router * router, "packedWeightBytes": 0,
               "resistanceBytes": 0, "packedOwners": 0, "maximumProjectionBytes": 0}
 
     def matrix(width, rows, bias=0, *, table=False, repeat=1):
@@ -123,11 +126,12 @@ def native_core_inventory(shape: Mapping[str, Any]) -> dict[str, int]:
     convolution(channels, channels, 16)
     linear(channels, d, True)
     linear(d, 3, True)
-    counts["logicalParameters"] += router * router
-    counts["packedWeightBytes"] += router * ((router + 3) // 4)
+    counts["logicalParameters"] += counts["routerSynapseParameters"]
+    if not sparse:
+        counts["packedWeightBytes"] += router * ((router + 3) // 4)
     counts["gainAndRateBytes"] = 8 * counts["packedOwners"]
     # STDP scalar counters (16), active-prefix scalar (8), first region end (8).
-    counts["routerNonweightTensorBytes"] = 10 * router * router + 16 * router + 32
+    counts["routerNonweightTensorBytes"] = (0 if sparse else 10 * router * router) + 16 * router + 32 + (40 if sparse else 0)
     counts["freshRouteControlBytes"] = 4096 + 24 + 16
     counts["liquidStateBytes"] = 4 * d
     counts["staticNonweightTensorBytes"] = (counts["resistanceBytes"] + counts["gainAndRateBytes"]
@@ -167,7 +171,8 @@ def validate_native_architecture(descriptor: Mapping[str, Any]) -> dict[str, Any
         or shape.get("liquidMode") not in {"cfc", "ltc"}
         or shape["workspaceLatents"] != max(8, shape["workingMemoryItems"] // 4)):
         raise ValueError("native architecture shape violates the constructor contract")
-    actual = native_core_inventory(shape)
+    sizing_value = descriptor.get("sizing")
+    actual = native_core_inventory(shape, sizing_value.get("routerStorageLayout") if isinstance(sizing_value, Mapping) else None)
     if dict(inventory) != actual or any(value > (1 << 53) - 1 for value in actual.values()):
         raise ValueError("native architecture exact inventory does not match its shape")
     if descriptor.get("sha256") != native_architecture_sha256(descriptor):

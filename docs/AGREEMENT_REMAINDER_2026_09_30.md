@@ -1,5 +1,14 @@
 # Current agreement audit and remaining implementation
 
+**Implementation follow-up:** the user requested fixes after this report.
+The [implementation closeout](AGREEMENT_IMPLEMENTATION_2026_09_30.md) records
+the resulting mechanisms and verification. R1–R12 are checked off there at
+source level. The sections below are the historical
+findings, not the current unfinished checklist. The later actual RAM answer
+selects allocation reservations, monitoring, reclaim/spill and pause. Own
+observed speech/Ponder and the originally planned audio-code generator are
+implemented under the request to complete the all-experience design.
+
 ## Result and scope
 
 The chronological agreement audit has been performed, but **the code does not

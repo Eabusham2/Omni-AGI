@@ -1,6 +1,8 @@
 """Injected process tables/resource/control fixtures; never an OS/device probe."""
 
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -11,10 +13,11 @@ if str(ENGINE) not in sys.path:
 
 from omni_core.managed_process_memory import (
     ManagedMemorySample, ManagedProcessMemorySampler, ProcessRow, ProcessTable,
-    managed_family_sample, parse_posix_process_table,
+    managed_family_sample, native_family_memory_containment, parse_posix_process_table,
 )
-from omni_core.offload import GIB, MIB, ResourcePolicy, ResourceReading
+from omni_core.offload import GIB, MIB, NeuralStateResourcePause, ResourcePolicy, ResourceReading
 from omni_core.native_core_paging import shared_native_residency_budget
+from omni_core.shared_resource_ledger import SharedResourceLedger
 from omni_core.working_attention_paging import WorkingAttentionPager
 
 
@@ -59,12 +62,73 @@ class ManagedRamCeilingFixtures(unittest.TestCase):
         self.assertTrue(cached.cached)
         self.assertEqual(cached.sample_age_seconds, 0.5)
         provider.assert_called_once()
-        clock[0] = 1.1; provider.side_effect = OSError("fixture inaccessible")
+        forced = sampler.sample(force=True)
+        self.assertFalse(forced.cached)
+        self.assertEqual(provider.call_count, 2)
+        clock[0] = 1.6; provider.side_effect = OSError("fixture inaccessible")
         failure = sampler.sample()
         self.assertFalse(failure.verified)
         self.assertIsNone(failure.rss_bytes)
         for invalid in ("", "0", "-1", "x", "9" * 5000):
             self.assertFalse(ManagedProcessMemorySampler(worker_pid=11, owner_pid=invalid, provider=provider).sample().verified)
+
+    def test_existing_native_cgroup_bound_is_credited_only_for_every_sampled_member(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc, groups = root / "proc", root / "cgroup"
+            for pid in (10, 11, 12):
+                path = proc / str(pid)
+                path.mkdir(parents=True)
+                (path / "cgroup").write_text("0::/omni\n", encoding="ascii")
+            (groups / "omni").mkdir(parents=True)
+            (groups / "omni" / "memory.max").write_text("1024", encoding="ascii")
+            args = dict(root_pid=10, worker_pid=11, member_pids=(10, 11, 12),
+                platform_name="linux", proc_root=proc, cgroup_root=groups)
+            capped = native_family_memory_containment(2048, **args)
+            self.assertTrue(capped["selectedCeilingNativeBounded"])
+            self.assertFalse(capped["hardRssIsolation"])
+            self.assertFalse(native_family_memory_containment(512, **args)["selectedCeilingNativeBounded"])
+            (proc / "12" / "cgroup").write_text("0::/other\n", encoding="ascii")
+            self.assertFalse(native_family_memory_containment(2048, **args)["existingNativeBound"])
+
+    def test_fresh_reservation_and_active_watchdog_pause_then_recover(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            ledger = SharedResourceLedger(root / "quota.sqlite3")
+            resident = [GIB]
+            def current():
+                return reading(managed_process_memory_bytes=resident[0], managed_worker_rss_bytes=256 * MIB,
+                    managed_memory_verified=True, managed_memory_root_pid=10,
+                    managed_memory_sample_started_ns=time.time_ns())
+            policy = ResourcePolicy(root, reading_provider=current, system_ram_share_percent=50,
+                shared_resource_owner_id="fixture", shared_storage_pool_bytes=10 * GIB, shared_ledger=ledger)
+            with patch.object(policy, "readings", wraps=policy.readings) as observed:
+                with policy.reserve_ram(MIB, "fixture allocation"):
+                    pass
+            self.assertTrue(observed.call_args.kwargs["fresh_memory_sample"])
+            with policy.active_operation("fixture compute", interval_seconds=0.05):
+                self.assertFalse(policy.check_active_pressure("fixture compute")["memoryPressure"])
+                resident[0] = 9 * GIB
+                for _ in range(50):
+                    with policy._active_ram_lock:
+                        seen_pressure = bool(policy._active_ram_status and policy._active_ram_status["memoryPressure"])
+                    if seen_pressure: break
+                    time.sleep(0.01)
+                self.assertTrue(seen_pressure)
+                recovered = policy.check_active_pressure("fixture compute", reclaim=lambda: resident.__setitem__(0, GIB))
+                self.assertFalse(recovered["memoryPressure"])
+                resident[0] = 9 * GIB
+                for _ in range(50):
+                    with policy._active_ram_lock:
+                        seen_pressure = bool(policy._active_ram_status and policy._active_ram_status["memoryPressure"])
+                    if seen_pressure: break
+                    time.sleep(0.01)
+                self.assertTrue(seen_pressure)
+                with self.assertRaises(NeuralStateResourcePause) as error:
+                    policy.check_active_pressure("fixture compute")
+                self.assertTrue(error.exception.status["recoverable"])
+                self.assertTrue(error.exception.status["activeWatchdog"])
+            self.assertEqual(policy._active_ram_watchers, 0)
 
     def test_manual_and_auto_caps_do_not_raise_for_a_larger_allocation(self):
         for share in (0, 50):

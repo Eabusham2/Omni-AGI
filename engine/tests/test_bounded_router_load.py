@@ -34,6 +34,8 @@ class RouterStateFixture(torch.nn.Module):
         self.synapses = torch.nn.Module()
         self.synapses.pre_neurons = self.synapses.post_neurons = neurons
         self.synapses._validate_packed = STDPSynapses._validate_packed.__get__(self.synapses)
+        self.synapses._tile_budget = STDPSynapses._tile_budget.__get__(self.synapses)
+        self.synapses._ram = STDPSynapses._ram.__get__(self.synapses)
         self.synapses.register_buffer("_packed_weights", torch.full((neurons, (neurons + 3) // 4), 0x55, dtype=torch.uint8))
         self.synapses.register_buffer("eligibility_accumulator", torch.zeros(neurons, neurons, dtype=torch.int16))
         self.synapses.register_buffer("stability", torch.zeros(neurons, neurons))

@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import torch
@@ -82,6 +83,13 @@ def load_tensors(path: Path, device: str = "cpu") -> Dict[str, torch.Tensor]:
     return load_file(str(path), device=device)
 
 
+@dataclass(frozen=True)
+class BoundedChecksumSource:
+    shape: tuple
+    dtype: torch.dtype
+    chunks: Any
+
+
 def tensor_checksum(tensors: Iterable[torch.Tensor], *, chunk_bytes: int = 4 * 1024 * 1024, reserve=None, on_chunk=None) -> str:
     if int(chunk_bytes) < 1:
         raise ValueError("checksum chunk size must be positive")
@@ -105,6 +113,25 @@ def tensor_checksum(tensors: Iterable[torch.Tensor], *, chunk_bytes: int = 4 * 1
                     yield from blocks(row, elements)
     digest = hashlib.sha256()
     for tensor in tensors:
+        if isinstance(tensor, BoundedChecksumSource):
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            count = 0
+            for part in tensor.chunks():
+                if part.dtype != tensor.dtype:
+                    raise ValueError("bounded checksum source dtype changed")
+                if reserve is not None:
+                    reserve(part.numel() * part.element_size() * 3 + 4096)
+                count += part.numel()
+                if count > math.prod(tensor.shape):
+                    raise ValueError("bounded checksum source exceeded its shape")
+                block = part.detach().cpu().contiguous().reshape(-1)
+                digest.update(memoryview(block.view(torch.uint8).numpy()))
+                if on_chunk is not None:
+                    on_chunk(block.numel() * block.element_size())
+            if count != math.prod(tensor.shape):
+                raise ValueError("bounded checksum source has incomplete coverage")
+            continue
         value = tensor.detach()
         digest.update(str(tuple(value.shape)).encode("ascii"))
         digest.update(str(value.dtype).encode("ascii"))
@@ -385,10 +412,12 @@ def snapshot_required_bytes(
     conversation = source / "conversation.sqlite3"
     if conversation.is_file() and not conversation.is_symlink():
         total += conversation.stat().st_size
+    from .registered_geometry_holdouts import registered_geometry_snapshot_files
+    total += sum(path.stat().st_size for path in registered_geometry_snapshot_files(source).values())
     return max(0, int(total))
 
 
-def snapshot_files(source: Path, destination: Path) -> None:
+def snapshot_files(source: Path, destination: Path, *, resource_policy=None) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     for filename in ("brain.json", "core.safetensors", "plasticity.safetensors"):
         source_file = source / filename
@@ -401,6 +430,18 @@ def snapshot_files(source: Path, destination: Path) -> None:
     from .offload import copy_mutable_state_snapshot
 
     copy_mutable_state_snapshot(source, destination)
+    from .registered_geometry_holdouts import registered_geometry_snapshot_files
+    for relative, path in registered_geometry_snapshot_files(source).items():
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if resource_policy is None:
+            shutil.copy2(path, target)
+        else:
+            with resource_policy.reserve_spill(((path.stat().st_size + 65535) // 65536) * 65536,
+                "protected geometry snapshot data") as lease:
+                lease.bind_path(target)
+                shutil.copy2(path, target)
+                lease.commit(path=target)
     # Structural argument views referenced by saved action/trace records are
     # operational state, not learned vectors or text context. Preserve their
     # checked immutable bytes so snapshot history never gains broken refs.

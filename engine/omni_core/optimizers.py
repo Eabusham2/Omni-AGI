@@ -69,13 +69,14 @@ class PackedMutationSnapshot:
     not assumed by the current retry contract.
     """
 
-    def __init__(self, entries: list[tuple[nn.Module, list[tuple[str, torch.Tensor]], int]], byte_count: int, *, disk_snapshot=None, disk_ram_reserve=None, disk_io_ram_bytes=0):
+    def __init__(self, entries: list[tuple[nn.Module, list[tuple[str, torch.Tensor]], int]], byte_count: int, *, disk_snapshot=None, disk_ram_reserve=None, disk_io_ram_bytes=0, topology_boundaries=()):
         self._entries = entries
         self.byte_count = byte_count
         self._disk_snapshot = disk_snapshot
         self._disk_ram_reserve = disk_ram_reserve
         self._disk_io_ram_bytes = int(disk_io_ram_bytes)
         self._diagnostic_scopes = active_diagnostic_scopes()
+        self._topology_boundaries = tuple(topology_boundaries)
         self.storage_mode = "private-disk-packed-snapshot" if disk_snapshot is not None else "reserved-cpu-packed-bytes"
         active = _BATCH_SNAPSHOTS.get()
         if active is not None:
@@ -96,6 +97,7 @@ class PackedMutationSnapshot:
         for pager in pagers:
             pager.flush()
         owners: list[tuple[nn.Module, tuple[tuple[str, torch.Tensor], ...]]] = []
+        topology_boundaries = []
         seen: set[int] = set()
         byte_count = 131072 # conservative metadata, RNG/control and transfer headroom
         for root in roots:
@@ -107,6 +109,15 @@ class PackedMutationSnapshot:
                 if not callable(packed_tensors):
                     continue
                 tensors = list(packed_tensors())
+                if not tensors and getattr(module, "packed_synapse_container", False):
+                    # Dynamic sparse recurrence exposes its actual registered
+                    # child owners, never aliases those buffers at the parent.
+                    boundary = getattr(module, "capture_packed_topology_boundary", None)
+                    if not callable(boundary):
+                        raise ValueError("sparse packed container has no explicit topology rollback boundary")
+                    topology_boundaries.append(boundary())
+                    byte_count += 1024
+                    continue
                 for name in ("_row_stability", "_bias_row_stability"):
                     buffer = getattr(module, name, None)
                     if isinstance(buffer, torch.Tensor):
@@ -136,7 +147,7 @@ class PackedMutationSnapshot:
                     roots, directory=disk_directory, reserve_disk=disk_reserve,
                 )
                 return cls([], disk_snapshot.byte_count, disk_snapshot=disk_snapshot,
-                    disk_ram_reserve=reserve, disk_io_ram_bytes=io_ram_bytes)
+                    disk_ram_reserve=reserve, disk_io_ram_bytes=io_ram_bytes, topology_boundaries=topology_boundaries)
         entries = []
         with torch.no_grad():
             for module, tensors in owners:
@@ -148,10 +159,13 @@ class PackedMutationSnapshot:
                     ],
                     int(getattr(module, "_pending_stability_events", 0)),
                 ))
-        return cls(entries, byte_count)
+        return cls(entries, byte_count, topology_boundaries=topology_boundaries)
 
     def restore(self) -> None:
         """Restore exactly the pre-batch packed state; safe for repeated retries."""
+
+        for state, generation in self._topology_boundaries:
+            state.restore_topology_boundary(generation)
 
         if self._disk_snapshot is not None:
             if self._disk_ram_reserve is not None:
@@ -183,6 +197,7 @@ class PackedMutationSnapshot:
             self._disk_snapshot = None
         self._entries.clear()
         self._disk_ram_reserve = None
+        self._topology_boundaries = ()
 
 
 def adamw_for_remaining_parameters(

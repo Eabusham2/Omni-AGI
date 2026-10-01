@@ -27,7 +27,8 @@ def generation_completion(token_ids, decode, stopped_by_steer=False, private_ste
 def mark_interrupted_turn(human, assistant, receipt, disposition="steered"):
     if disposition not in {"steered", "native-stop"}:
         raise ValueError("invalid generation disposition")
-    human["generation_end"] = disposition
+    if not human.get("input_accepted_before_reply"):
+        human["generation_end"] = disposition
     assistant["generation_end"] = disposition
     receipt["generationEnd"] = disposition
 
@@ -36,7 +37,8 @@ def mark_no_reply_turn(human, assistant, receipt):
     """Bind a zero-text, completed turn without pretending an interruption."""
     if assistant.get("content") != "":
         raise ValueError("no-reply completion must have zero assistant text")
-    human["generation_end"] = "no-reply"
+    if not human.get("input_accepted_before_reply"):
+        human["generation_end"] = "no-reply"
     assistant["generation_end"] = "no-reply"
     receipt["generationEnd"] = "no-reply"
 
@@ -44,7 +46,8 @@ def mark_no_reply_turn(human, assistant, receipt):
 def validate_no_reply_turn(human, assistant, trace, receipt):
     """Require exact saved evidence; an empty row alone is not a completion."""
     markers = (
-        human.get("generation_end"), assistant.get("generation_end"),
+        (assistant.get("generation_end") if human.get("input_accepted_before_reply") is True
+         and trace.get("input_accepted_before_reply") is True else human.get("generation_end")), assistant.get("generation_end"),
         receipt.get("generationEnd"), trace.get("generation_stop_reason"),
     )
     if "no-reply" not in markers:

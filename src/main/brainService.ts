@@ -5,6 +5,9 @@ import { normalizeConceptIdView } from "../shared/conceptIdView";
 import { chatInputCapacity, cleanChatInput } from "../shared/chatInput";
 import type { TemporarySteeringContext } from "./temporarySteeringContext";
 import { createChatToolObservation, type ChatToolObservationReceipt } from "./chatToolObservation";
+import { CompletedActionEvidenceStore, actionEvidenceFileHash, validateActionEvidenceReceipt,
+  type CompletedActionEvidenceJob, type CompletedActionEvidenceReceipt } from "./completedActionEvidence";
+import { receivedChatInput, receivedChatInputFromLedger } from "./chatInputReceipt";
 import {
   lstat,
   mkdir,
@@ -241,12 +244,23 @@ if (evolutionInput) {
   properties.architectureChange = {
     type: "object", required: ["mutation"], additionalProperties: false,
     properties: {
-      mutation: { type: "string", enum: ["grow-experts", "grow-depth", "grow-router", "grow-regions"] },
+      mutation: { type: "string", enum: ["grow-experts", "grow-depth", "grow-router", "grow-regions", "resize-width", "repartition-heads"] },
       addExperts: { type: "integer", minimum: 1 }, addLayers: { type: "integer", minimum: 1 },
       addNeurons: { type: "integer", minimum: 1 }, addRegions: { type: "integer", minimum: 1 },
-      neuronsPerRegion: { type: "integer", minimum: 1 }
+      neuronsPerRegion: { type: "integer", minimum: 1 },
+      dModel: { type: "integer", minimum: 1 }, feedForward: { type: "integer", minimum: 1 }, nHeads: { type: "integer", minimum: 1 }
     }
   };
+  const countedHoldout = { type: "object", additionalProperties: false,
+    properties: { path: { type: "string" }, records: { type: "integer", minimum: 1 } }, required: ["path", "records"] };
+  properties.geometryHoldouts = { type: "object", additionalProperties: false, required: ["token", "modality", "tool"],
+    properties: {
+      token: { type: "array", minItems: 1, items: countedHoldout },
+      tool: { type: "array", minItems: 1, items: countedHoldout },
+      modality: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
+        required: ["path", "kind", "conditionText"], properties: { path: { type: "string" },
+          kind: { type: "string", enum: ["image", "audio", "video"] }, conditionText: { type: "string", minLength: 1 } } } }
+    } };
 }
 
 const LEGACY_SYSTEM_TOOL_ALIASES: Readonly<Record<string, string>> = {
@@ -384,6 +398,7 @@ interface WorkerChatResult {
     generation_no_reply_reason?: string | null;
     generated_token_count?: number;
     generation_printable_text_characters?: number;
+    input_accepted_before_reply?: boolean;
     slow_learning_job?: {
       jobId?: string;
       priority?: number;
@@ -451,6 +466,7 @@ interface ValidatedWorkerChatPresentation {
 }
 
 export type NeuralChatStreamEvent =
+  | { type: "chat-input-accepted"; sequence: number; inputReceipt: import("../shared/types").ChatInputAcceptedReceipt; humanMessage: ChatMessage }
   | {
       type: "runtime-activity";
       state: "queued" | "running" | "cancelled" | "failed";
@@ -1337,7 +1353,8 @@ export function normalizeModalityPreview(
 
 export function normalizeChatEngineEvent(
   event: EngineEvent,
-  brainId: string
+  brainId: string,
+  inputOwner?: { turnId: string; input: string }
 ): NeuralChatStreamEvent | undefined {
   if (event.brainId !== undefined && event.brainId !== brainId) return undefined;
   const sequence = event.sequence;
@@ -1349,6 +1366,10 @@ export function normalizeChatEngineEvent(
     return undefined;
   }
   const data = objectRecord(event.data);
+  if (event.type === "chat-input-accepted") {
+    if (!inputOwner) return undefined;
+    return { type: "chat-input-accepted", sequence, ...receivedChatInput(data, inputOwner) };
+  }
   if (event.type === "inline-imagination-started" && typeof event.actionId === "string" &&
       /^[a-f0-9]{32}$/i.test(event.actionId)) {
     return { type: "inline-imagination-started", sequence, actionId: event.actionId };
@@ -2464,6 +2485,7 @@ function receiptAttentionEpoch(...values: unknown[]): number {
 function generationPresentationEnd(human: Record<string, unknown>, assistant: Record<string, unknown>,
   trace: Record<string, unknown>, receiptEnd?: unknown): ChatGenerationEnd | undefined {
   const markers = [human.generation_end, assistant.generation_end, receiptEnd];
+  const admittedHuman = human.input_accepted_before_reply === true && trace.input_accepted_before_reply === true;
   const disposition = trace.generation_stop_reason === "steered" ? "steered" :
     trace.generation_stop_reason === "native-action-stop" ? "native-stop" :
       trace.generation_stop_reason === "no-reply" ? "no-reply" : undefined;
@@ -2471,7 +2493,7 @@ function generationPresentationEnd(human: Record<string, unknown>, assistant: Re
     throw new Error("Committed chat generation disposition is inconsistent.");
   }
   if (disposition === "no-reply" && (
-    markers.some((marker) => marker !== "no-reply") ||
+    markers.some((marker, index) => marker !== "no-reply" && !(index === 0 && marker === undefined && admittedHuman)) ||
     assistant.content !== "" ||
     !["no-generated-tokens", "no-decoded-text", "whitespace-only", "no-printable-text"]
       .includes(String(trace.generation_no_reply_reason)) ||
@@ -2631,7 +2653,7 @@ function validateCommittedChatReceipt(
       runtime: "adaptive-core",
       status: "complete",
       attentionEpoch: epoch,
-      ...(generationEnd ? { generationEnd } : {})
+      ...(generationEnd && human.generation_end !== undefined ? { generationEnd } : {})
     },
     brainMessage: {
       id: brainMessageId,
@@ -2713,7 +2735,8 @@ export function validateWorkerChatPresentation(
     throw new Error("The neural worker returned an invalid committed turn presentation.");
   }
   const generationEnd = generationPresentationEnd(human, assistant, trace, receipt.generationEnd);
-  if (generationEnd && (human.generation_end !== generationEnd ||
+  if (generationEnd && (human.generation_end !== generationEnd &&
+      !(human.input_accepted_before_reply === true && trace.input_accepted_before_reply === true && human.generation_end === undefined) ||
       assistant.generation_end !== generationEnd || receipt.generationEnd !== generationEnd)) {
     throw new Error("Neural output is not bound to its durable disposition receipt.");
   }
@@ -2792,7 +2815,7 @@ export function validateWorkerChatPresentation(
       runtime: "adaptive-core",
       status: "complete",
       attentionEpoch: epoch,
-      ...(generationEnd ? { generationEnd } : {})
+      ...(generationEnd && human.generation_end !== undefined ? { generationEnd } : {})
     },
     brainMessage: {
       id: brainMessageId,
@@ -2958,8 +2981,16 @@ function mergeCommittedChatPresentation(
     };
   } else if (
     existingCount === 0 ||
+    existingCount === 1 && existingHuman && !existingBrain && !existingTrace ||
     (existingCount === 1 && existingTrace && brain.messages.length === 0)
   ) {
+    if (existingHuman) {
+      if (existingHuman.role !== "human" || existingHuman.content !== humanMessage.content ||
+          existingHuman.createdAt !== humanMessage.createdAt || existingHuman.turnId !== humanMessage.turnId) {
+        throw new Error("Completed reply conflicts with its already received human input.");
+      }
+      brain.messages = brain.messages.filter(message => message.id !== existingHuman.id);
+    }
     result = recordNeuralChat(
       brain,
       humanMessage.content,
@@ -2989,9 +3020,10 @@ async function committedEngineMetadata(
   const metadataPath = join(brainDirectory, "engine", "brain.json");
   try {
     const info = await lstat(metadataPath);
-    if (!info.isFile() || info.isSymbolicLink() || info.size > 32 * 1024 * 1024) {
-      throw new Error("Committed chat engine metadata is not a safe bounded file.");
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error("Committed chat engine metadata is not an owned regular file.");
     }
+    if (!hasTextMemoryHeadroom(info.size * 12)) throw new Error("Committed chat metadata awaits physical receipt-reading RAM.");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -3020,6 +3052,12 @@ function committedLedgerPayload(
     ).get() as { value?: unknown } | undefined;
     if (identity?.value !== brainId) {
       throw new Error("Committed chat ledger belongs to another brain.");
+    }
+    const allocation = database.prepare("SELECT length(CAST(payload_json AS BLOB)) AS bytes FROM entries WHERE entry_key=? AND kind=?")
+      .get(`${kind}:${identifier}`, kind) as { bytes?: unknown } | undefined;
+    if (!allocation) return undefined;
+    if (!Number.isSafeInteger(allocation.bytes) || Number(allocation.bytes) < 1 || !hasTextMemoryHeadroom(Number(allocation.bytes) * 12)) {
+      throw new Error("Committed human/trace receipt awaits physical ledger-reading RAM.");
     }
     const row = database.prepare(
       "SELECT payload_json,payload_sha256 FROM entries WHERE entry_key=? AND kind=?"
@@ -3100,7 +3138,8 @@ function persistedChatReceipt(
     ...((value.attention_epoch ?? value.attentionEpoch) !== undefined
       ? { attentionEpoch: value.attention_epoch ?? value.attentionEpoch }
       : {}),
-    ...(value.generation_end !== undefined ? { generation_end: value.generation_end } : {})
+    ...(value.generation_end !== undefined ? { generation_end: value.generation_end } : {}),
+    ...(value.input_accepted_before_reply === true ? { input_accepted_before_reply: true } : {})
   });
   return {
     format: "omni-chat-turn-receipt-query",
@@ -3893,6 +3932,10 @@ type ChatParameterLearningRuntime = Pick<
 >>;
 
 export class BrainService {
+  private readonly actionEvidenceStores = new Map<string, CompletedActionEvidenceStore>();
+  private readonly actionEvidenceDrains = new Map<string, Promise<void>>();
+  private readonly actionEvidenceRetries = new Map<string, NodeJS.Timeout>();
+  private completedActionLearningOwner?: string;
   readonly datasets: DatasetManifestStore;
   private readonly externalToolSchemas = new Map<string, ExternalToolSchema>();
   private readonly chatSlowLearning = new Map<string, Promise<void>>();
@@ -4002,6 +4045,7 @@ export class BrainService {
    * the worker's atomic generation and pending-job tombstone make retry exact.
    */
   resumePendingChatLearning(brainId: string): void {
+    if (brainId !== this.completedActionLearningOwner) return; // dormant library enumeration is not neural ownership
     if (this.pausedChatLearning.has(brainId) || this.backgroundLearningSuspendedForLaunch) {
       this.updateChatParameterLearningRuntime(brainId, { state: "paused" });
       return;
@@ -4045,8 +4089,8 @@ export class BrainService {
         // Check the current RAM/disk reserve before loading a large brain for
         // replay. Failed preflight keeps the durable job pending and reports
         // its reason; the bounded retry resumes when resources recover.
-        await this.preflightStart(brainId);
-        if (this.pausedChatLearning.has(brainId)) return;
+        await this.preflightStart(brainId, { selectActiveRuntime: false });
+        if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) return;
         this.updateChatParameterLearningRuntime(brainId, {
           state: "running",
           startedAt: new Date().toISOString(),
@@ -4054,6 +4098,7 @@ export class BrainService {
         });
         const result = await this.engine.request<{
           processed?: boolean;
+          jobComplete?: boolean;
           pending?: number;
           nextPriority?: number;
           jobId?: string;
@@ -4080,7 +4125,7 @@ export class BrainService {
         if (result.processed === true && Number(result.pending ?? 0) > 0) {
           retryPriority = Number(result.nextPriority ?? 0);
         }
-        if (result.processed === true) {
+        if (result.processed === true && result.jobComplete !== false) {
           this.chatSlowLearningFailures.delete(brainId);
           const completedAt = new Date().toISOString();
           this.updateChatParameterLearningRuntime(brainId, {
@@ -4108,7 +4153,7 @@ export class BrainService {
             retryPriority = Number(result.nextPriority ?? 0);
           }
           this.updateChatParameterLearningRuntime(brainId, {
-            state: Number(result.pending ?? 0) > 0 ? "pending" : "idle",
+            state: result.jobComplete === false || Number(result.pending ?? 0) > 0 ? "pending" : "idle",
             error: undefined
           });
         }
@@ -4168,6 +4213,102 @@ export class BrainService {
 
   recordConversationActions(brainId: string, actions: ActionEvent[]): Promise<void> {
     return this.repository.appendConversationActions(brainId, actions);
+  }
+
+  private actionEvidenceStore(brainId: string): CompletedActionEvidenceStore {
+    let store = this.actionEvidenceStores.get(brainId);
+    if (!store) {
+      store = new CompletedActionEvidenceStore(join(this.repository.brainDirectory(brainId), "engine"), brainId,
+        async (bytes, directory, writing = true) => {
+          if (!hasTextMemoryHeadroom(bytes * 6)) throw new Error("Completed evidence spool awaits physical transfer RAM.");
+          if (writing) await assertDiskReserve(directory, bytes);
+        });
+      this.actionEvidenceStores.set(brainId, store);
+    }
+    return store;
+  }
+
+  async queueCompletedActionEvidence(brainId: string, event: ActionEvent, output: unknown,
+    route?: CompletedActionEvidenceJob["route"], chatTurnId?: string): Promise<CompletedActionEvidenceJob> {
+    const job = await this.actionEvidenceStore(brainId).stage(event, output, route, chatTurnId);
+    this.resumeCompletedActionLearning(brainId);
+    return job;
+  }
+
+  async queueCompletedToolExecution(invocation: import("../shared/types").ToolInvocation,
+    execution: import("../shared/types").ToolExecutionResult, chatTurnId?: string): Promise<void> {
+    await this.actionEvidenceStore(invocation.brainId).stageTool(invocation, execution, chatTurnId);
+    this.resumeCompletedActionLearning(invocation.brainId);
+  }
+
+  resumeCompletedActionLearning(brainId: string): void {
+    if (brainId !== this.completedActionLearningOwner || this.backgroundLearningSuspendedForLaunch || this.pausedChatLearning.has(brainId)) return;
+    if (this.actionEvidenceDrains.has(brainId)) return;
+    const timer = this.actionEvidenceRetries.get(brainId);
+    if (timer) { clearTimeout(timer); this.actionEvidenceRetries.delete(brainId); }
+    const operation = (async () => {
+      const store = this.actionEvidenceStore(brainId);
+      try {
+        const owner = await this.repository.get(brainId); // never resurrect a removed owner through a retry timer
+        if (!owner.config.onlineLearning) return;
+        for (const job of await store.pending()) {
+          if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) break;
+          job.attempts += 1; job.updatedAt = new Date().toISOString();
+          await store.save(job);
+          try {
+            if (!job.receipt) {
+              if (await actionEvidenceFileHash(store.evidencePath(job.evidenceId)) !== job.evidenceSha256) throw new Error("Completed evidence file changed before neural learning.");
+              const receipt = await withBrainWrite(this.repository, brainId, async () => {
+                if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) throw new Error("Evidence owner yielded to another selected identity.");
+                await this.preflightStart(brainId, { selectActiveRuntime: false });
+                return this.engine.request<CompletedActionEvidenceReceipt>("learn_action_result", {
+                  brainId, evidenceId: job.evidenceId, executionId: job.executionId,
+                  evidencePath: store.evidencePath(job.evidenceId), evidenceSha256: job.evidenceSha256,
+                  provenance: job.provenance, storagePath: this.repository.brainDirectory(brainId)
+                }, ENGINE_REQUEST_NO_DEADLINE, undefined, "background", {
+                  requestId: job.evidenceId, owner: "training", label: "Confirmed action evidence learning", brainId
+                });
+              });
+              job.receipt = validateActionEvidenceReceipt(receipt, job);
+              await store.save(job); // native committed receipt survives route retry/lost host ACK
+            }
+            if (job.route && !job.routeComplete) {
+              if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) throw new Error("Tool-route evidence remains pending for its selected identity.");
+              await this.learnToolRouteOutcome(brainId, job.route, undefined, "background"); // actual event ID is native-idempotent
+              job.routeComplete = true;
+            }
+            job.state = "complete"; job.error = undefined; job.updatedAt = new Date().toISOString();
+            await store.save(job);
+          } catch (error) {
+            job.error = error instanceof Error ? error.message : String(error); job.updatedAt = new Date().toISOString();
+            await store.save(job); throw error;
+          }
+        }
+      } catch {
+        // Retry learning, never the external effect, with its original immutable
+        // evidence/transaction identity. No interrupted turn AbortSignal escapes.
+        if (brainId !== this.completedActionLearningOwner || !await lstat(join(this.repository.brainDirectory(brainId), "engine")).catch(() => undefined)) return;
+        const retry = setTimeout(() => { this.actionEvidenceRetries.delete(brainId); this.resumeCompletedActionLearning(brainId); }, 15_000);
+        retry.unref?.(); this.actionEvidenceRetries.set(brainId, retry);
+      }
+    })().finally(() => this.actionEvidenceDrains.delete(brainId));
+    this.actionEvidenceDrains.set(brainId, operation);
+  }
+
+  selectCompletedActionLearningOwner(brainId: string): void {
+    const previous = this.completedActionLearningOwner;
+    if (previous && previous !== brainId) {
+      const timer = this.actionEvidenceRetries.get(previous);
+      if (timer) { clearTimeout(timer); this.actionEvidenceRetries.delete(previous); }
+      this.engine.cancelBackgroundRequest?.(previous, "learn_action_result");
+      this.engine.cancelBackgroundRequest?.(previous, "learn_tool_route_outcome");
+      this.engine.cancelBackgroundRequest?.(previous, "consolidate_chat_learning");
+      const replayTimer = this.chatSlowLearningTimers.get(previous);
+      if (replayTimer) { clearTimeout(replayTimer); this.chatSlowLearningTimers.delete(previous); }
+    }
+    this.completedActionLearningOwner = brainId;
+    this.resumeCompletedActionLearning(brainId);
+    this.resumePendingChatLearning(brainId);
   }
 
   neuralToolSchemas(brain: BrainDocument): Array<{
@@ -4236,6 +4377,7 @@ export class BrainService {
       this.sharedResources?.selectActiveRuntime(
         brain.id, brain.config.storagePoolBytes, plan.resources.systemRamBudgetBytes
       );
+      this.selectCompletedActionLearningOwner(brain.id);
     }
     return plan;
   }
@@ -4411,6 +4553,8 @@ export class BrainService {
         const stopping = this.engine.cancelBackgroundRequest?.(
           brainId, "consolidate_chat_learning"
         ) ?? false;
+        this.engine.cancelBackgroundRequest?.(brainId, "learn_action_result");
+        this.engine.cancelBackgroundRequest?.(brainId, "learn_tool_route_outcome");
         this.updateChatParameterLearningRuntime(brainId, {
           state: stopping || this.chatSlowLearning.has(brainId)
             ? "pausing" : "paused",
@@ -4422,7 +4566,7 @@ export class BrainService {
           state: "pending",
           error: undefined
         });
-        queueMicrotask(() => this.resumePendingChatLearning(brainId));
+        queueMicrotask(() => this.selectCompletedActionLearningOwner(brainId));
       }
       return updated;
     });
@@ -4842,6 +4986,7 @@ export class BrainService {
   }
 
   async getReconciledBrain(brainId: string): Promise<BrainDocument> {
+    await this.reconcileReceivedChatInput(brainId);
     const brain = await this.repository.get(brainId);
     const candidate = await latestChatReconciliationRequest(
       brain,
@@ -4979,9 +5124,14 @@ export class BrainService {
     }
     const brainDirectory = this.repository.brainDirectory(brainId);
     const snapshot = await persistedWorkspaceSnapshot(brainDirectory, brainId);
+    const pendingCompletedResults = await this.actionEvidenceStore(brainId).pendingCount();
+    const completedActionResults = { pending: pendingCompletedResults,
+      state: this.actionEvidenceDrains.has(brainId) ? "running" as const : pendingCompletedResults === 0 ? "idle" as const :
+        brainId === this.completedActionLearningOwner && brain.config.onlineLearning && !this.backgroundLearningSuspendedForLaunch
+          ? "pending" as const : "dormant" as const };
     const runtime = this.chatParameterLearningRuntime.get(brainId);
-    if (!runtime && brain.config.onlineLearning && !this.backgroundLearningSuspendedForLaunch) {
-      return snapshot;
+    if (!runtime && brain.config.onlineLearning && !this.backgroundLearningSuspendedForLaunch && snapshot.learning) {
+      return { ...snapshot, learning: { ...snapshot.learning, completedActionResults } };
     }
     const persistedLearning = snapshot.learning;
     const background = persistedLearning?.backgroundParameters ?? {
@@ -4991,7 +5141,7 @@ export class BrainService {
       updatedAt: snapshot.contextWindow.updatedAt
     };
     const liveRuntime = runtime ?? {
-      state: "paused" as const,
+      state: brain.config.onlineLearning && !this.backgroundLearningSuspendedForLaunch ? "idle" as const : "paused" as const,
       updatedAt: new Date().toISOString()
     };
     const effectiveRuntime = (!brain.config.onlineLearning || this.backgroundLearningSuspendedForLaunch) && liveRuntime.state !== "pausing"
@@ -5005,6 +5155,7 @@ export class BrainService {
     return {
       ...snapshot,
       learning: {
+        completedActionResults,
         measuredAt: effectiveRuntime.updatedAt,
         fastNeuralMemory: persistedLearning?.fastNeuralMemory ?? {
           state: "idle",
@@ -5189,7 +5340,6 @@ export class BrainService {
         signal
       );
     } catch (error) {
-      if (error instanceof EngineRequestError && [-32801, -32802].includes(error.code ?? 0)) throw error;
       if (minimumInferenceCount !== undefined && neuralRequestStarted) {
         try {
           const reconciled = await this.reconcileCommittedChat(id, {
@@ -5206,6 +5356,14 @@ export class BrainService {
               ? reconciliationError.message
               : reconciliationError
           );
+        }
+      }
+      if (neuralRequestStarted) {
+        try {
+          const accepted = await this.reconcileReceivedChatInput(id, { turnId, input: message });
+          if (accepted) onStream?.({ type: "chat-input-accepted", sequence: 0, ...accepted });
+        } catch (reconciliationError) {
+          console.warn("Received input reconciliation awaits authoritative state:", reconciliationError);
         }
       }
       throw error;
@@ -5233,6 +5391,16 @@ export class BrainService {
       (bytes) => hasTextMemoryHeadroom(bytes) && freemem() - memoryReserveBytes() >= bytes);
     if (!observation) return undefined;
     return this.engine.observeChatAction(observation);
+  }
+
+  async authorizeInlineImagination(invocation: import("../shared/types").ToolInvocation,
+    executionId: string, requestId: string, intentPath: string): Promise<void> {
+    const args = invocation.arguments;
+    if (invocation.toolId !== "modality.imagine" || typeof args.neuralActionId !== "string" || typeof args.chatTurnId !== "string") return;
+    const argumentsJson = JSON.stringify(args);
+    await this.engine.authorizeInlineImagination({ brainId: invocation.brainId, streamId: args.chatTurnId,
+      neuralActionId: args.neuralActionId, executionId, requestId, intentPath, argumentsJson,
+      argumentSha256: sha256(argumentsJson) });
   }
 
   private chatSteerAdmissionBoundary(brainId: string, turnId: string): void {
@@ -5379,6 +5547,28 @@ export class BrainService {
     });
   }
 
+  private async reconcileReceivedChatInput(brainId: string, expected?: { turnId: string; input: string }): Promise<{
+    inputReceipt: import("../shared/types").ChatInputAcceptedReceipt; humanMessage: ChatMessage;
+  } | undefined> {
+    const directory = this.repository.brainDirectory(brainId), metadata = await committedEngineMetadata(directory);
+    if (!metadata || metadata.brain_id !== brainId) return undefined;
+    const receipts = Array.isArray(metadata.accepted_chat_inputs) ? metadata.accepted_chat_inputs.map(objectRecord).filter(Boolean) : [];
+    if (expected && !receipts.some(receipt => receipt?.turnId === expected.turnId)) {
+      const durable = committedLedgerPayload(directory, brainId, "trace", sha256(`${brainId}\0${expected.turnId}\0accepted-input-v1`));
+      const prior = objectRecord(durable?.inputAccepted);
+      if (prior) receipts.push(prior);
+    }
+    let accepted: ReturnType<typeof receivedChatInputFromLedger> | undefined;
+    for (const receipt of receipts) {
+      if (!receipt || expected && receipt.turnId !== expected.turnId) continue;
+      const human = committedLedgerPayload(directory, brainId, "message", receiptIdentifier(receipt.humanMessageId, "received human"));
+      const current = receivedChatInputFromLedger(receipt, human, expected);
+      await this.repository.appendReceivedChatInput(brainId, current.humanMessage);
+      accepted = current;
+    }
+    return accepted;
+  }
+
   private async chatUnlocked(
     id: string,
     input: string,
@@ -5459,7 +5649,7 @@ export class BrainService {
           : { maxNewTokens: responseTokenBudget })
       },
       (event) => {
-        const normalized = normalizeChatEngineEvent(event, id);
+        const normalized = normalizeChatEngineEvent(event, id, { turnId, input: message });
         if (!normalized) return;
         if (normalized.type === "chat-phase") {
           const ownership = this.liveChatTurns.get(turnId);
@@ -5789,7 +5979,8 @@ export class BrainService {
   async learnToolRouteOutcome(
     brainId: string,
     outcome: ConfirmedToolRouteOutcome,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    priority: "foreground" | "background" = "foreground"
   ): Promise<ToolRouteLearningResult> {
     return withBrainWrite(this.repository, brainId, async () => {
       if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(outcome.eventId)) {
@@ -5809,7 +6000,8 @@ export class BrainService {
       ) {
         throw new Error("Confirmed tool arguments must be a typed object.");
       }
-      await this.preflightStart(brainId);
+      if (priority === "background" && brainId !== this.completedActionLearningOwner) throw new Error("Tool-route evidence remains dormant for this identity.");
+      await this.preflightStart(brainId, { selectActiveRuntime: priority !== "background" });
       signal?.throwIfAborted();
       const worker = await this.engine.request<{
         brainId?: string;
@@ -5827,8 +6019,9 @@ export class BrainService {
           arguments: typedArguments,
           outcome: "success"
         },
-        120_000,
-        signal
+        priority === "background" ? ENGINE_REQUEST_NO_DEADLINE : 120_000,
+        signal,
+        priority
       );
       const learned = worker.routeLearning;
       if (
@@ -8873,11 +9066,13 @@ export class RuntimeJobManager extends EventEmitter {
     this.launch(job, async () => {
       await this.service.preflightStart(normalizedRequest.brainId);
       const signal = this.cancellationControllers.get(job.id)?.signal;
+      const inlineClaimRequired = await this.engine.awaitInlineArtifact(normalizedRequest as unknown as Record<string, unknown>, signal);
       const output = await this.engine.request<unknown>(
         "generate_modality",
         {
           jobId: job.id,
           ...normalizedRequest,
+          ...(inlineClaimRequired ? { inlineClaimRequired: true } : {}),
           storagePath: this.service.repository.brainDirectory(normalizedRequest.brainId)
         },
         3_600_000,

@@ -27,7 +27,7 @@ class InlineControlTests(unittest.TestCase):
         self.params = {"modality": "image", "conceptIds": ["fixture"]}
         staging = Path(self.temporary.name) / ".inline-imagination" / self.action_id
         staging.mkdir(parents=True)
-        self.record = InlineGeneration("brain", self.action_id, "turn", self.worker._inline_signature(self.params), staging, DeferredEventLog())
+        self.record = InlineGeneration("brain", self.action_id, "turn", self.worker._inline_signature(self.params), staging, DeferredEventLog(), snapshot_started=True)
         self.worker._inline_generations[("brain", self.action_id)] = self.record
 
     def control(self, **changes):

@@ -305,11 +305,18 @@ def load_module_bounded(
     overrides: Optional[Mapping[str, torch.Tensor]] = None,
     on_chunk: Optional[Callable[[str, int, int], None]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    excluded_prefixes: tuple[str, ...] = (),
 ) -> None:
     """Strict native state loading into already-sized owners in byte chunks."""
     defaults: dict[str, torch.Tensor] = {}
+    if any(not value or not value.endswith(".") for value in excluded_prefixes):
+        raise ValueError("bounded load exclusions must name complete child prefixes")
+    def excluded(name):
+        return any(name.startswith(value) for value in excluded_prefixes)
     for name, child in module.named_modules():
         child_path = name + "." if name else ""
+        if excluded(child_path):
+            continue
         prepare = getattr(child, "prepare_bounded_state_load", None)
         if callable(prepare):
             prepare(reader.specs, prefix + child_path)
@@ -325,8 +332,8 @@ def load_module_bounded(
                 if relative_name in defaults or prefix + relative_name in reader.specs:
                     raise ValueError("bounded optional state defaults overlap saved state")
                 defaults[relative_name] = value
-    state = module.state_dict(keep_vars=True)
-    actual = {name[len(prefix):] for name in reader.specs if name.startswith(prefix)}
+    state = {name: value for name, value in module.state_dict(keep_vars=True).items() if not excluded(name)}
+    actual = {name[len(prefix):] for name in reader.specs if name.startswith(prefix) and not excluded(name[len(prefix):])}
     expected = set(state)
     if (actual | set(defaults)) != expected:
         raise ValueError("%s checkpoint mismatch (missing=%s, unexpected=%s)" % (
@@ -354,7 +361,9 @@ def load_module_bounded(
             if replacement.dtype != spec.dtype or tuple(replacement.shape) != spec.shape:
                 raise ValueError("invalid recovered checkpoint override")
             target.copy_(replacement)
-    for child in module.modules():
+    for name, child in module.named_modules():
+        if excluded(name + "."):
+            continue
         validate_bounded = getattr(child, "validate_bounded_state_load", None)
         if callable(validate_bounded):
             validate_bounded()

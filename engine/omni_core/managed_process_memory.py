@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional
+from pathlib import Path
+from typing import Callable, Mapping, Optional, Tuple
 
 
 MAX_PROCESS_ROWS = 32768
@@ -46,6 +48,7 @@ class ManagedMemorySample:
     sample_duration_ms: float = 0.0
     sample_age_seconds: float = 0.0
     sample_started_ns: Optional[int] = None
+    owned_pids: Tuple[int, ...] = ()
 
 
 def parse_posix_process_table(payload: bytes) -> ProcessTable:
@@ -100,7 +103,8 @@ def managed_family_sample(table: ProcessTable, root_pid: int, worker_pid: int, s
         if pid == worker_pid:
             worker_rss = rss
         pending.extend(children.get(pid, ()))
-    return ManagedMemorySample(total, worker_rss, root_pid, len(owned), True, scope)
+    return ManagedMemorySample(total, worker_rss, root_pid, len(owned), True, scope,
+        owned_pids=tuple(sorted(owned)))
 
 
 def _posix_table() -> ProcessTable:
@@ -200,10 +204,10 @@ class ManagedProcessMemorySampler:
         self._at = float("-inf")
         self._lock = threading.Lock()
 
-    def sample(self) -> ManagedMemorySample:
+    def sample(self, *, force: bool = False) -> ManagedMemorySample:
         with self._lock:
             now = self.now()
-            if self._sample is not None and now - self._at < SAMPLE_INTERVAL_SECONDS:
+            if not force and self._sample is not None and now - self._at < SAMPLE_INTERVAL_SECONDS:
                 return ManagedMemorySample(**{**self._sample.__dict__, "cached": True, "sample_age_seconds": max(0.0, now - self._at)})
             try:
                 sample_started_ns = time.time_ns()
@@ -232,3 +236,61 @@ def default_managed_process_sampler() -> ManagedProcessMemorySampler:
             _default_sampler = ManagedProcessMemorySampler()
             _default_sampler_key = key
         return _default_sampler
+
+
+def native_family_memory_containment(
+    selected_bytes: int, *, root_pid: int, worker_pid: int,
+    member_pids: Tuple[int, ...] = (),
+    platform_name: Optional[str] = None, proc_root: Path = Path("/proc"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> dict:
+    """Report an *existing* whole-family kernel bound, never install one.
+
+    cgroup v2 can already constrain an app launched inside a container or a
+    delegated slice. We only credit it when both the trusted owner and worker
+    are in the same group and its hard memory.max is no higher than the selected
+    budget and all sampled family members are in it. This is not RSS
+    isolation, nor permission to write a shared system cgroup or set RLIMIT_AS
+    (which would break large file-backed mappings).
+    A missing/changed descendant membership fails this optional proof closed.
+    """
+    platform = sys.platform if platform_name is None else platform_name
+    result = {"mechanism": "none", "existingNativeBound": False,
+              "selectedCeilingNativeBounded": False, "hardRssIsolation": False,
+              "scope": "unavailable-or-unverified"}
+    if not platform.startswith("linux") or type(selected_bytes) is not int or selected_bytes < 0:
+        return result
+
+    def group(pid):
+        lines = (proc_root / str(pid) / "cgroup").read_text("ascii").splitlines()
+        matches = [line[3:] for line in lines if line.startswith("0::")]
+        if len(matches) != 1 or not matches[0].startswith("/") or ".." in Path(matches[0]).parts:
+            raise ValueError("unverified cgroup v2 membership")
+        return matches[0]
+
+    try:
+        members = set(member_pids)
+        if root_pid not in members or worker_pid not in members:
+            return result
+        root_group = group(root_pid)
+        if any(group(pid) != root_group for pid in members):
+            return result
+        # A cgroup namespace often mounts the process's own group at the
+        # visible root, while a host mount exposes its path below that root.
+        candidates = (cgroup_root / root_group.lstrip("/") / "memory.max",)
+        for candidate in candidates:
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+            raw = candidate.read_text("ascii").strip()
+            if raw == "max":
+                continue
+            limit = int(raw)
+            if limit <= 0:
+                continue
+            return {"mechanism": "existing-cgroup-v2-memory.max", "existingNativeBound": True,
+                    "selectedCeilingNativeBounded": limit <= selected_bytes,
+                    "hardRssIsolation": False, "scope": "sampled-managed-family-cgroup-v2",
+                    "limitBytes": limit}
+    except (OSError, ValueError):
+        pass
+    return result

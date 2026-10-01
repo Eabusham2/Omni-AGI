@@ -27,9 +27,12 @@ import type {
   ToolRouteLearningResult
 } from "./brainService";
 import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
+import { cleanGeometryHoldouts } from "./evolutionController";
 import { EngineRequestError } from "./engineSupervisor";
 import { inheritTemporarySteeringContext, type TemporarySteeringContext } from "./temporarySteeringContext";
 import type { ChatToolObservationReceipt } from "./chatToolObservation";
+import { actualTerminalToolOutcome, type CompletedActionEvidenceJob } from "./completedActionEvidence";
+import { receivedChatInput } from "./chatInputReceipt";
 
 export interface ActionChatService {
   chat(
@@ -45,6 +48,8 @@ export interface ActionChatService {
   currentChatAttentionEpoch?(brainId: string): Promise<number>;
   observeChatActionResult?(brainId: string, turnId: string, event: ActionEvent,
     output: unknown): Promise<ChatToolObservationReceipt | undefined>;
+  queueCompletedActionEvidence?(brainId: string, event: ActionEvent, output: unknown,
+    route?: CompletedActionEvidenceJob["route"], chatTurnId?: string): Promise<CompletedActionEvidenceJob>;
   idleCycle?(brainId: string, minimumIdleSeconds?: number): Promise<IdleCycleResult>;
   learnStructuredExperience?(
     brainId: string,
@@ -72,7 +77,8 @@ export interface ActionToolExecutor {
   execute(
     invocation: ToolInvocation,
     onProgress?: (job: RuntimeJob) => void,
-    requestId?: string
+    requestId?: string,
+    onCompleted?: (result: ToolExecutionResult) => Promise<void>
   ): Promise<ToolExecutionResult>;
   cancel(brainId: string, requestId?: string): number;
   hasPendingOrActive?(brainId: string): boolean;
@@ -145,7 +151,7 @@ export function confirmedArgumentTrainingFields(
   try {
     const payload = clean(action.arguments) as Record<string, unknown>;
     if (!action.toolId?.startsWith("mcp.")) {
-      for (const key of ["assemblyIds", "conceptIds", "organic", "recursive", "localPackEnabled", "trainedPackAvailable", "neuralRoute"]) delete payload[key];
+      for (const key of ["assemblyIds", "conceptIds", "organic", "recursive", "localPackEnabled", "trainedPackAvailable", "neuralRoute", "neuralActionId", "chatTurnId"]) delete payload[key];
     }
     // Keep user-authored ordinary strings untouched; URL authority credentials
     // are transport material, not a parameter-learning target.
@@ -282,6 +288,7 @@ interface ActiveTurn {
   observationOffers: Set<string>;
   approvalLearningActions: Set<string>;
   pendingDrain?: Promise<void>;
+  inputAccepted?: import("../shared/types").ChatInputAcceptedReceipt;
 }
 
 interface ActionOutcome {
@@ -328,6 +335,8 @@ export function actionEventForTurnStream(event: ActionEvent): ActionEvent {
 }
 
 export class ChatActionController extends EventEmitter {
+  private readonly durableEvidence = new WeakMap<ActionEvent, Promise<CompletedActionEvidenceJob>>();
+  private readonly actionChatTurns = new WeakMap<ActionEvent, string>();
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly pendingApprovedActions = new Map<
     string,
@@ -439,6 +448,7 @@ export class ChatActionController extends EventEmitter {
       | Omit<Extract<ChatStreamEvent, { type: "modality-preview" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-phase" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-reply-committed" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
+      | Omit<Extract<ChatStreamEvent, { type: "chat-input-accepted" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-state" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
   ): void {
     const value = {
@@ -465,7 +475,7 @@ export class ChatActionController extends EventEmitter {
 
   private async offerLiveToolObservation(turn: ActiveTurn | undefined, event: ActionEvent, output: unknown): Promise<void> {
     if (!turn || turn.neuralEnded || turn.outputClosed || turn.steerSuccessor || turn.controller.signal.aborted ||
-        event.action.kind !== "tool" || event.state !== "complete" || event.cancellationRequested || !event.neuralActionId) return;
+        event.action.kind !== "tool" || !actualTerminalToolOutcome(event.execution) || event.cancellationRequested || !event.neuralActionId) return;
     const key = `${event.id}:${event.execution?.id ?? ""}`;
     if (turn.observationOffers.has(key)) return;
     turn.observationOffers.add(key);
@@ -474,11 +484,34 @@ export class ChatActionController extends EventEmitter {
       // changes text, creates another conversation row, or executes a tool.
       await this.service.observeChatActionResult?.(turn.brainId, turn.turnId, event, output);
     } catch (error) {
-      if (event.state !== "complete" || event.cancellationRequested) return;
-      event.statusLabel = "Action complete · live observation not admitted; result retained for learning";
+      if (!actualTerminalToolOutcome(event.execution) || event.cancellationRequested) return;
+      event.statusLabel = `${event.execution.state === "complete" ? "Action complete" : "Attempt failed"} · live observation not admitted; result retained for learning`;
       event.error = `Live result observation: ${error instanceof Error ? error.message : String(error)}`;
       event.updatedAt = new Date().toISOString();
       this.publishAction(turn, event);
+    }
+  }
+
+  private async retainCompletedEvidence(event: ActionEvent, output: unknown, utterance?: string,
+    chatTurnId?: string): Promise<boolean> {
+    if (!this.service.queueCompletedActionEvidence || !actualTerminalToolOutcome(event.execution)) return false;
+    let pending = this.durableEvidence.get(event);
+    if (!pending) {
+      const route = event.execution.state === "complete" && utterance?.trim() && ["tool", "agent", "evolve"].includes(event.action.kind) && event.action.toolId && event.action.action
+        ? { eventId: event.id, utterance, toolId: canonicalSystemToolId(event.action.toolId) ?? event.action.toolId,
+            action: event.action.action, arguments: confirmedArgumentTrainingFields(event.action) } : undefined;
+      pending = this.service.queueCompletedActionEvidence(event.brainId, event, output, route, chatTurnId);
+      this.durableEvidence.set(event, pending);
+    }
+    try {
+      await pending;
+      event.statusLabel = `${event.execution.state === "complete" ? "Action complete" : "Attempt failed"} · exact outcome retained for independent learning`;
+      return true;
+    } catch (error) {
+      this.durableEvidence.delete(event);
+      event.error = `Completed result could not be retained: ${error instanceof Error ? error.message : String(error)}`;
+      event.statusLabel = `${event.execution.state === "complete" ? "Action complete" : "Attempt failed"} · result retention needs attention`;
+      return false;
     }
   }
 
@@ -686,7 +719,10 @@ export class ChatActionController extends EventEmitter {
                 addExperts:
                   typeof addExperts === "number" ? addExperts : undefined
               }
-            : undefined
+            : undefined,
+        ...(action.arguments.geometryHoldouts === undefined ? {} : {
+          geometryHoldouts: cleanGeometryHoldouts(action.arguments.geometryHoldouts)
+        })
       });
       event.evolutionRunId = run.id;
       event.state = run.state === "failed" ? "failed" : "complete";
@@ -705,9 +741,20 @@ export class ChatActionController extends EventEmitter {
       action: action.action,
       arguments:
         imagination && event.neuralActionId
-          ? { ...action.arguments, neuralActionId: event.neuralActionId }
+          ? { ...action.arguments, neuralActionId: event.neuralActionId,
+              ...(this.actionChatTurns.get(event) ? { chatTurnId: this.actionChatTurns.get(event) } : {}) }
           : action.arguments,
       ...(approvalToken ? { approvalToken } : {})
+    };
+    const retainBeforeAudit = async (actual: ToolExecutionResult): Promise<void> => {
+      if (!actualTerminalToolOutcome(actual)) return;
+      event.execution = actual;
+      if (!event.cancellationRequested && (event as ActionEvent).state !== "stopped") event.state = actual.state;
+      event.updatedAt = actual.finishedAt ?? new Date().toISOString();
+      await this.retainCompletedEvidence(event, actual.output, userUtterance, this.actionChatTurns.get(event));
+      const turn = [...this.activeTurns.values()].find(candidate => candidate.actions.get(event.id) === event);
+      await this.offerLiveToolObservation(turn, event, actual.output);
+      onUpdate(event);
     };
     const execution =
       imagination
@@ -723,10 +770,8 @@ export class ChatActionController extends EventEmitter {
             }
             event.updatedAt = job.updatedAt;
             onUpdate(event);
-          }, requestId)
-        : requestId
-          ? await this.tools.execute(invocation, undefined, requestId)
-          : await this.tools.execute(invocation);
+          }, requestId, retainBeforeAudit)
+        : await this.tools.execute(invocation, undefined, requestId, retainBeforeAudit);
     event.execution = execution;
     if (event.cancellationRequested || (event as ActionEvent).state === "stopped") return execution.output;
     event.state = execution.state;
@@ -782,6 +827,14 @@ export class ChatActionController extends EventEmitter {
       // or duplicate this independently confirmed receipt.
       turn?.approvalLearningActions.add(event.id);
       await this.offerLiveToolObservation(turn, event, output);
+      if (await this.retainCompletedEvidence(event, output, pending.userUtterance, turn?.turnId)) {
+        this.publish(event);
+        return { actionEvent: event, learned: false };
+      }
+      if (this.service.queueCompletedActionEvidence) {
+        this.publish(event);
+        return { actionEvent: event, learned: false, learningError: event.error };
+      }
       event.statusLabel = "Action complete · integrating result";
       event.updatedAt = new Date().toISOString();
       this.publish(event);
@@ -876,6 +929,7 @@ export class ChatActionController extends EventEmitter {
     const workerActions = new Map<string, ActionEvent>();
     const previewRevisions = new Map<string, number>();
     const executions: Array<() => Promise<ActionOutcome>> = [];
+    const startedExecutions = new Set<() => Promise<ActionOutcome>>();
     let latestImagination: ActionEvent | undefined;
 
     const updateAction = (event: ActionEvent): void => {
@@ -909,6 +963,7 @@ export class ChatActionController extends EventEmitter {
         neuralActionCorrelation(workerActionId)
       );
       events.push(event);
+      this.actionChatTurns.set(event, turn.turnId);
       turn.actions.set(event.id, event);
       if (workerActionId) workerActions.set(workerActionId, event);
       if (action.kind === "imagine") latestImagination = event;
@@ -934,18 +989,23 @@ export class ChatActionController extends EventEmitter {
             event.updatedAt = new Date().toISOString();
           }
         }
+        const retained = this.retainCompletedEvidence(event, output, input, turn.turnId);
         await this.offerLiveToolObservation(turn, event, output);
+        await retained;
         this.publishAction(turn, event);
         return { event, output };
       };
       let execution: Promise<ActionOutcome> | undefined;
-      const execute = (): Promise<ActionOutcome> => execution ??= perform();
+      const execute = (): Promise<ActionOutcome> => {
+        startedExecutions.add(execute);
+        return execution ??= perform();
+      };
       executions.push(execute);
       // External tool execution uses the trusted tool executor's grants and
       // durable pre-effect intent gate. Native brain mutations remain queued
       // on its write boundary; action-result learning below waits for commit.
       // Imagination retains its worker-owned progressive preview lifecycle.
-      if (workerActionId && action.kind === "tool") void execute();
+      if (workerActionId && (action.kind === "tool" || action.kind === "imagine")) void execute();
       return event;
     };
     const consumeNeuralStream = (neural: NeuralChatStreamEvent): void => {
@@ -973,6 +1033,12 @@ export class ChatActionController extends EventEmitter {
           turn.runtimeCancellationFailed = neural.state === "failed";
         }
         return;
+      }
+      if (neural.type === "chat-input-accepted") {
+        const accepted = receivedChatInput(neural.inputReceipt, { turnId: turn.turnId, input: turn.input });
+        turn.inputAccepted = accepted.inputReceipt;
+        this.publishStream(turn, { type: "chat-input-accepted", ...accepted });
+        return; // durable input stays valid even when its reply was just cancelled
       }
       if (controller.signal.aborted) return;
       if (neural.type === "chat-token") {
@@ -1113,6 +1179,10 @@ export class ChatActionController extends EventEmitter {
         controller.signal.throwIfAborted();
         const { event, output } = await executions[index]!();
         if (event.state !== "complete") continue;
+        if (this.service.queueCompletedActionEvidence && event.execution?.state === "complete") {
+          await this.retainCompletedEvidence(event, output, input, turn.turnId); continue;
+        }
+        if (this.durableEvidence.has(event)) continue;
         if (turn.approvalLearningActions.has(event.id)) continue;
         if (["talk", "ponder", "learn"].includes(event.action.kind)) continue;
         // The user-authored chat turn is already committed. Learn the visible
@@ -1204,8 +1274,13 @@ export class ChatActionController extends EventEmitter {
         // outcome learning remains serialized, but never delays the successor.
         turn.pendingDrain = (async () => {
           for (const execution of executions) {
+            if (!startedExecutions.has(execution)) continue;
             const { event, output } = await execution();
+            if (actualTerminalToolOutcome(event.execution) && this.service.queueCompletedActionEvidence) {
+              await this.retainCompletedEvidence(event, output, input, turn.turnId); continue;
+            }
             if (event.state !== "complete") continue;
+            if (await this.retainCompletedEvidence(event, output, input, turn.turnId)) continue;
             if (turn.approvalLearningActions.has(event.id)) continue;
             await this.learnConfirmedToolRoute(event, input, controller.signal).catch(() => undefined);
             if (this.service.learnStructuredExperience && !["talk", "ponder", "learn"].includes(event.action.kind)) {
@@ -1228,6 +1303,22 @@ export class ChatActionController extends EventEmitter {
         throw error;
       }
       const cancelled = controller.signal.aborted;
+      // A failed/stopped response is not authority to discard independently
+      // completed host evidence. Each already-started memoized execution
+      // retains only its actual complete receipt, without the turn signal.
+      turn.pendingDrain = (async () => {
+        for (const execution of executions) {
+          if (!startedExecutions.has(execution)) continue;
+          const { event, output } = await execution();
+          if (actualTerminalToolOutcome(event.execution)) {
+            await this.retainCompletedEvidence(event, output, input, turn.turnId);
+            this.publishAction(undefined, event);
+          }
+        }
+        await this.service.recordConversationActions?.(brainId, events);
+      })().catch(() => undefined).finally(() => {
+        this.activeTurns.delete(turnId); turn.resolveSettled();
+      });
       const cancellationFailed = cancelled && turn.runtimeCancellationFailed === true;
       const failureMessage = error instanceof Error ? error.message : String(error);
       // A worker/process failure can arrive after an organic inline preview

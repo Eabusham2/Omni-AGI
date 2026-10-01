@@ -230,6 +230,7 @@ class ParameterDiagnosticTests(unittest.TestCase):
     def test_ordinary_pre_neural_steer_still_uses_no_baseline_or_model(self):
         from types import SimpleNamespace
         owner = SimpleNamespace(brain_id="brain", completed_chat_turns=[], config=SimpleNamespace(max_seq_len=64),
+            resource_policy=SimpleNamespace(),
             _validated_chat_turn_id=AdaptiveBrain._validated_chat_turn_id)
         result = AdaptiveBrain.chat(owner, "actual input", turn_id="old", steer_check=lambda: True)
         self.assertTrue(result["zeroTokenYield"])

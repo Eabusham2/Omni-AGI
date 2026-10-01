@@ -44,7 +44,8 @@ import {
   EVOLUTION_POLICY_SHA256,
   EVOLUTION_PROTECTED_PATHS,
   EVOLUTION_TEST_NAMES,
-  isProtectedEvolutionPath
+  isProtectedEvolutionPath,
+  sourceImprovementEvidence
 } from "./evolutionPolicy";
 import {
   inspectRuntimeArtifacts,
@@ -652,7 +653,8 @@ export class ToolExecutor {
   async execute(
     invocation: ToolInvocation,
     onProgress?: (job: RuntimeJob) => void,
-    requestedRequestId?: string
+    requestedRequestId?: string,
+    onCompleted?: (result: ToolExecutionResult) => Promise<void>
   ): Promise<ToolExecutionResult> {
     // Imported brains can still emit historical protocol IDs. Canonicalize
     // once before permission, approval, execution, result, and learning audit
@@ -683,6 +685,21 @@ export class ToolExecutor {
       settled,
       resolveSettled
     });
+    let dispatchStarted = false;
+    const retainAndAuditTerminal = async (result: ToolExecutionResult): Promise<void> => {
+      if (result.state === "complete" || result.dispatchStarted === true) {
+        try {
+          if (onCompleted) await onCompleted(result);
+          else await this.service.queueCompletedToolExecution(invocation, result,
+            typeof invocation.arguments.chatTurnId === "string" ? invocation.arguments.chatTurnId : undefined);
+        } catch (error) {
+          result.error = `${result.error ? `${result.error}; ` : ""}Actual outcome retention needs attention: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+      void this.audit(invocation, result).catch((error: unknown) => {
+        result.error = `${result.error ? `${result.error}; ` : ""}Post-attempt audit pending: ${error instanceof Error ? error.message : String(error)}`;
+      });
+    };
     try {
       const permissionDecision = await this.permission(
         invocation.brainId,
@@ -737,13 +754,16 @@ export class ToolExecutor {
       // Persist independent authorization intent before any external effect.
       // Whole-brain result auditing remains serialized after the chat's
       // atomic checkpoint; this receipt cannot overwrite a live draft brain.
-      await persistAuthorizedToolIntent(
+      const intentPath = await persistAuthorizedToolIntent(
         this.service.repository.brainDirectory(invocation.brainId), invocation,
         { id, requestId, startedAt, permission, permissionRevision: permissionDecision.revision }
       );
       controller.signal.throwIfAborted();
+      await this.service.authorizeInlineImagination(invocation, id, requestId, intentPath);
+      controller.signal.throwIfAborted();
       let output: unknown;
       try {
+        dispatchStarted = true;
         output = await this.dispatch(
           invocation,
           controller.signal,
@@ -758,20 +778,26 @@ export class ToolExecutor {
       const result: ToolExecutionResult = {
         ...base,
         state: "complete",
+        dispatchStarted: true,
         finishedAt: new Date().toISOString(),
         output
       };
-      await this.audit(invocation, result);
+      // The effect is already performed. Retain its actual immutable receipt
+      // before a whole-brain audit can wait behind the live chat write lock.
+      // Neither Stop nor audit failure may turn this into an unperformed
+      // effect or cause it to execute a second time.
+      await retainAndAuditTerminal(result);
       return result;
     } catch (error) {
       const result: ToolExecutionResult = {
         ...base,
         state: "failed",
+        ...(dispatchStarted ? { dispatchStarted: true } : {}),
         finishedAt: new Date().toISOString(),
         ...(error instanceof ToolDispatchFailure ? { output: error.output } : {}),
         error: error instanceof Error ? error.message : String(error)
       };
-      await this.audit(invocation, result).catch(() => undefined);
+      await retainAndAuditTerminal(result);
       return result;
     } finally {
       const execution = this.activeExecutions.get(id);
@@ -1714,7 +1740,7 @@ export class ToolExecutor {
     const job = this.jobs.generate({
       brainId,
       modality: modality as "image" | "audio" | "video",
-      prompt: typeof args.prompt === "string" ? args.prompt.slice(0, 1_000_000) : undefined,
+      prompt: typeof args.prompt === "string" ? args.prompt : undefined,
       conceptIds: Array.isArray(args.conceptIds)
         ? args.conceptIds.filter((value): value is string => typeof value === "string")
         : undefined,
@@ -2784,7 +2810,8 @@ export class ToolExecutor {
             : "An empty source candidate cannot pass evaluation or be promoted.",
         truncated: false
       });
-      const passed = checks.every((check) => check.passed);
+      const improvementEvidence = sourceImprovementEvidence(baselineChecks, checks);
+      const passed = checks.every((check) => check.passed) && improvementEvidence.passed;
       const baselineDurationMs = baselineChecks.reduce(
         (total, check) => total + check.durationMs,
         0
@@ -2833,6 +2860,7 @@ export class ToolExecutor {
               })
             ),
             regressions,
+            improvementEvidence,
             resources,
             createdAt: new Date().toISOString()
           },
@@ -2854,6 +2882,7 @@ export class ToolExecutor {
         checks,
         baselineChecks,
         regressions,
+        improvementEvidence,
         resources
       };
     }
@@ -2881,14 +2910,20 @@ export class ToolExecutor {
         diffSha256?: string;
         passed?: boolean;
         boundaryPassed?: boolean;
+        baselineChecks?: unknown;
+        checks?: unknown;
+        improvementEvidence?: unknown;
       };
+      const improvementEvidence = sourceImprovementEvidence(validation.baselineChecks, validation.checks);
       if (
         validation.passed !== true ||
         validation.boundaryPassed !== true ||
         validation.diffSha256 !== expected ||
         validation.parentCommit !== proposal.parentCommit ||
         validation.evaluatorSha256 !== proposal.evaluatorSha256 ||
-        resolve(validation.worktree ?? "") !== resolve(worktree)
+        resolve(validation.worktree ?? "") !== resolve(worktree) ||
+        !improvementEvidence.passed ||
+        JSON.stringify(validation.improvementEvidence) !== JSON.stringify(improvementEvidence)
       ) {
         throw new Error("Evolution candidate has no matching passing validation record.");
       }

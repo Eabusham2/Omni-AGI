@@ -21,6 +21,7 @@ from .router_state_paging import (
     iter_row_major_ternary_chunks, pack_tile, release_router_tensor_chunk,
     tile_ranges, unpack_tile, update_historical_tensor_checksum,
 )
+from .sparse_router_state import SparseRouterState
 
 
 @dataclass(frozen=True)
@@ -112,20 +113,11 @@ class STDPSynapses(nn.Module):
             raise ValueError("synapse population dimensions must be positive")
         if not math.isfinite(self.learning_rate) or self.learning_rate < 0:
             raise ValueError("STDP learning rate must be finite and nonnegative")
-        self.register_buffer(
-            "_packed_weights",
-            self._router_buffer("_packed_weights", (post_neurons, (pre_neurons + 3) // 4), torch.uint8, 0x55),
-        )
-        # Eligibility is subthreshold timing pressure, not a second weight.
-        # Its fixed-point range is [-255, 255] after each update.
-        self.register_buffer(
-            "eligibility_accumulator",
-            self._router_buffer("eligibility_accumulator", (post_neurons, pre_neurons), torch.int16, 0),
-        )
-        self.register_buffer("stability", self._router_buffer("stability", (post_neurons, pre_neurons), torch.float32, 0))
+        # No logical NxN matrix is allocated at creation. A missing recurrent
+        # block is exactly ternary zero with zero timing/stability/uses state.
+        self._sparse_state = SparseRouterState(self, loading=self._router_loading_checkpoint)
         self.register_buffer("pre_trace", torch.zeros(pre_neurons))
         self.register_buffer("post_trace", torch.zeros(post_neurons))
-        self.register_buffer("uses", self._router_buffer("uses", (post_neurons, pre_neurons), torch.float32, 0))
         self.register_buffer("plasticity_events", torch.zeros((), dtype=torch.long))
         self.register_buffer("decay_cycles", torch.zeros((), dtype=torch.long))
 
@@ -136,6 +128,8 @@ class STDPSynapses(nn.Module):
         return torch.full(shape, fill, dtype=dtype)
 
     def _apply(self, fn, recurse=True):
+        if hasattr(self, "_sparse_state"):
+            return super()._apply(fn, recurse=recurse)
         if getattr(self, "_router_state_pager", None) is None:
             return super()._apply(fn, recurse=recurse)
         matrices = {name: self._buffers[name] for name in MATRIX_FIELDS}
@@ -150,6 +144,8 @@ class STDPSynapses(nn.Module):
         return pager.tile_bytes if pager is not None else TRANSFER_BYTES
 
     def _operation(self, *, validating=False):
+        if hasattr(self, "_sparse_state") and not validating and not self._sparse_state.ready:
+            raise RuntimeError("sparse router used before its complete bounded checkpoint load")
         pager = getattr(self, "_router_state_pager", None)
         return pager.operation(self, validating=validating) if pager is not None else nullcontext()
 
@@ -178,6 +174,9 @@ class STDPSynapses(nn.Module):
                 counter = getattr(self, name)
                 if counter.shape != () or counter.dtype != torch.long or int(counter) < 0:
                     raise ValueError("router timing counter is invalid")
+            if hasattr(self, "_sparse_state"):
+                self._sparse_state.validate()
+                return
             for r0, r1, c0, c1 in tile_ranges(self.post_neurons, self.pre_neurons, self._tile_budget()):
                 with self._ram((r1-r0)*(c1-c0)*32, "router control validation"):
                     eligibility = self.eligibility_accumulator[r0:r1, c0:c1]
@@ -199,11 +198,48 @@ class STDPSynapses(nn.Module):
         """The sole persistent synaptic weight bytes for checksum/accounting."""
 
         self._validate_packed()
+        if hasattr(self, "_sparse_state"):
+            # Registered owners are the child blocks. Generic rollback/hash
+            # walkers enumerate them without attributing their bytes twice.
+            return ()
         return (self._packed_weights,)
+
+    def iter_authoritative_packed_tensors(self):
+        """Aggregate bounded discovery for direct synapse-inspection callers."""
+        self._validate_packed()
+        if hasattr(self, "_sparse_state"):
+            for block in self.blocks.values():
+                yield from block.authoritative_packed_tensors()
+        else:
+            yield self._packed_weights
 
     @property
     def logical_ternary_parameter_count(self) -> int:
+        if hasattr(self, "_sparse_state"):
+            return self._sparse_state.allocated_trits
         return int(self.pre_neurons * self.post_neurons)
+
+    @property
+    def logical_connectivity_count(self) -> int:
+        """Potential pairs, distinct from actually allocated learned trits."""
+        return int(self.pre_neurons * self.post_neurons)
+
+    def sparse_state_status(self):
+        return self._sparse_state.status() if hasattr(self, "_sparse_state") else {
+            "mode": "dense-native-compatibility-owner", "potentialConnectivity": self.logical_connectivity_count}
+
+    def capture_packed_topology_boundary(self):
+        if not hasattr(self, "_sparse_state") or not self._sparse_state.ready:
+            raise RuntimeError("packed topology capture requires the loaded native sparse owner")
+        return self._sparse_state, self._sparse_state._generation
+
+    @torch.no_grad()
+    def load_recurrent_state_bounded(self, reader, prefix=""):
+        """Load this entire prefix before the outer router's bounded load."""
+        if not hasattr(self, "_sparse_state"):
+            raise RuntimeError("bounded recurrent migration requires the sparse native destination")
+        with self._operation(validating=True):
+            return self._sparse_state.load_bounded(reader, prefix)
 
     @torch.no_grad()
     def set_effective_weights(self, levels: torch.Tensor) -> None:
@@ -214,6 +250,9 @@ class STDPSynapses(nn.Module):
         if levels.dtype != torch.int8:
             raise ValueError("synapse levels must be exact int8 ternary values")
         with self._operation():
+            if hasattr(self, "_sparse_state"):
+                self._sparse_state.set_levels(levels)
+                return
             pager = getattr(self, "_router_state_pager", None)
             journal = RouterMutationJournal(self, pager, ram_bytes=pager.journal_ram_bytes if pager is not None else TRANSFER_BYTES)
             try:
@@ -239,6 +278,26 @@ class STDPSynapses(nn.Module):
         self, state_dict, prefix, local_metadata, strict, missing_keys,
         unexpected_keys, error_msgs,
     ):
+        if hasattr(self, "_sparse_state"):
+            # Large and legacy dense state must use the bounded migration
+            # entry point. Do not silently discard its controls or allocate a
+            # full decoded/floating shadow via a convenience state_dict load.
+            if prefix + "weights" in state_dict or prefix + "_packed_weights" in state_dict:
+                error_msgs.append(prefix + "recurrent state requires load_recurrent_state_bounded")
+                return
+            layout = state_dict.get(prefix + "_sparse_layout")
+            if layout is None or not torch.equal(layout.detach().cpu(), self._sparse_layout.detach().cpu()):
+                error_msgs.append(prefix + "sparse recurrent layout mismatch")
+                return
+            for name in state_dict:
+                if name.startswith(prefix + "blocks."):
+                    key = name[len(prefix + "blocks."):].split(".")[0]
+                    if key not in self.blocks:
+                        error_msgs.append(prefix + "sparse recurrent blocks must be prepared by the bounded loader")
+                        return
+            super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                missing_keys, unexpected_keys, error_msgs)
+            return
         legacy_name = prefix + "weights"
         packed_name = prefix + "_packed_weights"
         if legacy_name in state_dict:
@@ -264,6 +323,9 @@ class STDPSynapses(nn.Module):
 
     def _validate_packed(self) -> None:
         """Bounded byte/code validation, without an N² decoded shadow."""
+        if hasattr(self, "_sparse_state"):
+            self._sparse_state.validate()
+            return
         packed = self._packed_weights
         if packed.dtype != torch.uint8 or not packed.is_contiguous() or packed.shape != (
             self.post_neurons, (self.pre_neurons + 3) // 4
@@ -295,10 +357,19 @@ class STDPSynapses(nn.Module):
             raise ValueError("full router inspection exceeds one tile; use iter_effective_tiles/recurrent/count helpers")
         with self._operation(), self._ram(needed * 8, "explicit router inspection"):
             self._validate_packed()
+            if hasattr(self, "_sparse_state"):
+                result = torch.zeros((self.post_neurons, self.pre_neurons), dtype=torch.int8)
+                for region, levels in self._sparse_state.iter_effective_tiles():
+                    r0, r1, c0, c1 = region
+                    result[r0:r1, c0:c1].copy_(levels)
+                return result
             return unpack_ternary_weight_rows(self._packed_weights, self.pre_neurons)
 
     def iter_effective_tiles(self):
         with self._operation():
+            if hasattr(self, "_sparse_state"):
+                yield from self._sparse_state.iter_effective_tiles()
+                return
             for region in tile_ranges(self.post_neurons, self.pre_neurons, self._tile_budget()):
                 self._check()
                 try:
@@ -309,6 +380,11 @@ class STDPSynapses(nn.Module):
 
     def iter_decoded_weight_chunks(self):
         """Bounded row-major int8 view matching the historical inspection dtype."""
+        if hasattr(self, "_sparse_state"):
+            with self._operation():
+                self._validate_packed()
+                yield from self._sparse_state.dense_field_chunks("weights")
+            return
         yield from iter_row_major_ternary_chunks(self)
 
     def _historical_checksum(self, *, controls: bool) -> str:
@@ -320,20 +396,37 @@ class STDPSynapses(nn.Module):
                 digest.update(memoryview(block.view(torch.uint8).numpy()))
             if controls:
                 for name in ("stability", "uses", "plasticity_events"):
-                    update_historical_tensor_checksum(digest, getattr(self, name), self)
+                    if hasattr(self, "_sparse_state") and name != "plasticity_events":
+                        self._sparse_state.update_control_checksum(digest, name)
+                    else:
+                        update_historical_tensor_checksum(digest, getattr(self, name), self)
             return digest.hexdigest()
 
     def checksum_with_controls(self) -> str:
-        """Exact old Fresh boundary digest, without decoded N×N weights."""
+        """Canonical allocated native state; no implicit-potential scan."""
+        if hasattr(self, "_sparse_state"):
+            with self._operation():
+                return self._sparse_state.canonical_checksum(controls=True)
         return self._historical_checksum(controls=True)
 
     def decoded_weight_checksum(self) -> str:
-        """Exact old feedback weight-only digest, not a packed-byte digest."""
+        """Canonical allocated sparse weights (legacy dense owner compatible)."""
+        if hasattr(self, "_sparse_state"):
+            with self._operation():
+                return self._sparse_state.canonical_checksum(controls=False)
+        return self._historical_checksum(controls=False)
+
+    def historical_checksum_with_controls(self) -> str:
+        """Explicit old dense-byte equivalence proof, not normal integrity."""
+        return self._historical_checksum(controls=True)
+
+    def historical_decoded_weight_checksum(self) -> str:
+        """Explicit virtual row-major decoded weights for archived proofs."""
         return self._historical_checksum(controls=False)
 
     @torch.no_grad()
     def recurrent(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Every original dense edge participates; only temporary tiles decode."""
+        """All allocated edges participate; absent blocks are exact zero."""
         if inputs.numel() != self.pre_neurons or not bool(torch.isfinite(inputs).all()):
             raise ValueError("router recurrence vector is invalid")
         with self._operation(), self._ram((self.pre_neurons + self.post_neurons) * inputs.element_size() * 3, "router recurrent live vectors"):
@@ -354,6 +447,8 @@ class STDPSynapses(nn.Module):
         columns = self.pre_neurons if prefix is None else min(self.pre_neurons, int(prefix))
         total = 0.0
         with self._operation():
+            if hasattr(self, "_sparse_state"):
+                return self._sparse_state.stability_total(rows, columns) / max(1, rows * columns)
             for r0, r1, c0, c1 in tile_ranges(rows, columns, self._tile_budget()):
                 with self._ram((r1-r0)*(c1-c0)*16, "router stability reduction"):
                     total += float(self.stability[r0:r1, c0:c1].detach().to(device="cpu", dtype=torch.float64).sum())
@@ -375,6 +470,8 @@ class STDPSynapses(nn.Module):
             old_post = self.post_trace.detach().to(device="cpu", copy=True)
             if not all(bool(torch.isfinite(value).all()) for value in (pre, post, old_pre, old_post)):
                 raise ValueError("router spike/timing vectors must be finite")
+            if hasattr(self, "_sparse_state"):
+                return STDPUpdateSummary(*self._sparse_state.step(pre, post, old_pre, old_post))
             journal = RouterMutationJournal(self, pager, ram_bytes=ram_limit)
             absolute = signed = 0.0
             level_abs = level_signed = changed_count = active_count = 0
@@ -458,6 +555,9 @@ class STDPSynapses(nn.Module):
         amount = max(0.0, min(float(amount), 1.0))
         pager = getattr(self, "_router_state_pager", None)
         with self._operation():
+            if hasattr(self, "_sparse_state"):
+                self._sparse_state.decay_unused(amount)
+                return
             journal = RouterMutationJournal(self, pager, ram_bytes=pager.journal_ram_bytes if pager is not None else TRANSFER_BYTES)
             try:
                 journal.capture("decay_cycles")
@@ -526,6 +626,8 @@ class AssociativeSpikingRouter(nn.Module):
         """Preserve old trits/activity and add an initially dormant region."""
         if isinstance(add_neurons, bool) or not isinstance(add_neurons, int) or add_neurons < 1:
             raise ValueError("router additions must be a positive integer")
+        if not hasattr(self.synapses, "_sparse_state"):
+            raise RuntimeError("migrate dense-native recurrent state through its bounded loader before growth")
         old_neurons, new_neurons = int(self.neurons), int(self.neurons) + add_neurons
         if region_sizes is not None and (any(type(size) is not int or size < 1 for size in region_sizes) or sum(region_sizes) != add_neurons):
             raise ValueError("router region sizes must cover all appended neurons")
@@ -558,14 +660,7 @@ class AssociativeSpikingRouter(nn.Module):
                 weight_limit=old_synapses.weight_limit).to(device)
             synapses.pre_decay = old_synapses.pre_decay
             synapses.post_decay = old_synapses.post_decay
-            for name in MATRIX_FIELDS:
-                source, target = getattr(old_synapses, name), getattr(synapses, name)
-                for r0, r1, c0, c1 in tile_ranges(source.shape[0], source.shape[1], synapses._tile_budget()):
-                    with synapses._ram((r1-r0)*(c1-c0)*target.element_size()*3, "exact router growth prefix"):
-                        target[r0:r1, c0:c1].copy_(source[r0:r1, c0:c1].to(target.device))
-                    if router_pager is not None:
-                        for row in range(r0, r1):
-                            router_pager.release_chunk(target, (row*target.shape[1]+c0)*target.element_size(), (c1-c0)*target.element_size())
+            synapses._sparse_state.copy_from(old_synapses._sparse_state)
             for name in ("pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
                 copy_tensor_prefix(getattr(old_synapses, name), getattr(synapses, name))
             incoming.to(device)
@@ -580,7 +675,7 @@ class AssociativeSpikingRouter(nn.Module):
         self.neurons = new_neurons
         self.region_ends = torch.tensor(ends, dtype=torch.long, device=device)
         if router_pager is not None:
-            router_pager.release_owner(old_synapses)
+            old_synapses._sparse_state.release_all()
         return new_neurons
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):

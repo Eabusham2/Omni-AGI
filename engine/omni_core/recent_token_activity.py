@@ -152,7 +152,8 @@ class RecentTokenActivity:
         return tokens + list(turn)
 
     def cool(
-        self, tokens: List[int], afterimages: Sequence[Mapping[str, Any]], cycle: int
+        self, tokens: List[int], afterimages: Sequence[Mapping[str, Any]], cycle: int,
+        *, protected_episode_ids: Optional[set[str]] = None,
     ) -> List[int]:
         self._validate_alignment(tokens)
         by_id = {
@@ -167,7 +168,8 @@ class RecentTokenActivity:
             # No arbitrary turn-count/time cutoff. Preserve the current turn,
             # proved unfinished activity and exact episode reuse. Missing
             # legacy bindings are explicit, not fabricated neural evidence.
-            protected = index == len(self.spans) - 1 or not identifier
+            protected = (index == len(self.spans) - 1 or not identifier
+                         or identifier in (protected_episode_ids or set()))
             if item is not None:
                 protected = protected or (
                     _unit(item.get("unfinishedScore")) >= 0.35

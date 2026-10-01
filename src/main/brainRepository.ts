@@ -23,6 +23,9 @@ import { DatabaseSync } from "node:sqlite";
 import { basename, dirname, join, resolve } from "node:path";
 import { validateNativeArchitectureDescriptor } from "./nativeCoreInventory";
 import { savedToolIntentFiles, validateSavedToolIntent } from "./savedToolIntents";
+import { savedActionEvidenceFiles, rekeyActionEvidenceJobs, validateSavedActionEvidenceFiles } from "./completedActionEvidence";
+import { savedEvolutionContinuationFiles, safeEvolutionContinuationPath, savedEvolutionArchive,
+  validateEvolutionContinuationFiles, validateSavedEvolutionArchive } from "./savedEvolutionContinuation";
 import { strToU8 } from "fflate";
 import {
   BRAIN_SCHEMA_VERSION,
@@ -167,6 +170,9 @@ interface SavedSnapshotSummary extends BrainSnapshotSummary {
 
 function safeSnapshotContinuationPath(path: string): string {
   if (path !== "engine/state/working-memory.sqlite3" &&
+    path !== "evolution/archive.json" &&
+    !(path.startsWith("engine/") && safeEvolutionContinuationPath(path.slice(7))) &&
+    !/^engine\/action-result-learning\/(?:jobs\/[a-f0-9]{64}\.json|evidence\/[a-f0-9]{64}\.jsonl)$/.test(path) &&
     !/^engine\/evaluation\/(?:geometry-holdouts\.json|data\/[a-f0-9]{32}(?:\.[A-Za-z0-9_-]+)?)$/.test(path) &&
     !/^engine\/state\/concept-id-views\/[a-f0-9]{64}\.jsonl$/.test(path) &&
     !/^engine\/operational-tool-intents\/[a-f0-9-]{36}\.json$/i.test(path) &&
@@ -282,6 +288,20 @@ async function snapshotComponentHashes(base: string, summary: SavedSnapshotSumma
         [...observedIntents.keys()].some(name => !declaredIntents.has(name))) {
         throw new Error("Recovery-point operational journal differs from its committed declaration.");
       }
+      for (const [prefix, observed] of [
+        ["engine/action-result-learning/", await savedActionEvidenceFiles(engine)],
+        ["engine/", await savedEvolutionContinuationFiles(engine)]
+      ] as const) {
+        const declared = new Set(summary.savedContinuation.componentPaths.filter(path => prefix === "engine/"
+          ? path.startsWith(prefix) && safeEvolutionContinuationPath(path.slice(prefix.length)) : path.startsWith(prefix))
+          .map(path => path.slice(prefix.length)));
+        if (declared.size !== observed.size || [...observed.keys()].some(path => !declared.has(path))) {
+          throw new Error("Recovery-point inert continuation differs from its committed declaration.");
+        }
+      }
+      if (summary.savedContinuation.componentPaths.includes("evolution/archive.json")) {
+        await validateSavedEvolutionArchive(join(base, "evolution", "archive.json"));
+      }
       validateSavedWorkingPages(await pathExists(join(engine, "state", "working-memory.sqlite3"))
         ? join(engine, "state", "working-memory.sqlite3") : undefined, state);
       await savedJointGenerationFiles(state, (kind, relative) =>
@@ -359,6 +379,7 @@ async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads
     state.brain_id = brainId;
     await atomicWrite(enginePath, JSON.stringify(state, null, 2));
   }
+  await rekeyActionEvidenceJobs(join(base, "engine"), brainId);
   for (const [relative, key] of [
     ["conversation/ledger.sqlite3", "brainId"], ["activity/ledger.sqlite3", "brainId"],
     ["engine/conversation.sqlite3", "brain_id"], ["engine/artifacts/index.sqlite3", "brainId"]
@@ -1741,6 +1762,17 @@ function savedEngineState(contents: Buffer): Uint8Array {
 }
 
 /** Carry only the exact protected real-data references sealed in engine state. */
+export function portableGeometryReference(relative: string): string {
+  const match = /^evaluation\/data\/([a-f0-9]{32})(\.[^/\\\0]+)?$/.exec(relative);
+  if (!match) {
+    if (relative === "evaluation/geometry-holdouts.json") return relative;
+    throw new Error("Saved geometry data is not a generated owned path.");
+  }
+  const suffix = match[2] ?? "";
+  if (!suffix || /^\.[A-Za-z0-9_-]{1,128}$/.test(suffix)) return relative;
+  return `evaluation/data/${match[1]}.legacy-${createHash("sha256").update(suffix, "utf8").digest("hex")}`;
+}
+
 async function savedGeometryHoldoutFiles(
   state: unknown,
   engineDirectory: string
@@ -1777,17 +1809,19 @@ async function savedGeometryHoldoutFiles(
     if (!Array.isArray(entries) || !entries.length) throw new Error("Saved geometry holdout category is empty.");
     for (const entry of entries) {
       if (!isRecord(entry) || typeof entry.path !== "string" ||
-        !/^evaluation\/data\/[a-f0-9]{32}(?:\.[A-Za-z0-9_-]+)?$/.test(entry.path) ||
         typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256) ||
         !Number.isSafeInteger(entry.records) || Number(entry.records) < 1 || files.has(entry.path)) {
         throw new Error("Saved geometry holdout file declaration is invalid.");
       }
-      const source = join(engineDirectory, ...entry.path.split("/"));
+      const portable = portableGeometryReference(entry.path);
+      if (files.has(portable)) throw new Error("Saved geometry alias is repeated.");
+      let source = join(engineDirectory, ...entry.path.split("/"));
+      if (!(await pathExists(source))) source = join(engineDirectory, ...portable.split("/"));
       const info = await lstat(source);
       if (!info.isFile() || info.isSymbolicLink() || await fileSha256(source) !== entry.sha256) {
         throw new Error("Saved geometry holdout file is missing or changed.");
       }
-      files.set(entry.path, source);
+      files.set(portable, source);
     }
   }
   return files;
@@ -3645,7 +3679,8 @@ export class BrainRepository {
     sourceEngine: string,
     destinationEngine: string,
     metadata: unknown,
-    operation?: BrainStorageOperationHooks
+    operation?: BrainStorageOperationHooks,
+    destinationHost = dirname(destinationEngine)
   ): Promise<{ paths: string[]; hashes: string[] }> {
     const paths: string[] = [];
     const hashes: string[] = [];
@@ -3677,6 +3712,24 @@ export class BrainRepository {
       await this.linkBlobTo(hash, join(destinationEngine, "operational-tool-intents", name), operation);
       paths.push(`engine/operational-tool-intents/${name}`);
       hashes.push(hash);
+    }
+    for (const [relative, source] of await savedActionEvidenceFiles(sourceEngine)) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      await this.linkBlobTo(hash, join(destinationEngine, "action-result-learning", ...relative.split("/")), operation);
+      paths.push(`engine/action-result-learning/${relative}`); hashes.push(hash);
+    }
+    for (const [relative, source] of await savedEvolutionContinuationFiles(sourceEngine)) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      await this.linkBlobTo(hash, join(destinationEngine, ...relative.split("/")), operation);
+      paths.push(`engine/${relative}`); hashes.push(hash);
+    }
+    const archive = await savedEvolutionArchive(dirname(sourceEngine));
+    if (archive) {
+      const hash = await this.storeFileAsBlob(archive, operation);
+      await this.linkBlobTo(hash, join(destinationHost, "evolution", "archive.json"), operation);
+      paths.push("evolution/archive.json"); hashes.push(hash);
     }
     for (const [relative, source] of await savedConceptIdViewFiles(sourceEngine)) {
       operation?.signal.throwIfAborted();
@@ -3903,6 +3956,12 @@ export class BrainRepository {
     for (const [source, destination] of [[sourceEngine, targetEngine], [originSourceEngine, targetOrigin]]) {
       for (const [name, path] of await savedToolIntentFiles(source!)) {
         await addPath(path, join(destination!, "operational-tool-intents", name), `historical tool intent ${name}`, true);
+      }
+      for (const [relative, path] of await savedActionEvidenceFiles(source!)) {
+        await addPath(path, join(destination!, "action-result-learning", ...relative.split("/")), "historical completed action evidence", true);
+      }
+      for (const [relative, path] of await savedEvolutionContinuationFiles(source!)) {
+        await addPath(path, join(destination!, ...relative.split("/")), "saved inert evolution lineage", true);
       }
       for (const [relative, path] of await savedConceptIdViewFiles(source!)) {
         await addPath(path, join(destination!, ...relative.split("/")), "historical structural argument view", true);
@@ -4198,6 +4257,7 @@ export class BrainRepository {
           sourceArtifactIndex.artifacts
         );
       }
+      await rekeyActionEvidenceJobs(targetEngine, targetBrainId);
       const neuralConversationPath = join(sourceEngine, "conversation.sqlite3");
       if (await pathExists(neuralConversationPath)) {
         validateNeuralConversationLedger(neuralConversationPath, sourceBrainId);
@@ -4581,6 +4641,17 @@ export class BrainRepository {
     } finally {
       ledger.close();
     }
+  }
+
+  /** Project only an actual native-admitted human row; never invent a reply. */
+  async appendReceivedChatInput(id: string, message: ChatMessage): Promise<void> {
+    if (message.role !== "human" || message.inputReceipt?.committed !== true || message.id !== message.inputReceipt.humanMessageId) {
+      throw new Error("Received-input projection needs an authoritative human receipt.");
+    }
+    await access(this.documentPath(id));
+    const ledger = await ConversationLedger.open(this.brainDirectory(id), id);
+    try { ledger.append([{ kind: "message", value: message }]); }
+    finally { ledger.close(); }
   }
 
   /**
@@ -5213,6 +5284,11 @@ export class BrainRepository {
         fork.name,
         storageOperation
       );
+      const evolutionArchive = await savedEvolutionArchive(this.brainDirectory(source.id));
+      if (evolutionArchive) {
+        const hash = await this.storeFileAsBlob(evolutionArchive, storageOperation);
+        await this.linkBlobTo(hash, join(directory, "evolution", "archive.json"), storageOperation);
+      }
       const completed = clone(await this.get(fork.id));
       await this.observeCommittedBrain(completed);
       return completed;
@@ -5729,6 +5805,10 @@ export class BrainRepository {
     const activityPath = BrainActivityLedger.databasePath(brainDirectory);
     const conversationBackup = `${conversationPath}.${randomUUID()}.previous`;
     const activityBackup = `${activityPath}.${randomUUID()}.previous`;
+    const evolutionArchivePath = join(brainDirectory, "evolution", "archive.json");
+    const evolutionArchiveBackup = `${evolutionArchivePath}.${randomUUID()}.previous`;
+    let evolutionArchiveBackedUp = false;
+    let evolutionArchivePromoted = false;
     let conversationBackedUp = false;
     let activityBackedUp = false;
     let conversationPromoted = false;
@@ -5737,6 +5817,13 @@ export class BrainRepository {
     let previousMoved = false;
     let promoted = false;
     const rollbackHostLedgers = async (): Promise<void> => {
+      if (evolutionArchivePromoted) {
+        await rm(evolutionArchivePath, { force: true }).catch(() => undefined);
+        evolutionArchivePromoted = false;
+      }
+      if (evolutionArchiveBackedUp && await pathExists(evolutionArchiveBackup)) {
+        await rename(evolutionArchiveBackup, evolutionArchivePath); evolutionArchiveBackedUp = false;
+      }
       if (conversationPromoted) {
         await rm(conversationPath, { force: true }).catch(() => undefined);
         conversationPromoted = false;
@@ -5825,7 +5912,7 @@ export class BrainRepository {
         metadataValue,
         operation
       );
-      await this.copySavedContinuation(engineSnapshot, stagedEngine, metadataValue, operation);
+      await this.copySavedContinuation(engineSnapshot, stagedEngine, metadataValue, operation, stagedHost);
       if (summary.durableState) {
         await rm(join(stagedEngine, "artifacts"), {
           recursive: true,
@@ -5870,6 +5957,14 @@ export class BrainRepository {
       await rename(stagedEngine, targetEngine);
       promoted = true;
       try {
+        if (summary.savedContinuation?.componentPaths.includes("evolution/archive.json")) {
+          await mkdir(dirname(evolutionArchivePath), { recursive: true });
+          if (await pathExists(evolutionArchivePath)) {
+            await rename(evolutionArchivePath, evolutionArchiveBackup); evolutionArchiveBackedUp = true;
+          }
+          await rename(join(stagedHost, "evolution", "archive.json"), evolutionArchivePath);
+          evolutionArchivePromoted = true;
+        }
         if (summary.durableState) {
           await rename(conversationPath, conversationBackup);
           conversationBackedUp = true;
@@ -5898,6 +5993,7 @@ export class BrainRepository {
         );
         previousMoved = false;
         await Promise.all([
+          rm(evolutionArchiveBackup, { force: true }).catch(() => undefined),
           rm(conversationBackup, { force: true }).catch(() => undefined),
           rm(activityBackup, { force: true }).catch(() => undefined)
         ]);
@@ -6398,6 +6494,14 @@ export class BrainRepository {
         const name = `operational/${scope}/${file}`;
         entries[name] = { name, sourcePath: path };
       }
+      for (const [relative, path] of await savedActionEvidenceFiles(sourceEngine)) {
+        const name = `action-evidence/${scope}/${relative}`;
+        entries[name] = { name, sourcePath: path };
+      }
+      for (const [relative, path] of await savedEvolutionContinuationFiles(sourceEngine)) {
+        const name = `evolution/${scope}/${relative}`;
+        entries[name] = { name, sourcePath: path };
+      }
       const ledgerPath = join(sourceEngine, "conversation.sqlite3");
       const hasLedger = await pathExists(ledgerPath);
       assertImportedNeuralConversationHead(metadata, `Saved ${scope} state`, hasLedger);
@@ -6428,6 +6532,8 @@ export class BrainRepository {
         entries[name] = { name, sourcePath };
       }
     }
+    const mainEvolutionArchive = await savedEvolutionArchive(this.brainDirectory(portableBrain.id));
+    if (mainEvolutionArchive) entries["evolution/host/archive.json"] = { name: "evolution/host/archive.json", sourcePath: mainEvolutionArchive };
     const [currentSubstrate, originSubstrate] = await Promise.all([
       collectSubstrateSnapshot(
         engineDirectory,
@@ -7312,6 +7418,8 @@ export class BrainRepository {
     ]);
     const jointPaths = { current: new Set<string>(), origin: new Set<string>() };
     const operationalIntentPaths = { current: [] as string[], origin: [] as string[] };
+    const actionEvidencePaths = { current: new Map<string, string>(), origin: new Map<string, string>() };
+    const evolutionPaths = { current: new Map<string, string>(), origin: new Map<string, string>() };
     for (const name of names) {
       if (!name.startsWith("concept-views/")) continue;
       const match = /^concept-views\/(current|origin)\/([a-f0-9]{64}\.jsonl)$/.exec(name);
@@ -7325,6 +7433,22 @@ export class BrainRepository {
       await validateSavedToolIntent(entryPath(name));
       operationalIntentPaths[match[1] as "current" | "origin"].push(name);
     }
+    for (const name of names) {
+      if (name.startsWith("action-evidence/")) {
+        const match = /^action-evidence\/(current|origin)\/(jobs\/[a-f0-9]{64}\.json|evidence\/[a-f0-9]{64}\.jsonl)$/.exec(name);
+        if (!match) throw new Error("The bundle contains an unsafe completed evidence path.");
+        actionEvidencePaths[match[1] as "current" | "origin"].set(match[2]!, entryPath(name));
+      } else if (name.startsWith("evolution/") && name !== "evolution/host/archive.json") {
+        const match = /^evolution\/(current|origin)\/(.+)$/.exec(name);
+        if (!match || !safeEvolutionContinuationPath(match[2]!)) throw new Error("The bundle contains an unsafe inert evolution path.");
+        evolutionPaths[match[1] as "current" | "origin"].set(match[2]!, entryPath(name));
+      }
+    }
+    for (const scope of ["current", "origin"] as const) {
+      await validateSavedActionEvidenceFiles(actionEvidencePaths[scope]);
+      await validateEvolutionContinuationFiles(evolutionPaths[scope]);
+    }
+    if (names.has("evolution/host/archive.json")) await validateSavedEvolutionArchive(entryPath("evolution/host/archive.json"));
     for (const [scope, state] of [["current", engineValue], ["origin", originEngineValue]] as const) {
       const files = await savedJointGenerationFiles(state, (kind, relative) =>
         entryPath(`${kind}/${scope}/${relative}`)
@@ -7558,6 +7682,17 @@ export class BrainRepository {
           await materializeFile(entryPath(path), join(directory, "engine",
             ...(scope === "origin" ? ["origin"] : []), "operational-tool-intents", basename(path)), false);
         }
+        for (const [relative, source] of actionEvidencePaths[scope]) {
+          await materializeFile(source, join(directory, "engine", ...(scope === "origin" ? ["origin"] : []),
+            "action-result-learning", ...relative.split("/")), false);
+        }
+        for (const [relative, source] of evolutionPaths[scope]) {
+          await materializeFile(source, join(directory, "engine", ...(scope === "origin" ? ["origin"] : []), ...relative.split("/")), false);
+        }
+      }
+      await rekeyActionEvidenceJobs(join(directory, "engine"), imported.id);
+      if (names.has("evolution/host/archive.json")) {
+        await materializeFile(entryPath("evolution/host/archive.json"), join(directory, "evolution", "archive.json"), false);
       }
       if (hasActivityLedger) {
         await BrainActivityLedger.clone(

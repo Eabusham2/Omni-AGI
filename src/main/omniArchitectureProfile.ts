@@ -388,7 +388,7 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     };
   }
   function cost(shape: NativeArchitectureShape) {
-    const inventory = nativeCoreInventory(shape);
+    const inventory = nativeCoreInventory(shape, "block-sparse-v1");
     const derivedControlBytes = 4 * inventory.packedOwners + 8 * (2 * shape.layers + 6)
       + 2 * (shape.dModel / shape.nHeads) * shape.layers;
     const residentTensorAndStateReserve = inventory.packedWeightBytes + inventory.staticNonweightTensorBytes + derivedControlBytes + 16 * 1024;
@@ -412,11 +412,11 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     // Timing/STDP transient arrays are not a floating learned-weight master.
     // Cross-backend allocator/graph costs remain an explicit estimate.
     const boundedTrainingWithHeadroomReserve = Math.ceil((minimumTransferComputeReserve + minimumReturnedOutputReserve
-      + 32 * shape.routerNeurons ** 2 + 4 * MIB) * 1.2);
+      + 32 * Math.min(64, shape.routerNeurons) ** 2 + 16 * shape.routerNeurons + 4 * MIB) * 1.2);
     // This is a declared work *proxy*, not actual chat execution work. It
     // counts all projection entries plus one recurrent traversal, even though
     // an ordinary text turn does not execute every modality or every owner.
-    const traversalMacsProxy = inventory.projectionParameters + shape.routerNeurons ** 2;
+    const traversalMacsProxy = inventory.projectionParameters + Math.min(64, shape.routerNeurons) ** 2;
     return { inventory, checkpointReserve, nativeKernelReserve: checkpointReserve - workspaceBytes, traversalMacsProxy,
       residentTensorAndStateReserve, residentModelWithHeadroomReserve, baselineActivityWithHeadroomReserve,
       baselineWorkspaceRuntimeReserve, baselineKvAndIndexReserve, baselineFastItemReserve, residentItemBytesEstimate,
@@ -471,6 +471,7 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     architecture: "OmniCortex", externalPretrainedWeights: false,
     hardwareTier: tier, shape, inventory,
     sizing: {
+      routerStorageLayout: "block-sparse-v1",
       policy: ramFirst ? "total-envelope-ram-first-resident-baseline-headroom-v1" : compute ? "shared-envelope-measured-primitive-work-proxy-candidate-v1" : "shared-envelope-physical-capacity-admission-v2",
       selectedSystemRamBudgetBytes: Math.floor(input.selectedSystemRamBudgetBytes),
       runtimeBaselineReserveBytes: Math.floor(input.runtimeBaselineReserveBytes),

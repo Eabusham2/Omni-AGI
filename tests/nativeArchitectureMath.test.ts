@@ -13,6 +13,15 @@ const input = { hardwareTier: "personal" as const, workingMemoryItems: 32768,
   estimatedTrainingSourceBytes: 0, acceleratorAvailable: false };
 
 describe("source-derived native shape arithmetic without models", () => {
+  it("accounts sparse fresh storage without changing archived dense descriptor arithmetic", () => {
+    const old = nativeCoreInventory(shape);
+    const sparse = nativeCoreInventory(shape, "block-sparse-v1");
+    expect(sparse.routerSynapseParameters).toBe(0);
+    expect(sparse.logicalParameters).toBe(old.logicalParameters - shape.routerNeurons ** 2);
+    expect(sparse.packedWeightBytes).toBe(old.packedWeightBytes - shape.routerNeurons * Math.ceil(shape.routerNeurons / 4));
+    expect(sparse.routerNonweightTensorBytes).toBe(16 * shape.routerNeurons + 72);
+    expect(capacityDerivedNativeArchitectureProfile(input).nativeArchitecture?.sizing.routerStorageLayout).toBe("block-sparse-v1");
+  });
   it("matches the Python canonical descriptor and exact default inventory", () => {
     const inventory = nativeCoreInventory(shape);
     expect(inventory.logicalParameters).toBe(1301695);

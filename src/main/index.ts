@@ -484,7 +484,9 @@ async function bootstrap(): Promise<void> {
         error instanceof Error ? error.message : error
       );
     });
-    service.resumePendingChatLearning(summary.id);
+    // Ownership is selected before either optional durable queue resumes.
+    // Dormant imports/copies remain saved data, never a startup neural owner.
+    if (summary.activeMode) service.selectCompletedActionLearningOwner(summary.id);
   }
   const jobs = new RuntimeJobManager(service, engine, mediaArtifacts);
   const buildSelections = new BuildResourceSelectionStore(
@@ -549,6 +551,16 @@ async function bootstrap(): Promise<void> {
     isInitializationBusy: () => initialization.isBusy(),
     preemptBackground: () => engine!.claimForeground(),
     onError: (error) => console.error("Idle cognition cycle failed:", error)
+  });
+  evolution.setRecursiveReassessmentHandler(async (event) => {
+    // Observe a completed experiment, then offer the ordinary idle scheduler
+    // its next opportunity. The neural action head chooses new work or none;
+    // no behavioral prompt or repeating architecture command is supplied.
+    await service.learnStructuredExperience(event.brainId, {
+      content: JSON.stringify(event), name: `Observed improvement ${event.parentCandidateId}`,
+      sourceLabel: "completed own improvement experience", license: "Locally observed experiment"
+    });
+    await idleCognition?.tick();
   });
   actions.on("neural-cancelled", ({ brainId }: { brainId: string }) => {
     idleCognition?.reserveForegroundAfterCancel(brainId);

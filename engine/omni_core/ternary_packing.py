@@ -332,6 +332,18 @@ def collect_module_ternary_tensors(
             )
             if not (supported or claimed):
                 continue
+            if isinstance(module, STDPSynapses) and hasattr(module, "_sparse_state"):
+                if getattr(module, "ternary", False) is not True:
+                    raise TernaryCoverageError("sparse router is not marked ternary")
+                module._validate_packed()
+                for key, block in module.blocks.items():
+                    name = _qualified_name(root_name, module_name, "blocks." + key + ".weights")
+                    if name in collected:
+                        raise TernaryCoverageError("duplicate eligible tensor name: %s" % name)
+                    collected[name] = TernaryTensorSpec(
+                        name=name, values=packed_rows_source(block._packed_weights, (block.rows, block.columns)),
+                        scale=1.0, kind="dynamic-synapse", source_dtype="packed-2bit")
+                continue
             spec = _module_spec(root_name, module_name, module)
             if spec.name in collected:
                 raise TernaryCoverageError(
@@ -426,6 +438,15 @@ def inspect_module_ternary_layout(
                         "projection"
                         % _qualified_name(root_name, module_name, "weight")
                     )
+                continue
+            if supported_synapse and hasattr(module, "_sparse_state"):
+                if getattr(module, "ternary", False) is not True:
+                    raise TernaryCoverageError("sparse router is not marked ternary")
+                for key, block in module.blocks.items():
+                    name = _qualified_name(root_name, module_name, "blocks." + key + ".weights")
+                    if name in layout:
+                        raise TernaryCoverageError("%s has a duplicate weight" % name)
+                    layout[name] = ((block.rows, block.columns), "dynamic-synapse")
                 continue
             field = "weights" if supported_synapse else "weight"
             name = _qualified_name(root_name, module_name, field)

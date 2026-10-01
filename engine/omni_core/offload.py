@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import tempfile
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union, overload
@@ -34,7 +34,7 @@ from .persistence import (
     load_tensors,
     read_json,
 )
-from .managed_process_memory import default_managed_process_sampler
+from .managed_process_memory import default_managed_process_sampler, native_family_memory_containment
 from .shared_resource_ledger import SharedResourceLedger, SharedQuotaPause
 
 
@@ -73,6 +73,7 @@ class ResourceReading:
     managed_memory_sample_duration_ms: float = 0.0
     managed_memory_sample_age_seconds: float = 0.0
     managed_memory_sample_started_ns: Optional[int] = None
+    managed_process_pids: Tuple[int, ...] = ()
 
 
 _MAC_FOOTPRINT_CACHE_SECONDS = 1.0
@@ -345,14 +346,14 @@ def _mac_process_rusage() -> Tuple[Optional[int], Optional[int]]:
         return None, None
 
 
-def _mac_process_memory() -> Tuple[Optional[int], Optional[int]]:
+def _mac_process_memory(*, fresh: bool = False) -> Tuple[Optional[int], Optional[int]]:
     """Measure compressed-aware physical use without slowing neural steps."""
 
     global _mac_footprint_cache
     now = time.monotonic()
     with _mac_footprint_lock:
         cached_at, cached_current, cached_peak = _mac_footprint_cache
-        if now - cached_at < _MAC_FOOTPRINT_CACHE_SECONDS:
+        if not fresh and now - cached_at < _MAC_FOOTPRINT_CACHE_SECONDS:
             return cached_current, cached_peak
         current, peak = _mac_process_rusage()
         if current is None:
@@ -394,7 +395,7 @@ def _mac_process_memory() -> Tuple[Optional[int], Optional[int]]:
         return current, peak
 
 
-def _process_memory() -> Tuple[Optional[int], Optional[int]]:
+def _process_memory(*, fresh: bool = False) -> Tuple[Optional[int], Optional[int]]:
     try:
         if Path("/proc/self/statm").is_file():
             resident_pages = int(
@@ -431,7 +432,7 @@ def _process_memory() -> Tuple[Optional[int], Optional[int]]:
                 )
             return None, None
         if os.sys.platform == "darwin":
-            return _mac_process_memory()
+            return _mac_process_memory(fresh=fresh)
         # Portable fallback for platforms without a current-RSS API. This is
         # intentionally last because ru_maxrss is a peak, not live residency.
         import resource
@@ -551,24 +552,35 @@ class ResourcePolicy:
         self.shared_storage_pool_bytes = max(0, int(shared_storage_pool_bytes))
         self._shared_ledger_instance = shared_ledger
         self._shared_owner_registered = False
+        self._shared_ledger_lock = threading.RLock()
+        self._active_ram_lock = threading.RLock()
+        self._active_ram_watchers = 0
+        self._active_ram_generation = 0
+        self._active_ram_interval_seconds = 0.25
+        self._active_ram_stop: Optional[threading.Event] = None
+        self._active_ram_thread: Optional[threading.Thread] = None
+        self._active_ram_status: Optional[Dict[str, Any]] = None
+        self._active_ram_sampled_at = float("-inf")
 
     @property
     def shared_ledger(self) -> SharedResourceLedger:
-        if self._shared_ledger_instance is None:
-            configured = os.environ.get("OMNI_SHARED_RESOURCE_LEDGER")
-            path = Path(configured) if configured else Path(tempfile.gettempdir()) / ("omni-resource-ledger-%d" % os.getpid()) / "quota.sqlite3"
-            self._shared_ledger_instance = SharedResourceLedger(path)
-        if not self._shared_owner_registered:
-            self._shared_ledger_instance.register_owner(self.shared_resource_owner_id, self.shared_storage_pool_bytes,
-                preserve_existing_pool=self.shared_storage_pool_bytes == 0)
-            self._shared_owner_registered = True
-        return self._shared_ledger_instance
+        with self._shared_ledger_lock:
+            if self._shared_ledger_instance is None:
+                configured = os.environ.get("OMNI_SHARED_RESOURCE_LEDGER")
+                path = Path(configured) if configured else Path(tempfile.gettempdir()) / ("omni-resource-ledger-%d" % os.getpid()) / "quota.sqlite3"
+                self._shared_ledger_instance = SharedResourceLedger(path)
+            if not self._shared_owner_registered:
+                self._shared_ledger_instance.register_owner(self.shared_resource_owner_id, self.shared_storage_pool_bytes,
+                    preserve_existing_pool=self.shared_storage_pool_bytes == 0)
+                self._shared_owner_registered = True
+            return self._shared_ledger_instance
 
     def configure_shared_resources(self, *, owner_id: str, storage_pool_bytes: int):
-        self.shared_resource_owner_id = owner_id
-        self.shared_storage_pool_bytes = max(0, int(storage_pool_bytes))
-        self.shared_ledger.register_owner(owner_id, self.shared_storage_pool_bytes)
-        self._shared_owner_registered = True
+        with self._shared_ledger_lock:
+            self.shared_resource_owner_id = owner_id
+            self.shared_storage_pool_bytes = max(0, int(storage_pool_bytes))
+            self.shared_ledger.register_owner(owner_id, self.shared_storage_pool_bytes)
+            self._shared_owner_registered = True
 
     @staticmethod
     def _observed_memory_epoch(status):
@@ -577,7 +589,9 @@ class ResourcePolicy:
         return status.get("managedMemorySampleStartedNs")
 
     def reserve_ram(self, estimated_bytes: int, operation: str = "native RAM allocation"):
-        status = self.status(estimated_ram_bytes=estimated_bytes)
+        # Every new allocation receives a fresh family sample. A one-second
+        # UI/status cache must not permit multiple independent over-admissions.
+        status = self.status(estimated_ram_bytes=estimated_bytes, fresh_memory_sample=True)
         if status["memoryPressure"]:
             raise NeuralStateResourcePause(operation + " paused at selected RAM ceiling", status)
         try:
@@ -608,7 +622,103 @@ class ResourcePolicy:
     def reconcile_shared_owner(self, *, max_entries: int = 256, after_identity: str = ""):
         return self.shared_ledger.reconcile_owner(self.shared_resource_owner_id, max_entries=max_entries, after_identity=after_identity)
 
-    def readings(self) -> ResourceReading:
+    def _record_active_ram_sample(self, status: Dict[str, Any], generation: Optional[int] = None) -> None:
+        with self._active_ram_lock:
+            if generation is None or generation == self._active_ram_generation:
+                self._active_ram_status = status
+                self._active_ram_sampled_at = time.monotonic()
+
+    def _fresh_active_ram_status(self) -> Dict[str, Any]:
+        try:
+            return self.status(fresh_memory_sample=True)
+        except Exception as error:
+            # An unavailable sampler/ledger cannot be interpreted as zero
+            # residency. The foreground owner receives a recoverable pause.
+            return {"memoryPressure": True, "ramAdmissionVerified": False,
+                "paused": True, "recoverable": True, "activeWatchdogError": str(error)}
+
+    def _active_ram_watch(self, stop: threading.Event, generation: int) -> None:
+        while not stop.is_set():
+            status = self._fresh_active_ram_status()
+            self._record_active_ram_sample(status, generation)
+            with self._active_ram_lock:
+                next_interval = self._active_ram_interval_seconds
+            stop.wait(next_interval)
+
+    @contextmanager
+    def active_operation(self, operation: str, *, interval_seconds: float = 0.25):
+        """Monitor an active operation; callers pause at their safe boundaries.
+
+        A daemon only observes. It never kills a worker, mutates neural state,
+        changes the selected geometry/cap, or raises from another thread.
+        Concurrent chat/inline jobs share one monitor for this resource policy.
+        """
+        del operation
+        interval = float(interval_seconds)
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("active RAM monitor interval is invalid")
+        interval = max(0.05, interval)
+        with self._active_ram_lock:
+            self._active_ram_watchers += 1
+            if self._active_ram_watchers == 1:
+                self._active_ram_generation += 1
+                generation = self._active_ram_generation
+                self._active_ram_interval_seconds = interval
+                self._active_ram_status = None
+                self._active_ram_sampled_at = float("-inf")
+                stop = threading.Event()
+                self._active_ram_stop = stop
+                thread = threading.Thread(target=self._active_ram_watch,
+                    args=(stop, generation), name="omni-active-ram-watch", daemon=True)
+                self._active_ram_thread = thread
+                try:
+                    thread.start()
+                except BaseException:
+                    self._active_ram_watchers -= 1
+                    self._active_ram_stop = None
+                    self._active_ram_thread = None
+                    raise
+            else:
+                self._active_ram_interval_seconds = min(self._active_ram_interval_seconds, interval)
+        try:
+            yield self
+        finally:
+            with self._active_ram_lock:
+                self._active_ram_watchers -= 1
+                if self._active_ram_watchers == 0:
+                    if self._active_ram_stop is not None:
+                        self._active_ram_stop.set()
+                    self._active_ram_stop = None
+                    self._active_ram_thread = None
+                    self._active_ram_status = None
+                    self._active_ram_sampled_at = float("-inf")
+
+    def check_active_pressure(self, operation: str, *, reclaim: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+        """At a safe boundary, reclaim once and pause if fresh pressure remains.
+
+        The watcher makes active peaks visible without making each token pay
+        for a full process inventory. Positive/stale samples are rechecked
+        before pausing, so a closed application can let the work resume with
+        exactly the same selected memory budget and neural geometry.
+        """
+        with self._active_ram_lock:
+            active = self._active_ram_watchers > 0
+            cached = self._active_ram_status
+            age = time.monotonic() - self._active_ram_sampled_at
+            interval = self._active_ram_interval_seconds
+        if active and cached is not None and not cached.get("memoryPressure") and age < interval:
+            return cached
+        status = self._fresh_active_ram_status()
+        if status["memoryPressure"] and reclaim is not None:
+            reclaim()
+            status = self._fresh_active_ram_status()
+        self._record_active_ram_sample(status)
+        if status["memoryPressure"]:
+            raise NeuralStateResourcePause(operation + " paused at the active selected RAM ceiling",
+                {**status, "paused": True, "recoverable": True, "activeWatchdog": active})
+        return status
+
+    def readings(self, *, fresh_memory_sample: bool = False) -> ResourceReading:
         if self.reading_provider is not None:
             return self.reading_provider()
         probe = self.probe_path
@@ -632,8 +742,10 @@ class ResourcePolicy:
             if self.include_accelerator_memory
             else (None, None, None)
         )
-        process_memory, process_peak_memory = _process_memory()
-        managed = default_managed_process_sampler().sample()
+        process_memory, process_peak_memory = (
+            _process_memory(fresh=True) if fresh_memory_sample else _process_memory()
+        )
+        managed = default_managed_process_sampler().sample(force=fresh_memory_sample)
         return ResourceReading(
             total_memory_bytes=total,
             available_memory_bytes=available,
@@ -654,6 +766,7 @@ class ResourcePolicy:
             managed_memory_sample_duration_ms=managed.sample_duration_ms,
             managed_memory_sample_age_seconds=managed.sample_age_seconds,
             managed_memory_sample_started_ns=managed.sample_started_ns,
+            managed_process_pids=managed.owned_pids,
         )
 
     @staticmethod
@@ -752,8 +865,9 @@ class ResourcePolicy:
         *,
         estimated_write_bytes: int = 0,
         estimated_ram_bytes: int = 0,
+        fresh_memory_sample: bool = False,
     ) -> Dict[str, Any]:
-        reading = self.readings()
+        reading = self.readings(fresh_memory_sample=fresh_memory_sample)
         ram_reserve = self.configured_ram_reserve or self._adaptive_ram_reserve(
             reading.total_memory_bytes
         )
@@ -793,6 +907,16 @@ class ResourcePolicy:
                 system_ram_budget = min(system_ram_budget, int(quota["globalRamCeilingBytes"]))
             if projected_process_memory is not None:
                 projected_process_memory += int(quota["ramEscrowBytes"])
+            current_omni_available = min(current_omni_available, system_ram_budget)
+            current_omni_shortfall = max(0, system_ram_budget - current_omni_available)
+        native_containment = native_family_memory_containment(
+            system_ram_budget,
+            root_pid=int(reading.managed_memory_root_pid or 0),
+            worker_pid=os.getpid(), member_pids=reading.managed_process_pids,
+        ) if self.reading_provider is None else {
+            "mechanism": "injected-reading-unverified", "existingNativeBound": False,
+            "selectedCeilingNativeBounded": False, "hardRssIsolation": False,
+            "scope": "injected-reading"}
         memory_pressure = bool(
             unknown_ram
             or
@@ -824,6 +948,7 @@ class ResourcePolicy:
             "ramAdmissionVerified": not unknown_ram,
             "ramCapMechanism": "cooperative-measured-family-plus-estimated-allocation-admission",
             "hardRssIsolation": False,
+            "nativeMemoryContainment": native_containment,
             "crossProcessAtomicReservation": quota is not None,
             "sharedQuota": quota,
             "osPhysicalPagePinning": False,

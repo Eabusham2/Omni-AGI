@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ActionEvent } from "../shared/types";
+import { actualTerminalToolOutcome } from "./completedActionEvidence";
 
 export interface ChatToolObservation {
   format: "omni-chat-tool-observation-v1";
@@ -87,15 +88,17 @@ export function createChatToolObservation(
   admit: (estimatedAllocationBytes: number) => boolean
 ): ChatToolObservation | undefined {
   const execution = event.execution;
-  if (event.brainId !== brainId || event.action.kind !== "tool" || event.state !== "complete" ||
+  if (event.brainId !== brainId || event.action.kind !== "tool" || !["complete", "failed"].includes(event.state) ||
       event.cancellationRequested || !event.neuralActionId || !/^[a-f0-9]{32}$/.test(event.neuralActionId) ||
-      execution?.state !== "complete") return undefined;
+      !actualTerminalToolOutcome(execution) || !execution.finishedAt) return undefined;
   const toolId = event.action.toolId, action = event.action.action;
-  const completedAt = execution.finishedAt ?? event.updatedAt;
+  const completedAt = execution.finishedAt;
   if (![brainId, turnId, event.id, execution.id, toolId, action, completedAt].every(identity) ||
       canonicalToolId(execution.toolId) !== canonicalToolId(toolId) || execution.action !== action || !Number.isFinite(Date.parse(completedAt)) ||
       execution.output !== output) throw new Error("Live tool observation lost its exact completed execution binding.");
-  const data = output === undefined ? { outputPresent: false } : { outputPresent: true, output };
+  const data = { ...(output === undefined ? { outputPresent: false } : { outputPresent: true, output }),
+    ...(execution.state === "failed" ? { executionState: "failed", dispatchStarted: true,
+      ...(typeof execution.error === "string" ? { executionError: execution.error } : {}) } : {}) };
   // Both canonical payload and escaped RPC frame coexist briefly. Resource
   // admission precedes either copy; no fixed result-size product ceiling and
   // no silently shortened output are introduced.

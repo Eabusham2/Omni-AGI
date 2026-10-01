@@ -1,5 +1,9 @@
 # OmniCortex agreement and implementation recheck
 
+The [implementation closeout](AGREEMENT_IMPLEMENTATION_2026_09_30.md) supersedes
+the open source-difference status recorded in this historical recheck and its
+subsequent audit. Trained native qualification remains user-deferred.
+
 **Current follow-up:** the source at `20e36ee` was pushed to `main`. The later
 [current agreement remainder](AGREEMENT_REMAINDER_2026_09_30.md) supersedes
 current-status wording below. It records additional concrete source gaps and

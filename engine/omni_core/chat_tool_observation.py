@@ -87,9 +87,16 @@ class ChatToolObservationInbox:
             with parse_lease:
                 def invalid_constant(_value): raise ValueError("nonfinite tool observation JSON")
                 payload = json.loads(value["payloadJson"], parse_constant=invalid_constant)
-                if not isinstance(payload, dict) or type(payload.get("outputPresent")) is not bool or \
-                        set(payload) != ({"outputPresent", "output"} if payload["outputPresent"] else {"outputPresent"}):
+                if not isinstance(payload, dict) or type(payload.get("outputPresent")) is not bool:
                     raise ValueError("tool observation has no exact actual-output wrapper")
+                ordinary = {"outputPresent", "output"} if payload["outputPresent"] else {"outputPresent"}
+                keys = set(payload)
+                if keys != ordinary:
+                    failed = ordinary | {"executionState", "dispatchStarted"}
+                    if "executionError" in payload: failed.add("executionError")
+                    if (keys != failed or payload.get("executionState") != "failed" or payload.get("dispatchStarted") is not True
+                        or "executionError" in payload and not isinstance(payload["executionError"], str)):
+                        raise ValueError("tool observation has no exact actual failed-dispatch wrapper")
                 del payload
             self.pending.append(_RetainedObservation(value, allocation))
             self.seen.add(value["observationId"])

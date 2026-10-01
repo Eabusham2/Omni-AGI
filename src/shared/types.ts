@@ -218,6 +218,19 @@ export interface ChatMessage {
   status?: "complete" | "error";
   attentionEpoch?: number;
   deliveryReceipt?: ChatDeliveryReceipt;
+  /** Actual received human experience, durable before any assistant reply. */
+  inputReceipt?: ChatInputAcceptedReceipt;
+}
+
+export interface ChatInputAcceptedReceipt {
+  committed: true;
+  turnId: string;
+  inputSha256: string;
+  humanMessageId: string;
+  afterimageId: string;
+  createdAt: string;
+  attentionEpoch: number;
+  slowJobId?: string;
 }
 
 export interface TraceStep {
@@ -730,6 +743,8 @@ export type BackgroundParameterLearningState =
 export interface WorkspaceLearningStatus {
   /** Timestamp of the committed worker metadata used for these measurements. */
   measuredAt: string;
+  /** Inert host-owned actual outcome queue; does not imply cortical learning. */
+  completedActionResults?: { pending: number; state: "idle" | "pending" | "running" | "dormant" };
   fastNeuralMemory: {
     state: "idle" | "learned";
     safelyStored: boolean;
@@ -2209,6 +2224,8 @@ export interface ToolInvocation {
 }
 
 export interface ToolExecutionResult {
+  /** Entered trusted dispatch after authorization; does not assert a failed attempt changed external state. */
+  dispatchStarted?: true;
   id: string;
   toolId: string;
   action: string;
@@ -2462,6 +2479,12 @@ export interface ChatReplyCommittedStreamEvent extends ChatStreamEventBase {
   pendingActions: number;
 }
 
+export interface ChatInputAcceptedStreamEvent extends ChatStreamEventBase {
+  type: "chat-input-accepted";
+  inputReceipt: ChatInputAcceptedReceipt;
+  humanMessage: ChatMessage;
+}
+
 export interface ChatStateStreamEvent extends ChatStreamEventBase {
   type: "chat-state";
   state: "started" | "queued" | "complete" | "steered" | "stopped" | "no-reply" | "cancelled" | "failed";
@@ -2477,6 +2500,7 @@ export interface ChatStateStreamEvent extends ChatStreamEventBase {
  * instructions are parsed to manufacture an action.
  */
 export type ChatStreamEvent =
+  | ChatInputAcceptedStreamEvent
   | ChatTokenStreamEvent
   | ChatActionStreamEvent
   | ChatModalityPreviewStreamEvent
@@ -2602,6 +2626,22 @@ export interface EvolutionCandidate {
   authoredDiffSha256?: string;
   authoredBytes?: number;
   error?: string;
+  /** Exact authorized request retained as operational lineage, not a prompt. */
+  continuationRequest?: EvolutionStartRequest;
+  processMeasurement?: Record<string, unknown>;
+}
+
+export interface RecursiveEvolutionReassessment {
+  format: "omni-observed-evolution-reassessment";
+  formatVersion: 1;
+  brainId: string;
+  parentCandidateId: string;
+  workerCandidateId?: string;
+  candidateKind: NonNullable<EvolutionStartRequest["candidateKind"]>;
+  configuration: EvolutionStartRequest;
+  evaluation: Record<string, unknown>;
+  promotion: Record<string, unknown>;
+  processMeasurement?: Record<string, unknown>;
 }
 
 export interface EvolutionRun {

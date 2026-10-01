@@ -10,6 +10,7 @@ import type {
   EvolutionSourceEdit,
   EvolutionSourceEditLineage,
   EvolutionStartRequest,
+  RecursiveEvolutionReassessment,
   PromotionRecord,
   RuntimeJob,
   ToolPermissionLevel,
@@ -25,7 +26,8 @@ import {
   EVOLUTION_BENCHMARK_DOMAINS,
   EVOLUTION_EVALUATOR_VERSION,
   EVOLUTION_POLICY_SHA256,
-  EVOLUTION_TEST_NAMES
+  EVOLUTION_TEST_NAMES,
+  sourceImprovementEvidence
 } from "./evolutionPolicy";
 import { persistAuthorizedToolIntent } from "./toolIntentJournal";
 import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
@@ -102,6 +104,7 @@ export interface EvolutionEvaluationRecord extends EvolutionEvaluation {
   workerResources?: Record<string, unknown>;
   workerMetrics?: Record<string, unknown>;
   workerEvaluationSha256?: string;
+  improvementEvidence?: ReturnType<typeof sourceImprovementEvidence>;
   rejectionReason?: string;
 }
 
@@ -202,7 +205,12 @@ const REQUIRED_WORKER_CHECKS = [
   "objectiveNonRegression",
   "capabilityRetention",
   "neuralRetention",
-  "changed"
+  "changed",
+  "heldOutToken",
+  "heldOutModality",
+  "heldOutTool",
+  "heldOutResources",
+  "statisticallySupportedImprovement"
 ] as const;
 
 function clone<T>(value: T): T {
@@ -501,6 +509,35 @@ function workerState(status: string | undefined): EvolutionCandidateRecord["stat
 }
 
 export class EvolutionController {
+  private recursiveReassessmentHandler?: (event: RecursiveEvolutionReassessment) => Promise<void>;
+  private readonly trustedReassessmentParents = new Map<string, string>();
+
+  setRecursiveReassessmentHandler(handler: (event: RecursiveEvolutionReassessment) => Promise<void>): void {
+    this.recursiveReassessmentHandler = handler;
+  }
+
+  private async requestRecursiveReassessment(candidate: EvolutionCandidateRecord): Promise<void> {
+    const configuration = candidate.continuationRequest;
+    if (!configuration) throw new Error("Recursive candidate lost its exact authorized configuration.");
+    const evaluation = candidate.evaluations[candidate.evaluations.length - 1];
+    const event: RecursiveEvolutionReassessment = {
+      format: "omni-observed-evolution-reassessment", formatVersion: 1,
+      brainId: candidate.brainId, parentCandidateId: candidate.id,
+      workerCandidateId: candidate.workerCandidateId, candidateKind: candidate.candidateKind,
+      configuration: clone(configuration), evaluation: clone(evaluation ?? {}),
+      promotion: clone(candidate.neuralPromotion ?? candidate.promotion ?? {}),
+      ...(candidate.processMeasurement ? { processMeasurement: clone(candidate.processMeasurement) } : {})
+    };
+    this.trustedReassessmentParents.set(candidate.brainId, candidate.id);
+    if (!this.recursiveReassessmentHandler) {
+      await this.mutateArchive(candidate.brainId, (archive) => {
+        const current = archive.candidates.find((entry) => entry.id === candidate.id);
+        if (current) current.recursiveError = "Observed reassessment is pending the normal idle neural scheduler.";
+      });
+      return;
+    }
+    await this.recursiveReassessmentHandler(event);
+  }
   private readonly archiveLocks = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, string>();
   private readonly stoppingRuns = new Set<string>();
@@ -861,6 +898,15 @@ export class EvolutionController {
   }
 
   async start(request: EvolutionStartRequest): Promise<EvolutionRunRecord> {
+    if (request.provenance?.source === "same-native-cortex-action" && request.parentCandidateId === undefined) {
+      let parent = this.trustedReassessmentParents.get(request.brainId);
+      if (!parent) {
+        const archive = await this.loadArchive(request.brainId);
+        parent = [...archive.candidates].reverse().find((candidate) => candidate.state === "promoted" &&
+          archive.runs.some((run) => run.id === candidate.runId && run.recursive))?.id;
+      }
+      if (parent) request = { ...request, parentCandidateId: parent };
+    }
     return this.startWithPolicy(request, true);
   }
 
@@ -962,7 +1008,8 @@ export class EvolutionController {
         updatedAt: now,
         evaluations: [],
         evaluatorVersion: EVOLUTION_EVALUATOR_VERSION,
-        benchmarkDomains: [...EVOLUTION_BENCHMARK_DOMAINS]
+        benchmarkDomains: [...EVOLUTION_BENCHMARK_DOMAINS],
+        continuationRequest: clone(request)
       };
       archive.runs.push(run);
       archive.candidates.push(candidate);
@@ -1107,12 +1154,7 @@ export class EvolutionController {
             addExperts: 1
           })
         : undefined;
-    const geometryChange = architectureChange?.mutation === "resize-width" ||
-      architectureChange?.mutation === "repartition-heads";
-    if (!geometryChange && request.geometryHoldouts !== undefined) {
-      throw new Error("Geometry holdouts apply only to isolated width/head candidates.");
-    }
-    const geometryHoldouts = geometryChange
+    const geometryHoldouts = request.geometryHoldouts !== undefined
       ? cleanGeometryHoldouts(request.geometryHoldouts)
       : undefined;
     const epochs = request.epochs ?? 1;
@@ -1157,10 +1199,12 @@ export class EvolutionController {
       }
       const sourceToSubstrateReassessment =
         parent?.candidateKind === "source" && kind === "substrate";
+      const observedNativeReassessment = parent?.state === "promoted" &&
+        request.provenance?.source === "same-native-cortex-action";
       if (
         parent &&
         parent.candidateKind !== kind &&
-        !sourceToSubstrateReassessment
+        !sourceToSubstrateReassessment && !observedNativeReassessment
       ) {
         throw new Error("A worker evolution lineage cannot change candidate kind.");
       }
@@ -1216,6 +1260,7 @@ export class EvolutionController {
         workerProtocol: "evolution.*",
         workerSourceIds: sourceIds,
         workerObjectives: objectives
+        ,continuationRequest: clone({ ...request, architectureChange, geometryHoldouts, epochs, latentReplay })
       };
       archive.runs.push(run);
       archive.candidates.push(candidate);
@@ -1238,6 +1283,9 @@ export class EvolutionController {
         }
       }, { id: ids.run, requestId: ids.run, startedAt: now, permission: policy, permissionRevision: JSON.stringify(permissionRecord ?? { level: policy }) });
       await this.assertWorkerPermission(request.brainId, "experiment");
+      const recursiveParent = request.parentCandidateId
+        ? (await this.loadArchive(request.brainId)).candidates.find((entry) => entry.id === request.parentCandidateId)
+        : undefined;
       proposal = await this.workerRequest<Record<string, unknown>>(
         "evolution.propose",
         request.brainId,
@@ -1259,6 +1307,7 @@ export class EvolutionController {
             limitationEvidence: initial.limitations,
             route: kind
           }
+          ,recursiveParentCandidateId: recursiveParent?.workerCandidateId
         },
         30 * 60_000,
         ids.run
@@ -1656,6 +1705,7 @@ export class EvolutionController {
     const testOutput = outputRecord(tested);
     const checks = outputChecks(testOutput, "checks");
     const baselineChecks = outputChecks(testOutput, "baselineChecks");
+    const improvementEvidence = sourceImprovementEvidence(baselineChecks, checks);
     const diffSha256 = outputString(testOutput, "diffSha256");
     const evaluatorSha256 = outputString(testOutput, "evaluatorSha256");
     const parentCommit = outputString(testOutput, "parentCommit");
@@ -1687,6 +1737,9 @@ export class EvolutionController {
         ? "An empty source candidate cannot be promoted."
         : undefined,
       !checksComplete ? "Required checks were missing or failed." : undefined,
+      !improvementEvidence.passed
+        ? "No paired immutable functional improvement was demonstrated; passing checks or one faster timing is not a benefit proof."
+        : undefined,
       regressions.length ? `Detected regressions: ${regressions.join(", ")}.` : undefined
     ].filter((reason): reason is string => Boolean(reason));
     const evaluation: EvolutionEvaluationRecord = {
@@ -1701,6 +1754,7 @@ export class EvolutionController {
       benchmarkDomains,
       checks,
       baselineChecks,
+      improvementEvidence,
       regressions,
       resources,
       rejectionReason: rejectionReasons.join(" ")
@@ -1710,6 +1764,14 @@ export class EvolutionController {
       const run = archive.runs.find((entry) => entry.id === candidate.runId);
       if (!current || !run) throw new Error("The evolution archive changed unexpectedly.");
       current.evaluations.push(evaluation);
+      current.processMeasurement = {
+        format: "omni-measured-improvement-process", formatVersion: 1,
+        completedCandidates: 1, evaluatorSuccesses: Number(evaluation.passed),
+        wallSeconds: Math.max(0, (Date.parse(evaluation.createdAt) - Date.parse(current.createdAt)) / 1000),
+        nativeQualityGainMeasured: false, nativeRelativeGain: null,
+        metaImprovementEstablished: false,
+        reason: "measured source evaluator outcome and elapsed wall cost; no neural benefit inferred"
+      };
       current.updatedAt = evaluation.createdAt;
       current.state = evaluation.passed ? "awaiting-review" : "rejected";
       current.error = evaluation.passed ? undefined : evaluation.rejectionReason;
@@ -1807,22 +1869,7 @@ export class EvolutionController {
     const run = archive.runs.find((entry) => entry.id === candidate.runId);
     if (updated.state === "promoted" && run?.recursive) {
       try {
-        const next = await this.startWithPolicy({
-          brainId: request.brainId,
-          objective:
-            `Reassess the promoted change and improve the improvement process under the same immutable evaluator: ` +
-            run.objective,
-          recursive: true,
-          parentCandidateId: updated.id
-        }, false);
-        await this.mutateArchive(request.brainId, (currentArchive) => {
-          const current = currentArchive.candidates.find((entry) => entry.id === updated.id);
-          if (!current) throw new Error("The recursive evolution parent disappeared.");
-          current.recursiveNextRunId = next.id;
-          current.recursiveError = next.state === "failed" ? next.error : undefined;
-          current.updatedAt = new Date().toISOString();
-          return current;
-        });
+        await this.requestRecursiveReassessment(updated);
       } catch (error) {
         await this.mutateArchive(request.brainId, (currentArchive) => {
           const current = currentArchive.candidates.find((entry) => entry.id === updated.id);
@@ -1933,6 +1980,7 @@ export class EvolutionController {
       if (!current || !run) throw new Error("The evolution archive changed unexpectedly.");
       current.evaluations.push(evaluation);
       current.workerStatus = outputString(evaluated, "status") ?? "evaluation-failed";
+      current.processMeasurement = clone(recordValue(evaluated.processMeasurement));
       current.updatedAt = evaluation.createdAt;
       current.state = evaluation.passed ? "awaiting-review" : "rejected";
       current.error = evaluation.passed ? undefined : evaluation.rejectionReason;
@@ -2063,26 +2111,7 @@ export class EvolutionController {
     const run = archive.runs.find((entry) => entry.id === candidate.runId);
     if (updated.state === "promoted" && run?.recursive) {
       try {
-        const next = await this.startWithPolicy({
-          brainId: request.brainId,
-          objective:
-            `Reassess the promoted ${candidate.candidateKind} overlay and improve the improvement process under the same immutable neural gates: ${run.objective}`,
-          recursive: true,
-          parentCandidateId: updated.id,
-          candidateKind: candidate.candidateKind,
-          sourceIds:
-            candidate.candidateKind === "data" ? candidate.workerSourceIds : undefined,
-          latentReplay: true,
-          objectives: candidate.workerObjectives
-        }, false);
-        await this.mutateArchive(request.brainId, (currentArchive) => {
-          const current = currentArchive.candidates.find((entry) => entry.id === updated.id);
-          if (!current) throw new Error("The recursive evolution parent disappeared.");
-          current.recursiveNextRunId = next.id;
-          current.recursiveError = next.state === "failed" ? next.error : undefined;
-          current.updatedAt = new Date().toISOString();
-          return current;
-        });
+        await this.requestRecursiveReassessment(updated);
       } catch (error) {
         await this.mutateArchive(request.brainId, (currentArchive) => {
           const current = currentArchive.candidates.find((entry) => entry.id === updated.id);

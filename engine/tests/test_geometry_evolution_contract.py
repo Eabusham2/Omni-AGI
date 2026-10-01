@@ -5,6 +5,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,6 +23,7 @@ from omni_core.architecture_migration import normalize_architecture_change
 from omni_core.geometry_candidate_application import ROOTS, apply_isolated_geometry_candidate
 from omni_core.persistence import atomic_write_json, read_json, snapshot_files
 from omni_core.registered_geometry_holdouts import load_registered_geometry_holdouts
+from omni_core.paired_geometry_statistics import PairedLossWriter
 import test_geometry_candidate_application as application_fixtures
 from test_geometry_candidate_application import Pager, Policy, roots
 
@@ -29,7 +31,7 @@ from test_geometry_candidate_application import Pager, Policy, roots
 def register_data(engine):
     categories = {}
     for category in ("token", "modality", "tool"):
-        path = engine / "evaluation" / "data" / (category + ".jsonl")
+        path = engine / "evaluation" / "data" / (uuid.uuid4().hex + ".jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(path, {"fixture": category, "heldout": True})
         categories[category] = [{"path": path.relative_to(engine).as_posix(), "sha256": _file_sha256(path), "records": 1}]
@@ -44,7 +46,13 @@ def register_data(engine):
 
 def metrics(**kwargs):
     manifest = kwargs["registered_manifest"]
+    policy = getattr(metrics, "policy")
+    writer = PairedLossWriter(kwargs["score_path"], policy, sum(value["examples"] for value in manifest["categories"].values()))
+    for category, values in manifest["categories"].items():
+        for index in range(values["examples"]): writer.add(category, hashlib.sha256((category + str(index)).encode()).hexdigest(), 1., 1)
+    paired = writer.finish()
     return {"format": "omni-native-geometry-holdouts", "formatVersion": 1, "benchmarkSha256": manifest["benchmarkSha256"],
+        "pairedScores": paired,
         **{category: {"sourceSha256": values["sourceSha256"], "loss": 1.0, "examples": values["examples"],
             "heldOut": True, "trainingOverlapCount": 0} for category, values in manifest["categories"].items()},
         "resources": {"withinSelectedEnvelope": True, "peakManagedMemoryBytes": 4096, "peakAcceleratorMemoryBytes": 0}}
@@ -68,26 +76,31 @@ class EvolutionGeometryGates(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "protected"):
                 _geometry_holdout_metrics(candidate, [])
             register_data(engine)
-            measured = _geometry_holdout_metrics(candidate, [])
-            self.assertTrue(all(_geometry_holdout_checks(measured, measured).values()))
+            from test_geometry_registration_transactions import Policy as QuotaPolicy
+            metrics.policy = QuotaPolicy(directory, 2**20)
+            measured = _geometry_holdout_metrics(candidate, [], score_path=engine / "scores.jsonl")
+            checks = _geometry_holdout_checks(measured, measured)
+            self.assertTrue(checks["heldOutToken"]); self.assertFalse(checks["statisticallySupportedImprovement"])
             altered = copy.deepcopy(measured); altered["modality"]["loss"] = 2
             self.assertFalse(_geometry_holdout_checks(measured, altered)["heldOutModality"])
             def incomplete(**kwargs):
                 result = metrics(**kwargs); result["token"]["examples"] = 0; return result
             candidate.evaluate_isolated_geometry_holdouts = incomplete
-            with self.assertRaises(ValueError): _geometry_holdout_metrics(candidate, [])
+            with self.assertRaises(ValueError): _geometry_holdout_metrics(candidate, [], score_path=engine / "incomplete.jsonl")
 
     def test_registered_data_tamper_traversal_and_mid_measurement_changes_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory); atomic_write_json(engine / "brain.json", {})
             register_data(engine)
-            original = (engine / "evaluation" / "data" / "token.jsonl").read_bytes()
+            token_path = engine / read_json(engine / "evaluation" / "geometry-holdouts.json")["categories"]["token"][0]["path"]
+            from test_geometry_registration_transactions import Policy as QuotaPolicy
+            metrics.policy = QuotaPolicy(directory, 2**20)
             def changing(**kwargs):
                 result = metrics(**kwargs)
-                atomic_write_json(engine / "evaluation" / "data" / "token.jsonl", {"different": True})
+                atomic_write_json(token_path, {"different": True})
                 return result
             with self.assertRaisesRegex(ValueError, "hash changed"):
-                _geometry_holdout_metrics(SimpleNamespace(engine_path=engine, evaluate_isolated_geometry_holdouts=changing), [])
+                _geometry_holdout_metrics(SimpleNamespace(engine_path=engine, evaluate_isolated_geometry_holdouts=changing), [], score_path=engine / "changed.jsonl")
             with self.assertRaises(ValueError): load_registered_geometry_holdouts(engine)
             register_data(engine)
             body = read_json(engine / "evaluation" / "geometry-holdouts.json")
@@ -96,7 +109,7 @@ class EvolutionGeometryGates(unittest.TestCase):
             metadata = read_json(engine / "brain.json")
             metadata["geometry_holdout_registration"]["manifestSha256"] = _file_sha256(engine / "evaluation" / "geometry-holdouts.json")
             atomic_write_json(engine / "brain.json", metadata)
-            with self.assertRaisesRegex(ValueError, "inside"):
+            with self.assertRaisesRegex(ValueError, "inside|owned"):
                 load_registered_geometry_holdouts(engine)
 
     def test_geometry_authorization_is_candidate_evaluation_state_bound_and_default_deny(self):

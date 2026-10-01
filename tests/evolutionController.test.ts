@@ -94,7 +94,12 @@ function workerEvaluation(passed = true): Record<string, unknown> {
       objectiveNonRegression: passed,
       capabilityRetention: true,
       neuralRetention: true,
-      changed: true
+      changed: true,
+      heldOutToken: true,
+      heldOutModality: true,
+      heldOutTool: true,
+      heldOutResources: true,
+      statisticallySupportedImprovement: passed
     },
     failures: passed ? [] : ["objectiveNonRegression"],
     metrics: { candidateObjectiveLoss: passed ? 0.5 : 50 },
@@ -144,8 +149,10 @@ function passingEvaluationOutput(
     ],
     baselineChecks: checks.map((name) => ({
       name,
-      passed: true,
-      exitCode: 0,
+      // Source positives represent a concrete repaired fixed check, not an
+      // already-green candidate being relabeled as an improvement.
+      passed: name !== "unit",
+      exitCode: name === "unit" ? 1 : 0,
       durationMs: 6
     })),
     regressions: [],
@@ -209,6 +216,27 @@ describe("EvolutionController", () => {
     await repository.save(current);
     brain = current;
   }
+
+  it("archives an all-green source change without promoting an unproved improvement", async () => {
+    await setEvolutionPermission("ask");
+    const execute = vi.fn(async (invocation: ToolInvocation) => {
+      if (invocation.action === "propose") return execution(invocation, "complete",
+        proposalOutput(join(temporaryRoot, "worktree"), "omni-evolution/fixture"));
+      if (invocation.action === "test") {
+        const output = passingEvaluationOutput(["typecheck", "unit", "build"]);
+        output.baselineChecks = ["typecheck", "unit", "build"].map(name => ({ name, passed: true, exitCode: 0, durationMs: 6 }));
+        return execution(invocation, "complete", output);
+      }
+      throw new Error("An unproved source change must not reach promotion.");
+    });
+    const controller = new EvolutionController(repository, { execute, cancel: vi.fn(() => 0) });
+    const run = await controller.start({ brainId: brain.id, objective: "Claim one faster all-green run", ...sourceRequest() });
+    const candidate = (await controller.listCandidates(brain.id, run.id))[0]!;
+    const result = await controller.approve({ brainId: brain.id, candidateId: candidate.id });
+    expect(result.state).toBe("rejected");
+    expect(result.evaluations[0]).toMatchObject({ passed: false, improvementEvidence: { passed: false, improvedChecks: [] } });
+    expect(execute.mock.calls.some(([invocation]) => invocation.action === "promote")).toBe(false);
+  });
 
   it("durably archives isolated candidates and stopping without deleting evidence", async () => {
     await setEvolutionPermission("ask");
