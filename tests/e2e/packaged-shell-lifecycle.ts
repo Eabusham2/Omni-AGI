@@ -6,7 +6,6 @@ type OwnedChild = Pick<ChildProcess, "pid" | "exitCode" | "signalCode"> & {
   kill(signal: "SIGKILL"): boolean;
 };
 export interface OwnedPackagedApplication {
-  process(): OwnedChild;
   close(): Promise<void>;
 }
 
@@ -20,12 +19,11 @@ async function bounded<T>(work: Promise<T>, milliseconds: number, label: string)
 }
 
 /** A timed-out normal quit remains a failed smoke, even after owned-child cleanup. */
-export async function closeOwnedPackagedApplication(application: OwnedPackagedApplication, options: {
+export async function closeOwnedPackagedApplication(application: OwnedPackagedApplication, child: OwnedChild, options: {
   normalCloseMs?: number;
   forceExitMs?: number;
   observe?(phase: string): void;
 } = {}): Promise<void> {
-  const child = application.process();
   if (!Number.isSafeInteger(child.pid) || child.pid! < 1) throw new Error("Packaged smoke has no exact owned child to close.");
   const alive = () => child.exitCode === null && child.signalCode === null;
   let observedExit = !alive();
@@ -38,6 +36,9 @@ export async function closeOwnedPackagedApplication(application: OwnedPackagedAp
     options.observe?.("normal-close-start");
     await bounded(Promise.all([Promise.resolve().then(() => application.close()), exited]),
       options.normalCloseMs ?? 30_000, "Packaged application's normal shutdown");
+    if (child.exitCode !== 0 || child.signalCode !== null) {
+      throw new Error(`Packaged application did not exit cleanly (code ${String(child.exitCode)}, signal ${String(child.signalCode)}).`);
+    }
     options.observe?.("normal-close-complete");
   } catch (normalFailure) {
     options.observe?.("normal-close-failed");

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   copyMutableFileIsolated,
+  privateSqliteFilename,
   snapshotMutableSqliteIsolated,
   writeMutableFileIsolated
 } from "../src/main/mutableFileIsolation";
@@ -130,6 +131,58 @@ describe("mutable file isolation", () => {
     expect(failure).toBeInstanceOf(AggregateError);
     expect(failure.message).toContain(backup);
     expect(failure.errors).toEqual([blocked, restoration]);
+  });
+
+  it.each([
+    [String.raw`C:\owned\teacher's #?% & data\workspace.sqlite3`, String.raw`\\?\C:\owned\teacher's #?% & data\workspace.sqlite3`],
+    [String.raw`\\server\share\teacher #%.sqlite3`, String.raw`\\?\UNC\server\share\teacher #%.sqlite3`],
+    [String.raw`\\?\C:\owned\workspace.sqlite3`, String.raw`\\?\C:\owned\workspace.sqlite3`]
+  ])("uses the locking Windows longpath VFS without interpreting filename options: %s", (path, namespaced) => {
+    const filename = privateSqliteFilename(path, "win32");
+    const [encoded, query] = filename.slice("file:".length).split("?");
+    expect(filename.startsWith("file:")).toBe(true);
+    expect(decodeURIComponent(encoded!)).toBe(namespaced);
+    expect(query).toBe("vfs=win32-longpath");
+    expect(filename).not.toContain("#");
+    expect(privateSqliteFilename(path, "darwin")).toBe(path);
+  });
+
+  it("snapshots deep managed paths beyond default Windows limits without changing the source or sharing its inode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-private-long-path-"));
+    roots.push(root);
+    const source = join(root, "source's #&%.sqlite3"), restored = join(root, "restored.sqlite3");
+    let directory = root;
+    // Exceed SQLite win32's default 1040-byte buffer as well as MAX_PATH on
+    // Windows; stay within the smaller native pathname limit on other hosts.
+    const minimumLength = process.platform === "win32" ? 1200 : 320;
+    for (let i = 0; directory.length < minimumLength; i++) directory = join(directory, `owned-${i}-${"x".repeat(60)}`);
+    await mkdir(directory, { recursive: true });
+    const destination = join(directory, "teacher's #&%.sqlite3");
+    expect(destination.length).toBeGreaterThan(260);
+    const database = new DatabaseSync(source);
+    try { database.exec("CREATE TABLE events(value TEXT); INSERT INTO events VALUES ('original private row');"); }
+    finally { database.close(); }
+    const sourceBefore = digest(await readFile(source));
+
+    await snapshotMutableSqliteIsolated(source, destination);
+    const [sourceInfo, destinationInfo] = await Promise.all([
+      stat(source, { bigint: true }), stat(destination, { bigint: true })
+    ]);
+    expect([destinationInfo.dev, destinationInfo.ino]).not.toEqual([sourceInfo.dev, sourceInfo.ino]);
+    expect(await readdir(directory)).toEqual(["teacher's #&%.sqlite3"]);
+    const snapshot = new DatabaseSync(privateSqliteFilename(destination));
+    try {
+      expect(snapshot.prepare("SELECT value FROM events").all()).toEqual([{ value: "original private row" }]);
+      snapshot.exec("INSERT INTO events VALUES ('copy-only row');");
+    } finally { snapshot.close(); }
+    expect(digest(await readFile(source))).toBe(sourceBefore);
+
+    // A deep source must use the same safe filename handling, not just INTO.
+    await snapshotMutableSqliteIsolated(destination, restored);
+    const roundTrip = new DatabaseSync(restored);
+    try { expect(roundTrip.prepare("SELECT value FROM events ORDER BY rowid").all()).toEqual([
+      { value: "original private row" }, { value: "copy-only row" }
+    ]); } finally { roundTrip.close(); }
   });
 
   it("captures committed WAL rows without copying sidecars or sharing an inode", async () => {

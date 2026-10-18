@@ -13,7 +13,7 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 | 5/8 | Load/unload, resource planner, devices, media lifecycle | Actual RAM/VRAM/storage retained-context ownership and capacity are implemented, including primary snapshot plus extra-drive spill accounting. Existing Gloo/NCCL training, thirteen complete-operation kinds and six-text-kind sequential mixed routes are preserved. Active's fixed12%/50% duty restrictions are removed while actual admission/preemption remains; broader hardware/concurrent/direct-accelerator qualification stays distinct |
 | 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | Source implemented with scoped component/control evidence. The actual compiled main now opens a real empty Library and Build form and quits normally without creating a brain. Full native learned sequencing and universal theme/accessibility/device acceptance are not inferred |
 | 7/8 | Focused fixtures, visual audit, complete feature audit and documentation | Current non-neural runner93/93, affected desktop20/20, Node/Web types and shell bundle pass; public curriculum22 preserves8 manuals. Residual no-engine walkthrough has31 numbered captures,30 in its accepted index and one rejected scroll capture. These are bounded results, not full U1/live-engine proof |
-| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | Not complete: all8 jobs on fdd16a4 are terminal; Android/iOS passed, all6 desktop jobs failed. New desktop corrections are local and not remotely requalified. No v2 tag/release completion claim |
+| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | Not complete: all8 jobs on51ce41a are terminal; Android/iOS passed. Both Linux/macOS architectures passed all11 UI contracts and actual preload/Library/Build/normal-quit phases, then failed SDK-handle bookkeeping in the smoke. Windows reached completion contracts and exposed deep SQLite snapshot paths. Both distinct corrections are composed locally; fresh native/package qualification and v2 release remain pending |
 
 ## Settled scope changes
 
@@ -26,6 +26,10 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 - New v2 goal authorizes GitHub CI and package release after audits.
 
 ## Evidence
+
+Latest hosted results and exact corrections are recorded at the top of
+CONTINUATION.md. The prior local/historical evidence below remains scoped to
+its own source point, not a substitute for current exact-commit green jobs.
 
 ### Current local correction boundary — October18
 

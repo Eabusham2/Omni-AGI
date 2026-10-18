@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import type { ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
@@ -17,6 +18,7 @@ test("packaged desktop opens the library and Build screen without training", asy
     )
   );
   let application: ElectronApplication | undefined;
+  let child: ChildProcess | undefined;
   let failure: unknown;
   const started = performance.now(), phases: Array<{ phase: string; elapsedMs: number }> = [];
   let childOutput = "";
@@ -41,9 +43,12 @@ test("packaged desktop opens the library and Build screen without training", asy
       chromiumSandbox: false,
       timeout: 60_000
     });
+    // SDK channel objects are disposed by normal close. Keep its exact public
+    // child now for output, teardown and the later owned-profile exit check.
+    child = application.process();
     phase("launch-complete");
-    application.process().stdout?.on("data", retainOutput);
-    application.process().stderr?.on("data", retainOutput);
+    child.stdout?.on("data", retainOutput);
+    child.stderr?.on("data", retainOutput);
     application.on("console", message => { if (message.type() === "error" || message.type() === "warning") retainOutput(`${message.type()}: ${message.text()}\n`); });
     await application.evaluate(({ app, BrowserWindow }) => {
       const observe = (contents: Electron.WebContents) => contents.on("preload-error", (_event, _path, error) => {
@@ -84,13 +89,12 @@ test("packaged desktop opens the library and Build screen without training", asy
     // while real neural training belongs to a separate acceptance run.
   } catch (error) { failure = error; }
   finally {
-    try { if (application) await closeOwnedPackagedApplication(application, { observe: phase }); }
+    try { if (application && child) await closeOwnedPackagedApplication(application, child, { observe: phase }); }
     catch (error) { failure = failure ? new AggregateError([failure, error], "Packaged shell navigation and normal shutdown failed.") : error; }
-    const child = application?.process();
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
+    if (!application || child && (child.exitCode !== null || child.signalCode !== null)) {
       try { await rm(dataDirectory, { recursive: true, force: true }); }
       catch (error) { failure = failure ? new AggregateError([failure, error], "Packaged shell failed and its owned profile could not be removed.") : error; }
-    } else phase("owned-profile-retained-child-still-live");
+    } else phase(child ? "owned-profile-retained-child-still-live" : "owned-profile-retained-no-child-handle");
     if (failure) {
       const diagnosticPath = testInfo.outputPath("packaged-shell-owned-child.log");
       await writeFile(diagnosticPath, `${JSON.stringify({ phases, normalShutdownRequired: true, neuralAcceptanceTested: false })}\n${childOutput}`, "utf8");

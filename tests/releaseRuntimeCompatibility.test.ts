@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { closeOwnedPackagedApplication, type OwnedPackagedApplication } from "./e2e/packaged-shell-lifecycle";
+import { closeOwnedPackagedApplication } from "./e2e/packaged-shell-lifecycle";
 
 const read = (path: string): string => readFileSync(resolve(path), "utf8");
 
@@ -36,7 +36,7 @@ describe("native release Python compatibility", () => {
         kill: vi.fn((signal: NodeJS.Signals) => { child.signalCode = signal; child.emit("exit", null, signal); return true; })
       });
       const close = vi.fn(() => new Promise<void>(() => undefined));
-      const failure = expect(closeOwnedPackagedApplication({ process: () => child, close }, {
+      const failure = expect(closeOwnedPackagedApplication({ close }, child, {
         normalCloseMs: 30, forceExitMs: 5, observe: value => phases.push(value)
       })).rejects.toThrow("normal shutdown exceeded 30 ms");
       await vi.advanceTimersByTimeAsync(30); await failure;
@@ -50,15 +50,50 @@ describe("native release Python compatibility", () => {
     const child = Object.assign(new EventEmitter(), { pid: 4243, exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null, kill: vi.fn(() => false) });
     const close = vi.fn(async () => { child.exitCode = 0; child.emit("exit", 0, null); });
-    await closeOwnedPackagedApplication({ process: () => child, close });
+    await closeOwnedPackagedApplication({ close }, child);
     expect(child.kill).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
     expect(child.listenerCount("exit")).toBe(0);
     const exact = new Error("normal close rejected before acknowledgement");
-    await expect(closeOwnedPackagedApplication({ process: () => child, close: async () => { throw exact; } })).rejects.toBe(exact);
+    await expect(closeOwnedPackagedApplication({ close: async () => { throw exact; } }, child)).rejects.toBe(exact);
     expect(child.kill).not.toHaveBeenCalled();
-    await expect(closeOwnedPackagedApplication({ process: () => ({ ...child, pid: undefined }), close } as unknown as OwnedPackagedApplication))
+    await expect(closeOwnedPackagedApplication({ close }, { ...child, pid: undefined }))
       .rejects.toThrow("no exact owned child");
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the exact public packaged child after normal close retires the SDK process getter", async () => {
+    let disposed = false;
+    const child = Object.assign(new EventEmitter(), { pid: 4244, exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null, kill: vi.fn(() => false) });
+    const application = {
+      process: vi.fn(() => { if (disposed) throw new TypeError("SDK channel has no _object after close"); return child; }),
+      close: vi.fn(async () => { disposed = true; child.exitCode = 0; child.emit("exit", 0, null); })
+    };
+    const captured = application.process();
+    await closeOwnedPackagedApplication(application, captured);
+    expect(application.process).toHaveBeenCalledTimes(1); expect(captured).toBe(child);
+    expect(captured.exitCode).toBe(0); expect(captured.signalCode).toBeNull();
+    expect(captured.kill).not.toHaveBeenCalled(); expect(captured.listenerCount("exit")).toBe(0);
+    expect(() => application.process()).toThrow("SDK channel has no _object after close");
+    const source = read("tests/e2e/packaged-shell.spec.ts");
+    expect(source.match(/\bapplication\.process\(\)/g)).toHaveLength(1);
+    expect(source).not.toContain("application?.process()");
+    expect(source).toContain("closeOwnedPackagedApplication(application, child,");
+  });
+
+  it("rejects nonzero or signalled packaged exits even when SDK close resolves without killing the dead child again", async () => {
+    for (const terminal of [{ exitCode: 1, signalCode: null }, { exitCode: null, signalCode: "SIGKILL" as NodeJS.Signals }]) {
+      const phases: string[] = [], child = Object.assign(new EventEmitter(), { pid: 4245,
+        exitCode: null as number | null, signalCode: null as NodeJS.Signals | null, kill: vi.fn(() => false) });
+      const close = vi.fn(async () => {
+        child.exitCode = terminal.exitCode; child.signalCode = terminal.signalCode;
+        child.emit("exit", terminal.exitCode, terminal.signalCode);
+      });
+      await expect(closeOwnedPackagedApplication({ close }, child, { observe: phase => phases.push(phase) })).rejects.toThrow("did not exit cleanly");
+      expect(close).toHaveBeenCalledTimes(1); expect(child.kill).not.toHaveBeenCalled();
+      expect(phases).toEqual(["normal-close-start", "normal-close-failed"]);
+      expect(child.listenerCount("exit")).toBe(0);
+    }
   });
 
   it("delegates DMG construction once to the installed hash-pinned vendor with bounded ordinary detach retries", async () => {

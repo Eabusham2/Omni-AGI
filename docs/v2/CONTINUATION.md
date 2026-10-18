@@ -1,5 +1,50 @@
 # Current implementation continuation
 
+### Current hosted boundary —51ce41a completed; two distinct corrections composed
+
+All eight jobs on `51ce41a164fcc35cf2d0d77665cd8aef9770332f` are terminal.
+Android39173662089 and iOS39173662036 passed. Windows39173662029,
+Linux39173662023 and macOS39173662145 failed. These handles are no longer live;
+do not restart them because an observation expired or count them as green.
+
+Both Linux and both macOS architectures passed the source selections,
+packaging, worker health and **all11 no-engine UI contracts**, including the new
+actual Imagination/recovery-label contrast case. Exact phase logs then showed
+the real preload platform IPC, Library, Build form and ordinary normal-close
+completion. Linux x64 completed those phases in2353ms; Linux ARM64 in2071ms;
+macOS ARM64 in3932ms; Intel in28078ms on their first smoke attempts. The
+subsequent failure was a test defect: calling Playwright's `process()` after
+normal close had disposed its SDK channel. The smoke now captures the public
+child once after launch and reuses that exact handle through output, strict
+shutdown and profile cleanup. It additionally rejects nonzero/signalled exits
+even if the SDK resolves close. New inert regressions pass; real packaged
+requalification is pending. Previous failed smokes are not retroactively green.
+
+Windows passed the93 fixed Python contracts,511 contract-group cases and the
+MCP group (40 pass, one existing platform skip), then failed one of175 completion
+cases. The real full-merge teacher snapshot's deep `VACUUM INTO` filename exceeded
+the Windows SQLite path boundary. The source correction selects the locking
+`win32-longpath` VFS with a percent-encoded extended absolute/UNC filename for
+source, snapshot and integrity reopen, leaving non-Windows paths unchanged.
+Same-directory transaction, read-only source, WAL-consistent snapshot, private
+inode, checksum, integrity and atomic promotion remain; there is no extra copy,
+global working-directory change, shortened test root or relaxed quota. URI
+mapping and the deep-path file/copy/composition selection pass16 local cases;
+the actual patched Windows VFS remains unverified until the next hosted run.
+
+The Windows lane checked [SQLite's URI-target contract](https://www.sqlite.org/lang_vacuum.html),
+the locking [Windows long-path VFS](https://www.sqlite.org/vfs.html), and the
+supported [Node22.16 URI-open implementation](https://github.com/nodejs/node/blob/v22.16.0/src/node_sqlite.cc#L704).
+No new runtime API, global setting or non-locking VFS is required. Final composed
+Node/Web TypeScript and release configuration verification pass. The packaged
+SDK regression and nonzero/signalled-exit regression each pass their new
+targeted inert case; no local Playwright or neural test was run.
+
+No model was created, Loaded or trained. Root owns final composed types, the
+next normal main push, required exact-commit green checks and only then a
+verified v2 release. Provider/hardware and explicitly deferred learned-quality
+boundaries below are unchanged.
+
 ### Hosted source-contract follow-up on7db7cea
 
 The reviewed source candidate `7db7ceae0d02f4b4e1f09d92ccc947820b529800`
