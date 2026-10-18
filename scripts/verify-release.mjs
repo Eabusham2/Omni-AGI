@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { verifyReleaseTagBinding } from "./release-tag-state.mjs";
+import { stableReleaseVersion } from "./release-version-policy.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
@@ -15,17 +16,9 @@ function requireValue(condition, message) {
 
 const packageDocument = JSON.parse(await readFile("package.json", "utf8"));
 const packageLock = JSON.parse(await readFile("package-lock.json", "utf8"));
-const expectedTag = `v${packageDocument.version}`;
+const { tag: expectedTag, androidVersionCode } = stableReleaseVersion(packageDocument.version);
 const requestedTag = option("--tag") ?? process.env.OMNI_RELEASE_TAG;
 
-requireValue(
-  /^\d+\.\d+\.\d+$/.test(packageDocument.version),
-  `Release version must be a stable semantic version, received ${packageDocument.version}.`
-);
-requireValue(
-  packageDocument.version.split(".")[0] === "1",
-  `Stable Omni AGI Studio v1 releases must use major version 1, received ${packageDocument.version}.`
-);
 requireValue(
   packageLock.version === packageDocument.version &&
     packageLock.packages?.[""]?.version === packageDocument.version,
@@ -100,12 +93,6 @@ for (const resource of packageDocument.build?.extraResources ?? []) {
 }
 
 const androidBuild = await readFile("mobile/android/app/build.gradle.kts", "utf8");
-const [major, minor, patch] = packageDocument.version.split(".").map(Number);
-requireValue(
-  minor < 100 && patch < 100,
-  "Android versionCode mapping requires minor and patch versions below 100."
-);
-const androidVersionCode = major * 10_000 + minor * 100 + patch;
 requireValue(
   androidBuild.includes(`versionCode = ${androidVersionCode}`) &&
     androidBuild.includes(`versionName = "${packageDocument.version}"`),
@@ -638,6 +625,21 @@ requireValue(
   stableRelease.includes("contents: write") && stableRelease.includes("verify-release-artifacts.mjs"),
   "Stable publishing must have a scoped write permission and use the artifact verifier."
 );
+
+for (const [path, job] of [
+  [".github/workflows/windows.yml", "test-and-package"],
+  [".github/workflows/macos.yml", "test-and-package"],
+  [".github/workflows/linux.yml", "test-and-package"],
+  ...["windows", "macos", "linux"].map(job => [".github/workflows/release.yml", job])
+]) {
+  requireValue(workflowJob(path, job).includes("run: npm run test:python:ci:contracts"),
+    `${path} ${job} must run bounded Python source contracts, not full neural test discovery.`);
+}
+const publishJob = workflowJob(".github/workflows/release.yml", "publish");
+requireValue(publishJob.includes("persist-credentials: false") && publishJob.includes("GIT_CONFIG_COUNT=1") &&
+  publishJob.includes('omni_release_expected_origin="${GITHUB_SERVER_URL%/}/$GITHUB_REPOSITORY"') &&
+  publishJob.includes("pattern: omni-release-*") && !stableRelease.includes("omni-v1-"),
+  "Publishing must use nonpersistent current-repository authentication and version-neutral artifact custody.");
 
 process.stdout.write(
   `${JSON.stringify(

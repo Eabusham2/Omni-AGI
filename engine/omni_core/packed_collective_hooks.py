@@ -50,3 +50,22 @@ def defer_packed_rows(packed, width, row_start, gradient, rate, scale,
         raise RuntimeError("distributed packed derivative has no registered owner")
     return sink.stage(owner, packed, int(width), int(row_start), gradient,
                       float(rate), scale, row_stability, float(stability_strength))
+
+
+def defer_packed_tile(packed, width, row_start, column_start, gradient, rate, scale,
+                      row_stability=None, stability_strength=0.0):
+    """Column-aware derivative staging; never expand a tile for a row sink."""
+    sink = _SINK.get()
+    if sink is None:
+        return None
+    owner = _OWNER.get()
+    if owner is None:
+        raise RuntimeError("distributed packed derivative has no registered owner")
+    stage = getattr(sink, "stage_tile", None)
+    if callable(stage):
+        return stage(owner, packed, int(width), int(row_start), int(column_start), gradient,
+                     float(rate), scale, row_stability, float(stability_strength))
+    if column_start == 0 and gradient.shape[1] == width:
+        return sink.stage(owner, packed, int(width), int(row_start), gradient,
+                          float(rate), scale, row_stability, float(stability_strength))
+    raise RuntimeError("packed derivative sink does not support bounded column tiles")

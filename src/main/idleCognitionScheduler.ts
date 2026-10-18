@@ -375,6 +375,7 @@ export class IdleCognitionScheduler {
             : "waiting",
           result.reason === "foreground-work"
             ? "Foreground work preempted optional cognition."
+            : result.reason === "instance-unloaded" ? "Instance is unloaded; Active Mode waits for explicit Load."
             : "Waiting for the next duty-capped idle cycle.",
           undefined,
           false,

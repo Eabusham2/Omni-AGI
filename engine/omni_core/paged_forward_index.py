@@ -40,6 +40,10 @@ def group_payload(root: Path, descriptor: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("derived forward group descriptor binding is stale")
     if len(value.get("forwardRecords", ())) != descriptor.get("forwardCount"):
         raise ValueError("derived forward group count is invalid")
+    if descriptor.get("connectionStateVersion") == 1:
+        encoded = value.get("packedConnectionStrengths")
+        if not isinstance(encoded, str) or len(base64.b64decode(encoded, validate=True)) != descriptor.get("strengthBytes"):
+            raise ValueError("derived forward connection strengths are missing or inconsistent")
     remember_verified_blob(path, checksum, before=before)
     return value
 
@@ -95,6 +99,10 @@ def publish_entries(root: Path, entries, guard) -> list[dict[str, Any]]:
             descriptor.update(forwardCount=len(value["forwardRecords"]),
                               packedBytes=len(base64.b64decode(value["packedEffectiveWeights"], validate=True)),
                               entry={"path": relative, "sha256": sha, "bytes": len(payload)})
+            if "packedConnectionStrengths" in value:
+                from .weighted_substrate_state import validate_strengths
+                strengths = validate_strengths(base64.b64decode(value["packedConnectionStrengths"], validate=True), value["count"])
+                descriptor.update(connectionStateVersion=1, strengthBytes=len(strengths))
         key = descriptor["bucket"], descriptor["part"]
         if key in seen:
             raise ValueError("derived forward group is repeated")
@@ -114,7 +122,7 @@ class BlobForwardTopology(Mapping[tuple[str, int], tuple[list[tuple], bytes]]):
         value = group_payload(self.root, self.descriptors[key])
         structures = value["forwardRecords"]
         packed = base64.b64decode(value["packedEffectiveWeights"], validate=True)
-        from .vsa import _pack_ternary_levels, _unpack_ternary_level, _synapse_id_matches_endpoints
+        from .vsa import _pack_ternary_levels, _unpack_ternary_level, _synapse_id_matches_endpoints, _weighted_forward_signs
         if not isinstance(structures, list) or any(
             not isinstance(row, list) or len(row) != 4 or type(row[0]) is not int
             or not 0 <= row[0] < value["count"] or not all(isinstance(item, str) and item for item in row[1:])
@@ -124,7 +132,7 @@ class BlobForwardTopology(Mapping[tuple[str, int], tuple[list[tuple], bytes]]):
         levels = [_unpack_ternary_level(packed, index) for index in range(len(structures))]
         if any(level == 0 for level in levels) or _pack_ternary_levels(levels) != packed:
             raise ValueError("paged forward packed sign is invalid")
-        return [tuple(row) for row in structures], packed
+        return [tuple(row) for row in structures], _weighted_forward_signs(value, structures, packed)
 
     def __iter__(self):
         return iter(self.descriptors)

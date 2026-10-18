@@ -41,6 +41,7 @@ describe("true warm steering boundary", () => {
     let originalSettled = false;
     const first = controller.send("brain", "old", undefined, "old");
     void first.then(() => { originalSettled = true; });
+    await vi.waitFor(() => expect(service.chat).toHaveBeenCalledOnce());
     const next = controller.send("brain", "new direction verbatim", undefined, "new", {
       kind: "steer", replacesTurnId: "old", source: "human", createdAt
     });
@@ -74,6 +75,7 @@ describe("true warm steering boundary", () => {
     const stream: ChatStreamEvent[] = [];
     controller.on("stream", (event: ChatStreamEvent) => stream.push(event));
     const first = controller.send("brain", "old", undefined, "old").catch((error: unknown) => error);
+    await vi.waitFor(() => expect(service.chat).toHaveBeenCalledOnce());
     await controller.send("brain", "new", undefined, "new", {
       kind: "steer", replacesTurnId: "old", source: "human", createdAt
     });

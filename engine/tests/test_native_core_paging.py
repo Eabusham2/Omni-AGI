@@ -316,8 +316,11 @@ class NativeCorePagingStorageTests(unittest.TestCase):
         ram.restore()
         self.assertTrue(torch.equal(owner._packed_forward_weight, expected))
         ram.close()
+        admissions = []
         def reject_ram(_size):
-            raise RuntimeError("RAM reserve")
+            admissions.append(_size)
+            if len(admissions) == 1:
+                raise RuntimeError("RAM reserve")
         disk = PackedMutationSnapshot.capture((owner,), reserve=reject_ram,
                                                disk_directory=self.root / "rollback")
         self.assertEqual(disk.storage_mode, "private-disk-packed-snapshot")

@@ -7,7 +7,20 @@ import type { ToolInvocation, ToolPermissionLevel } from "../shared/types";
 export async function persistAuthorizedToolIntent(
   brainDirectory: string,
   invocation: ToolInvocation,
-  identity: { id: string; requestId: string; startedAt: string; permission: ToolPermissionLevel; permissionRevision: string }
+  identity: {
+    id: string;
+    requestId: string;
+    startedAt: string;
+    permission: ToolPermissionLevel;
+    permissionRevision: string;
+    resolvedPlugin?: {
+      pluginId: string;
+      contentSha256: string;
+      toolId: string;
+      action: string;
+      argumentSha256: string;
+    };
+  }
 ): Promise<string> {
   if (!/^[a-f0-9-]{36}$/i.test(identity.id)) throw new Error("Tool intent identity is invalid.");
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(identity.requestId)) throw new Error("Tool intent request ownership is invalid.");
@@ -24,6 +37,14 @@ export async function persistAuthorizedToolIntent(
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Tool intent directory must be an owned real directory.");
   }
   const argumentsJson = JSON.stringify(invocation.arguments);
+  if (identity.resolvedPlugin &&
+    (!/^[a-z0-9][a-z0-9.-]{0,127}$/.test(identity.resolvedPlugin.pluginId) ||
+      !/^[a-f0-9]{64}$/.test(identity.resolvedPlugin.contentSha256) ||
+      !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$/.test(identity.resolvedPlugin.toolId) ||
+      !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(identity.resolvedPlugin.action) ||
+      !/^[a-f0-9]{64}$/.test(identity.resolvedPlugin.argumentSha256))) {
+    throw new Error("Resolved plugin tool intent is invalid.");
+  }
   const receipt = {
     format: "omni-authorized-tool-intent", formatVersion: 1,
     state: "authorized-before-side-effects", id: identity.id,
@@ -31,6 +52,7 @@ export async function persistAuthorizedToolIntent(
     toolId: invocation.toolId, action: invocation.action,
     startedAt: identity.startedAt,
     permission: identity.permission, permissionRevision: identity.permissionRevision,
+    ...(identity.resolvedPlugin ? { resolvedPlugin: identity.resolvedPlugin } : {}),
     ...(typeof invocation.arguments.neuralActionId === "string" && /^[a-f0-9]{32}$/i.test(invocation.arguments.neuralActionId)
       ? { neuralActionId: invocation.arguments.neuralActionId } : {}),
     ...(typeof invocation.arguments.chatTurnId === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(invocation.arguments.chatTurnId)

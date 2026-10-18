@@ -8,6 +8,31 @@ import {
 } from "../src/renderer/src/neuralRuntimePresentation";
 
 describe("native OmniCortex runtime presentation", () => {
+  it("includes repeated memory contacts without counting their state bytes as extra parameters", () => {
+    const result = neuralParameterAccounting({ parameterAccounting: {
+      mutableDenseParameters: 10, substrateVectorParameters: 6, substrateDynamicSparseSynapses: 2,
+      dynamicSparseSynapses: 2, totalNeuralParameters: 18, substrateBaseVectorParameters: 4,
+      substrateRepeatedVectorContacts: 2, substrateVectorLearnedStateBytes: 9,
+      substrateVectorStructuralStateBytes: 24, substrateVectorAllocatedStateBytes: 45,
+      substrateVectorRowEnvelopeBytes: 12, countingRule: "Each logical contact once"
+    }});
+    expect(result?.totalNeuralParameters).toBe(18);
+    expect(result?.substrateRepeatedVectorContacts).toBe(2);
+    expect(result?.substrateVectorLearnedStateBytes).toBe(9);
+    expect(result?.exactLabel).toContain("2 repeated memory-vector contacts");
+  });
+  it("reports weighted-state cost without multiplying the logical parameter count", () => {
+    const result = neuralParameterAccounting({ parameterAccounting: {
+      mutableDenseParameters: 7, substrateDynamicSparseSynapses: 0,
+      dynamicSparseSynapses: 0, totalNeuralParameters: 7,
+      nativeRepeatedConnections: 1, packedLearnedStateBytes: 10, connectionStateBytes: 7,
+      countingRule: "Each connection counted once"
+    }});
+    expect(result?.totalNeuralParameters).toBe(7);
+    expect(result?.nativeRepeatedConnections).toBe(1);
+    expect(result?.exactLabel).toContain("Strength and plasticity: 7 B");
+    expect(result?.exactLabel).toContain("Native learned storage: 10 B");
+  });
   it("shows worker-owned neural parameter and memory measurements", () => {
     const app = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/App.tsx"), "utf8");
     expect(app).toContain("neuralResourceRuntimeRows(workspace?.runtimeCard)");

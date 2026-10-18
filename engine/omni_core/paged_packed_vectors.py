@@ -31,8 +31,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
+from .weighted_vsa_row import payload_parts, make_payload, weighted_levels, activity as weighted_activity, adapt_payload
 
 from .paged_store_counts import ensure_row_count, row_count
+from .paged_vector_counts import ensure_vector_counts, vector_counts
 from .packed_vsa_vectors import (
     FORMAT as SHARD_FORMAT,
     FORMAT_VERSION as SHARD_FORMAT_VERSION,
@@ -154,7 +156,7 @@ def _decoded_row(row: Tuple[Any, ...], dimensions: int) -> Tuple[int, str, bytes
     updates = _counter(updates)
     if _row_sha(packed, updates) != digest:
         raise ValueError("paged vector row checksum mismatch")
-    _validate_packed_row(packed, dimensions)
+    payload_parts(packed, dimensions)
     return sequence, identifier, packed, updates
 
 
@@ -279,6 +281,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                 ),
             )
             ensure_row_count(connection, "paged_vector_rows", reserve_disk)
+            ensure_vector_counts(connection, dimensions, reserve_disk)
             return chosen_seed, chosen_deadband
         rows = dict(connection.execute("SELECT key,value FROM paged_vector_meta"))
         if (
@@ -327,9 +330,14 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                 "('committed_revision','-1')"
             )
         ensure_row_count(connection, "paged_vector_rows", reserve_disk)
+        ensure_vector_counts(connection, dimensions, reserve_disk)
         return stored_seed, stored_deadband
 
     def _connect(self) -> sqlite3.Connection:
+        from .connected_transaction import borrow_paged_connection, enlist_paged_connection
+        shared = borrow_paged_connection(self.path)
+        if shared is not None:
+            return shared
         connection = sqlite3.connect(
             str(self.path), timeout=30.0, isolation_level=None
         )
@@ -338,7 +346,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
         connection.execute("PRAGMA temp_store=FILE")
         from .paged_idle_selection import observe_idle_source_connection
         observe_idle_source_connection(connection, self.path)
-        return connection
+        return enlist_paged_connection(self.path, connection)
 
     @contextmanager
     def _transaction(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -543,9 +551,22 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
 
     @property
     def storage_bytes(self) -> int:
-        """Logical packed-level and update-counter bytes, without SQL overhead."""
+        """Actual row payload plus fixed counter encoding, not DB overhead."""
+        return self.parameter_accounting()["allocatedStateBytes"]
 
-        return len(self) * (self.row_bytes + 8)
+    def parameter_accounting(self) -> dict[str, int]:
+        with self._transaction() as connection:
+            count = row_count(connection, "paged_vector_rows")
+            payload_bytes, weighted_rows, repeated = vector_counts(connection)
+        if weighted_rows > count:
+            raise ValueError("weighted row count exceeds vector rows")
+        learned = count * self.row_bytes + weighted_rows * self.dimensions + repeated * 2
+        structural = count * 8 + repeated * 8
+        return {"rows": count, "baseContacts": count * self.dimensions,
+            "repeatedContacts": repeated, "logicalParameters": count * self.dimensions + repeated,
+            "learnedBytes": learned, "structuralBytes": structural,
+            "connectionStateBytes": weighted_rows * self.dimensions + repeated,
+            "rowEnvelopeBytes": weighted_rows * 12, "allocatedStateBytes": payload_bytes + count * 8}
 
     def __contains__(self, key: object) -> bool:
         if not isinstance(key, str):
@@ -588,7 +609,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
             if size is None:
                 raise KeyError(identifier)
             self._reserve_memory(
-                _READ_OVERHEAD_BYTES + 4 * int(size[1]) + self.dimensions,
+                _READ_OVERHEAD_BYTES + 4 * int(size[1]) + self.dimensions * 32,
                 "paged vector row read",
             )
             row = connection.execute(
@@ -601,7 +622,20 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
             return self._decode_row(row)
 
     def packed_row(self, key: str) -> bytes:
-        return self._read_row(_identifier(key))[2]
+        return payload_parts(self._read_row(_identifier(key))[2], self.dimensions)[0]
+
+    def row_payload(self, key: str) -> bytes:
+        payload = self._read_row(_identifier(key))[2]
+        return make_payload(*payload_parts(payload, self.dimensions), self.dimensions)
+
+    def connection_state(self, key: str) -> bytes:
+        return payload_parts(self._read_row(_identifier(key))[2], self.dimensions)[1]
+
+    def parallel_records(self, key: str) -> bytes:
+        return payload_parts(self._read_row(_identifier(key))[2], self.dimensions)[2]
+
+    def weighted_levels(self, key: str) -> torch.Tensor:
+        return weighted_levels(self._read_row(_identifier(key))[2], self.dimensions)
 
     def update_count(self, key: str) -> int:
         return self._read_row(_identifier(key))[3]
@@ -635,14 +669,14 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
             if row is None:
                 raise ValueError("paged vector row changed during decode")
             _sequence, _identifier_value, packed, _updates = self._decode_row(row)
-            levels = _decode_exact_row(packed, self.dimensions)
+            levels = _decode_exact_row(payload_parts(packed, self.dimensions)[0], self.dimensions)
             with self._cache_lock:
                 self._cache_clear_if_revision_changed(revision)
                 self._cache_put(identifier, levels)
             return levels.clone()
 
     def __getitem__(self, key: str) -> torch.Tensor:
-        return _activity(self.levels(key))
+        return weighted_activity(self._read_row(_identifier(key))[2], self.dimensions)
 
     @staticmethod
     def write_packed_in_connection(
@@ -659,7 +693,9 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
 
         identifier = _identifier(identifier)
         updates = _counter(updates)
-        _validate_packed_row(packed, dimensions)
+        incoming_signs, incoming_state, incoming_contacts = payload_parts(packed, dimensions)
+        incoming_legacy = len(packed) == (dimensions + 3) // 4
+        packed = make_payload(incoming_signs, incoming_state, incoming_contacts, dimensions)
         existing = connection.execute(
             "SELECT sequence,vector_id,packed,updates,row_sha256 "
             "FROM paged_vector_rows WHERE vector_id=?",
@@ -667,7 +703,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
         ).fetchone()
         if existing is not None:
             _decoded_row(existing, dimensions)
-            if preserve_counter_if_same and existing[2] == packed:
+            if preserve_counter_if_same and (existing[2] == packed or incoming_legacy and payload_parts(existing[2], dimensions)[0] == incoming_signs):
                 return False, PagedPackedVectors.revision_in_connection(connection)
             if existing[2] == packed and existing[3] == updates:
                 return False, PagedPackedVectors.revision_in_connection(connection)
@@ -712,7 +748,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
         identifier = _identifier(key)
         if not isinstance(packed, bytes):
             raise ValueError("paged vector packed rows must be bytes")
-        _validate_packed_row(packed, self.dimensions)
+        packed = make_payload(*payload_parts(packed, self.dimensions), self.dimensions)
         self._reserve_memory(
             _READ_OVERHEAD_BYTES + 4 * len(packed) + self.dimensions,
             "paged vector write buffer",
@@ -750,15 +786,11 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
     def adapt(self, key: str, target: torch.Tensor, rate: float) -> torch.Tensor:
         identifier = _identifier(key)
         alpha = _valid_rate(rate)
-        desired = quantize_vsa_vector(
-            target, self.dimensions, zero_deadband=self.zero_deadband
-        )
         with self._transaction(write=True) as connection:
             levels, revision = self._adapt_in_transaction(
-                connection, identifier, desired, alpha
+                connection, identifier, target, alpha
             )
         self.invalidate(identifier, revision)
-        self._cache_put(identifier, levels)
         return _activity(levels)
 
     def _adapt_in_transaction(
@@ -776,30 +808,17 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
         if existing is None:
             raise KeyError(identifier)
         _sequence, _identifier_value, packed, updates = self._decode_row(existing)
-        previous = _decode_exact_row(packed, self.dimensions)
-        if alpha == 0.0 or torch.equal(previous, desired):
-            return previous, self.revision_in_connection(connection)
+        self._reserve_memory(_READ_OVERHEAD_BYTES + 64 * len(packed) + self.dimensions * 128,
+            "weighted vector adaptation")
         if updates >= _MAX_UPDATES:
             raise OverflowError("paged vector update counter is exhausted")
-        digest = hashlib.sha256(
-            json.dumps(
-                [self.seed, identifier, updates],
-                ensure_ascii=False, separators=(",", ":"),
-            ).encode("utf-8")
-        ).digest()
-        state = int.from_bytes(digest[:8], "little")
-        changed: list[int] = []
-        for old, goal in zip(previous.tolist(), desired.tolist()):
-            state, draw = _splitmix64(state)
-            expectation = old + alpha * (goal - old)
-            lower = math.floor(expectation)
-            changed.append(lower + int(draw < expectation - lower))
-        levels = torch.tensor(changed, dtype=torch.int8)
-        next_packed = _pack_exact_row(levels, self.dimensions)
+        replacement, attempted = adapt_payload(packed, desired, alpha, self.dimensions,
+            seed=self.seed, identifier=identifier, updates=updates, zero_deadband=self.zero_deadband)
+        if not attempted:
+            return weighted_levels(packed, self.dimensions), self.revision_in_connection(connection)
         _changed, revision = self._write_packed_in_transaction(
-            connection, identifier, next_packed, updates=updates + 1
-        )
-        return levels, revision
+            connection, identifier, replacement, updates=updates + 1)
+        return weighted_levels(replacement, self.dimensions), revision
 
     def batch(
         self, *, max_rows: int = 256, max_payload_bytes: int = 8 * 1024 * 1024
@@ -867,51 +886,25 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                 ids = [str(row[0]) for row in connection.execute(
                     "SELECT vector_id FROM paged_vector_rows ORDER BY sequence"
                 ).fetchall()]
-            self._reserve_memory(
-                _READ_OVERHEAD_BYTES
-                + 4 * len(ids) * (self.row_bytes + 8 + 96),
-                "paged vector shard export",
-            )
-            rows = bytearray(len(ids) * self.row_bytes)
-            counters = bytearray(len(ids) * 8)
-            for index, identifier in enumerate(ids):
+            total_bytes = 0
+            for offset in range(0, len(ids), 256):
+                part = ids[offset:offset + 256]
+                total_bytes += int(connection.execute(
+                    "SELECT COALESCE(SUM(LENGTH(packed)),0) FROM paged_vector_rows WHERE vector_id IN (%s)" % ",".join("?" for _ in part), part
+                ).fetchone()[0])
+            self._reserve_memory(_READ_OVERHEAD_BYTES + total_bytes * 8 + len(ids) * (self.dimensions * 8 + 512),
+                "weighted vector shard export")
+            result = PackedTernaryVectors(self.dimensions, seed=self.seed, zero_deadband=self.zero_deadband)
+            for identifier in ids:
                 value = connection.execute(
-                    "SELECT sequence,vector_id,packed,updates,row_sha256 "
-                    "FROM paged_vector_rows WHERE vector_id=?",
+                    "SELECT sequence,vector_id,packed,updates,row_sha256 FROM paged_vector_rows WHERE vector_id=?",
                     (identifier,),
                 ).fetchone()
                 if value is None:
                     raise ValueError("packed vector export key is missing")
-                _sequence, _id, packed, updates = self._decode_row(value)
-                rows[index * self.row_bytes : (index + 1) * self.row_bytes] = packed
-                struct.pack_into("<Q", counters, index * 8, updates)
-        packed_tensor = (
-            torch.frombuffer(rows, dtype=torch.uint8).reshape(len(ids), self.row_bytes)
-            if rows else torch.empty((0, self.row_bytes), dtype=torch.uint8)
-        )
-        counter_tensor = (
-            torch.frombuffer(counters, dtype=torch.uint8).reshape(len(ids), 8)
-            if counters else torch.empty((0, 8), dtype=torch.uint8)
-        )
-        ids_bytes = json.dumps(
-            ids, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-        metadata = {
-            "format": SHARD_FORMAT,
-            "formatVersion": SHARD_FORMAT_VERSION,
-            "dimensions": self.dimensions,
-            "seed": self.seed,
-            "zeroDeadband": self.zero_deadband,
-            "rowCount": len(ids),
-            "ids": ids,
-            "idsSha256": _sha256(ids_bytes),
-            "packedSha256": _sha256(rows),
-            "countersSha256": _sha256(counters),
-        }
-        return metadata, {
-            prefix + "packed_rows": packed_tensor,
-            prefix + "update_counters_le": counter_tensor,
-        }
+                _sequence, _identifier, payload, updates = self._decode_row(value)
+                result.append_row_payload(identifier, payload, updates)
+        return result.export_state(prefix=prefix)
 
     def import_state(
         self,
@@ -940,14 +933,10 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
             raise ValueError("paged vector shard is too large or incompatible")
         if not shard:
             return 0
-        estimated = _WRITE_OVERHEAD_BYTES + len(shard) * (
-            4 * self.row_bytes + 8 + 128
-        )
+        estimated = _WRITE_OVERHEAD_BYTES + 4 * shard.storage_bytes + len(shard) * (12 + 128)
         self._reserve_disk(estimated, "paged vector shard import")
         self._reserve_memory(
-            _READ_OVERHEAD_BYTES + len(shard) * (
-                self.row_bytes + 8 + 128
-            ),
+            _READ_OVERHEAD_BYTES + 4 * shard.storage_bytes + len(shard) * (12 + 128),
             "paged vector shard import buffer",
         )
         with self._transaction(write=True) as connection:
@@ -960,7 +949,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                 self.write_packed_in_connection(
                     connection,
                     identifier,
-                    shard.packed_row(identifier),
+                    shard.row_payload(identifier),
                     dimensions=self.dimensions,
                     updates=shard.update_count(identifier),
                     reserve_disk=self._disk_reserve,
@@ -1112,6 +1101,7 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
     def status(self) -> dict[str, Any]:
         with self._transaction() as connection:
             count = row_count(connection, "paged_vector_rows")
+            payload_bytes, weighted_rows, repeated_contacts = vector_counts(connection)
             high_water = connection.execute(
                 "SELECT COALESCE(MAX(sequence),0) FROM paged_vector_rows"
             ).fetchone()[0]
@@ -1148,7 +1138,10 @@ class PagedPackedVectors(MutableMapping[str, torch.Tensor]):
                 committed_generation is None or committed_revision != revision
             ),
             "packedRowBytes": self.row_bytes,
-            "logicalPackedBytes": int(count) * (self.row_bytes + 8),
+            "logicalPackedBytes": payload_bytes + int(count) * 8,
+            "repeatedContacts": repeated_contacts,
+            "logicalParameters": count * self.dimensions + repeated_contacts,
+            "connectionStateBytes": weighted_rows * self.dimensions + repeated_contacts,
             "cacheBytes": self._cache_bytes,
             "cacheCapacityBytes": self.cache_capacity_bytes,
             "storageBytes": bytes_used,
@@ -1228,7 +1221,7 @@ class PagedVectorBatch:
             identifier = _identifier(key)
             if not isinstance(packed, bytes):
                 raise ValueError("paged vector packed rows must be bytes")
-            _validate_packed_row(packed, self.store.dimensions)
+            packed = make_payload(*payload_parts(packed, self.store.dimensions), self.store.dimensions)
             self._charge(identifier, len(packed))
             self.store._reserve_memory(
                 _READ_OVERHEAD_BYTES + 4 * len(packed) + self.store.dimensions,
@@ -1261,19 +1254,22 @@ class PagedVectorBatch:
         try:
             identifier = _identifier(key)
             alpha = _valid_rate(rate)
-            desired = quantize_vsa_vector(
-                target, self.store.dimensions,
-                zero_deadband=self.store.zero_deadband,
-            )
-            self._charge(identifier, self.store.row_bytes)
+            size = connection.execute("SELECT LENGTH(packed) FROM paged_vector_rows WHERE vector_id=?", (identifier,)).fetchone()
+            if size is None:
+                raise KeyError(identifier)
+            self._charge(identifier, int(size[0]))
             self.store._reserve_memory(
                 _READ_OVERHEAD_BYTES + 5 * self.store.row_bytes
                 + self.store.dimensions * 2,
                 "paged vector batch adaptation buffer",
             )
             levels, self._revision = self.store._adapt_in_transaction(
-                connection, identifier, desired, alpha
+                connection, identifier, target, alpha
             )
+            after = connection.execute("SELECT LENGTH(packed) FROM paged_vector_rows WHERE vector_id=?", (identifier,)).fetchone()[0]
+            self.payload_bytes += max(0, int(after) - int(size[0])) * 4
+            if self.payload_bytes > self.max_payload_bytes:
+                raise PagedVectorResourcePause("paged vector batch window reached; retry in a new transaction")
             return _activity(levels)
         except BaseException:
             self._aborted = True

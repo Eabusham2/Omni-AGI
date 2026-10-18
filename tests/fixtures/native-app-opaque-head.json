@@ -1,0 +1,45 @@
+{
+  "format": "owned-native-app-id-contract-fixture",
+  "source": {
+    "kind": "retained-actual-native-frontier",
+    "metadataSha256": "bed5719887bf9c4f1a21263bed5ee8715a1c758c6c74cfed30a9571a9118e2a6",
+    "recordedAttempt": "work/v2-native-app-media-retry-2026-10-13/watchdog.jsonl",
+    "qualityClaim": false
+  },
+  "inheritedGrammarExample": {
+    "value": "ancestral-50bcb3baad27d8fdee107612a3fb17cf896769d9ac20dd2226b69e8619b6de5b",
+    "source": "Root read actual retained originD9 rootTurnId via jq",
+    "scope": "Current native opaque-ID grammar only; App streams do not inherit chat rootTurnId automatically"
+  },
+  "frontier": {
+    "format": "omni-native-app-observation-frontier",
+    "version": 1,
+    "brainId": "app-native-fixture",
+    "frontierSha256": "976a8f68dec29b84490fa06ae0b570b1ffd7cc6797abfab3c3c624b71fcc7c38",
+    "head": {
+      "baseFrontierSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "committedAt": "2026-10-11T09:07:39.051841+00:00",
+      "dataSha256": "3c4af4e7acbbf40dc4c0f487081fd7a16f1b221ec6f60c3d5c0fe6fa94042a2f",
+      "disposition": "observe",
+      "format": "omni-native-app-observation-head",
+      "learning": {
+        "afterimageId": "67219e690f3a45c59eff7d49be52a9d2",
+        "assemblyId": "a248b16acacb7624840e52c2",
+        "experienceCountAfter": 1,
+        "experienceCountBefore": 0,
+        "kind": "experience",
+        "source": "mcp-app",
+        "sourceLabel": "reviewed-mcp-app:fixture-server/artifact-one",
+        "steps": 0,
+        "textBytes": 19,
+        "textSha256": "eaa8f9b8f9ab88de22e49260e6d94e9571f2f927c91c78ca441c68fa189777f8"
+      },
+      "ordinal": 1,
+      "previousSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "recordSha256": "4586391796ca248103c62b25940536bf1e6ea8cda314a3110a454802b1fca037",
+      "state": "observed",
+      "streamId": "app-stream",
+      "version": 1
+    }
+  }
+}

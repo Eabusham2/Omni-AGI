@@ -1,12 +1,14 @@
 """Packed, authoritative ternary vectors for the adaptive VSA substrate.
 
-This is a storage primitive, not a second memory or an answering path. A row's
-only learned vector state is its canonical two-bit ``{-1, 0, +1}`` payload.
-Decoded tensors are short-lived copies. The per-row counter is needed only to
-resume deterministic, small-rate discrete adaptations after a checkpoint.
+This is a storage primitive, not a second memory or an answering path. Learned
+state is canonical two-bit ``{-1, 0, +1}`` signs, one integer strength/resistance
+byte per base contact, and explicit packed repeated contacts. Decoded activity
+tensors are short-lived copies. The per-row counter resumes deterministic
+small-rate discrete adaptations after a checkpoint.
 
 The mapping returns transient unit-norm float32 rows for VSA activation math;
-``levels()`` returns exact int8 levels. No float row or scale is retained here.
+``levels()`` returns base int8 signs and ``weighted_levels()`` returns actual
+summed integer contributions. No float learned row or scale is retained here.
 ``export_state`` splits JSON-safe metadata from CPU uint8 tensors suitable for
 ``safetensors``; callers must save both parts together.
 """
@@ -24,7 +26,7 @@ import torch
 
 
 FORMAT = "omni-packed-vsa-vectors"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MAX_DECODE_ROWS = 64
 _MAX_UPDATES = (1 << 63) - 1
 _MASK64 = (1 << 64) - 1
@@ -163,6 +165,16 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
 
     packed_authoritative = True
 
+    @staticmethod
+    def tensor_names(metadata, *, prefix=""):
+        version = metadata.get("formatVersion") if isinstance(metadata, Mapping) else None
+        if type(version) is not int or version not in (1, FORMAT_VERSION):
+            raise ValueError("packed vector format is incompatible")
+        names = {"packed_rows", "update_counters_le"}
+        if version == 2:
+            names |= {"connection_state", "parallel_offsets_le", "parallel_records"}
+        return {prefix + name for name in names}
+
     def __init__(
         self,
         dimensions: int,
@@ -178,6 +190,13 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
         self._locations: dict[str, int] = {}
         self._rows = bytearray()
         self._update_counters = bytearray()
+        self._connection_state = bytearray()
+        self._parallel_records: dict[int, bytes] = {}
+        self._parallel_record_bytes = 0
+        self.source_format_version = FORMAT_VERSION
+        # Execution guard only, never a checkpoint/checksum field. A stream
+        # must fail if live state changed even when it was later changed back.
+        self._revision = 0
         self._free_slots: list[int] = []
         if initial is not None:
             self.update(initial)
@@ -186,7 +205,26 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
     def storage_bytes(self) -> int:
         """Actual allocated packed payload and counter bytes, including holes."""
 
-        return len(self._rows) + len(self._update_counters)
+        return len(self._rows) + len(self._update_counters) + len(self._connection_state) + self._parallel_record_bytes
+
+    def parameter_accounting(self) -> dict[str, int]:
+        count = len(self)
+        repeated = self._parallel_record_bytes // 10
+        learned = count * (self.row_bytes + self.dimensions) + repeated * 2
+        structural = count * 8 + repeated * 8
+        return {"rows": count, "baseContacts": count * self.dimensions,
+            "repeatedContacts": repeated, "logicalParameters": count * self.dimensions + repeated,
+            "learnedBytes": learned, "structuralBytes": structural,
+            "connectionStateBytes": count * self.dimensions + repeated,
+            "rowEnvelopeBytes": 0, "allocatedStateBytes": self.storage_bytes}
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def current_snapshot(self) -> str:
+        """Process-local identity for generation-bound streamed reads."""
+        return "resident-packed-vsa:%x:%d:%d" % (id(self), self._revision, len(self))
 
     def __len__(self) -> int:
         return len(self._locations)
@@ -208,9 +246,53 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
         struct.pack_into("<Q", self._update_counters, slot * 8, value)
 
     def __getitem__(self, key: str) -> torch.Tensor:
-        activity = self.levels(key).to(torch.float32)
-        norm = activity.norm()
-        return activity / norm if float(norm) > 0.0 else activity
+        from .weighted_vsa_row import activity
+        return activity(self.row_payload(key), self.dimensions)
+
+    def row_payload(self, key: str) -> bytes:
+        from .weighted_vsa_row import make_payload
+        slot = self._locations[key]
+        return make_payload(self.packed_row(key), self.connection_state(key), self.parallel_records(key), self.dimensions)
+
+    def connection_state(self, key: str) -> bytes:
+        slot = self._locations[key]
+        return bytes(self._connection_state[slot * self.dimensions:(slot + 1) * self.dimensions])
+
+    def parallel_records(self, key: str) -> bytes:
+        return self._parallel_records.get(self._locations[key], b"")
+
+    def weighted_levels(self, key: str) -> torch.Tensor:
+        from .weighted_vsa_row import weighted_levels
+        return weighted_levels(self.row_payload(key), self.dimensions)
+
+    def set_connection_state(self, key: str, state: bytes, repeats: bytes = b"") -> None:
+        from .weighted_vsa_row import make_payload
+        make_payload(self.packed_row(key), state, repeats, self.dimensions)
+        slot = self._locations[key]
+        self._parallel_record_bytes += len(repeats) - len(self._parallel_records.get(slot, b""))
+        self._connection_state[slot * self.dimensions:(slot + 1) * self.dimensions] = state
+        if repeats:
+            self._parallel_records[slot] = repeats
+        else:
+            self._parallel_records.pop(slot, None)
+        self._revision += 1
+
+    def append_row_payload(self, key: str, payload: bytes, updates: int = 0) -> None:
+        """Append verified native bytes without decoding or resetting counters."""
+        from .weighted_vsa_row import payload_parts
+        identifier = _valid_identifier(key)
+        if identifier in self._locations or type(updates) is not int or not 0 <= updates <= _MAX_UPDATES:
+            raise ValueError("packed vector append identity or update count is invalid")
+        signs, states, repeats = payload_parts(payload, self.dimensions)
+        slot = len(self._rows) // self.row_bytes
+        self._rows.extend(signs)
+        self._connection_state.extend(states)
+        self._update_counters.extend(struct.pack("<Q", updates))
+        self._locations[identifier] = slot
+        if repeats:
+            self._parallel_records[slot] = repeats
+            self._parallel_record_bytes += len(repeats)
+        self._revision += 1
 
     def levels(self, key: str) -> torch.Tensor:
         """Return an independent exact int8 copy of one row."""
@@ -240,20 +322,32 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
             slot = len(self._rows) // self.row_bytes
             self._rows.extend(bytes([0x55]) * self.row_bytes)
             self._update_counters.extend(b"\x00" * 8)
+            self._connection_state.extend(bytes(self.dimensions))
             self._locations[identifier] = slot
         self._row(slot)[:] = packed
         self._set_counter(slot, 0)
+        self._connection_state[slot * self.dimensions:(slot + 1) * self.dimensions] = bytes(self.dimensions)
+        self._parallel_record_bytes -= len(self._parallel_records.pop(slot, b""))
+        self._revision += 1
 
     def __delitem__(self, key: str) -> None:
         slot = self._locations.pop(key)
         self._row(slot)[:] = bytes([0x55]) * self.row_bytes
         self._set_counter(slot, 0)
+        self._connection_state[slot * self.dimensions:(slot + 1) * self.dimensions] = bytes(self.dimensions)
+        self._parallel_record_bytes -= len(self._parallel_records.pop(slot, b""))
         self._free_slots.append(slot)
+        self._revision += 1
 
     def clear(self) -> None:
+        if self._locations or self._rows:
+            self._revision += 1
         self._locations.clear()
         self._rows.clear()
         self._update_counters.clear()
+        self._connection_state.clear()
+        self._parallel_records.clear()
+        self._parallel_record_bytes = 0
         self._free_slots.clear()
 
     def decode_rows(self, keys: Sequence[str]) -> torch.Tensor:
@@ -285,31 +379,17 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
         if not math.isfinite(alpha) or not 0.0 <= alpha <= 1.0:
             raise ValueError("packed vector adaptation rate must be in [0, 1]")
         slot = self._locations[key]
-        previous = self.levels(key)
-        desired = quantize_vsa_vector(
-            target, self.dimensions, zero_deadband=self.zero_deadband
-        )
-        if alpha == 0.0 or torch.equal(previous, desired):
-            return self[key]
+        from .weighted_vsa_row import adapt_payload, payload_parts
         counter = self._counter(slot)
         if counter >= _MAX_UPDATES:
             raise OverflowError("packed vector update counter is exhausted")
-        digest = hashlib.sha256(
-            json.dumps(
-                [self.seed, key, counter],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).digest()
-        state = int.from_bytes(digest[:8], "little")
-        changed: list[int] = []
-        for old, goal in zip(previous.tolist(), desired.tolist()):
-            state, draw = _splitmix64(state)
-            expectation = old + alpha * (goal - old)
-            lower = math.floor(expectation)
-            changed.append(lower + int(draw < expectation - lower))
-        levels = torch.tensor(changed, dtype=torch.int8)
-        self._row(slot)[:] = _pack_exact_row(levels, self.dimensions)
+        payload, attempted = adapt_payload(self.row_payload(key), target, alpha, self.dimensions,
+            seed=self.seed, identifier=key, updates=counter, zero_deadband=self.zero_deadband)
+        if not attempted:
+            return self[key]
+        signs, state, repeats = payload_parts(payload, self.dimensions)
+        self._row(slot)[:] = signs
+        self.set_connection_state(key, state, repeats)
         self._set_counter(slot, counter + 1)
         return self[key]
 
@@ -338,6 +418,9 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
                 raise ValueError("packed vector export keys are invalid")
         rows = bytearray(len(ids) * self.row_bytes)
         counters = bytearray(len(ids) * 8)
+        connection_state = bytearray(len(ids) * self.dimensions)
+        offsets = bytearray((len(ids) + 1) * 8)
+        parallel = bytearray()
         for index, identifier in enumerate(ids):
             slot = self._locations[identifier]
             row = self._row(slot)
@@ -348,6 +431,9 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
             counters[index * 8 : (index + 1) * 8] = self._update_counters[
                 slot * 8 : (slot + 1) * 8
             ]
+            connection_state[index * self.dimensions:(index + 1) * self.dimensions] = self.connection_state(identifier)
+            parallel.extend(self.parallel_records(identifier))
+            struct.pack_into("<Q", offsets, (index + 1) * 8, len(parallel) // 10)
         packed_tensor = (
             torch.frombuffer(rows, dtype=torch.uint8).reshape(len(ids), self.row_bytes)
             if rows
@@ -372,10 +458,16 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
             "idsSha256": hashlib.sha256(ids_bytes).hexdigest(),
             "packedSha256": hashlib.sha256(rows).hexdigest(),
             "countersSha256": hashlib.sha256(counters).hexdigest(),
+            "connectionStateSha256": hashlib.sha256(connection_state).hexdigest(),
+            "parallelOffsetsSha256": hashlib.sha256(offsets).hexdigest(),
+            "parallelRecordsSha256": hashlib.sha256(parallel).hexdigest(),
         }
         return metadata, {
             prefix + "packed_rows": packed_tensor,
             prefix + "update_counters_le": counter_tensor,
+            prefix + "connection_state": torch.frombuffer(connection_state, dtype=torch.uint8).reshape(len(ids), self.dimensions) if connection_state else torch.empty((0, self.dimensions), dtype=torch.uint8),
+            prefix + "parallel_offsets_le": torch.frombuffer(offsets, dtype=torch.uint8).reshape(len(ids) + 1, 8),
+            prefix + "parallel_records": torch.frombuffer(parallel, dtype=torch.uint8).reshape(-1, 10) if parallel else torch.empty((0, 10), dtype=torch.uint8),
         }
 
     def update_packed(self, other: "PackedTernaryVectors") -> None:
@@ -404,9 +496,11 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
                 slot = len(self._rows) // self.row_bytes
                 self._rows.extend(bytes([0x55]) * self.row_bytes)
                 self._update_counters.extend(b"\x00" * 8)
+                self._connection_state.extend(bytes(self.dimensions))
             self._locations[identifier] = slot
             self._row(slot)[:] = other.packed_row(identifier)
             self._set_counter(slot, other.update_count(identifier))
+            self.set_connection_state(identifier, other.connection_state(identifier), other.parallel_records(identifier))
 
     @classmethod
     def from_state(
@@ -422,12 +516,16 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
             "format", "formatVersion", "dimensions", "seed", "zeroDeadband",
             "rowCount", "ids", "idsSha256", "packedSha256", "countersSha256",
         }
+        version = metadata.get("formatVersion") if isinstance(metadata, Mapping) else None
+        cls.tensor_names(metadata)
+        if version == 2:
+            expected_fields |= {"connectionStateSha256", "parallelOffsetsSha256", "parallelRecordsSha256"}
         if not isinstance(metadata, Mapping) or set(metadata) != expected_fields:
             raise ValueError("packed vector metadata fields are invalid")
         if (
             metadata["format"] != FORMAT
             or type(metadata["formatVersion"]) is not int
-            or metadata["formatVersion"] != FORMAT_VERSION
+            or metadata["formatVersion"] not in (1, FORMAT_VERSION)
         ):
             raise ValueError("packed vector format is incompatible")
         result = cls(
@@ -485,6 +583,33 @@ class PackedTernaryVectors(MutableMapping[str, torch.Tensor]):
         result._locations = {identifier: index for index, identifier in enumerate(ids)}
         result._rows = bytearray(row_bytes)
         result._update_counters = bytearray(counter_bytes)
+        result._connection_state = bytearray(len(ids) * result.dimensions)
+        result.source_format_version = version
+        if version == 2:
+            companions = {}
+            for name, shape, digest_name in (
+                ("connection_state", (len(ids), result.dimensions), "connectionStateSha256"),
+                ("parallel_offsets_le", (len(ids) + 1, 8), "parallelOffsetsSha256"),
+                ("parallel_records", None, "parallelRecordsSha256"),
+            ):
+                tensor = tensors.get(prefix + name)
+                if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.uint8 or tensor.layout != torch.strided or (shape is not None and tuple(tensor.shape) != shape) or (shape is None and (tensor.ndim != 2 or tensor.shape[1] != 10)):
+                    raise ValueError("weighted vector %s tensor is invalid" % name)
+                raw = tensor.detach().cpu().contiguous().numpy().tobytes()
+                if hashlib.sha256(raw).hexdigest() != metadata[digest_name]:
+                    raise ValueError("weighted vector %s checksum mismatch" % name)
+                companions[name] = raw
+            boundaries = [value[0] for value in struct.iter_unpack("<Q", companions["parallel_offsets_le"])]
+            if boundaries[0] != 0 or boundaries[-1] * 10 != len(companions["parallel_records"]) or any(a > b for a, b in zip(boundaries, boundaries[1:])):
+                raise ValueError("weighted vector repeated-contact offsets are invalid")
+            from .weighted_vsa_row import validate_contacts
+            result._connection_state[:] = companions["connection_state"]
+            for index, (first, last) in enumerate(zip(boundaries, boundaries[1:])):
+                records = companions["parallel_records"][first * 10:last * 10]
+                validate_contacts(records, result.dimensions)
+                if records:
+                    result._parallel_records[index] = records
+                    result._parallel_record_bytes += len(records)
         return result
 
 

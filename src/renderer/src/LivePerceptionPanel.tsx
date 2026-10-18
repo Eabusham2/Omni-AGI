@@ -9,12 +9,15 @@ import {
   createBrowserLivePerceptionCapture,
   planLivePerception,
   type LivePerceptionPlanInput,
+  type LivePerceptionPreview,
   type LivePerceptionSnapshotResolution,
   type LivePerceptionSource,
   type LivePerceptionState
 } from "./livePerceptionController";
 import { Icon } from "./icons";
 import { livePerceptionErrorMessage } from "./uiPresentation";
+import { LiveCapturePreview } from "./LiveCapturePreview";
+import "./cameraScreenPanel.css";
 
 const CAPTURE_MODES: LiveObservationCaptureMode[] = [
   "auto",
@@ -25,9 +28,7 @@ const CAPTURE_MODES: LiveObservationCaptureMode[] = [
 
 const SOURCES: Array<{ id: LivePerceptionSource; label: string }> = [
   { id: "camera", label: "Camera" },
-  { id: "microphone", label: "Microphone" },
-  { id: "screen", label: "Screen" },
-  { id: "mixed", label: "Mixed" }
+  { id: "screen", label: "Screen" }
 ];
 
 const EMPTY_STATE: LivePerceptionState = {
@@ -86,26 +87,42 @@ function controlLabel(state: LivePerceptionState): string | null {
 }
 
 export function LivePerceptionPanel({
-  brain
+  brain,
+  runtimeLoaded = true
 }: {
   brain: BrainDocument;
+  runtimeLoaded?: boolean;
+}) {
+  // A different instance must never inherit a view of the previous device handle.
+  return <CameraScreenPanel key={brain.id} brain={brain} runtimeLoaded={runtimeLoaded} />;
+}
+
+function CameraScreenPanel({
+  brain,
+  runtimeLoaded = true
+}: {
+  brain: BrainDocument;
+  runtimeLoaded?: boolean;
 }) {
   const captureAdapter = useMemo(() => createBrowserLivePerceptionCapture(), []);
   const controllerRef = useRef<LivePerceptionController | null>(null);
+  const operation = useRef(0);
+  const [preview, setPreview] = useState<Readonly<LivePerceptionPreview>>({});
   const defaultTier = brain.readiness.recovery?.foundation.hardwareTier ?? "personal";
+  const measuredTps = useMemo(() => measuredTokensPerSecond(brain), [brain.traces]);
+  const { workingMemoryMode, workingMemorySlots, systemRamMode, systemRamSharePercent } = brain.config;
   const [planInput, setPlanInput] = useState<LivePerceptionPlanInput>({
     hardwareTier: defaultTier,
     mode: "auto",
-    generationTokensPerSecond: measuredTokensPerSecond(brain)
+    generationTokensPerSecond: measuredTps
   });
   const [state, setState] = useState<LivePerceptionState>(EMPTY_STATE);
   const [source, setSource] = useState<LivePerceptionSource>(
     captureAdapter.capabilities.camera
       ? "camera"
-      : captureAdapter.capabilities.screen
-        ? "screen"
-        : "microphone"
+      : "screen"
   );
+  const [delivery, setDelivery] = useState<"continuous" | "snapshots">("continuous");
   const [resolutionMode, setResolutionMode] =
     useState<LivePerceptionSnapshotResolution>("native");
   const [customWidth, setCustomWidth] = useState("1280");
@@ -114,15 +131,16 @@ export function LivePerceptionPanel({
   const [intervalMs, setIntervalMs] = useState(250);
   const [pending, setPending] = useState(false);
   const [localError, setLocalError] = useState("");
-  const plan = useMemo(() => planLivePerception(planInput), [planInput]);
+  const requestedPlan = useMemo(() => planLivePerception(planInput), [planInput]);
+  const plan = state.enabled && state.plan ? state.plan : requestedPlan;
 
   useEffect(() => {
     setPlanInput((current) => ({
       ...current,
       hardwareTier: defaultTier,
-      generationTokensPerSecond: measuredTokensPerSecond(brain)
+      generationTokensPerSecond: measuredTps
     }));
-  }, [brain, defaultTier]);
+  }, [measuredTps, defaultTier]);
 
   useEffect(() => {
     if (!window.omni) return;
@@ -131,14 +149,14 @@ export function LivePerceptionPanel({
       const profile = await window.omni!.catalog.hardwareProfile().catch(() => null);
       const hardwareTier: HardwareTier = profile?.recommendedTier ?? defaultTier;
       const resource = await window.omni!.catalog.resourcePlan({
-        mode: brain.config.workingMemoryMode,
+        mode: workingMemoryMode,
         hardwareTier,
-        ...(brain.config.workingMemoryMode === "manual"
-          ? { requestedItems: String(brain.config.workingMemorySlots) }
+        ...(workingMemoryMode === "manual"
+          ? { requestedItems: String(workingMemorySlots) }
           : {}),
-        systemRamMode: brain.config.systemRamMode,
-        ...(brain.config.systemRamMode === "manual"
-          ? { systemRamSharePercent: brain.config.systemRamSharePercent }
+        systemRamMode,
+        ...(systemRamMode === "manual"
+          ? { systemRamSharePercent }
           : {})
       }).catch(() => null);
       if (!active) return;
@@ -156,7 +174,7 @@ export function LivePerceptionPanel({
     return () => {
       active = false;
     };
-  }, [brain.config, defaultTier]);
+  }, [workingMemoryMode, workingMemorySlots, systemRamMode, systemRamSharePercent, defaultTier]);
 
   useEffect(() => {
     if (!window.omni) {
@@ -170,32 +188,51 @@ export function LivePerceptionPanel({
     });
     controllerRef.current = controller;
     const unsubscribe = controller.subscribe((next) => setState({ ...next }));
+    const unsubscribePreview = controller.subscribePreview(setPreview);
     return () => {
+      operation.current += 1;
       unsubscribe();
+      unsubscribePreview();
       if (controllerRef.current === controller) controllerRef.current = null;
       void controller.dispose();
     };
   }, [brain.id, captureAdapter]);
 
   useEffect(() => {
+    if (runtimeLoaded) return;
+    operation.current += 1;
+    setPending(false);
+    const controller = controllerRef.current;
+    // Invalidates a pending OS prompt too; its eventual stream is closed by the owner.
+    void controller?.cancel();
+  }, [runtimeLoaded]);
+
+  useEffect(() => {
     setBurstCount((current) => Math.min(Math.max(1, current), plan.maxSnapshotBurst));
     setIntervalMs((current) => Math.max(current, plan.minSnapshotIntervalMs));
   }, [plan.maxSnapshotBurst, plan.minSnapshotIntervalMs]);
 
-  const run = async (task: (controller: LivePerceptionController) => Promise<unknown>) => {
+  const run = async (task: (controller: LivePerceptionController) => Promise<unknown>, requiresLoaded = true) => {
     const controller = controllerRef.current;
     if (!controller) {
-      setLocalError("Live Perception requires the packaged desktop runtime.");
+      setLocalError("Camera and screen sharing require the packaged desktop runtime.");
       return;
     }
+    if (requiresLoaded && !runtimeLoaded) {
+      setLocalError("Load this instance before starting capture.");
+      return;
+    }
+    const revision = ++operation.current;
     setPending(true);
     setLocalError("");
     try {
       await task(controller);
     } catch (error) {
-      setLocalError(livePerceptionErrorMessage(error));
+      if (controllerRef.current === controller && revision === operation.current) {
+        setLocalError(livePerceptionErrorMessage(error));
+      }
     } finally {
-      setPending(false);
+      if (controllerRef.current === controller && revision === operation.current) setPending(false);
     }
   };
 
@@ -223,10 +260,10 @@ export function LivePerceptionPanel({
 
   const capture = state.negotiatedCapture ?? state.session?.capture;
   const selectedMode = state.enabled ? capture?.mode ?? plan.mode : plan.mode;
-  const visualSource = source !== "microphone";
   const snapshotBusy = state.snapshot?.state === "capturing";
+  const sessionNeedsClose = !state.enabled && state.session?.state === "active";
   const status = state.phase === "observing"
-    ? "Observing"
+    ? "Sharing"
     : state.phase === "requesting"
       ? "Requesting permission"
       : state.phase === "stopping"
@@ -237,16 +274,17 @@ export function LivePerceptionPanel({
   const latestControl = controlLabel(state);
 
   return (
-    <details className="live-perception-panel">
-      <summary>
+    <section className="camera-screen-panel" aria-label="Camera and screen sharing">
+      <header>
         <span className="live-perception-panel__icon"><Icon name="activity" size={14} /></span>
         <span>
-          <strong>Live Perception</strong>
-          <small>{state.enabled ? `${titleCase(state.source ?? source)} · ${captureLabel(state)}` : "Camera, screen, or direct neural audio"}</small>
+          <strong>Camera & screen</strong>
+          <small>{state.enabled ? `${titleCase(state.source ?? source)} · ${captureLabel(state)}` : "Share a source when you choose"}</small>
         </span>
         <em className={state.enabled ? "is-active" : ""}><i /> {status}</em>
-      </summary>
-      <div className="live-perception-panel__body">
+      </header>
+      <div className="camera-screen-panel__body">
+        <LiveCapturePreview preview={preview} state={state} loaded={runtimeLoaded} />
         <div className="live-perception-toolbar">
           <fieldset>
             <legend>Source</legend>
@@ -255,9 +293,10 @@ export function LivePerceptionPanel({
               return (
                 <button
                   key={item.id}
+                  type="button"
                   aria-pressed={source === item.id}
-                  disabled={!available || state.enabled || state.phase === "requesting"}
-                  title={available ? `Use ${item.label.toLocaleLowerCase()} perception` : `${item.label} is unavailable in this runtime`}
+                  disabled={!available || state.enabled || state.phase === "requesting" || state.phase === "stopping"}
+                  title={available ? `Share ${item.label.toLocaleLowerCase()} after Start` : `${item.label} is unavailable in this runtime`}
                   onClick={() => setSource(item.id)}
                 >
                   {item.label}
@@ -266,71 +305,64 @@ export function LivePerceptionPanel({
             })}
           </fieldset>
           <fieldset>
-            <legend>Quality</legend>
-            {CAPTURE_MODES.map((mode) => (
-              <button
-                key={mode}
-                aria-pressed={selectedMode === mode}
-                disabled={pending || state.phase === "requesting" || state.phase === "stopping"}
-                onClick={() => selectMode(mode)}
-              >
-                {titleCase(mode)}
-              </button>
-            ))}
+            <legend>Sharing mode</legend>
+            {(["continuous", "snapshots"] as const).map(mode => <button type="button" key={mode} aria-pressed={delivery === mode}
+              disabled={state.enabled || state.phase === "requesting" || state.phase === "stopping"}
+              title={mode === "continuous" ? "Share frames continuously within the device resource plan" : "Share only audited snapshots requested by you or the brain"}
+              onClick={() => setDelivery(mode)}>{mode === "continuous" ? "Stream" : "Snapshots"}</button>)}
           </fieldset>
           <div className="live-perception-actions">
-            {!state.enabled && state.phase !== "requesting" ? (
+            {!state.enabled && !sessionNeedsClose && state.phase !== "requesting" && state.phase !== "stopping" ? (
               <button
+                type="button"
                 className="is-primary"
-                disabled={pending || !sourceAvailable(source, captureAdapter.capabilities)}
-                onClick={() => void run((controller) => controller.start(source, plan, "neural"))}
+                disabled={!runtimeLoaded || pending || !sourceAvailable(source, captureAdapter.capabilities)}
+                onClick={() => void run((controller) => controller.start(source, plan, "neural", delivery))}
               >
                 <Icon name="play" size={12} /> Start
               </button>
             ) : null}
-            {state.enabled ? (
-              <button disabled={pending} onClick={() => void run((controller) => controller.stop())}>
+            {state.enabled || sessionNeedsClose ? (
+              <button type="button" onClick={() => void run((controller) => controller.stop(), false)}>
                 <Icon name="close" size={12} /> Stop
               </button>
             ) : null}
-            {state.phase === "requesting" || state.enabled || state.phase === "stopping" ? (
-              <button className="is-danger" onClick={() => void run((controller) => controller.cancel())}>
-                Cancel
+            {state.phase === "requesting" ? (
+              <button type="button" onClick={() => void run((controller) => controller.cancel(), false)}>
+                Cancel request
               </button>
             ) : null}
+            {state.enabled ? <button type="button" disabled={pending || snapshotBusy} onClick={requestSnapshot} title="Capture an audited snapshot burst with the selected resolution">
+              <Icon name="image" size={12} /> Snapshot
+            </button> : null}
           </div>
         </div>
 
-        <div className="live-perception-facts" aria-live="polite">
-          <span><small>Applied capture</small><strong>{captureLabel(state)}</strong></span>
-          <span><small>Resource class</small><strong>{titleCase(capture?.benchmarkClass ?? plan.benchmarkClass)}</strong></span>
-          <span><small>Accepted</small><strong>{state.session?.packetsAccepted.toLocaleString() ?? "0"}</strong></span>
-          <span><small>Backpressure</small><strong>{((state.session?.packetsDroppedBackpressure ?? 0) + state.localPacketsDropped).toLocaleString()}</strong></span>
-        </div>
-
-        {latestControl ? (
-          <p className="live-perception-control-status" role="status">
-            <Icon name={state.lastControl?.state === "rejected" ? "warning" : "pulse"} size={13} />
-            <span>{latestControl}</span>
-          </p>
-        ) : null}
         {state.error || localError ? (
           <p className="live-perception-error" role="alert"><Icon name="warning" size={13} /> {localError || state.error}</p>
         ) : null}
 
         <details className="live-perception-advanced">
-          <summary>Snapshot bursts, source bounds, and control audit</summary>
+          <summary>Quality, snapshots & activity</summary>
           <div>
+            <fieldset className="camera-screen-quality">
+              <legend>Capture priority</legend>
+              {CAPTURE_MODES.map((mode) => <button type="button" key={mode} aria-pressed={selectedMode === mode}
+                disabled={pending || state.phase === "requesting" || state.phase === "stopping"}
+                title={mode === "motion" ? "Prioritize movement and frame rate" : mode === "detail" ? "Prioritize still-image detail" : mode === "auto" ? "Adapt to actual source and device resources" : "Balance detail and movement"}
+                onClick={() => selectMode(mode)}>{mode === "detail" ? "Detail" : titleCase(mode)}</button>)}
+            </fieldset>
             <section className="live-perception-snapshot" aria-labelledby="snapshot-burst-title">
               <div>
                 <strong id="snapshot-burst-title">Snapshot burst</strong>
-                <small>Temporary visual samples enter this same brain only after every frame is accepted.</small>
+                <small>Native, current, or custom resolution. Each frame is submitted separately.</small>
               </div>
               <fieldset>
                 <legend>Resolution</legend>
                 {(["native", "current", "custom"] as const).map((resolution) => (
                   <button
                     key={resolution}
+                    type="button"
                     aria-pressed={resolutionMode === resolution}
                     disabled={snapshotBusy}
                     onClick={() => setResolutionMode(resolution)}
@@ -359,32 +391,40 @@ export function LivePerceptionPanel({
               <div className="live-perception-snapshot-actions">
                 <button
                   className="is-primary"
-                  disabled={!state.enabled || !visualSource || pending || snapshotBusy}
+                  type="button"
+                  disabled={!state.enabled || pending || snapshotBusy}
                   onClick={requestSnapshot}
                 >
                   <Icon name="image" size={12} /> Capture burst
                 </button>
-                {snapshotBusy ? <button onClick={cancelSnapshot}>Cancel burst</button> : null}
+                {snapshotBusy ? <button type="button" onClick={cancelSnapshot}>Stop burst</button> : null}
                 {state.snapshot ? (
                   <span role="status">{titleCase(state.snapshot.state)} · {state.snapshot.acceptedFrames}/{state.snapshot.requestedFrames} accepted</span>
                 ) : null}
               </div>
             </section>
 
+            <div className="live-perception-facts">
+              <span><small>Capture</small><strong>{captureLabel(state)}</strong></span>
+              <span><small>Resources</small><strong>{titleCase(capture?.benchmarkClass ?? plan.benchmarkClass)}</strong></span>
+              <span><small>Accepted</small><strong>{state.session?.packetsAccepted.toLocaleString() ?? "0"}</strong></span>
+              <span><small>Backpressure</small><strong>{((state.session?.packetsDroppedBackpressure ?? 0) + state.localPacketsDropped).toLocaleString()}</strong></span>
+            </div>
+
             <dl className="live-perception-audit">
               <div><dt>Source native</dt><dd>{capture?.sourceNativeWidth && capture.sourceNativeHeight ? `${capture.sourceNativeWidth}×${capture.sourceNativeHeight}${capture.sourceNativeFps ? ` @ ${capture.sourceNativeFps} FPS` : ""}` : "Available after source negotiation"}</dd></div>
               <div><dt>Capture revision</dt><dd>{capture ? `r${capture.revision}` : "—"}</dd></div>
               <div><dt>Transport window</dt><dd>{state.session ? `${state.session.maxInFlight} in flight · ${state.session.maxPacketBytes.toLocaleString()} bytes/packet` : `${plan.maxInFlight} planned`}</dd></div>
-              <div><dt>Auto plan</dt><dd>{plan.reason}</dd></div>
+              <div><dt>Current plan</dt><dd>{state.enabled && capture ? `${captureLabel(state)} · ${titleCase(capture.mode)} priority` : plan.reason}</dd></div>
               <div><dt>Last control</dt><dd>{latestControl ?? "No human or brain capture control yet"}</dd></div>
               <div><dt>Brain actions</dt><dd>{state.lastActions.length ? state.lastActions.map((action) => action.kind).join(", ") : "None from the latest observation"}</dd></div>
             </dl>
             <p className="live-perception-privacy">
-              Raw packets are not stored. Accepted perception may update working or neural state, but it does not commit dataset coverage and it never injects a hidden behavioral prompt.
+              The preview stays on this device. Raw packets are not stored. Accepted perception may update working or neural state, but it does not commit dataset coverage and it never injects a hidden behavioral prompt.
             </p>
           </div>
         </details>
       </div>
-    </details>
+    </section>
   );
 }

@@ -1,0 +1,114 @@
+{
+  "scope": "fixed constructor-free CPU recurrence only; no brain, learning, corpus, or accelerator timing",
+  "platform": "macOS-26.3-arm64-arm-64bit",
+  "architecture": "arm64",
+  "torch": "2.13.0",
+  "threads": 1,
+  "pairedRounds": 7,
+  "callsPerSample": 5,
+  "nativeManifest": {
+    "abi": 1,
+    "platform": "darwin",
+    "architecture": "arm64",
+    "sourceSha256": "0be63aed8c1e2ad6de369bce4d5cf80fa935dd7b9e722440423465f5dc7cd42e",
+    "sha256": "973a783ffeece0f24acb0aaca2dcdc230da1bb3cc88708a10c7162a86924940c",
+    "file": "omni_packed_kernel.dylib"
+  },
+  "sourceSha256": {
+    "spiking.py": "bd00fe072f149948dffe136242610d227a031089c1b1a4f85c0c96375ecb7c3e",
+    "sparse_router_state.py": "af285014d379c8993977655d2126217f3045fe04590ddad445ad2f40d8114164",
+    "packed_native_kernel.py": "28a4fe45124c354b953ecf9308f910d0b5fdc0b6e9e8e75413bafdfa48efd36f",
+    "kernels/weighted_ternary.cpp": "0be63aed8c1e2ad6de369bce4d5cf80fa935dd7b9e722440423465f5dc7cd42e",
+    "kernels/weighted_ternary.metal": "85e0c74e6c468967d79bfff03271e0f392ac1068abf2b1cc329c10f85237ad6d"
+  },
+  "cases": [
+    {
+      "case": "sparse-repeated-hot-64KiB",
+      "rows": 67,
+      "columns": 69,
+      "allocatedBlocks": 5,
+      "allocatedContactSlots": 12623,
+      "tileBudgetBytes": 65536,
+      "tilesPerCall": 42,
+      "residentStateBytes": 142059,
+      "mappedLogicalStateBytes": 0,
+      "maximumRawSignGainPayloadBytes": 400,
+      "formerMaximumFloatWeightTileBytesOnly": 1280,
+      "exactFixedDyadicOutput": true,
+      "learnedStateUnchanged": true,
+      "samplesMillisecondsPerCall": {
+        "decoded": [4.1674084, 4.1895, 3.697225, 3.6231, 3.6215083999999997, 3.64995, 3.6206],
+        "packed": [2.1104416, 2.2411916, 2.0206916, 1.8961918, 1.9686, 1.9216, 2.0274418]
+      },
+      "decodedMedianMilliseconds": 3.64995,
+      "packedMedianMilliseconds": 2.0206916,
+      "decodedOverPackedRatio": 1.8062875106720886
+    },
+    {
+      "case": "sparse-repeated-mapped-64KiB",
+      "rows": 67,
+      "columns": 69,
+      "allocatedBlocks": 5,
+      "allocatedContactSlots": 12623,
+      "tileBudgetBytes": 65536,
+      "tilesPerCall": 42,
+      "residentStateBytes": 0,
+      "mappedLogicalStateBytes": 142059,
+      "maximumRawSignGainPayloadBytes": 400,
+      "formerMaximumFloatWeightTileBytesOnly": 1280,
+      "exactFixedDyadicOutput": true,
+      "learnedStateUnchanged": true,
+      "samplesMillisecondsPerCall": {
+        "decoded": [7.186725, 7.10165, 10.0598916, 7.4356165999999995, 7.2058418, 7.534158400000001, 7.7372666],
+        "packed": [5.3866, 5.4122918, 5.7384, 5.6294084, 5.453033400000001, 5.7086916, 5.511141599999999]
+      },
+      "decodedMedianMilliseconds": 7.4356165999999995,
+      "packedMedianMilliseconds": 5.511141599999999,
+      "decodedOverPackedRatio": 1.3491971608931261
+    },
+    {
+      "case": "sparse-repeated-hot-1MiB",
+      "rows": 67,
+      "columns": 69,
+      "allocatedBlocks": 5,
+      "allocatedContactSlots": 12623,
+      "tileBudgetBytes": 1048576,
+      "tilesPerCall": 5,
+      "residentStateBytes": 142059,
+      "mappedLogicalStateBytes": 0,
+      "maximumRawSignGainPayloadBytes": 5120,
+      "formerMaximumFloatWeightTileBytesOnly": 16384,
+      "exactFixedDyadicOutput": true,
+      "learnedStateUnchanged": true,
+      "samplesMillisecondsPerCall": {
+        "decoded": [0.9025834, 0.9051, 0.8601, 0.8724168, 0.8650166, 0.9782666, 0.8969168000000001],
+        "packed": [0.7261331999999999, 0.8265165999999999, 0.7358416, 0.7764666, 0.7539084, 0.7554918, 0.7473082]
+      },
+      "decodedMedianMilliseconds": 0.8969168000000001,
+      "packedMedianMilliseconds": 0.7539084,
+      "decodedOverPackedRatio": 1.1896893574869307
+    },
+    {
+      "case": "dense-compatible-hot-64KiB",
+      "rows": 67,
+      "columns": 69,
+      "allocatedBlocks": null,
+      "allocatedContactSlots": 4623,
+      "tileBudgetBytes": 65536,
+      "tilesPerCall": 28,
+      "residentStateBytes": 47436,
+      "mappedLogicalStateBytes": 0,
+      "maximumRawSignGainPayloadBytes": 80,
+      "formerMaximumFloatWeightTileBytesOnly": 1280,
+      "exactFixedDyadicOutput": true,
+      "learnedStateUnchanged": true,
+      "samplesMillisecondsPerCall": {
+        "decoded": [1.787375, 1.7937666, 1.860625, 1.85425, 1.677375, 1.9233334, 1.766575],
+        "packed": [0.9941831999999999, 1.0139834, 0.9748, 0.9449915999999999, 1.0455584, 1.021725, 1.144775]
+      },
+      "decodedMedianMilliseconds": 1.7937666,
+      "packedMedianMilliseconds": 1.0139834,
+      "decodedOverPackedRatio": 1.7690295521603212
+    }
+  ]
+}

@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 const root = resolve(import.meta.dirname, "..");
 const app = readFileSync(resolve(root, "src/renderer/src/App.tsx"), "utf8");
 const styles = readFileSync(resolve(root, "src/renderer/src/styles.css"), "utf8");
+const responseCounter = readFileSync(resolve(root, "src/renderer/src/ResponseOutputCounter.tsx"), "utf8");
+const submitControl = readFileSync(resolve(root, "src/renderer/src/ComposerSubmitControl.tsx"), "utf8");
 const chatWorkspaceActivity = readFileSync(
   resolve(root, "src/renderer/src/chatWorkspaceActivity.ts"),
   "utf8"
@@ -18,7 +20,9 @@ describe("screenshot defect regressions", () => {
 
   it("bounds diagnostics at the toast and compact job surfaces", () => {
     expect(app).toContain("const presentedMessage = conciseUiMessage(message)");
-    expect(app).toContain("className=\"toast__message\"");
+    const toast = readFileSync(resolve(root, "src/renderer/src/ToastNotice.tsx"), "utf8");
+    expect(app).toContain("<ToastNotice");
+    expect(toast).toContain("className=\"toast__message\"");
     expect(app).toContain("className=\"ui-error-copy\"");
     expect(app).toContain("conciseUiMessage(activeJob.error)");
     expect(styles).toContain("overflow-wrap: anywhere");
@@ -43,16 +47,17 @@ describe("screenshot defect regressions", () => {
   });
 
   it("exposes exact keyboard semantics and a visible token-used counter", () => {
-    expect(app).toContain('aria-keyshortcuts="Enter Shift+Enter Control+Enter Meta+Enter"');
-    expect(app).toContain('className="composer__token-counter"');
-    expect(app).toContain('aria-label={`Token counter and neural learning status. ${composerTelemetryAriaLabel}`}');
-    expect(app).toContain('{draftTokenCount.toLocaleString()} draft · {contextTokenCopy} · {composerTelemetryCopy}');
-    expect(app).toContain("utf8DraftTokenCount(input)");
-    expect(app).toContain("Enter queues · Ctrl/Cmd Enter steers");
-    expect(app).toContain("Enter to send · Shift Enter for a line break");
-    expect(app).toContain("pendingChatOutputPresentation({");
-    expect(app).toContain("responseOutputPresentation.label");
-    expect(app).toContain("response-token-counter--${responseOutputPresentation.phase}");
+    expect(app.includes('aria-keyshortcuts="Enter Shift+Enter Control+Enter Meta+Enter"')).toBe(true);
+    expect(app.includes('className="composer__input-count" title={composerTelemetryAriaLabel}')).toBe(true);
+    expect(app.includes('aria-label={`${draftTokenCount.toLocaleString()} input tokens. ${composerTelemetryAriaLabel}`}')).toBe(true);
+    expect(app.includes("utf8DraftTokenCount(input)")).toBe(true);
+    expect(submitControl).toContain("Queue message · hold Ctrl or ⌘ to steer");
+    expect(submitControl).toContain('active ? steering ? "Steer" : "Queue" : "Send"');
+    expect(app.includes("pendingChatOutputPresentation({")).toBe(true);
+    expect(app.includes("<ResponseOutputCounter presentation={responseOutputPresentation}")).toBe(true);
+    expect(responseCounter).toContain("presentation.label");
+    expect(responseCounter).toContain("response-token-counter--${presentation.phase}");
+    expect(responseCounter).toContain("title={presentation.ariaLabel}");
     expect(styles).toContain(".response-token-counter--loading");
   });
 
@@ -105,24 +110,17 @@ describe("screenshot defect regressions", () => {
     expect(app).toContain("if (hidden || !userTimelineScrollRef.current) return;");
     expect(app).toContain('className="workspace-header__chat-status"');
     expect(app).toContain("chatActivityStatus.headerLabel");
-    expect(app).toContain('className="composer__steer-choice"');
-    expect(app).toContain("onClick={() => void steerCurrentTurn()}");
-    expect(app).toContain(
-      'title="Apply this direction at the next safe neural boundary; the prior request remains visible and the loaded mind stays warm"'
-    );
-    expect(app).toContain('className="send-button composer__queue-choice"');
-    expect(app).toContain("onClick={submitOrdinaryTurn}");
+    expect(app).toContain("<ComposerSubmitControl active={turnActive}");
+    expect(app).toContain("onSend={submitOrdinaryTurn} onSteer={() => void steerCurrentTurn()}");
+    expect(submitControl).toContain('className="send-button composer__submit"');
+    expect(submitControl).toContain('active && canSteer && (event.ctrlKey || event.metaKey) ? onSteer() : onSend()');
+    expect(submitControl).not.toContain('className="composer__steer-choice"');
     expect(app).toContain('className="chat-tool-status" role="status"');
     expect(app).toContain("Cancel the exact job in its action details.");
-    expect(app).toContain('className="composer__stop-choice"');
-    const queueControl = app.indexOf(
-      'className="send-button composer__queue-choice"'
-    );
-    const stopControl = app.indexOf(
-      'className="composer__stop-choice"',
-      queueControl
-    );
-    expect(stopControl).toBeGreaterThan(queueControl);
+    expect(app).toContain("onStop={() => void cancelChatTool()}");
+    expect(submitControl).toContain('className="composer__stop-choice"');
+    expect(submitControl.indexOf('className="composer__stop-choice"'))
+      .toBeLessThan(submitControl.indexOf('className="send-button composer__submit"'));
     expect(app).toContain("const showTurnActivity =\n    textTurnVisiblyActive || voicePondering;");
     expect(styles).toMatch(
       /\.message__streaming-text--reply-complete::after\s*\{[^}]*display: none;[^}]*animation: none;/

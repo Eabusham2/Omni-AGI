@@ -105,6 +105,9 @@ function writeReleaseFixture(): string {
   };
 
   for (const arch of ["x64", "arm64"] as const) {
+    const portableRuntime = { portableProtocol: 1, appVersion: version, sourceCommit,
+      desktopArchitecture: arch, workerArchitecture: "x64", runtimeReceiptVerified: true,
+      selectedInstanceTested: false, destinationReservationTested: false, neuralAcceptanceTested: false };
     const windowsExe = artifact(`${product}-${version}-Windows-${arch}.exe`);
     const windowsZip = artifact(`${product}-${version}-Windows-${arch}.zip`);
     const macDmg = artifact(`${product}-${version}-macOS-${arch}.dmg`);
@@ -130,6 +133,7 @@ function writeReleaseFixture(): string {
           packagedWorkerArchitecture: "x64",
           desktopArchitecture: arch,
           desktopSignature: { valid: false },
+          portableRuntime,
           rpcSmoke: workerSmoke()
         },
         nsis: {
@@ -142,6 +146,7 @@ function writeReleaseFixture(): string {
           neuralAcceptanceTested: false,
           installerSignature: { valid: false },
           desktopSignature: { valid: false },
+          portableRuntime,
           rpcSmoke: workerSmoke()
         },
         signing: {
@@ -520,6 +525,17 @@ describe("stable release artifact gate", () => {
         )
       )
     ).toBe(false);
+  });
+
+  it("rejects release evidence with a missing or foreign portable runtime commit", () => {
+    for (const kind of ["zip", "nsis"] as const) {
+      const directory = writeReleaseFixture();
+      const path = join(directory, "windows-package-smoke-arm64.json");
+      const smoke = JSON.parse(readFileSync(path, "utf8"));
+      smoke[kind].portableRuntime.sourceCommit = kind === "zip" ? null : "b".repeat(40);
+      writeFileSync(path, JSON.stringify(smoke));
+      expect(() => verify(directory)).toThrow(/commit-bound portable runtime evidence/u);
+    }
   });
 
   it("rejects a packaged/public filename collision before writing metadata", () => {

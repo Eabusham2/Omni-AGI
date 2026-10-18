@@ -196,13 +196,15 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
                     continue
                 receipt = RequestAllocationReceipt([raw_lease, decode_lease])
                 if isinstance(request, dict): request = AdmittedRequest(request, receipt)
-                if isinstance(request, dict) and request.get("method") in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status"}:
+                if isinstance(request, dict) and request.get("method") in {"cancel_inline_generation", "steer_chat", "suspend_chat", "instance_status", "inherited_execution_presentation", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status", "router_activity_control", "decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop", "mcp_sampling_enqueue", "mcp_sampling_status", "mcp_sampling_cancel", "mcp_sampling_consume"}:
                     # dispatch_control validates the exact ownership tuple and
                     # cannot execute/load/save a brain or alter chat cancellation.
                     dispatch(request, receipt, control=True)
                 else:
+                    retire_private = getattr(worker, "retire_private_native_work", None)
+                    if callable(retire_private): retire_private()
                     reserve = getattr(worker, "reserve_chat_steering", None)
-                    if isinstance(request, dict) and request.get("method") == "chat" and callable(reserve):
+                    if isinstance(request, dict) and request.get("method") in {"chat", "resume_chat", "resume_inherited_chat"} and callable(reserve):
                         try:
                             reserve(request)
                         except rpc_fault_type as error:
@@ -212,6 +214,8 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
                             continue
                     requests.put((request, receipt))
         finally:
+            retire_private = getattr(worker, "retire_private_native_work", None)
+            if callable(retire_private): retire_private()
             if drain_lease is not None: drain_lease.release()
             if worker.running: requests.put(eof)
             else: release_queued()
@@ -220,7 +224,13 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
     reader.start()
     try:
         while worker.running:
-            item = requests.get()
+            try:
+                item = requests.get_nowait()
+            except queue.Empty:
+                private_step = getattr(worker, "step_private_native_work", None)
+                if callable(private_step) and private_step():
+                    continue
+                item = requests.get()
             if item is eof:
                 break
             request, receipt = item

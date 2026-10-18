@@ -24,6 +24,7 @@ import torch
 from safetensors.torch import load_file
 
 from .packed_vsa_vectors import PackedTernaryVectors
+from .weighted_substrate_state import unpack_strengths, synapse_inspection_fields
 from .persistence import atomic_write_bytes
 
 
@@ -75,9 +76,14 @@ def _safe_path(root: Path, relative: str) -> Path:
 
 
 def _read_bytes(path: Path, expected_sha: str, expected_bytes: int) -> bytes:
+    from .inspection_resources import current_inspection_resources
+    admit, cancelled = current_inspection_resources()
+    if cancelled is not None and cancelled(): raise InterruptedError("substrate inspection cancelled")
+    if admit is not None: admit(512 * 1024 + expected_bytes * 8, "inspection exact source metadata/bytes")
     payload = path.read_bytes()
     if len(payload) != expected_bytes or _sha256(payload) != expected_sha:
         raise ValueError("persisted substrate inspection blob checksum mismatch")
+    if cancelled is not None and cancelled(): raise InterruptedError("substrate inspection cancelled")
     return payload
 
 
@@ -287,10 +293,16 @@ class PersistedSubstrateView:
         self.shards = list(generation["shards"])
 
     @classmethod
-    def open(cls, engine_directory: Path, expected_brain_id: str) -> "PersistedSubstrateView":
+    def open(cls, engine_directory: Path, expected_brain_id: str, *, _committed_source=None) -> "PersistedSubstrateView":
         engine_directory = Path(engine_directory).resolve()
         metadata_path = engine_directory / "brain.json"
-        metadata = json.loads(metadata_path.read_text("utf-8"))
+        if _committed_source is None:
+            metadata = json.loads(metadata_path.read_text("utf-8"))
+        else:
+            from .committed_substrate_source import VerifiedCommittedSubstrateSource
+            if not isinstance(_committed_source, VerifiedCommittedSubstrateSource):
+                raise ValueError("regional substrate source must be an internal verified descriptor")
+            metadata = dict(_committed_source.resolve(engine_directory, expected_brain_id))
         if not isinstance(metadata, dict) or str(metadata.get("brain_id", "")) != expected_brain_id:
             raise ValueError("persisted substrate belongs to another brain")
         substrate = metadata.get("substrate")
@@ -517,13 +529,14 @@ class PersistedSubstrateView:
                 and shard.get("kind") == "neurons"
             ):
                 payload = self.records(shard)
-                if set(tensors) != {"packed_rows", "update_counters_le"}:
+                if set(tensors) != PackedTernaryVectors.tensor_names(payload["packedVectorState"]):
                     raise ValueError("persisted neuron packed tensor fields are invalid")
                 PackedTernaryVectors.from_state(
                     payload["packedVectorState"], tensors
                 )
             return tensors
         count = _count(shard.get("count"), "synapse count")
+        tensors["connection_strength"] = unpack_strengths(tensors.get("packed_connection_strength"), count)
         version = int(self.generation.get("formatVersion", 0))
         if version == 1:
             tensors.pop("latent_weight", None)
@@ -1270,15 +1283,17 @@ def _inspect_assembly(
     identifier = str(record.get("id", ""))
     neuron_ids = [str(value) for value in record.get("neuron_ids", [])]
     child_ids = [str(value) for value in record.get("child_assembly_ids", [])]
+    neuron_count = _count(record.get("__inspection_neuron_count", len(neuron_ids)), "assembly neurons")
+    child_count = _count(record.get("__inspection_child_count", len(child_ids)), "assembly children")
     return {
         "id": identifier,
         "label": str(record.get("source_label", record.get("kind", "assembly"))),
         "region": "assembly",
         "neuronIds": neuron_ids,
         "childAssemblyIds": child_ids,
-        "neuronCount": len(neuron_ids),
-        "childAssemblyCount": len(child_ids),
-        "relationshipsPaged": False,
+        "neuronCount": neuron_count,
+        "childAssemblyCount": child_count,
+        "relationshipsPaged": neuron_count > len(neuron_ids) or child_count > len(child_ids),
         "kind": str(record.get("kind", "knowledge")),
         "source": str(record.get("source", "")),
         "confidence": _number(record.get("confidence"), 0.5),
@@ -1330,6 +1345,8 @@ def _synapse_records(
                 "targetId": str(raw.get("target_id", "")),
                 "kind": str(raw.get("kind", "associates")),
                 "effectiveWeight": effective,
+                **synapse_inspection_fields({**raw, "effective_weight": effective,
+                    "connection_strength": int(tensors["connection_strength"][index].item())}),
                 "eligibility": (
                     view.effective_eligibility(str(raw.get("id", "")), float(tensors["eligibility"][index].item()))
                     if apply_attention else float(tensors["eligibility"][index].item())
@@ -1385,6 +1402,7 @@ def query_persisted_substrate(
     query: Optional[Mapping[str, Any]] = None,
     *,
     expected_live: Optional[Mapping[str, Any]] = None,
+    _committed_source=None,
 ) -> Dict[str, Any]:
     """Query one committed generation without loading the neural runtime.
 
@@ -1392,7 +1410,7 @@ def query_persisted_substrate(
     dirty or mismatched live state is rejected before any shard query.
     """
 
-    view = PersistedSubstrateView.open(engine_directory, expected_brain_id)
+    view = PersistedSubstrateView.open(engine_directory, expected_brain_id, _committed_source=_committed_source)
     if expected_live is not None:
         require_current_substrate_generation(view, expected_live)
     raw = dict(query or {})
@@ -1406,10 +1424,21 @@ def query_persisted_substrate(
     region = str(raw.get("region", "")).strip()
     search = str(raw.get("search", "")).strip()
     connected_to = str(raw.get("connectedTo", "")).strip()
-    if len(region) > 128 or len(search) > 512 or len(connected_to) > 256:
+    members_of = raw.get("membersOf", "")
+    source_region, target_region = raw.get("sourceRegion", ""), raw.get("targetRegion", "")
+    activation_band = raw.get("activationBand", "")
+    if not all(isinstance(value, str) for value in (members_of, source_region, target_region)):
+        raise ValueError("substrate exact source filter is invalid")
+    if len(region) > 128 or len(search) > 512 or len(connected_to) > 256 or len(members_of) > 512 or max(len(source_region), len(target_region)) > 128:
         raise ValueError("substrate filter is too long")
     if connected_to and entity != "synapses":
         raise ValueError("connectedTo is valid only for synapse queries")
+    if bool(source_region) != bool(target_region) or ((source_region or target_region) and (entity != "synapses" or zoom < .66)):
+        raise ValueError("an exact ordered pathway requires both regions and detailed synapses")
+    if members_of and (entity != "assemblies" or zoom < .66 or region or search or connected_to or source_region or target_region):
+        raise ValueError("exact assembly members require an unambiguous detailed assembly query")
+    if activation_band not in ("", "quiet", "medium", "high") or activation_band and (entity != "neurons" or zoom < .66):
+        raise ValueError("an exact activation band requires detailed neurons")
     fingerprint = hashlib.sha256(
         _canonical_json(
             {
@@ -1418,6 +1447,10 @@ def query_persisted_substrate(
                 "region": region.casefold(),
                 "search": search.casefold(),
                 "connectedTo": connected_to,
+                "membersOf": members_of,
+                "sourceRegion": source_region,
+                "targetRegion": target_region,
+                "activationBand": activation_band,
             }
         )
     ).hexdigest()[:20]
@@ -1438,55 +1471,45 @@ def query_persisted_substrate(
         "transportLimited": False,
         "hasMore": False,
         "clusters": [],
+        "clusterAnchors": [],
         "neurons": [],
         "assemblies": [],
         "synapses": [],
     }
+    if source_region:
+        response["pathwayFilter"] = {"sourceRegion": source_region, "targetRegion": target_region}
+    if activation_band:
+        response["activationBand"] = activation_band
 
-    search_value = search.casefold()
+    from .paged_inspection_queries import PagedInspectionIndex
+    query_index = PagedInspectionIndex(view)
+    if members_of:
+        header, members, matched = query_index.members(members_of, offset, page_size)
+        members, _, member_bytes, limited = _bounded_page(members, 0, page_size)
+        header = {**header, "neuron_ids": [row["memberId"] for row in members if row["memberKind"] == "neuron"],
+                  "child_assembly_ids": [row["memberId"] for row in members if row["memberKind"] == "assembly"]}
+        inspected = _inspect_assembly(view, header)
+        neuron = query_index.neuron(members_of)
+        if neuron is not None:
+            inspected.update(activation=view.effective_activation(neuron), activationObserved=True)
+        response["assemblies"] = [inspected]
+        end = offset + len(members)
+        response.update(matched=matched, returned=len(members), hasMore=end < matched,
+                        pageBytes=member_bytes, transportLimited=limited, membershipPage={"assemblyId": members_of,
+                        "total": matched, "offset": offset, "returned": len(members), "members": members})
+        if response["hasMore"]: response["nextCursor"] = _cursor(end, view.revision, fingerprint)
+        return response
     if entity == "overview" or zoom < 0.66:
-        index = ensure_inspection_index(view)
-        bands = _attention_masked_bands(
-            view,
-            _index_records(view, index, "activation-bands"),
-        )
-        neuron_clusters = _region_clusters(bands) if zoom < 0.35 else bands
-        pathways = list(_index_records(view, index, "pathways"))
-        clusters = neuron_clusters + pathways
-
-        def aggregate_matches(record: Mapping[str, Any]) -> bool:
-            if region:
-                values = {
-                    str(record.get("region", "")).casefold(),
-                    str(record.get("sourceRegion", "")).casefold(),
-                    str(record.get("targetRegion", "")).casefold(),
-                }
-                if region.casefold() not in values:
-                    return False
-            if search_value:
-                searchable = "%s %s %s %s %s" % (
-                    record.get("id", ""),
-                    record.get("label", ""),
-                    record.get("region", ""),
-                    record.get("sourceRegion", ""),
-                    record.get("targetRegion", ""),
-                )
-                if search_value not in searchable.casefold():
-                    return False
-            return True
-
-        ordered = sorted(
-            (dict(record) for record in clusters if aggregate_matches(record)),
-            key=lambda item: (str(item["kind"]), -int(item["count"]), str(item["id"])),
-        )
-        page, matched, page_bytes, transport_limited = _bounded_page(ordered, offset, page_size)
+        from .inspection_multiresolution import aggregate_page
+        aggregates, anchors, matched = aggregate_page(query_index, zoom=zoom, region=region, search=search,
+                                                      offset=offset, page_size=page_size)
+        page, _, page_bytes, transport_limited = _bounded_page(aggregates, 0, page_size)
         response["clusters"] = page
+        response["clusterAnchors"] = anchors
     else:
-        from .paged_inspection_queries import PagedInspectionIndex
-        query_index = PagedInspectionIndex(view)
         raw_page, matched = query_index.page(
             entity, region=region, search=search, connected_to=connected_to,
-            offset=offset, page_size=page_size,
+            offset=offset, page_size=page_size, source_region=source_region, target_region=target_region, activation_band=activation_band,
         )
         inspected = []
         for raw_record in raw_page:

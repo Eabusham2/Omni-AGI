@@ -30,7 +30,7 @@ def validate_structural_value(value: Any, schema: Mapping[str, Any], *, depth: i
 def action_fingerprint(action: Mapping[str, Any]) -> str:
     arguments = dict(action.get("arguments", {}))
     if not str(action.get("toolId", "")).startswith("mcp."):
-        for name in ("assemblyIds", "conceptIds", "organic", "completedInTurn", "ponderTrace", "selectionPhase", "selectionStep"):
+        for name in ("assemblyIds", "conceptIds", "assemblyIdView", "conceptIdView", "sourceTurnId", "organic", "handledInTurn", "completedInTurn", "ponderTrace", "ponderSelfReport", "_ponderSelfReportCandidate", "selectionPhase", "selectionStep"):
             arguments.pop(name, None)
     payload = [action.get("kind"), action.get("toolId"), action.get("action"), arguments]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
@@ -42,6 +42,7 @@ class NativeActionEmissionLedger:
     def __init__(self, turn_id: str):
         self.turn_id = str(turn_id)
         self.actions: Dict[str, Dict[str, Any]] = {}
+        self.effect_fingerprints = set()
 
     def register(self, action: Mapping[str, Any], *, step: int, phase: str) -> Optional[Dict[str, Any]]:
         fingerprint = action_fingerprint(action)
@@ -52,7 +53,7 @@ class NativeActionEmissionLedger:
             fingerprint = hashlib.sha256(json.dumps(
                 [fingerprint, int(step), str(phase)], separators=(",", ":")
             ).encode()).hexdigest()
-        if fingerprint in self.actions:
+        if fingerprint in self.actions or action.get("kind") != "ponder" and fingerprint in self.effect_fingerprints:
             return None
         result = dict(action)
         result.update({
@@ -61,6 +62,25 @@ class NativeActionEmissionLedger:
             "selectionPhase": str(phase),
         })
         self.actions[fingerprint] = result
+        if action.get("kind") != "ponder": self.effect_fingerprints.add(fingerprint)
+        return result
+
+    def suspension_state(self):
+        return {"turnId": self.turn_id, "actions": dict(self.actions)}
+
+    @classmethod
+    def from_suspension_state(cls, value, turn_id):
+        if not isinstance(value, dict) or set(value) != {"turnId", "actions"} or value["turnId"] != turn_id or not isinstance(value["actions"], dict):
+            raise ValueError("invalid native action continuation owner")
+        result = cls(turn_id)
+        for fingerprint, action in value["actions"].items():
+            if not isinstance(fingerprint, str) or len(fingerprint) != 64 or not isinstance(action, dict):
+                raise ValueError("invalid native action continuation identity")
+            expected = hashlib.sha256((turn_id + ":" + fingerprint).encode()).hexdigest()[:32]
+            if action.get("actionId") != expected:
+                raise ValueError("native action continuation lost its original effect identity")
+            result.actions[fingerprint] = dict(action)
+            if action.get("kind") != "ponder": result.effect_fingerprints.add(action_fingerprint(action))
         return result
 
 

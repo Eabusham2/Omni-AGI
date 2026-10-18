@@ -2,6 +2,17 @@ import type { NeuralParameterAccounting } from "../../shared/types";
 
 type RuntimeRow = readonly [label: string, value: string];
 
+/** A sign remains ternary even when its independently learned gain is larger. */
+export function nativeConnectionLabel(connection: {
+  effectiveWeight: number; connectionStrength?: number; isRepeatedContact?: boolean;
+}): string {
+  if (![-1, 0, 1].includes(connection.effectiveWeight)) return "—";
+  const sign = connection.effectiveWeight === 1 ? "+1" : connection.effectiveWeight === -1 ? "−1" : "0";
+  const strength = connection.connectionStrength;
+  return sign + (Number.isInteger(strength) && strength! >= 1 && strength! <= 16 ? ` × ${strength}` : "") +
+    (connection.isRepeatedContact ? " · repeated" : "");
+}
+
 export interface NeuralParameterAccountingPresentation
   extends NeuralParameterAccounting {
   compactTotal: string;
@@ -88,12 +99,29 @@ export function neuralParameterAccounting(
     return undefined;
   }
   const exact = (value: number): string => value.toLocaleString("en-US");
+  const repeated = safeCount(accounting.nativeRepeatedConnections);
+  const packedBytes = safeCount(accounting.packedLearnedStateBytes);
+  const structuralBytes = safeCount(accounting.packedStructuralStateBytes);
+  const allocatedBytes = safeCount(accounting.packedAllocatedStateBytes);
+  const connectionBytes = safeCount(accounting.connectionStateBytes);
+  const vectorRepeats = safeCount(accounting.substrateRepeatedVectorContacts);
+  const memoryByteFields = Object.fromEntries([
+    "substrateBaseVectorParameters", "substrateRepeatedVectorContacts", "substrateVectorLearnedStateBytes",
+    "substrateVectorStructuralStateBytes", "substrateVectorAllocatedStateBytes", "substrateVectorRowEnvelopeBytes",
+    "corePackedLearnedStateBytes", "corePackedStructuralStateBytes"
+  ].flatMap((key) => { const value = safeCount(accounting[key]); return value === undefined ? [] : [[key, value]]; }));
   return {
     mutableDenseParameters,
     ...(accounting.substrateVectorParameters !== undefined ? { substrateVectorParameters } : {}),
     substrateDynamicSparseSynapses,
     dynamicSparseSynapses,
     totalNeuralParameters,
+    ...(repeated !== undefined ? { nativeRepeatedConnections: repeated } : {}),
+    ...(packedBytes !== undefined ? { packedLearnedStateBytes: packedBytes } : {}),
+    ...(structuralBytes !== undefined ? { packedStructuralStateBytes: structuralBytes } : {}),
+    ...(allocatedBytes !== undefined ? { packedAllocatedStateBytes: allocatedBytes } : {}),
+    ...(connectionBytes !== undefined ? { connectionStateBytes: connectionBytes } : {}),
+    ...memoryByteFields,
     countingRule,
     compactTotal: compactParameterCount(totalNeuralParameters),
     exactLabel:
@@ -102,7 +130,11 @@ export function neuralParameterAccounting(
       (substrateVectorParameters > 0
         ? `${exact(substrateVectorParameters)} learned memory weights and `
         : "") +
-      `${exact(dynamicSparseSynapses)} grown connections. ${countingRule}`
+      `${exact(dynamicSparseSynapses)} grown connections. ${countingRule}` +
+      (vectorRepeats !== undefined ? ` Includes ${exact(vectorRepeats)} repeated memory-vector contacts.` : "") +
+      (connectionBytes !== undefined ? ` Strength and plasticity: ${formatBytes(connectionBytes)}.` : "") +
+      (packedBytes !== undefined ? ` Native learned storage: ${formatBytes(packedBytes)}.` : "") +
+      (structuralBytes !== undefined ? ` Connection structure: ${formatBytes(structuralBytes)}.` : "")
   };
 }
 

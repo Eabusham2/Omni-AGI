@@ -48,9 +48,10 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import dataclass
+import struct
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -61,10 +62,12 @@ from .model import (
 )
 from .spiking import STDPSynapses
 from .streamed_ternary import TernaryPackedSource, packed_rows_source, dense_source, source_chunks, tensor_digest, verify_file
+from .packed_connections import CONNECTION_STATE_VERSION
+from .native_core_paging import release_native_tensor_chunk
 
 
 FORMAT_NAME = "omni-packed-ternary"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_NAME = "manifest.json"
 MANIFEST_CHECKSUM_NAME = "manifest.sha256"
 
@@ -72,6 +75,7 @@ _CODE_TO_VALUE = (-1, 0, 1)
 _ZERO_CODE = 1
 _RESERVED_CODE = 3
 _ALLOWED_KINDS = frozenset({"projection", "dynamic-synapse"})
+_PARALLEL_RECORD = struct.Struct("<QQQBB")
 
 
 class TernaryPackingError(ValueError):
@@ -87,6 +91,60 @@ class TernaryIntegrityError(TernaryPackingError):
 
 
 @dataclass(frozen=True)
+class ParallelConnectionSource:
+    count: int
+    records: Callable[[], Iterable[Tuple[Any, ...]]]
+
+
+@dataclass(frozen=True)
+class ConnectionStateSource:
+    """Replayable bounded strength/resistance pages in the sign stream's order.
+
+    Database/paged graph owners provide a generation-bound page factory; they
+    need not gather every connection's byte into one resident matrix.
+    """
+
+    shape: Tuple[int, int]
+    pages: Callable[[], Iterable[torch.Tensor]]
+
+    def __post_init__(self):
+        if (not isinstance(self.shape, tuple) or len(self.shape) != 2
+                or any(type(size) is not int or size < 0 for size in self.shape)
+                or not callable(self.pages)):
+            raise TernaryPackingError("connection source requires a nonnegative matrix shape and page factory")
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+
+def _connection_state_chunks(state):
+    if isinstance(state, ConnectionStateSource):
+        seen = 0
+        for page in state.pages():
+            if not isinstance(page, torch.Tensor) or page.dtype != torch.uint8 or page.numel() > 1 << 20:
+                raise TernaryPackingError("connection source page must be bounded uint8 state")
+            seen += page.numel()
+            if seen > state.numel():
+                raise TernaryPackingError("connection source exceeds its declared shape")
+            yield page.detach().cpu().contiguous().numpy().tobytes()
+        if seen != state.numel():
+            raise TernaryPackingError("connection source has incomplete coverage")
+        return
+    if not isinstance(state, torch.Tensor) or state.dtype != torch.uint8 or not state.is_contiguous():
+        raise TernaryPackingError("connection state must be a contiguous uint8 matrix")
+    version = int(state._version)
+    flat = state.reshape(-1)
+    for start in range(0, flat.numel(), 1 << 20):
+        if int(state._version) != version:
+            raise TernaryPackingError("connection state changed during streamed export")
+        block = flat[start:start + (1 << 20)].detach().cpu().numpy().tobytes()
+        yield block
+        release_native_tensor_chunk(state, start, len(block))
+    if int(state._version) != version:
+        raise TernaryPackingError("connection state changed during streamed export")
+
+
+@dataclass(frozen=True)
 class TernaryTensorSpec:
     """One exact-ternary tensor and its post-projection floating scale."""
 
@@ -95,6 +153,9 @@ class TernaryTensorSpec:
     scale: float = 1.0
     kind: str = "projection"
     source_dtype: Optional[str] = None
+    connection_state: Optional[Union[torch.Tensor, ConnectionStateSource]] = None
+    parallel_connections: Union[Tuple[Tuple[Any, ...], ...], ParallelConnectionSource] = ()
+    packed_row_layout: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -103,10 +164,41 @@ class VerifiedTernaryBundle:
 
     manifest: Dict[str, Any]
     tensors: Dict[str, torch.Tensor]
+    connection_states: Dict[str, torch.Tensor] = field(default_factory=dict)
+    parallel_connections: Dict[str, Tuple[Tuple[int, ...], ...]] = field(default_factory=dict)
 
 
 DynamicSynapse = Union[TernaryTensorSpec, TernaryPackedSource, torch.Tensor, nn.Module]
 ModuleRoots = Union[nn.Module, Mapping[str, nn.Module]]
+
+
+def _parallel_source(module, *, bias=False):
+    pool = module.parallel_connections
+    revision = pool._revision
+    count = pool.count(bias=bias)
+    def records():
+        if pool._revision != revision:
+            raise TernaryPackingError("parallel connections changed during streamed export")
+        for record in module.iter_parallel_connection_records(bias=bias):
+            if pool._revision != revision:
+                raise TernaryPackingError("parallel connections changed during streamed export")
+            yield record
+        if pool._revision != revision:
+            raise TernaryPackingError("parallel connections changed during streamed export")
+    return ParallelConnectionSource(count, records)
+
+
+def connection_matrix_shape(shape, kind, layout=None):
+    """Map saved logical geometry to the native packed row ordering."""
+    if layout is None:
+        return (int(shape[0]), math.prod(shape[1:])) if len(shape) >= 2 else (1, math.prod(shape))
+    if (not isinstance(layout, dict) or set(layout) != {"kind", "groups"}
+            or layout["kind"] != "transpose-convolution" or kind != "projection"
+            or len(shape) not in (3, 4, 5) or type(layout["groups"]) is not int
+            or layout["groups"] < 1 or shape[0] < 1 or shape[1] < 1
+            or any(value < 1 for value in shape[2:]) or shape[0] % layout["groups"]):
+        raise TernaryIntegrityError("packed row layout is invalid")
+    return (int(shape[1]) * layout["groups"] * math.prod(shape[2:]), int(shape[0]) // layout["groups"])
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
@@ -292,6 +384,10 @@ def _module_spec(root_name: str, module_name: str, module: nn.Module) -> Ternary
         scale=float(module._packed_forward_scale.item()),
         kind="projection",
         source_dtype="packed-2bit",
+        connection_state=module._connection_state,
+        parallel_connections=_parallel_source(module),
+        packed_row_layout={"kind": "transpose-convolution", "groups": module.groups}
+            if getattr(module, "transposed", False) else None,
     )
 
 
@@ -342,7 +438,8 @@ def collect_module_ternary_tensors(
                         raise TernaryCoverageError("duplicate eligible tensor name: %s" % name)
                     collected[name] = TernaryTensorSpec(
                         name=name, values=packed_rows_source(block._packed_weights, (block.rows, block.columns)),
-                        scale=1.0, kind="dynamic-synapse", source_dtype="packed-2bit")
+                        scale=1.0, kind="dynamic-synapse", source_dtype="packed-2bit",
+                        connection_state=getattr(block, "_connection_state", None))
                 continue
             spec = _module_spec(root_name, module_name, module)
             if spec.name in collected:
@@ -365,6 +462,8 @@ def collect_module_ternary_tensors(
                     scale=float(module._packed_forward_scale.item()),
                     kind="projection",
                     source_dtype="packed-2bit",
+                    connection_state=module._bias_connection_state,
+                    parallel_connections=_parallel_source(module, bias=True),
                 )
 
     for name, source in sorted((dynamic_synapses or {}).items()):
@@ -396,6 +495,9 @@ def collect_module_ternary_tensors(
                 scale=spec.scale,
                 kind="dynamic-synapse",
                 source_dtype=spec.source_dtype,
+                connection_state=spec.connection_state,
+                parallel_connections=spec.parallel_connections,
+                packed_row_layout=spec.packed_row_layout,
             )
         else:
             raise TernaryCoverageError(
@@ -413,7 +515,7 @@ def collect_module_ternary_tensors(
 def inspect_module_ternary_layout(
     roots: ModuleRoots,
     *,
-    dynamic_synapses: Mapping[str, Union[torch.Tensor, TernaryPackedSource]],
+    dynamic_synapses: Mapping[str, Union[TernaryTensorSpec, torch.Tensor, TernaryPackedSource]],
 ) -> Dict[str, Tuple[Tuple[int, ...], str]]:
     """Inspect eligible names and shapes without evaluating accelerator weights.
 
@@ -475,9 +577,14 @@ def inspect_module_ternary_layout(
     for name, source in dynamic_synapses.items():
         if not isinstance(name, str) or not name or "\0" in name:
             raise TernaryCoverageError("dynamic synapse names must be non-empty strings")
+        kind = "dynamic-synapse"
+        if isinstance(source, TernaryTensorSpec):
+            if source.name != name or source.kind not in _ALLOWED_KINDS:
+                raise TernaryCoverageError("dynamic source specification disagrees with its identity")
+            kind, source = source.kind, source.values
         if not isinstance(source, (torch.Tensor, TernaryPackedSource)) or name in layout:
             raise TernaryCoverageError("%s is not a unique dynamic tensor" % name)
-        layout[name] = (tuple(int(value) for value in source.shape), "dynamic-synapse")
+        layout[name] = (tuple(int(value) for value in source.shape), kind)
     return dict(sorted(layout.items()))
 
 
@@ -586,6 +693,9 @@ def export_ternary_shards(
             "packedSha256": packed_hash,
             "tensorSha256": logical_digest.hexdigest(),
         }
+        expected_connection_shape = connection_matrix_shape(source.shape, spec.kind, spec.packed_row_layout)
+        if spec.packed_row_layout is not None:
+            entry["packedRowLayout"] = dict(spec.packed_row_layout)
         entries.append(entry)
         shard_entries.append(
             {
@@ -594,6 +704,73 @@ def export_ternary_shards(
                 "sha256": packed_hash,
             }
         )
+        if spec.connection_state is None:
+            entry["connectionState"] = {"encoding": "unit-strength", "strength": 1}
+        else:
+            state = spec.connection_state
+            if not isinstance(state, (torch.Tensor, ConnectionStateSource)) or tuple(state.shape) != expected_connection_shape:
+                raise TernaryPackingError("%s connection state is not a matching uint8 matrix" % name)
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".connection-stream-", dir=destination)
+            digest = hashlib.sha256()
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    for block in _connection_state_chunks(state):
+                        handle.write(block)
+                        digest.update(block)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                connection_hash = digest.hexdigest()
+                connection_file = "connections-%05d-%s.bin" % (index, connection_hash[:16])
+                os.replace(temporary_name, destination / connection_file)
+            finally:
+                Path(temporary_name).unlink(missing_ok=True)
+            entry["connectionState"] = {
+                "formatVersion": CONNECTION_STATE_VERSION,
+                "encoding": "uint4-strength-minus-one-high4-resistance",
+                "shape": list(state.shape), "shard": connection_file,
+                "byteLength": state.numel(), "sha256": connection_hash,
+            }
+            shard_entries.append({"file": connection_file, "byteLength": state.numel(), "sha256": connection_hash})
+        parallel_count = spec.parallel_connections.count if isinstance(spec.parallel_connections, ParallelConnectionSource) else len(spec.parallel_connections)
+        if parallel_count:
+            if spec.connection_state is None:
+                raise TernaryPackingError("parallel contacts require explicit connection state")
+            if isinstance(spec.parallel_connections, ParallelConnectionSource):
+                rows = ((int(row), int(column), int(key.rsplit("_n", 1)[1]), int(sign), int(state))
+                    for key, row, column, sign, state in spec.parallel_connections.records())
+            else:
+                rows = iter(sorted((int(row), int(column), int(key.rsplit("_n", 1)[1]), int(sign), int(state))
+                    for key, row, column, sign, state in spec.parallel_connections))
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".parallel-stream-", dir=destination)
+            digest = hashlib.sha256()
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    previous = None
+                    written = 0
+                    for record in rows:
+                        row, column, ordinal, sign, state_value = record
+                        if (row < 0 or column < 0 or ordinal < 0 or row >= spec.connection_state.shape[0]
+                                or column >= spec.connection_state.shape[1] or sign >> 2 != 0x15 or sign & 3 == 3
+                                or not 0 <= state_value <= 255 or previous is not None and record[:3] <= previous):
+                            raise TernaryPackingError("parallel contact has an invalid endpoint, identity or code")
+                        payload = _PARALLEL_RECORD.pack(*record)
+                        handle.write(payload)
+                        digest.update(payload)
+                        written += 1
+                        previous = record[:3]
+                    if written != parallel_count:
+                        raise TernaryPackingError("parallel contact stream count changed during export")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                parallel_hash = digest.hexdigest()
+                parallel_file = "parallel-%05d-%s.bin" % (index, parallel_hash[:16])
+                os.replace(temporary_name, destination / parallel_file)
+            finally:
+                Path(temporary_name).unlink(missing_ok=True)
+            entry["parallelConnections"] = {"encoding": "u64-row-column-ordinal-u8-sign-state-le",
+                "count": parallel_count, "byteLength": parallel_count * _PARALLEL_RECORD.size,
+                "shard": parallel_file, "sha256": parallel_hash}
+            shard_entries.append({"file": parallel_file, "byteLength": parallel_count * _PARALLEL_RECORD.size, "sha256": parallel_hash})
 
     manifest_without_hash: Dict[str, Any] = {
         "format": FORMAT_NAME,
@@ -706,7 +883,7 @@ def verify_ternary_shards(
         raise TernaryIntegrityError("manifest is not in canonical form")
     if (
         manifest.get("format") != FORMAT_NAME
-        or manifest.get("formatVersion") != FORMAT_VERSION
+        or manifest.get("formatVersion") not in (1, FORMAT_VERSION)
         or manifest.get("architecture") != "OmniCortex"
     ):
         raise TernaryIntegrityError("unsupported packed ternary format")
@@ -752,6 +929,8 @@ def verify_ternary_shards(
     names = []
     seen_names = set()
     tensors: Dict[str, torch.Tensor] = {}
+    connection_states: Dict[str, torch.Tensor] = {}
+    parallel_connections: Dict[str, Tuple[Tuple[int, ...], ...]] = {}
     used_shards = set()
     for entry in tensor_entries:
         name = entry.get("name")
@@ -768,6 +947,7 @@ def verify_ternary_shards(
         except TernaryPackingError as error:
             raise TernaryIntegrityError("%s has an invalid shape" % name) from error
         count = math.prod(shape)
+        expected_connection_shape = connection_matrix_shape(shape, entry.get("kind"), entry.get("packedRowLayout"))
         if entry.get("numel") != count:
             raise TernaryIntegrityError("%s has inconsistent element count" % name)
         scale = entry.get("scale")
@@ -807,6 +987,85 @@ def verify_ternary_shards(
             tensors[name] = decode_ternary_2bit(path.read_bytes(), shape)
         names.append(name)
         used_shards.add(filename)
+        connection = entry.get("connectionState")
+        if connection is None and manifest.get("formatVersion") == 1:
+            if entry.get("parallelConnections") is not None:
+                raise TernaryIntegrityError("old native sign-only shards cannot contain parallel contacts")
+            continue
+        if connection == {"encoding": "unit-strength", "strength": 1}:
+            if entry.get("parallelConnections") is not None:
+                raise TernaryIntegrityError("parallel contacts require explicit connection state")
+            continue
+        if not isinstance(connection, dict) or connection.get("formatVersion") != CONNECTION_STATE_VERSION or connection.get("encoding") != "uint4-strength-minus-one-high4-resistance":
+            raise TernaryIntegrityError("%s has an invalid connection-state encoding" % name)
+        connection_shape = connection.get("shape")
+        if (not isinstance(connection_shape, list) or len(connection_shape) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in connection_shape)
+                or tuple(connection_shape) != expected_connection_shape):
+            raise TernaryIntegrityError("%s connection-state shape mismatch" % name)
+        connection_filename = connection.get("shard")
+        if connection_filename not in shard_table or connection_filename in used_shards:
+            raise TernaryIntegrityError("%s has a missing or reused connection shard" % name)
+        connection_path = _safe_shard_path(destination, connection_filename)
+        connection_shard = shard_table[connection_filename]
+        if connection.get("byteLength") != count or connection_shard.get("byteLength") != count or connection_path.stat().st_size != count:
+            raise TernaryIntegrityError("%s connection-state length mismatch" % name)
+        digest = hashlib.sha256()
+        retained_bytes = bytearray() if retained is None or name in retained else None
+        before = connection_path.stat()
+        total = 0
+        with connection_path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+                total += len(block)
+                if retained_bytes is not None:
+                    retained_bytes.extend(block)
+        after = connection_path.stat()
+        identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if total != count or identity(before) != identity(after):
+            raise TernaryIntegrityError("%s connection-state shard changed during verification" % name)
+        if connection.get("sha256") != digest.hexdigest() or connection_shard.get("sha256") != digest.hexdigest():
+            raise TernaryIntegrityError("%s connection-state checksum mismatch" % name)
+        used_shards.add(connection_filename)
+        if retained_bytes is not None:
+            connection_states[name] = (torch.frombuffer(retained_bytes, dtype=torch.uint8).reshape(connection_shape)
+                if count else torch.empty(connection_shape, dtype=torch.uint8))
+        parallel = entry.get("parallelConnections")
+        if parallel is not None:
+            if (not isinstance(parallel, dict) or parallel.get("encoding") != "u64-row-column-ordinal-u8-sign-state-le"
+                    or isinstance(parallel.get("count"), bool) or not isinstance(parallel.get("count"), int) or parallel["count"] < 1):
+                raise TernaryIntegrityError("parallel contact encoding/count is invalid")
+            parallel_filename = parallel.get("shard")
+            if parallel_filename not in shard_table or parallel_filename in used_shards:
+                raise TernaryIntegrityError("parallel contact shard is missing or reused")
+            parallel_path = _safe_shard_path(destination, parallel_filename)
+            length = parallel["count"] * _PARALLEL_RECORD.size
+            if parallel.get("byteLength") != length or shard_table[parallel_filename].get("byteLength") != length or parallel_path.stat().st_size != length:
+                raise TernaryIntegrityError("parallel contact shard length mismatch")
+            digest, records, previous = hashlib.sha256(), [], None
+            before = parallel_path.stat()
+            total = 0
+            with parallel_path.open("rb") as handle:
+                for payload in iter(lambda: handle.read(_PARALLEL_RECORD.size), b""):
+                    if len(payload) != _PARALLEL_RECORD.size:
+                        raise TernaryIntegrityError("parallel contact shard record is incomplete")
+                    digest.update(payload)
+                    total += len(payload)
+                    record = _PARALLEL_RECORD.unpack(payload)
+                    row, column, ordinal, sign, _state = record
+                    if (row >= connection_shape[0] or column >= connection_shape[1] or sign >> 2 != 0x15
+                            or sign & 3 == 3 or previous is not None and record[:3] <= previous):
+                        raise TernaryIntegrityError("parallel contact endpoint/identity/code is invalid")
+                    previous = record[:3]
+                    if retained is None or name in retained:
+                        records.append(record)
+            if total != length or identity(before) != identity(parallel_path.stat()):
+                raise TernaryIntegrityError("parallel contact shard changed during verification")
+            if parallel.get("sha256") != digest.hexdigest() or shard_table[parallel_filename].get("sha256") != digest.hexdigest():
+                raise TernaryIntegrityError("parallel contact checksum mismatch")
+            used_shards.add(parallel_filename)
+            if retained is None or name in retained:
+                parallel_connections[name] = tuple(records)
 
     if used_shards != set(shard_table):
         raise TernaryIntegrityError("manifest contains unreferenced ternary shards")
@@ -822,7 +1081,8 @@ def verify_ternary_shards(
         _assert_coverage(names, expected_names)
     except TernaryCoverageError as error:
         raise TernaryIntegrityError(str(error)) from error
-    return VerifiedTernaryBundle(manifest=manifest, tensors=tensors)
+    return VerifiedTernaryBundle(manifest=manifest, tensors=tensors, connection_states=connection_states,
+                                parallel_connections=parallel_connections)
 
 
 __all__ = [

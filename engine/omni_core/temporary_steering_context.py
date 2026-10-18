@@ -8,13 +8,14 @@ from .offload import NeuralStateResourcePause
 
 def temporary_steering_inputs(value, *, brain_id, turn_id, attention_epoch, policy):
     if value is None: return [], None
-    if not isinstance(value, Mapping) or set(value) != {"format", "brainId", "successorTurnId", "attentionEpoch", "inputs"} or \
+    required = {"format", "brainId", "successorTurnId", "attentionEpoch", "inputs"}
+    if not isinstance(value, Mapping) or not required <= set(value) or set(value) - required - {"audioInputs"} or \
             value.get("format") != "omni-temporary-steering-input-v1" or value.get("brainId") != brain_id or \
             value.get("successorTurnId") != turn_id or type(value.get("attentionEpoch")) is not int or value["attentionEpoch"] < 0 or \
-            not isinstance(value.get("inputs"), list) or not value["inputs"]:
+            not isinstance(value.get("inputs"), list) or not isinstance(value.get("audioInputs", []), list) or not (value["inputs"] or value.get("audioInputs")):
         raise ValueError("temporary steering input has invalid brain/turn/attention ownership")
     inputs = value["inputs"]
-    charge = 131072 + len(inputs) * 1024 + max((len(item.get("content", "")) * 4
+    charge = 131072 + len(inputs) * 1024 + len(value.get("audioInputs", [])) * 4096 + max((len(item.get("content", "")) * 4
         for item in inputs if isinstance(item, Mapping) and isinstance(item.get("content"), str)), default=0)
     status = policy.status(estimated_ram_bytes=charge)
     if status.get("memoryPressure"):
@@ -30,10 +31,21 @@ def temporary_steering_inputs(value, *, brain_id, turn_id, attention_epoch, poli
                 hashlib.sha256(item["content"].encode("utf-8")).hexdigest() != item["inputSha256"]:
             raise ValueError("temporary steering input lost its exact human identity/hash")
         seen.add(item["turnId"])
+    audio_inputs = []
+    if value.get("audioInputs"):
+        from .native_audio_chat import validate_native_audio_input
+        for item in value["audioInputs"]:
+            audio = validate_native_audio_input(item, brain_id=brain_id)
+            owner = audio["attachment"]["turnId"]
+            if owner == turn_id or owner in seen:
+                raise ValueError("temporary audio handoff repeats or replaces its original owner")
+            seen.add(owner); audio_inputs.append(audio)
     audit = {"format": value["format"], "attentionEpoch": value["attentionEpoch"],
         "inputs": [{"turnId": item["turnId"], "inputSha256": item["inputSha256"]} for item in inputs],
         "freshAttentionDiscarded": value["attentionEpoch"] != attention_epoch,
         "durablePredecessorLearning": False, "longTermHistoryRead": False}
+    if audio_inputs:
+        audit["audioInputs"] = [{"turnId": item["attachment"]["turnId"], "inputSha256": item["inputSha256"]} for item in audio_inputs]
     # Fresh is an explicit ownership boundary. Even an already queued carry
     # cannot reintroduce its retired raw task input into the next native turn.
     return ([] if audit["freshAttentionDiscarded"] else [item["content"] for item in inputs]), audit

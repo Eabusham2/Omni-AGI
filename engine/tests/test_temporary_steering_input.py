@@ -85,7 +85,10 @@ class TemporarySteeringInputTests(unittest.TestCase):
         self.assertIn("temporary_steering_context", inspect.signature(AdaptiveBrain.chat).parameters)
         source = inspect.getsource(AdaptiveBrain.chat)
         self.assertIn("clean, temporary_user_inputs", source)
-        self.assertIn("\"temporary_steering_input\": temporary_input_audit", source)
+        self.assertIn("self._finish_chat_continuation(final_context(locals())", source)
+        from omni_core.chat_continuation import FINAL_FIELDS
+        self.assertIn("temporary_input_audit", FINAL_FIELDS)
+        self.assertIn("\"temporary_steering_input\": temporary_input_audit", inspect.getsource(AdaptiveBrain._finish_chat_continuation))
 
 
 if __name__ == "__main__": unittest.main()

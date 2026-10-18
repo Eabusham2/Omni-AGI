@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 import json
 from pathlib import Path
 from typing import Any, Optional
+from .weighted_substrate_state import validate_contribution
 
 
 class PagedRecurrentState:
@@ -41,7 +42,7 @@ class PagedRecurrentState:
             ("settled", "node_id TEXT PRIMARY KEY,value REAL NOT NULL"),
             ("incoming", "node_id TEXT PRIMARY KEY,count INTEGER NOT NULL"),
             ("edges", "ordinal INTEGER PRIMARY KEY,source_id TEXT NOT NULL,target_id TEXT NOT NULL,"
-                      "level INTEGER NOT NULL CHECK(level IN (-1,1))"),
+                      "level INTEGER NOT NULL CHECK(level BETWEEN -16 AND 16 AND level!=0)"),
             ("recalled", "position INTEGER PRIMARY KEY,assembly_id TEXT NOT NULL UNIQUE,payload BLOB NOT NULL"),
         ):
             self.connection.execute("CREATE TABLE %s (%s)" % (table, columns))
@@ -73,16 +74,15 @@ class PagedRecurrentState:
             connection.execute("INSERT INTO seeds VALUES(?,?)", (identifier, float(value)))
             self.seed_count += 1
         for source, target, level in edges:
-            if type(level) is not int or level not in {-1, 0, 1}:
-                raise ValueError("recurrent contribution is not exactly ternary")
+            validate_contribution(level)
             if level == 0 or not node_exists(source) or not node_exists(target):
                 continue
             self._require(4096 + 4 * (len(source) + len(target)), "recurrent edge page")
             connection.execute("INSERT INTO edges VALUES(?,?,?,?)",
                                (self.eligible_edges, source, target, level))
             connection.execute(
-                "INSERT INTO incoming VALUES(?,1) ON CONFLICT(node_id) DO UPDATE SET count=count+1",
-                (target,),
+                "INSERT INTO incoming VALUES(?,?) ON CONFLICT(node_id) DO UPDATE SET count=count+excluded.count",
+                (target, abs(level)),
             )
             self.eligible_edges += 1
             self.inhibitory_edges += int(level < 0)

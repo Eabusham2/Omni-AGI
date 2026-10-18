@@ -105,25 +105,19 @@ def _cue_values(cue: torch.Tensor | Sequence[float], dimensions: int) -> Tuple[f
 def _packed_cosine(
     cue: Tuple[float, ...], cue_norm: float, packed: bytes, dimensions: int
 ) -> float:
-    """Cosine against exact {-1,0,+1} codes without decoding a float row."""
+    """Cosine against summed integer contacts without a float learned row."""
 
-    if not isinstance(packed, bytes) or len(packed) != (dimensions + 3) // 4:
-        raise ValueError("packed similarity row width is invalid")
-    terms = []
-    nonzero = 0
-    for index in range(dimensions):
-        code = (packed[index // 4] >> ((index % 4) * 2)) & 3
-        if code == 3:
-            raise ValueError("packed similarity row has a reserved ternary code")
-        if code != 1:
-            nonzero += 1
-            terms.append(cue[index] if code == 2 else -cue[index])
-    for index in range(dimensions, len(packed) * 4):
-        if ((packed[index // 4] >> ((index % 4) * 2)) & 3) != 1:
-            raise ValueError("packed similarity row has non-canonical padding")
-    if nonzero == 0:
+    from .weighted_vsa_row import iter_weighted_levels
+    if not isinstance(packed, bytes):
+        raise ValueError("packed similarity row must be bytes")
+    norm_square = 0
+    products = []
+    for index, value in enumerate(iter_weighted_levels(packed, dimensions)):
+        norm_square += value * value
+        products.append(value * cue[index])
+    if norm_square == 0:
         return 0.0
-    score = math.fsum(terms) / (max(cue_norm, _MIN_NORM) * math.sqrt(nonzero))
+    score = math.fsum(products) / (max(cue_norm, _MIN_NORM) * math.sqrt(norm_square))
     return max(-1.0, min(1.0, score))
 
 
@@ -197,6 +191,7 @@ def _iter_scored_rows(
                 or not row.assembly_id
             ):
                 raise ValueError("packed-vector provider row order or identity is invalid")
+            _reserve_page(reserve_memory, 1, len(row.packed) + dimensions * 32, stage)
             score = _packed_cosine(cue, cue_norm, row.packed, dimensions)
             last_sequence = row.sequence
             _update_digest(digest, row)

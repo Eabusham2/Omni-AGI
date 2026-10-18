@@ -1,6 +1,32 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, createReadStream } from "node:fs";
 import { savedConceptIdViewFiles, validateConceptIdViewFile } from "./conceptIdViewFiles";
+import { verifyPackedConnectionCompanions } from "./packedConnectionIntegrity";
+import { assertSavedInferenceSidecarReady } from "./inferenceSidecarStatus";
+import { validateDeviceResourceSettings } from "./deviceResourcePlan";
+import { verifyConnectedNativeOrigin } from "./fullMergeHost";
+import { nativeExecutionFiles, safeNativeExecutionPath, snapshotNativeExecution } from "./executionCheckpointPortability";
+import { adoptLearningWorkspace, cloneLearningWorkspace, learningWorkspaceArchive, safeLearningWorkspacePath, snapshotLearningWorkspace } from "./learningWorkspacePortability";
+import { mergeMcpAppArtifacts } from "./mcpAppArtifacts";
+import { safeAppObservationAuditPath, savedAppObservationAuditFiles } from "./mcpAppObservationAudit";
+import { mergeAutomationWorkspace } from "./automationPortability";
+import { mergeAssemblyWorkspace } from "./assemblyPortability";
+import { mergeEnvironmentWorkspace } from "./environmentPortability";
+import { mergeClipboardWorkspace } from "./clipboardPortability";
+import { mergeLocalTeacherWorkspace } from "./localTeacherPortability";
+import { mergeExternalAdviceWorkspace } from "./externalAdvicePortability";
+import { mergeApiTeacherWorkspace } from "./apiTeacherPortability";
+import { mergeFileHandoffCustody } from "./fileToolHandoffCustody";
+import { mergePluginRuntimeWorkspace } from "./pluginRuntimePortability";
+import { mergeSparseSubstrateTransferWorkspace } from "./sparseSubstrateTransferPortability";
+import { mergePanelReceiptWorkspace } from "./pluginPanelReceiptPortability";
+import { projectMcpAppAction } from "./mcpAppPresentation";
+import type { FullMergeAssemblyInput } from "./fullBrainMerge";
+import {
+  collectConnectedArchive, connectedArchiveSources, materializeConnectedArchive,
+  readConnectedArchive, readConnectedArchiveDirectory, saveConnectedArchive,
+  validateConnectedArchive, rewriteNativeIdentity
+} from "./connectedBrainArchive";
 import {
   access,
   cp,
@@ -18,10 +44,12 @@ import {
   stat,
   writeFile
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, freemem } from "node:os";
+import { getHeapStatistics } from "node:v8";
 import { DatabaseSync } from "node:sqlite";
 import { basename, dirname, join, resolve } from "node:path";
 import { validateNativeArchitectureDescriptor } from "./nativeCoreInventory";
+import { clearStagedConnectedWorkingPublication } from "./connectedWorkingPublicationStaging";
 import { savedToolIntentFiles, validateSavedToolIntent } from "./savedToolIntents";
 import { savedActionEvidenceFiles, rekeyActionEvidenceJobs, validateSavedActionEvidenceFiles } from "./completedActionEvidence";
 import { savedEvolutionContinuationFiles, safeEvolutionContinuationPath, savedEvolutionArchive,
@@ -71,6 +99,7 @@ import {
 } from "./streamingZip";
 import { withBrainWrite } from "./brainWriteCoordinator";
 import { verifyPortableReplaySqlite } from "./portableReplayIntegrity";
+import { validatePortableWorkingActivity, validatePortableWorkingActivityMetadata } from "./portableWorkingActivity";
 import {
   assertPortableWorkingMemoryCheckpoint,
   emptyPortableWorkingMemoryCheckpoint
@@ -90,10 +119,37 @@ import {
   snapshotMutableSqliteIsolated,
   writeMutableFileIsolated
 } from "./mutableFileIsolation";
+import {
+  ToolPermissionStore,
+  type ToolPermissionMutationOptions,
+  type ToolPermissionSnapshot
+} from "./toolPermissionStore";
+import type {
+  PluginPortabilityDeclaration,
+  PluginPortabilityExport,
+  ValidatedPluginPortabilityArchive
+} from "./pluginPortability";
+import type { NativeVoiceParameterEvidence } from "../shared/voiceRouting";
+import { initializeInstanceVoice } from "./voicePreferencesStore";
+import { mergeSteerDirectionWorkspace } from "./steerDirectionPortability";
+import { mergeImaginationWorkspace } from "./imaginationCaptureWorkspace";
+import { mergeReplayWorkspace } from "./imaginationAssemblyWorkspace";
+import { adoptWholeBrainCatalog, collectWholeBrainCatalog, collectWholeBrainCatalogLineage,
+  safeWholeBrainCatalogPath, readWholeBrainCatalogMetadata, type WholeBrainCatalogAdoption,
+  admitWholeBrainCatalogMemory, type WholeBrainCatalogFile, type WholeBrainCatalogReadOptions } from "./wholeBrainCatalogPortability";
+import { OMNI_BUNDLE_VERSION, OMNI_BUNDLE_REQUIRED_FEATURES, assertOmniBundleFeatures,
+  collectWholeBrainCatalogArchive, validateWholeBrainCatalogArchive, rewriteNativeCatalogFields } from "./wholeBrainCatalogArchive";
+import { captureMcpTaskCustody, mcpTaskCustodyFiles, mergeMcpTaskCustody, safeMcpTaskCustodyPath,
+  type McpTaskCustodyOptions } from "./mcpTaskCustody";
+import { MCP_TASK_DIRECTORY } from "./mcpTaskStore";
+import { captureMcpTaskArchive, validateMcpTaskArchive, hasMcpTaskArchivePayload,
+  validateEmbeddedMcpTaskSources, MCP_TASK_CUSTODY_REQUIRED_FEATURE } from "./mcpTaskArchive";
+import { API_TEACHER_MEDIA_REQUIRED_FEATURE, type ApiTeacherMediaIo } from "./apiTeacherMedia";
+import { validateApiTeacherMediaArchiveSources } from "./apiTeacherMediaArchive";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const BUNDLE_FORMAT = "omni-brain";
-const BUNDLE_VERSION = 1;
+const BUNDLE_VERSION = OMNI_BUNDLE_VERSION;
 /** Must remain identical to engine/omni_core/vsa.py's store format. */
 export const SUBSTRATE_STORE_FORMAT = "omni-substrate-shards";
 const READABLE_SUBSTRATE_STORE_VERSIONS = new Set([1, 2, 3]);
@@ -105,6 +161,7 @@ const BETA_REVIEW_FILE = ".stable-v1-beta-review.json";
 interface OmniManifest {
   format: typeof BUNDLE_FORMAT;
   formatVersion: number;
+  requiredFeatures?: readonly string[];
   releaseFormat: typeof STABLE_RELEASE_FORMAT;
   architecture: "OmniCortex";
   architectureSchemaVersion: number;
@@ -126,7 +183,7 @@ interface OmniManifest {
   };
   packedTernary?: {
     format: "omni-packed-ternary";
-    formatVersion: 1;
+    formatVersion: 1 | 2;
     currentManifestSha256: string;
     originManifestSha256: string;
     currentTensorCount: number;
@@ -143,6 +200,7 @@ interface OmniManifest {
   /** v1: saved content is preserved, not a sanitized sharing projection. */
   savedInstance?: { version: 1; content: "unsanitized" };
   recoveryPoints?: Array<{ id: string; brainId: string; missingPayloads: string[] }>;
+  pluginPortability?: PluginPortabilityDeclaration;
   licenseLedger: {
     application: "PolyForm-Noncommercial-1.0.0-or-commercial-license";
     sourceCount?: number;
@@ -169,14 +227,18 @@ interface SavedSnapshotSummary extends BrainSnapshotSummary {
 }
 
 function safeSnapshotContinuationPath(path: string): string {
-  if (path !== "engine/state/working-memory.sqlite3" &&
+  if (path !== "connected/manifest.json" && path !== "engine/state/working-memory.sqlite3" &&
+    !(path.startsWith("learning-workspace/") && safeLearningWorkspacePath(path.slice(19))) &&
     path !== "evolution/archive.json" &&
+    !(path.startsWith("engine/") && safeNativeExecutionPath(path.slice(7))) &&
     !(path.startsWith("engine/") && safeEvolutionContinuationPath(path.slice(7))) &&
+    !(path.startsWith("engine/") && safeAppObservationAuditPath(path.slice(7))) &&
     !/^engine\/action-result-learning\/(?:jobs\/[a-f0-9]{64}\.json|evidence\/[a-f0-9]{64}\.jsonl)$/.test(path) &&
     !/^engine\/evaluation\/(?:geometry-holdouts\.json|data\/[a-f0-9]{32}(?:\.[A-Za-z0-9_-]+)?)$/.test(path) &&
     !/^engine\/state\/concept-id-views\/[a-f0-9]{64}\.jsonl$/.test(path) &&
     !/^engine\/operational-tool-intents\/[a-f0-9-]{36}\.json$/i.test(path) &&
-    !/^engine\/state\/ingestion-joint\/generations\/[a-f0-9]{32}\/(?:manifest\.json|packed-vector-index\.sqlite3)$/.test(path)) {
+    !/^engine\/state\/ingestion-joint\/generations\/[a-f0-9]{32}\/(?:manifest\.json|packed-vector-index\.sqlite3)$/.test(path) &&
+    !(path.startsWith("engine/") && (safeWholeBrainCatalogPath(path.slice(7)) || safeMcpTaskCustodyPath(path.slice(7))))) {
     throw new Error("Recovery point has an unsupported continuation path.");
   }
   return path;
@@ -206,15 +268,28 @@ async function savedTreeFiles(directory: string): Promise<Map<string, string>> {
   return files;
 }
 
-async function snapshotComponentHashes(base: string, summary: SavedSnapshotSummary): Promise<string[]> {
+async function snapshotComponentHashes(base: string, summary: SavedSnapshotSummary,
+  catalogOptions: WholeBrainCatalogReadOptions = {}): Promise<string[]> {
   const engine = join(base, "engine");
   const hashes: string[] = [];
   const metadataPath = join(engine, "brain.json");
+  const taskCustody = await mcpTaskCustodyFiles(engine, catalogOptions);
   if (await pathExists(metadataPath)) {
-    const metadata = await readFile(metadataPath);
+    const { raw: metadata, value: metadataValue } = await readWholeBrainCatalogMetadata(metadataPath, catalogOptions);
     savedEngineState(metadata);
-    const state = JSON.parse(metadata.toString("utf8")) as Record<string, unknown>;
+    const state = metadataValue as Record<string, unknown>;
     if (state.brain_id !== summary.brainId) throw new Error("Recovery-point neural identity does not match its owner.");
+    const appAudits = await savedAppObservationAuditFiles(state, engine);
+    const declaredAppAudits = new Set((summary.savedContinuation?.componentPaths ?? [])
+      .filter(path => path.startsWith("engine/app-observation-audits/")).map(path => path.slice(7)));
+    if (appAudits.size !== declaredAppAudits.size || [...appAudits.keys()].some(path => !declaredAppAudits.has(path))) {
+      throw new Error("Recovery-point current App audit differs from its native head declaration.");
+    }
+    const connected = await readConnectedArchiveDirectory(base);
+    await validateConnectedArchive(connected, [{ engine: "engine", metadata: state }]);
+    if (connected && !summary.savedContinuation?.componentPaths.includes("connected/manifest.json")) {
+      throw new Error("Recovery-point connected dependencies are not bound to its checkpoint.");
+    }
     hashes.push(sha256(metadata));
     for (const name of ["core.safetensors", "plasticity.safetensors"]) {
       const path = join(engine, name);
@@ -271,6 +346,17 @@ async function snapshotComponentHashes(base: string, summary: SavedSnapshotSumma
       if (summary.savedContinuation.version !== 1 || !Array.isArray(summary.savedContinuation.componentPaths)) {
         throw new Error("Recovery-point continuation declaration is invalid.");
       }
+      const currentCatalog = await collectWholeBrainCatalog(engine, state, catalogOptions);
+      const lineageCatalog = await collectWholeBrainCatalogLineage(engine, state, catalogOptions);
+      const observedCatalog = new Set([...(currentCatalog?.files.keys() ?? []), ...lineageCatalog.files.keys()]);
+      const declaredCatalog = new Set(summary.savedContinuation.componentPaths
+        .filter(path => path.startsWith("engine/whole-brain-catalog/"))
+        .map(path => path.slice(7)));
+      if (observedCatalog.size !== declaredCatalog.size || [...observedCatalog].some(path => !declaredCatalog.has(path))) {
+        throw new Error("Recovery-point whole-brain catalog differs from its committed closure.");
+      }
+      const declaredTasks = new Set(summary.savedContinuation.componentPaths.filter(path => path.startsWith(`engine/${MCP_TASK_DIRECTORY}/`)).map(path => path.slice(7)));
+      if (declaredTasks.size !== taskCustody.size || [...taskCustody.keys()].some(path => !declaredTasks.has(path))) throw new Error("Recovery-point MCP task custody differs from its exact committed closure.");
       for (const relative of summary.savedContinuation.componentPaths) {
         if (relative.startsWith("engine/state/concept-id-views/")) {
           await validateConceptIdViewFile(join(base, ...relative.split("/")), basename(relative));
@@ -288,6 +374,12 @@ async function snapshotComponentHashes(base: string, summary: SavedSnapshotSumma
         [...observedIntents.keys()].some(name => !declaredIntents.has(name))) {
         throw new Error("Recovery-point operational journal differs from its committed declaration.");
       }
+      const execution = await nativeExecutionFiles(engine, summary.brainId);
+      const declaredExecution = new Set(summary.savedContinuation.componentPaths.filter(path => path.startsWith("engine/.execution/")).map(path => path.slice(7)));
+      if (execution.files.size !== declaredExecution.size || [...execution.files.keys()].some(path => !declaredExecution.has(path))) throw new Error("Recovery-point native execution differs from its committed declaration.");
+      const workspace = await learningWorkspaceArchive(join(base, "learning-workspace"));
+      const declaredWorkspace = new Set(summary.savedContinuation.componentPaths.filter(path => path.startsWith("learning-workspace/")).map(path => path.slice(19)));
+      if ((workspace?.files.size ?? 0) !== declaredWorkspace.size || workspace && [...workspace.files.keys()].some(path => !declaredWorkspace.has(path))) throw new Error("Recovery-point learning workspace differs from its committed declaration.");
       for (const [prefix, observed] of [
         ["engine/action-result-learning/", await savedActionEvidenceFiles(engine)],
         ["engine/", await savedEvolutionContinuationFiles(engine)]
@@ -324,20 +416,21 @@ async function snapshotComponentHashes(base: string, summary: SavedSnapshotSumma
   return hashes;
 }
 
-async function validateSavedSnapshot(base: string, id: string, brainId: string): Promise<{ summary: SavedSnapshotSummary; missingPayloads: string[] }> {
+async function validateSavedSnapshot(base: string, id: string, brainId: string,
+  catalogOptions: McpTaskCustodyOptions = {}): Promise<{ summary: SavedSnapshotSummary; missingPayloads: string[]; mcpTasksPresent: boolean; embeddedTeacherMediaPresent: boolean }> {
   const [document, summaryText] = await Promise.all([readFile(`${base}.json`), readFile(`${base}.meta.json`, "utf8")]);
   const summary = JSON.parse(summaryText) as SavedSnapshotSummary;
   const brain = normalizeBrain(JSON.parse(document.toString("utf8")));
   if (summary.id !== id || summary.brainId !== brainId || brain.id !== brainId ||
     summary.checksum !== sha256(document)) throw new Error("Recovery-point document checksum or identity failed.");
-  const hashes = await snapshotComponentHashes(base, summary);
+  const hashes = await snapshotComponentHashes(base, summary, catalogOptions);
   if (summary.engineChecksum && summary.engineChecksum !== sha256(hashes.join(":"))) {
     throw new Error("Recovery-point neural and ledger checksum failed.");
   }
   const missingPayloads: string[] = [];
   const metadataPath = join(base, "engine", "brain.json");
   if (await pathExists(metadataPath)) {
-    const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>;
+    const metadata = (await readWholeBrainCatalogMetadata(metadataPath, catalogOptions)).value as Record<string, unknown>;
     if (isRecord(metadata.paged_working_memory) && Number(metadata.paged_working_memory.count) > 0 &&
       !await pathExists(join(base, "engine", "state", "working-memory.sqlite3"))) {
       missingPayloads.push("engine/state/working-memory.sqlite3");
@@ -363,10 +456,47 @@ async function validateSavedSnapshot(base: string, id: string, brainId: string):
       }
     }
   }
-  return { summary, missingPayloads };
+  let mcpTasksPresent = (await mcpTaskCustodyFiles(join(base, "engine"), catalogOptions)).size > 0;
+  let embeddedTeacherMediaPresent = false;
+  const embedded = await readConnectedArchiveDirectory(base, "connected", catalogOptions.signal);
+  if (embedded) {
+    const stage = await mkdtemp(join(dirname(base), ".mcp-task-history-validation-"));
+    try { mcpTasksPresent = await validateEmbeddedMcpTaskSources(embedded.files, stage, {
+      ...catalogOptions, checkDisk: catalogOptions.checkDisk ?? (async bytes => { await ensureDiskReserve(dirname(base), bytes); })
+    }) || mcpTasksPresent; }
+    finally { await rm(stage, { recursive: true, force: true }); }
+    const teacherStage = await mkdtemp(join(dirname(base), ".teacher-media-history-validation-"));
+    try { embeddedTeacherMediaPresent = await validateApiTeacherMediaArchiveSources(embedded.files, teacherStage, {
+      signal: catalogOptions.signal, checkDisk: catalogOptions.checkDisk,
+      admitMetadata: async (bytes, purpose, signal) => {
+        signal?.throwIfAborted(); catalogOptions.signal?.throwIfAborted();
+        await admitWholeBrainCatalogMemory(catalogOptions, bytes, purpose);
+        signal?.throwIfAborted(); catalogOptions.signal?.throwIfAborted();
+      }
+    }); } finally { await rm(teacherStage, { recursive: true, force: true }); }
+  }
+  return { summary, missingPayloads, mcpTasksPresent, embeddedTeacherMediaPresent };
 }
 
-async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads: string[]): Promise<void> {
+async function materializeCatalogFilesDirect(engine: string, files: Map<string, WholeBrainCatalogFile>): Promise<void> {
+  for (const file of files.values()) {
+    const target = join(engine, ...file.relativePath.split("/"));
+    if (file.sourcePath && resolve(file.sourcePath) === resolve(target)) continue;
+    await mkdir(dirname(target), { recursive: true });
+    if (await pathExists(target)) {
+      if ((await lstat(target)).size !== file.bytes || await streamFileSha256(target) !== file.sha256)
+        throw new Error("Conflicting whole-brain catalog rekey destination.");
+      continue;
+    }
+    if (file.sourcePath) await copyFile(file.sourcePath, target);
+    else await writeFile(target, file.contents!, { flag: "wx", mode: 0o600 });
+    if ((await lstat(target)).size !== file.bytes || await streamFileSha256(target) !== file.sha256)
+      throw new Error("Whole-brain catalog rekey materialization failed.");
+  }
+}
+
+async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads: string[],
+  catalogOptions: WholeBrainCatalogReadOptions = {}): Promise<void> {
   const summary = JSON.parse(await readFile(`${base}.meta.json`, "utf8")) as SavedSnapshotSummary;
   const document = JSON.parse(await readFile(`${base}.json`, "utf8")) as BrainDocument;
   const priorId = summary.brainId;
@@ -375,9 +505,36 @@ async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads
   await atomicWrite(`${base}.json`, documentBytes);
   const enginePath = join(base, "engine", "brain.json");
   if (await pathExists(enginePath)) {
-    const state = JSON.parse(await readFile(enginePath, "utf8")) as Record<string, unknown>;
-    state.brain_id = brainId;
-    await atomicWrite(enginePath, JSON.stringify(state, null, 2));
+    const { raw, value: sourceMetadata } = await readWholeBrainCatalogMetadata(enginePath, catalogOptions);
+    const text = raw.toString("utf8"), rewrittenText = rewriteNativeIdentity(text, brainId);
+    const rewrittenMetadata = JSON.parse(rewrittenText) as unknown;
+    const catalog = await adoptWholeBrainCatalog(join(base, "engine"), sourceMetadata,
+      rewrittenMetadata, brainId, { sameIdentity: false, ...catalogOptions });
+    await materializeCatalogFilesDirect(join(base, "engine"), catalog.files);
+    await rm(join(base, "engine", "whole-brain-catalog", "blobs"), { recursive: true, force: true });
+    await rm(join(base, "engine", "whole-brain-catalog", "index"), { recursive: true, force: true });
+    const temporary = join(base, `.execution-rekey-${randomUUID()}.json`);
+    try {
+      if (await pathExists(join(base, "engine", ".execution"))) await atomicWrite(temporary, text);
+      await atomicWrite(enginePath, rewriteNativeCatalogFields(rewrittenText, catalog.metadata));
+      if (await pathExists(temporary)) {
+        const copied = await snapshotNativeExecution(join(base, "engine"), join(base, "engine"), {
+          sourceBrainId: priorId, targetBrainId: brainId, metadataPath: temporary
+        });
+        if (summary.savedContinuation) summary.savedContinuation.componentPaths = [
+          ...summary.savedContinuation.componentPaths.filter(path => !path.startsWith("engine/.execution/")),
+          ...[...copied.keys()].sort().map(path => `engine/${path}`)
+        ];
+      }
+      // A historical incomplete capture may predate continuation declarations.
+      // Its exact catalog custody is still adopted and outer-checksummed, but
+      // inventing a new partial declaration would falsely require old absent
+      // cold pages/workspaces to form a runnable recovery point.
+      if (summary.savedContinuation) summary.savedContinuation.componentPaths = [
+        ...summary.savedContinuation.componentPaths.filter(path => !path.startsWith("engine/whole-brain-catalog/")),
+        ...[...catalog.files.keys()].sort((a, b) => a < b ? -1 : a > b ? 1 : 0).map(path => `engine/${path}`)
+      ];
+    } finally { await rm(temporary, { force: true }); }
   }
   await rekeyActionEvidenceJobs(join(base, "engine"), brainId);
   for (const [relative, key] of [
@@ -402,13 +559,14 @@ async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads
   summary.brainId = brainId;
   summary.checksum = sha256(documentBytes);
   if (missingPayloads.length) summary.exportMissingPayloads = missingPayloads;
-  const hashes = await snapshotComponentHashes(base, summary);
+  const hashes = await snapshotComponentHashes(base, summary, catalogOptions);
   if (summary.engineChecksum) summary.engineChecksum = sha256(hashes.join(":"));
   if (summary.checkpointComponentSha256) summary.checkpointComponentSha256 = hashes;
   await atomicWrite(`${base}.meta.json`, JSON.stringify(summary, null, 2));
 }
 
 interface StreamingPackedTernaryDirectory {
+  formatVersion: 1 | 2;
   manifestSha256: string;
   tensorCount: number;
   files: Map<string, string>;
@@ -438,15 +596,32 @@ export interface ImmutableOriginStorageReport {
 }
 
 export const DEFAULT_TOOL_PERMISSIONS: ToolPermissionRecord[] = [
+  "system.time",
+  "studio.stopwatch",
+  "studio.schedule",
+  "studio.automation",
+  "studio.artifact",
+  "data.learn",
+  "data.fact-check",
   "system.files",
+  "studio.clipboard",
+  "system.clipboard",
+  "system.memory",
   "system.shell",
   "code.execute",
+  "runtime.sandbox",
+  "runtime.vm",
+  "code.assembly",
+  "task.attachments",
+  "maps.search",
+  "maps.display",
   "web.search",
   "web.fetch",
   "browser.automation",
   "device.input",
   "modality.imagine",
   "brain.history",
+  "brain.substrate",
   "agent.fork",
   "source.self-modify"
 ].map((toolId) => ({
@@ -456,9 +631,9 @@ export const DEFAULT_TOOL_PERMISSIONS: ToolPermissionRecord[] = [
     .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
     .join(" "),
   level:
-    toolId === "browser.automation" || toolId === "source.self-modify"
+    toolId === "browser.automation" || toolId === "source.self-modify" || toolId === "system.memory" || toolId === "system.clipboard"
       ? ("off" as const)
-      : toolId === "modality.imagine" || toolId === "brain.history"
+      : toolId === "modality.imagine" || toolId === "brain.history" || toolId === "task.attachments" || toolId === "studio.artifact" || toolId === "studio.clipboard"
         ? ("auto" as const)
         : ("ask" as const),
   updatedAt: new Date(0).toISOString()
@@ -703,6 +878,7 @@ function validateSavedWorkingPages(path: string | undefined, state: unknown): vo
     if (quick?.quick_check !== "ok" || table?.type !== "table") {
       throw new Error("Saved working-memory SQLite integrity failed.");
     }
+    validatePortableWorkingActivity(database);
     const dtypeBytes: Record<string, number> = {
       "torch.bool": 1, "torch.uint8": 1, "torch.int8": 1,
       "torch.int16": 2, "torch.int32": 4, "torch.int64": 8,
@@ -728,6 +904,7 @@ function validateSavedWorkingPages(path: string | undefined, state: unknown): vo
         !Number.isFinite(row.updated_at)) {
         throw new Error("Saved working-memory page schema is invalid.");
       }
+      validatePortableWorkingActivityMetadata(metadata);
       const bytes = tensorShape.reduce((total: number, dimension: number) => total * dimension, 1) * dtypeBytes[dtype]!;
       const checksum = createHash("sha256").update(dtype).update("\0")
         .update(`[${tensorShape.join(", ")}]`).update("\0").update(payload).digest("hex");
@@ -1037,6 +1214,97 @@ function persistedParameterAccounting(
     totalNeuralParameters,
     countingRule: value.countingRule.trim()
   };
+}
+
+/** Native worker measurement bound to the current committed checkpoint.
+ * This validates metadata/manifests, not an advertised architecture size or a
+ * new model run. It never loads tensors or independently recounts their bytes.
+ */
+export async function readCommittedVoiceParameterEvidence(
+  engineDirectory: string, expectedBrainId: string
+): Promise<NativeVoiceParameterEvidence> {
+  const path = join(engineDirectory, "brain.json"), before = await lstat(path, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error("Native accounting metadata is not a regular file.");
+  const bytes = Number(before.size), need = bytes * 12;
+  if (!Number.isSafeInteger(need) || need > freemem() ||
+      need > getHeapStatistics().heap_size_limit - process.memoryUsage().heapUsed) throw new Error("Native accounting metadata awaits available transfer RAM.");
+  const payload = await readFile(path), metadata: unknown = JSON.parse(payload.toString("utf8"));
+  let inspectedBytes = bytes;
+  const boundedRegular = async (source: string): Promise<Buffer> => {
+    const info = await lstat(source);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("Native accounting manifest is not a regular managed file.");
+    inspectedBytes += info.size;
+    const needed = inspectedBytes * 12;
+    if (!Number.isSafeInteger(needed) || needed > freemem() ||
+        needed > getHeapStatistics().heap_size_limit - process.memoryUsage().heapUsed) throw new Error("Native accounting manifest awaits physical transfer RAM.");
+    return readFile(source);
+  };
+  if (!isRecord(metadata) || metadata.brain_id !== expectedBrainId || metadata.release_format !== STABLE_RELEASE_FORMAT ||
+      !isRecord(metadata.config) || metadata.config.origin_kind !== "ground-up" ||
+      ["foundation_model_id", "foundationModelId"].some(key => Object.hasOwn(metadata.config as object, key)) ||
+      Object.hasOwn(metadata, "neural_sequence_memory")) throw new Error("Native accounting does not belong to a supported committed instance.");
+  const card = isRecord(metadata.runtime_card) ? metadata.runtime_card : undefined;
+  const workspace = card && isRecord(card.workspace) ? card.workspace : undefined;
+  const accounting = card && isRecord(card.parameterAccounting) ? card.parameterAccounting : undefined;
+  const mutable = isRecord(metadata.mutable_state) ? metadata.mutable_state : undefined;
+  const substrate = isRecord(metadata.substrate) && isRecord(metadata.substrate.persistence) ? metadata.substrate.persistence : undefined;
+  const sha = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+  const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
+  if (!accounting || !workspace || workspace.brainId !== expectedBrainId ||
+      typeof workspace.queriedAt !== "string" || !Number.isFinite(Date.parse(workspace.queriedAt)) ||
+      !mutable || !substrate || !sha(substrate.activeGeneration) || substrate.contentSha256 !== substrate.activeGeneration ||
+      !sha(substrate.generationManifestSha256) || substrate.generationManifest !== `generations/${substrate.activeGeneration}/manifest.json` ||
+      substrate.format !== SUBSTRATE_STORE_FORMAT || substrate.formatVersion !== 3 ||
+      !["mutableDenseParameters", "substrateVectorParameters", "dynamicSparseSynapses", "substrateDynamicSparseSynapses", "totalNeuralParameters"].every(key => count(accounting[key])) ||
+      ["foundationEffectiveParameters", "sequenceDynamicSparseSynapses", "fixedSequenceStatisticalCapacity"].some(key => Object.hasOwn(accounting, key)) ||
+      accounting.dynamicSparseSynapses !== accounting.substrateDynamicSparseSynapses ||
+      Number(accounting.mutableDenseParameters) + Number(accounting.substrateVectorParameters) + Number(accounting.dynamicSparseSynapses) !== accounting.totalNeuralParameters ||
+      typeof accounting.countingRule !== "string" || !accounting.countingRule.trim() || accounting.countingRule.length > 512 || accounting.countingRule.includes("\0")) {
+    throw new Error("Committed native logical parameter accounting is unavailable or inconsistent.");
+  }
+  const stateRelative = safeMutableStateRelativePath(String(mutable.generationManifest ?? ""));
+  const stateBytes = await boundedRegular(join(engineDirectory, "state", ...stateRelative.split("/")));
+  if (sha256(stateBytes) !== mutable.generationManifestSha256) throw new Error("Native accounting mutable manifest checksum failed.");
+  const state: unknown = JSON.parse(stateBytes.toString("utf8"));
+  validateMutableGeneration(mutable, state, stateBytes.toString("utf8"));
+  if (!isRecord(state) || !isRecord(state.metadata) || !sha(state.metadata.parameterChecksum) ||
+      state.metadata.substrateContentSha256 !== substrate.activeGeneration) throw new Error("Native accounting lost its joint learned-generation binding.");
+  const substrateBytes = await boundedRegular(join(engineDirectory, "substrate", ...String(substrate.generationManifest).split("/")));
+  if (sha256(substrateBytes) !== substrate.generationManifestSha256) throw new Error("Native accounting substrate manifest checksum failed.");
+  const generation: unknown = JSON.parse(substrateBytes.toString("utf8"));
+  if (!isRecord(generation) || generation.format !== SUBSTRATE_STORE_FORMAT || generation.formatVersion !== 3 ||
+      generation.schema !== "neural-substrate-2" || generation.contentSha256 !== substrate.activeGeneration ||
+      !isRecord(generation.counts) || !["neurons", "assemblies", "synapses"].every(key => count((generation.counts as Record<string, unknown>)[key])) ||
+      !Array.isArray(generation.shards) || generation.shards.length !== substrate.shardCount ||
+      canonicalJson(generation.counts) !== canonicalJson(substrate.counts)) throw new Error("Native accounting substrate generation differs from its checkpoint.");
+  const totals = { neurons: 0, assemblies: 0, synapses: 0 };
+  for (const shard of generation.shards) {
+    if (!isRecord(shard) || !["neurons", "assemblies", "synapses"].includes(String(shard.kind)) ||
+        typeof shard.bucket !== "string" || !/^[a-f0-9]$/.test(shard.bucket) || !count(shard.part) || !count(shard.count)) {
+      throw new Error("Native accounting source shard table is invalid.");
+    }
+    totals[shard.kind as keyof typeof totals] += Number(shard.count);
+    if (!count(totals[shard.kind as keyof typeof totals])) throw new Error("Native accounting source count overflowed.");
+  }
+  if (canonicalJson(totals) !== canonicalJson(generation.counts)) throw new Error("Native accounting source shard coverage is inconsistent.");
+  const body = { ...generation }; delete body.contentSha256;
+  if (sha256(canonicalJson(body)) !== substrate.activeGeneration) throw new Error("Native accounting substrate content checksum failed.");
+  const rootSynapses = Number(generation.counts.synapses), dynamic = Number(accounting.dynamicSparseSynapses);
+  // A connected brain measures all distinct regional memories once. Do not
+  // mistake the outer root's graph cardinality for the complete joined count.
+  if (metadata.connected_regions ? dynamic < rootSynapses : dynamic !== rootSynapses) throw new Error("Native accounting sparse contacts disagree with the committed source.");
+  for (const [store, embedded] of [["state", mutable], ["substrate", substrate]] as const) {
+    const pointer = JSON.parse((await boundedRegular(join(engineDirectory, store, "manifest.json"))).toString("utf8"));
+    if (canonicalJson(pointer) !== canonicalJson(embedded)) throw new Error("Native accounting checkpoint is still publishing; no route was assumed.");
+  }
+  const after = await lstat(path, { bigint: true });
+  if (["dev", "ino", "size", "mtimeNs", "ctimeNs"].some(key => before[key as keyof typeof before] !== after[key as keyof typeof after])) {
+    throw new Error("Native accounting changed during inspection; no route was assumed.");
+  }
+  return { source: "committed-native-parameter-accounting", totalNeuralParameters: Number(accounting.totalNeuralParameters),
+    countingRule: accounting.countingRule, metadataSha256: sha256(payload), substrateGenerationSha256: substrate.activeGeneration,
+    mutableGenerationSha256: String(mutable.activeGeneration), parameterChecksum: state.metadata.parameterChecksum,
+    measuredAt: workspace.queriedAt };
 }
 
 async function readPersistedSubstrateOverview(
@@ -2016,6 +2284,21 @@ function normalizeConfig(value: unknown): BrainConfig {
     }
   }
   merged.runtime = "adaptive-core";
+  if (typeof merged.bestWorkEnabled !== "boolean") {
+    throw new Error("Best Work must be enabled or disabled.");
+  }
+  if (!Number.isSafeInteger(merged.bestWorkExplorationBranches) ||
+    Number(merged.bestWorkExplorationBranches) < 1 || Number(merged.bestWorkExplorationBranches) > 16) {
+    throw new Error("Best Work exploration must allow between 1 and 16 additional branches.");
+  }
+  if (config.deviceResources !== undefined) {
+    merged.deviceResources = validateDeviceResourceSettings(config.deviceResources);
+    const ram = merged.deviceResources.allocations.find((entry) => entry.deviceId === "ram:system");
+    if (ram) {
+      merged.systemRamMode = ram.mode;
+      merged.systemRamSharePercent = ram.mode === "manual" ? ram.percent : 0;
+    }
+  }
   if (
     !["whole-brain", "ternary", "neuromorphic", "liquid", "symbolic", "custom"].includes(
       merged.preset
@@ -2134,12 +2417,20 @@ function normalizeConfig(value: unknown): BrainConfig {
 
 function normalizedBrainProvenance(value: unknown): BrainProvenance | undefined {
   if (!isRecord(value)) return undefined;
-  const originKind = ["ground-up", "legacy-hybrid", "legacy"].includes(
+  const originKind = ["ground-up", "merged-native", "legacy-hybrid", "legacy"].includes(
     String(value.originKind)
   )
     ? value.originKind as BrainProvenance["originKind"]
     : undefined;
   if (!originKind) return undefined;
+  if (originKind === "merged-native") {
+    const merge = isRecord(value.merge) ? value.merge : undefined;
+    if (!merge || !/^[a-f0-9]{64}$/.test(String(merge.descriptorSha256)) || merge.initialCurriculumRerun !== false ||
+      !Array.isArray(merge.parentIds) || merge.parentIds.length < 2 || merge.parentIds.some((id) => typeof id !== "string" || !SAFE_ID.test(id))) {
+      throw new Error("Invalid merged native origin provenance.");
+    }
+    return { originKind, merge: { descriptorSha256: String(merge.descriptorSha256), parentIds: merge.parentIds as string[], initialCurriculumRerun: false } };
+  }
   const rawFoundation = isRecord(value.foundation) ? value.foundation : undefined;
   const modelId = typeof rawFoundation?.modelId === "string" &&
     /^[a-zA-Z0-9._-]{1,128}$/.test(rawFoundation.modelId)
@@ -2232,13 +2523,27 @@ async function readEngineBrainProvenance(
   expectedBrainId: string
 ): Promise<BrainProvenance | undefined> {
   const metadataPath = join(engineDirectory, "brain.json");
+  let connected = false;
   try {
     const info = await lstat(metadataPath);
     if (!info.isFile() || info.isSymbolicLink()) return undefined;
     const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as unknown;
     if (!isRecord(metadata) || metadata.brain_id !== expectedBrainId) return undefined;
+    if (metadata.connected_regions !== undefined) {
+      connected = true;
+      assertNativeOmniEngineState(metadata, "Merged native state");
+      const origin = await verifyConnectedNativeOrigin(engineDirectory, expectedBrainId, { allowAncestralIdentity: true });
+      const descriptor = isRecord(metadata.connected_regions) ? metadata.connected_regions : {};
+      // parents includes all inputs even when identical neural owners are shared.
+      const parents = Array.isArray(descriptor.parents) ? descriptor.parents : [];
+      const ids = parents.map((parent) => isRecord(parent) ? String(parent.parentId ?? parent.brainId ?? "") : "");
+      return normalizedBrainProvenance({ originKind: "merged-native", merge: {
+        descriptorSha256: origin.descriptorSha256, parentIds: ids, initialCurriculumRerun: false
+      } });
+    }
     return brainProvenanceFromEngineMetadata(metadata);
-  } catch {
+  } catch (error) {
+    if (connected) throw error;
     return undefined;
   }
 }
@@ -2451,6 +2756,7 @@ function normalizeBrain(value: unknown): BrainDocument {
     },
     ...(provenance ? { provenance } : {}),
     lineage: {
+      ...(Array.isArray(lineageValue.parentIds) ? { parentIds: lineageValue.parentIds.filter((id): id is string => typeof id === "string" && SAFE_ID.test(id)) } : {}),
       parentId:
         typeof lineageValue.parentId === "string" && SAFE_ID.test(lineageValue.parentId)
           ? lineageValue.parentId
@@ -2813,7 +3119,8 @@ async function inspectPackedTernaryDirectory(
   if (
     !isRecord(parsed) ||
     parsed.format !== "omni-packed-ternary" ||
-    parsed.formatVersion !== 1 ||
+    ![1, 2].includes(Number(parsed.formatVersion)) ||
+    typeof parsed.formatVersion !== "number" ||
     parsed.architecture !== "OmniCortex" ||
     !isRecord(parsed.encoding) ||
     parsed.encoding.bitsPerValue !== 2 ||
@@ -2861,7 +3168,7 @@ async function inspectPackedTernaryDirectory(
     if (
       !isRecord(descriptor) ||
       typeof descriptor.file !== "string" ||
-      !/^ternary-[0-9]{5,}-[a-f0-9]{16}\.bin$/.test(descriptor.file) ||
+      !/^(?:ternary|connections|parallel)-[0-9]{5,}-[a-f0-9]{16}\.bin$/.test(descriptor.file) ||
       typeof descriptor.byteLength !== "number" ||
       !Number.isSafeInteger(descriptor.byteLength) ||
       descriptor.byteLength < 0 ||
@@ -2894,6 +3201,7 @@ async function inspectPackedTernaryDirectory(
       !isRecord(tensor) ||
       typeof tensor.name !== "string" ||
       typeof tensor.shard !== "string" ||
+      !tensor.shard.startsWith("ternary-") ||
       !shardTable.has(tensor.shard) ||
       usedShards.has(tensor.shard) ||
       !["projection", "dynamic-synapse"].includes(String(tensor.kind)) ||
@@ -2972,6 +3280,7 @@ async function inspectPackedTernaryDirectory(
     }
     tensorNames.push(tensor.name);
     usedShards.add(tensor.shard);
+    await verifyPackedConnectionCompanions(tensor, parsed.formatVersion as 1 | 2, shardTable, usedShards, label);
   }
   if (
     tensorNames.length !== expectedNames.length ||
@@ -2985,6 +3294,7 @@ async function inspectPackedTernaryDirectory(
     throw new Error(`${label} packed ternary directory contains an unlisted file.`);
   }
   return {
+    formatVersion: parsed.formatVersion as 1 | 2,
     manifestSha256: expectedManifestHash,
     tensorCount: expectedNames.length,
     files: new Map([...allowed].map((name) => [name, filePath(name)]))
@@ -3011,11 +3321,78 @@ export interface BrainRepositoryCommitObserver {
   error?(operation: "saved" | "removed", brainId: string, error: unknown): void;
 }
 
+export interface BrainPluginPortabilityHooks {
+  cloneTrusted(sourceBrainId: string, targetBrainId: string): Promise<void>;
+  exportBrain(brainId: string, mode: BrainExportMode, destination: string): Promise<PluginPortabilityExport | undefined>;
+  validateImport(
+    files: Map<string, string>,
+    declaration: PluginPortabilityDeclaration,
+    sourceBrainId: string
+  ): Promise<ValidatedPluginPortabilityArchive>;
+  adoptExternal(targetBrainId: string, archive: ValidatedPluginPortabilityArchive): Promise<void>;
+  removeBrain(brainId: string): Promise<void>;
+}
+
 export class BrainRepository {
   readonly root: string;
+  readonly toolPermissionStore: ToolPermissionStore;
+  private pluginPortability?: BrainPluginPortabilityHooks;
 
-  constructor(root: string, private readonly commitObserver?: BrainRepositoryCommitObserver) {
+  constructor(root: string, private readonly commitObserver?: BrainRepositoryCommitObserver,
+    private readonly hostPolicyOptions: { toolPermissionRoot?: string; bootstrapToolPermissions?: boolean;
+      beforeSavedDataAccess?: () => void; catalogAdmission?: WholeBrainCatalogReadOptions["admit"] } = {}) {
     this.root = resolve(root);
+    this.toolPermissionStore = new ToolPermissionStore(hostPolicyOptions.toolPermissionRoot ?? this.root);
+  }
+
+  configurePluginPortability(hooks: BrainPluginPortabilityHooks): void {
+    this.pluginPortability = hooks;
+  }
+
+  private catalogReadOptions(signal?: AbortSignal): WholeBrainCatalogReadOptions {
+    return { signal, admit: this.hostPolicyOptions.catalogAdmission };
+  }
+
+  async admitMetadataTransfer(bytes: number, purpose: string): Promise<void> {
+    await admitWholeBrainCatalogMemory({ admit: this.hostPolicyOptions.catalogAdmission }, bytes, purpose);
+  }
+
+  private teacherMetadataAdmission(signal?: AbortSignal): NonNullable<ApiTeacherMediaIo["admitMetadata"]> {
+    return async (bytes, purpose, requestedSignal) => {
+      signal?.throwIfAborted(); requestedSignal?.throwIfAborted();
+      await this.admitMetadataTransfer(bytes, purpose);
+      signal?.throwIfAborted(); requestedSignal?.throwIfAborted();
+    };
+  }
+
+  private async validateTeacherArchiveSources(sources: Iterable<[string, StreamingZipSource]>, stagingParent: string,
+    operation?: BrainStorageOperationHooks): Promise<boolean> {
+    const stage = await mkdtemp(join(stagingParent, ".teacher-media-archive-validation-"));
+    try { return await validateApiTeacherMediaArchiveSources(sources, stage, {
+      signal: operation?.signal, admitMetadata: this.teacherMetadataAdmission(operation?.signal),
+      checkDisk: async bytes => { operation?.signal.throwIfAborted(); await operation?.checkDisk(this.root, bytes); await ensureDiskReserve(this.root, bytes); operation?.signal.throwIfAborted(); }
+    }); } finally { await rm(stage, { recursive: true, force: true }); }
+  }
+
+  private mcpTaskOptions(operation?: BrainStorageOperationHooks): McpTaskCustodyOptions {
+    return { ...this.catalogReadOptions(operation?.signal), checkDisk: async bytes => {
+      await operation?.checkDisk(this.root, bytes); await ensureDiskReserve(this.root, bytes);
+    } };
+  }
+
+  private async copyMcpTaskSnapshot(sourceEngine: string, targetEngine: string,
+    operation?: BrainStorageOperationHooks): Promise<Map<string, string>> {
+    const stage = await mkdtemp(join(this.root, ".mcp-task-capture-"));
+    try {
+      const snapshot = await captureMcpTaskCustody(sourceEngine, join(stage, "engine"), this.mcpTaskOptions(operation));
+      await rm(join(targetEngine, MCP_TASK_DIRECTORY), { recursive: true, force: true });
+      for (const [local, source] of snapshot) {
+        operation?.signal.throwIfAborted(); const bytes = (await lstat(source)).size;
+        await this.mcpTaskOptions(operation).checkDisk?.(bytes);
+        await copyMutableFileIsolated(source, join(targetEngine, ...local.split("/")), { expectedSha256: await streamFileSha256(source) });
+      }
+      return mcpTaskCustodyFiles(targetEngine, this.mcpTaskOptions(operation));
+    } finally { await rm(stage, { recursive: true, force: true }); }
   }
 
   private async observeCommittedBrain(brain: BrainDocument): Promise<void> {
@@ -3054,8 +3431,65 @@ export class BrainRepository {
       mkdir(this.root, { recursive: true }),
       mkdir(join(this.root, ".trash"), { recursive: true }),
       mkdir(join(this.root, ".blobs"), { recursive: true }),
-      mkdir(join(this.root, ".blob-leases"), { recursive: true })
+      mkdir(join(this.root, ".blob-leases"), { recursive: true }),
+      this.toolPermissionStore.initialize()
     ]);
+  }
+
+  async toolPermissionSnapshot(
+    brainId: string,
+    bootstrap?: readonly ToolPermissionRecord[]
+  ): Promise<ToolPermissionSnapshot> {
+    const id = requireSafeId(brainId);
+    const documentPath = this.documentPath(id);
+    await access(documentPath);
+    // On the first stable-host-policy read, preserve a validated locally saved
+    // pre-store policy. Once the installation-private store exists, read()
+    // ignores this projection, so later neural/snapshot bytes can never regain
+    // authority. External imports/full merges establish policy explicitly.
+    const savedProjection = this.hostPolicyOptions.bootstrapToolPermissions === false ? DEFAULT_TOOL_PERMISSIONS : bootstrap ?? normalizeBrain(
+      JSON.parse(await readFile(documentPath, "utf8"))
+    ).toolPermissions ?? DEFAULT_TOOL_PERMISSIONS;
+    return this.toolPermissionStore.read(
+      id,
+      savedProjection
+    );
+  }
+
+  async updateToolPermission(
+    brainId: string,
+    toolId: string,
+    label: string,
+    level: ToolPermissionRecord["level"],
+    options: ToolPermissionMutationOptions
+  ): Promise<ToolPermissionSnapshot> {
+    const brain = await this.get(brainId);
+    return this.toolPermissionStore.update(
+      brain.id,
+      toolId,
+      label,
+      level,
+      brain.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS,
+      options
+    );
+  }
+
+  async ensureToolPermission(
+    brainId: string,
+    toolId: string,
+    label: string,
+    level: ToolPermissionRecord["level"],
+    requestId: string
+  ): Promise<ToolPermissionSnapshot> {
+    const brain = await this.get(brainId);
+    return this.toolPermissionStore.ensure(
+      brain.id,
+      toolId,
+      label,
+      level,
+      brain.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS,
+      requestId
+    );
   }
 
   async betaReviewComplete(): Promise<boolean> {
@@ -3540,6 +3974,19 @@ export class BrainRepository {
       if (!entry.isDirectory() || !SAFE_ID.test(entry.name)) continue;
       try {
         collectStrings(JSON.parse(await readFile(this.documentPath(entry.name), "utf8")));
+        // Complete merges retain source references in parent histories, not
+        // necessarily the compact current UI document. Their verified local
+        // payload namespace keeps the common source resolver's CAS alive.
+        const shared = join(this.brainDirectory(entry.name), "merge", "shared-blobs");
+        if (await pathExists(shared)) {
+          const info = await lstat(shared);
+          if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Unsafe connected shared-blob directory.");
+          for (const blob of await readdir(shared, { withFileTypes: true })) {
+            if (!blob.isFile() || blob.isSymbolicLink() || !/^[a-f0-9]{64}$/.test(blob.name)) throw new Error("Invalid connected shared-blob reference.");
+            if (await streamFileSha256(join(shared, blob.name)) !== blob.name) throw new Error("Connected shared-blob checksum failed.");
+            protectedHashes.add(blob.name);
+          }
+        }
       } catch {
         // A live but unreadable instance is reason to collect nothing.
         return { removedSharedBlobs: 0, reclaimedBytes: 0 };
@@ -3745,6 +4192,39 @@ export class BrainRepository {
       paths.push(`engine/${relative}`);
       hashes.push(hash);
     }
+    for (const [relative, source] of await savedAppObservationAuditFiles(metadata, sourceEngine, { signal: operation?.signal })) {
+      operation?.signal.throwIfAborted();
+      const hash = await this.storeFileAsBlob(source, operation);
+      if (hash !== basename(relative, ".jsonl")) throw new Error("Current App audit changed while saving its continuation.");
+      await this.linkBlobTo(hash, join(destinationEngine, ...relative.split("/")), operation);
+      paths.push(`engine/${relative}`); hashes.push(hash);
+    }
+    if (!isRecord(metadata) || typeof metadata.brain_id !== "string") {
+      throw new Error("Whole-brain catalog snapshot needs exact engine metadata.");
+    }
+    // Recovery selects an exact older inspection closure. Remove only the
+    // private staged copy so later live, unreferenced shards cannot survive.
+    await rm(join(destinationEngine, "whole-brain-catalog"), { recursive: true, force: true });
+    const catalog = await adoptWholeBrainCatalog(sourceEngine, metadata, metadata,
+      metadata.brain_id, { sameIdentity: true, ...this.catalogReadOptions(operation?.signal) });
+    for (const file of catalog.files.values()) {
+      operation?.signal.throwIfAborted();
+      const hash = file.sourcePath ? await this.storeFileAsBlob(file.sourcePath, operation)
+        : await this.storeBlob(Buffer.from(file.contents!));
+      if (hash !== file.sha256) throw new Error("Whole-brain catalog changed during snapshot materialization.");
+      await this.linkBlobTo(hash, join(destinationEngine, ...file.relativePath.split("/")), operation);
+      paths.push(`engine/${file.relativePath}`); hashes.push(hash);
+    }
+    for (const [local, path] of await this.copyMcpTaskSnapshot(sourceEngine, destinationEngine, operation)) {
+      paths.push(`engine/${local}`); hashes.push(await fileSha256(path));
+    }
+    const execution = await snapshotNativeExecution(sourceEngine, destinationEngine, {
+      sourceBrainId: String((metadata as Record<string, unknown>).brain_id), targetMetadataPath: join(sourceEngine, "brain.json"),
+      clearIfAbsent: true, signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); }
+    });
+    for (const [relative, source] of [...execution].sort(([a], [b]) => a.localeCompare(b))) {
+      paths.push(`engine/${relative}`); hashes.push(await fileSha256(source));
+    }
     return { paths, hashes };
   }
 
@@ -3889,7 +4369,8 @@ export class BrainRepository {
     const metadataPath = join(sourceEngine, "brain.json");
     if (!(await pathExists(metadataPath))) return;
     operation?.signal.throwIfAborted();
-    const sourceMetadata = JSON.parse(await readFile(metadataPath, "utf8")) as unknown;
+    const { raw: sourceMetadataBytes, value: sourceMetadata } = await readWholeBrainCatalogMetadata(metadataPath,
+      this.catalogReadOptions(operation?.signal));
     if (!isRecord(sourceMetadata)) {
       throw new Error("The source engine metadata is invalid.");
     }
@@ -3907,12 +4388,13 @@ export class BrainRepository {
       `.engine-${randomUUID()}.clone-next`
     );
     const targetOrigin = join(targetEngine, "origin");
+    const connectedStaging = join(this.brainDirectory(targetBrainId), `.connected-${randomUUID()}.clone-next`);
     const sourceOrigin = join(sourceEngine, "origin");
     const sourceOriginMetadataPath = join(sourceOrigin, "brain.json");
     const hasImmutableOrigin = await pathExists(sourceOriginMetadataPath);
     const originSourceEngine = hasImmutableOrigin ? sourceOrigin : sourceEngine;
     const originMetadata = hasImmutableOrigin
-      ? (JSON.parse(await readFile(sourceOriginMetadataPath, "utf8")) as unknown)
+      ? (await readWholeBrainCatalogMetadata(sourceOriginMetadataPath, this.catalogReadOptions(operation?.signal))).value
       : sourceMetadata;
     if (!isRecord(originMetadata)) {
       throw new Error("The source verified origin metadata is invalid.");
@@ -3953,6 +4435,22 @@ export class BrainRepository {
       });
     };
 
+    const liveCatalog = await adoptWholeBrainCatalog(sourceEngine, sourceMetadata,
+      metadata, targetBrainId, { sameIdentity: false, ...this.catalogReadOptions(operation?.signal) });
+    for (const key of Object.keys(metadata)) delete metadata[key];
+    Object.assign(metadata, liveCatalog.metadata);
+    const originCatalog = await adoptWholeBrainCatalog(originSourceEngine, originMetadata,
+      originMetadata, String(originMetadata.brain_id), { sameIdentity: true, ...this.catalogReadOptions(operation?.signal) });
+    const addCatalog = async (catalog: WholeBrainCatalogAdoption, destination: string, label: string): Promise<void> => {
+      for (const file of catalog.files.values()) {
+        const target = join(destination, ...file.relativePath.split("/"));
+        if (file.sourcePath) await addPath(file.sourcePath, target, `${label} ${file.relativePath}`, true);
+        else addContents(file.contents!, target, `${label} ${file.relativePath}`);
+      }
+    };
+    await addCatalog(liveCatalog, targetEngine, "inherited whole-brain catalog");
+    await addCatalog(originCatalog, targetOrigin, "origin whole-brain catalog");
+
     for (const [source, destination] of [[sourceEngine, targetEngine], [originSourceEngine, targetOrigin]]) {
       for (const [name, path] of await savedToolIntentFiles(source!)) {
         await addPath(path, join(destination!, "operational-tool-intents", name), `historical tool intent ${name}`, true);
@@ -3966,9 +4464,12 @@ export class BrainRepository {
       for (const [relative, path] of await savedConceptIdViewFiles(source!)) {
         await addPath(path, join(destination!, ...relative.split("/")), "historical structural argument view", true);
       }
-      const sourceState = JSON.parse(await readFile(join(source!, "brain.json"), "utf8")) as unknown;
+      const sourceState = (await readWholeBrainCatalogMetadata(join(source!, "brain.json"), this.catalogReadOptions(operation?.signal))).value;
       for (const [relative, path] of await savedGeometryHoldoutFiles(sourceState, source!)) {
         await addPath(path, join(destination!, ...relative.split("/")), "registered geometry holdout", true);
+      }
+      for (const [relative, path] of await savedAppObservationAuditFiles(sourceState, source!, { signal: operation?.signal })) {
+        await addPath(path, join(destination!, ...relative.split("/")), "current native App observation audit", true);
       }
     }
 
@@ -4170,12 +4671,13 @@ export class BrainRepository {
       );
     } else {
       addContents(
-        Buffer.from(JSON.stringify(sourceMetadata, null, 2)),
+        sourceMetadataBytes,
         join(targetOrigin, "brain.json"),
         "origin engine metadata"
       );
     }
-    const currentMetadataBytes = Buffer.from(JSON.stringify(metadata, null, 2));
+    const currentMetadataBytes = Buffer.from(rewriteNativeCatalogFields(
+      rewriteNativeIdentity(sourceMetadataBytes.toString("utf8"), targetBrainId, targetName), metadata));
     const logicalBytesTotal = materials.reduce(
       (sum, material) => sum + material.bytes,
       currentMetadataBytes.byteLength
@@ -4204,6 +4706,15 @@ export class BrainRepository {
     try {
       await mkdir(targetEngine, { recursive: false });
       await mkdir(targetOrigin, { recursive: false });
+      const connected = await collectConnectedArchive({
+        instanceRoot: this.brainDirectory(sourceBrainId), repositoryRoot: this.root,
+        scopes: [{ engine: "engine", sourceEngine, metadata: sourceMetadata },
+          { engine: "engine/origin", sourceEngine: originSourceEngine, metadata: originMetadata }],
+        stagingDirectory: connectedStaging, collectSubstrate: collectSubstrateSnapshot, operation
+      });
+      if (connected) await materializeConnectedArchive(connected, this.brainDirectory(targetBrainId), {
+        operation, engineDirectory: targetEngine
+      });
       await progress({ phase: "materializing" });
       for (const material of materials) {
         await progress({ label: material.label });
@@ -4280,6 +4791,10 @@ export class BrainRepository {
           "Copied"
         );
       }
+      await savedAppObservationAuditFiles(sourceMetadata, targetEngine, { signal: operation?.signal });
+      await savedAppObservationAuditFiles(originMetadata, targetOrigin, { signal: operation?.signal });
+      await this.copyMcpTaskSnapshot(sourceEngine, targetEngine, operation);
+      await this.copyMcpTaskSnapshot(originSourceEngine, targetOrigin, operation);
       if (liveSubstrate) {
         await collectSubstrateSnapshot(
           targetEngine,
@@ -4327,7 +4842,9 @@ export class BrainRepository {
       });
       operation?.signal.throwIfAborted();
       await rename(targetEngine, finalTargetEngine);
+      await rm(connectedStaging, { recursive: true, force: true });
     } catch (error) {
+      await rm(connectedStaging, { recursive: true, force: true }).catch(() => undefined);
       const stagingName = basename(targetEngine);
       const stagingParent = dirname(targetEngine);
       if (
@@ -4464,7 +4981,9 @@ export class BrainRepository {
     await this.get(id);
     const ledger = await ConversationLedger.open(this.brainDirectory(id), id);
     try {
-      return ledger.page(beforeSequence, limit);
+      const page = ledger.page(beforeSequence, limit);
+      for (const entry of page.entries) if (entry.action) entry.action = await projectMcpAppAction(this.brainDirectory(id), id, entry.action);
+      return page;
     } finally {
       ledger.close();
     }
@@ -4522,12 +5041,13 @@ export class BrainRepository {
 
   async trainingSourceByContentHash(
     id: string,
-    contentHash: string
+    contentHash: string,
+    parserBindingSha256?: string
   ): Promise<TrainingSource | undefined> {
     await this.get(id, false);
     const ledger = await BrainActivityLedger.open(this.brainDirectory(id), id);
     try {
-      return ledger.trainingSourceByContentHash(contentHash);
+      return ledger.trainingSourceByContentHash(contentHash, parserBindingSha256);
     } finally {
       ledger.close();
     }
@@ -4670,12 +5190,15 @@ export class BrainRepository {
       role: "human",
       content: receipt.content,
       createdAt: receipt.createdAt,
+      turnId: receipt.turnId,
+      ...(receipt.attachmentIds?.length ? { taskAttachmentIds: [...receipt.attachmentIds] } : {}),
       deliveryReceipt: {
         schemaVersion: 1,
         presentationOnly: true,
         turnId: receipt.turnId,
         state: receipt.state,
-        updatedAt
+        updatedAt,
+        ...(receipt.attachmentIds?.length ? { attachmentIds: [...receipt.attachmentIds] } : {})
       }
     };
     const ledger = await ConversationLedger.open(this.brainDirectory(id), id);
@@ -4767,6 +5290,9 @@ export class BrainRepository {
     const directory = this.brainDirectory(id);
     await mkdir(join(directory, "snapshots"), { recursive: true });
     await this.compactActivityDocument(brain, false, false);
+    // Initialize before the first discoverable document so legacy migration
+    // cannot race a fresh-created instance's Auto output default.
+    await initializeInstanceVoice(directory, id, "fresh-auto");
     await atomicWrite(this.documentPath(id), JSON.stringify(brain, null, 2));
     await writeFile(join(directory, "origin.json"), JSON.stringify(originBrain, null, 2), {
       encoding: "utf8",
@@ -4778,6 +5304,46 @@ export class BrainRepository {
     return normalizedConfig.idleCognition
       ? (await this.setActiveMode(id, true)).brain
       : created;
+  }
+
+  /** Called only for the coordinator-owned unpublished directory. No create/train receipt is synthesized. */
+  async createMergedDocument(input: FullMergeAssemblyInput): Promise<BrainDocument> {
+    const expected = join(this.root, ".full-merges", input.request.operationId, "target");
+    if (resolve(input.targetDirectory) !== expected || !SAFE_ID.test(input.targetBrainId) ||
+      !SAFE_ID.test(input.request.operationId) || !input.request.accessPolicy) throw new Error("Invalid staged full merge owner.");
+    const marker = await verifyConnectedNativeOrigin(join(expected, "engine"), input.targetBrainId);
+    const now = new Date().toISOString();
+    const config = normalizeConfig(input.request.config);
+    const conversation = await ConversationLedger.open(expected, input.targetBrainId);
+    const activity = await BrainActivityLedger.open(expected, input.targetBrainId);
+    const selected = new Map(input.request.accessPolicy.toolPermissions.map((entry) => [entry.toolId, entry.level]));
+    const permissions = new Map(DEFAULT_TOOL_PERMISSIONS.map((entry) => [entry.toolId, { ...entry, level: selected.get(entry.toolId) ?? "off" as const, updatedAt: now }]));
+    for (const [toolId, level] of selected) permissions.set(toolId, { toolId, level, label: toolId, updatedAt: now });
+    let brain: BrainDocument;
+    try {
+      brain = {
+        schemaVersion: BRAIN_SCHEMA_VERSION, releaseFormat: STABLE_RELEASE_FORMAT,
+        id: input.targetBrainId, name: input.request.name, createdAt: now, updatedAt: now,
+        readiness: { state: "ready", startedAt: now, completedAt: now, attempt: 1 },
+        provenance: { originKind: "merged-native", merge: { descriptorSha256: String(marker.descriptorSha256),
+          parentIds: input.parents.map((parent) => parent.brainId), initialCurriculumRerun: false } },
+        lineage: { rootId: input.targetBrainId, parentIds: input.parents.map((parent) => parent.brainId), generation: 0 },
+        config, concepts: {}, synapses: {}, ideas: [], workingMemory: [],
+        liquidState: { values: [], timeConstants: [], lastUpdatedAt: now },
+        messages: [], traces: [], conversation: conversation.integrity(), activity: activity.integrity(),
+        trainingSources: [], counters: { plasticityEvents: 0, inferenceCount: 0, consolidationCycles: 0 },
+        toolPermissions: [...permissions.values()], journal: []
+      };
+    } finally { conversation.close(); activity.close(); }
+    brain.originChecksum = originChecksumFor(brain);
+    await initializeInstanceVoice(expected, brain.id, "merged-auto");
+    await atomicWrite(join(expected, "origin.json"), JSON.stringify(brain, null, 2));
+    await atomicWrite(join(expected, "brain.json"), JSON.stringify(brain, null, 2));
+    await this.toolPermissionStore.replaceIdentity(
+      brain.id,
+      brain.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS
+    );
+    return brain;
   }
 
   async completeInitialization(id: string): Promise<BrainDocument> {
@@ -4873,15 +5439,16 @@ export class BrainRepository {
   }
 
   async get(id: string, hydrateActivity = true): Promise<BrainDocument> {
+    this.hostPolicyOptions.beforeSavedDataAccess?.();
     const documentPath = this.documentPath(id);
     const hydrateProvenance = async (brain: BrainDocument): Promise<BrainDocument> => {
       const provenance = brain.provenance;
-      if (provenance && provenance.originKind !== "ground-up") {
+      if (provenance && !["ground-up", "merged-native"].includes(provenance.originKind)) {
         throw new Error("This saved instance has a non-native origin and is not supported.");
       }
       const needsEngineProvenance =
         !provenance ||
-        provenance.originKind === "ground-up";
+        ["ground-up", "merged-native"].includes(provenance.originKind);
       if (!needsEngineProvenance) return brain;
       const engineProvenance = await readEngineBrainProvenance(
         join(this.brainDirectory(id), "engine"),
@@ -4898,7 +5465,7 @@ export class BrainRepository {
       ) {
         brain.provenance = engineProvenance;
       }
-      if (brain.provenance && brain.provenance.originKind !== "ground-up") {
+      if (brain.provenance && !["ground-up", "merged-native"].includes(brain.provenance.originKind)) {
         throw new Error("This saved instance has a non-native origin and is not supported.");
       }
       return brain;
@@ -4910,9 +5477,11 @@ export class BrainRepository {
         true,
         true
       );
-      return hydrateProvenance(
-        await this.compactActivityDocument(compact, true, hydrateActivity)
-      );
+      const hydrated = await this.compactActivityDocument(compact, true, hydrateActivity);
+      hydrated.toolPermissions = (
+        await this.toolPermissionStore.read(hydrated.id, this.hostPolicyOptions.bootstrapToolPermissions === false ? DEFAULT_TOOL_PERMISSIONS : hydrated.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS)
+      ).records;
+      return hydrateProvenance(hydrated);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       const backup = `${documentPath}.bak`;
@@ -4924,6 +5493,9 @@ export class BrainRepository {
         true
       );
       const compact = await this.compactActivityDocument(brain, true, hydrateActivity);
+      compact.toolPermissions = (
+        await this.toolPermissionStore.read(compact.id, this.hostPolicyOptions.bootstrapToolPermissions === false ? DEFAULT_TOOL_PERMISSIONS : compact.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS)
+      ).records;
       const persisted = clone(compact);
       persisted.messages = [];
       persisted.traces = [];
@@ -4946,11 +5518,26 @@ export class BrainRepository {
     );
   }
 
+  async voiceParameterEvidence(id: string): Promise<NativeVoiceParameterEvidence> {
+    await access(this.documentPath(id));
+    return readCommittedVoiceParameterEvidence(join(this.brainDirectory(id), "engine"), id);
+  }
+
   async save(brain: BrainDocument, touch = true): Promise<BrainDocument> {
+    this.hostPolicyOptions.beforeSavedDataAccess?.();
     let normalized = await this.compactConversationDocument(
       normalizeBrain(brain)
     );
     normalized = await this.compactActivityDocument(normalized, false, false);
+    // Neural/chat writers may hold an older BrainDocument while the user
+    // changes access. The installation-private policy store always wins, so a
+    // later checkpoint cannot resurrect a stale grant or revocation.
+    normalized.toolPermissions = (
+      await this.toolPermissionStore.read(
+        normalized.id,
+        this.hostPolicyOptions.bootstrapToolPermissions === false ? DEFAULT_TOOL_PERMISSIONS : normalized.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS
+      )
+    ).records;
     if (touch) normalized.updatedAt = new Date().toISOString();
     normalized.name = normalized.config.name.trim() || normalized.name;
     await atomicWrite(this.documentPath(normalized.id), JSON.stringify(normalized, null, 2));
@@ -5260,6 +5847,7 @@ export class BrainRepository {
         fork.id
       );
       await this.compactActivityDocument(fork, false, false);
+      await initializeInstanceVoice(directory, fork.id, "copy-auto");
       await atomicWrite(this.documentPath(fork.id), JSON.stringify(fork, null, 2));
       if (sourceOriginBlob) {
         await this.linkBlobTo(
@@ -5284,15 +5872,33 @@ export class BrainRepository {
         fork.name,
         storageOperation
       );
+      await snapshotNativeExecution(join(this.brainDirectory(source.id), "engine"), join(directory, "engine"), {
+        sourceBrainId: source.id, targetBrainId: fork.id, signal: storageOperation?.signal,
+        checkDisk: async bytes => { await storageOperation?.checkDisk(this.root, bytes); }
+      });
+      await cloneLearningWorkspace(this.brainDirectory(source.id), directory, source.id, fork.id, {
+        signal: storageOperation?.signal, checkDisk: async bytes => { await storageOperation?.checkDisk(this.root, bytes); },
+        admitMetadata: this.teacherMetadataAdmission(storageOperation?.signal)
+      });
       const evolutionArchive = await savedEvolutionArchive(this.brainDirectory(source.id));
       if (evolutionArchive) {
         const hash = await this.storeFileAsBlob(evolutionArchive, storageOperation);
         await this.linkBlobTo(hash, join(directory, "evolution", "archive.json"), storageOperation);
       }
+      // Fork/duplicate is an explicit trusted local operation. Preserve the
+      // selected parent policy, but give the new identity its own revision
+      // history and receipts rather than sharing authorization state.
+      await this.toolPermissionStore.initializeIdentity(
+        fork.id,
+        source.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS
+      );
+      await this.pluginPortability?.cloneTrusted(source.id, fork.id);
       const completed = clone(await this.get(fork.id));
       await this.observeCommittedBrain(completed);
       return completed;
     } catch (error) {
+      await this.pluginPortability?.removeBrain(fork.id).catch(() => undefined);
+      await this.toolPermissionStore.removeIdentity(fork.id).catch(() => undefined);
       await removeTreeWithRetry(directory);
       throw error;
     }
@@ -5332,6 +5938,14 @@ export class BrainRepository {
       }
 
       await rm(exactPath, { recursive: true, force: false });
+      // The identity deletion is already committed; policy cleanup cannot
+      // make callers retry the destructive operation.
+      await this.toolPermissionStore.removeIdentity(id).catch((error) =>
+        this.observeCommitError("removed", id, error)
+      );
+      await this.pluginPortability?.removeBrain(id).catch((error) =>
+        this.observeCommitError("removed", id, error)
+      );
       await this.observeRemovedBrain(id);
       const reclaimed = await this.collectUnreferencedBlobs().catch(() => ({
         removedSharedBlobs: 0,
@@ -5401,8 +6015,8 @@ export class BrainRepository {
       const persisted = await readPersistedSubstrateOverview(engineSource, brain.id);
       if (await pathExists(join(engineSource, "brain.json"))) {
         await mkdir(engineSnapshot, { recursive: true });
-        const metadata = await readFile(join(engineSource, "brain.json"));
-        const metadataValue = JSON.parse(metadata.toString("utf8")) as unknown;
+        const { raw: metadata, value: metadataValue } = await readWholeBrainCatalogMetadata(join(engineSource, "brain.json"),
+          this.catalogReadOptions(operation?.signal));
         const hasNeuralConversation = await pathExists(join(engineSource, "conversation.sqlite3"));
         assertImportedNeuralConversationHead(metadataValue, "Recovery-point source", hasNeuralConversation);
         if (!hasNeuralConversation && isRecord(metadataValue) &&
@@ -5471,6 +6085,18 @@ export class BrainRepository {
           neuralConversationIncluded = true;
         }
         const continuation = await this.copySavedContinuation(engineSource, engineSnapshot, metadataValue, operation);
+        const connectedStaging = join(base, ".connected-staging");
+        try {
+          const connected = await collectConnectedArchive({
+            instanceRoot: brainDirectory, repositoryRoot: this.root,
+            scopes: [{ engine: "engine", sourceEngine: engineSource, metadata: metadataValue }],
+            stagingDirectory: connectedStaging, collectSubstrate: collectSubstrateSnapshot, operation
+          });
+          if (connected) {
+            continuation.hashes.push(await saveConnectedArchive(connected, base, operation));
+            continuation.paths.push("connected/manifest.json");
+          }
+        } finally { await rm(connectedStaging, { recursive: true, force: true }); }
         hashes.push(...continuation.hashes);
         savedContinuation = { version: 1, componentPaths: continuation.paths };
         operation?.signal.throwIfAborted();
@@ -5496,6 +6122,16 @@ export class BrainRepository {
       await ConversationLedger.clone(brainDirectory, base, brain.id, brain.id);
       operation?.signal.throwIfAborted();
       await BrainActivityLedger.clone(brainDirectory, base, brain.id, brain.id);
+      const learningWorkspace = await snapshotLearningWorkspace(brainDirectory, join(base, "learning-workspace"), brain.id, {
+        signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); },
+        admitMetadata: this.teacherMetadataAdmission(operation?.signal)
+      });
+      if (learningWorkspace) {
+        savedContinuation ??= { version: 1, componentPaths: [] };
+        for (const [name, path] of [...learningWorkspace.files].sort(([a], [b]) => a.localeCompare(b))) {
+          savedContinuation.componentPaths.push(`learning-workspace/${name}`); checkpointHashes.push(await fileSha256(path));
+        }
+      }
       checkpointHashes.push(
         await fileSha256(join(base, "conversation", "ledger.sqlite3")),
         await fileSha256(BrainActivityLedger.databasePath(base))
@@ -5703,9 +6339,15 @@ export class BrainRepository {
       }
     ];
     const engineSnapshot = join(this.brainDirectory(id), "snapshots", snapshotId, "engine");
+    const connectedSnapshot = await readConnectedArchiveDirectory(base, "connected", operation?.signal);
+    await mcpTaskCustodyFiles(engineSnapshot, this.mcpTaskOptions(operation));
     if (await pathExists(join(engineSnapshot, "brain.json"))) {
-      const engineMetadata = await readFile(join(engineSnapshot, "brain.json"));
-      const engineMetadataValue = JSON.parse(engineMetadata.toString("utf8")) as unknown;
+      const { raw: engineMetadata, value: engineMetadataValue } = await readWholeBrainCatalogMetadata(join(engineSnapshot, "brain.json"),
+        this.catalogReadOptions(operation?.signal));
+      await validateConnectedArchive(connectedSnapshot, [{ engine: "engine", metadata: engineMetadataValue }], operation?.signal);
+      if (connectedSnapshot && !summary.savedContinuation?.componentPaths.includes("connected/manifest.json")) {
+        throw new Error("Recovery-point connected dependencies are not bound to its checkpoint.");
+      }
       const hashes = [sha256(engineMetadata)];
       for (const name of ["core.safetensors", "plasticity.safetensors"]) {
         const sourcePath = join(engineSnapshot, name);
@@ -5816,7 +6458,12 @@ export class BrainRepository {
     let documentPromoted = false;
     let previousMoved = false;
     let promoted = false;
+    const connectedHostPromotions: Array<{ path: string; backup: string; moved: boolean; promoted: boolean }> = [];
     const rollbackHostLedgers = async (): Promise<void> => {
+      for (const item of [...connectedHostPromotions].reverse()) {
+        if (item.promoted) { await rm(item.path, { recursive: true, force: true }); item.promoted = false; }
+        if (item.moved) { await rename(item.backup, item.path); item.moved = false; }
+      }
       if (evolutionArchivePromoted) {
         await rm(evolutionArchivePath, { force: true }).catch(() => undefined);
         evolutionArchivePromoted = false;
@@ -5879,11 +6526,17 @@ export class BrainRepository {
           preserveTimestamps: true
         });
         operation?.signal.throwIfAborted();
+        // The live engine may own a valid in-flight connected working-page
+        // beforeimage. A recovery point selects another committed generation,
+        // so validate and remove only the copied private-stage marker/backup
+        // before installing that selected snapshot. Never clean the live,
+        // source, selected-snapshot, or previous-engine paths here.
+        await clearStagedConnectedWorkingPublication(stagedEngine);
       } else {
         await mkdir(stagedEngine, { recursive: true });
       }
-      const metadata = await readFile(join(engineSnapshot, "brain.json"));
-      const metadataValue = JSON.parse(metadata.toString("utf8")) as unknown;
+      const { raw: metadata, value: metadataValue } = await readWholeBrainCatalogMetadata(join(engineSnapshot, "brain.json"),
+        this.catalogReadOptions(operation?.signal));
       for (const name of ["core.safetensors", "plasticity.safetensors"]) {
         operation?.signal.throwIfAborted();
         const sourcePath = join(engineSnapshot, name);
@@ -5913,6 +6566,17 @@ export class BrainRepository {
         operation
       );
       await this.copySavedContinuation(engineSnapshot, stagedEngine, metadataValue, operation, stagedHost);
+      const laterTaskStage = await mkdtemp(join(this.root, ".mcp-task-recovery-"));
+      try {
+        await captureMcpTaskCustody(targetEngine, join(laterTaskStage, "engine"), this.mcpTaskOptions(operation));
+        await mergeMcpTaskCustody(join(laterTaskStage, "engine"), stagedEngine, this.mcpTaskOptions(operation));
+      } finally { await rm(laterTaskStage, { recursive: true, force: true }); }
+      if (connectedSnapshot) await materializeConnectedArchive(connectedSnapshot, stagedHost, {
+        operation, engineDirectory: stagedEngine,
+        onSharedBlob: async (expected, path) => {
+          if (await this.storeFileAsBlob(path, operation) !== expected) throw new Error("Recovered parent source blob checksum failed.");
+        }
+      });
       if (summary.durableState) {
         await rm(join(stagedEngine, "artifacts"), {
           recursive: true,
@@ -5949,6 +6613,43 @@ export class BrainRepository {
       }
       // Metadata is the staged generation's final commit record.
       await atomicWrite(join(stagedEngine, "brain.json"), metadata);
+      const recoveredLearningWorkspace = await learningWorkspaceArchive(join(base, "learning-workspace"));
+      if (recoveredLearningWorkspace) await adoptLearningWorkspace(recoveredLearningWorkspace, stagedHost, id, {
+        signal: operation?.signal, targetCorePath: join(stagedEngine, "core.safetensors"),
+        checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); },
+        admitMetadata: this.teacherMetadataAdmission(operation?.signal)
+      });
+      // Host effects cannot be undone by restoring an older neural snapshot.
+      // Retain later actual automation receipts as dormant historical branches.
+      await mergeAutomationWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`);
+      await mergeAssemblyWorkspace(brainDirectory, stagedHost, `recovery-${snapshotId}`, async bytes => { await operation?.checkDisk(this.root, bytes); });
+      await mergeEnvironmentWorkspace(brainDirectory, stagedHost, id, id, `recovery-${snapshotId}`,
+        async bytes => { await operation?.checkDisk(this.root, bytes); });
+      await mergeClipboardWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`,
+        async bytes => { await operation?.checkDisk(this.root, bytes); });
+      await mergeLocalTeacherWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`,
+        async bytes => { await operation?.checkDisk(this.root, bytes); }, undefined, undefined, "recovery-history");
+      await mergeExternalAdviceWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`,
+        async bytes => { await operation?.checkDisk(this.root, bytes); }, operation?.signal);
+      await mergeApiTeacherWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`,
+        async bytes => { await operation?.checkDisk(this.root, bytes); }, operation?.signal, this.teacherMetadataAdmission(operation?.signal));
+      await mergeFileHandoffCustody(stagedHost, id, brainDirectory, id, { signal: operation?.signal,
+        reserve: async (_root, bytes) => { await operation?.checkDisk(this.root, bytes); } });
+      await mergePluginRuntimeWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`,
+        { signal: operation?.signal, mode: "history-only", checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); } });
+      await mergePanelReceiptWorkspace(brainDirectory, stagedHost, id,
+        { signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); } });
+      await mergeSparseSubstrateTransferWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`,
+        { signal: operation?.signal, reserveWrite: async bytes => { await operation?.checkDisk(this.root, bytes); } });
+      await mergeSteerDirectionWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`, undefined,
+        "recovered-history", async bytes => { await operation?.checkDisk(this.root, bytes); });
+      const retainedRecordingAliases = await mergeImaginationWorkspace(brainDirectory, stagedHost, id, `recovery-${snapshotId}`, async bytes => { await operation?.checkDisk(this.root, bytes); });
+      await mergeReplayWorkspace(brainDirectory, stagedHost, id, async bytes => { await operation?.checkDisk(this.root, bytes); }, retainedRecordingAliases);
+      // Recovery does not erase later real UI artifacts. Retain them as inert
+      // evidence, without restoring sessions, grants or completed effects.
+      await mergeMcpAppArtifacts([{ root: brainDirectory, brainId: id }], stagedHost, id, {
+        signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); }
+      });
 
       if (await pathExists(targetEngine)) {
         await rename(targetEngine, previousEngine);
@@ -5957,6 +6658,32 @@ export class BrainRepository {
       await rename(stagedEngine, targetEngine);
       promoted = true;
       try {
+        const retainedHostRoots = recoveredLearningWorkspace ? ["learning", "datasets", "questions", "clock", "voice", "attachments", "directions", "imagination", "imagination-assemblies", "automation", "environments", "clipboard", "local-teachers", "assembly", "mcp-apps", "html-artifacts", ...(await pathExists(join(stagedHost, "external-advice", "workspace.sqlite3")) ? ["external-advice"] : []), ...(await pathExists(join(stagedHost, "plugin-runtime", "workspace.sqlite3")) ? ["plugin-runtime"] : []), ...(await pathExists(join(stagedHost, "substrate-transfers")) ? ["substrate-transfers"] : [])]
+          : [...(await pathExists(join(stagedHost, "mcp-apps")) ? ["mcp-apps"] : []), ...(await pathExists(join(stagedHost, "directions")) ? ["directions"] : []), ...(await pathExists(join(stagedHost, "imagination")) ? ["imagination"] : []), ...(await pathExists(join(stagedHost, "imagination-assemblies")) ? ["imagination-assemblies"] : []), ...(await pathExists(join(stagedHost, "environments")) ? ["environments"] : []), ...(await pathExists(join(stagedHost, "clipboard")) ? ["clipboard"] : []), ...(await pathExists(join(stagedHost, "local-teachers")) ? ["local-teachers"] : []), ...(await pathExists(join(stagedHost, "html-artifacts")) ? ["html-artifacts"] : []), ...(await pathExists(join(stagedHost, "external-advice", "workspace.sqlite3")) ? ["external-advice"] : []), ...(await pathExists(join(stagedHost, "plugin-runtime", "workspace.sqlite3")) ? ["plugin-runtime"] : []), ...(await pathExists(join(stagedHost, "substrate-transfers")) ? ["substrate-transfers"] : [])];
+        if (await pathExists(join(stagedHost, "plugin-panels", "workspace.sqlite3"))) retainedHostRoots.push("plugin-panels");
+        if (await pathExists(join(stagedHost, "api-teachers", "workspace.sqlite3"))) retainedHostRoots.push("api-teachers");
+        if (!retainedHostRoots.includes("attachments") && await pathExists(join(stagedHost, "attachments"))) retainedHostRoots.push("attachments");
+        for (const name of retainedHostRoots) {
+          const path = join(brainDirectory, name), backup = join(brainDirectory, `.learning-${randomUUID()}.previous`);
+          const item = { path, backup, moved: false, promoted: false }; connectedHostPromotions.push(item);
+          if (await pathExists(path)) { await rename(path, backup); item.moved = true; }
+          // Absence is a valid optional workspace state. Do not invent an
+          // empty clipboard/environment/teacher root without its owned DB.
+          // A moved prior root stays rollbackable until the whole promotion
+          // commits, even when the recovered state intentionally has no root.
+          if (await pathExists(join(stagedHost, name))) {
+            await rename(join(stagedHost, name), path); item.promoted = true;
+          }
+        }
+        if (connectedSnapshot) {
+          for (const name of ["merge", "full-merge.json"]) {
+            const path = join(brainDirectory, name), backup = join(brainDirectory, `.connected-${randomUUID()}.previous`);
+            const item = { path, backup, moved: false, promoted: false };
+            connectedHostPromotions.push(item);
+            if (await pathExists(path)) { await rename(path, backup); item.moved = true; }
+            await rename(join(stagedHost, name), path); item.promoted = true;
+          }
+        }
         if (summary.savedContinuation?.componentPaths.includes("evolution/archive.json")) {
           await mkdir(dirname(evolutionArchivePath), { recursive: true });
           if (await pathExists(evolutionArchivePath)) {
@@ -5988,6 +6715,9 @@ export class BrainRepository {
           label: "Reloading the exact recovered neural state"
         });
         await afterPromotion?.();
+        for (const item of connectedHostPromotions) {
+          await rm(item.backup, { recursive: true, force: true }); item.moved = false; item.promoted = false;
+        }
         await rm(previousEngine, { recursive: true, force: true }).catch(
           () => undefined
         );
@@ -6053,9 +6783,10 @@ export class BrainRepository {
     id: string,
     destination: string,
     mode: BrainExportMode = "current",
-    operation?: BrainStorageOperationHooks
+    operation?: BrainStorageOperationHooks,
+    beforeSnapshot?: () => void | Promise<void>
   ): Promise<void> {
-    return withBrainWrite(this, id, () => this.exportBundleUnlocked(id, destination, mode, operation), operation?.signal);
+    return withBrainWrite(this, id, async () => { await beforeSnapshot?.(); return this.exportBundleUnlocked(id, destination, mode, operation); }, operation?.signal);
   }
 
   private async exportBundleUnlocked(
@@ -6079,6 +6810,22 @@ export class BrainRepository {
       !await pathExists(join(directory, "engine", "origin", "brain.json"))) {
       throw new Error("Finish initial learning before exporting this mind; a saved native checkpoint and its materialized origin are required.");
     }
+    // Format2 requires real saved registries, including the immutable origin.
+    // Refuse before cloning potentially large history; do not synthesize a
+    // missing registry, rewrite an old origin, or start a model to obtain one.
+    const catalogOptions = this.catalogReadOptions(operation?.signal);
+    const { raw: catalogCurrentMetadataBytes, value: catalogCurrentMetadata } = await readWholeBrainCatalogMetadata(
+      join(engineDirectory, "brain.json"), catalogOptions);
+    const { raw: catalogOriginMetadataBytes, value: catalogOriginMetadata } = await readWholeBrainCatalogMetadata(
+      join(directory, "engine", "origin", "brain.json"), catalogOptions);
+    const catalogArchive = await collectWholeBrainCatalogArchive({
+      current: { engineRoot: engineDirectory, metadata: catalogCurrentMetadata },
+      origin: { engineRoot: join(directory, "engine", "origin"), metadata: catalogOriginMetadata }
+    }, catalogOptions);
+    const taskArchive = await captureMcpTaskArchive({ current: engineDirectory, origin: join(directory, "engine", "origin") },
+      join(activityExportRoot, "mcp-task-capture"), this.mcpTaskOptions(operation));
+    let embeddedMcpTasksPresent = false;
+    let embeddedTeacherMediaPresent = false;
     const storedOriginBytes = await readFile(join(directory, "origin.json"));
     const storedOriginValue: unknown = JSON.parse(storedOriginBytes.toString("utf8"));
     const storedOriginChecksum = assertOriginChecksum(storedOriginValue, "The stored origin");
@@ -6090,7 +6837,7 @@ export class BrainRepository {
     let portableBrain =
       mode === "origin"
         ? clone(storedOriginValue) as BrainDocument
-        : JSON.parse(currentDocumentBytes.toString("utf8")) as BrainDocument;
+        : clone(currentBrain);
     normalizeBrain(portableBrain);
     const activityExportBrainDirectory = join(activityExportRoot, "brain");
     let rawEpisodesPresent = false;
@@ -6138,7 +6885,7 @@ export class BrainRepository {
         ? await inspectPackedTernaryDirectory(selectedPackedPath, "Current")
         : undefined;
     const engineState = engineMaterialized
-      ? savedEngineState(await readFile(engineStatePath))
+      ? savedEngineState((await readWholeBrainCatalogMetadata(engineStatePath, catalogOptions)).raw)
       : strToU8(
           JSON.stringify(
             {
@@ -6155,6 +6902,7 @@ export class BrainRepository {
         "Materialized OmniCortex state is missing its verified packed ternary inference shards."
       );
     }
+    if (engineMaterialized) assertSavedInferenceSidecarReady(JSON.parse(Buffer.from(engineState).toString("utf8")));
     const corePath = join(engineDirectory, "core.safetensors");
     const plasticityPath = join(engineDirectory, "plasticity.safetensors");
     const coreExists = await pathExists(corePath);
@@ -6182,6 +6930,8 @@ export class BrainRepository {
             `OS-vault credentials are not included. Import starts dormant; a collision rekeys the live identity. ` +
             `Dataset continuation retains its original absolute-path/stat, content, kind/policy/epoch ` +
             `and parser bindings; relocated sources are not automatically remapped. ` +
+            `Declared plugin packages, documentation, selections, semantic receipts and provenance may be included. ` +
+            `External import keeps those selections dormant and never transfers credentials, approvals or grants. ` +
             `This is not an in-flight process clone.\n`
         )
       },
@@ -6310,12 +7060,9 @@ export class BrainRepository {
       ) {
         throw new Error("The immutable origin contains an unsafe filesystem link.");
       }
-      immutableStateBytes = await readFile(immutableStatePath);
-      try {
-        immutableStateMetadata = JSON.parse(immutableStateBytes.toString("utf8"));
-      } catch {
-        throw new Error("The verified origin engine metadata is invalid.");
-      }
+      const immutableMetadata = await readWholeBrainCatalogMetadata(immutableStatePath, catalogOptions);
+      immutableStateBytes = immutableMetadata.raw;
+      immutableStateMetadata = immutableMetadata.value;
       assertUiNeuralOriginIdentity(originBrain, immutableStateMetadata);
       assertNativeOmniEngineState(immutableStateMetadata, "Immutable origin");
     }
@@ -6481,11 +7228,35 @@ export class BrainRepository {
       .includes("omni-cortex-engine")
       ? (JSON.parse(Buffer.from(immutableState).toString("utf8")) as unknown)
       : undefined;
+    if (!Buffer.from(engineState).equals(catalogCurrentMetadataBytes) || !Buffer.from(immutableState).equals(catalogOriginMetadataBytes)) {
+      throw new Error("Saved catalog source metadata changed while preparing format2 export; no stale closure was archived.");
+    }
+    for (const source of catalogArchive.sources) entries[source.name] = source;
+    for (const source of taskArchive.sources) entries[source.name] = source;
+    if (currentEngineMetadata && originEngineMetadata) {
+      const connected = await collectConnectedArchive({
+        instanceRoot: directory, repositoryRoot: this.root,
+        scopes: [{ engine: "engine", sourceEngine: engineDirectory, metadata: currentEngineMetadata },
+          { engine: "engine/origin", sourceEngine: immutableEngine, metadata: originEngineMetadata }],
+        stagingDirectory: join(activityExportRoot, "connected-state"), collectSubstrate: collectSubstrateSnapshot, operation
+      });
+      if (connected) {
+        embeddedMcpTasksPresent = await validateEmbeddedMcpTaskSources(connected.files,
+          join(activityExportRoot, "mcp-task-embedded"), this.mcpTaskOptions(operation));
+        embeddedTeacherMediaPresent = await this.validateTeacherArchiveSources(connected.files, activityExportRoot, operation);
+        for (const source of connectedArchiveSources(connected)) entries[source.name] = source;
+      }
+    }
     for (const [sourceEngine, metadata, scope, sourceBrainId, ledgerPrefix] of [
       [engineDirectory, currentEngineMetadata, "current", portableBrain.id, "conversation"],
       [immutableEngine, originEngineMetadata, "origin", originBrain.id, "origin/conversation"]
     ] as const) {
       if (!metadata) continue;
+      const execution = await nativeExecutionFiles(sourceEngine, String((metadata as Record<string, unknown>).brain_id));
+      for (const [relative, path] of execution.files) {
+        const name = `execution/${scope}/${relative}`;
+        entries[name] = { name, sourcePath: path };
+      }
       for (const [relative, path] of await savedConceptIdViewFiles(sourceEngine)) {
         const name = `concept-views/${scope}/${relative.split("/").at(-1)}`;
         entries[name] = { name, sourcePath: path };
@@ -6500,6 +7271,10 @@ export class BrainRepository {
       }
       for (const [relative, path] of await savedEvolutionContinuationFiles(sourceEngine)) {
         const name = `evolution/${scope}/${relative}`;
+        entries[name] = { name, sourcePath: path };
+      }
+      for (const [relative, path] of await savedAppObservationAuditFiles(metadata, sourceEngine, { signal: operation?.signal })) {
+        const name = `app-audits/${scope}/${relative}`;
         entries[name] = { name, sourcePath: path };
       }
       const ledgerPath = join(sourceEngine, "conversation.sqlite3");
@@ -6612,7 +7387,9 @@ export class BrainRepository {
           await operation?.checkDisk(this.root, (await lstat(source)).size);
           await copyMutableFileIsolated(source, target);
         }
-        const checked = await validateSavedSnapshot(stagedBase, snapshotId, currentBrain.id);
+        const checked = await validateSavedSnapshot(stagedBase, snapshotId, currentBrain.id, this.mcpTaskOptions(operation));
+        embeddedMcpTasksPresent ||= checked.mcpTasksPresent;
+        embeddedTeacherMediaPresent ||= checked.embeddedTeacherMediaPresent;
         recoveryPoints.push({ id: snapshotId, brainId: currentBrain.id, missingPayloads: checked.missingPayloads });
         for (const relative of sourceFiles.keys()) {
           const name = relative === "../document" ? `snapshots/${snapshotId}.json`
@@ -6646,6 +7423,23 @@ export class BrainRepository {
       entries["model-card.md"]!.contents = strToU8(modelCard + "\nAlready-missing historical recovery payloads (records retained, not claimed restorable):\n" +
         missingHistory.map((snapshot) => `${snapshot.id}: ${snapshot.missingPayloads.join(", ")}`).join("\n") + "\n");
     }
+    const learningWorkspace = await snapshotLearningWorkspace(directory, join(activityExportRoot, "learning-workspace"), id, {
+      signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); },
+      admitMetadata: this.teacherMetadataAdmission(operation?.signal)
+    });
+    if (learningWorkspace) for (const [relative, sourcePath] of learningWorkspace.files) {
+      const name = `learning-workspace/${relative}`; entries[name] = { name, sourcePath };
+    }
+    const pluginExport = await this.pluginPortability?.exportBrain(
+      id, mode, join(activityExportRoot, "plugins")
+    );
+    if (pluginExport) {
+      for (const [relative, sourcePath] of pluginExport.files) {
+        const name = `plugins/${relative}`;
+        assertAllowedBundlePath(name);
+        entries[name] = { name, sourcePath };
+      }
+    }
     const fileRecords: Record<string, { sha256: string; bytes: number }> = {};
     const stagedSourceRoot = join(activityExportRoot, "sources");
     for (const [path, source] of Object.entries(entries)) {
@@ -6675,16 +7469,25 @@ export class BrainRepository {
           bytes: info.size
         };
       } else throw new Error(`Bundle source ${path} is empty.`);
+      const expectedCatalog = catalogArchive.files.get(path), observed = fileRecords[path]!;
+      if (expectedCatalog && (observed.sha256 !== expectedCatalog.sha256 || observed.bytes !== expectedCatalog.bytes)) {
+        throw new Error("Saved whole-brain catalog changed during export staging; no archive was published.");
+      }
+      const expectedTask = taskArchive.files.get(path);
+      if (expectedTask && (observed.sha256 !== expectedTask.sha256 || observed.bytes !== expectedTask.bytes)) throw new Error("MCP task capture changed during archive staging; no archive was published.");
     }
     if (!Buffer.from(await readFile(join(directory, "origin.json"))).equals(storedOriginBytes) ||
       (mode !== "origin" && !Buffer.from(await readFile(this.documentPath(id))).equals(currentDocumentBytes)) ||
-      (engineMaterialized && !Buffer.from(await readFile(engineStatePath)).equals(Buffer.from(engineState))) ||
-      (immutableStateBytes && !Buffer.from(await readFile(immutableStatePath)).equals(immutableStateBytes))) {
+      (engineMaterialized && !(await readWholeBrainCatalogMetadata(engineStatePath, catalogOptions)).raw.equals(Buffer.from(engineState))) ||
+      (immutableStateBytes && !(await readWholeBrainCatalogMetadata(immutableStatePath, catalogOptions)).raw.equals(immutableStateBytes))) {
       throw new Error("Saved instance changed during export; retry after its checkpoint finishes.");
     }
+    const teacherMediaPresent = await this.validateTeacherArchiveSources(Object.entries(entries), activityExportRoot, operation) || embeddedTeacherMediaPresent;
     const manifest: OmniManifest = {
       format: BUNDLE_FORMAT,
       formatVersion: BUNDLE_VERSION,
+      requiredFeatures: [...OMNI_BUNDLE_REQUIRED_FEATURES, ...(embeddedMcpTasksPresent || hasMcpTaskArchivePayload(Object.keys(entries)) ? [MCP_TASK_CUSTODY_REQUIRED_FEATURE] : []),
+        ...(teacherMediaPresent ? [API_TEACHER_MEDIA_REQUIRED_FEATURE] : [])],
       releaseFormat: STABLE_RELEASE_FORMAT,
       architecture: "OmniCortex",
       architectureSchemaVersion: portableBrain.schemaVersion,
@@ -6715,7 +7518,7 @@ export class BrainRepository {
         selectedPacked && immutablePacked
           ? {
               format: "omni-packed-ternary",
-              formatVersion: 1,
+              formatVersion: Math.max(selectedPacked.formatVersion, immutablePacked.formatVersion) as 1 | 2,
               currentManifestSha256: selectedPacked.manifestSha256,
               originManifestSha256: immutablePacked.manifestSha256,
               currentTensorCount: selectedPacked.tensorCount,
@@ -6729,6 +7532,7 @@ export class BrainRepository {
       },
       savedInstance: { version: 1, content: "unsanitized" },
       recoveryPoints,
+      ...(pluginExport ? { pluginPortability: pluginExport.declaration } : {}),
       licenseLedger: {
         application: "PolyForm-Noncommercial-1.0.0-or-commercial-license",
         sourceCount: activitySummary.trainingSourceCount,
@@ -6906,6 +7710,13 @@ export class BrainRepository {
       if (!entry) throw new Error(`The .omni bundle is missing ${name}.`);
       return entry.path;
     };
+    let manifestValue: unknown;
+    try { manifestValue = JSON.parse(await readFile(entryPath("manifest.json"), "utf8")); }
+    catch { throw new Error("manifest.json is missing or invalid."); }
+    const bundleVersion = assertOmniBundleFeatures(manifestValue);
+    if (!isRecord(manifestValue) || manifestValue.releaseFormat !== STABLE_RELEASE_FORMAT) {
+      throw new Error("Unsupported or beta .omni neural release; supported stable native state is required.");
+    }
     for (const required of [
       "manifest.json",
       "model-card.md",
@@ -6939,22 +7750,11 @@ export class BrainRepository {
         throw new Error(`The .omni bundle has no checksum for ${path}.`);
       }
     }
-    let manifestValue: unknown;
-    try {
-      manifestValue = JSON.parse(await readFile(entryPath("manifest.json"), "utf8"));
-    } catch {
-      throw new Error("manifest.json is invalid.");
-    }
-    if (
-      !isRecord(manifestValue) ||
-      manifestValue.format !== BUNDLE_FORMAT ||
-      manifestValue.formatVersion !== BUNDLE_VERSION ||
-      manifestValue.releaseFormat !== STABLE_RELEASE_FORMAT
-    ) {
-      throw new Error(
-        "Unsupported or beta .omni bundle; stable Omni AGI Studio v1 format is required."
-      );
-    }
+    const importedTaskClosures = await validateMcpTaskArchive(archive, bundleVersion,
+      (manifestValue.requiredFeatures ?? []) as string[], this.mcpTaskOptions(operation));
+    const typedTeacherPresent = await this.validateTeacherArchiveSources([...archive.entries].map(([name, entry]): [string, StreamingZipSource] => [name, { name, sourcePath: entry.path }]), archive.root, operation);
+    if (typedTeacherPresent && (bundleVersion !== 2 || !(manifestValue.requiredFeatures as string[] | undefined)?.includes(API_TEACHER_MEDIA_REQUIRED_FEATURE)))
+      throw new Error("Typed API teacher media custody requires its format2 feature declaration before identity adoption.");
     if (
       manifestValue.architecture !== "OmniCortex" ||
       manifestValue.architectureSchemaVersion !== BRAIN_SCHEMA_VERSION ||
@@ -6965,6 +7765,22 @@ export class BrainRepository {
     ) {
       throw new Error("The .omni bundle targets an incompatible architecture schema.");
     }
+    let pluginDeclaration: PluginPortabilityDeclaration | undefined;
+    const pluginNames = [...names].filter((name) => name.startsWith("plugins/"));
+    if (manifestValue.pluginPortability !== undefined) {
+      const value = manifestValue.pluginPortability;
+      if (!isRecord(value) || Object.keys(value).sort().join(",") !==
+          ["formatVersion", "manifestSha256", "packageCount", "selectionCount"].sort().join(",") ||
+          value.formatVersion !== 1 || !Number.isSafeInteger(value.selectionCount) || Number(value.selectionCount) < 0 ||
+          !Number.isSafeInteger(value.packageCount) || Number(value.packageCount) < 0 ||
+          typeof value.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.manifestSha256)) {
+        throw new Error("The .omni plugin portability declaration is invalid.");
+      }
+      pluginDeclaration = value as unknown as PluginPortabilityDeclaration;
+      if (!this.pluginPortability) throw new Error("Plugin portability is unavailable in this installation.");
+    } else if (pluginNames.length) {
+      throw new Error("The .omni bundle contains undeclared plugin portability data.");
+    }
     const declaredEngineMaterialized = manifestValue.engineMaterialized === true;
     let packedDeclaration: OmniManifest["packedTernary"];
     if (manifestValue.packedTernary !== undefined) {
@@ -6972,7 +7788,8 @@ export class BrainRepository {
       if (
         !isRecord(packed) ||
         packed.format !== "omni-packed-ternary" ||
-        packed.formatVersion !== 1 ||
+        ![1, 2].includes(Number(packed.formatVersion)) ||
+        typeof packed.formatVersion !== "number" ||
         typeof packed.currentManifestSha256 !== "string" ||
         !/^[a-f0-9]{64}$/.test(packed.currentManifestSha256) ||
         typeof packed.originManifestSha256 !== "string" ||
@@ -7005,7 +7822,7 @@ export class BrainRepository {
           for (const [name, hash] of Object.entries(value)) {
             if (
               !["manifest.json", "manifest.sha256"].includes(name) &&
-              !/^ternary-[0-9]{5,}-[a-f0-9]{16}\.bin$/.test(name)
+              !/^(?:ternary|connections|parallel)-[0-9]{5,}-[a-f0-9]{16}\.bin$/.test(name)
             ) {
               throw new Error("A packed ternary local reference has an unsafe name.");
             }
@@ -7023,7 +7840,7 @@ export class BrainRepository {
       }
       packedDeclaration = {
         format: "omni-packed-ternary",
-        formatVersion: 1,
+        formatVersion: packed.formatVersion as 1 | 2,
         currentManifestSha256: packed.currentManifestSha256,
         originManifestSha256: packed.originManifestSha256,
         currentTensorCount: packed.currentTensorCount,
@@ -7189,6 +8006,7 @@ export class BrainRepository {
         packedOverrides.origin
       );
       if (
+        Math.max(verifiedPackedCurrent.formatVersion, verifiedPackedOrigin.formatVersion) !== packedDeclaration.formatVersion ||
         verifiedPackedCurrent.manifestSha256 !== packedDeclaration.currentManifestSha256 ||
         verifiedPackedOrigin.manifestSha256 !== packedDeclaration.originManifestSha256 ||
         verifiedPackedCurrent.tensorCount !== packedDeclaration.currentTensorCount ||
@@ -7223,18 +8041,62 @@ export class BrainRepository {
     let originBrainValue: unknown;
     let engineValue: unknown;
     let originEngineValue: unknown;
-    try {
-      brainValue = JSON.parse(await readFile(entryPath("state/brain.json"), "utf8"));
-      originBrainValue = JSON.parse(await readFile(entryPath("origin/state/brain.json"), "utf8"));
-      engineValue = JSON.parse(await readFile(entryPath("state/engine.json"), "utf8"));
-      originEngineValue = JSON.parse(await readFile(entryPath("origin/state/engine.json"), "utf8"));
-    } catch {
-      throw new Error("A required brain or engine state document is invalid.");
-    }
+    brainValue = (await readWholeBrainCatalogMetadata(entryPath("state/brain.json"), this.catalogReadOptions(operation?.signal))).value;
+    originBrainValue = (await readWholeBrainCatalogMetadata(entryPath("origin/state/brain.json"), this.catalogReadOptions(operation?.signal))).value;
+    engineValue = (await readWholeBrainCatalogMetadata(entryPath("state/engine.json"), this.catalogReadOptions(operation?.signal))).value;
+    originEngineValue = (await readWholeBrainCatalogMetadata(entryPath("origin/state/engine.json"), this.catalogReadOptions(operation?.signal))).value;
     // Check both mutable and immutable metadata before any neural state is
     // installed. An imported foundation is never a native OmniCortex origin.
     assertNativeOmniEngineState(engineValue, "Current .omni state");
     assertNativeOmniEngineState(originEngineValue, "Origin .omni state");
+    await validateWholeBrainCatalogArchive(archive, bundleVersion, { current: engineValue, origin: originEngineValue },
+      this.catalogReadOptions(operation?.signal));
+    // Preserve the authenticated ancestral identity for catalog adoption. The
+    // mutable import owner may be rekeyed below, but its source must not be.
+    const sourceCatalogMetadata = structuredClone(engineValue);
+    for (const name of names) if (name.startsWith("execution/")) {
+      const match = /^execution\/(current|origin)\/(.+)$/.exec(name);
+      if (!match || !safeNativeExecutionPath(match[2]!)) throw new Error("The bundle contains an unsafe native execution component.");
+    }
+    for (const name of names) if (name.startsWith("app-audits/")) {
+      const match = /^app-audits\/(current|origin)\/(.+)$/.exec(name);
+      if (!match || !safeAppObservationAuditPath(match[2]!)) throw new Error("The bundle contains an unsafe current App audit path.");
+    }
+    const appAuditPaths = { current: new Map<string, string>(), origin: new Map<string, string>() };
+    for (const [scope, state] of [["current", engineValue], ["origin", originEngineValue]] as const) {
+      const files = await savedAppObservationAuditFiles(state, join(archive.root, "app-audits", scope), { signal: operation?.signal });
+      const prefix = `app-audits/${scope}/`, declared = [...names].filter(name => name.startsWith(prefix));
+      if (declared.length !== files.size || declared.some(name => !files.has(name.slice(prefix.length)))) {
+        throw new Error("The bundle's current App audit differs from its sealed native head.");
+      }
+      appAuditPaths[scope] = files;
+    }
+    for (const [scope, state, metadataPath, corePath, plasticPath] of [
+      ["current", engineValue, "state/engine.json", "tensors/core.safetensors", "tensors/plastic.safetensors"],
+      ["origin", originEngineValue, "origin/state/engine.json", "origin/tensors/core.safetensors", "origin/tensors/plastic.safetensors"]
+    ] as const) {
+      const execution = await nativeExecutionFiles(join(archive.root, "execution", scope), String((state as Record<string, unknown>).brain_id), {
+        metadataPath: entryPath(metadataPath), neuralPaths: { "core.safetensors": tensorPaths[corePath]!, "plasticity.safetensors": tensorPaths[plasticPath]! }
+      });
+      const declared = [...names].filter(name => name.startsWith(`execution/${scope}/`));
+      if (declared.length !== execution.files.size || declared.some(name => !execution.files.has(name.slice(`execution/${scope}/`.length)))) throw new Error("The bundle's native execution payloads differ from their authenticated declaration.");
+    }
+    const connectedArchive = await readConnectedArchive(archive.entries, "connected", operation?.signal);
+    await validateConnectedArchive(connectedArchive, [
+      { engine: "engine", metadata: engineValue }, { engine: "engine/origin", metadata: originEngineValue }
+    ], operation?.signal);
+    if (connectedArchive) {
+      const stage = await mkdtemp(join(archive.root, ".mcp-task-connected-validation-"));
+      try {
+        const present = await validateEmbeddedMcpTaskSources(connectedArchive.files, stage, this.mcpTaskOptions(operation));
+        if (present && (bundleVersion !== 2 || !(manifestValue.requiredFeatures as string[] | undefined)?.includes(MCP_TASK_CUSTODY_REQUIRED_FEATURE))) {
+          throw new Error("Embedded parent MCP task custody requires its format2 feature declaration before adoption.");
+        }
+      } finally { await rm(stage, { recursive: true, force: true }); }
+      const teacherPresent = await this.validateTeacherArchiveSources(connectedArchive.files, archive.root, operation);
+      if (teacherPresent && (bundleVersion !== 2 || !(manifestValue.requiredFeatures as string[] | undefined)?.includes(API_TEACHER_MEDIA_REQUIRED_FEATURE)))
+        throw new Error("Embedded parent typed API teacher media requires its format2 feature declaration before identity adoption.");
+    }
     if (names.has("origin/provenance.json")) {
       throw new Error("Legacy bundled foundation provenance is not supported.");
     }
@@ -7470,7 +8332,13 @@ export class BrainRepository {
           throw new Error("Saved recovery-point declaration is invalid.");
         }
         ids.add(value.id);
-        const checked = await validateSavedSnapshot(join(archive.root, "snapshots", value.id), value.id, value.brainId);
+        const checked = await validateSavedSnapshot(join(archive.root, "snapshots", value.id), value.id, value.brainId,
+          this.mcpTaskOptions(operation));
+        if (checked.mcpTasksPresent && (bundleVersion !== 2 || !(manifestValue.requiredFeatures as string[] | undefined)?.includes(MCP_TASK_CUSTODY_REQUIRED_FEATURE))) {
+          throw new Error("Historical MCP task custody requires its format2 feature declaration before adoption.");
+        }
+        if (checked.embeddedTeacherMediaPresent && (bundleVersion !== 2 || !(manifestValue.requiredFeatures as string[] | undefined)?.includes(API_TEACHER_MEDIA_REQUIRED_FEATURE)))
+          throw new Error("Historical embedded API teacher media requires its format2 feature declaration before identity adoption.");
         if (canonicalJson(checked.missingPayloads) !== canonicalJson(value.missingPayloads)) {
           throw new Error("Saved recovery-point missing-payload report is invalid.");
         }
@@ -7486,6 +8354,13 @@ export class BrainRepository {
     }
     const bundledBrainId = imported.id;
     const bundledGeneration = imported.lineage.generation;
+    const pluginArchive = pluginDeclaration
+      ? await this.pluginPortability!.validateImport(
+          new Map(pluginNames.map((name) => [name.slice("plugins/".length), entryPath(name)])),
+          pluginDeclaration,
+          bundledBrainId
+        )
+      : undefined;
     let rekeyed = false;
     let directory = this.brainDirectory(imported.id);
     for (;;) {
@@ -7530,6 +8405,10 @@ export class BrainRepository {
     }
     imported.name = imported.name.slice(0, 120);
     imported.config.name = imported.name;
+    // Bundled policy is descriptive provenance, never installation authority.
+    // A newly imported identity starts from this installation's reviewed safe
+    // defaults; remote Full/Auto grants cannot cross the archive boundary.
+    imported.toolPermissions = clone(DEFAULT_TOOL_PERMISSIONS);
     // Imported/recovered identities start dormant so importing a second copy
     // cannot silently create another prompt-free runtime owner.
     imported.config.idleCognition = false;
@@ -7545,7 +8424,7 @@ export class BrainRepository {
       id: randomUUID(),
       createdAt: imported.createdAt,
       kind: "system",
-      summary: `Imported from ${basename(sourceLabel)}.`
+      summary: `Imported from ${basename(sourceLabel)}.${bundleVersion === 1 ? " Format1 native archive had no Brain Map catalog; no registry was synthesized." : " Complete format2 Brain Map catalog custody was verified."}`
     });
     imported.journal = [];
     imported.trainingSources = [];
@@ -7654,6 +8533,37 @@ export class BrainRepository {
         mkdir(join(directory, "snapshots"), { recursive: true }),
         mkdir(join(directory, "engine"), { recursive: true })
       ]);
+      const importedCatalog = await adoptWholeBrainCatalog(join(archive.root, "catalog", "current"), sourceCatalogMetadata,
+        engineValue, imported.id, { sameIdentity: !rekeyed, ...this.catalogReadOptions(operation?.signal) });
+      const importedOriginCatalog = await adoptWholeBrainCatalog(join(archive.root, "catalog", "origin"), originEngineValue,
+        originEngineValue, importedOrigin.id, { sameIdentity: true, ...this.catalogReadOptions(operation?.signal) });
+      if (isRecord(engineValue)) for (const field of ["whole_brain_catalog", "whole_brain_catalog_lineage"] as const) {
+        if (Object.hasOwn(importedCatalog.metadata, field)) engineValue[field] = importedCatalog.metadata[field]; else delete engineValue[field];
+      }
+      for (const [catalog, targetEngine] of [[importedCatalog, join(directory, "engine")], [importedOriginCatalog, join(directory, "engine", "origin")]] as const) {
+        for (const file of catalog.files.values()) {
+          if (!safeWholeBrainCatalogPath(file.relativePath)) throw new Error("Unsafe imported catalog destination.");
+          const target = join(targetEngine, ...file.relativePath.split("/"));
+          if (file.sourcePath) await materializeFile(file.sourcePath, target);
+          else {
+            operation?.signal.throwIfAborted(); await operation?.checkDisk(this.root, file.bytes);
+            const existed = await verifiedExistingBlob(join(this.root, ".blobs", file.sha256), file.sha256);
+            const hash = await this.storeBlob(Buffer.from(file.contents!));
+            if (hash !== file.sha256) throw new Error("Generated inert catalog lineage changed before import publication.");
+            if (!existed) installedPhysicalBytes += file.bytes;
+            await materializeReference(hash, target);
+          }
+        }
+      }
+      for (const scope of ["current", "origin"] as const) {
+        const targetEngine = join(directory, "engine", ...(scope === "origin" ? ["origin"] : []));
+        for (const [local, source] of importedTaskClosures.get(scope) ?? []) {
+          const target = join(targetEngine, ...local.split("/"));
+          await materializeFile(source, target, false);
+          if (await streamFileSha256(target) !== checksums.get(`mcp-tasks/${scope}/${local}`)) throw new Error("MCP task import source changed before exact custody publication.");
+        }
+        await mcpTaskCustodyFiles(targetEngine, this.mcpTaskOptions(operation));
+      }
       if (hasConversationLedger) {
         await ConversationLedger.clone(
           archive.root,
@@ -7822,7 +8732,11 @@ export class BrainRepository {
       }
       if (engineMaterialized) {
         operation?.signal.throwIfAborted();
-        const engineDocument = JSON.stringify(engineValue, null, 2);
+        let engineDocument = rewriteNativeIdentity(
+          (await readWholeBrainCatalogMetadata(entryPath("state/engine.json"), this.catalogReadOptions(operation?.signal))).raw.toString("utf8"),
+          imported.id, imported.name
+        );
+        if (rekeyed) engineDocument = rewriteNativeCatalogFields(engineDocument, importedCatalog.metadata);
         await operation?.checkDisk(this.root, Buffer.byteLength(engineDocument));
         await atomicWrite(
           join(directory, "engine", "brain.json"),
@@ -7886,6 +8800,29 @@ export class BrainRepository {
           join(directory, "engine", "origin", "brain.json")
         );
       }
+      for (const [scope, state, targetEngine, metadataPath, corePath, plasticPath, targetBrainId] of [
+        ["current", engineValue, join(directory, "engine"), "state/engine.json", "tensors/core.safetensors", "tensors/plastic.safetensors", imported.id],
+        ["origin", originEngineValue, join(directory, "engine", "origin"), "origin/state/engine.json", "origin/tensors/core.safetensors", "origin/tensors/plastic.safetensors", importedOrigin.id]
+      ] as const) {
+        await snapshotNativeExecution(join(archive.root, "execution", scope), targetEngine, {
+          sourceBrainId: scope === "current" ? bundledBrainId : String((state as Record<string, unknown>).brain_id), targetBrainId,
+          metadataPath: entryPath(metadataPath), neuralPaths: { "core.safetensors": tensorPaths[corePath]!, "plasticity.safetensors": tensorPaths[plasticPath]! },
+          signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); }
+        });
+        for (const [relative, source] of appAuditPaths[scope]) {
+          await materializeFile(source, join(targetEngine, ...relative.split("/")), false);
+        }
+        await savedAppObservationAuditFiles(state, targetEngine, { signal: operation?.signal });
+      }
+      const retainedLearningWorkspace = await learningWorkspaceArchive(join(archive.root, "learning-workspace"));
+      if (retainedLearningWorkspace) {
+        const declared = [...names].filter(name => name.startsWith("learning-workspace/"));
+        if (declared.length !== retainedLearningWorkspace.files.size || declared.some(name => !safeLearningWorkspacePath(name.slice(19)) || !retainedLearningWorkspace.files.has(name.slice(19)))) throw new Error("The .omni learning workspace differs from its verified inventory.");
+        await adoptLearningWorkspace(retainedLearningWorkspace, directory, imported.id, {
+          signal: operation?.signal, checkDisk: async bytes => { await operation?.checkDisk(this.root, bytes); },
+          admitMetadata: this.teacherMetadataAdmission(operation?.signal), retireCopiedTeacherAuthority: true
+        });
+      }
       for (const [scope, state, destinationEngine] of [
         ["current", engineValue, join(directory, "engine")],
         ["origin", originEngineValue, join(directory, "engine", "origin")]
@@ -7914,6 +8851,19 @@ export class BrainRepository {
           throw new Error(`Content-addressed blob validation failed for ${path}.`);
         }
       }
+      if (connectedArchive) await materializeConnectedArchive(connectedArchive, directory, {
+        operation,
+        onSharedBlob: async (expected, path) => {
+          if (await this.storeFileAsBlob(path, operation) !== expected) throw new Error("Imported parent source blob checksum failed.");
+        }
+      });
+      // Never publish a host identity whose saved metadata points at missing
+      // catalog state. A collision preserves original registries as lineage;
+      // it does not fabricate a current destination registry or activation.
+      await collectWholeBrainCatalog(join(directory, "engine"), engineValue, this.catalogReadOptions(operation?.signal));
+      await collectWholeBrainCatalogLineage(join(directory, "engine"), engineValue, this.catalogReadOptions(operation?.signal));
+      await collectWholeBrainCatalog(join(directory, "engine", "origin"), originEngineValue, this.catalogReadOptions(operation?.signal));
+      await collectWholeBrainCatalogLineage(join(directory, "engine", "origin"), originEngineValue, this.catalogReadOptions(operation?.signal));
       for (const snapshot of recoveryPoints) {
         for (const path of [...names].filter((name) =>
           name === `snapshots/${snapshot.id}.json` || name === `snapshots/${snapshot.id}.meta.json` ||
@@ -7921,9 +8871,13 @@ export class BrainRepository {
           await materializeFile(entryPath(path), join(directory, ...path.split("/")),
             !/\.(?:json|sqlite3)$/.test(path));
         }
-        await rekeySavedSnapshot(join(directory, "snapshots", snapshot.id), imported.id, snapshot.missingPayloads);
+        await rekeySavedSnapshot(join(directory, "snapshots", snapshot.id), imported.id, snapshot.missingPayloads,
+          this.catalogReadOptions(operation?.signal));
       }
       await materializeFile(entryPath("origin/state/brain.json"), join(directory, "origin.json"));
+      if (pluginArchive) {
+        await this.pluginPortability!.adoptExternal(imported.id, pluginArchive);
+      }
       await operation?.checkpoint({
         phase: "promoting",
         label: "Imported identity verified and ready",
@@ -7938,11 +8892,20 @@ export class BrainRepository {
       operation?.signal.throwIfAborted();
       // The host document is the final identity commit record. Reserved
       // directories without it are not visible as half-installed brains.
+      // Imports without their own saved setting get Auto, never this
+      // installation's unrelated legacy global voice choices.
+      await initializeInstanceVoice(directory, imported.id, "import-auto");
       await atomicWrite(this.documentPath(imported.id), importedDocument);
+      await this.toolPermissionStore.replaceIdentity(
+        imported.id,
+        imported.toolPermissions ?? DEFAULT_TOOL_PERMISSIONS
+      );
       const completed = clone(await this.get(imported.id));
       await this.observeCommittedBrain(completed);
       return completed;
     } catch (error) {
+      await this.pluginPortability?.removeBrain(imported.id).catch(() => undefined);
+      await this.toolPermissionStore.removeIdentity(imported.id).catch(() => undefined);
       await removeTreeWithRetry(directory);
       throw error;
     }

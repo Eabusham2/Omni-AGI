@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import re
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -16,6 +17,7 @@ from torch.utils.checkpoint import checkpoint
 from .config import OmniConfig
 from .native_action_protocol import structural_schema, validate_structural_value
 from .utf8_text_boundary import Utf8TextBoundary
+from .generation_cursor import NativeGenerationCursor, NativeGenerationSuspended
 from .working_attention_paging import (
     PagedTensorSequence,
     SavedActivityTensor,
@@ -33,6 +35,24 @@ from .native_core_paging import (
 )
 from .packed_collective_hooks import defer_packed_rows, packed_row_owner, current_packed_row_owner, packed_derivative_collective_active
 from .parameter_diagnostics import packed_diagnostic_write
+from .packed_connections import (
+    CONNECTION_STATE_VERSION,
+    CONNECTION_STRENGTH_MAX,
+    connection_strengths,
+    connection_resistance,
+    encode_connection_state,
+    weighted_ternary_levels,
+    PooledParallelConnections,
+)
+from .packed_native_kernel import packed_forward_i8, packed_input_gradient_f32
+from .regional_execution import regional_block_call
+from .decoder_path_execution import capture_decoder_prefill, measured_isolated_prefill
+from .cached_decoder_execution import cached_sampling_operation
+from .cached_whole_operation_auto import reusable_cached_sampling_operation
+from .prefill_whole_operation_auto import full_prefix_sampling_operation
+from .forward_whole_operation_auto import measured_full_forward
+from .native_token_sampling import sample_native_token
+from .reply_execution_planner import dispatch_reply_sample, world_callback
 
 
 ACTION_KINDS = (
@@ -63,15 +83,29 @@ def _zero_packed_state(module, target):
 
 
 class _PackedRowMetaplasticity(NativePackedModuleMixin):
-    """One byte of resistance per output row, never a dense weight shadow.
+    """Compact per-contact strengths/resistance plus output-row resistance.
 
     Repeated successful plastic changes make that row harder, but never
     impossible, to change again. The state is checkpointed with the packed
     module and moves/offloads with it. A row-level approximation is deliberate:
-    per-synapse FP32 eligibility would exceed the packed model's residency.
+    per-synapse floating eligibility would exceed the packed model's residency.
     """
 
     def _init_packed_stability(self, rows: int, has_bias: bool) -> None:
+        width = int(getattr(self, "in_features", getattr(self, "embedding_dim", getattr(self, "_matrix_width", 0))))
+        bias_width = int(getattr(self, "out_features", getattr(self, "out_channels", 0)))
+        self.parallel_connections = PooledParallelConnections((int(rows), width), bias_width if has_bias else 0,
+            pager=self._native_core_pager)
+        self.register_buffer("_connection_state", self._native_buffer(
+            "_connection_state", (int(rows), width),
+            fill=None if self._native_loading_checkpoint else 0,
+        ))
+        self.register_buffer("_bias_connection_state", self._native_buffer(
+            "_bias_connection_state", (1, bias_width),
+            fill=None if self._native_loading_checkpoint else 0,
+        ) if has_bias else None)
+        self._connection_state_validated_version = -1
+        self._bias_connection_state_validated_version = -1
         self.register_buffer(
             "_row_stability", self._native_buffer(
                 "_row_stability", (int(rows),),
@@ -91,6 +125,10 @@ class _PackedRowMetaplasticity(NativePackedModuleMixin):
     def _packed_stability_changed(self) -> bool:
         bias = self._bias_row_stability
         return (
+            self._connection_state_validated_version != int(self._connection_state._version)
+            or (self._bias_connection_state is not None and
+                self._bias_connection_state_validated_version != int(self._bias_connection_state._version))
+            or
             self._row_stability_validated_version
             != int(self._row_stability._version)
             or (
@@ -115,8 +153,19 @@ class _PackedRowMetaplasticity(NativePackedModuleMixin):
         return events
 
     def packed_stability_status(self) -> Dict[str, object]:
+        base = self._connection_state.numel() + (0 if self._bias_connection_state is None else self._bias_connection_state.numel())
         return {
-            "metaplasticityMode": "bounded-uint8-output-row-resistance",
+            "baseTernaryConnectionCount": int(base),
+            "connectionStateVersion": CONNECTION_STATE_VERSION,
+            "connectionStrengthEncoding": "uint4-plus-one",
+            "connectionStrengthRange": [1, CONNECTION_STRENGTH_MAX],
+            "connectionStrengthBits": 4,
+            "connectionResistanceBits": 4,
+            "connectionStateBytes": int(self._connection_state.numel()) +
+                (0 if self._bias_connection_state is None else int(self._bias_connection_state.numel())),
+            **self.parallel_connections.storage_status(),
+            "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+            "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
             "metaplasticityEnabled": self._packed_stability_strength > 0.0,
             "metaplasticityCheckpointBytes": int(self._row_stability.numel())
             + (
@@ -128,6 +177,19 @@ class _PackedRowMetaplasticity(NativePackedModuleMixin):
         }
 
     def _validate_packed_stability(self, rows: int, device: torch.device) -> None:
+        width = int(getattr(self, "in_features", getattr(self, "embedding_dim", getattr(self, "_matrix_width", 0))))
+        state = self._connection_state
+        if state.dtype != torch.uint8 or tuple(state.shape) != (int(rows), width) or state.device != device:
+            raise ValueError("packed connection state shape, dtype or device is invalid")
+        bias_width = int(getattr(self, "out_features", getattr(self, "out_channels", 0)))
+        bias_state = self._bias_connection_state
+        if (bias_state is not None) != bool(getattr(self, "has_bias", False)):
+            raise ValueError("packed bias connection state presence is invalid")
+        if bias_state is not None and (bias_state.dtype != torch.uint8 or
+                tuple(bias_state.shape) != (1, bias_width) or bias_state.device != device):
+            raise ValueError("packed bias connection state shape, dtype or device is invalid")
+        self._connection_state_validated_version = int(state._version)
+        self._bias_connection_state_validated_version = int(bias_state._version) if bias_state is not None else -1
         resistance = self._row_stability
         if (
             resistance.dtype != torch.uint8
@@ -150,6 +212,143 @@ class _PackedRowMetaplasticity(NativePackedModuleMixin):
         self._bias_row_stability_validated_version = (
             int(bias._version) if bias is not None else -1
         )
+
+    def authoritative_connection_tensors(self) -> Tuple[torch.Tensor, ...]:
+        values = (self._connection_state,)
+        return values if self._bias_connection_state is None else values + (self._bias_connection_state,)
+
+    def connection_state_for(self, packed: torch.Tensor) -> Optional[torch.Tensor]:
+        if packed is self._packed_forward_weight:
+            return self._connection_state
+        if packed is getattr(self, "_packed_forward_bias", None):
+            return self._bias_connection_state
+        return None
+
+    def bounded_optional_state_defaults(self, specs, prefix):
+        # Only pre-strength native checkpoints receive defaults. A partially
+        # missing v2 state is corruption, not a request to reset learned gains.
+        fields = [name for name in ("_connection_state", "_bias_connection_state")
+                  if getattr(self, name) is not None]
+        present = [prefix + name in specs for name in fields]
+        if any(present) and not all(present):
+            raise ValueError("native connection state is incomplete")
+        if any(present):
+            return {}
+        if any(name.startswith(prefix + "parallel_connections.pages.") for name in specs):
+            raise ValueError("parallel contacts require saved base connection state")
+        defaults = {}
+        for name in fields:
+            target = getattr(self, name)
+            defaults[name] = torch.zeros((), dtype=target.dtype, device=target.device).expand_as(target)
+        return defaults
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        self.prepare_bounded_state_load(state_dict, prefix)
+        defaults = self.bounded_optional_state_defaults(state_dict, prefix)
+        for name, value in defaults.items():
+            state_dict[prefix + name] = value
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                    missing_keys, unexpected_keys, error_msgs)
+
+    @torch.no_grad()
+    def set_connection_strengths_(self, values: torch.Tensor, *, bias: bool = False) -> None:
+        target = self._bias_connection_state if bias else self._connection_state
+        if target is None or values.shape != target.shape:
+            raise ValueError("connection strength replacement has an invalid shape")
+        replacement = encode_connection_state(values.to(target.device), connection_resistance(target))
+        with packed_diagnostic_write(self, target, replacement):
+            target.copy_(replacement)
+
+    def connection_strengths(self, *, bias: bool = False) -> torch.Tensor:
+        target = self._bias_connection_state if bias else self._connection_state
+        if target is None:
+            raise ValueError("projection has no bias connections")
+        return connection_strengths(target)
+
+    def _parallel_endpoint(self, key):
+        role, row, column, _ = self.parallel_connections.parse_key(key)
+        self.parallel_connections._validate_endpoint(row, column, role == "b")
+        return role, row, column
+
+    def capture_packed_topology_boundary(self):
+        return self.parallel_connections.capture_packed_topology_boundary()
+
+    def restore_topology_boundary(self, boundary):
+        self.parallel_connections.restore_topology_boundary(boundary)
+
+    def prepare_bounded_state_load(self, specs, prefix):
+        self.bounded_optional_state_defaults(specs, prefix)
+        self.parallel_connections.prepare_bounded_state_load(specs, prefix + "parallel_connections.")
+
+    @torch.no_grad()
+    def add_parallel_connection_(self, row: int, column: int, *, sign: int = 0,
+                                 strength: int = 1, bias: bool = False):
+        return self.parallel_connections.add(row, column, sign, strength, bias=bias)
+
+    def iter_parallel_connection_records(self, *, bias=False, start=0, end=None):
+        yield from self.parallel_connections.iter_records(bias=bias, start=start, end=end)
+
+    def parallel_connection_records(self, *, bias=False, start=0, end=None):
+        return list(self.iter_parallel_connection_records(bias=bias, start=start, end=end))
+
+    def parallel_connection_scratch_bytes(self, *, bias=False, start=0, end=None):
+        return self.parallel_connections.scratch_bytes(bias=bias, start=start, end=end)
+
+    @torch.no_grad()
+    def restore_parallel_connections_(self, records, *, bias=False, start=0, end=None):
+        self.parallel_connections.replace_records(records, bias=bias, start=start, end=end)
+
+    @torch.no_grad()
+    def install_parallel_connection_records_(self, records, *, bias=False, start=0, end=None):
+        """Apply one bounded contact stream batch without dropping earlier batches."""
+        self.parallel_connections.replace_records(records, bias=bias, start=start, end=end, prune=False)
+
+    @torch.no_grad()
+    def copy_parallel_connections_from_(self, source):
+        """Copy an unchanged native contact identity into a fresh wider owner."""
+        self.parallel_connections.copy_from(source.parallel_connections)
+
+    def weighted_connection_rows(self, levels, state, *, start=0, bias=False):
+        result = weighted_ternary_levels(levels, state)
+        for _key, row, column, sign, connection in self.iter_parallel_connection_records(bias=bias, start=start, end=start + levels.shape[0]):
+            if result.dtype != torch.int64:
+                result = result.to(torch.int64)
+            result[row - start, column] += ((sign & 3) - 1) * ((connection & 15) + 1)
+        return result
+
+    def effective_weighted_bias(self):
+        if self._bias_connection_state is None:
+            return None
+        levels = self.effective_bias().reshape(1, -1)
+        return self.weighted_connection_rows(levels, self._bias_connection_state, bias=True)[0]
+
+    @torch.no_grad()
+    def learn_parallel_connections_(self, packed, row_start, gradient, rate, scale, generator=None):
+        bias = packed is getattr(self, "_packed_forward_bias", None)
+        changed = 0
+        records = self.iter_parallel_connection_records(bias=bias, start=row_start, end=row_start + gradient.shape[0])
+        for key, row, column, packed_sign, connection in records:
+            value = ((packed_sign & 3) - 1) * ((connection & 15) + 1)
+            derivative = gradient[row - row_start, column]
+            resistance = connection >> 4
+            probability = -torch.expm1(-derivative.abs() * (float(rate) / float(scale)) /
+                (1.0 + resistance * max(self._packed_stability_strength, 1.0 / 16.0)))
+            from .training_randomness import learning_rand
+            if not bool(learning_rand((), device=gradient.device, generator=generator) < probability):
+                continue
+            direction = 1 if float(derivative) < 0 else -1 if float(derivative) > 0 else 0
+            if not direction:
+                continue
+            updated = value + direction
+            if abs(updated) > CONNECTION_STRENGTH_MAX:
+                self.add_parallel_connection_(row, column, sign=direction, bias=bias)
+            else:
+                new_sign = 0x54 | ((1 if updated > 0 else -1 if updated < 0 else 0) + 1)
+                new_state = max(1, abs(updated)) - 1 | (min(15, resistance + 1) << 4)
+                self.parallel_connections.update(key, new_sign, new_state)
+            changed += 1
+        return changed
 
 
 def pack_ternary_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -228,6 +427,7 @@ def _apply_packed_gradient_rows(
     generator: Optional[torch.Generator] = None,
     row_stability: Optional[torch.Tensor] = None,
     stability_strength: float = 0.0,
+    connection_state: Optional[torch.Tensor] = None,
 ) -> int:
     """Apply a bounded stochastic step directly to authoritative 2-bit rows."""
     deferred = defer_packed_rows(
@@ -240,11 +440,21 @@ def _apply_packed_gradient_rows(
     levels = unpack_ternary_weight_rows(
         packed, width, row_start, row_end, validate_reserved=False
     )
+    owner = current_packed_row_owner()
+    if connection_state is None and owner is not None:
+        getter = getattr(owner, "connection_state_for", None)
+        connection_state = getter(packed) if callable(getter) else None
+    state = None if connection_state is None else connection_state[row_start:row_end]
+    if state is not None and (state.dtype != torch.uint8 or state.shape != gradient.shape or state.device != packed.device):
+        raise ValueError("packed per-connection learning state is invalid")
     # ``gradient`` is with respect to a physical projection weight, whereas
     # one ternary level changes that weight by ``scale``. Convert a physical
     # SGD-sized update to level units; multiplying by scale here would make
     # wider/smaller-gain layers artificially unable to learn.
     strength = gradient.abs() * (float(rate) / float(scale))
+    if state is not None:
+        strength = strength / (1.0 + connection_resistance(state).float() *
+                              max(float(stability_strength), 1.0 / 16.0))
     if row_stability is not None and stability_strength > 0.0:
         if (
             row_stability.dtype != torch.uint8
@@ -259,26 +469,46 @@ def _apply_packed_gradient_rows(
             * row_stability[row_start:row_end].float().unsqueeze(-1)
         )
     probability = -torch.expm1(-strength)
-    draws = torch.rand(
+    from .training_randomness import learning_rand
+    draws = learning_rand(
         probability.shape,
         dtype=probability.dtype,
         device=probability.device,
         generator=generator,
     )
+    signed = levels if state is None else weighted_ternary_levels(levels, state)
+    maximum = 1 if state is None else CONNECTION_STRENGTH_MAX
+    parallel_changes = 0
+    if state is not None and owner is not None:
+        parallel_changes = owner.learn_parallel_connections_(packed, row_start, gradient, rate, scale, generator)
+        saturated = ((draws < probability) & ((gradient < 0) & (signed == maximum) |
+                     (gradient > 0) & (signed == -maximum)))
+        for local_row, column in torch.nonzero(saturated, as_tuple=False).tolist():
+            owner.add_parallel_connection_(int(row_start) + local_row, column,
+                sign=1 if float(gradient[local_row, column]) < 0 else -1,
+                bias=packed is getattr(owner, "_packed_forward_bias", None))
+            parallel_changes += 1
     movement = torch.where(
-        (draws < probability) & (gradient < 0) & (levels < 1),
+        (draws < probability) & (gradient < 0) & (signed < maximum),
         1,
         torch.where(
-            (draws < probability) & (gradient > 0) & (levels > -1),
+            (draws < probability) & (gradient > 0) & (signed > -maximum),
             -1,
             0,
         ),
     ).to(torch.int8)
     changed = int((movement != 0).sum().item())
     if changed:
-        replacement = pack_ternary_weight(levels + movement)
+        updated = signed + movement
+        replacement = pack_ternary_weight(updated.sign())
         with packed_diagnostic_write(current_packed_row_owner(), packed, replacement, start=int(row_start) * packed.shape[1]):
             packed[row_start:row_end].copy_(replacement)
+        if state is not None:
+            resistance = connection_resistance(state).to(torch.int16)
+            resistance = torch.where(movement.ne(0), (resistance + 1).clamp_max(15), resistance)
+            replacement_state = encode_connection_state(updated.abs().to(torch.int16).clamp_min(1), resistance)
+            with packed_diagnostic_write(owner, connection_state, replacement_state, start=int(row_start) * width):
+                state.copy_(replacement_state)
         if row_stability is not None and stability_strength > 0.0:
             rows = row_stability[row_start:row_end]
             grew = movement.ne(0).any(dim=1)
@@ -290,7 +520,7 @@ def _apply_packed_gradient_rows(
                 )
             with packed_diagnostic_write(current_packed_row_owner(), row_stability, replacement_rows, start=row_start):
                 rows.copy_(replacement_rows)
-    return changed
+    return changed + parallel_changes
 
 
 def _quantize_activation_int8(
@@ -307,77 +537,42 @@ def _quantize_activation_int8(
 PACKED_INTEGER_INPUT_BLOCK = 256
 
 
-def _unsupported_integer_kernel(error: BaseException) -> bool:
-    if isinstance(error, NotImplementedError):
-        return True
-    message = str(error).lower()
-    return any(
-        marker in message
-        for marker in (
-            "not implemented", "not supported", "unsupported",
-            "not compiled", "could not run 'aten::",
-        )
-    )
 
 
-def _bounded_cpu_integer_mm(
-    inputs: torch.Tensor, weight_block: torch.Tensor
-) -> torch.Tensor:
-    """Fallback one packed output block at a time, never a full weight mirror."""
-
-    weights = weight_block.to(device="cpu", dtype=torch.int32).t().contiguous()
-    chunks = []
-    for start in range(0, int(inputs.shape[0]), PACKED_INTEGER_INPUT_BLOCK):
-        end = min(int(inputs.shape[0]), start + PACKED_INTEGER_INPUT_BLOCK)
-        activity = inputs[start:end].to(device="cpu", dtype=torch.int32)
-        try:
-            chunks.append(activity @ weights)
-        except (NotImplementedError, RuntimeError) as error:
-            if not _unsupported_integer_kernel(error):
-                raise
-            # A few CPU builds lack even int32 matmul. Elementwise products
-            # and int64 reductions remain exact without a dense float weight.
-            rows = weights.t().to(torch.int64)
-            chunks.append(
-                torch.stack(
-                    [
-                        (activity.to(torch.int64) * row).sum(dim=1)
-                        for row in rows
-                    ],
-                    dim=1,
-                )
-            )
-    if not chunks:
-        return torch.empty(
-            (0, int(weight_block.shape[0])),
-            dtype=torch.int32,
-            device=inputs.device,
-        )
-    return torch.cat(chunks, dim=0).to(inputs.device)
-
-
-def _packed_integer_mm(
-    inputs: torch.Tensor, weight_block: torch.Tensor
-) -> torch.Tensor:
-    # CPU _int_mm is present in some PyTorch builds but has no CPU kernel on
-    # macOS Intel. Only request it on CUDA; ordinary int32 matmul is exact for
-    # the bounded projection widths used by OmniCortex.
-    if inputs.device.type == "cuda" and hasattr(torch, "_int_mm"):
-        try:
-            return torch._int_mm(  # type: ignore[attr-defined]
-                inputs, weight_block.t().contiguous()
-            )
-        except (NotImplementedError, RuntimeError) as error:
-            if not _unsupported_integer_kernel(error):
-                raise
+def _native_packed_projection(function, activity, signs, states, width, rows, owner, *, transpose=False):
+    """Direct packed backend, or an admitted raw-packed CPU transfer tile."""
     try:
-        return inputs.to(torch.int32) @ weight_block.to(torch.int32).t()
-    except (NotImplementedError, RuntimeError) as error:
-        if not _unsupported_integer_kernel(error):
+        return function(activity, signs, states, width, rows, validate_reserved=False)
+    except NotImplementedError:
+        if activity.device.type == "cpu":
             raise
-        # MPS/DirectML builds may lack integer matmul. Transfer only this
-        # bounded output block and row chunks, then return to the live device.
-        return _bounded_cpu_integer_mm(inputs, weight_block)
+    pager = getattr(owner, "_native_core_pager", None)
+    policy = getattr(pager, "shared_resource_policy", None)
+    reserve = getattr(policy, "reserve_ram", None)
+    sample_bytes = max(1, (width if not transpose else rows) * activity.element_size() + (width if transpose else rows) * 8)
+    transfer_limit = int(getattr(pager, "chunk_bytes", 4 * 1024 * 1024))
+    samples = max(1, min(PACKED_INTEGER_INPUT_BLOCK, transfer_limit // sample_bytes))
+    result = torch.zeros((activity.shape[0], width if transpose else rows),
+        dtype=torch.float32 if transpose else torch.int64, device=activity.device)
+    for r0 in range(0, rows, PACKED_TERNARY_OUTPUT_BLOCK):
+        r1 = min(rows, r0 + PACKED_TERNARY_OUTPUT_BLOCK)
+        for s0 in range(0, activity.shape[0], samples):
+            s1 = min(activity.shape[0], s0 + samples)
+            scratch = (r1 - r0) * ((width + 3) // 4 + (width if states is not None else 0))
+            scratch += (s1 - s0) * ((r1 - r0 if transpose else width) * activity.element_size() + (width if transpose else r1 - r0) * 8) + 4096
+            if pager is not None and pager.reserve_admission is not None:
+                pager.reserve_admission(scratch, torch.device("cpu"))
+            lease = reserve(scratch, "direct packed CPU fallback transfer") if callable(reserve) else nullcontext()
+            with lease:
+                cpu_activity = (activity[s0:s1, r0:r1] if transpose else activity[s0:s1]).to(device="cpu").contiguous()
+                cpu_signs = signs[r0:r1].to(device="cpu").contiguous()
+                cpu_states = None if states is None else states[r0:r1].to(device="cpu").contiguous()
+                output = function(cpu_activity, cpu_signs, cpu_states, width, r1 - r0, validate_reserved=False).to(activity.device)
+                if transpose:
+                    result[s0:s1].add_(output)
+                else:
+                    result[s0:s1, r0:r1].copy_(output)
+    return result
 
 
 def _packed_ternary_forward(
@@ -386,6 +581,9 @@ def _packed_ternary_forward(
     in_features: int,
     out_features: int,
     weight_scale: torch.Tensor,
+    connection_state: Optional[torch.Tensor] = None,
+    connection_owner=None,
+    connection_offset: int = 0,
 ) -> torch.Tensor:
     if inputs.shape[-1] != int(in_features):
         raise ValueError("packed ternary input width is invalid")
@@ -394,14 +592,16 @@ def _packed_ternary_forward(
     blocks: List[torch.Tensor] = []
     for start in range(0, int(out_features), PACKED_TERNARY_OUTPUT_BLOCK):
         end = min(int(out_features), start + PACKED_TERNARY_OUTPUT_BLOCK)
-        weight_block = unpack_ternary_weight_rows(
-            packed,
-            int(in_features),
-            start,
-            end,
-            validate_reserved=False,
-        )
-        blocks.append(_packed_integer_mm(flat, weight_block))
+        state = None if connection_state is None else connection_state[start:end]
+        signs = packed[start:end]
+        output = _native_packed_projection(packed_forward_i8, flat, signs, state,
+            int(in_features), end - start, connection_owner)
+        if connection_owner is not None:
+            for _key, row, column, sign, strength in connection_owner.iter_parallel_connection_records(start=start + connection_offset, end=end + connection_offset):
+                gain = ((sign & 3) - 1) * ((strength & 15) + 1)
+                if gain:
+                    output[:, row - start - connection_offset].add_(flat[:, column].to(torch.int64) * gain)
+        blocks.append(output)
     integer_output = torch.cat(blocks, dim=-1).reshape(
         *inputs.shape[:-1], int(out_features)
     )
@@ -418,38 +618,20 @@ def _packed_ternary_input_gradient(
     in_features: int,
     out_features: int,
     weight_scale: torch.Tensor,
+    connection_state: Optional[torch.Tensor] = None,
+    connection_owner=None,
+    connection_offset: int = 0,
 ) -> torch.Tensor:
-    flat_output = grad_output.reshape(-1, int(out_features))
-    flat_input = torch.zeros(
-        (flat_output.shape[0], int(in_features)),
-        dtype=grad_output.dtype,
-        device=grad_output.device,
-    )
-    scale = weight_scale.detach().to(grad_output.dtype)
-    for row in range(int(out_features)):
-        levels = unpack_ternary_weight_rows(
-            packed,
-            int(in_features),
-            row,
-            row + 1,
-            validate_reserved=False,
-        )[0]
-        positive = torch.nonzero(levels > 0, as_tuple=False).flatten()
-        negative = torch.nonzero(levels < 0, as_tuple=False).flatten()
-        contribution = flat_output[:, row : row + 1] * scale
-        if positive.numel():
-            flat_input.index_add_(
-                1,
-                positive,
-                contribution.expand(-1, int(positive.numel())),
-            )
-        if negative.numel():
-            flat_input.index_add_(
-                1,
-                negative,
-                -contribution.expand(-1, int(negative.numel())),
-            )
-    return flat_input.reshape(*grad_output.shape[:-1], int(in_features))
+    flat_output = grad_output.reshape(-1, int(out_features)).float().contiguous()
+    flat_input = _native_packed_projection(packed_input_gradient_f32, flat_output, packed, connection_state,
+        int(in_features), int(out_features), connection_owner, transpose=True)
+    if connection_owner is not None:
+        for _key, row, column, sign, strength in connection_owner.iter_parallel_connection_records(start=connection_offset, end=connection_offset + int(out_features)):
+            gain = ((sign & 3) - 1) * ((strength & 15) + 1)
+            if gain:
+                flat_input[:, column].add_(flat_output[:, row - connection_offset] * gain)
+    flat_input.mul_(weight_scale.detach().float())
+    return flat_input.to(grad_output.dtype).reshape(*grad_output.shape[:-1], int(in_features))
 
 
 class _PackedOnlyTernaryLinear(torch.autograd.Function):
@@ -475,11 +657,13 @@ class _PackedOnlyTernaryLinear(torch.autograd.Function):
         # frozen forward-weight shadow.
         ctx.save_for_backward(inputs)
         output = _packed_ternary_forward(
-            inputs, packed, ctx.in_features, ctx.out_features, scale
+            inputs, packed, ctx.in_features, ctx.out_features, scale,
+            module._connection_state,
+            module,
         )
         if module.has_bias:
             output = output + (
-                module.effective_bias().to(output.dtype)
+                module.effective_weighted_bias().to(output.dtype)
                 * scale.detach().to(output.dtype)
             )
         return output
@@ -494,6 +678,8 @@ class _PackedOnlyTernaryLinear(torch.autograd.Function):
                 ctx.in_features,
                 ctx.out_features,
                 ctx.module._packed_forward_scale,
+                ctx.module._connection_state,
+                ctx.module,
             )
             if ctx.module.training:
                 ctx.module.learn_from_gradient(
@@ -508,10 +694,10 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
     """A packed-authoritative ternary projection with direct discrete updates.
 
     It has no dense floating weight parameter, latent master, or per-weight
-    optimizer moments. Four synapses occupy one
-    byte throughout its lifetime. ``learn_from_gradient`` consumes activations
+    optimizer moments. Four signs occupy one byte; every base contact also
+    carries one byte of integer strength/resistance. ``learn_from_gradient`` consumes activations
     and downstream gradients in bounded row blocks and stochastically moves
-    each eligible synapse by one exact ternary level. The stochastic update
+    each eligible contact by one discrete strength or sign level. The stochastic update
     keeps subthreshold gradients capable of learning over repeated events
     without retaining a second full-sized weight tensor.
 
@@ -704,8 +890,37 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         with packed_diagnostic_write(self, packed, replacement):
             packed.copy_(replacement)
         _zero_packed_state(self, self._row_stability)
+        _zero_packed_state(self, self._connection_state)
+        self.restore_parallel_connections_([])
         self._pending_stability_events = 0
         self._validate_packed()
+
+    @torch.no_grad()
+    @paged_projection_call
+    def transpose_projection(self, activity: torch.Tensor) -> torch.Tensor:
+        """Apply the same native weighted contacts in the reverse direction.
+
+        Sensory assembly admission uses this tied projection. The direct
+        transpose kernel reads packed signs/strengths; repeated contacts are
+        included by the shared native operation. Bias has no reverse edge.
+        This is an inference operation, rather than an autograd training API.
+        """
+        if activity.ndim < 1 or activity.shape[-1] != self.out_features:
+            raise ValueError("native transpose projection activity width is invalid")
+        if not activity.is_floating_point() or not bool(torch.isfinite(activity).all()):
+            raise ValueError("native transpose projection needs finite floating activity")
+        pager = getattr(self, "_native_core_pager", None)
+        policy = getattr(pager, "shared_resource_policy", None)
+        reserve = getattr(policy, "reserve_ram", None)
+        samples = activity.numel() // self.out_features
+        scratch = samples * (self.in_features + self.out_features) * 4 + 4096
+        lease = reserve(scratch, "native tied sensory projection") if callable(reserve) else nullcontext()
+        with lease:
+            return _packed_ternary_input_gradient(
+                activity, self.packed_forward_weight(), self.in_features,
+                self.out_features, self._packed_forward_scale,
+                self._connection_state, self,
+            )
 
     def effective_bias(self) -> Optional[torch.Tensor]:
         """Materialize the ternary bias levels only when requested."""
@@ -717,17 +932,17 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         )[0]
 
     def authoritative_packed_tensors(self) -> Tuple[torch.Tensor, ...]:
-        """Persistent synapse bytes, excluding scalar gains and training state."""
+        """Exact learned signs and connection bytes, excluding scalar controls."""
         packed = self.packed_forward_weight()
         if self._packed_forward_bias is None:
-            return (packed,)
-        return packed, self._packed_forward_bias
+            return (packed,) + self.authoritative_connection_tensors()
+        return (packed, self._packed_forward_bias) + self.authoritative_connection_tensors()
 
     @property
     def logical_ternary_parameter_count(self) -> int:
         return self.in_features * self.out_features + (
             self.out_features if self.has_bias else 0
-        )
+        ) + len(self.parallel_connections)
 
     @property
     def ternary_weight_shape(self) -> Tuple[int, ...]:
@@ -762,6 +977,8 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
             with packed_diagnostic_write(self, packed, replacement, start=start * packed.shape[1]):
                 packed[start:end].copy_(replacement)
         _zero_packed_state(self, self._row_stability)
+        _zero_packed_state(self, self._connection_state)
+        self.restore_parallel_connections_([])
         self._pending_stability_events = 0
         self._packed_validated_version = int(packed._version)
         if zero_bias and self._packed_forward_bias is not None:
@@ -772,6 +989,8 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
                 with packed_diagnostic_write(self, self._packed_forward_bias, replacement, start=start):
                     bias[start:start + count].fill_(0x55)
             _zero_packed_state(self, self._bias_row_stability)
+            _zero_packed_state(self, self._bias_connection_state)
+            self.restore_parallel_connections_([], bias=True)
             self._bias_validated_version = int(self._packed_forward_bias._version)
         return self
 
@@ -876,18 +1095,22 @@ class PackedAdaptiveBitLinear(_PackedRowMetaplasticity, nn.Module):
         levels = self.effective_bias()
         if levels is None:
             return None
-        return levels.float() * self._packed_forward_scale.float()
+        return self.effective_weighted_bias().float() * self._packed_forward_scale.float()
 
     def packed_forward_status(self) -> Dict[str, object]:
         packed = self.packed_forward_weight()
         return {
             "format": "omni-packed-adaptive-ternary-linear",
-            "formatVersion": 1,
+            "formatVersion": 2,
             "weightLevels": [-1, 0, 1],
             "weightsPerByte": PACKED_TERNARY_WEIGHTS_PER_BYTE,
             "activationBits": 8,
             "packedBytes": int(packed.numel())
-            + (0 if self._packed_forward_bias is None else int(self._packed_forward_bias.numel())),
+            + (0 if self._packed_forward_bias is None else int(self._packed_forward_bias.numel()))
+            + sum(value.numel() for value in self.authoritative_connection_tensors())
+            + self.parallel_connections.storage_status()["parallelConnectionLearnedBytes"],
+            "packedSignBytes": int(packed.numel()) +
+                (0 if self._packed_forward_bias is None else int(self._packed_forward_bias.numel())) + self.parallel_connections.storage_status()["parallelConnectionPackedSignBytes"],
             "hasPackedBias": self.has_bias,
             "authoritativePackedWeight": True,
             "denseForwardWeightMaterialized": False,
@@ -1069,6 +1292,9 @@ def packed_online_step(
                 else None
             ),
             int(module._pending_stability_events),
+            module.parallel_connection_records(),
+            module.parallel_connection_records(bias=True),
+            module.capture_packed_topology_boundary(),
         )
         for module in begun
     ]
@@ -1078,9 +1304,8 @@ def packed_online_step(
     except BaseException:
         with torch.no_grad():
             for module, snapshot in zip(begun, snapshots):
-                current = (module._packed_forward_weight,)
-                if module._packed_forward_bias is not None:
-                    current += (module._packed_forward_bias,)
+                snapshot[6][0].restore_topology_boundary(snapshot[6][1])
+                current = module.authoritative_packed_tensors()
                 for tensor, original in zip(
                     current, snapshot[0]
                 ):
@@ -1090,6 +1315,9 @@ def packed_online_step(
                 if module._bias_row_stability is not None and snapshot[2] is not None:
                     module._bias_row_stability.copy_(snapshot[2])
                 module._pending_stability_events = snapshot[3]
+                module.restore_parallel_connections_(snapshot[4])
+                if module.has_bias:
+                    module.restore_parallel_connections_(snapshot[5], bias=True)
                 module._validate_packed()
                 module.discard_online_step()
         raise
@@ -1120,6 +1348,12 @@ class _PackedOnlyTernaryEmbedding(torch.autograd.Function):
         levels = unpack_ternary_weight_rows(
             selected, module.embedding_dim, validate_reserved=False
         )
+        levels = weighted_ternary_levels(levels, module._connection_state.index_select(0, flat))
+        for observed_row in torch.unique(flat).tolist():
+            for _key, row, column, sign, connection in module.iter_parallel_connection_records(start=observed_row, end=observed_row + 1):
+                if levels.dtype != torch.int64:
+                    levels = levels.to(torch.int64)
+                levels[:, column].add_(flat.eq(row).to(levels.dtype) * ((sign & 3) - 1) * ((connection & 15) + 1))
         return (
             levels.reshape(*indices.shape, module.embedding_dim).float()
             * scale.detach().float()
@@ -1250,10 +1484,10 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
 
     @property
     def logical_ternary_parameter_count(self) -> int:
-        return self.num_embeddings * self.embedding_dim
+        return self.num_embeddings * self.embedding_dim + len(self.parallel_connections)
 
     def authoritative_packed_tensors(self) -> Tuple[torch.Tensor, ...]:
-        return (self.packed_forward_weight(),)
+        return (self.packed_forward_weight(),) + self.authoritative_connection_tensors()
 
     def _validate_packed(self) -> None:
         packed = self._packed_forward_weight
@@ -1326,16 +1560,19 @@ class PackedAdaptiveTernaryEmbedding(_PackedRowMetaplasticity, nn.Module):
             with packed_diagnostic_write(self, packed, replacement, start=start * packed.shape[1]):
                 packed[start:end].copy_(replacement)
         _zero_packed_state(self, self._row_stability)
+        _zero_packed_state(self, self._connection_state)
+        self.restore_parallel_connections_([])
         self._pending_stability_events = 0
         self._validate_packed()
 
     def packed_forward_status(self) -> Dict[str, object]:
         return {
             "format": "omni-packed-adaptive-ternary-embedding",
-            "formatVersion": 1,
+            "formatVersion": 2,
             "weightLevels": [-1, 0, 1],
             "weightsPerByte": PACKED_TERNARY_WEIGHTS_PER_BYTE,
-            "packedBytes": int(self.packed_forward_weight().numel()),
+            "packedBytes": int(self.packed_forward_weight().numel() + self._connection_state.numel()) + self.parallel_connections.storage_status()["parallelConnectionLearnedBytes"],
+            "packedSignBytes": int(self.packed_forward_weight().numel()) + self.parallel_connections.storage_status()["parallelConnectionPackedSignBytes"],
             "authoritativePackedWeight": True,
             "latentMasterLearningState": False,
             "touchedRowsOnly": True,
@@ -1635,6 +1872,8 @@ def _packed_standard_conv_forward(
     dilation: Tuple[int, ...],
     groups: int,
     padding_mode: str,
+    connection_state: Optional[torch.Tensor] = None,
+    connection_owner=None,
 ) -> torch.Tensor:
     dimensions = inputs.ndim - 2
     kernel = tuple(int(value) for value in weight_shape[2:])
@@ -1687,6 +1926,8 @@ def _packed_standard_conv_forward(
                 row_width,
                 out_per_group,
                 scale,
+                None if connection_state is None else connection_state[row_start:row_start + out_per_group],
+                connection_owner, row_start,
             )
             output[:, start:end, row_start : row_start + out_per_group] = projected
     permutation = (0, dimensions + 1, *range(1, dimensions + 1))
@@ -1703,6 +1944,8 @@ def _packed_transpose_conv_forward(
     dilation: Tuple[int, ...],
     groups: int,
     output_padding: Tuple[int, ...],
+    connection_state: Optional[torch.Tensor] = None,
+    connection_owner=None,
 ) -> torch.Tensor:
     dimensions = inputs.ndim - 2
     kernel = tuple(int(value) for value in weight_shape[2:])
@@ -1744,6 +1987,8 @@ def _packed_transpose_conv_forward(
                 in_per_group,
                 out_per_group * kernel_count,
                 scale,
+                None if connection_state is None else connection_state[row_start:row_start + out_per_group * kernel_count],
+                connection_owner, row_start,
             ).reshape(batch, end - start, out_per_group, kernel_count)
             output_channels = slice(
                 group * out_per_group, (group + 1) * out_per_group
@@ -1800,6 +2045,8 @@ def _packed_standard_conv_backward(
     padding_mode: str,
     *,
     compute_weight_gradient: bool = False,
+    connection_state: Optional[torch.Tensor] = None,
+    connection_owner=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if compute_weight_gradient:
         raise RuntimeError("floating convolution weight gradients are retired")
@@ -1837,6 +2084,8 @@ def _packed_standard_conv_backward(
                 row_width,
                 out_per_group,
                 scale,
+                None if connection_state is None else connection_state[output_start:output_start + out_per_group],
+                connection_owner, output_start,
             ).reshape(batch, end - start, in_per_group, *kernel)
             for local, coordinate in enumerate(coordinates):
                 slices = tuple(
@@ -1922,6 +2171,8 @@ def _packed_transpose_conv_backward(
     groups: int,
     *,
     compute_weight_gradient: bool = False,
+    connection_state: Optional[torch.Tensor] = None,
+    connection_owner=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     if compute_weight_gradient:
         raise RuntimeError("floating convolution weight gradients are retired")
@@ -1973,6 +2224,8 @@ def _packed_transpose_conv_backward(
                 in_per_group,
                 out_per_group * kernel_count,
                 scale,
+                None if connection_state is None else connection_state[row_start:row_start + out_per_group * kernel_count],
+                connection_owner, row_start,
             )
     return (
         flat_grad_input.transpose(1, 2).reshape_as(inputs),
@@ -2005,6 +2258,8 @@ class _PackedOnlyTernaryConvolution(torch.autograd.Function):
                 module.dilation,
                 module.groups,
                 module.output_padding,
+                module._connection_state,
+                module,
             )
         else:
             output = _packed_standard_conv_forward(
@@ -2017,9 +2272,11 @@ class _PackedOnlyTernaryConvolution(torch.autograd.Function):
                 module.dilation,
                 module.groups,
                 module.padding_mode,
+                module._connection_state,
+                module,
             )
         if module.has_bias:
-            bias = module.effective_bias()
+            bias = module.effective_weighted_bias()
             if bias is None:
                 raise RuntimeError("packed convolution bias is missing")
             output = output + (
@@ -2047,6 +2304,8 @@ class _PackedOnlyTernaryConvolution(torch.autograd.Function):
                     module.dilation,
                     module.groups,
                     compute_weight_gradient=False,
+                    connection_state=module._connection_state,
+                    connection_owner=module,
                 )
             else:
                 grad_input, _ = _packed_standard_conv_backward(
@@ -2061,6 +2320,8 @@ class _PackedOnlyTernaryConvolution(torch.autograd.Function):
                     module.groups,
                     module.padding_mode,
                     compute_weight_gradient=False,
+                    connection_state=module._connection_state,
+                    connection_owner=module,
                 )
             if module.training:
                 module.learn_from_gradient(
@@ -2295,14 +2556,14 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
     def authoritative_packed_tensors(self) -> Tuple[torch.Tensor, ...]:
         packed = self.packed_forward_weight()
         if self._packed_forward_bias is None:
-            return (packed,)
-        return packed, self._packed_forward_bias
+            return (packed,) + self.authoritative_connection_tensors()
+        return (packed, self._packed_forward_bias) + self.authoritative_connection_tensors()
 
     @property
     def logical_ternary_parameter_count(self) -> int:
         return math.prod(self._weight_shape) + (
             self.out_channels if self.has_bias else 0
-        )
+        ) + len(self.parallel_connections)
 
     @property
     def ternary_weight_shape(self) -> Tuple[int, ...]:
@@ -2340,18 +2601,22 @@ class _PackedAdaptiveConvBase(_PackedRowMetaplasticity, nn.Module):
         levels = self.effective_bias()
         if levels is None:
             return None
-        return levels.float() * self._packed_forward_scale.float()
+        return self.effective_weighted_bias().float() * self._packed_forward_scale.float()
 
     def packed_forward_status(self) -> Dict[str, object]:
         packed = self.packed_forward_weight()
         return {
             "format": "omni-packed-adaptive-ternary-convolution",
-            "formatVersion": 1,
+            "formatVersion": 2,
             "weightLevels": [-1, 0, 1],
             "weightsPerByte": PACKED_TERNARY_WEIGHTS_PER_BYTE,
             "activationBits": 8,
             "packedBytes": int(packed.numel())
-            + (0 if self._packed_forward_bias is None else int(self._packed_forward_bias.numel())),
+            + (0 if self._packed_forward_bias is None else int(self._packed_forward_bias.numel()))
+            + sum(value.numel() for value in self.authoritative_connection_tensors())
+            + self.parallel_connections.storage_status()["parallelConnectionLearnedBytes"],
+            "packedSignBytes": int(packed.numel()) +
+                (0 if self._packed_forward_bias is None else int(self._packed_forward_bias.numel())) + self.parallel_connections.storage_status()["parallelConnectionPackedSignBytes"],
             "hasPackedBias": self.has_bias,
             "authoritativePackedWeight": True,
             "packedForward": True,
@@ -2660,11 +2925,29 @@ def packed_runtime_status(module: nn.Module) -> Dict[str, object]:
     floating_learned_parameter_blockers = [
         name or "<root>"
         for name, parameter in module.named_parameters()
-        if parameter.requires_grad
-        and (parameter.is_floating_point() or parameter.is_complex())
+        # Frozen learned weights still occupy a floating model and can be used
+        # in forward computation. Disabling autograd cannot exempt them from
+        # the native representation contract; fixed controls belong in buffers.
+        if parameter.is_floating_point() or parameter.is_complex()
     ]
     dense_bf16_linear_materialized = False
     for name, child in module.named_modules():
+        if isinstance(child, PACKED_AUTHORITATIVE_PROJECTION_TYPES):
+            # Inspect actual storage, not a constant "no master" flag. Native
+            # projection owners keep only three floating scalar controls; a
+            # floating parameter/buffer or retained decoded matrix is a blocker
+            # even when detached or hidden from the optimizer.
+            allowed_controls = {"_packed_forward_scale", "_online_learning_rate", "_autograd_trigger"}
+            resident = dict(child.named_buffers(recurse=False))
+            resident.update(dict(child.named_parameters(recurse=False)))
+            resident.update({key: value for key, value in vars(child).items()
+                             if isinstance(value, torch.Tensor)})
+            for field, value in resident.items():
+                if not (value.is_floating_point() or value.is_complex()):
+                    continue
+                if field in allowed_controls and value.numel() == 1 and not value.is_complex():
+                    continue
+                resident_float_master_blockers.append("%s.%s" % (name or "<root>", field))
         if isinstance(child, PackedAdaptiveTernaryEmbedding):
             authoritative_embedding += 1
         elif isinstance(child, PackedAdaptiveBitLinear):
@@ -2694,7 +2977,8 @@ def packed_runtime_status(module: nn.Module) -> Dict[str, object]:
         and not dense_embedding_blockers
         and not resident_float_master_blockers
         and not floating_learned_parameter_blockers,
-        "weightFormat": "two-bit-packed-ternary",
+        "weightFormat": "two-bit-ternary-signs-with-discrete-connection-strengths",
+        "connectionStateVersion": CONNECTION_STATE_VERSION,
         "activationFormat": "signed-int8-dynamic-scale",
         "packedBitLinearModules": packed_linear,
         "packedConvolutionModules": packed_convolution,
@@ -2744,7 +3028,9 @@ class RMSNorm(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         rms = inputs.float().pow(2).mean(dim=-1, keepdim=True)
         normalized = inputs * torch.rsqrt(rms.to(inputs.dtype) + self.eps)
-        delta = self.scale_delta(self._gain_index).squeeze(0)
+        # This derived one-element index must follow an explicitly placed
+        # decoder region; the learned packed gain keeps its ordinary owner.
+        delta = self.scale_delta(self._gain_index.to(device=inputs.device)).squeeze(0)
         return normalized * (1.0 + delta.to(dtype=normalized.dtype))
 
 
@@ -2998,11 +3284,13 @@ class DecoderBlock(nn.Module):
         self.feed_forward_norm = RMSNorm(config.d_model)
         self.feed_forward = SwiGLU(config.d_model, config.d_ff)
 
+    @regional_block_call
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         hidden = hidden + self.attention(self.attention_norm(hidden))
         hidden = hidden + self.feed_forward(self.feed_forward_norm(hidden))
         return hidden
 
+    @regional_block_call
     def forward_cached(
         self,
         hidden: torch.Tensor,
@@ -4341,6 +4629,7 @@ class OmniDecoder(nn.Module):
             pager._pause("one prefill token exceeds live activity headroom", requiredComputeBytes=per_token)
         return min(preferred, maximum)
 
+    @measured_full_forward
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -4434,11 +4723,23 @@ class OmniDecoder(nn.Module):
 
         for block in self.blocks:
             if self.training and self.config.gradient_checkpointing:
+                working_pager = self._working_pager()
+                # Backward recomputation runs after forward's ContextVar scope
+                # has exited. Restore the exact pager for both passes: otherwise
+                # attention changes from paged saved state to ordinary tensors,
+                # breaking checkpoint metadata and memory admission.
+                contexts = (lambda pager=working_pager: (pager.activate(), pager.activate())) \
+                    if working_pager is not None else (lambda: (nullcontext(), nullcontext()))
+                from .training_randomness import training_wave_active
                 hidden = checkpoint(
                     block,
                     hidden,
                     use_reentrant=False,
-                    preserve_rng_state=True,
+                    # This declared block has no stochastic forward layer.
+                    # Whole learner waves use explicit home generators; the
+                    # checkpoint must not temporarily reset process RNG there.
+                    preserve_rng_state=not training_wave_active(),
+                    context_fn=contexts,
                 )
             else:
                 hidden = block(hidden)
@@ -4543,7 +4844,13 @@ class OmniDecoder(nn.Module):
         memory_signature = None
         if memory_bias is not None:
             try:
-                memory_signature = (id(memory_bias), int(memory_bias._version))
+                # Connected regions create equivalent split views each step.
+                # Their Python object identity is not a cue mutation. The
+                # invocation retains the cue storage; actual replacements
+                # also explicitly retire old caches in the sampling loop.
+                memory_signature = (memory_bias.untyped_storage().data_ptr(), int(memory_bias._version),
+                    int(memory_bias.storage_offset()), tuple(memory_bias.shape), tuple(memory_bias.stride()),
+                    memory_bias.device, memory_bias.dtype)
             except RuntimeError:
                 # Inference-mode tensors have no mutation counter. Preserve
                 # mutable-cue semantics by using full forwards for this call.
@@ -4569,6 +4876,8 @@ class OmniDecoder(nn.Module):
                 if any(part in name for part in (
                     "_packed_forward_weight", "_packed_forward_bias", "_packed_forward_scale",
                     "_packed_bias", "_row_stability", "_bias_row_stability",
+                    "_connection_state", "_bias_connection_state",
+                    "parallel_connections",
                 ))
             )
         )
@@ -4588,8 +4897,12 @@ class OmniDecoder(nn.Module):
             int(self.config.max_seq_len),
             int(self.global_workspace.slots),
             int(self.global_workspace.query_chunk_slots),
+            # A manual placement epoch is operational cache identity, never
+            # learned state. Activation/deactivation itself refuses live caches.
+            getattr(self.native_core_pager, "regional_execution_epoch", None),
         )
 
+    @capture_decoder_prefill
     def _generation_step(
         self,
         window: torch.Tensor,
@@ -4601,6 +4914,18 @@ class OmniDecoder(nn.Module):
             return self._generation_step_bounded(window, memory_bias, cache)
         with pager.activate():
             return self._generation_step_bounded(window, memory_bias, cache)
+
+    def _isolated_generation_logits(self, window, memory_bias):
+        """No-cache reference, optionally using one exact checked Auto lease.
+
+        The default/reference body is unchanged. A measured prefill may replace
+        it only for the exact tested input/cue/state and returns home-device
+        logits/state with no retained KV. Cached continuation never calls it.
+        """
+        def reference():
+            output = self.forward(window, memory_bias=memory_bias)
+            return output["logits"][:, -1], output["hidden"][:, -1].detach().clone()
+        return measured_isolated_prefill(self, window, memory_bias, reference)
 
     def _generation_step_bounded(
         self,
@@ -4742,6 +5067,10 @@ class OmniDecoder(nn.Module):
         activity_callback: Optional[Callable[[torch.Tensor, int, float], Any]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
         conditioning_callback: Optional[Callable[[Optional[torch.Tensor], int], Any]] = None,
+        suspension_check: Optional[Callable[[], bool]] = None,
+        resume_cursor: Any = None,
+        allow_cached_execution: bool = False,
+        cached_cancelled: Optional[Callable[[], bool]] = None,
     ) -> Tuple[torch.Tensor, List[float]]:
         if input_ids.ndim != 2 or input_ids.shape[1] < 1:
             raise ValueError("generation input must be a non-empty [batch, sequence]")
@@ -4770,17 +5099,39 @@ class OmniDecoder(nn.Module):
                     use_cache=use_cache, _cache_owner=owner,
                     activity_callback=activity_callback, steer_check=steer_check,
                     conditioning_callback=conditioning_callback,
+                    suspension_check=suspension_check, resume_cursor=resume_cursor,
+                    allow_cached_execution=allow_cached_execution, cached_cancelled=cached_cancelled,
                 )
         except WorkingAttentionCancelled:
             # Cancellation before any sample or prefill mutation.
             self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
             return input_ids, []
+        except NativeGenerationSuspended:
+            # The continuation owner, not this exhausted call, must persist
+            # and then release the exact cache before unloading learned state.
+            owner[0] = None
+            raise
         finally:
             if owner[0] is not None:
                 owner[0].close()
 
     @torch.no_grad()
     def _generate_scoped(
+        self, *args, **kwargs,
+    ) -> Tuple[torch.Tensor, List[float]]:
+        """Consume the same cooperative token loop for ordinary generation."""
+        iterator = self._generate_scoped_iter(*args, **kwargs)
+        try:
+            while True:
+                try:
+                    next(iterator)
+                except StopIteration as stopped:
+                    return stopped.value
+        finally:
+            iterator.close()
+
+    @torch.no_grad()
+    def _generate_scoped_iter(
         self,
         input_ids: torch.Tensor,
         memory_bias: Optional[torch.Tensor] = None,
@@ -4800,6 +5151,10 @@ class OmniDecoder(nn.Module):
         activity_callback: Optional[Callable[[torch.Tensor, int, float], Any]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
         conditioning_callback: Optional[Callable[[Optional[torch.Tensor], int], Any]] = None,
+        suspension_check: Optional[Callable[[], bool]] = None,
+        resume_cursor: Any = None,
+        allow_cached_execution: bool = False,
+        cached_cancelled: Optional[Callable[[], bool]] = None,
     ) -> Tuple[torch.Tensor, List[float]]:
         """Sample from the decoder with invocation-local inference state.
 
@@ -4817,7 +5172,10 @@ class OmniDecoder(nn.Module):
         entropies: List[float] = []
         generator = torch.Generator(device=input_ids.device)
         generator.manual_seed(int(seed))
-        cancelled = cancelled or (lambda: False)
+        cancelled = world_callback(cancelled or (lambda: False))
+        token_callback, activity_callback = world_callback(token_callback), world_callback(activity_callback)
+        steer_check, conditioning_callback = world_callback(steer_check), world_callback(conditioning_callback)
+        suspension_check = world_callback(suspension_check)
 
         # Keep the existing public keyword for callers, but constrain only
         # text wire syntax: all valid Unicode scalars and natural initial EOS.
@@ -4828,9 +5186,34 @@ class OmniDecoder(nn.Module):
         token_budget = max(1, int(max_new_tokens))
         self.last_generation_tool_observations = []
         resumed_conditioning = None
+        window_start = 0
+
+        sampling_options = {"temperature": float(temperature), "top_k": int(top_k), "noise": float(noise),
+                            "seed": int(seed), "printable_only": bool(printable_only), "use_cache": bool(use_cache),
+                            "token_budget": token_budget, "context_capacity": int(self.config.max_seq_len)}
+        if resume_cursor is not None:
+            resume_cursor.validate(input_ids, sampling_options)
+            generated, memory_bias, inference_cache = resume_cursor.generated, resume_cursor.memory_bias, resume_cursor.cache
+            entropies = list(resume_cursor.entropies)
+            generator.set_state(resume_cursor.rng_state)
+            text_boundaries = resume_cursor.restore_boundaries()
+            last_text_boundary, emission_start = resume_cursor.last_text_boundary, resume_cursor.emission_start
+            resumed_conditioning = resume_cursor.resumed_conditioning
+            window_start = resume_cursor.window_start
+            for name, value in resume_cursor.metadata.items():
+                setattr(self, name, value)
+            if _cache_owner is not None:
+                _cache_owner[0] = inference_cache
+            resume_cursor.cache = None
 
         while generated.shape[1] - input_ids.shape[1] < token_budget:
             step = int(generated.shape[1] - input_ids.shape[1])
+            if suspension_check is not None and suspension_check():
+                raise NativeGenerationSuspended(NativeGenerationCursor.capture(generated=generated,
+                    input_length=input_ids.shape[1], memory_bias=memory_bias, cache=inference_cache,
+                    entropies=entropies, generator=generator, text_boundaries=text_boundaries,
+                    last_text_boundary=last_text_boundary, emission_start=emission_start, token_budget=token_budget,
+                    options=sampling_options, decoder=self, resumed_conditioning=resumed_conditioning, window_start=window_start))
             if steer_check is not None and steer_check():
                 self.last_generation_stop_reason = "steered"
                 break
@@ -4857,65 +5240,56 @@ class OmniDecoder(nn.Module):
                         inference_cache.close()
                         inference_cache = None
                         if _cache_owner is not None: _cache_owner[0] = None
-            window = generated[:, -self.config.max_seq_len :]
-            try:
-                if use_cache:
-                    logits, inference_cache = self._generation_step(
-                        window, memory_bias, inference_cache
-                    )
-                    if _cache_owner is not None:
-                        _cache_owner[0] = inference_cache
-                    cache_mode = (
-                        "paged-incremental-v2"
-                        if inference_cache is not None and self._working_pager() is not None
-                        else "incremental-v1" if inference_cache is not None
-                        else "full-prefix-fallback"
-                    )
+            window_start = max(window_start, int(generated.shape[1]) - self.config.max_seq_len)
+            window = generated[:, window_start:]
+            original_cache = inference_cache
+            sampling = {"temperature": temperature, "top_k": top_k, "noise": noise,
+                        "text_boundaries": text_boundaries, "remaining_tokens": token_budget - step}
+            def record_forward(cache, neural_state, *, mode=None):
+                nonlocal inference_cache
+                inference_cache = cache
+                if _cache_owner is not None: _cache_owner[0] = cache
+                self.last_generation_neural_state = neural_state
+                cache_mode = mode or ("paged-incremental-v2" if cache is not None and self._working_pager() is not None
+                                      else "incremental-v1" if cache is not None else "full-prefix-fallback")
+                # Genuine caller boundary ONCE, never in private trials.
+                for binding in pending_observation_bindings:
+                    self.last_generation_tool_observations.append({**dict(binding),
+                        "generationStep": int(step), "tokenOffset": int(step), "nativeDecodingUsed": True})
+                if self.last_generation_cache_mode == "not-started": self.last_generation_cache_mode = cache_mode
+                elif self.last_generation_cache_mode != cache_mode: self.last_generation_cache_mode = "mixed"
+                if cancelled():
+                    self.last_generation_stop_reason = "cancelled"
+                    return False
+                return True
+            def ordinary_cached(*, serve_boundary=True):
+                nonlocal inference_cache
+                logits, cache = self._generation_step(window, memory_bias, original_cache)
+                if serve_boundary:
+                    if not record_forward(cache, self.last_generation_neural_state): return None
                 else:
-                    output = self.forward(window, memory_bias=memory_bias)
-                    self.last_generation_neural_state = output["hidden"][:, -1].detach().clone()
-                    logits = output["logits"][:, -1]
-                    cache_mode = "full-prefix-reference"
+                    # A genuine boundary already ran. Do not repeat a world
+                    # control callback if its RNG was unexpectedly replaced.
+                    inference_cache = cache
+                    if _cache_owner is not None: _cache_owner[0] = cache
+                return sample_native_token(logits, generator, **sampling)
+            def ordinary_uncached():
+                logits, self.last_generation_neural_state = self._isolated_generation_logits(window, memory_bias)
+                return sample_native_token(logits, generator, **sampling) if record_forward(
+                    None, self.last_generation_neural_state, mode="full-prefix-reference") else None
+            try:
+                sampled = dispatch_reply_sample(self, use_cache=use_cache, resumed=resume_cursor is not None,
+                    allowed=allow_cached_execution, window=window, cue=memory_bias, cache=original_cache,
+                    generator=generator, sampling=sampling, flags_cancelled=cached_cancelled,
+                    before_sample=world_callback(record_forward),
+                    cached=reusable_cached_sampling_operation, prefix=full_prefix_sampling_operation,
+                    one_shot=cached_sampling_operation, ordinary=ordinary_cached if use_cache else ordinary_uncached,
+                    ordinary_after_boundary=lambda: ordinary_cached(serve_boundary=False))
             except WorkingAttentionCancelled:
                 self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
                 break
-            # Proof follows actual forward use, not inbox ACK/adoption. Even
-            # EOS now receives this observation before it is sampled.
-            for binding in pending_observation_bindings:
-                self.last_generation_tool_observations.append({**dict(binding),
-                    "generationStep": int(step), "tokenOffset": int(step), "nativeDecodingUsed": True})
-            if self.last_generation_cache_mode == "not-started":
-                self.last_generation_cache_mode = cache_mode
-            elif self.last_generation_cache_mode != cache_mode:
-                self.last_generation_cache_mode = "mixed"
-            if cancelled():
-                self.last_generation_stop_reason = "cancelled"
-                break
-            if noise > 0:
-                jitter = torch.randn(
-                    logits.shape,
-                    generator=generator,
-                    device=logits.device,
-                    dtype=logits.dtype,
-                )
-                logits = logits + float(noise) * jitter
-            logits = logits / max(float(temperature), 1e-4)
-
-            if text_boundaries is not None:
-                mask = torch.zeros_like(logits, dtype=torch.bool)
-                for row, boundary in enumerate(text_boundaries):
-                    mask[row, boundary.allowed_token_ids(token_budget - step)] = True
-                logits = logits.masked_fill(~mask, -float("inf"))
-            if top_k > 0 and top_k < logits.shape[-1]:
-                values, indices = torch.topk(logits, top_k, dim=-1)
-                probabilities = F.softmax(values.float(), dim=-1)
-                sample = torch.multinomial(probabilities, 1, generator=generator)
-                token = indices.gather(-1, sample)
-            else:
-                probabilities = F.softmax(logits.float(), dim=-1)
-                token = torch.multinomial(probabilities, 1, generator=generator)
-            entropy = -(probabilities * probabilities.clamp_min(1e-9).log()).sum(dim=-1)
-            entropy_value = float(entropy.mean().item())
+            if sampled is None: break
+            token, selected_log_probability, entropy_value = sampled
             # The activity channel is an actual live native hidden state,
             # never response prose or a second model/backend. A Steer arriving
             # before this safe boundary cannot publish another token/action.
@@ -4927,6 +5301,9 @@ class OmniDecoder(nn.Module):
                     directive = activity_callback(self.last_generation_neural_state, step, entropy_value)
                 except WorkingAttentionCancelled:
                     self.last_generation_stop_reason = "steered" if steer_check is not None and steer_check() else "cancelled"
+                    break
+                if isinstance(directive, Mapping) and directive.get("yield") == "steered":
+                    self.last_generation_stop_reason = "steered"
                     break
                 if directive is True or (isinstance(directive, Mapping) and directive.get("stop") is True):
                     self.last_generation_stop_reason = "native-action-stop"
@@ -4975,8 +5352,15 @@ class OmniDecoder(nn.Module):
                     step,
                     entropies[-1],
                 )
-            if bool((token == 2).all()):
+            terminal = bool((token == 2).all())
+            if terminal:
                 self.last_generation_stop_reason = "learned-boundary"
+            # No pager/context scope is entered here: each caller's advance
+            # owns its scope and exits it before another branch can run.
+            yield {"step": step, "entropy": entropy_value,
+                   "logProbability": selected_log_probability,
+                   "terminal": terminal}
+            if terminal:
                 break
         else:
             self.last_generation_stop_reason = "token-budget"

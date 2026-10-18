@@ -120,12 +120,16 @@ function idempotentProjectionDrift(
       role: stored.role,
       content: stored.content,
       turnId: semanticValue(stored, "turnId", "turn_id"),
-      traceId: semanticValue(stored, "traceId", "trace_id")
+      traceId: semanticValue(stored, "traceId", "trace_id"),
+      taskAttachmentIds: semanticValue(stored, "taskAttachmentIds", "task_attachment_ids"),
+      ponderSelfReports: semanticValue(stored, "ponderSelfReports", "ponder_self_reports")
     }) === JSON.stringify({
       role: incoming.role,
       content: incoming.content,
       turnId: semanticValue(incoming, "turnId", "turn_id"),
-      traceId: semanticValue(incoming, "traceId", "trace_id")
+      traceId: semanticValue(incoming, "traceId", "trace_id"),
+      taskAttachmentIds: semanticValue(incoming, "taskAttachmentIds", "task_attachment_ids"),
+      ponderSelfReports: semanticValue(incoming, "ponderSelfReports", "ponder_self_reports")
     });
   }
   if (kind === "trace") {
@@ -133,11 +137,13 @@ function idempotentProjectionDrift(
       input: stored.input,
       seed: stored.seed,
       turnId: semanticValue(stored, "turnId", "turn_id"),
+      ponderSelfReports: semanticValue(stored, "ponderSelfReports", "ponder_self_reports"),
       binding: stableTraceBinding(stored)
     }) === JSON.stringify({
       input: incoming.input,
       seed: incoming.seed,
       turnId: semanticValue(incoming, "turnId", "turn_id"),
+      ponderSelfReports: semanticValue(incoming, "ponderSelfReports", "ponder_self_reports"),
       binding: stableTraceBinding(incoming)
     });
   }

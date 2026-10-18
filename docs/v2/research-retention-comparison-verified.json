@@ -1,0 +1,5022 @@
+{
+  "format": "omni-packed-retention-comparison",
+  "formatVersion": 1,
+  "scope": "fixed tiny sequential-task native projection; not whole-brain learned capability",
+  "protocol": {
+    "version": 1,
+    "seeds": [
+      17,
+      29,
+      43
+    ],
+    "tasks": 3,
+    "classes": 4,
+    "dimensions": 12,
+    "train_samples": 64,
+    "heldout_samples": 96,
+    "batch_size": 16,
+    "steps_per_task": 64,
+    "replay_samples_per_task": 16,
+    "learning_rate": 0.3,
+    "projection_scale": 0.25,
+    "stability_strength": 0.025,
+    "max_state_and_replay_bytes": 65536,
+    "max_train_time_ratio": 2.0,
+    "max_worker_rss_bytes": 805306368,
+    "accuracy_regression_tolerance": 0.0,
+    "minimum_acquisition_gain": 0.1
+  },
+  "protocolSha256": "c4c32be559173769ce466cd47c57f0ae7457bb0387f7ffc7992cbc984c7bd198",
+  "sourceSha256": {
+    "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+    "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+    "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+    "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+  },
+  "environment": {
+    "python": "3.10.0",
+    "torch": "2.13.0",
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "machine": "arm64",
+    "threads": 1
+  },
+  "measurement": {
+    "time": "perf_counter_ns update loop; initial kernel warmup and evaluation excluded",
+    "memory": "exact tensor payload/storage bytes; isolated process high-water RSS includes Python/Torch/loader overhead",
+    "workerIsolation": true,
+    "maximumTrialSeconds": 60,
+    "dataset": "deterministic constructed fixtures; no external/user corpus",
+    "replay": "first 16 balanced training records per past task; evaluation never used; 25 percent replaces new examples"
+  },
+  "elapsedSeconds": 27.863294375,
+  "trials": [
+    {
+      "condition": "shortcut-shift",
+      "seed": 17,
+      "variant": "native-default",
+      "dataSha256": "ed81cfd78c9a3ae5dd7b7c83f6be4ef220f2b3edf1ac7063dea1bd3bde85449a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "a425ce679c9c0c800419b83aaf4076b02640f489420ea98800dd32b305289fab",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.2210849523544312
+        },
+        {
+          "accuracy": 0.2708333432674408,
+          "crossEntropy": 1.4603856801986694
+        },
+        {
+          "accuracy": 0.010416666977107525,
+          "crossEntropy": 1.5716978311538696
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.10266199707984924
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.8064663410186768
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.839111328125
+          }
+        ],
+        [
+          {
+            "accuracy": 0.3125,
+            "crossEntropy": 1.1093440055847168
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.1914464682340622
+          },
+          {
+            "accuracy": 0.010416666977107525,
+            "crossEntropy": 2.4273483753204346
+          }
+        ],
+        [
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.381710171699524
+          },
+          {
+            "accuracy": 0.3958333432674408,
+            "crossEntropy": 0.8011975288391113
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.23361504077911377
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.1041666641831398,
+        0.3958333432674408
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.7291666567325592,
+        0.9895833330228925
+      ],
+      "forgetting": [
+        0.8958333358168602,
+        0.6041666567325592
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        50,
+        64,
+        55
+      ],
+      "trainingSecondsByTask": [
+        0.030082875,
+        0.031122334,
+        0.03393625
+      ],
+      "trainingSeconds": 0.095141459,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213319680
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 17,
+      "variant": "row-resistance-off",
+      "dataSha256": "ed81cfd78c9a3ae5dd7b7c83f6be4ef220f2b3edf1ac7063dea1bd3bde85449a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "32694e9294e0d43c78159cd1ea6cbc43ad35bcee9e8e4e01ad1bfa537e85f068",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.2210849523544312
+        },
+        {
+          "accuracy": 0.2708333432674408,
+          "crossEntropy": 1.4603856801986694
+        },
+        {
+          "accuracy": 0.010416666977107525,
+          "crossEntropy": 1.5716978311538696
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.052835676819086075
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.505239725112915
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.3952529430389404
+          }
+        ],
+        [
+          {
+            "accuracy": 0.03125,
+            "crossEntropy": 1.713157296180725
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.0692494586110115
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.969334840774536
+          }
+        ],
+        [
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.972929835319519
+          },
+          {
+            "accuracy": 0.25,
+            "crossEntropy": 1.1641274690628052
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.060483526438474655
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.0,
+        0.25
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.7291666567325592,
+        0.9895833330228925
+      ],
+      "forgetting": [
+        1.0,
+        0.75
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        61,
+        89,
+        83
+      ],
+      "trainingSecondsByTask": [
+        0.029928917,
+        0.032125375,
+        0.025201459
+      ],
+      "trainingSeconds": 0.08725575099999999,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 214138880
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 17,
+      "variant": "native-rehearsal",
+      "dataSha256": "ed81cfd78c9a3ae5dd7b7c83f6be4ef220f2b3edf1ac7063dea1bd3bde85449a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "a5efe7ca61358ee5839ace12441e5f13de3358e24c88f4e62535c227e5f23a00",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.2210849523544312
+        },
+        {
+          "accuracy": 0.2708333432674408,
+          "crossEntropy": 1.4603856801986694
+        },
+        {
+          "accuracy": 0.010416666977107525,
+          "crossEntropy": 1.5716978311538696
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.10266199707984924
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.8064663410186768
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.839111328125
+          }
+        ],
+        [
+          {
+            "accuracy": 0.6875,
+            "crossEntropy": 0.6355723738670349
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3758642375469208
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.2443535327911377
+          }
+        ],
+        [
+          {
+            "accuracy": 0.65625,
+            "crossEntropy": 0.8598383069038391
+          },
+          {
+            "accuracy": 0.7083333134651184,
+            "crossEntropy": 0.7093343138694763
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3328697383403778
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.65625,
+        0.7083333134651184
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.7291666567325592,
+        0.9895833330228925
+      ],
+      "forgetting": [
+        0.34375,
+        0.2916666865348816
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        50,
+        53,
+        52
+      ],
+      "trainingSecondsByTask": [
+        0.02581025,
+        0.029267625,
+        0.026277958
+      ],
+      "trainingSeconds": 0.081355833,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 212467712
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 17,
+      "variant": "row-off-rehearsal",
+      "dataSha256": "ed81cfd78c9a3ae5dd7b7c83f6be4ef220f2b3edf1ac7063dea1bd3bde85449a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "2d73d6c9fd5060b5156fba3f73f21f574e2ce0de6b3512a9ef6641d9cdb1cbc5",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.2210849523544312
+        },
+        {
+          "accuracy": 0.2708333432674408,
+          "crossEntropy": 1.4603856801986694
+        },
+        {
+          "accuracy": 0.010416666977107525,
+          "crossEntropy": 1.5716978311538696
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.052835676819086075
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.505239725112915
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.3952529430389404
+          }
+        ],
+        [
+          {
+            "accuracy": 0.8125,
+            "crossEntropy": 0.568350613117218
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.21513067185878754
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.25978684425354
+          }
+        ],
+        [
+          {
+            "accuracy": 0.53125,
+            "crossEntropy": 0.8727027773857117
+          },
+          {
+            "accuracy": 0.5833333134651184,
+            "crossEntropy": 0.7300328612327576
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.13794516026973724
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.53125,
+        0.5833333134651184
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.7291666567325592,
+        0.9895833330228925
+      ],
+      "forgetting": [
+        0.46875,
+        0.4166666865348816
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        61,
+        85,
+        77
+      ],
+      "trainingSecondsByTask": [
+        0.028749583,
+        0.030342375,
+        0.030657125
+      ],
+      "trainingSeconds": 0.08974908300000001,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213549056
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 29,
+      "variant": "row-resistance-off",
+      "dataSha256": "659320f096e44faf2c34cb8d9800f6314ca5cf936545c1c29b9806167a47faf5",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "d1030ae26d5e56d6da0cd037abcffddb89b3c24e3b81d406bb145ec84f35c6b3",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.320405125617981
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4570722579956055
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4460034370422363
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.05512339249253273
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.65533185005188
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.324199676513672
+          }
+        ],
+        [
+          {
+            "accuracy": 0.0729166641831398,
+            "crossEntropy": 1.8961702585220337
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.06172659993171692
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.568941831588745
+          }
+        ],
+        [
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.203179121017456
+          },
+          {
+            "accuracy": 0.2916666567325592,
+            "crossEntropy": 0.9177945256233215
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.05452319607138634
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.0,
+        0.2916666567325592
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.75,
+        0.75
+      ],
+      "forgetting": [
+        1.0,
+        0.7083333432674408
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        60,
+        93,
+        77
+      ],
+      "trainingSecondsByTask": [
+        0.028976041,
+        0.029699125,
+        0.027911458
+      ],
+      "trainingSeconds": 0.086586624,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 214040576
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 29,
+      "variant": "native-rehearsal",
+      "dataSha256": "659320f096e44faf2c34cb8d9800f6314ca5cf936545c1c29b9806167a47faf5",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "c6f255104c05b694a8c753a15efe0eee4a8ab561731385970e223b2551928a5a",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.320405125617981
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4570722579956055
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4460034370422363
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.11476096510887146
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.996797800064087
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.800581693649292
+          }
+        ],
+        [
+          {
+            "accuracy": 0.7291666865348816,
+            "crossEntropy": 0.703063428401947
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.37146416306495667
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.0280230045318604
+          }
+        ],
+        [
+          {
+            "accuracy": 0.5,
+            "crossEntropy": 0.9286193251609802
+          },
+          {
+            "accuracy": 0.75,
+            "crossEntropy": 0.6820966601371765
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3613894283771515
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.5,
+        0.75
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.75,
+        0.75
+      ],
+      "forgetting": [
+        0.5,
+        0.25
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        48,
+        61,
+        45
+      ],
+      "trainingSecondsByTask": [
+        0.026712875,
+        0.028061417,
+        0.0268665
+      ],
+      "trainingSeconds": 0.081640792,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213532672
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 29,
+      "variant": "row-off-rehearsal",
+      "dataSha256": "659320f096e44faf2c34cb8d9800f6314ca5cf936545c1c29b9806167a47faf5",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "af5cb748e8a3a342ca88c3577883c9367cac2ca0232a682cb258ef2041599914",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.320405125617981
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4570722579956055
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4460034370422363
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.05512339249253273
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.65533185005188
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.324199676513672
+          }
+        ],
+        [
+          {
+            "accuracy": 0.6979166865348816,
+            "crossEntropy": 0.6214014291763306
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.19855846464633942
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.294116735458374
+          }
+        ],
+        [
+          {
+            "accuracy": 0.6770833134651184,
+            "crossEntropy": 0.8564785122871399
+          },
+          {
+            "accuracy": 0.96875,
+            "crossEntropy": 0.4790712594985962
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.17133088409900665
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.6770833134651184,
+        0.96875
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.75,
+        0.75
+      ],
+      "forgetting": [
+        0.3229166865348816,
+        0.03125
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        60,
+        87,
+        68
+      ],
+      "trainingSecondsByTask": [
+        0.026451625,
+        0.028141333,
+        0.027148375
+      ],
+      "trainingSeconds": 0.081741333,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213401600
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 29,
+      "variant": "native-default",
+      "dataSha256": "659320f096e44faf2c34cb8d9800f6314ca5cf936545c1c29b9806167a47faf5",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "1a89b83c98959901bd0b1ca74c5d87f65f217593ef12c142f96c6d613f6a11ef",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4895833432674408,
+          "crossEntropy": 1.320405125617981
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4570722579956055
+        },
+        {
+          "accuracy": 0.25,
+          "crossEntropy": 1.4460034370422363
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.11476096510887146
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.996797800064087
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.800581693649292
+          }
+        ],
+        [
+          {
+            "accuracy": 0.1979166716337204,
+            "crossEntropy": 1.3546580076217651
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.19030892848968506
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.303974151611328
+          }
+        ],
+        [
+          {
+            "accuracy": 0.010416666977107525,
+            "crossEntropy": 1.5451750755310059
+          },
+          {
+            "accuracy": 0.3958333432674408,
+            "crossEntropy": 0.9171832203865051
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.16284207999706268
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.010416666977107525,
+        0.3958333432674408
+      ],
+      "acquisitionGain": [
+        0.5104166567325592,
+        0.75,
+        0.75
+      ],
+      "forgetting": [
+        0.9895833330228925,
+        0.6041666567325592
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        48,
+        69,
+        55
+      ],
+      "trainingSecondsByTask": [
+        0.02545075,
+        0.02872625,
+        0.02668225
+      ],
+      "trainingSeconds": 0.08085925000000001,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213811200
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 43,
+      "variant": "native-rehearsal",
+      "dataSha256": "b1bf16742b876c58ec14801d51850e8b109d5d16d63e652d9dcb73e86c44b22a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "fb77ed2dcb4f3881099537a1f90ce5c61d551329c3a22c1bf8388f3e99db2f2f",
+      "initialHeldout": [
+        {
+          "accuracy": 0.75,
+          "crossEntropy": 1.1440064907073975
+        },
+        {
+          "accuracy": 0.1666666716337204,
+          "crossEntropy": 1.4941612482070923
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.7204947471618652
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.13565056025981903
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.6910016536712646
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.944207191467285
+          }
+        ],
+        [
+          {
+            "accuracy": 0.8958333134651184,
+            "crossEntropy": 0.5143706798553467
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.33204153180122375
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.659139394760132
+          }
+        ],
+        [
+          {
+            "accuracy": 0.9583333134651184,
+            "crossEntropy": 0.6829809546470642
+          },
+          {
+            "accuracy": 0.9166666865348816,
+            "crossEntropy": 0.502712607383728
+          },
+          {
+            "accuracy": 0.7916666865348816,
+            "crossEntropy": 0.7008727192878723
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        0.7916666865348816
+      ],
+      "retention": [
+        0.9583333134651184,
+        0.9166666865348816
+      ],
+      "acquisitionGain": [
+        0.25,
+        0.8333333283662796,
+        0.7916666865348816
+      ],
+      "forgetting": [
+        0.04166668653488159,
+        0.08333331346511841
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        44,
+        54,
+        45
+      ],
+      "trainingSecondsByTask": [
+        0.025044417,
+        0.026309583,
+        0.025267459
+      ],
+      "trainingSeconds": 0.076621459,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213729280
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 43,
+      "variant": "row-off-rehearsal",
+      "dataSha256": "b1bf16742b876c58ec14801d51850e8b109d5d16d63e652d9dcb73e86c44b22a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "066199ad27d431870c39162658872e5fe999a578b1f384cb1af11ca7d49142d3",
+      "initialHeldout": [
+        {
+          "accuracy": 0.75,
+          "crossEntropy": 1.1440064907073975
+        },
+        {
+          "accuracy": 0.1666666716337204,
+          "crossEntropy": 1.4941612482070923
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.7204947471618652
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.07739672809839249
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.0234391689300537
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.2771787643432617
+          }
+        ],
+        [
+          {
+            "accuracy": 0.9583333134651184,
+            "crossEntropy": 0.4863623380661011
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.17878763377666473
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.7316977977752686
+          }
+        ],
+        [
+          {
+            "accuracy": 0.90625,
+            "crossEntropy": 0.6379296183586121
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.4088132083415985
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.228337824344635
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.90625,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.25,
+        0.8333333283662796,
+        1.0
+      ],
+      "forgetting": [
+        0.09375,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        58,
+        79,
+        73
+      ],
+      "trainingSecondsByTask": [
+        0.024695,
+        0.026759167,
+        0.026198084
+      ],
+      "trainingSeconds": 0.077652251,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213237760
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 43,
+      "variant": "native-default",
+      "dataSha256": "b1bf16742b876c58ec14801d51850e8b109d5d16d63e652d9dcb73e86c44b22a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "6452b418f35d0a996436ba18b97674e0119f6fa84d7509a2b31d7488f439c59c",
+      "initialHeldout": [
+        {
+          "accuracy": 0.75,
+          "crossEntropy": 1.1440064907073975
+        },
+        {
+          "accuracy": 0.1666666716337204,
+          "crossEntropy": 1.4941612482070923
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.7204947471618652
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.13565056025981903
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.6910016536712646
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.944207191467285
+          }
+        ],
+        [
+          {
+            "accuracy": 0.6041666865348816,
+            "crossEntropy": 0.7992939352989197
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2216653972864151
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 2.6465325355529785
+          }
+        ],
+        [
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.20265793800354
+          },
+          {
+            "accuracy": 0.9791666865348816,
+            "crossEntropy": 0.510444700717926
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3994079828262329
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.34375,
+        0.9791666865348816
+      ],
+      "acquisitionGain": [
+        0.25,
+        0.8333333283662796,
+        1.0
+      ],
+      "forgetting": [
+        0.65625,
+        0.020833313465118408
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        44,
+        60,
+        52
+      ],
+      "trainingSecondsByTask": [
+        0.028501333,
+        0.028657333,
+        0.027441
+      ],
+      "trainingSeconds": 0.08459966599999999,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213729280
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "shortcut-shift",
+      "seed": 43,
+      "variant": "row-resistance-off",
+      "dataSha256": "b1bf16742b876c58ec14801d51850e8b109d5d16d63e652d9dcb73e86c44b22a",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "affa6f39ba994e817c3ce4c82272634640a23b08dfdf44cbf9ce07e1615056d2",
+      "initialHeldout": [
+        {
+          "accuracy": 0.75,
+          "crossEntropy": 1.1440064907073975
+        },
+        {
+          "accuracy": 0.1666666716337204,
+          "crossEntropy": 1.4941612482070923
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.7204947471618652
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.07739672809839249
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.0234391689300537
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.2771787643432617
+          }
+        ],
+        [
+          {
+            "accuracy": 0.0520833320915699,
+            "crossEntropy": 1.3269954919815063
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.058814942836761475
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 3.007941484451294
+          }
+        ],
+        [
+          {
+            "accuracy": 0.1145833358168602,
+            "crossEntropy": 1.6653857231140137
+          },
+          {
+            "accuracy": 0.8958333134651184,
+            "crossEntropy": 0.5193706154823303
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.12976989150047302
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        0.1145833358168602,
+        0.8958333134651184
+      ],
+      "acquisitionGain": [
+        0.25,
+        0.8333333283662796,
+        1.0
+      ],
+      "forgetting": [
+        0.8854166641831398,
+        0.10416668653488159
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        58,
+        80,
+        75
+      ],
+      "trainingSecondsByTask": [
+        0.0296445,
+        0.062047291,
+        0.086578292
+      ],
+      "trainingSeconds": 0.178270083,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 214204416
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 17,
+      "variant": "native-default",
+      "dataSha256": "d47c873846754d58623fbb64716a77540be8d45b3da7290bb74008f252e43f50",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "f03ed1099c3c8c7d96aba0c0eb25e5f09fe55d33f354fca84f3238d8f46cc979",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3333333432674408,
+          "crossEntropy": 1.3938616514205933
+        },
+        {
+          "accuracy": 0.4479166567325592,
+          "crossEntropy": 1.2931724786758423
+        },
+        {
+          "accuracy": 0.1041666641831398,
+          "crossEntropy": 1.4292138814926147
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.38587284088134766
+          },
+          {
+            "accuracy": 0.4479166567325592,
+            "crossEntropy": 1.2931724786758423
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.38587284088134766
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.5600113868713379
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.38587284088134766
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.5600113868713379
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.7893113493919373
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6666666567325592,
+        0.5520833432674408,
+        0.8958333358168602
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        46,
+        31,
+        25
+      ],
+      "trainingSecondsByTask": [
+        0.032183666,
+        0.023731458,
+        0.022191166
+      ],
+      "trainingSeconds": 0.07810629,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213352448
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 17,
+      "variant": "row-resistance-off",
+      "dataSha256": "d47c873846754d58623fbb64716a77540be8d45b3da7290bb74008f252e43f50",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "eac9bcadab2c6cff8e344fc7774dbdb4101d3e9a9cf1f9658c130e1b69e16442",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3333333432674408,
+          "crossEntropy": 1.3938616514205933
+        },
+        {
+          "accuracy": 0.4479166567325592,
+          "crossEntropy": 1.2931724786758423
+        },
+        {
+          "accuracy": 0.1041666641831398,
+          "crossEntropy": 1.4292138814926147
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2664426863193512
+          },
+          {
+            "accuracy": 0.4479166567325592,
+            "crossEntropy": 1.2931724786758423
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2664426863193512
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.28408393263816833
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2664426863193512
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.28408393263816833
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3109988868236542
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6666666567325592,
+        0.5520833432674408,
+        0.8958333358168602
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        56,
+        55,
+        55
+      ],
+      "trainingSecondsByTask": [
+        0.031456042,
+        0.028714084,
+        0.029193292
+      ],
+      "trainingSeconds": 0.089363418,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213991424
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 17,
+      "variant": "native-rehearsal",
+      "dataSha256": "d47c873846754d58623fbb64716a77540be8d45b3da7290bb74008f252e43f50",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "7f73e55156154cf450e6557ec57056e6b6e55b41c2018a19c9460752cfed9591",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3333333432674408,
+          "crossEntropy": 1.3938616514205933
+        },
+        {
+          "accuracy": 0.4479166567325592,
+          "crossEntropy": 1.2931724786758423
+        },
+        {
+          "accuracy": 0.1041666641831398,
+          "crossEntropy": 1.4292138814926147
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.38587284088134766
+          },
+          {
+            "accuracy": 0.4479166567325592,
+            "crossEntropy": 1.2931724786758423
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.31081223487854004
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.6212760806083679
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2950781285762787
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.5706806778907776
+          },
+          {
+            "accuracy": 0.8958333134651184,
+            "crossEntropy": 0.9838349223136902
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        0.8958333134651184
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6666666567325592,
+        0.5520833432674408,
+        0.7916666492819786
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        46,
+        37,
+        22
+      ],
+      "trainingSecondsByTask": [
+        0.026893333,
+        0.026906042,
+        0.023050959
+      ],
+      "trainingSeconds": 0.07685033399999999,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213254144
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 17,
+      "variant": "row-off-rehearsal",
+      "dataSha256": "d47c873846754d58623fbb64716a77540be8d45b3da7290bb74008f252e43f50",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "b4f750025cb9d639a318960f890fe3e5fcdc8240d84ae716652746543dced5e2",
+      "finalStateSha256": "3aa9b706db6b0105c082ff9b5a4b1b697541e6202a803f62cb59e0abed26a1c5",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3333333432674408,
+          "crossEntropy": 1.3938616514205933
+        },
+        {
+          "accuracy": 0.4479166567325592,
+          "crossEntropy": 1.2931724786758423
+        },
+        {
+          "accuracy": 0.1041666641831398,
+          "crossEntropy": 1.4292138814926147
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2664426863193512
+          },
+          {
+            "accuracy": 0.4479166567325592,
+            "crossEntropy": 1.2931724786758423
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.20013397932052612
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3559219539165497
+          },
+          {
+            "accuracy": 0.1041666641831398,
+            "crossEntropy": 1.4292138814926147
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.168919637799263
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3044004738330841
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.40731170773506165
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6666666567325592,
+        0.5520833432674408,
+        0.8958333358168602
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        56,
+        59,
+        53
+      ],
+      "trainingSecondsByTask": [
+        0.030846167,
+        0.030966625,
+        0.030314042
+      ],
+      "trainingSeconds": 0.092126834,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 212303872
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 29,
+      "variant": "row-resistance-off",
+      "dataSha256": "4954dd1deea9201bde1eecf0285c4917f823c352b83fad471bea1685975e99f6",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "8988a44a6d064e77f0908dbbb7c5e80f322b8e89a2738d3b7c76d5e922051d4a",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4791666567325592,
+          "crossEntropy": 1.2970545291900635
+        },
+        {
+          "accuracy": 0.3229166567325592,
+          "crossEntropy": 1.371495246887207
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.5387629270553589
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3086504340171814
+          },
+          {
+            "accuracy": 0.3229166567325592,
+            "crossEntropy": 1.371495246887207
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3086504340171814
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.21918095648288727
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3086504340171814
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.21918095648288727
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.27119383215904236
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.5208333432674408,
+        0.6770833432674408,
+        1.0
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        51,
+        61,
+        64
+      ],
+      "trainingSecondsByTask": [
+        0.027801166,
+        0.02556925,
+        0.025466833
+      ],
+      "trainingSeconds": 0.078837249,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213352448
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 29,
+      "variant": "native-rehearsal",
+      "dataSha256": "4954dd1deea9201bde1eecf0285c4917f823c352b83fad471bea1685975e99f6",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "5a14cf49d3ebeba3cf81e0000e998cb15d302c0429b07dcf0aa799ca7dd7e113",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4791666567325592,
+          "crossEntropy": 1.2970545291900635
+        },
+        {
+          "accuracy": 0.3229166567325592,
+          "crossEntropy": 1.371495246887207
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.5387629270553589
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.45389994978904724
+          },
+          {
+            "accuracy": 0.3229166567325592,
+            "crossEntropy": 1.371495246887207
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.39874038100242615
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.6071473360061646
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3802146911621094
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.5894442200660706
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.856641948223114
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.5208333432674408,
+        0.6770833432674408,
+        1.0
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        39,
+        35,
+        29
+      ],
+      "trainingSecondsByTask": [
+        0.02705075,
+        0.027208541,
+        0.025011292
+      ],
+      "trainingSeconds": 0.079270583,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213286912
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 29,
+      "variant": "row-off-rehearsal",
+      "dataSha256": "4954dd1deea9201bde1eecf0285c4917f823c352b83fad471bea1685975e99f6",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "db1c2c63f4117adb90fc070e215fe750757b79526f54de435cff82e340c970bf",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4791666567325592,
+          "crossEntropy": 1.2970545291900635
+        },
+        {
+          "accuracy": 0.3229166567325592,
+          "crossEntropy": 1.371495246887207
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.5387629270553589
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3086504340171814
+          },
+          {
+            "accuracy": 0.3229166567325592,
+            "crossEntropy": 1.371495246887207
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.26016518473625183
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.28814274072647095
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.23899905383586884
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2777351438999176
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.37963616847991943
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.5208333432674408,
+        0.6770833432674408,
+        1.0
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        51,
+        58,
+        55
+      ],
+      "trainingSecondsByTask": [
+        0.0255465,
+        0.0262465,
+        0.0260155
+      ],
+      "trainingSeconds": 0.0778085,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213172224
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 29,
+      "variant": "native-default",
+      "dataSha256": "4954dd1deea9201bde1eecf0285c4917f823c352b83fad471bea1685975e99f6",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "be00aab46f7a57608651da28438856c8ceedc2320b0a7a6f01e8cb0368895c43",
+      "finalStateSha256": "bd233966863e582eacec9493a3e576c2569dae65ace7c71086ec59a573e22102",
+      "initialHeldout": [
+        {
+          "accuracy": 0.4791666567325592,
+          "crossEntropy": 1.2970545291900635
+        },
+        {
+          "accuracy": 0.3229166567325592,
+          "crossEntropy": 1.371495246887207
+        },
+        {
+          "accuracy": 0.0,
+          "crossEntropy": 1.5387629270553589
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.45389994978904724
+          },
+          {
+            "accuracy": 0.3229166567325592,
+            "crossEntropy": 1.371495246887207
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.45389994978904724
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.4878312349319458
+          },
+          {
+            "accuracy": 0.0,
+            "crossEntropy": 1.5387629270553589
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.45389994978904724
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.4878312349319458
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.7070675492286682
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.5208333432674408,
+        0.6770833432674408,
+        1.0
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        39,
+        36,
+        33
+      ],
+      "trainingSecondsByTask": [
+        0.02896675,
+        0.027525791,
+        0.025198834
+      ],
+      "trainingSeconds": 0.081691375,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213794816
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 43,
+      "variant": "native-rehearsal",
+      "dataSha256": "7fae0e37fe5e1330e902032a72eda5caa0555315796f58e02c48f97e17732f9e",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "f77a6d418e2211dcfcd20605c7ae6f11b6d04cd09fca6491c48479a90ae30c3f",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3958333432674408,
+          "crossEntropy": 1.3805713653564453
+        },
+        {
+          "accuracy": 0.4583333432674408,
+          "crossEntropy": 1.2469593286514282
+        },
+        {
+          "accuracy": 0.34375,
+          "crossEntropy": 1.3196557760238647
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.43609288334846497
+          },
+          {
+            "accuracy": 0.4583333432674408,
+            "crossEntropy": 1.2469593286514282
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3358517587184906
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.7124531865119934
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3358517587184906
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.6659099459648132
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.7684879302978516
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6041666567325592,
+        0.5416666567325592,
+        0.65625
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        40,
+        33,
+        24
+      ],
+      "trainingSecondsByTask": [
+        0.081472584,
+        0.109040916,
+        0.080982167
+      ],
+      "trainingSeconds": 0.271495667,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213925888
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 43,
+      "variant": "row-off-rehearsal",
+      "dataSha256": "7fae0e37fe5e1330e902032a72eda5caa0555315796f58e02c48f97e17732f9e",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "36f8b90245d5544c5856d7bc8dd677a12d36311f425e935f83d6f82e46f92025",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3958333432674408,
+          "crossEntropy": 1.3805713653564453
+        },
+        {
+          "accuracy": 0.4583333432674408,
+          "crossEntropy": 1.2469593286514282
+        },
+        {
+          "accuracy": 0.34375,
+          "crossEntropy": 1.3196557760238647
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2615361213684082
+          },
+          {
+            "accuracy": 0.4583333432674408,
+            "crossEntropy": 1.2469593286514282
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.1975339651107788
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3613477051258087
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.1975339651107788
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.3263167440891266
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.39290252327919006
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6041666567325592,
+        0.5416666567325592,
+        0.65625
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 768,
+          "replayedExamples": 256,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        55,
+        53,
+        51
+      ],
+      "trainingSecondsByTask": [
+        0.025398292,
+        0.027701,
+        0.024204458
+      ],
+      "trainingSeconds": 0.07730375,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 2688,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213581824
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 43,
+      "variant": "native-default",
+      "dataSha256": "7fae0e37fe5e1330e902032a72eda5caa0555315796f58e02c48f97e17732f9e",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "518ae7140780488771a3622bb03a4a328c833beda09ffd8aa74ab0f0392b5213",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3958333432674408,
+          "crossEntropy": 1.3805713653564453
+        },
+        {
+          "accuracy": 0.4583333432674408,
+          "crossEntropy": 1.2469593286514282
+        },
+        {
+          "accuracy": 0.34375,
+          "crossEntropy": 1.3196557760238647
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.43609288334846497
+          },
+          {
+            "accuracy": 0.4583333432674408,
+            "crossEntropy": 1.2469593286514282
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.43609288334846497
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.6189601421356201
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.43609288334846497
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.6189601421356201
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.6392688751220703
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6041666567325592,
+        0.5416666567325592,
+        0.65625
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        40,
+        28,
+        31
+      ],
+      "trainingSecondsByTask": [
+        0.025733791,
+        0.023778292,
+        0.023133291
+      ],
+      "trainingSeconds": 0.072645374,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213254144
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": true,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    },
+    {
+      "condition": "disjoint-support-control",
+      "seed": 43,
+      "variant": "row-resistance-off",
+      "dataSha256": "7fae0e37fe5e1330e902032a72eda5caa0555315796f58e02c48f97e17732f9e",
+      "sourceSha256": {
+        "retention_comparison.py": "4304988cbde16a17892b377533adfc406e729b9e705ddb06025a31a12601365d",
+        "model.py": "d7c78726abe4ed03af8daef6ccbcba1c38799a47997afcd3655af46f5363db29",
+        "packed_connections.py": "1eb55a4e0d5bfee173de2baffe9fa8961af81d244524099dc9d205afafeb9d2a",
+        "packed_native_kernel.py": "1158b897518926fbefc82b17dfa1812392f80ca46b8f426b0231609aca605ac4"
+      },
+      "initialStateSha256": "2dfa8de43fb6d6942e3d359f79992743979351d87f4680c079f2b0fd04eee72f",
+      "finalStateSha256": "6e509184ddf3f4f720147d58cc5f09c35fab9dfa2b4e29c95b88cf72599d4c16",
+      "initialHeldout": [
+        {
+          "accuracy": 0.3958333432674408,
+          "crossEntropy": 1.3805713653564453
+        },
+        {
+          "accuracy": 0.4583333432674408,
+          "crossEntropy": 1.2469593286514282
+        },
+        {
+          "accuracy": 0.34375,
+          "crossEntropy": 1.3196557760238647
+        }
+      ],
+      "afterEachTask": [
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2615361213684082
+          },
+          {
+            "accuracy": 0.4583333432674408,
+            "crossEntropy": 1.2469593286514282
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2615361213684082
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2895427942276001
+          },
+          {
+            "accuracy": 0.34375,
+            "crossEntropy": 1.3196557760238647
+          }
+        ],
+        [
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2615361213684082
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.2895427942276001
+          },
+          {
+            "accuracy": 1.0,
+            "crossEntropy": 0.29628637433052063
+          }
+        ]
+      ],
+      "acquisition": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "retention": [
+        1.0,
+        1.0
+      ],
+      "acquisitionGain": [
+        0.6041666567325592,
+        0.5416666567325592,
+        0.65625
+      ],
+      "forgetting": [
+        0.0,
+        0.0
+      ],
+      "newAndReplayExposure": [
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        },
+        {
+          "newTaskExamples": 1024,
+          "replayedExamples": 0,
+          "updates": 64
+        }
+      ],
+      "changedContactsByTask": [
+        55,
+        54,
+        55
+      ],
+      "trainingSecondsByTask": [
+        0.025262125,
+        0.048446291,
+        0.08551775
+      ],
+      "trainingSeconds": 0.159226166,
+      "storage": {
+        "checkpointTensorBytes": 80,
+        "residentTensorStorageBytes": 84,
+        "floatingParameterBytes": 0,
+        "peakCheckpointTensorBytes": 80,
+        "peakReplayTensorBytes": 0,
+        "peakAccountedBatchTensorBytes": 1408,
+        "peakWorkerRssBytes": 213041152
+      },
+      "nativeContract": {
+        "learnedFloatParameters": 0,
+        "latentMasterLearningState": false,
+        "stability": {
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        },
+        "packedKernel": {
+          "format": "omni-packed-adaptive-ternary-linear",
+          "formatVersion": 2,
+          "weightLevels": [
+            -1,
+            0,
+            1
+          ],
+          "weightsPerByte": 4,
+          "activationBits": 8,
+          "packedBytes": 60,
+          "packedSignBytes": 12,
+          "hasPackedBias": false,
+          "authoritativePackedWeight": true,
+          "denseForwardWeightMaterialized": false,
+          "latentMasterLearningState": false,
+          "baseTernaryConnectionCount": 48,
+          "connectionStateVersion": 1,
+          "connectionStrengthEncoding": "uint4-plus-one",
+          "connectionStrengthRange": [
+            1,
+            16
+          ],
+          "connectionStrengthBits": 4,
+          "connectionResistanceBits": 4,
+          "connectionStateBytes": 48,
+          "parallelConnectionCount": 0,
+          "parallelConnectionLearnedBytes": 0,
+          "parallelConnectionPackedSignBytes": 0,
+          "parallelConnectionActiveLearnedBits": 0,
+          "parallelConnectionStructuralBytes": 8,
+          "parallelConnectionAllocatedTensorBytes": 8,
+          "parallelConnectionIndexCacheBytes": 0,
+          "parallelConnectionPageCount": 0,
+          "parallelConnectionPageCapacity": 1024,
+          "parallelConnectionRegistryAdmissionBytes": 0,
+          "parallelConnectionRegistryStorage": "packed-record-pages",
+          "parallelConnectionBackingAllocationIncluded": false,
+          "connectionStrengthOverflow": "allocate-independent-parallel-contact",
+          "metaplasticityMode": "per-connection-uint4-and-output-row-resistance",
+          "metaplasticityEnabled": false,
+          "metaplasticityCheckpointBytes": 4,
+          "metaplasticityMaximumLevel": 15
+        }
+      },
+      "evaluationEnteredReplay": false
+    }
+  ],
+  "comparisons": {
+    "row-resistance-off": {
+      "componentScreenPassed": false,
+      "reasons": [
+        "shortcut-shift/seed-17: retention regression",
+        "shortcut-shift/seed-29: retention regression",
+        "shortcut-shift/seed-43: retention regression",
+        "shortcut-shift/seed-43: training time budget",
+        "disjoint-support-control/seed-43: training time budget"
+      ],
+      "meanAcquisitionDelta": 0.0,
+      "worstAcquisitionDelta": 0.0,
+      "meanRetentionDelta": -0.056423616517956056,
+      "worstRetentionDelta": -0.2291666641831398,
+      "meanTrainingTimeRatio": 1.399363821508603,
+      "maximumTrainingTimeRatio": 2.191828016468055,
+      "defaultChangeAuthorized": false
+    },
+    "native-rehearsal": {
+      "componentScreenPassed": false,
+      "reasons": [
+        "shortcut-shift/seed-43: acquisition regression",
+        "shortcut-shift/seed-43: retention regression",
+        "disjoint-support-control/seed-17: acquisition regression",
+        "disjoint-support-control/seed-43: training time budget"
+      ],
+      "meanAcquisitionDelta": -0.017361111111111112,
+      "worstAcquisitionDelta": -0.2083333134651184,
+      "meanRetentionDelta": 0.18836805076959232,
+      "worstRetentionDelta": -0.0625,
+      "meanTrainingTimeRatio": 1.4103374110638116,
+      "maximumTrainingTimeRatio": 3.737273993523662,
+      "defaultChangeAuthorized": false
+    },
+    "row-off-rehearsal": {
+      "componentScreenPassed": true,
+      "reasons": [],
+      "meanAcquisitionDelta": 0.0,
+      "worstAcquisitionDelta": 0.0,
+      "meanRetentionDelta": 0.2031249935583522,
+      "worstRetentionDelta": 0.0,
+      "meanTrainingTimeRatio": 1.0113683582747677,
+      "maximumTrainingTimeRatio": 1.1795059527216056,
+      "defaultChangeAuthorized": false
+    }
+  },
+  "defaultChangeAuthorized": false,
+  "nextGate": "full native sequential held-out multimodal/source tests, persistence and resource evidence before any default proposal"
+}

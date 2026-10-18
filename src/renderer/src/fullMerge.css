@@ -1,0 +1,33 @@
+.full-merge-panel { margin: 20px 0 28px; padding: 22px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); color: var(--text); }
+.full-merge-panel__heading, .full-merge-receipt__heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.full-merge-panel h2 { margin: 0; font-size: 19px; }
+.full-merge-panel p { line-height: 1.5; overflow-wrap: anywhere; }
+.full-merge-panel button { min-height: 36px; white-space: normal; }
+.full-merge-panel button:disabled { cursor: not-allowed; opacity: .6; }
+.full-merge-panel .button:not(.button--primary):hover:not(:disabled) { color: var(--text); background: var(--surface-2, var(--surface)); border-color: var(--text-3); }
+.full-merge-panel fieldset { min-width: 0; margin: 20px 0; padding: 18px; border: 1px solid var(--border); border-radius: 12px; }
+.full-merge-panel legend { padding: 0 8px; font-weight: 650; }
+.full-merge-parent-list { display: grid; gap: 10px; max-height: 260px; overflow: auto; }
+.full-merge-parent-list label, .full-merge-review { display: flex; align-items: flex-start; gap: 10px; line-height: 1.5; }
+.full-merge-review { margin: 20px 0; }
+.full-merge-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.full-merge-fields label, .full-merge-panel details > label { display: flex; min-width: 0; overflow-wrap: anywhere; flex-direction: column; gap: 7px; font-size: 13px; color: var(--text-2); }
+.full-merge-parent-list span, .full-merge-receipt__heading strong { min-width: 0; overflow-wrap: anywhere; }
+.full-merge-fields label:has(input[type="checkbox"]) { flex-direction: row; align-items: center; }
+.full-merge-wide { grid-column: 1 / -1; }
+.full-merge-panel input:not([type="checkbox"]), .full-merge-panel textarea, .full-merge-panel select { box-sizing: border-box; min-width: 0; width: 100%; padding: 10px 12px; color: var(--text); background: var(--surface); border: 1px solid var(--border-bright, var(--border)); border-radius: 8px; font: inherit; }
+.full-merge-panel input[type="checkbox"] { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 2px; accent-color: var(--accent, #8f7df7); }
+.full-merge-panel :is(input, button, select, textarea, summary):focus-visible { outline: 2px solid var(--accent, #8f7df7); outline-offset: 3px; }
+.full-merge-panel summary { cursor: pointer; padding: 10px 0; font-weight: 600; }
+.full-merge-panel pre, .full-merge-json { max-width: 100%; max-height: 320px; overflow: auto; font: 12px/1.5 ui-monospace, monospace !important; }
+.full-merge-panel pre { padding: 12px; border: 1px solid var(--border); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.full-merge-muted { color: var(--text-2); font-size: 12px; }
+.full-merge-error { padding: 10px 12px; border-left: 3px solid var(--danger, #f07878); color: var(--text); background: color-mix(in srgb, var(--danger, #f07878) 10%, transparent); }
+.full-merge-receipts { display: grid; gap: 12px; margin-top: 16px; }
+.full-merge-receipt { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; }
+.full-merge-receipt__heading > span { color: var(--text-2); font-size: 12px; }
+.full-merge-receipt progress { width: 100%; height: 8px; accent-color: var(--accent, #8f7df7); }
+.full-merge-actions, .full-merge-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.full-merge-confirm { padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.full-merge-confirm p { flex-basis: 100%; }
+@media (max-width: 640px) { .full-merge-panel { padding: 14px; } .full-merge-panel__heading, .full-merge-receipt__heading { align-items: flex-start; flex-direction: column; } .full-merge-fields { grid-template-columns: minmax(0, 1fr); } .full-merge-panel fieldset { padding: 12px; } }

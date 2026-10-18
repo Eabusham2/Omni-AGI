@@ -30,6 +30,7 @@ class FakeActivityPager:
         self.resident_budget_bytes = kwargs["resident_budget_bytes"]
         self.scratch_budget_bytes = kwargs["scratch_budget_bytes"]
         self.device_tile_budget_bytes = kwargs["device_tile_budget_bytes"]
+        self.resource_policy = kwargs["resource_policy"]
         self.closed = False
 
     def status(self):
@@ -85,6 +86,7 @@ class BrainPagingContractTests(unittest.TestCase):
         fixture = method_fixture({"_configure_working_attention_resources"}, WorkingAttentionPager=FakeActivityPager)
         fixture.resource_policy = SimpleNamespace(status=lambda: dict(readings))
         fixture.core_pager = SimpleNamespace(status=lambda: {"cpuHeapBytes": 0, "cpuMappedLogicalBytes": 0})
+        fixture.router_state_pager = SimpleNamespace(status=lambda: {"cpuHeapBytes": 0, "mappedHotRetainedBytesEstimate": 0})
         fixture.config = SimpleNamespace(training_accelerator_budget_bytes=0, training_scratch_budget_bytes=0,
             disk_state_offload=True, storage_pool_bytes=0, working_attention_scratch_budget_bytes=None)
         fixture.device = "cpu"
@@ -99,6 +101,20 @@ class BrainPagingContractTests(unittest.TestCase):
             self.assertLessEqual(envelope["activityLiveBudgetBytes"] + envelope["computeTileBudgetBytes"], envelope["residualRamBytes"])
             self.assertGreater(envelope["activityCapacityBytes"], 512 * 1024 ** 2)
             self.assertFalse(envelope["capacityShrunk"])
+            # Primary disk pressure must not shrink explicitly admitted pages
+            # whose actual allocator enforces quotas on selected other drives.
+            readings["diskFreeBytes"] = 21 * gib
+            readings["sharedQuota"] = {"largestConfiguredPoolBytes": 32 * gib}
+            fixture.resource_policy.device_resources = SimpleNamespace(settings={
+                "storageDirectories": ["/fixture/other-drive"], "allowStorageSpill": True})
+            fixture.config.storage_pool_bytes = 8 * gib
+            fixture.config.working_attention_scratch_budget_bytes = 24 * gib
+            fixture._configure_working_attention_resources()
+            self.assertEqual(fixture.working_attention_pager.scratch_budget_bytes, 24 * gib)
+            self.assertEqual(fixture._working_attention_envelope["scratchPlacement"], "selected-drives")
+            fixture.resource_policy.device_resources.settings["allowStorageSpill"] = False
+            fixture._configure_working_attention_resources()
+            self.assertEqual(fixture.working_attention_pager.scratch_budget_bytes, 0)
             fixture.config.disk_state_offload = False
             fixture._configure_working_attention_resources()
             self.assertEqual(fixture.working_attention_pager.scratch_budget_bytes, 0)

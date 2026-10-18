@@ -76,6 +76,9 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q engine
 
+      - name: Test bounded Python source contracts without a brain
+        run: npm run test:python:ci:contracts
+
       - name: Test desktop app
         run: npm run test:node:ci
 
@@ -101,6 +104,7 @@ jobs:
       - name: Package unsigned signed-ready Windows installer and archive
         env:
           OMNI_SKIP_BUILD_DEPENDENCY_INSTALL: "1"
+          OMNI_RELEASE_COMMIT: ${{ github.sha }}
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Arch "${{ matrix.arch }}" -SkipBuild
 

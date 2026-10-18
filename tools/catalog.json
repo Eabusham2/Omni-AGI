@@ -2,19 +2,181 @@
   "schemaVersion": 1,
   "tools": [
     {
+      "id": "brain.substrate", "label": "Native sparse connections", "defaultGrant": "ask",
+      "description": "Inspect/export exact committed native sparse neurons, assemblies and ternary contacts with their strengths and learning controls. Prepare append or explicit replace-exact plans and apply the reviewed selected-row preimages at the next loaded writer boundary. Returns a tracked job; queued is not applied. No hidden Load, prompt-text memory, foreign cortex conversion, whole-brain merge, evaluator/origin replacement or inherited authority. Selected task attachments can supply compatible bundles; external provenance stays unverified.",
+      "actions": {
+        "inspect": { "input": { "entity": "all|neurons|assemblies|synapses?", "cursor": "string?", "maxBytes": "number?", "stateScope": "committed?" }, "output": { "scope": "string", "stateScope": "string", "generationSha256": "string", "rows": "object[]", "hasMore": "boolean", "nextCursor": "string?" } },
+        "export": { "input": { "selection": "object" }, "output": { "id": "string", "sha256": "string", "bytes": "number", "manifestJson": "string", "rows": "number" } },
+        "register-bundle": { "input": { "attachmentId": "string" }, "output": { "id": "string", "sha256": "string", "bytes": "number", "manifestJson": "string", "sourceBinding": "string" } },
+        "read": { "input": { "bundleId": "string", "offset": "number?", "maxBytes": "number?" }, "output": { "dataBase64": "string", "pageSha256": "string", "nextOffset": "number?", "complete": "boolean" } },
+        "prepare-import": { "input": { "bundleId": "string", "mode": "append|replace-exact" }, "output": { "id": "string", "sha256": "string", "selectedPreimagesSha256": "string", "changesSha256": "string", "rows": "number", "conflicts": "number" } },
+        "prepare-rollback": { "input": { "jobId": "string" }, "output": { "id": "string", "sha256": "string", "selectedPreimagesSha256": "string", "changesSha256": "string", "rows": "number", "conflicts": "number" } },
+        "apply": { "input": { "planId": "string", "reviewSha256": "string" }, "output": { "id": "string", "state": "string", "planSha256": "string", "liveAuthorityPersisted": "boolean" } },
+        "status": { "input": { "jobId": "string" }, "output": { "id": "string", "state": "string", "receipt": "object?", "error": "string?" } },
+        "list": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "nextAfter": "string?" } },
+        "cancel": { "input": { "jobId": "string" }, "output": { "id": "string", "state": "string", "receipt": "object?" } }
+      }
+    },
+    {
+      "id": "maps.search", "label": "Private map search", "description": "Inspect reviewed private Photon connections and search one exact connection revision. Credentials stay in the host. Responses are untrusted task data retained through ordinary learning/history/export. No public geocoder is silently chosen and no failed request is automatically retried.", "defaultGrant": "ask",
+      "actions": {
+        "connections": { "input": {}, "output": { "connections": "object[]", "publicServiceSelected": "boolean" } },
+        "search": { "input": { "connectionId": "string", "expectedRevision": "number", "query": "string", "limit": "number?", "language": "string?", "bbox": "number[]?", "refresh": "boolean?" }, "output": { "geoJson": "object", "bounds": "number[]?", "attribution": "string", "provenance": "object", "searchResultId": "string?", "cacheStored": "boolean", "warning": "string?" } }
+      }
+    },
+    {
+      "id": "maps.display", "label": "Maps and coordinates", "description": "Show supplied GeoJSON or an owner-bound map search on the default offline coordinate canvas. Optionally inspect explicitly configured imagery profiles and request one exact reviewed revision. No online source is selected by default. Actual raster bytes and attribution are retained; credentials and live grants are not.", "defaultGrant": "ask",
+      "actions": {
+        "show": { "input": { "searchResultId": "string?", "geoJson": "object?", "attribution": "string?", "attributionUrl": "string?" }, "output": { "displayMode": "string", "geoJson": "object", "bounds": "number[]?", "attribution": "string", "basemapDownloaded": "boolean" } },
+        "basemaps": { "input": {}, "output": { "profiles": "object[]", "publicServiceSelected": "boolean" } },
+        "basemap": { "input": { "profileId": "string", "expectedRevision": "number", "bounds": "number[]", "width": "number", "height": "number", "zoom": "number?" }, "output": { "format": "string", "images": "object[]", "bounds": "number[]", "attribution": "string", "provenance": "object", "basemapDownloaded": "boolean" } }
+      }
+    },
+    {
+      "id": "system.time", "label": "Host time", "description": "Read the actual host UTC date/time, selected IANA time zone and offset. Duration measurements use a separate monotonic clock.", "defaultGrant": "ask",
+      "actions": { "now": { "input": { "timeZone": "string?" }, "output": { "utc": "string", "local": "string", "timeZone": "string", "utcOffsetMinutes": "number", "monotonicMilliseconds": "number" } } }
+    },
+    {
+      "id": "studio.stopwatch", "label": "Stopwatches & speed", "description": "Measure real monotonic durations and laps, and inspect timestamped actual native output-rate history. A restarted stopwatch pauses at its last durable measurement; unmeasured gaps are excluded.", "defaultGrant": "ask",
+      "actions": {
+        "start": { "input": { "label": "string", "requestKey": "string?" }, "output": { "id": "string", "state": "string", "elapsedMs": "number" } },
+        "status": { "input": { "stopwatchId": "string" }, "output": { "state": "string", "elapsedMs": "number", "lapCount": "number" } },
+        "list": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "nextAfter": "string?" } },
+        "laps": { "input": { "stopwatchId": "string", "after": "number?" }, "output": { "entries": "object[]", "nextAfter": "number?" } },
+        "lap": { "input": { "stopwatchId": "string", "requestKey": "string?" }, "output": { "elapsedMs": "number", "lapCount": "number" } },
+        "pause": { "input": { "stopwatchId": "string", "requestKey": "string?" }, "output": { "state": "string", "elapsedMs": "number" } },
+        "resume": { "input": { "stopwatchId": "string", "requestKey": "string?" }, "output": { "state": "string", "elapsedMs": "number" } },
+        "reset": { "input": { "stopwatchId": "string", "requestKey": "string?" }, "output": { "state": "string", "elapsedMs": "number" } },
+        "performance": { "input": { "after": "string?", "limit": "number?" }, "output": { "measuredAt": "string", "rates": "object", "estimatesAreGuarantees": "boolean" } }
+      }
+    },
+    {
+      "id": "studio.schedule", "label": "Timers & scheduled tasks", "description": "Save a timer, explicit-offset calendar instant or typed event trigger. Optional fixed-interval repeats coalesce or skip missed intervals. Wakeups use the normal controller and existing tool permissions; unloaded minds wait for Load. The app must remain running; OS boot/wake is not implied.", "defaultGrant": "ask",
+      "actions": {
+        "create": { "input": { "label": "string", "kind": "timer|at|event", "delivery": "notify|wake|automation", "automation": "object?", "task": "string?", "delayMs": "number?", "at": "string?", "timeZone": "string?", "repeatMs": "number?", "eventKey": "string?", "missedPolicy": "coalesce|skip?", "requestKey": "string?", "loadWhenDue": "boolean?" }, "output": { "id": "string", "state": "string", "dueAt": "string?" } },
+        "list": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "nextAfter": "string?" } },
+        "status": { "input": { "scheduleId": "string" }, "output": { "state": "string", "revision": "number" } },
+        "occurrences": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "nextAfter": "string?" } },
+        "occurrence": { "input": { "occurrenceId": "string" }, "output": { "state": "string", "input": "string", "eventData": "object?", "waitingFor": "string?" } },
+        "edit": { "input": { "scheduleId": "string", "expectedRevision": "number", "label": "string?", "task": "string?", "delivery": "notify|wake|automation?", "automation": "object?", "at": "string?", "delayMs": "number?", "timeZone": "string?", "repeatMs": "number?", "missedPolicy": "coalesce|skip?", "requestKey": "string?", "loadWhenDue": "boolean?" }, "output": { "state": "string", "revision": "number" } },
+        "pause": { "input": { "scheduleId": "string", "requestKey": "string?" }, "output": { "state": "string", "remainingMs": "number?" } },
+        "resume": { "input": { "scheduleId": "string", "requestKey": "string?" }, "output": { "state": "string", "dueAt": "string?" } },
+        "cancel": { "input": { "scheduleId": "string", "requestKey": "string?" }, "output": { "state": "string" } },
+        "resume-occurrence": { "input": { "occurrenceId": "string", "requestKey": "string?" }, "output": { "state": "string" } },
+        "signal": { "input": { "eventKey": "string", "eventId": "string", "data": "object?", "requestKey": "string?" }, "output": { "duplicate": "boolean", "occurrencesCreated": "number" } }
+      }
+    },
+    {
+      "id": "studio.automation", "label": "Action files", "description": "Save versioned inert tool sequences or delegated scripts, timed waits and data conditions. Run through current nested tool permissions without loading a brain. Activate an exact revision for timer/event triggers separately. Stop preserves actual effects. Unknown outcomes require explicit human review; retries never silently replay completed steps.", "defaultGrant": "ask",
+      "actions": {
+        "list": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "total": "number", "nextAfter": "string?" } },
+        "status": { "input": {}, "output": { "counts": "object", "catalogRevision": "number", "hostExecution": "boolean" } },
+        "export": { "input": { "definitionId": "string", "revisionSha256": "string?" }, "output": { "definition": "object", "program": "object" } },
+        "runs": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "total": "number", "nextAfter": "string?" } },
+        "steps": { "input": { "runId": "string", "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "total": "number", "nextAfter": "string?" } },
+        "current-step": { "input": { "runId": "string" }, "output": { "runId": "string", "receipt": "object?" } },
+        "save": { "input": { "program": "object", "definitionId": "string?", "expectedRevision": "number?", "requestKey": "string?" }, "output": { "id": "string", "revisionSha256": "string", "revision": "number" } },
+        "activate": { "input": { "definitionId": "string", "expectedRevision": "number", "revisionSha256": "string", "allowTriggers": "boolean?", "requestKey": "string?" }, "output": { "id": "string", "activation": "object", "revision": "number" } },
+        "disable": { "input": { "definitionId": "string", "expectedRevision": "number", "revisionSha256": "string", "requestKey": "string?" }, "output": { "id": "string", "activation": "object", "revision": "number" } },
+        "run": { "input": { "definitionId": "string", "revisionSha256": "string", "inputs": "object?", "requestKey": "string?" }, "output": { "id": "string", "state": "string" } },
+        "pause": { "input": { "runId": "string", "requestKey": "string?" }, "output": { "id": "string", "state": "string" } },
+        "resume": { "input": { "runId": "string", "requestKey": "string?" }, "output": { "id": "string", "state": "string" } },
+        "stop": { "input": { "runId": "string", "requestKey": "string?" }, "output": { "id": "string", "state": "string" } },
+        "approve": { "input": { "runId": "string", "approvalToken": "string", "requestKey": "string?" }, "output": { "id": "string", "state": "string" } },
+        "review": { "input": { "runId": "string", "resolution": "skip|retry-confirmed", "acknowledgePossibleEffects": "boolean", "reason": "string", "requestKey": "string?" }, "output": { "id": "string", "state": "string" } }
+      }
+    },
+    {
+      "id": "data.distill-local", "label": "Local GGUF teacher", "description": "Generate attributable ordinary learning sources with an explicitly selected installed llama.cpp runner and exact local GGUF. Preferred private raw server completion has no chat template/system prompt; optional console logs are labeled as logs. Native Omni identity/weights are not replaced. Current host selection, policy, resource fit and full source receipts are required; copied jobs are dormant. No downloads/setup/remote provider.", "defaultGrant": "ask",
+      "actions": {
+        "selections": { "input": {}, "output": { "teachers": "array" } },
+        "plan": { "input": { "teacherId": "string", "prompts": "string[]?" }, "output": { "recommendation": "object?", "fit": "estimated|unknown|blocked", "blockers": "array" } },
+        "start": { "input": { "teacherId": "string", "prompts": "string[]", "generation": "object", "epochs": "number?" }, "output": { "id": "string", "state": "string" } },
+        "list": { "input": {}, "output": { "jobs": "array" } },
+        "status": { "input": { "jobId": "string" }, "output": { "state": "string", "phase": "string", "generatedCount": "number", "learnedCount": "number" } },
+        "items": { "input": { "jobId": "string", "afterIndex": "number?", "limit": "number?" }, "output": { "items": "array" } },
+        "pause": { "input": { "jobId": "string" }, "output": { "state": "string" } },
+        "resume": { "input": { "jobId": "string" }, "output": { "state": "string" } },
+        "stop": { "input": { "jobId": "string" }, "output": { "state": "string" } }
+      }
+    },
+    {
+      "id": "data.learn", "label": "Specific Learn", "description": "Start or manage ordinary same-brain learning from explicit text, an already selected dataset manifest, or web URLs. Jobs return durable progress rather than claiming immediate learning.", "defaultGrant": "ask",
+      "actions": {
+        "start": { "input": { "inputs": "object[]", "instructions": "string?", "constraints": "object?", "epochs": "number?" }, "output": { "id": "string", "state": "string", "traversalComplete": "boolean" } },
+        "status": { "input": { "taskId": "string" }, "output": { "state": "string", "sources": "object[]" } },
+        "pause": { "input": { "taskId": "string" }, "output": { "state": "string" } },
+        "resume": { "input": { "taskId": "string" }, "output": { "state": "string" } },
+        "stop": { "input": { "taskId": "string" }, "output": { "state": "string" } },
+        "steer": { "input": { "taskId": "string", "expectedRevision": "number", "instructions": "string?", "constraints": "object?" }, "output": { "revision": "number", "policy": "object" } }
+      }
+    },
+    {
+      "id": "data.fact-check", "label": "Fact Check", "description": "Examine selected claims and actual captured evidence with provenance. Record proposed findings and questions; no exhaustive inventory of distributed knowledge or guaranteed truth is claimed.", "defaultGrant": "ask",
+      "actions": {
+        "start": { "input": { "claims": "object[]", "instructions": "string?", "constraints": "object?" }, "output": { "task": "object", "claims": "object[]" } },
+        "status": { "input": { "taskId": "string" }, "output": { "task": "object", "claims": "object[]" } },
+        "record": { "input": { "taskId": "string", "claimId": "string", "conclusion": "supported|contradicted|mixed|undetermined", "explanation": "string", "evidenceIds": "string[]", "proposedCorrection": "string?", "question": "object?" }, "output": { "task": "object", "claims": "object[]" } },
+        "pause": { "input": { "taskId": "string" }, "output": { "state": "string" } },
+        "resume": { "input": { "taskId": "string" }, "output": { "state": "string" } },
+        "stop": { "input": { "taskId": "string" }, "output": { "state": "string" } },
+        "steer": { "input": { "taskId": "string", "expectedRevision": "number", "instructions": "string?", "constraints": "object?" }, "output": { "revision": "number", "policy": "object" } }
+      }
+    },
+    {
+      "id": "studio.question",
+      "label": "Ask a question",
+      "description": "Ask the user for a task choice or written answer. The result is a task choice and never changes host permissions. Questions remain available while other work continues.",
+      "defaultGrant": "auto",
+      "actions": {
+        "ask": {
+          "input": { "prompt": "string", "detail": "string?", "mode": "single|multiple|text", "options": "object[]?", "minSelections": "number?", "maxSelections": "number?", "allowOther": "boolean?", "suggestedResponse": "object?" },
+          "output": { "id": "string", "status": "string", "timeout": "object" }
+        },
+        "status": {
+          "input": { "questionId": "string" },
+          "output": { "status": "string", "resolution": "object?" }
+        }
+      }
+    },
+    {
+      "id": "task.attachments",
+      "label": "Current task attachments",
+      "description": "List or read only the immutable files and media explicitly attached to this exact chat turn. Staging does not train the brain; visible read results follow ordinary experience learning.",
+      "defaultGrant": "auto",
+      "actions": {
+        "list": {
+          "input": {},
+          "output": { "attachments": "array" }
+        },
+        "read": {
+          "input": { "attachmentId": "string?", "offset": "number?", "maxBytes": "number?" },
+          "output": { "attachment": "object", "content": "string", "encoding": "utf8|base64", "nextOffset": "number?" }
+        }
+      }
+    },
+    {
       "id": "system.files",
       "label": "System files",
-      "description": "List, read, and write absolute paths. Auto reads are contained to the brain-local directory; paths outside it and all writes require one-action approval unless Full Authority is enabled.",
+      "description": "Stream directory metadata, exact file segments/full read pages, and literal content/name search without whole-file loads. Explicit task attachment handoff copies verified bytes but never executes code. Auto host reads remain brain-local; outside paths and all writes/handoffs require current one-action approval unless Full Authority is enabled. Every cursor page rechecks current policy and original source identity.",
       "defaultGrant": "ask",
       "actions": {
         "list": {
-          "input": { "path": "string", "cursor": "string?", "pageSize": "number?" },
-          "output": { "entries": "array", "total": "number", "hasMore": "boolean", "nextCursor": "string?" }
+          "input": { "path": "string", "pageSize": "number?" },
+          "output": { "entries": "array", "total": "number?", "totalKnown": "boolean", "hasMore": "boolean", "nextCursor": "string?" }
         },
+        "list-next": { "input": { "cursor": "string", "path": "string?" }, "output": { "entries": "array", "hasMore": "boolean", "nextCursor": "string?" } },
         "read": {
-          "input": { "path": "string", "maxBytes": "number?" },
-          "output": { "content": "string", "sha256": "string" }
+          "input": { "path": "string?", "attachmentId": "string?", "maxBytes": "number?" },
+          "output": { "content": "string", "encoding": "utf8|base64", "sha256": "string", "wholeSha256": "string?", "complete": "boolean", "nextCursor": "string?" }
         },
+        "read-segment": { "input": { "path": "string?", "attachmentId": "string?", "offset": "number?", "maxBytes": "number?", "expectedFileIdentity": "string?" }, "output": { "content": "string", "encoding": "utf8|base64", "sha256": "string", "nextOffset": "number?", "source": "object" } },
+        "read-all": { "input": { "path": "string?", "attachmentId": "string?", "maxBytes": "number?" }, "output": { "content": "string", "sha256": "string", "wholeSha256": "string?", "complete": "boolean", "nextCursor": "string?" } },
+        "read-next": { "input": { "cursor": "string", "path": "string?" }, "output": { "content": "string", "sha256": "string", "wholeSha256": "string?", "complete": "boolean", "nextCursor": "string?" } },
+        "search": { "input": { "path": "string?", "attachmentId": "string?", "mode": "metadata|name|content", "query": "string?", "name": "string?", "recursive": "boolean?", "pageSize": "number?", "scanBytes": "number?" }, "output": { "matches": "array", "scannedBytes": "number", "complete": "boolean", "nextCursor": "string?" } },
+        "search-next": { "input": { "cursor": "string", "path": "string?" }, "output": { "matches": "array", "scannedBytes": "number", "complete": "boolean", "nextCursor": "string?" } },
+        "close": { "input": { "cursor": "string", "path": "string?" }, "output": { "closed": "boolean" } },
+        "materialize-task": { "input": { "attachmentId": "string" }, "output": { "path": "string", "relativePath": "string", "source": "object", "sha256": "string", "executionStarted": "boolean", "authority": "string" } },
         "write": {
           "input": { "path": "string", "content": "string", "expectedSha256": "string?" },
           "output": { "sha256": "string", "bytes": "number" }
@@ -51,14 +213,87 @@
       }
     },
     {
+      "id": "studio.clipboard",
+      "label": "Instance clipboard",
+      "description": "Read, write, clear and inspect this brain's private text clipboard. Complete unsanitized content and version provenance are portable with the brain; this tool never reads or changes the operating-system clipboard.",
+      "defaultGrant": "auto",
+      "actions": {
+        "capabilities": { "input": { "scope": "instance", "afterVersion": "string?", "limit": "number?" }, "output": { "scope": "string", "currentVersionId": "string", "retainedVersions": "object[]" } },
+        "read": { "input": { "scope": "instance", "cursor": "string?", "maxBytes": "number?", "versionId": "string?" }, "output": { "state": "string", "text": "string", "chunkBytes": "number", "chunkSha256": "string", "complete": "boolean", "cursor": "string?", "provenance": "object" } },
+        "write": { "input": { "scope": "instance", "contentType": "text/plain", "text": "string" }, "output": { "state": "string", "contentSha256": "string", "versionId": "string", "revision": "number" } },
+        "clear": { "input": { "scope": "instance" }, "output": { "state": "string", "versionId": "string", "revision": "number" } }
+      }
+    },
+    {
+      "id": "system.clipboard",
+      "label": "Host clipboard",
+      "description": "Explicit Off-default current-user OS text clipboard access. Reads are bounded and streamed through a monitored helper; write/clear effects use durable nonreplayable receipts. No renderer clipboard fallback, setup, elevation, copied OS grant, or unsupported format claim.",
+      "defaultGrant": "off",
+      "actions": {
+        "capabilities": { "input": { "scope": "host" }, "output": { "implemented": "boolean", "adapter": "string", "contentTypes": "string[]", "detail": "string" } },
+        "read": { "input": { "scope": "host", "cursor": "string?", "maxBytes": "number?" }, "output": { "state": "string", "text": "string", "chunkBytes": "number", "chunkSha256": "string", "complete": "boolean", "cursor": "string?", "provenance": "object" } },
+        "write": { "input": { "scope": "host", "contentType": "text/plain", "text": "string" }, "output": { "state": "string", "contentSha256": "string", "writeMayHaveOccurred": "boolean", "retrySafe": "boolean", "provenance": "object" } },
+        "clear": { "input": { "scope": "host" }, "output": { "state": "string", "writeMayHaveOccurred": "boolean", "retrySafe": "boolean", "provenance": "object" } }
+      }
+    },
+    {
+      "id": "system.memory", "label": "DMA · process memory", "description": "Advanced opt-in OS-permitted process-memory inspection/modification. An installation-local user DMA setting AND current tool policy are required. Explicit selected PID, exact creation identity, paged regions/bytes, and preimage SHA for writes; no process scan, physical RAM, privilege enablement or protection changes. Protected or unavailable targets are reported honestly. Host only until an actual sandbox/VM adapter exists. Auto reviews attach/read/regions/write. Leases expire on Unload and are never copied as grants.", "defaultGrant": "off",
+      "actions": {
+        "capabilities": { "input": {}, "output": { "enabled": "boolean", "revision": "number", "capabilities": "object" } },
+        "attach": { "input": { "pid": "number", "access": "read|read-write", "environment": "string?" }, "output": { "target": "object", "receipt": "object" } },
+        "regions": { "input": { "targetId": "string", "afterAddress": "string?", "limit": "number?" }, "output": { "state": "string", "regions": "object[]", "nextAddress": "string", "endOfRegions": "boolean" } },
+        "read": { "input": { "targetId": "string", "address": "string", "length": "number" }, "output": { "state": "string", "dataBase64": "string?", "dataSha256": "string?", "transferredBytes": "number" } },
+        "write": { "input": { "targetId": "string", "address": "string", "dataBase64": "string", "expectedBeforeSha256": "string" }, "output": { "state": "string", "transferredBytes": "number?", "writeMayHaveOccurred": "boolean", "retrySafe": "boolean", "beforeSha256": "string?", "afterSha256": "string?" } },
+        "detach": { "input": { "targetId": "string" }, "output": { "detached": "boolean", "osHandleRetained": "boolean" } }
+      }
+    },
+    {
+      "id": "runtime.sandbox",
+      "label": "Managed sandbox",
+      "description": "Create, inspect, load, use and stop a private OS-backed sandbox workspace. Missing adapters fail closed; the normal host runner is never substituted. Darwin sandbox-exec is deprecated, Linux requires bubblewrap, and supported Windows 11 hosts use the already-installed Windows Sandbox CLI with disposable guest state and no guest process I/O. Network is disabled and every mutating action remains risky under Auto.",
+      "defaultGrant": "ask",
+      "actions": {
+        "capabilities": { "input": {}, "output": { "adapters": "object[]", "installationPerformed": "boolean" } },
+        "create": { "input": { "name": "string", "adapter": "darwin-sandbox-exec|linux-bwrap|windows-sandbox-cli?" }, "output": { "environment": "object", "operation": "object" } },
+        "list": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "total": "number", "nextAfter": "string?" } },
+        "status": { "input": { "environmentId": "string" }, "output": { "environment": "object", "operations": "object[]" } },
+        "load": { "input": { "environmentId": "string" }, "output": { "environment": "object", "operation": "object" } },
+        "run": { "input": { "environmentId": "string", "program": "string", "arguments": "string[]?", "timeoutMs": "number?" }, "output": { "environment": "object", "operation": "object" } },
+        "stop": { "input": { "environmentId": "string" }, "output": { "environment": "object", "operation": "object" } }
+      }
+    },
+    {
+      "id": "runtime.vm",
+      "label": "Managed virtual machine",
+      "description": "Manage a private Lima VM only from an exact hash-verified current-task local image. No remote URL/template download, user provisioning script, host mount, credential forwarding, elevation, or existing user VM is adopted; Lima still performs its documented base guest/SSH setup. Guest outbound networking must be explicit and every mutating action remains risky under Auto.",
+      "defaultGrant": "ask",
+      "actions": {
+        "capabilities": { "input": {}, "output": { "adapters": "object[]", "installationPerformed": "boolean" } },
+        "create": { "input": { "name": "string", "adapter": "string?", "imageAttachmentId": "string", "imageSha256": "string", "architecture": "aarch64|x86_64", "cpus": "number?", "memoryGiB": "number?", "diskGiB": "number?", "network": "string" }, "output": { "environment": "object", "operation": "object" } },
+        "list": { "input": { "after": "string?", "limit": "number?" }, "output": { "entries": "object[]", "total": "number", "nextAfter": "string?" } },
+        "status": { "input": { "environmentId": "string" }, "output": { "environment": "object", "operations": "object[]" } },
+        "load": { "input": { "environmentId": "string" }, "output": { "environment": "object", "operation": "object" } },
+        "run": { "input": { "environmentId": "string", "program": "string", "arguments": "string[]?", "timeoutMs": "number?" }, "output": { "environment": "object", "operation": "object" } },
+        "stop": { "input": { "environmentId": "string" }, "output": { "environment": "object", "operation": "object" } }
+      }
+    },
+    {
+      "id": "code.assembly", "label": "Assembly & native code", "description": "Inspect installed native toolchains, compile exact inline assembly into a fresh managed artifact, and separately run a hash-verified native executable with exact argv. Compile/run remain risky under Auto. No compiler download, OS sandbox, admin access or raw RAM/DMA grant is implied.", "defaultGrant": "ask",
+      "actions": {
+        "inspect": { "input": { "artifactId": "string?", "after": "string?", "limit": "number?" }, "output": { "platform": "string?", "architecture": "string?", "toolchains": "object[]?", "artifacts": "object?", "receipt": "object?" } },
+        "compile": { "input": { "source": "string", "syntax": "gas|nasm|masm?", "kind": "executable|object|flat-binary?", "toolchain": "auto|clang|gcc|nasm|msvc?", "architecture": "x64|arm64|ia32?", "entryPoint": "string?", "libraries": "string[]?", "timeoutMs": "number?" }, "output": { "state": "string", "artifactId": "string?", "artifact": "object?", "receiptPath": "string?", "partialFiles": "object[]?" } },
+        "run": { "input": { "artifactId": "string", "artifactSha256": "string", "arguments": "string[]?", "timeoutMs": "number?" }, "output": { "state": "string", "processes": "object[]", "receiptPath": "string" } }
+      }
+    },
+    {
       "id": "web.search",
       "label": "Web search",
-      "description": "Search through a configured SearxNG-compatible endpoint.",
+      "description": "Search through a configured SearxNG-compatible endpoint or public RSS. Image metadata is an attributable unfetched reference; explicitly select a reference through web.fetch inspect-image to read pixels.",
       "defaultGrant": "ask",
       "actions": {
         "search": {
-          "input": { "query": "string", "limit": "number?" },
-          "output": { "results": "array" }
+          "input": { "query": "string", "limit": "number?", "images": "boolean?" },
+          "output": { "results": "array", "imageReferences": "object[]" }
         }
       }
     },
@@ -70,7 +305,11 @@
       "actions": {
         "fetch": {
           "input": { "url": "string", "maxBytes": "number?" },
-          "output": { "status": "number", "contentType": "string", "content": "string" }
+          "output": { "status": "number", "contentType": "string", "content": "string", "imageReferences": "object[]" }
+        },
+        "inspect-image": {
+          "input": { "referenceId": "string", "maxBytes": "number?" },
+          "output": { "format": "string", "reference": "object", "download": "object", "attachment": "object", "selectionSha256": "string", "observation": "object" }
         }
       }
     },
@@ -133,6 +372,29 @@
             "artifactPath": "string",
             "mimeType": "string",
             "seed": "number"
+          }
+        }
+      }
+    },
+    {
+      "id": "studio.artifact",
+      "label": "Interactive HTML artifact",
+      "description": "Create a durable local HTML/CSS artifact with an optional isolated canvas/control script. Raw markup stays in the main-owned artifact store. Declared host calls re-enter current tool permissions; copied, imported, and merged interactions remain dormant until explicitly reviewed.",
+      "defaultGrant": "auto",
+      "actions": {
+        "create": {
+          "input": {
+            "title": "string",
+            "html": "string",
+            "css": "string?",
+            "script": "string?",
+            "tools": "object[]?",
+            "height": "number?"
+          },
+          "output": {
+            "format": "string",
+            "version": "number",
+            "artifact": "object"
           }
         }
       }
@@ -208,13 +470,21 @@
     },
     {
       "id": "source.self-modify",
-      "label": "Source evolution",
-      "description": "Fork the source workspace, edit it, run required checks, and produce a promotion candidate.",
+      "label": "Self-improvement",
+      "description": "Propose an isolated native neural/data/substrate/architecture candidate for the protected evaluator, or fork Git source edits. An explicit native candidate never falls back to source edits. Native proposals return a durable queued job, not a completed promotion.",
       "defaultGrant": "off",
       "actions": {
         "propose": {
-          "input": { "objective": "string", "candidateKind": "string?", "addExperts": "number?", "architectureChange": "object?", "tests": "string[]?", "sourceEdits": "object[]?", "texts": "string[]?", "sourceIds": "string[]?", "latentReplay": "boolean?", "epochs": "number?", "learningRate": "number?", "objectives": "string[]?" },
-          "output": { "worktree": "string", "diff": "string", "checks": "array" }
+          "input": { "objective": "string", "candidateKind": "source|neural|data|substrate|architecture?", "addExperts": "number?", "architectureChange": "object?", "geometryHoldouts": "object?", "recursive": "boolean?", "parentCandidateId": "string?", "provenance": "object?", "tests": "string[]? (source only)", "sourceEdits": "object[]? (source only)", "texts": "string[]?", "sourceIds": "string[]?", "latentReplay": "boolean?", "epochs": "number?", "learningRate": "number?", "objectives": "string[]?" },
+          "output": { "format": "omni-native-candidate-tool-job? (native only)", "id": "string? (native job ID)", "state": "string? (native job state)", "runId": "string? (assigned by evaluator)", "candidateId": "string? (assigned by evaluator)", "worktree": "string? (source only)", "diff": "string? (source only)", "checks": "array? (source only)" }
+        },
+        "native-status": {
+          "input": { "jobId": "string" },
+          "output": { "format": "omni-native-candidate-tool-job", "id": "string", "state": "string", "runId": "string?", "candidateId": "string?", "reassessmentPending": "boolean?", "error": "string?" }
+        },
+        "native-stop": {
+          "input": { "jobId": "string" },
+          "output": { "format": "omni-native-candidate-tool-job", "id": "string", "state": "string", "runId": "string?", "error": "string?" }
         },
         "diff": {
           "input": { "worktree": "string" },

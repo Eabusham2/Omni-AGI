@@ -30,9 +30,9 @@ class NativeComputeProfileFixtures(unittest.TestCase):
         value = profile_native_projection_compute(primitive=lambda: calls.append(True), clock=lambda: next(ticks),
                                                    reserve=lambda count, device: reserves.append((count, device)))
         self.assertEqual(len(calls), 4)
-        self.assertEqual(reserves, [(1053700, "cpu")])
+        self.assertEqual(reserves, [(1072688, "cpu")])
         self.assertEqual(value["projectionMacsPerRun"], 32768)
-        self.assertEqual(value["sampleTensorBytes"], 5124)
+        self.assertEqual(value["sampleTensorBytes"], 7172)
         self.assertEqual(value["projectionMacsPerSecond"], 32768 * 1_000_000 // value["medianRunMicroseconds"])
         self.assertEqual(value["activityDtype"], "float32")
         self.assertEqual(value["implementation"], "injected-fixture")
@@ -65,7 +65,7 @@ class NativeComputeProfileFixtures(unittest.TestCase):
             "projectedProcessMemoryBytes": kwargs["estimated_ram_bytes"] + 1000})
         def profiler(**kwargs):
             captured.append(kwargs["device"])
-            kwargs["reserve"](1053700, "cpu")
+            kwargs["reserve"](1072688, "cpu")
             self.assertFalse(kwargs["cancelled"]())
             return {"fixture": "no probe performed"}
         with patch("omni_core.offload.ResourcePolicy", return_value=policy), patch(

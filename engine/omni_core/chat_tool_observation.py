@@ -33,15 +33,17 @@ def _tool(value):
 
 class ChatToolObservationInbox:
     def __init__(self, brain_id, turn_id, admit, *, cancelled=lambda: False, wait_seconds=30.0,
-                 reserve_parse=None):
+                 reserve_parse=None, service_pending=None):
         self.brain_id, self.turn_id, self.admit = brain_id, turn_id, admit
         self.reserve_parse = reserve_parse
         self.expected, self.seen, self.pending = {}, set(), deque()
+        self.receipts = {}
         self.awaiting = set()
         self.closed = False
         self.lock = threading.RLock()
         self.ready = threading.Condition(self.lock)
         self.cancelled, self.wait_seconds = cancelled, max(0.0, float(wait_seconds))
+        self.service_pending = service_pending
 
     def register(self, action_id, action):
         if action.get("kind") != "tool": return
@@ -100,6 +102,7 @@ class ChatToolObservationInbox:
                 del payload
             self.pending.append(_RetainedObservation(value, allocation))
             self.seen.add(value["observationId"])
+            self.receipts[value["observationId"]] = {key: value[key] for key in FIELDS if key != "payloadJson"}
             self.awaiting.discard(value["neuralActionId"])
             self.ready.notify_all()
             # This acknowledges inbox ownership, not neural use or learning.
@@ -111,6 +114,65 @@ class ChatToolObservationInbox:
             result = list(self.pending)
             self.pending.clear()
             return result
+
+    def suspension_state(self):
+        """Same-turn inbox ownership, not an external handle or new effect."""
+        with self.lock:
+            if self.closed:
+                raise ValueError("cannot suspend a closed observation inbox")
+            return {"format": "omni-chat-observation-frontier", "version": 2,
+                "brainId": self.brain_id, "turnId": self.turn_id,
+                "expected": {key: list(value) for key, value in self.expected.items()},
+                "seen": sorted(self.seen), "awaiting": sorted(self.awaiting),
+                "pending": [dict(value) for value in self.pending], "receipts": dict(self.receipts), "waitSeconds": self.wait_seconds}
+
+    @classmethod
+    def from_suspension_state(cls, value, brain_id, turn_id, admit, *, cancelled=lambda: False, reserve_parse=None):
+        fields = {"format", "version", "brainId", "turnId", "expected", "seen", "awaiting", "pending", "receipts", "waitSeconds"}
+        if (not isinstance(value, dict) or set(value) != fields or value.get("format") != "omni-chat-observation-frontier"
+                or value.get("version") != 2 or value.get("brainId") != brain_id or value.get("turnId") != turn_id
+                or not isinstance(value.get("expected"), dict) or not isinstance(value.get("seen"), list)
+                or not isinstance(value.get("awaiting"), list) or not isinstance(value.get("pending"), list)
+                or not isinstance(value.get("receipts"), dict) or set(value["receipts"]) != set(value["seen"])):
+            raise ValueError("invalid observation suspension ownership")
+        wait = value["waitSeconds"]
+        if not isinstance(wait, (int, float)) or isinstance(wait, bool) or not 0 <= wait <= 3600:
+            raise ValueError("invalid suspended observation wait")
+        result = cls(brain_id, turn_id, admit, cancelled=cancelled, wait_seconds=wait, reserve_parse=reserve_parse)
+        for key, route in value["expected"].items():
+            if (not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{32}", key) or not isinstance(route, list)
+                    or len(route) != 2 or any(not isinstance(item, str) or not item or "\0" in item for item in route)):
+                raise ValueError("invalid suspended native action binding")
+            result.expected[key] = tuple(route)
+        if (any(not isinstance(item, str) or not re.fullmatch(r"[a-f0-9]{64}", item) for item in value["seen"])
+                or len(set(value["seen"])) != len(value["seen"])
+                or len(set(value["awaiting"])) != len(value["awaiting"])
+                or not set(value["awaiting"]).issubset(result.expected)):
+            raise ValueError("invalid suspended observation identity set")
+        prior = set(value["seen"])
+        for identifier, receipt in value["receipts"].items():
+            if (not isinstance(receipt, dict) or set(receipt) != FIELDS - {"payloadJson"}
+                    or any(not isinstance(item, str) or not item or "\0" in item for item in receipt.values())
+                    or receipt["brainId"] != brain_id or receipt["turnId"] != turn_id or receipt["observationId"] != identifier
+                    or receipt["format"] != FORMAT or not re.fullmatch(r"[a-f0-9]{64}", receipt["payloadSha256"])
+                    or result.expected.get(receipt["neuralActionId"]) != (_tool(receipt["toolId"]), receipt["action"])):
+                raise ValueError("suspended consumed-observation receipt lost its original effect identity")
+            parts = [receipt[key] for key in ("format", "brainId", "turnId", "neuralActionId", "actionEventId",
+                "executionId", "toolId", "action", "completedAt", "payloadSha256")]
+            if hashlib.sha256("\0".join(parts).encode()).hexdigest() != identifier:
+                raise ValueError("suspended consumed-observation receipt checksum failed")
+        for item in value["pending"]:
+            if not isinstance(item, dict) or item.get("observationId") not in prior:
+                raise ValueError("suspended pending observation lacks prior admission")
+            receipt = result.offer(item)
+            if not receipt.get("accepted") or receipt.get("duplicate"):
+                raise ValueError("suspended pending observations are duplicated or not admitted")
+        if set(value["awaiting"]) & {item["neuralActionId"] for item in result.pending}:
+            raise ValueError("an already received suspended action is still marked awaiting")
+        result.seen = prior
+        result.receipts = dict(value["receipts"])
+        result.awaiting = set(value["awaiting"])
+        return result
 
     def close(self):
         with self.lock:
@@ -125,11 +187,25 @@ class ChatToolObservationInbox:
         bounds the ownership; expiry does not manufacture an observation.
         """
         deadline = time.monotonic() + self.wait_seconds
-        with self.ready:
-            while self.awaiting and not self.pending and not self.closed and not self.cancelled():
+        while True:
+            # A nested MCP sampling request must run on this writer while its
+            # tool awaits the result. Never hold the inbox/control-reader lock
+            # over native computation or the producer cannot deliver evidence.
+            if callable(self.service_pending) and not self.cancelled():
+                computation_started = time.monotonic()
+                try:
+                    self.service_pending()
+                finally:
+                    # This interval was owned native computation, not an
+                    # external-result wait. Keep the configured wait budget
+                    # available to the tool after its nested sample finishes.
+                    deadline += max(0.0, time.monotonic() - computation_started)
+            with self.ready:
+                if not self.awaiting or self.pending or self.closed or self.cancelled():
+                    return self.drain() if not self.cancelled() else []
                 remaining = deadline - time.monotonic()
-                if remaining <= 0: break
+                if remaining <= 0:
+                    return self.drain() if not self.cancelled() else []
                 self.ready.wait(min(remaining, 0.05))
-            return self.drain() if not self.cancelled() else []
 
     __call__ = drain

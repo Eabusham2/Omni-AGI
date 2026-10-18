@@ -107,6 +107,8 @@ function control(
 function harness() {
   let packetListener: ((packet: LivePerceptionCapturePacket) => void) | undefined;
   let eventListener: ((event: LiveObservationEvent) => void) | undefined;
+  let endedListener: (() => void) | undefined;
+  const previewStream = { getTracks: () => [] } as unknown as MediaStream;
   let currentCapture = { ...baseCapture };
   const captureStop = vi.fn();
   const reconfigure = vi.fn(async (request) => {
@@ -149,6 +151,8 @@ function harness() {
   };
   const captureHandle: LivePerceptionCaptureHandle = {
     getCapture: () => ({ ...currentCapture }),
+    getPreviewStream: () => previewStream,
+    onEnded: (listener) => { endedListener = listener; return () => { endedListener = undefined; }; },
     setPacketByteLimit: vi.fn(),
     start: (listener) => {
       packetListener = listener;
@@ -217,6 +221,7 @@ function harness() {
     controller,
     capture,
     captureHandle,
+    previewStream,
     captureStop,
     reconfigure,
     modality,
@@ -227,6 +232,7 @@ function harness() {
       snapshotImplementation = implementation;
     },
     emitPacket: (packet: LivePerceptionCapturePacket) => packetListener?.(packet),
+    emitEnded: () => endedListener?.(),
     emitEvent: (event: LiveObservationEvent) => eventListener?.(event)
   };
 }
@@ -499,6 +505,12 @@ describe("LivePerceptionController", () => {
       state: "complete",
       acceptedFrames: 3
     });
+    expect(live.controller.getPreview().snapshot?.data).toEqual(new Uint8Array([3]));
+    await live.controller.stop();
+    await start(live);
+    expect(live.controller.getState().lastControl).toBeUndefined();
+    expect(live.controller.getState().lastSnapshot).toBeUndefined();
+    expect(live.controller.getPreview().snapshot).toBeUndefined();
   });
 
   it("retries a backpressured snapshot frame with a new sequence instead of dropping it", async () => {
@@ -625,6 +637,135 @@ describe("LivePerceptionController", () => {
 
     await vi.waitFor(() => expect(live.modality.resolveObservationControl).toHaveBeenCalledOnce());
     expect(live.reconfigure).toHaveBeenCalledOnce();
+  });
+
+  it("borrows one owned preview and closes it once on an external track end", async () => {
+    const live = harness(), previews = vi.fn();
+    const unsubscribe = live.controller.subscribePreview(previews);
+    expect(live.controller.getPreview()).toEqual({});
+    expect(live.capture.open).not.toHaveBeenCalled();
+    await start(live);
+    expect(live.controller.getPreview().stream).toBe(live.previewStream);
+    expect(live.capture.open).toHaveBeenCalledOnce();
+    live.emitEnded();
+    await vi.waitFor(() => expect(live.controller.getState().phase).toBe("idle"));
+    expect(live.captureStop).toHaveBeenCalledOnce();
+    expect(live.modality.stopObservation).toHaveBeenCalledOnce();
+    expect(live.controller.getPreview()).toEqual({});
+    expect(previews).toHaveBeenLastCalledWith({});
+    unsubscribe();
+  });
+
+  it("invalidates pending OS permission on Stop and closes a late grant without opening a neural session", async () => {
+    const live = harness();
+    let grant!: (value: LivePerceptionCaptureHandle) => void;
+    vi.mocked(live.capture.open).mockImplementationOnce(() => new Promise(resolve => { grant = resolve; }));
+    const opening = start(live);
+    expect(live.controller.getState().phase).toBe("requesting");
+    await live.controller.stop();
+    grant(live.captureHandle);
+    await opening;
+    expect(live.captureStop).toHaveBeenCalledOnce();
+    expect(live.modality.startObservation).not.toHaveBeenCalled();
+    expect(live.controller.getPreview()).toEqual({});
+    expect(live.controller.getState()).toMatchObject({ enabled: false, phase: "idle" });
+  });
+
+  it("disposes immediately while session admission is pending and cancels its late receipt", async () => {
+    const live = harness();
+    let admitted!: (value: LiveObservationSession) => void;
+    live.modality.startObservation.mockImplementationOnce(() => new Promise(resolve => { admitted = resolve; }));
+    const opening = start(live);
+    await vi.waitFor(() => expect(live.modality.startObservation).toHaveBeenCalledOnce());
+    await live.controller.dispose();
+    await expect(start(live)).rejects.toThrow("disposed");
+    admitted(session());
+    await opening;
+    expect(live.captureStop).toHaveBeenCalledOnce();
+    expect(live.modality.cancelObservation).toHaveBeenCalledOnce();
+    expect(live.controller.getPreview()).toEqual({});
+  });
+
+  it("releases capture when the host closes the session, without replaying Stop or Cancel", async () => {
+    const live = harness();
+    await start(live);
+    live.emitEvent({ type: "stopped", session: session({ state: "stopped" }) });
+    await vi.waitFor(() => expect(live.controller.getState().phase).toBe("idle"));
+    expect(live.captureStop).toHaveBeenCalledOnce();
+    expect(live.modality.stopObservation).not.toHaveBeenCalled();
+    expect(live.modality.cancelObservation).not.toHaveBeenCalled();
+    expect(live.controller.getPreview()).toEqual({});
+  });
+
+  it("does not publish a snapshot preview while its frame is waiting for acceptance", async () => {
+    const live = harness();
+    await start(live);
+    let accept!: (value: LiveObservationPacketResult) => void;
+    live.modality.pushObservation.mockImplementationOnce(() => new Promise(resolve => { accept = resolve; }));
+    live.emitEvent({ type: "control", session: session(), control: control("snapshot", { burstCount: 1 }) });
+    await vi.waitFor(() => expect(live.modality.pushObservation).toHaveBeenCalledOnce());
+    expect(live.controller.getPreview().snapshot).toBeUndefined();
+    accept(packetResult(1));
+    await vi.waitFor(() => expect(live.controller.getPreview().snapshot?.data).toEqual(new Uint8Array([1])));
+    await live.controller.cancel();
+    expect(live.controller.getPreview()).toEqual({});
+  });
+
+  it("shares no continuous packets in snapshot-only mode while retaining audited burst controls", async () => {
+    const live = harness(), continuousStart = vi.spyOn(live.captureHandle, "start");
+    await live.controller.start("screen", planLivePerception({ hardwareTier: "micro" }), "neural", "snapshots");
+    expect(continuousStart).not.toHaveBeenCalled();
+    expect(live.modality.pushObservation).not.toHaveBeenCalled();
+    expect(live.controller.getPreview().stream).toBe(live.previewStream);
+    live.emitEvent({ type: "control", session: session(), control: control("snapshot", { burstCount: 1 }) });
+    await vi.waitFor(() => expect(live.modality.pushObservation).toHaveBeenCalledOnce());
+    await live.controller.stop();
+    expect(live.captureStop).toHaveBeenCalledOnce();
+  });
+
+  it("uses the actual negotiated resource plan for snapshot and control bounds", async () => {
+    const live = harness(), requested = planLivePerception({ hardwareTier: "personal" });
+    const negotiated = planLivePerception({ hardwareTier: "workstation", sourceNativeWidth: 3840,
+      sourceNativeHeight: 2160, sourceNativeFps: 60, generationTokensPerSecond: 80,
+      memoryBytesPerSecond: 40 * 1024 ** 3, ioBytesPerSecond: 1024 ** 3 });
+    live.captureHandle.getPlan = () => negotiated;
+    await live.controller.start("camera", requested);
+    expect(live.controller.getState().plan?.resourcePixelsPerSecond).toBe(3840 * 2160 * 60);
+    expect(live.controller.getState().plan?.maxSnapshotBurst).toBe(negotiated.maxSnapshotBurst);
+    expect(live.controller.getState().plan?.maxInFlight).toBe(2); // Host concurrency remains authoritative.
+  });
+
+  it("releases the local source on a failed host close but requires explicit Stop retry before another source", async () => {
+    const live = harness();
+    await start(live);
+    live.modality.stopObservation.mockRejectedValueOnce(new Error("host close unavailable"));
+    await live.controller.stop();
+    expect(live.captureStop).toHaveBeenCalledOnce();
+    expect(live.controller.getPreview()).toEqual({});
+    expect(live.controller.getState()).toMatchObject({ enabled: false, phase: "error", session: { state: "active" } });
+    await expect(start(live)).rejects.toThrow("Choose Stop again");
+    expect(live.capture.open).toHaveBeenCalledOnce();
+    await live.controller.stop();
+    expect(live.controller.getState()).toMatchObject({ enabled: false, phase: "idle", session: { state: "stopped" } });
+  });
+
+  it("replans mode-only motion/detail controls using the same native and measured envelope", async () => {
+    const live = harness(), actualPlan = planLivePerception({ hardwareTier: "personal", sourceNativeWidth: 3840,
+      sourceNativeHeight: 2160, sourceNativeFps: 60, generationTokensPerSecond: 12,
+      memoryBytesPerSecond: 8 * 1024 ** 3, ioBytesPerSecond: 128 * 1024 ** 2 });
+    live.captureHandle.getPlan = () => actualPlan;
+    await start(live);
+    live.emitEvent({ type: "control", session: session(), control: { ...control("configure", { mode: "motion" }), id: "motion-control" } });
+    await vi.waitFor(() => expect(live.reconfigure).toHaveBeenCalledOnce());
+    const motion = live.reconfigure.mock.calls[0]![0];
+    expect(motion.fps).toBe(60);
+    live.emitEvent({ type: "control", session: session(), control: { ...control("configure", { mode: "detail" }), id: "detail-control" } });
+    await vi.waitFor(() => expect(live.reconfigure).toHaveBeenCalledTimes(2));
+    const detail = live.reconfigure.mock.calls[1]![0];
+    expect(detail.width).toBeGreaterThan(motion.width);
+    expect(detail.fps).toBeLessThan(motion.fps);
+    for (const applied of [motion, detail]) expect(applied.width * applied.height * applied.fps).toBeLessThanOrEqual(actualPlan.resourcePixelsPerSecond);
+    await live.controller.stop();
   });
 });
 

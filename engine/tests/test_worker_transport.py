@@ -90,6 +90,39 @@ class TransportTests(unittest.TestCase):
             pipe.lines.put(b"")
             runner.join(3)
 
+    def test_native_sampling_metadata_controls_never_queue_behind_waiting_chat(self):
+        started, release = threading.Event(), threading.Event()
+        responses, pipe = queue.Queue(), Pipe()
+        neural_threads, control_threads = [], []
+        class Session:
+            running = True
+            def dispatch(self, request):
+                neural_threads.append(threading.get_ident())
+                started.set()
+                release.wait(2)
+                return {"jsonrpc": "2.0", "id": request["id"], "result": {"turnCommitted": True}}
+            def dispatch_control(self, request):
+                control_threads.append(threading.get_ident())
+                return {"jsonrpc": "2.0", "id": request["id"], "result": {"state": "queued"}}
+        session = Session()
+        runner = threading.Thread(target=serve_worker_stdio, args=(session, pipe, responses.put, lambda: None, Fault))
+        runner.start()
+        try:
+            pipe.send("chat", "waiting-turn")
+            self.assertTrue(started.wait(1))
+            for method in ("mcp_sampling_enqueue", "mcp_sampling_status", "mcp_sampling_cancel", "mcp_sampling_consume"):
+                pipe.send(method, method)
+                self.assertEqual(responses.get(timeout=1)["id"], method)
+            self.assertEqual(len(neural_threads), 1)
+            self.assertEqual(len(control_threads), 4)
+            self.assertTrue(all(thread != neural_threads[0] for thread in control_threads))
+            pipe.lines.put(b"")
+            release.set()
+            self.assertEqual(responses.get(timeout=1)["id"], "waiting-turn")
+        finally:
+            release.set(); pipe.lines.put(b""); runner.join(3)
+        self.assertFalse(runner.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

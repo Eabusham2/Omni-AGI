@@ -219,13 +219,17 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
                 raise
 
     def _connect(self) -> sqlite3.Connection:
+        from .connected_transaction import borrow_paged_connection, enlist_paged_connection
+        shared = borrow_paged_connection(self.path)
+        if shared is not None:
+            return shared
         connection = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA temp_store=FILE")
         from .paged_idle_selection import observe_idle_source_connection
         observe_idle_source_connection(connection, self.path)
-        return connection
+        return enlist_paged_connection(self.path, connection)
 
     @contextmanager
     def _transaction(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -290,7 +294,11 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
     @property
     def graph_revision(self) -> int:
         with self._transaction() as connection:
-            value = self._meta(connection, "graph_revision")
+            return self._graph_revision(connection)
+
+    @classmethod
+    def _graph_revision(cls, connection: sqlite3.Connection) -> int:
+        value = cls._meta(connection, "graph_revision")
         if not value.isdecimal() or str(int(value)) != value:
             raise ValueError("paged neuron graph revision is invalid")
         return int(value)
@@ -415,6 +423,39 @@ class PagedNeuronMetadata(MutableMapping[str, Mapping[str, Any]]):
             return connection.execute(
                 "SELECT 1 FROM paged_neuron_records WHERE neuron_id=?", (key,)
             ).fetchone() is not None
+
+    def contains_many(
+        self, identifiers: tuple[str, ...], *, expected_graph_revision: int,
+    ) -> frozenset[str]:
+        """Check one bounded structural page at the caller's exact revision.
+
+        Only ID membership is returned, never neuron values or a retained
+        corpus mirror. This read transaction binds its revision and the one
+        SQL membership query to the same snapshot; callers must also check
+        their generation after using the result. The ordinary single-ID path
+        remains available for mutable/unsupported consumers.
+        """
+        if (
+            not isinstance(identifiers, tuple) or len(identifiers) > 128
+            or any(not isinstance(value, str) for value in identifiers)
+            or type(expected_graph_revision) is not int
+            or expected_graph_revision < 0
+        ):
+            raise ValueError("paged neuron membership page is invalid")
+        self._reserve_memory(
+            8192 + sum(4 * len(value) + 128 for value in identifiers),
+            "paged neuron membership page",
+        )
+        with self._transaction() as connection:
+            if self._graph_revision(connection) != expected_graph_revision:
+                raise ValueError("native recall node generation changed during membership page")
+            if not identifiers:
+                return frozenset()
+            placeholders = ",".join("?" for _value in identifiers)
+            return frozenset(row[0] for row in connection.execute(
+                "SELECT neuron_id FROM paged_neuron_records WHERE neuron_id IN (%s)"
+                % placeholders, identifiers,
+            ))
 
     def __getitem__(self, key: str) -> Mapping[str, Any]:
         with self._transaction() as connection:

@@ -1,0 +1,14 @@
+.action-canvas-editor { min-width:0; }
+.action-canvas-caption { color:var(--text-2); }
+.automation-workspace [role=group] button[aria-pressed=true] { background:var(--accent-soft); border-color:var(--accent); color:var(--text); }
+.action-canvas-viewport { min-width:0; border:1px solid var(--border); border-radius:8px; background:var(--surface); }
+.action-canvas-viewport--freeform { overflow:auto; max-height:32rem; }
+.action-canvas-nodes--grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,14rem),1fr)); gap:.75rem; padding:.75rem; }
+.action-canvas-nodes--freeform { position:relative; }
+.action-canvas-links { position:absolute; inset:0; pointer-events:none; }
+.action-canvas-links path { fill:none; stroke:var(--text-2); stroke-width:2; }
+.automation-workspace .action-canvas-node { display:flex; flex-direction:column; align-items:flex-start; gap:.3rem; text-align:left; overflow-wrap:anywhere; min-width:0; background:var(--panel); }
+.action-canvas-nodes--freeform .action-canvas-node { position:absolute; touch-action:none; }
+.automation-workspace .action-canvas-node[aria-pressed=true] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+.action-canvas-coordinates { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; }
+.action-canvas-coordinates label { flex:1 1 6rem; }

@@ -20,6 +20,37 @@ from omni_core.packed_vsa_vectors import (
 
 
 class PackedVSAVectorTests(unittest.TestCase):
+    def test_runtime_revision_covers_signs_gains_contacts_counters_and_membership_without_persisting(self):
+        from omni_core.weighted_vsa_row import CONTACT
+        vectors = PackedTernaryVectors(5, seed=17)
+        original = vectors.current_snapshot()
+        vectors['one'] = torch.ones(5)
+        self.assertNotEqual(vectors.current_snapshot(), original)
+        snapshot = vectors.current_snapshot()
+        vectors.set_connection_state('one', bytes([2]) + bytes(4), CONTACT.pack(0, 0x54, 0))
+        self.assertNotEqual(vectors.current_snapshot(), snapshot)
+        snapshot = vectors.current_snapshot()
+        vectors.adapt('one', -torch.ones(5), .5)
+        self.assertNotEqual(vectors.current_snapshot(), snapshot)
+        snapshot = vectors.current_snapshot()
+        vectors.adapt('one', -torch.ones(5), 0.)
+        self.assertEqual(vectors.current_snapshot(), snapshot)
+        metadata, tensors = vectors.export_state()
+        restored = PackedTernaryVectors.from_state(metadata, tensors)
+        self.assertEqual(restored.revision, 0)
+        self.assertNotEqual(restored.current_snapshot(), vectors.current_snapshot())
+        self.assertEqual(restored.export_state()[0], metadata)
+        self.assertNotIn('revision', metadata)
+        snapshot = vectors.current_snapshot()
+        vectors.append_row_payload('two', restored.row_payload('one'), 4)
+        self.assertNotEqual(vectors.current_snapshot(), snapshot)
+        snapshot = vectors.current_snapshot()
+        del vectors['two']
+        self.assertNotEqual(vectors.current_snapshot(), snapshot)
+        snapshot = vectors.current_snapshot()
+        vectors.clear()
+        self.assertNotEqual(vectors.current_snapshot(), snapshot)
+
     def test_relative_quantization_is_exact_deterministic_and_shape_safe(self):
         values = torch.tensor([4.0, 1.0, -1.0, -4.0, 0.0])
         expected = torch.tensor([1, 0, 0, -1, 0], dtype=torch.int8)
@@ -48,7 +79,7 @@ class PackedVSAVectorTests(unittest.TestCase):
         vectors.update({"second": torch.tensor([-1, 1, 0, -1, 0])})
         self.assertEqual(list(vectors), ["first", "second"])
         self.assertEqual(len(vectors), 2)
-        self.assertEqual(vectors.storage_bytes, 2 * (2 + 8))
+        self.assertEqual(vectors.storage_bytes, 2 * (2 + 8 + 5))
         self.assertEqual(vectors["first"].dtype, torch.float32)
         self.assertTrue(torch.equal(
             vectors.levels("first"),
@@ -67,7 +98,7 @@ class PackedVSAVectorTests(unittest.TestCase):
         del vectors["first"]
         vectors["third"] = torch.tensor([0, 0, 0, 0, -1])
         self.assertEqual(list(vectors), ["second", "third"])
-        self.assertEqual(vectors.storage_bytes, 2 * (2 + 8))
+        self.assertEqual(vectors.storage_bytes, 2 * (2 + 8 + 5))
         self.assertEqual(vectors.update_count("third"), 0)
         self.assertTrue(torch.equal(
             vectors.levels("third"), torch.tensor([0, 0, 0, 0, -1], dtype=torch.int8)
@@ -84,7 +115,8 @@ class PackedVSAVectorTests(unittest.TestCase):
         self.assertEqual(first.dtype, torch.float32)
         self.assertEqual(original.update_count("assembly"), 1)
         metadata, tensors = original.export_state(prefix="vsa.")
-        self.assertEqual(set(tensors), {"vsa.packed_rows", "vsa.update_counters_le"})
+        self.assertEqual(set(tensors), {"vsa.packed_rows", "vsa.update_counters_le",
+            "vsa.connection_state", "vsa.parallel_offsets_le", "vsa.parallel_records"})
         self.assertEqual(tensors["vsa.packed_rows"].dtype, torch.uint8)
         self.assertEqual(tensors["vsa.packed_rows"].shape, (1, 4))
         self.assertEqual(tensors["vsa.update_counters_le"].shape, (1, 8))
@@ -96,12 +128,12 @@ class PackedVSAVectorTests(unittest.TestCase):
             restored = PackedTernaryVectors.from_state(
                 metadata, load_file(str(path)), prefix="vsa."
             )
-        self.assertEqual(restored.packed_row("assembly"), original.packed_row("assembly"))
+        self.assertEqual(restored.row_payload("assembly"), original.row_payload("assembly"))
         self.assertEqual(restored.update_count("assembly"), 1)
         for _ in range(128):
             original.adapt("assembly", target, 0.05)
             restored.adapt("assembly", target, 0.05)
-        self.assertEqual(restored.packed_row("assembly"), original.packed_row("assembly"))
+        self.assertEqual(restored.row_payload("assembly"), original.row_payload("assembly"))
         self.assertEqual(restored.update_count("assembly"), original.update_count("assembly"))
         self.assertFalse(torch.equal(original.levels("assembly"), torch.ones(16, dtype=torch.int8)))
 
@@ -130,7 +162,7 @@ class PackedVSAVectorTests(unittest.TestCase):
         self.assertIn("idea", neurons)
         self.assertNotIn("semantic", assemblies)
         self.assertIs(assemblies.backing, neurons)
-        self.assertEqual(neurons.storage_bytes, 2 * (2 + 8))
+        self.assertEqual(neurons.storage_bytes, 2 * (2 + 8 + 5))
         assemblies.adapt("idea", torch.ones(5), 1.0)
         self.assertTrue(torch.equal(neurons.levels("idea"), torch.ones(5, dtype=torch.int8)))
         self.assertTrue(torch.equal(neurons["idea"], assemblies["idea"]))

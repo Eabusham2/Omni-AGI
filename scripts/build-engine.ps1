@@ -30,6 +30,9 @@ else {
   }
 }
 
+& $Python (Join-Path $RepoRoot "scripts\build-native-kernels.py")
+if ($LASTEXITCODE -ne 0) { throw "Native packed kernel build failed" }
+
 if (Test-Path $DistRoot) {
   Remove-Item -Recurse -Force $DistRoot
 }
@@ -46,6 +49,8 @@ if (Test-Path $WorkRoot) {
   --workpath $WorkRoot `
   --specpath $WorkRoot `
   --paths (Join-Path $RepoRoot "engine") `
+  --add-data "$(Join-Path $RepoRoot 'engine\omni_core\native');omni_core/native" `
+  --add-data "$(Join-Path $RepoRoot 'engine\omni_core\kernels');omni_core/kernels" `
   --collect-all torch `
   --collect-all safetensors `
   --collect-all imageio_ffmpeg `

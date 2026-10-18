@@ -62,7 +62,7 @@ export function preserveSteeredChatMessage(
   );
 }
 
-export type OptimisticChatTerminalState = "failed" | "cancelled" | "stopped";
+export type OptimisticChatTerminalState = "failed" | "cancelled" | "stopped" | "suspended" | "detached";
 
 /**
  * A terminal renderer/RPC failure must settle the local receipt, not erase the
@@ -164,6 +164,8 @@ export function chatMessageDeliveryState(
   if (message.id.startsWith("failed-")) return "failed";
   if (message.id.startsWith("cancelled-")) return "cancelled";
   if (message.id.startsWith("stopped-")) return "stopped";
+  if (message.id.startsWith("suspended-")) return "suspended";
+  if (message.id.startsWith("detached-")) return "detached";
   if (message.id.startsWith("steered-")) return "steered";
   if (message.id.startsWith("queued-")) return "queued";
   if (message.id.startsWith("pending-")) return "pending";
@@ -183,7 +185,7 @@ function optimisticTurnId(message: ChatMessage): string | undefined {
   if (message.deliveryReceipt?.presentationOnly) {
     return message.deliveryReceipt.turnId;
   }
-  const normalized = message.id.replace(/^(?:failed-|cancelled-|stopped-)/, "");
+  const normalized = message.id.replace(/^(?:failed-|cancelled-|stopped-|suspended-|detached-)/, "");
   const prefix = ["pending-", "queued-", "steered-"].find((value) =>
     normalized.startsWith(value)
   );
@@ -226,6 +228,8 @@ export function mergeChatMessagesForPresentation(
   const receiptPriority: Record<ChatDeliveryReceiptState, number> = {
     queued: 0,
     pending: 1,
+    suspended: 3,
+    detached: 3,
     steered: 2,
     stopped: 3,
     cancelled: 3,

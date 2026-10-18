@@ -63,6 +63,8 @@ interface Harness {
   service: {
     create: ReturnType<typeof vi.fn>;
     resumeFoundation: ReturnType<typeof vi.fn>;
+    teachInitialDocumentation: ReturnType<typeof vi.fn>;
+    teachInitialCapabilities: ReturnType<typeof vi.fn>;
     previewDataset: ReturnType<typeof vi.fn>;
     ingestManifest: ReturnType<typeof vi.fn>;
     crawlWeb: ReturnType<typeof vi.fn>;
@@ -86,6 +88,16 @@ async function makeHarness(options: {
   const service = {
     repository,
     preflightStart: vi.fn(async () => undefined),
+    teachInitialDocumentation: vi.fn(async () => ({
+      format: "omni-documentation-curriculum-receipt",
+      version: 1,
+      packId: "omni-v2-user-documentation-7",
+      packVersion: 7,
+      packSha256: "b".repeat(64),
+      complete: true,
+      records: []
+    })),
+    teachInitialCapabilities: vi.fn(async () => ({ candidateAccepted: false, recordsVisited: 17, parameterSteps: 0, protectedOwners: [], sha256: "a".repeat(64) })),
     create: vi.fn(async (
       buildRequest: CreateBrainRequest,
       _onProgress?: unknown,
@@ -163,6 +175,13 @@ describe("main-authoritative initialization recovery", () => {
       readiness: { state: "ready" }
     });
     expect(harness.coordinator.isBusy()).toBe(false);
+    expect(harness.service.teachInitialDocumentation).toHaveBeenCalledTimes(1);
+    expect(harness.service.teachInitialCapabilities).toHaveBeenCalledTimes(1);
+    expect(
+      harness.service.teachInitialDocumentation.mock.invocationCallOrder[0]
+    ).toBeLessThan(
+      harness.service.teachInitialCapabilities.mock.invocationCallOrder[0]!
+    );
   });
 
   it("waits beyond one second for first-learning work without timing out or opening chat", async () => {
@@ -338,7 +357,7 @@ describe("main-authoritative initialization recovery", () => {
     };
 
     await expect(harness.coordinator.create(buildRequest)).rejects.toThrow(
-      /complete crawl coverage/i
+      /complete (?:crawl|frontier) coverage/i
     );
 
     const [summary] = await harness.repository.list();
@@ -347,7 +366,7 @@ describe("main-authoritative initialization recovery", () => {
       state: "failed",
       failure: {
         phase: "initial-learning",
-        message: expect.stringMatching(/complete crawl coverage/i),
+        message: expect.stringMatching(/complete (?:crawl|frontier) coverage/i),
         retryable: true
       }
     });
@@ -390,11 +409,13 @@ describe("main-authoritative initialization recovery", () => {
     });
     expect(harness.service.previewDataset).toHaveBeenCalledTimes(1);
     expect(harness.service.ingestManifest).toHaveBeenCalledTimes(1);
+    expect(harness.service.teachInitialDocumentation).not.toHaveBeenCalled();
 
     const recovered = await harness.coordinator.retry(failed.id);
     expect(recovered.readiness.state).toBe("ready");
     expect(harness.service.previewDataset).toHaveBeenCalledTimes(1);
     expect(harness.service.ingestManifest).toHaveBeenCalledTimes(2);
+    expect(harness.service.teachInitialDocumentation).toHaveBeenCalledTimes(1);
   });
 
   it("keeps retry record progress visible and converges promptly to a failed card", async () => {

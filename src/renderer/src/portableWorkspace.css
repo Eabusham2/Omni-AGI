@@ -1,0 +1,16 @@
+.portable-workspace { margin: 0 0 20px; padding: 16px; border: 1px solid var(--border); border-radius: var(--panel-radius, 12px); background: var(--surface-solid); color: var(--text); min-width: 0; }
+.portable-workspace h2 { margin: 0 0 8px; font-size: 16px; }
+.portable-workspace p { margin: 8px 0; line-height: 1.5; overflow-wrap: anywhere; }
+.portable-workspace > details { margin: 10px 0; }
+.portable-workspace summary { cursor: pointer; padding-block: 6px; }
+.portable-workspace label { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.portable-workspace select { min-width: 0; max-width: 100%; color: var(--text); background: var(--surface-solid); border: 1px solid var(--border); padding: 7px; border-radius: var(--control-radius, 6px); }
+.portable-workspace__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.portable-workspace__review { padding-block: 8px; }
+.portable-workspace__review dl { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0; }
+.portable-workspace__review dl div { min-width: 0; }
+.portable-workspace__review dt { color: var(--text-3); font-size: 12px; }
+.portable-workspace__review dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.portable-workspace__review code { display: block; max-width: 100%; overflow-wrap: anywhere; margin-block: 4px; }
+.portable-workspace [role="alert"] { color: var(--danger, var(--red)); }
+.portable-workspace ul { max-height: 240px; overflow: auto; padding-left: 20px; overflow-wrap: anywhere; }

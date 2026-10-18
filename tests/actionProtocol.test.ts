@@ -5,9 +5,11 @@ import {
 } from "../src/main/actionProtocol";
 import {
   ChatActionController,
-  confirmedArgumentTrainingFields
+  confirmedArgumentTrainingFields,
+  type ActionChatService
 } from "../src/main/chatActionController";
 import type { NeuralChatStreamEvent } from "../src/main/brainService";
+import type { SteerDirectionsService } from "../src/main/steerDirections";
 import type {
   ActionEvent,
   ChatResult,
@@ -289,7 +291,7 @@ describe("structured chat actions", () => {
       if (event.type === "chat-phase") phases.push(event);
     });
 
-    const result = await controller.send("brain-1", "Generate an image of an emergent city");
+    const result = await controller.send("brain-1", "Generate an image of an emergent city", undefined, "turn-visible-imagination");
 
     expect(tools.execute).toHaveBeenCalledWith(
       {
@@ -299,11 +301,18 @@ describe("structured chat actions", () => {
         arguments: {
           modality: "image",
           conceptIds: ["emergent-city"],
-          neuralActionId: "11111111111111111111111111111111"
+          neuralActionId: "11111111111111111111111111111111",
+          chatTurnId: "turn-visible-imagination"
         }
       },
       expect.any(Function),
-      expect.any(String)
+      "turn-visible-imagination",
+      expect.any(Function),
+      expect.objectContaining({
+        actionEventId: result.actionEvents?.[0]?.id,
+        chatTurnId: "turn-visible-imagination",
+        nativeActionId: "11111111111111111111111111111111"
+      })
     );
     expect(service.chat).toHaveBeenCalledOnce();
     expect(service.learnStructuredExperience).toHaveBeenCalledOnce();
@@ -548,7 +557,8 @@ describe("structured chat actions", () => {
       "Research both questions.",
       expect.any(AbortSignal),
       expect.any(Function),
-      expect.any(String)
+      expect.any(String),
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined
     );
     expect(tools.execute).toHaveBeenCalledTimes(2);
     expect(service.learnStructuredExperience).toHaveBeenCalledTimes(2);
@@ -739,7 +749,7 @@ describe("structured chat actions", () => {
       expect(turnStream.some((event) => event.type === "modality-preview")).toBe(true)
     );
     expect(calls).toBe(1);
-    expect(tools.execute).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(tools.execute).toHaveBeenCalledOnce());
     expect(turnStream.slice(0, 3).map((event) => event.type)).toEqual([
       "chat-state",
       "chat-token",
@@ -753,7 +763,7 @@ describe("structured chat actions", () => {
     expect(service.learnStructuredExperience).toHaveBeenCalledOnce();
     expect(streamed).toEqual([
       { state: "proposed", progress: undefined, label: undefined },
-      { state: "running", progress: 0.08, label: "A first temporal sketch" },
+      { state: "running", progress: undefined, label: undefined },
       { state: "running", progress: 0.08, label: "A first temporal sketch" },
       { state: "running", progress: 0.18, label: "Forming temporal latents" },
       { state: "running", progress: 0.72, label: "Decoding frames and sound" },
@@ -814,8 +824,10 @@ describe("structured chat actions", () => {
         throw new Error("neural worker exited during inline imagination");
       })
     };
+    let finishAttempt!: (result: ToolExecutionResult) => void;
+    const attempt = new Promise<ToolExecutionResult>((resolve) => { finishAttempt = resolve; });
     const tools = {
-      execute: vi.fn(),
+      execute: vi.fn(() => attempt),
       cancel: vi.fn(() => 0)
     };
     const controller = new ChatActionController(service, tools, { start: vi.fn() });
@@ -824,11 +836,19 @@ describe("structured chat actions", () => {
       if (event.type === "chat-action") states.push(event.actionEvent.state);
     });
 
-    await expect(controller.send("brain-mps", "Recall this file.")).rejects.toThrow(
+    await expect(controller.send("brain-mps", "Recall this file.", undefined, "turn-worker-failure")).rejects.toThrow(
       /worker exited/i
     );
-    expect(states).toEqual(["proposed", "running", "failed"]);
-    expect(tools.execute).not.toHaveBeenCalled();
+    expect(states).toEqual(["proposed", "running", "running", "failed"]);
+    expect(tools.execute).toHaveBeenCalledOnce();
+    // The worker failure ends its preview, not the independently authorized
+    // host attempt. Settle that same attempt instead of rerunning it.
+    finishAttempt({ id: "failed-image-attempt", toolId: "modality.imagine", action: "generate",
+      state: "failed", dispatchStarted: true, startedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(), error: "fixture artifact attempt failed after worker exit" });
+    await controller.cancelAndWait("brain-mps", "turn-worker-failure");
+    expect(states.at(-1)).toBe("failed");
+    expect(tools.execute).toHaveBeenCalledOnce();
   });
 
   it("commits the original turn before tool audit and learns its result outside chat history", async () => {
@@ -897,12 +917,10 @@ describe("structured chat actions", () => {
     };
     const tools = {
       execute: vi.fn(async () => {
-        // Model ToolExecutor.audit's former read/modify/write race: an eager
-        // execution captures a stale document, waits for chat commit, and can
-        // then overwrite the original turn with only its audit entry.
-        const documentBeforeAudit = [...persistedMessages];
+        // Dispatch may start during decoding, but the complete audit read /
+        // modify / save remains behind the original chat's writer boundary.
         await initialCommitted;
-        persistedMessages = [...documentBeforeAudit, "tool-audit"];
+        persistedMessages = [...persistedMessages, "tool-audit"];
         return execution;
       }),
       cancel: vi.fn(() => 0)
@@ -918,7 +936,9 @@ describe("structured chat actions", () => {
       "make an image from this internal scene"
     );
     await vi.waitFor(() => expect(states).toContain("proposed"));
-    expect(tools.execute).not.toHaveBeenCalled();
+    expect(tools.execute).toHaveBeenCalledOnce();
+    expect(persistedMessages).toEqual([]);
+    expect(learnedExperiences).toEqual([]);
 
     releaseInitial();
     const result = await pending;
@@ -964,14 +984,16 @@ describe("structured chat actions", () => {
     };
     const controller = new ChatActionController(service, tools, { start: vi.fn() });
 
-    await controller.send("brain-choice", "Create an image of a city");
+    const result = await controller.send("brain-choice", "Create an image of a city", undefined, "turn-native-choice");
 
     expect(tools.execute).toHaveBeenCalledWith(
       expect.objectContaining({
         arguments: { modality: "audio", conceptIds: ["learned-choice"] }
       }),
       expect.any(Function),
-      expect.any(String)
+      "turn-native-choice",
+      expect.any(Function),
+      expect.objectContaining({ actionEventId: result.actionEvents?.[0]?.id, chatTurnId: "turn-native-choice" })
     );
     expect(service.chat).toHaveBeenCalledOnce();
     expect(service.learnStructuredExperience).toHaveBeenCalledOnce();
@@ -1027,7 +1049,20 @@ describe("structured chat actions", () => {
     ]);
   });
 
-  it("consumes a pre-speech foundation Ponder exactly once", async () => {
+  it("does not rerun a measured resource-paused Ponder after the reply", async () => {
+    const trace = { activated: true, activated_by: "learned-action-head", passes: 2,
+      elapsed_ms: 50, final_delta: .4, private: true, visibleMagicTags: false,
+      completed: false, stop_reason: "resource-pressure" };
+    const service = { chat: vi.fn().mockResolvedValue(chatResult("Partial refinement was available.", [{
+      kind: "ponder", source: "brain", arguments: { handledInTurn: true, completedInTurn: false, ponderTrace: trace }
+    }])), idleCycle: vi.fn() };
+    const controller = new ChatActionController(service, { execute: vi.fn(), cancel: vi.fn(() => 0) }, { start: vi.fn() });
+    const result = await controller.send("brain-ponder-resource", "Consider this relation.");
+    expect(service.idleCycle).not.toHaveBeenCalled();
+    expect(result.actionEvents).toEqual([expect.objectContaining({ state: "stopped", statusLabel: "Ponder paused for resources" })]);
+  });
+
+  it("consumes a pre-speech Ponder exactly once", async () => {
     const trace = {
       activated: true,
       activated_by: "on-demand-action",
@@ -1317,7 +1352,7 @@ describe("structured chat actions", () => {
       toolId: "web.search",
       action: "search",
       arguments: { query: "unresolved ternary association" }
-    });
+    }, undefined, undefined, expect.any(Function));
     expect(result.actionEvents).toEqual([
       expect.objectContaining({
         state: "approval-required",
@@ -1458,7 +1493,7 @@ describe("structured chat actions", () => {
       toolId: "studio.ui",
       action: "open-creativity",
       arguments: { assemblyIds: ["story-scene"], organic: true }
-    });
+    }, undefined, undefined, expect.any(Function));
     expect(result.actionEvents).toEqual([
       expect.objectContaining({
         state: "complete",
@@ -1622,7 +1657,7 @@ describe("structured chat actions", () => {
       undefined,
       "turn-phase"
     );
-    expect(emitStream).toBeTypeOf("function");
+    await vi.waitFor(() => expect(emitStream).toBeTypeOf("function"));
     emitStream?.({
       type: "chat-phase",
       sequence: 4,
@@ -1693,6 +1728,52 @@ describe("structured chat actions", () => {
       state: "started",
       turnMetadata: metadata
     });
+  });
+
+  it("registers a pending direction before history IO so an early Steer cannot dispatch alongside it", async () => {
+    let releaseHistory!: () => void;
+    const heldHistory = new Promise<void>((resolve) => { releaseHistory = resolve; });
+    const tracker = () => ({ received: vi.fn(), completed: vi.fn(), terminal: vi.fn(), detached: vi.fn(), close: vi.fn() });
+    const firstTracker = tracker(), nextTracker = tracker();
+    const directions = { begin: vi.fn(async (_brainId: string, turnId: string) => {
+      if (turnId === "turn-pending-history") { await heldHistory; return firstTracker; }
+      return nextTracker;
+    }) };
+    const service = { chat: vi.fn<ActionChatService["chat"]>(async (_brainId, _input) => chatResult("Only the latest direction reached the native boundary.")), steerChat: vi.fn() };
+    const tools = { execute: vi.fn(), cancel: vi.fn(() => 0) };
+    const controller = new ChatActionController(service, tools, { start: vi.fn() });
+    controller.setSteerDirections(directions as unknown as SteerDirectionsService);
+    const stream: ChatStreamEvent[] = [];
+    controller.on("stream", (event) => stream.push(event));
+    const pending = controller.send("brain-pending-history", "  Older pending direction  ", undefined, "turn-pending-history", {
+      kind: "steer", replacesTurnId: "earlier-finished-turn", source: "human", createdAt: "2026-10-18T12:00:00.000Z"
+    });
+    const yielded = expect(pending).rejects.toMatchObject({ code: -32801 });
+    await vi.waitFor(() => expect(directions.begin).toHaveBeenCalledOnce());
+    await expect(controller.send("brain-pending-history", "Do not submit twice", undefined, "turn-pending-history"))
+      .rejects.toThrow("already active");
+
+    const latest = controller.send("brain-pending-history", "Use the newer direction", undefined, "turn-latest-direction", {
+      kind: "steer", replacesTurnId: "turn-pending-history", source: "human", createdAt: "2026-10-18T12:00:01.000Z"
+    });
+    await vi.waitFor(() => expect(stream).toContainEqual(expect.objectContaining({
+      type: "chat-state", turnId: "turn-latest-direction", state: "queued",
+      queue: expect.objectContaining({ queuedBehind: expect.objectContaining({ turnId: "turn-pending-history" }) })
+    })));
+    expect(service.chat).not.toHaveBeenCalled();
+    expect(service.steerChat).not.toHaveBeenCalled();
+    releaseHistory();
+    await yielded;
+    await latest;
+
+    expect(service.chat).toHaveBeenCalledOnce();
+    expect(service.chat.mock.calls[0]?.[1]).toBe("Use the newer direction");
+    expect(firstTracker.terminal).toHaveBeenCalledWith("steered");
+    expect(firstTracker.close).toHaveBeenCalledOnce();
+    expect(nextTracker.completed).toHaveBeenCalledOnce();
+    expect(nextTracker.close).toHaveBeenCalledOnce();
+    expect(tools.execute).not.toHaveBeenCalled();
+    expect(tools.cancel).not.toHaveBeenCalled();
   });
 
   it("hands an active Steer turn to the same warm runtime after its predecessor settles", async () => {

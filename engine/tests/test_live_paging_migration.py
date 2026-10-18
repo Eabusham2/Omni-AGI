@@ -46,8 +46,10 @@ class LivePagingMigrationTests(unittest.TestCase):
             self.memory.assembly_vectors.link(assembly)
 
     def test_migration_uses_one_shared_cache_and_paged_views(self) -> None:
+        from omni_core.weighted_vsa_row import CONTACT
+        self.memory.neuron_vectors.set_connection_state("assembly-1", bytes([0x93]) + bytes(15), CONTACT.pack(2, 0x54, 0x12))
         original_rows = {
-            identifier: self.memory.neuron_vectors.packed_row(identifier)
+            identifier: self.memory.neuron_vectors.row_payload(identifier)
             for identifier in self.memory.neurons
         }
         result = migrate_live_substrate_to_paged(self.memory, self.cache)
@@ -61,7 +63,8 @@ class LivePagingMigrationTests(unittest.TestCase):
         self.assertIs(self.memory.assembly_vectors.backing, self.memory.neuron_vectors)
         self.assertEqual(list(self.memory.assemblies)[-1]["id"], "assembly-6")
         for identifier, packed in original_rows.items():
-            self.assertEqual(self.memory.neuron_vectors.packed_row(identifier), packed)
+            self.assertEqual(self.memory.neuron_vectors.row_payload(identifier), packed)
+        self.assertEqual(self.memory.assemblies.index.get_weighted_vector("assembly-1"), original_rows["assembly-1"])
         self.assertFalse((self.cache / ".live-paged-staging").exists())
         receipt = json.loads(
             (self.cache / "live-paged" / "receipt.json").read_text("utf-8")

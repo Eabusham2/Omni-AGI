@@ -25,7 +25,10 @@ describe("UI visual integrity", () => {
     expect(styles).toContain("--graph-edge-positive:");
     expect(styles).toMatch(/\.pathway-pagination\s*\{[^}]*position:\s*static;/s);
     expect(styles).toMatch(/@media \(max-width: 760px\)[\s\S]*?\.map-viewport-controls button\s*\{[^}]*min-height:\s*36px;/);
-    expect(app).toContain('"graph-edge",');
+    const graph = readFileSync(resolve(process.cwd(), "src/renderer/src/BrainMapSubstrateGraph.tsx"), "utf8");
+    expect(graph).toContain('className={`graph-edge ${');
+    expect(graph).toContain('"graph-edge--negative"');
+    expect(graph).toContain('"graph-edge--positive"');
     expect(app).toContain('className="map-viewport-controls pathway-pagination"');
   });
 

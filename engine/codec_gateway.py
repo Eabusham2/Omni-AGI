@@ -39,6 +39,7 @@ class CodecOwner:
 
 
 _SCOPE = ContextVar("codec_runtime_owner", default=None)
+_PINNED = ContextVar("private_pinned_codec_runtime", default=None)
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 CODEC_PURPOSES = frozenset({"decode-live-audio", "decode-audio", "decode-video", "inspect-video-audio", "encode-video"})
 
@@ -78,6 +79,21 @@ class CodecRuntimeGateway:
     def current_owner(self):
         scope = _SCOPE.get()
         return scope[1] if scope is not None and scope[0] is self else None
+
+    @contextmanager
+    def pinned_scope(self, owner, cancelled, configuration):
+        """An internal private replay may reverify, never install or prompt.
+
+        The exact already-selected runtime remains pinned until the lease is
+        released. This is not external executable/path approval authority.
+        """
+        with self.condition:
+            if self.selected_configuration != configuration or not self.selected_path:
+                raise CodecRuntimeUnavailable("private media codec selection changed")
+        token = _PINNED.set((self, copy.deepcopy(configuration)))
+        try:
+            with self.scope(owner, cancelled): yield
+        finally: _PINNED.reset(token)
 
     def resolve(self, params):
         required = {"challengeId", "requestId", "brainId", "jobId", "streamId", "actionId", "outcome"}
@@ -140,6 +156,9 @@ class CodecRuntimeGateway:
         if cancelled():
             raise CodecRuntimeCancelled("codec use was cancelled before setup")
         with self.condition:
+            pinned = _PINNED.get()
+            if pinned is not None and (pinned[0] is not self or pinned[1] != self.selected_configuration or not self.selected_path):
+                raise CodecRuntimeUnavailable("private media cannot provision or replace its pinned codec")
             if not self.selected_path:
                 external = self.resolve_external(self.environment)
                 if external:
@@ -181,6 +200,9 @@ class CodecRuntimeGateway:
         with self.condition:
             if effective_cancelled():
                 raise CodecRuntimeCancelled("codec use was cancelled before its side effect")
+            pinned = _PINNED.get()
+            if pinned is not None and (pinned[0] is not self or pinned[1] != self.selected_configuration or not self.selected_path):
+                raise CodecRuntimeUnavailable("private media pinned codec changed before its actual lease")
             path = self.selected_path
             self.leases[path] = self.leases.get(path, 0) + 1
         try:

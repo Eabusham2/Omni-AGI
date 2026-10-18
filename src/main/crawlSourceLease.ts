@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { hashFile } from "./dataIngestion";
+import type { WebDateEvidence } from "../shared/learning";
 
 export interface CrawlSourceLease {
   schemaVersion: 1;
@@ -13,6 +14,8 @@ export interface CrawlSourceLease {
   bytes: number;
   path: string;
   metadataPath: string;
+  publication?: WebDateEvidence;
+  fetchedAt?: string;
 }
 
 /** Active source bytes are immutable until their neural/repository commit. */
@@ -25,6 +28,8 @@ export async function acquireCrawlSourceLease(input: {
   extension: string;
   text?: string;
   sourcePath?: string;
+  publication?: WebDateEvidence;
+  fetchedAt?: string;
 }): Promise<CrawlSourceLease> {
   const identity = createHash("sha256").update(input.url).digest("hex");
   const metadataPath = join(input.directory, `${identity}.lease.json`);
@@ -65,6 +70,8 @@ export async function acquireCrawlSourceLease(input: {
       schemaVersion: 1, url: input.url, kind: input.kind,
       contentHash: input.contentHash, contentType: input.contentType,
       file, bytes: sourceInfo.size,
+      ...(input.publication ? { publication: input.publication } : {}),
+      ...(input.fetchedAt ? { fetchedAt: input.fetchedAt } : {}),
     };
     const temporary = `${metadataPath}.tmp-${randomUUID()}`;
     await writeFile(temporary, `${JSON.stringify(stored)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });

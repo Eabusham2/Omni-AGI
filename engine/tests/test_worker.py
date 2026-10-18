@@ -1350,13 +1350,13 @@ class WorkerProtocolTests(unittest.TestCase):
 
     def test_gpu_profiles_select_available_backend_without_overriding_explicit_device(self):
         worker = Worker()
-        with patch("worker.torch.cuda.is_available", return_value=True):
+        with patch("worker.torch.cuda.is_available", return_value=True), patch.object(worker, "_mps_available", return_value=False):
             selected = worker._builder_config({"hardwareTier": "gpu"}, {})
-        self.assertEqual(selected["device"], "cuda")
+        self.assertEqual(selected["device"], "cpu")
 
         with patch("worker.torch.cuda.is_available", return_value=False), patch.object(
             worker, "_mps_available", return_value=True
-        ), patch.object(worker, "_directml_available", return_value=True):
+        ), patch.object(worker, "_directml_available", return_value=True), patch("worker.torch.mps.compile_shader", create=True):
             selected = worker._builder_config({"hardwareTier": "gpu"}, {})
         self.assertEqual(selected["device"], "mps")
 
@@ -1366,13 +1366,15 @@ class WorkerProtocolTests(unittest.TestCase):
             worker, "_directml_available", return_value=True
         ):
             selected = worker._builder_config({"hardwareTier": "workstation"}, {})
-        self.assertEqual(selected["device"], "directml")
+        self.assertEqual(selected["device"], "cpu")
 
         with patch("worker.torch.cuda.is_available", return_value=True):
             selected = worker._builder_config(
                 {"hardwareTier": "gpu"}, {"device": "cpu"}
             )
         self.assertEqual(selected["device"], "cpu")
+        self.assertEqual(worker._builder_config({"hardwareTier": "gpu"}, {"device": "cuda:1"})["device"], "cuda:1")
+        worker.shutdown({}, "shutdown")
 
     def test_jsonrpc_health_create_state_and_shutdown(self):
         worker = Worker()

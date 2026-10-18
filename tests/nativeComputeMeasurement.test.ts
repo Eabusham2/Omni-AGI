@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import {
   createNativeComputeMeasurementCollector, validateNativeProjectionComputeProfile,
+  NATIVE_COMPUTE_TENSOR_BUDGET, NATIVE_COMPUTE_ADMITTED_BYTES, NATIVE_COMPUTE_KERNEL_REVISION,
   type NativeProjectionComputeProfile
 } from "../src/main/nativeComputeMeasurement";
 import { balancedMeasuredNativeArchitectureProfile, capacityDerivedNativeArchitectureProfile,
@@ -14,13 +15,16 @@ const gib = 1024 ** 3;
 const date = "2026-09-30T12:00:00.000Z";
 function measurement(medianRunMicroseconds = 1000): NativeProjectionComputeProfile {
   return {
-    format: "omni-bounded-packed-projection-compute-profile", formatVersion: 1,
+    format: "omni-bounded-packed-projection-compute-profile", formatVersion: 2,
     measuredAt: date, requestedDevice: "cpu", actualDevice: "cpu",
     kernel: "omni_core.model._packed_ternary_forward",
-    kernelRevision: "float32-activity-int8-quantization-packed-rows-integer-dispatch-v1",
-    activityDtype: "float32", packedDtype: "uint8", quantizedActivityDtype: "int8", integerResultDtype: "int32", intermediateAccumulationDtypeVerified: false, outputDtype: "float32",
-    activityRows: 8, inputFeatures: 64, outputFeatures: 64, sampleTensorBytes: 5124,
-    scratchReserveBytes: 1048576, admittedBytes: 1053700, runs: 4, projectionMacsPerRun: 32768,
+    kernelRevision: NATIVE_COMPUTE_KERNEL_REVISION,
+    activityDtype: "float32", packedDtype: "uint8", quantizedActivityDtype: "int8", integerResultDtype: "int64", intermediateAccumulationDtypeVerified: false, outputDtype: "float32",
+    connectionStateDtype: "uint8", connectionStateEncoding: "strength-low4-resistance-high4",
+    repeatedContacts: 0, repeatedContactPages: 0, repeatedContactTimingMeasured: false,
+    activityRows: 8, inputFeatures: 64, outputFeatures: 64, ...NATIVE_COMPUTE_TENSOR_BUDGET,
+    scratchReserveBytes: 1048576, admittedBytes: NATIVE_COMPUTE_ADMITTED_BYTES, runs: 4, projectionMacsPerRun: 32768,
+    tensorReserveIsExactPeak: false, resourceByteBasis: "known-forward-tensors-plus-allocator-initialization-reserve",
     medianRunMicroseconds, projectionMacsPerSecond: Math.floor(32768 * 1_000_000 / medianRunMicroseconds),
     elapsedMicroseconds: medianRunMicroseconds * 4, fallbackReason: null,
     samplingBudgetMicroseconds: 250000, hardWallClockDeadline: false,
@@ -104,7 +108,7 @@ describe("trusted optional actual packed-primitive profiling, without probes", (
     const physical = capacityDerivedNativeArchitectureProfile(input);
     expect(fast.dModel).toBeGreaterThan(slow.dModel);
     expect(fast.dModel).toBeLessThan(physical.dModel);
-    expect(fast.nativeArchitecture?.inventory).toEqual(nativeCoreInventory(fast.nativeArchitecture!.shape));
+    expect(fast.nativeArchitecture?.inventory).toEqual(nativeCoreInventory(fast.nativeArchitecture!.shape, "block-sparse-v1"));
     expect(fast.nativeArchitecture?.sizing).toMatchObject({ isAutomaticDefault: false, qualityOptimizationVerified: false,
       neuralTokensPerSecondMeasured: false, sourceCorpusTimeEstimated: false,
       selectionMode: "balanced-measured-primitive-candidate", mainSelectedPrimitiveWorkBudgetMicroseconds: 100000 });

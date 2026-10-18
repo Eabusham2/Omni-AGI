@@ -37,7 +37,8 @@ function mediaFields(value: Record<string, unknown> | null): {
         : "";
   return {
     // Embedded media bypasses Electron's custom-scheme audio/video data pipe.
-    // Keep the opaque capability as the preferred download for persisted files.
+    // The opaque capability is preferred when present; it does not itself
+    // prove persistence because spontaneous output also uses an expiring URL.
     sourceUrl: dataUrl ?? mediaUrl,
     downloadUrl: mediaUrl ?? dataUrl,
     mimeType,
@@ -52,7 +53,9 @@ export interface ImaginationMediaPresentation {
   artifactPath: string;
   finalArtifactPath: string;
   isFinal: boolean;
+  hasFinalArtifact: boolean;
   isLiveRevision: boolean;
+  artifactRetention?: "ephemeral-spontaneous";
   revision?: number;
   progress?: number;
   statusLabel: string;
@@ -150,7 +153,11 @@ export function imaginationMediaPresentation(
     artifactPath: selected.artifactPath,
     finalArtifactPath: complete ? finalMedia.artifactPath : "",
     isFinal: complete,
+    hasFinalArtifact: useFinalMedia,
     isLiveRevision: Boolean(preview) && !complete,
+    ...(output?.artifactRetention === "ephemeral-spontaneous"
+      ? { artifactRetention: "ephemeral-spontaneous" as const }
+      : {}),
     revision: preview?.revision,
     progress: complete ? 1 : preview?.progress,
     statusLabel: complete

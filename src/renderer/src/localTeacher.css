@@ -1,0 +1,18 @@
+.local-teacher { min-width:0; padding:16px; color:var(--text-1); }
+.local-teacher > summary { font-weight:600; cursor:pointer; }
+.local-teacher__body { display:flex; flex-direction:column; gap:12px; padding-top:12px; min-width:0; }
+.local-teacher label { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.local-teacher p { margin:0; overflow-wrap:anywhere; line-height:1.5; }
+.local-teacher :is(input,select,textarea) { width:100%; min-width:0; box-sizing:border-box; color:var(--text-1); background:var(--panel); border:1px solid var(--border-bright); border-radius:var(--control-radius); padding:9px; font:inherit; }
+.local-teacher textarea { resize:vertical; }
+.local-teacher__row { display:flex; flex-wrap:wrap; gap:8px; align-items:end; }
+.local-teacher__row > label { flex:1 1 180px; }
+.local-teacher__fit { display:flex; flex-direction:column; gap:8px; min-width:0; }
+.local-teacher :is(li,span,code,small,summary) { overflow-wrap:anywhere; }
+.local-teacher__fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-block:10px; }
+.local-teacher__jobs { display:flex; flex-direction:column; list-style:none; gap:8px; padding:0; margin-block:10px; }
+.local-teacher__jobs li { display:flex; flex-wrap:wrap; gap:6px; }
+.local-teacher__jobs li > button:first-child { flex:1 1 200px; display:flex; flex-direction:column; align-items:start; white-space:normal; text-align:start; }
+.local-teacher__prompt { white-space:pre-wrap; }
+.local-teacher [role="alert"] { color:var(--danger); }
+@media(max-width:520px) { .local-teacher__fields { grid-template-columns:1fr; } }

@@ -246,7 +246,7 @@ describe("browser live voice adapters", () => {
     expect(chat.cancel).toHaveBeenCalledWith("brain", "voice-one");
   });
 
-  it("opens a persistent same-brain neural microphone stream without relabeling it as ASR or TTS", async () => {
+  it("uses the owned raw capture/chat path without the old assisted STT observation stream", async () => {
     const handleStop = vi.fn(async () => undefined);
     const handle: LivePerceptionCaptureHandle = {
       getCapture: () => ({
@@ -272,7 +272,7 @@ describe("browser live voice adapters", () => {
     const startObservation = vi.fn(async () => observationSession());
     const cancelObservation = vi.fn(async () => observationSession("cancelled"));
     const modality = {
-      capabilities: vi.fn(async () => neuralCapabilities()),
+      capabilities: vi.fn(async () => neuralCapabilities({ audioRegionAvailable: true })),
       startObservation,
       pushObservation: vi.fn(),
       stopObservation: vi.fn(async () => observationSession("stopped")),
@@ -281,30 +281,35 @@ describe("browser live voice adapters", () => {
       resolveObservationControl: vi.fn(),
       onObservation: vi.fn(() => () => undefined)
     } as unknown as OmniApi["modality"];
-    const adapter = createOmniNeuralAudioAdapter(modality, capture);
+    const chat = { audioInputCapabilities: vi.fn(async () => ({ brainId: "brain-neural", loaded: true, available: true, transcriptRequired: false })),
+      sendAudio: vi.fn() } as unknown as OmniApi["chat"];
+    const nativeCapture = { available: true, start: vi.fn(async (authorize: (rate: number) => Promise<import("../src/renderer/src/nativeAudioCapture").NativeAudioCaptureAuthorization>) => {
+      const lease = await authorize(48000);
+      return { stop: () => { handleStop(); void lease.stop(); } };
+    }) };
+    const adapter = createOmniNeuralAudioAdapter(modality, capture, { chat, nativeCapture });
 
     await expect(adapter.inspect("brain-neural")).resolves.toMatchObject({
       listening: true,
+      nativeAudioChatInput: true,
       voice: false
     });
-    const session = await adapter.startListening("brain-neural");
+    const session = await adapter.startListening("brain-neural", { onSpeechStart: vi.fn(), onFinalAudio: vi.fn(), onError: vi.fn() });
     expect(startObservation).toHaveBeenCalledWith(
       expect.objectContaining({
         brainId: "brain-neural",
         modalities: ["audio"],
-        retention: "neural",
+        retention: "working",
         permission: expect.objectContaining({ source: "microphone" })
       })
     );
-    expect(capture.open).toHaveBeenCalledWith(
-      "microphone",
-      expect.objectContaining({ realtime: true })
-    );
-    expect(handle.start).toHaveBeenCalledOnce();
+    expect(capture.open).not.toHaveBeenCalled();
+    expect(modality.pushObservation).not.toHaveBeenCalled();
+    expect(nativeCapture.start).toHaveBeenCalledOnce();
 
     session.stop();
     await vi.waitFor(() =>
-      expect(cancelObservation).toHaveBeenCalledWith("neural-listening-session")
+      expect(modality.stopObservation).toHaveBeenCalledWith("neural-listening-session")
     );
     expect(handleStop).toHaveBeenCalledOnce();
   });
@@ -324,7 +329,8 @@ describe("browser live voice adapters", () => {
     });
 
     await expect(adapter.inspect("brain-neural")).resolves.toMatchObject({
-      listening: true,
+      listening: false,
+      nativeAudioChatInput: false,
       voice: false
     });
     expect(adapter.synthesis).toBeUndefined();

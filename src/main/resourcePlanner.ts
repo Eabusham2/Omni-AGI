@@ -19,6 +19,12 @@ import {
   groundUpArchitectureProfile,
   type GroundUpArchitectureProfile
 } from "./omniArchitectureProfile";
+import { nativeCoreInventory, packedOwnerMetadataReserve, packedLearningScratchBytes } from "./nativeCoreInventory";
+import { nativeCheckpointMemory, type SavedTensorShape } from "./nativeCheckpointMemory";
+import { connectedResourceProfile, type NativeContextGeometry } from "./connectedResourceProfile";
+import { authorizedSpillCapacity } from "./authorizedSpillCapacity";
+import { planDeviceResources, validateDeviceResourceSettings } from "./deviceResourcePlan";
+import type { AuthorizedSpillStorageSnapshot, DeviceResourceSettings, DeviceResourceTopology } from "../shared/deviceResources";
 import {
   validateNativeProjectionComputeProfile,
   type NativeComputeMeasurementCollector,
@@ -73,6 +79,9 @@ export interface ResourcePlannerDependencies {
   now?: () => Date;
   /** Explicit main hardware-profiling dependency; never a renderer override. */
   measurementCollector?: NativeComputeMeasurementCollector;
+  deviceTopology?: (settings: DeviceResourceSettings) => Promise<DeviceResourceTopology>;
+  spillCapacity?: (settings: DeviceResourceSettings, topology: DeviceResourceTopology,
+    context: { brainId?: string; selectionId?: string }) => Promise<AuthorizedSpillStorageSnapshot>;
 }
 
 export function parseLinuxMemoryInfo(text: string): {
@@ -367,17 +376,24 @@ function prospectiveGroundUpWorkingMemoryItems(
 }
 
 export function planWorkingMemory(input: {
+  spillStorage?: AuthorizedSpillStorageSnapshot;
+  allowStorageSpill?: boolean;
   request: WorkingMemoryPlanRequest;
   resources: ResourceSnapshot;
   benchmark: StorageBenchmark;
   hardwareTier: HardwareTier;
   modelBytes: number;
+  /** Host-only module/registry/cache allowance; it is not checkpoint payload. */
+  runtimeMetadataReserveBytes?: number;
   /** Exact project-owned architecture accounting for a new native build. */
   architectureProfile?: GroundUpArchitectureProfile;
   acceleratorAvailable?: boolean;
   modelContextLimitTokens?: number;
   modelHiddenSize?: number;
   modelLayers?: number;
+  modelContextGeometry?: NativeContextGeometry;
+  maximumNativeBufferBytes?: number;
+  modelUpdateScratchBytes?: number;
   /** Saved learned latent geometry, independent of runtime context mode. */
   modelWorkspaceSlots?: number;
   fixedWorkingMemoryItems?: number;
@@ -401,7 +417,10 @@ export function planWorkingMemory(input: {
     )
   };
   const modelBytes = safeWhole(input.modelBytes);
+  const runtimeMetadataReserveBytes = safeWhole(input.runtimeMetadataReserveBytes ?? 0);
   const admissionScope = input.admissionScope ?? "capacity";
+  const allowStorageSpill = input.allowStorageSpill !== false;
+  const selectedDrives = input.spillStorage;
   const diskReserveBytes = adaptiveDiskReserve({
     platform: platform(),
     diskTotalBytes: resources.diskTotalBytes,
@@ -422,7 +441,7 @@ export function planWorkingMemory(input: {
   // Runtime residency is based on packed ternary learned weights plus a
   // conservative metadata reserve, never a full-precision learned mirror.
   const modelWorkingSetBytes = Math.ceil(
-    (architectureProfile?.residentInferenceStateBytes ?? modelBytes) *
+    (architectureProfile?.residentInferenceStateBytes ?? (modelBytes + runtimeMetadataReserveBytes)) *
       MODEL_WORKING_SET_RATIO
   );
   const ramReserveBytes = adaptiveRamReserve(resources.totalMemoryBytes);
@@ -450,13 +469,13 @@ export function planWorkingMemory(input: {
     1,
     safeWhole(input.modelHiddenSize ?? contextShape.hiddenSize)
   );
-  const modelLayers = Math.max(
+  const modelLayers = input.modelContextGeometry?.attentionLayers ?? Math.max(
     1,
     safeWhole(input.modelLayers ?? contextShape.layers)
   );
   // Packed learned weights are ternary; attention activations are float32.
   // Two K/V arrays per layer are paged independently from transient tiles.
-  const estimatedKvActivationBytesPerToken = modelLayers * modelHiddenSize * 8;
+  const estimatedKvActivationBytesPerToken = input.modelContextGeometry?.kvBytesPerToken ?? modelLayers * modelHiddenSize * 8;
   const residentTokenBytesPerToken = 96;
   // Conservative Python descriptor/path/checksum allowance, not tensor bytes.
   // The worker coalesces incremental tails into bounded 256-token pages.
@@ -464,7 +483,9 @@ export function planWorkingMemory(input: {
   let contextMetadataBytesPerToken = Math.ceil(2048 * 2 * modelLayers / pageTokens);
   let residentIndexBytesPerToken = residentTokenBytesPerToken + contextMetadataBytesPerToken;
   const workspaceSlots = input.modelWorkspaceSlots ?? architectureProfile?.workspaceLatents ?? 8;
-  let workspaceResidentBytes = Math.ceil(4 * workspaceSlots * (2 * modelHiddenSize + 1));
+  let workspaceResidentBytes = input.modelContextGeometry
+    ? input.modelContextGeometry.workspaceStateBytes + input.modelContextGeometry.connectedActivityBytes
+    : Math.ceil(4 * workspaceSlots * (2 * modelHiddenSize + 1));
   const modelContextLimitTokens = Math.max(
     8,
     safeWhole(
@@ -482,9 +503,10 @@ export function planWorkingMemory(input: {
     ? Math.max(
         8 * MIB,
         architectureProfile.residentInferenceStateBytes +
-          architectureProfile.packedUpdateScratchBytes
+          architectureProfile.packedUpdateScratchBytes + (architectureProfile.packedForwardTensorReserveBytes ?? 0)
       )
-    : Math.max(512 * MIB, Math.ceil(modelBytes * 1.5) + 128 * MIB);
+    : Math.max(512 * MIB, Math.ceil(modelBytes * 1.5) + 128 * MIB,
+        modelBytes + (input.modelUpdateScratchBytes ?? 0) + 128 * MIB) + runtimeMetadataReserveBytes;
   const fullFoundationRuntimeBytes =
     Math.max(modelWorkingSetBytes, estimatedResidentModelBytes) +
     BASE_RUNTIME_MEMORY_BYTES;
@@ -492,19 +514,25 @@ export function planWorkingMemory(input: {
     ? Math.max(
         8 * MIB,
         architectureProfile.fixedControlBufferReserveBytes +
+          architectureProfile.pythonOwnerMetadataReserveBytes +
           architectureProfile.packedMetaplasticityReserveBytes +
           architectureProfile.packedWorkspaceTableBytes +
+          architectureProfile.workspaceConnectionStateBytes +
           architectureProfile.packedUpdateScratchBytes +
+          (architectureProfile.packedForwardTensorReserveBytes ?? 0) +
           Math.ceil(
-            (architectureProfile.packedTernaryWeightBytes -
-              architectureProfile.packedWorkspaceTableBytes) /
+            (architectureProfile.packedLearnedStateBytes -
+              architectureProfile.packedWorkspaceTableBytes - architectureProfile.workspaceConnectionStateBytes) /
               Math.max(1, architectureProfile.layers)
-          )
+          ),
+        architectureProfile.maximumProjectionBytes + architectureProfile.packedUpdateScratchBytes +
+          (architectureProfile.packedForwardTensorReserveBytes ?? 0) +
+          architectureProfile.fixedControlBufferReserveBytes + architectureProfile.pythonOwnerMetadataReserveBytes
       )
-    : Math.max(
+    : Math.max(input.modelUpdateScratchBytes ?? 0,
         192 * MIB,
-        Math.min(512 * MIB, Math.floor(estimatedResidentModelBytes / 4))
-      );
+        Math.min(512 * MIB, Math.floor((estimatedResidentModelBytes - runtimeMetadataReserveBytes) / 4))
+      ) + runtimeMetadataReserveBytes;
   const minimumFoundationContextTokens = Math.min(
     256,
     modelContextLimitTokens
@@ -512,30 +540,15 @@ export function planWorkingMemory(input: {
   const minimumContextWorkspaceBytes = Math.max(8 * MIB,
     workspaceResidentBytes + minimumFoundationContextTokens *
       (estimatedKvActivationBytesPerToken + residentIndexBytesPerToken));
-  const contextFloorWorkspaceBytes = Math.max(
-    minimumContextWorkspaceBytes,
-    workspaceResidentBytes + contextFloorTokens *
-      (estimatedKvActivationBytesPerToken + residentIndexBytesPerToken)
-  );
   // Slow storage receives more of the already-safe RAM pool so Auto avoids
-  // paging. This is still bounded by the OS reserve and the live free pool.
+  // paging. Current external pressure is separate from this saved ceiling.
   const autoBaseSharePercent =
     AUTO_SYSTEM_RAM_SHARE_BY_TIER[hardwareTier] +
-    (storageClass === "slow-storage" ? 10 : storageClass === "moderate-storage" ? 5 : 0);
-  const autoFoundationSharePercent = safeRamPoolBytes > 0
-    ? Math.ceil(
-      (
-        fullFoundationRuntimeBytes + contextFloorWorkspaceBytes
-      ) * 100 /
-        safeRamPoolBytes
-    )
-    : 100;
-  // Auto can expand to fit the actual packed foundation and runtime while it
-  // remains inside the safe pool. A user-selected manual cap stays exact.
-  const autoSystemRamSharePercent = Math.min(
-    90,
-    Math.max(autoBaseSharePercent, autoFoundationSharePercent)
-  );
+    (benchmark.storageBytesPerSecond > 0 ? storageClass === "slow-storage" ? 10 : storageClass === "moderate-storage" ? 5 : 0 : 0);
+  // Same base policy as ResourcePolicy._adaptive_system_ram_share. Model size
+  // cannot silently increase the selected RAM ceiling; use admitted paging or
+  // an explicit revised allocation when the packed model is larger.
+  const autoSystemRamSharePercent = Math.min(90, autoBaseSharePercent);
   const manualSystemShareValid =
     request.systemRamMode !== "manual" ||
     (typeof requestedSystemShare === "number" &&
@@ -574,8 +587,12 @@ export function planWorkingMemory(input: {
   residentIndexBytesPerToken = residentTokenBytesPerToken + contextMetadataBytesPerToken;
   const querySlotsPerChunk = Math.max(1, Math.min(256, workspaceSlots,
     Math.floor(transferBudgetBytes / Math.max(1, 64 * modelHiddenSize))));
-  workspaceResidentBytes += Math.ceil(workspaceSlots / querySlotsPerChunk) * 8192 + 4096 * modelLayers;
-  const diskBlockSizeBytes = Math.max(4096, safeWhole(resources.diskBlockSizeBytes ?? 16384));
+  const queryChunks = input.modelContextGeometry ? input.modelContextGeometry.leaves.reduce((sum, leaf) => sum
+    + Math.ceil(leaf.workspaceSlots / Math.max(1, Math.min(256, leaf.workspaceSlots, Math.floor(transferBudgetBytes / Math.max(1, 64 * leaf.width))))), 0)
+    : Math.ceil(workspaceSlots / querySlotsPerChunk);
+  workspaceResidentBytes += queryChunks * 8192 + 4096 * modelLayers;
+  const defaultDiskUnit = Math.max(platform() === "win32" ? 65536 : 4096, safeWhole(resources.diskBlockSizeBytes ?? 16384));
+  const diskBlockSizeBytes = selectedDrives?.groups.reduce((largest, group) => Math.max(largest, group.allocationUnitBytes), defaultDiskUnit) ?? defaultDiskUnit;
   const pagedKvBytesPerToken = estimatedKvActivationBytesPerToken + Math.ceil(2 * modelLayers * diskBlockSizeBytes / pageTokens);
   const plannedResidentModelBytes = Math.min(estimatedResidentModelBytes,
     Math.max(minimumLayerResidencyBytes, Math.floor(residualRamBytes * 0.55)));
@@ -597,15 +614,23 @@ export function planWorkingMemory(input: {
   const plannedModelSpillBytes = Math.max(0, estimatedResidentModelBytes - plannedResidentModelBytes);
   const plannedCoreScratchBytes = plannedModelSpillBytes > 0
     ? Math.max(64 * MIB, Math.ceil(plannedModelSpillBytes * 1.25) + 8 * MIB) : 0;
-  const maximumStoragePoolBytes = Math.max(0, resources.diskFreeBytes - diskReserveBytes);
+  const primaryPoolCapacityBytes = Math.max(0, resources.diskFreeBytes - diskReserveBytes);
+  // Only locally authorized, physically distinct groups add placement capacity.
+  // The primary drive still owns all checkpoints, origins and persistent data.
+  const maximumStoragePoolBytes = safeWhole(primaryPoolCapacityBytes + (selectedDrives?.groups
+    .filter((group) => !group.primaryVolume).reduce((total, group) => total + group.ceilingBytes, 0) ?? 0));
   const storagePoolMode = request.storagePoolMode ?? "auto";
   const requestedStoragePoolText = positiveIntegerText(request.storagePoolBytes);
   const boundedStoragePoolCapacity = storagePoolMode === "manual"
     ? Math.min(maximumStoragePoolBytes, safeWhole(Number(requestedStoragePoolText ?? 0)))
     : maximumStoragePoolBytes;
-  const contextSpillCapacityBytes = Math.max(0, boundedStoragePoolCapacity
-    - (admissionScope === "existing-runtime" ? checkpointHeadroomBytes
-      : fixedBuildWriteBytes + trainingScratchBytes + baseGrowthHeadroomBytes + plannedCoreScratchBytes));
+  const primaryRequiredBytes = admissionScope === "existing-runtime" ? checkpointHeadroomBytes
+    : fixedBuildWriteBytes + trainingScratchBytes + baseGrowthHeadroomBytes;
+  const selectedDriveCapacity = selectedDrives ? authorizedSpillCapacity(selectedDrives, {
+    selectedPoolBytes: boundedStoragePoolCapacity, primaryRequiredBytes
+  }) : undefined;
+  const contextSpillCapacityBytes = allowStorageSpill ? Math.max(0,
+    (selectedDriveCapacity?.capacityBytes ?? (boundedStoragePoolCapacity - primaryRequiredBytes)) - plannedCoreScratchBytes) : 0;
   const contextResidentWorkingBytes = Math.max(0, contextResidentBudgetBytes - workspaceResidentBytes);
   const storageBackedContextMaximumTokens = Math.min(modelContextLimitTokens,
     safeWhole(contextResidentWorkingBytes / Math.max(1, residentIndexBytesPerToken)),
@@ -672,7 +697,7 @@ export function planWorkingMemory(input: {
   const selectedContextSpillBytes = Math.max(0, selectedContextKvBytes - selectedContextKvResidentBytes);
   // Reserve backing for the whole declared window so live RAM pressure can
   // demote its cold pages without silently shrinking the saved context.
-  const contextOffloadBudgetBytes = selectedContextTokens * pagedKvBytesPerToken;
+  const contextOffloadBudgetBytes = allowStorageSpill ? selectedContextTokens * pagedKvBytesPerToken : 0;
   const selectedContextResidentBytes = workspaceResidentBytes + selectedContextIndexBytes + selectedContextKvResidentBytes;
   const residentModelBytes = plannedResidentModelBytes;
   const residentFoundationBytes =
@@ -695,11 +720,13 @@ export function planWorkingMemory(input: {
     0,
     safeRamBytes - residentFoundationBytes - selectedContextResidentBytes - transferBudgetBytes
   );
-  const diskForPagedMemoryBytes = Math.max(
+  const primaryEphemeralBytes = !selectedDrives || selectedDrives.groups.some((group) => group.primaryVolume)
+    ? modelOffloadScratchBytes + contextOffloadBudgetBytes : 0;
+  const diskForPagedMemoryBytes = allowStorageSpill ? Math.max(
     0,
     Math.min(usableDiskAfterReserveBytes, boundedStoragePoolCapacity - fixedBuildWriteBytes)
-      - modelOffloadScratchBytes - contextOffloadBudgetBytes - trainingScratchBytes - baseGrowthHeadroomBytes
-  );
+      - primaryEphemeralBytes - trainingScratchBytes - baseGrowthHeadroomBytes
+  ) : 0;
   const residentItems = safeWhole(
     residentMemoryBytes / ramBytesPerMemoryItem
   );
@@ -772,12 +799,12 @@ export function planWorkingMemory(input: {
       modelBytes: initialModelWriteBytes,
       checkpointBytes: checkpointWriteBytes,
       maximumWorkingMemorySpillBytes:
-        admissionScope === "existing-runtime" ? 0 : memorySpillBytes + contextOffloadBudgetBytes,
+        admissionScope === "existing-runtime" ? 0 : memorySpillBytes + (primaryEphemeralBytes > 0 ? contextOffloadBudgetBytes : 0),
       futureGrowthBytes:
         admissionScope === "existing-runtime" ? 0 : futureGrowthHeadroomBytes,
       operationWriteBytes: admissionScope === "existing-runtime"
         ? 0
-        : modelOffloadScratchBytes + trainingScratchBytes
+        : (primaryEphemeralBytes > 0 ? modelOffloadScratchBytes : 0) + trainingScratchBytes
     }
   });
   const minimumStoragePoolBytes = safeWhole(input.minimumStoragePoolBytes ?? 0);
@@ -820,12 +847,12 @@ export function planWorkingMemory(input: {
     diskReserveBytes + (
       admissionScope === "existing-runtime"
         ? checkpointHeadroomBytes
-        : fixedBuildWriteBytes + modelOffloadScratchBytes
+        : fixedBuildWriteBytes + (primaryEphemeralBytes > 0 ? modelOffloadScratchBytes : 0)
     );
   const diskFitsSelection =
     !diskSpace.paused;
   const storagePoolFits = admissionScope === "existing-runtime" || (
-    sharedStoragePoolBytes >= requiredStoragePoolBytes &&
+    Math.max(sharedStoragePoolBytes, selectedDrives?.largestSharedPoolBytes ?? 0) >= requiredStoragePoolBytes &&
     sharedStoragePoolBytes <= maximumStoragePoolBytes
   );
   const manualItemsValid =
@@ -853,6 +880,13 @@ export function planWorkingMemory(input: {
   const enforceContextFloor = input.enforceContextFloor !== false;
   const blockers: string[] = [];
   const warnings: string[] = [];
+  if (!allowStorageSpill && offloadRequired) blockers.push("Storage spill is off. Increase the RAM allocation or enable storage spill before loading this selection.");
+  if (selectedDriveCapacity) {
+    const ephemeralBytes = modelOffloadScratchBytes + contextOffloadBudgetBytes;
+    if (ephemeralBytes > selectedDriveCapacity.currentlyAvailableBytes) blockers.push("Selected spill drives are temporarily occupied or have pending writes. The selected context is retained; free space or wait for those operations to finish.");
+    const largestFile = Math.max(pageTokens * modelHiddenSize * 4, modelSpillBytes > 0 ? input.maximumNativeBufferBytes ?? architectureProfile?.maximumProjectionBytes ?? 0 : 0);
+    if (largestFile > selectedDriveCapacity.largestSingleAllocationBytes) blockers.push("No selected drive can hold the largest native page. Increase one drive's allocation; several drives cannot split one mapped page.");
+  }
   if (!manualSystemShareValid) {
     blockers.push(
       "The Omni RAM cap must be between 30% and 100% of safely available memory."
@@ -1126,6 +1160,8 @@ export function planWorkingMemory(input: {
         contextOffloadBudgetBytes,
         residentContextMaximumTokens,
         contextSpillCapacityBytes,
+        ...(selectedDriveCapacity ? { selectedDriveCapacityBytes: selectedDriveCapacity.capacityBytes,
+          selectedDriveAvailableBytes: selectedDriveCapacity.currentlyAvailableBytes } : {}),
         residentTokenBytesPerToken,
         contextMetadataBytesPerToken,
         workspaceResidentBytes,
@@ -1155,6 +1191,7 @@ export function planWorkingMemory(input: {
           }
         : {}),
       modelWorkingSetBytes,
+      modelMetadataReserveBytes: architectureProfile?.pythonOwnerMetadataReserveBytes ?? runtimeMetadataReserveBytes,
       estimatedResidentModelBytes,
       fullFoundationRuntimeBytes,
       minimumLayerResidencyBytes,
@@ -1329,19 +1366,25 @@ async function boundedStorageBenchmark(root: string, now: Date): Promise<Storage
 
 interface CheckpointModelProfile {
   modelBytes?: number;
+  runtimeMetadataReserveBytes?: number;
   hardwareTier?: HardwareTier;
   modelHiddenSize?: number;
   modelLayers?: number;
   modelWorkspaceSlots?: number;
   workingMemoryItems?: number;
+  modelContextGeometry?: NativeContextGeometry;
+  maximumNativeBufferBytes?: number;
+  modelUpdateScratchBytes?: number;
 }
 
 async function checkpointModelProfile(
   brainDirectory: string
 ): Promise<CheckpointModelProfile> {
   const metadataPath = join(brainDirectory, "engine", "brain.json");
+  let metadataRead = false;
   try {
     const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as {
+      connected_regions?: unknown;
       config?: {
         hardware_tier?: unknown;
         d_model?: unknown;
@@ -1349,6 +1392,7 @@ async function checkpointModelProfile(
         working_memory_slots?: unknown;
       };
     };
+    metadataRead = true;
     const recordedTier = String(metadata.config?.hardware_tier ?? "");
     const hardwareTier = ["micro", "personal", "gpu", "workstation"].includes(
       recordedTier
@@ -1359,13 +1403,32 @@ async function checkpointModelProfile(
       join(brainDirectory, "engine", "core.safetensors"),
       join(brainDirectory, "engine", "plasticity.safetensors")
     ];
-    let total = 0;
-    for (const path of paths) total += (await stat(path)).size;
+    let tensors: ReadonlyMap<string, SavedTensorShape> = new Map();
+    const memory = await nativeCheckpointMemory(paths, (inventory) => { tensors = inventory; });
+    const modelContextGeometry = metadata.connected_regions === undefined ? undefined
+      : await connectedResourceProfile(join(brainDirectory, "engine"), tensors);
+    const total = memory.projectedCheckpointBytes;
     const hidden = Number(metadata.config?.d_model);
     const layers = Number(metadata.config?.n_layers);
     const items = Number(metadata.config?.working_memory_slots);
+    let maximumNativeBufferBytes = 0, modelUpdateScratchBytes = 0;
+    for (const [name, tensor] of tensors) if (/^(decoder|memory_bridge|idea_adapter|liquid|modalities|router)\./.test(name)) {
+      maximumNativeBufferBytes = Math.max(maximumNativeBufferBytes, tensor.bytes);
+      const packed = /(_packed_forward_weight|_packed_forward_bias|_packed_weights)$/.exec(name);
+      if (packed) {
+        const prefix = name.slice(0, -packed[1]!.length);
+        const state = tensors.get(prefix + (packed[1] === "_packed_forward_bias" ? "_bias_connection_state" : "_connection_state"));
+        const rows = tensor.shape[0]!, width = state?.shape[1] ?? tensor.shape[1]! * 4;
+        if (state && (state.shape.length !== 2 || state.shape[0] !== rows || Math.ceil(width / 4) !== tensor.shape[1])) throw new Error("Saved native connection dimensions disagree with packed signs.");
+        modelUpdateScratchBytes = Math.max(modelUpdateScratchBytes, packedLearningScratchBytes(rows, width));
+      }
+    }
     return {
       ...(total > 0 ? { modelBytes: total } : {}),
+      runtimeMetadataReserveBytes: memory.runtimeMetadataReserveBytes,
+      modelContextGeometry,
+      maximumNativeBufferBytes,
+      modelUpdateScratchBytes,
       ...(hardwareTier ? { hardwareTier } : {}),
       ...(Number.isSafeInteger(hidden) && hidden > 0
         ? { modelHiddenSize: hidden }
@@ -1377,9 +1440,34 @@ async function checkpointModelProfile(
         ? { workingMemoryItems: items, modelWorkspaceSlots: Math.max(8, Math.floor(items / 4)) }
         : {})
     };
-  } catch {
+  } catch (error) {
+    if (metadataRead || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     return {};
   }
+}
+
+interface ResourcePlannerOptions {
+  spillStorage?: AuthorizedSpillStorageSnapshot;
+  allowStorageSpill?: boolean;
+  hardwareTier?: HardwareTier;
+  modelBytes?: number;
+  brainDirectory?: string;
+  config?: BrainConfig;
+  acceleratorAvailable?: boolean;
+  modelContextLimitTokens?: number;
+  modelHiddenSize?: number;
+  modelLayers?: number;
+  modelContextGeometry?: NativeContextGeometry;
+  maximumNativeBufferBytes?: number;
+  modelUpdateScratchBytes?: number;
+  modelWorkspaceSlots?: number;
+  fixedWorkingMemoryItems?: number;
+  minimumStoragePoolBytes?: number;
+  admissionScope?: "capacity" | "existing-runtime";
+  enforceContextFloor?: boolean;
+  nativeSizingMode?: "ram-first" | "physical-capacity" | "balanced-measured";
+  nativeComputeDevice?: string;
+  nativePrimitiveWorkBudgetMicroseconds?: number;
 }
 
 export class ResourcePlanner {
@@ -1413,26 +1501,87 @@ export class ResourcePlanner {
     }
   }
 
-  async plan(
+  /** Select a reviewed RAM ceiling without constructing a hypothetical model.
+   * Connected merges use this before native allocation; it is not a fit proof.
+   */
+  async reviewedRamEnvelope(config: BrainConfig, hardwareTier?: HardwareTier): Promise<{
+    systemRamBudgetBytes: number; systemRamMode: "auto" | "manual"; systemRamSharePercent: number;
+    totalMemoryBytes: number; ramReserveBytes: number; safeRamPoolBytes: number; availableSafeRamBytes: number;
+    hardwareTier: HardwareTier; modelFitEvaluated: false;
+  }> {
+    const resources = await this.resources();
+    if (!Number.isSafeInteger(resources.totalMemoryBytes) || resources.totalMemoryBytes <= 0
+      || !Number.isSafeInteger(resources.availableMemoryBytes) || resources.availableMemoryBytes < 0) throw new Error("RAM capacity measurement is unavailable.");
+    const tier = hardwareTier ?? config.nativeArchitecture?.hardwareTier ?? tierForConfig(config);
+    if (!(tier in AUTO_SYSTEM_RAM_SHARE_BY_TIER)) throw new Error("Invalid reviewed hardware tier.");
+    const selected = config.deviceResources === undefined ? undefined : validateDeviceResourceSettings(config.deviceResources);
+    const ram = selected?.allocations.find((entry) => entry.deviceId === "ram:system");
+    const mode = ram?.mode ?? config.systemRamMode;
+    if (mode !== "auto" && mode !== "manual") throw new Error("Invalid reviewed RAM mode.");
+    const manual = ram?.percent ?? config.systemRamSharePercent;
+    if (mode === "manual" && (!Number.isFinite(manual) || manual < 30 || manual > 100)) throw new Error("Reviewed RAM share must be 30–100 percent.");
+    const speed = roundedStorageBytesPerSecond(config.storageBytesPerSecond);
+    const auto = Math.min(90, AUTO_SYSTEM_RAM_SHARE_BY_TIER[tier] + (speed > 0 && speed < 100 * MIB ? 10 : speed > 0 && speed < 500 * MIB ? 5 : 0));
+    const share = mode === "manual" ? manual : auto;
+    const reserve = adaptiveRamReserve(resources.totalMemoryBytes);
+    const safe = Math.max(0, resources.totalMemoryBytes - reserve);
+    return { systemRamBudgetBytes: Math.floor(safe * share / 100), systemRamMode: mode, systemRamSharePercent: share,
+      totalMemoryBytes: resources.totalMemoryBytes, ramReserveBytes: reserve, safeRamPoolBytes: safe,
+      availableSafeRamBytes: Math.max(0, Math.min(resources.totalMemoryBytes, resources.availableMemoryBytes) - reserve),
+      hardwareTier: tier, modelFitEvaluated: false };
+  }
+
+  async plan(request: WorkingMemoryPlanRequest, options: ResourcePlannerOptions = {}): Promise<WorkingMemoryResourcePlan> {
+    const supplied = request.deviceResources ?? options.config?.deviceResources;
+    const settings = supplied === undefined ? undefined : validateDeviceResourceSettings(supplied);
+    const ram = settings?.allocations.find((entry) => entry.deviceId === "ram:system");
+    const selectedRequest = ram ? { ...request, systemRamMode: ram.mode, systemRamSharePercent: ram.mode === "manual" ? ram.percent : undefined } : request;
+    if (!settings) return this.planCore(selectedRequest, options);
+    let base: WorkingMemoryResourcePlan | undefined;
+    try {
+      if (!this.dependencies.deviceTopology) throw new Error("Selected device allocations await hardware discovery.");
+      const topology = await this.dependencies.deviceTopology(settings);
+      let spillStorage: AuthorizedSpillStorageSnapshot | undefined;
+      if (settings.allowStorageSpill && settings.storageDirectories.length > 0) {
+        if (!this.dependencies.spillCapacity) throw new Error("Selected drives await local spill authorization.");
+        spillStorage = await this.dependencies.spillCapacity(settings, topology, { brainId: request.brainId,
+          selectionId: request.spillPoolSelectionId });
+      }
+      base = await this.planCore(selectedRequest, { ...options, spillStorage, allowStorageSpill: settings.allowStorageSpill });
+      const workspaceBytes = base.context.evidence.workspaceResidentBytes;
+      const tokenIndexBytes = base.context.evidence.residentTokenBytesPerToken;
+      const pageMetadataBytes = base.context.evidence.contextMetadataBytesPerToken;
+      if (workspaceBytes === undefined || tokenIndexBytes === undefined || pageMetadataBytes === undefined) throw new Error("The saved context geometry is unavailable for device placement.");
+      const selected = planDeviceResources(topology, settings, {
+        modelBytes: base.resources.modelBytes,
+        fixedRuntimeBytes: base.resources.runtimeOverheadBytes + (base.resources.modelMetadataReserveBytes ?? 0)
+          + workspaceBytes + (base.architecture?.packedUpdateScratchBytes ?? 0)
+          + (base.architecture?.packedForwardTensorReserveBytes ?? 0),
+        contextBytesPerToken: base.context.evidence.estimatedKvActivationBytesPerToken + tokenIndexBytes + pageMetadataBytes,
+        requestedContextTokens: base.context.selectedTokens,
+        systemRamBudgetBytes: base.resources.systemRamBudgetBytes,
+        diskReserveBytes: base.resources.mandatoryFreeDiskBytes
+      });
+      selected.admittedContextMaximumTokens = base.context.maximumTokens;
+      if (spillStorage) selected.appliedStorage = {
+        largestSharedPoolBytes: Math.max(spillStorage.largestSharedPoolBytes, base.resources.sharedStoragePoolBytes),
+        chargedBytes: spillStorage.sharedUsedBytes, pendingBytes: spillStorage.sharedPendingBytes,
+        groups: spillStorage.groups.map((group) => ({ memoryGroupId: group.physicalGroup, ceilingBytes: group.ceilingBytes,
+          availableAfterReserveBytes: group.availableBytes, chargedBytes: group.allocatedBytes,
+          pendingBytes: group.pendingBytes, unmaterializedPromiseBytes: group.unmaterializedPromiseBytes }))
+      };
+      return { ...base, deviceResources: selected, allowed: base.allowed && selected.executionBlockers.length === 0,
+        blockers: [...base.blockers, ...selected.executionBlockers] };
+    } catch (error) {
+      base ??= await this.planCore(selectedRequest, { ...options, allowStorageSpill: settings.allowStorageSpill });
+      return { ...base, allowed: false, blockers: [...base.blockers,
+        `Device resource measurement is unavailable: ${error instanceof Error ? error.message : String(error)}`] };
+    }
+  }
+
+  private async planCore(
     request: WorkingMemoryPlanRequest,
-    options: {
-      hardwareTier?: HardwareTier;
-      modelBytes?: number;
-      brainDirectory?: string;
-      config?: BrainConfig;
-      acceleratorAvailable?: boolean;
-      modelContextLimitTokens?: number;
-      modelHiddenSize?: number;
-      modelLayers?: number;
-      modelWorkspaceSlots?: number;
-      fixedWorkingMemoryItems?: number;
-      minimumStoragePoolBytes?: number;
-      admissionScope?: "capacity" | "existing-runtime";
-      enforceContextFloor?: boolean;
-      nativeSizingMode?: "ram-first" | "physical-capacity" | "balanced-measured";
-      nativeComputeDevice?: string;
-      nativePrimitiveWorkBudgetMicroseconds?: number;
-    } = {}
+    options: ResourcePlannerOptions = {}
   ): Promise<WorkingMemoryResourcePlan> {
     const checkpoint = options.brainDirectory
       ? await checkpointModelProfile(options.brainDirectory)
@@ -1452,6 +1601,8 @@ export class ResourcePlanner {
         ? String(options.config.storagePoolBytes)
         : undefined);
     const sharedInput = {
+      spillStorage: options.spillStorage,
+      allowStorageSpill: options.allowStorageSpill,
       request: {
         ...request,
         systemRamMode,
@@ -1467,6 +1618,9 @@ export class ResourcePlanner {
       modelContextLimitTokens: options.modelContextLimitTokens,
       modelHiddenSize: options.modelHiddenSize ?? checkpoint.modelHiddenSize,
       modelLayers: options.modelLayers ?? checkpoint.modelLayers,
+      modelContextGeometry: options.modelContextGeometry ?? checkpoint.modelContextGeometry,
+      maximumNativeBufferBytes: options.maximumNativeBufferBytes ?? checkpoint.maximumNativeBufferBytes,
+      modelUpdateScratchBytes: options.modelUpdateScratchBytes ?? checkpoint.modelUpdateScratchBytes,
       modelWorkspaceSlots: options.modelWorkspaceSlots ?? checkpoint.modelWorkspaceSlots ??
         (options.brainDirectory && options.config ? options.config.nativeArchitecture?.shape.workspaceLatents ?? Math.max(8, Math.floor(options.config.workingMemorySlots / 4)) : undefined),
       fixedWorkingMemoryItems: options.fixedWorkingMemoryItems ?? checkpoint.workingMemoryItems ??
@@ -1485,7 +1639,8 @@ export class ResourcePlanner {
       // facts. Never relabel them as a fresh ground-up architecture estimate.
       return planWorkingMemory({
         ...sharedInput,
-        modelBytes: recordedModelBytes
+        modelBytes: recordedModelBytes,
+        runtimeMetadataReserveBytes: checkpoint.runtimeMetadataReserveBytes
       });
     }
 
@@ -1495,9 +1650,14 @@ export class ResourcePlanner {
       // explicit descriptor, or its legacy recorded tier/item geometry.
       const descriptor = options.config.nativeArchitecture;
       const legacy = groundUpArchitectureProfile(hardwareTier, options.config.workingMemorySlots);
+      // The archived descriptor remains unchanged. Unit-strength migration of
+      // a native v1 checkpoint needs the current connection-state allocation.
+      const runtimeInventory = descriptor ? nativeCoreInventory(descriptor.shape,
+        descriptor.sizing.routerStorageLayout as "block-sparse-v1" | undefined) : undefined;
       return planWorkingMemory({
         ...sharedInput,
-        modelBytes: descriptor ? descriptor.inventory.packedWeightBytes + descriptor.inventory.staticNonweightTensorBytes : legacy.checkpointTensorBytes,
+        modelBytes: runtimeInventory ? runtimeInventory.packedLearnedStateBytes! + runtimeInventory.staticNonweightTensorBytes : legacy.checkpointTensorBytes,
+        runtimeMetadataReserveBytes: runtimeInventory ? packedOwnerMetadataReserve(runtimeInventory.packedOwners) : legacy.pythonOwnerMetadataReserveBytes,
         modelHiddenSize: descriptor?.shape.dModel ?? sharedInput.modelHiddenSize ?? legacy.dModel,
         modelLayers: descriptor?.shape.layers ?? sharedInput.modelLayers ?? legacy.layers,
       });

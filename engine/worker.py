@@ -31,8 +31,19 @@ WORKER_DIR = Path(__file__).resolve().parent
 if str(WORKER_DIR) not in sys.path:
     sys.path.insert(0, str(WORKER_DIR))
 
+# The packaged executable hosts the small stdlib-only OS adapter without
+# importing/allocating the neural runtime. It has its own two-phase protocol.
+if __name__ == "__main__" and sys.argv[1:] == ["--process-memory-helper"]:
+    from process_memory_helper import main as process_memory_main
+    raise SystemExit(process_memory_main())
+
 import torch
 from worker_transport import ProtocolLineReader, serve_worker_stdio
+from worker_lifecycle import WorkerLifecycle
+from worker_mcp_sampling import WorkerMcpSampling, MCP_SAMPLING_CONTROLS
+from worker_app_observation import WorkerAppObservation
+from worker_sparse_transfer import WorkerSparseTransfer, SPARSE_READ_METHODS
+from spontaneous_output import SpontaneousOutputLeases
 
 from omni_core import AdaptiveBrain, OmniConfig, __version__
 from omni_core.brain import ChatGenerationCancelled, is_allocator_oom_error
@@ -55,6 +66,8 @@ from omni_core.substrate_inspection import query_persisted_substrate
 from omni_core.text_spool import DatasetResourcePause, require_parser_resources
 from omni_core.isolated_module_snapshot import IsolatedModuleSnapshot
 from omni_core.slow_state_snapshot import admit_snapshot_metadata
+from omni_core.whole_path_scheduler import owned_request_path
+from omni_core.outer_learning_pipeline import learning_pipeline, learning_phase
 from video_runtime import (
     VideoRuntimeConfigurationCancelled,
 )
@@ -130,6 +143,12 @@ def _write_content_addressed_preview(
     path or the potentially large JSON/base64 payload.
     """
 
+    from omni_core.media_streaming_codec import EncodedMediaFile
+    if isinstance(payload, EncodedMediaFile):
+        directory.mkdir(parents=True, exist_ok=True)
+        artifact = directory / (payload.sha256 + _preview_extension(mime_type))
+        payload.copy_to(artifact)
+        return payload.sha256, artifact.resolve()
     digest = hashlib.sha256(payload).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
     artifact = directory / (digest + _preview_extension(mime_type))
@@ -269,6 +288,9 @@ class ChatSteeringState:
     approved_imagination: List[str] = field(default_factory=list)
     generation_open: bool = True
     imagination_grant: str = "off"
+    suspension_requested: threading.Event = field(default_factory=threading.Event)
+    suspension_freezing: bool = False
+    minimum_context_tokens: int = 0
 
 
 @dataclass
@@ -315,7 +337,7 @@ class LiveObservationSessionState:
     last_timestamp_ms: float = -1.0
 
 
-class Worker:
+class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSparseTransfer):
     def __init__(self):
         self.worker_role = str(
             os.environ.get("OMNI_WORKER_ROLE", "neural")
@@ -334,6 +356,7 @@ class Worker:
         self._codec_gateway = CodecRuntimeGateway(self._notify_codec_runtime)
         self._steering_lock = threading.RLock()
         self._chat_steering: Dict[Tuple[str, str], ChatSteeringState] = {}
+        self.initialize_native_mcp_sampling()
         self.running = True
         self._inline_lock = threading.RLock()
         self._inline_generations: Dict[Tuple[str, str], InlineGeneration] = {}
@@ -344,33 +367,75 @@ class Worker:
         self._inline_executor_closed = False
         self._observation_lock = threading.RLock()
         self._observation_sessions: Dict[str, LiveObservationSessionState] = {}
+        self._spontaneous_output_leases = SpontaneousOutputLeases()
         self.methods: Dict[str, Callable[[Dict[str, Any], Optional[str]], Any]] = {
             "health": self.health,
             "hardware_projection_profile": self.hardware_projection_profile,
+            "hardware_topology": self.hardware_topology,
+            "regional_execution_prepare": self.regional_execution_prepare,
+            "regional_execution_status": self.regional_execution_status,
+            "regional_execution_activate": self.regional_execution_activate,
+            "regional_execution_deactivate": self.regional_execution_deactivate,
+            "decoder_execution_capture_next": self.decoder_execution_capture_next,
+            "decoder_execution_prepare": self.decoder_execution_prepare,
+            "decoder_execution_calibrate": self.decoder_execution_calibrate,
+            "decoder_execution_apply": self.decoder_execution_apply,
+            "decoder_execution_status": self.decoder_execution_status,
+            "decoder_execution_stop": self.decoder_execution_stop,
+            "decoder_execution_release_stopped": self.decoder_execution_release_stopped,
+            "cached_decoder_execution_prepare": self.cached_decoder_execution_prepare,
+            "cached_decoder_execution_arm": self.cached_decoder_execution_arm,
+            "cached_decoder_execution_status": self.cached_decoder_execution_status,
+            "cached_decoder_execution_stop": self.cached_decoder_execution_stop,
+            "native_operation_auto_prepare": self.native_operation_auto_prepare,
+            "native_operation_auto_arm": self.native_operation_auto_arm,
+            "native_operation_auto_status": self.native_operation_auto_status,
+            "native_operation_auto_plans": self.native_operation_auto_plans,
+            "native_operation_auto_stop": self.native_operation_auto_stop,
+            "native_operation_auto_release_stopped": self.native_operation_auto_release_stopped,
             "configure_video_runtime": self.configure_video_runtime,
             "create": self.create,
             "load": self.load,
             "reload": self.reload,
             "unload": self.unload,
+            "instance_status": self.instance_status,
+            "inherited_execution_presentation": self.inherited_execution_presentation,
+            "suspend_instance": self.suspend_instance,
+            "resume_chat": self.resume_chat,
+            "resume_inherited_chat": self.resume_inherited_chat,
+            "stop_inherited_chat": self.stop_inherited_chat,
+            "stop_suspended_chat": self.stop_suspended_chat,
             "restore_snapshot": self.restore_snapshot,
             "update_config": self.update_config,
             "preview_overlay": self.preview_overlay,
             "merge_overlay": self.merge_overlay,
+            "full_merge_assemble": self.full_merge_assemble,
+            "full_merge_verify": self.full_merge_verify,
+            "full_merge_activate_ingestion": self.full_merge_activate_ingestion,
             "install_modality_pack": self.install_modality_pack,
             "list": self.list_brains,
             "state": self.state,
             "export_state": self.state,
             "query_substrate": self.query_substrate,
+            **{name: getattr(self, name) for name in SPARSE_READ_METHODS},
+            "sparse_substrate_apply": self.sparse_substrate_apply,
             "query_concept_id_view": self.query_concept_id_view,
             "query_cortex": self.query_cortex,
+            "query_whole_brain": self.query_whole_brain,
             "cortex_activity": self.cortex_activity,
+            "router_activity": self.router_activity,
             "workspace": self.workspace,
             "fresh_attention": self.fresh_attention,
             "feedback": self.feedback,
             "idle_cycle": self.idle_cycle,
             "chat": self.chat,
+            "mcp_sample": self.mcp_sample,
+            "app_observation_frontier": self.app_observation_frontier,
+            "admit_app_observation": self.admit_app_observation,
             "consolidate_chat_learning": self.consolidate_chat_learning,
             "learn_tool_route_outcome": self.learn_tool_route_outcome,
+            "learn_capability_pack": self.learn_capability_pack,
+            "rebind_learning_source": self.rebind_learning_source,
             "learn_action_result": self.learn_action_result,
             "chat_receipt": self.chat_receipt,
             "conversation_page": self.conversation_page,
@@ -378,6 +443,8 @@ class Worker:
             "ingest": self.ingest,
             "modality_capabilities": self.modality_capabilities,
             "generate_modality": self.generate_modality,
+            "authorize_spontaneous_output": self.authorize_spontaneous_output,
+            "discard_spontaneous_output": self.discard_spontaneous_output,
             "generate_neural_speech": self.generate_neural_speech,
             "start_observation": self.start_observation,
             "observe_packet": self.observe_packet,
@@ -409,8 +476,10 @@ class Worker:
             self.methods = {
                 "health": self.health,
                 "query_substrate": self.query_substrate,
+                **{name: getattr(self, name) for name in SPARSE_READ_METHODS},
                 "query_concept_id_view": self.query_concept_id_view,
                 "query_cortex": self.query_cortex,
+                "query_whole_brain": self.query_whole_brain,
                 "cancel": self.cancel,
                 "shutdown": self.shutdown,
             }
@@ -491,12 +560,23 @@ class Worker:
         if active is None or active[0] not in {
             "load",
             "chat",
+            "resume_chat",
+            "resume_inherited_chat",
             "consolidate_chat_learning",
             "learn_action_result",
+            "admit_app_observation",
             "learn_tool_route_outcome",
+            "learn_capability_pack",
+            "rebind_learning_source",
             "configure_video_runtime",
             "generate_neural_speech",
             "generate_modality",
+            "full_merge_assemble",
+            "full_merge_verify",
+            "full_merge_activate_ingestion",
+            "train", "ingest", "checkpoint", "snapshot",
+            "evolution.propose", "evolution_propose", "evolution.evaluate", "evolution_evaluate",
+            "evolution.promote", "evolution_promote", "evolution.rollback", "evolution_rollback",
         }:
             return False
         self._cooperative_cancel.set()
@@ -509,6 +589,19 @@ class Worker:
                 active = self._active_request
                 return bool(active is not None and active[1] == identifier and self._cooperative_cancel.is_set())
         return check
+
+    def _outer_learning_scope(self, brain, params, request_id, operation):
+        """Use only the existing loaded owner and this actual job's Stop flag."""
+        request_cancelled = self._request_cancel_check(request_id)
+        job_id = str(params.get("jobId") or "")
+        def cancelled():
+            return request_cancelled() or bool(job_id and job_id in self.cancelled_jobs)
+        def stopped():
+            return RpcFault(-32800, "learning stopped at a safe boundary",
+                {"cancelled": True, "safeBoundary": True})
+        if cancelled():
+            raise stopped()
+        return learning_pipeline(brain, operation, cancelled=cancelled, cancel_error=stopped)
 
     def _acknowledge_inline_cancellation(self, record: InlineGeneration) -> None:
         with self._inline_lock:
@@ -524,10 +617,29 @@ class Worker:
 
     def dispatch_control(self, request: Any) -> Dict[str, Any]:
         if self.worker_role != "neural" or not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or \
-                request.get("method") not in {"cancel_inline_generation", "steer_chat", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status"} or \
+                request.get("method") not in {"cancel_inline_generation", "steer_chat", "suspend_chat", "instance_status", "inherited_execution_presentation", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status", "router_activity_control", "decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop", *MCP_SAMPLING_CONTROLS} or \
                 not isinstance(request.get("id"), (str, int)) or not isinstance(request.get("params"), dict):
             raise RpcFault(-32600, "invalid flags-only worker control request")
         params = request["params"]
+        if request["method"] in {"decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop"}:
+            result = getattr(self, request["method"])(params, request["id"])
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        if request["method"] == "router_activity_control":
+            result = self.router_activity_control(params)
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        if request["method"] in MCP_SAMPLING_CONTROLS:
+            try:
+                result = self.native_mcp_sampling_control(request["method"], params, request)
+            except (ValueError, UnicodeError) as error:
+                raise RpcFault(-32602, str(error)) from error
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+        if request["method"] in {"suspend_chat", "instance_status", "inherited_execution_presentation"}:
+            try:
+                result = self.request_chat_suspension(params) if request["method"] == "suspend_chat" else \
+                    self.inherited_execution_presentation(params) if request["method"] == "inherited_execution_presentation" else self.instance_status(params)
+            except ValueError as error:
+                raise RpcFault(-32602, str(error)) from error
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
         if request["method"] == "inline_generation_status":
             brain_id = self._brain_id(params)
             action_id = self._valid_inline_action_id(params.get("neuralActionId"))
@@ -550,6 +662,11 @@ class Worker:
             stream_id = params.get("streamId")
             with self._steering_lock:
                 session = self._chat_steering.get((brain_id, stream_id))
+                if session is not None and session.suspension_freezing:
+                    observation = params.get("observation")
+                    return {"jsonrpc": "2.0", "id": request["id"], "result": {"brainId": brain_id, "turnId": stream_id,
+                        "observationId": observation.get("observationId") if isinstance(observation, dict) else "",
+                        "accepted": False, "reason": "supported-turn-suspending"}}
                 if session is None or session.observation_inbox is None or session.requested.is_set() or self._cooperative_cancel.is_set():
                     raise RpcFault(-32602, "tool observation does not own an open live chat")
                 from stdio_request_admission import retain_request_allocation
@@ -657,7 +774,7 @@ class Worker:
             return {"accepted": True, "started": record.snapshot_started, "brainId": brain_id, "streamId": stream_id, "neuralActionId": action_id}
 
     def reserve_chat_steering(self, request: Dict[str, Any]) -> None:
-        if self.worker_role != "neural" or request.get("method") != "chat":
+        if self.worker_role != "neural" or request.get("method") not in {"chat", "resume_chat", "resume_inherited_chat"}:
             return
         params = request.get("params")
         if request.get("jsonrpc") != "2.0" or not isinstance(params, dict):
@@ -850,6 +967,7 @@ class Worker:
         action: Dict[str, Any],
         emit_preview: Callable[[InlineGeneration, Dict[str, Any]], None],
         emit_started: Optional[Callable[[InlineGeneration], None]] = None,
+        *, authority_brain=None, authority_action=None,
     ) -> Optional[InlineGeneration]:
         if self._inline_executor_closed:
             return None
@@ -863,11 +981,12 @@ class Worker:
             or not isinstance(arguments, dict)
         ):
             return None
+        authority_brain = authority_brain or brain
         request = self._inline_request(arguments)
-        signature = self._inline_signature(arguments)
+        signature = self._inline_signature((authority_action or action).get("arguments"))
         if request is None or not signature:
             return None
-        key = (brain.brain_id, action_id)
+        key = (authority_brain.brain_id, action_id)
         with self._inline_lock:
             existing = self._inline_generations.get(key)
             if existing is not None and (existing.snapshot_started or existing.cancelled):
@@ -881,15 +1000,15 @@ class Worker:
         # CUDA and CPU also use isolated CPU state: no original-device
         # allocation may happen before the shared resource admission.
         staging_root = (
-            brain.engine_path / ".inline-imagination" / action_id
+            authority_brain.engine_path / ".inline-imagination" / action_id
         ).resolve()
-        staging_parent = (brain.engine_path / ".inline-imagination").resolve()
-        record = existing or InlineGeneration(brain_id=brain.brain_id, action_id=action_id,
+        staging_parent = (authority_brain.engine_path / ".inline-imagination").resolve()
+        record = existing or InlineGeneration(brain_id=authority_brain.brain_id, action_id=action_id,
                                   stream_id=stream_id, signature=signature,
                                   staging_root=staging_root, events=DeferredEventLog())
         gateway = getattr(self, "_codec_gateway", None)
         parent_owner = gateway.current_owner() if gateway is not None else None
-        codec_owner = CodecOwner(parent_owner.request_id, brain.brain_id, "", stream_id, action_id) if parent_owner else None
+        codec_owner = CodecOwner(parent_owner.request_id, authority_brain.brain_id, "", stream_id, action_id) if parent_owner else None
         with self._inline_lock:
             self._inline_generations[key] = record
             record.snapshot_started = True
@@ -897,7 +1016,7 @@ class Worker:
             record.finished.set()
             self._acknowledge_inline_cancellation(record)
             if codec_owner:
-                self.notify("inline-imagination-finished", brain_id=brain.brain_id,
+                self.notify("inline-imagination-finished", brain_id=record.brain_id,
                     stream_id=stream_id, action_id=action_id, data={"requestId": codec_owner.request_id})
         try:
             if emit_started is not None:
@@ -950,6 +1069,7 @@ class Worker:
                 }, "inline snapshot control metadata")
                 deferred_events = DeferredEventLog()
                 snapshot = copy.copy(brain)
+                snapshot.brain_id = authority_brain.brain_id
                 snapshot.config = copy.deepcopy(brain.config)
                 snapshot.modalities = modality_snapshot
                 snapshot.events = deferred_events
@@ -1288,7 +1408,7 @@ class Worker:
                     })
         brain._derived_cache_prune_outcomes = outcomes
 
-    def _get(self, params: Dict[str, Any]) -> AdaptiveBrain:
+    def _get(self, params: Dict[str, Any], *, allow_load: bool = False, runtime_config=None) -> AdaptiveBrain:
         brain_id = self._brain_id(params)
         storage = self._storage(params, brain_id)
         existing = self.brains.get(brain_id)
@@ -1298,8 +1418,20 @@ class Worker:
                     -32602,
                     "brainId is already loaded from a different storagePath",
                 )
-            self._owner_lease(brain_id, storage)
-            return existing
+            if getattr(existing, "_native_execution_restore_required", False):
+                raise RpcFault(-32020, "Native placement restore requires explicit Unload; the worker was not restarted", {"reloadRequired": True})
+            if getattr(existing, "_connected_recovery_required", False):
+                # Failed cross-region admissions cannot leave a warm object
+                # available to another action. This path is never entered for
+                # ordinary Stop/Steer after an accepted input committed.
+                self._discard_inline_generations(brain_id)
+                self.brains.pop(brain_id, None)
+                existing.close()
+            else:
+                self._owner_lease(brain_id, storage)
+                return existing
+        if not allow_load:
+            raise RpcFault(-32004, "Explicit Load is required before neural work; no brain was implicitly loaded")
         # A hard process interruption can leave only disposable inline media
         # staging behind. It is never an authoritative brain artifact and is
         # removed before the persistent checkpoint is opened again.
@@ -1321,7 +1453,8 @@ class Worker:
         try:
             self._clear_inline_staging(storage / "engine")
             self._clear_preview_cache(storage / "engine")
-            brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id)
+            brain = AdaptiveBrain.load(storage, expected_brain_id=brain_id,
+                **({"runtime_config": runtime_config} if runtime_config is not None else {}))
             if newly_acquired and brain_id not in self._ever_loaded_brains:
                 self._prune_verified_abandoned_live_caches(
                     brain_id, brain, lease
@@ -1357,12 +1490,13 @@ class Worker:
             merged["video_enabled"] = "video" in selected
         tier = str(merged.get("hardwareTier", "personal"))
         if "device" not in merged and tier in {"gpu", "workstation"}:
-            if torch.cuda.is_available():
-                merged["device"] = "cuda"
-            elif self._mps_available():
-                merged["device"] = "mps"
-            elif self._directml_available():
-                merged["device"] = "directml"
+            # Hardware discovery is not proof of a direct packed kernel.
+            # CUDA/DirectML explicit requests retain the admitted CPU-tile
+            # fallback, but Auto must not pay transfers for every projection
+            # and label generic Torch availability native acceleration.
+            merged["device"] = "mps" if (
+                self._mps_available() and callable(getattr(getattr(torch, "mps", None), "compile_shader", None))
+            ) else "cpu"
         return merged
 
     @staticmethod
@@ -1485,18 +1619,33 @@ class Worker:
             }
         cuda = torch.cuda.is_available()
         mps = self._mps_available()
+        from omni_core.packed_native_kernel import native_packed_kernel_available
+        kernel_error = None
+        try:
+            packed_cpu = native_packed_kernel_available()
+        except (OSError, RuntimeError, ValueError) as error:
+            packed_cpu = False
+            kernel_error = str(error)
         return {
-            "ready": True,
+            "ready": packed_cpu,
             "worker": "python",
             "engineVersion": __version__,
             "protocolVersion": PROTOCOL_VERSION,
-            "detail": "Python OmniCortex neural worker is ready.",
+            "detail": ("Python OmniCortex neural worker is ready." if packed_cpu else
+                "The native packed CPU kernel is unavailable. Rebuild the worker package or run scripts/build-native-kernels.py for a source checkout."),
             "pythonVersion": platform.python_version(),
             "torchVersion": torch.__version__,
             "platform": platform.platform(),
             "operatingSystem": sys.platform,
             "capabilities": {
                 "cpu": True,
+                "nativePackedKernels": {
+                    "cpu": packed_cpu,
+                    "metal": bool(mps and hasattr(torch.mps, "compile_shader")),
+                    "cuda": False,
+                    "expandedWeightMatrix": False,
+                    "error": kernel_error,
+                },
                 "cuda": cuda,
                 "cudaDevices": torch.cuda.device_count() if cuda else 0,
                 "mps": mps,
@@ -1508,6 +1657,30 @@ class Worker:
             },
             "loadedBrains": len(self.brains),
         }
+
+    def hardware_topology(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        del request_id
+        if self.worker_role != "neural":
+            raise RpcFault(-32601, "Device topology uses the neural runtime's actual backends")
+        if set(params) - {"measure", "probeBudgetBytes", "storageDirectories"}:
+            raise RpcFault(-32602, "Device topology accepts hardware fields only")
+        measure = params.get("measure", False)
+        budget = params.get("probeBudgetBytes", 0)
+        paths = params.get("storageDirectories", [])
+        if type(measure) is not bool or type(budget) is not int or budget < 0 or not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            raise RpcFault(-32602, "Invalid bounded device topology request")
+        if measure and any(record.future is not None and not record.future.done() for record in getattr(self, "_inline_generations", {}).values()):
+            raise RpcFault(-32010, "Device measurement waits for active inline generation to finish")
+        from omni_core.device_topology import collect_device_topology
+        from omni_core.offload import ResourcePolicy
+        policy = ResourcePolicy(self._default_root(), include_accelerator_memory=False)
+        try:
+            return collect_device_topology(policy=policy, storage_paths=paths, measure=measure,
+                probe_budget_bytes=budget, cancelled=self._cooperative_cancel.is_set)
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error), {"hardwareMeasurementCancelled": True}) from error
+        except (ValueError, OSError) as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def hardware_projection_profile(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -1550,6 +1723,177 @@ class Worker:
             raise RpcFault(-32800, str(error), {"hardwareMeasurementCancelled": True, "safeBoundary": True}) from error
         except NeuralStateResourcePause as error:
             return {"available": False, "reason": "hardware-measurement-memory-admission", "status": error.status}
+
+    def _regional_loaded_owner(self, params, extra):
+        if self.worker_role != "neural":
+            raise RpcFault(-32601, "Regional execution requires the already-loaded neural owner")
+        if set(params) - ({"brainId", "storagePath"} | set(extra)):
+            raise RpcFault(-32602, "Regional execution accepts reviewed hardware fields only")
+        return self._get(params)  # Default allow_load=False; never starts a brain.
+
+    def regional_execution_prepare(self, params, request_id):
+        del request_id
+        brain = self._regional_loaded_owner(params, {"start", "count", "topology"})
+        return brain.regional_execution_prepare(start=params.get("start", 0), count=params.get("count", 64), topology=params.get("topology"))
+
+    def regional_execution_status(self, params, request_id):
+        del request_id
+        return self._regional_loaded_owner(params, set()).regional_execution_status()
+
+    def regional_execution_activate(self, params, request_id):
+        del request_id
+        return self._regional_loaded_owner(params, {"reviewed"}).regional_execution_activate(params.get("reviewed"))
+
+    def regional_execution_deactivate(self, params, request_id):
+        del request_id
+        return self._regional_loaded_owner(params, {"epoch"}).regional_execution_deactivate(epoch=params.get("epoch"))
+
+    def _decoder_loaded_owner(self, params, extra):
+        brain = self._regional_loaded_owner(params, extra)
+        with getattr(self, "_inline_lock", nullcontext()):
+            if any(record.brain_id == brain.brain_id and record.future is not None and not record.future.done()
+                   for record in getattr(self, "_inline_generations", {}).values()):
+                raise RpcFault(-32020, "Decoder calibration awaits the independent inline job; no job was stopped or restarted")
+        return brain
+
+    def decoder_execution_capture_next(self, params, request_id):
+        del request_id
+        brain = self._decoder_loaded_owner(params, {"acknowledgeCudaCpuTileFallback"})
+        return brain.decoder_execution_capture_next(acknowledge_cuda=params.get("acknowledgeCudaCpuTileFallback", False))
+
+    def decoder_execution_prepare(self, params, request_id):
+        del request_id
+        return self._decoder_loaded_owner(params, {"topology"}).decoder_execution_prepare(topology=params.get("topology"))
+
+    def decoder_execution_calibrate(self, params, request_id):
+        del request_id
+        brain = self._decoder_loaded_owner(params, {"operationId", "reviewed", "samplesPerCandidate"})
+        try:
+            return brain.decoder_execution_calibrate(operation_id=params.get("operationId"), reviewed=params.get("reviewed"),
+                samples_per_candidate=params.get("samplesPerCandidate", 3))
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error), {"decoderExecutionCancelled": True, "supplyingChatCancelled": False,
+                "operationId": params.get("operationId"), "safeBoundary": True}) from error
+
+    def decoder_execution_apply(self, params, request_id):
+        del request_id
+        return self._decoder_loaded_owner(params, {"proposalId", "proposalSha256"}).decoder_execution_apply(
+            proposal_id=params.get("proposalId"), proposal_sha256=params.get("proposalSha256"))
+
+    def _decoder_control_owner(self, params, extra):
+        # Flags-only lane: no _get, Torch, policy/fence inspection, owner Load,
+        # mutation, generic cancellation, or supervisor replacement.
+        if self.worker_role != "neural" or set(params) - ({"brainId", "storagePath"} | set(extra)):
+            raise RpcFault(-32602, "invalid decoder metadata control fields")
+        brain_id = self._brain_id(params)
+        brain = self.brains.get(brain_id)
+        if brain is None or brain.storage_path != self._storage(params, brain_id):
+            raise RpcFault(-32004, "decoder metadata requires its exact already-loaded owner")
+        return brain
+
+    def decoder_execution_status(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, set()).decoder_execution_status()
+
+    def decoder_execution_stop(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, {"operationId"}).decoder_execution_stop(operation_id=params.get("operationId"))
+
+    def decoder_execution_release_stopped(self, params, request_id=None):
+        del request_id
+        # Normal serialized method (NOT transport's flags-only allowlist).
+        return self._decoder_control_owner(params, {"operationId"}).decoder_execution_release_stopped(operation_id=params.get("operationId"))
+
+    def cached_decoder_execution_prepare(self, params, request_id):
+        del request_id
+        return self._decoder_loaded_owner(params, {"topology", "acknowledgeCudaCpuTileFallback"}).cached_decoder_execution_prepare(
+            topology=params.get("topology"), acknowledge_cuda=params.get("acknowledgeCudaCpuTileFallback", False))
+
+    def cached_decoder_execution_arm(self, params, request_id):
+        del request_id
+        return self._decoder_loaded_owner(params, {"operationId", "reviewed", "samplesPerCandidate"}).cached_decoder_execution_arm(
+            operation_id=params.get("operationId"), reviewed=params.get("reviewed"), samples=params.get("samplesPerCandidate", 3))
+
+    def cached_decoder_execution_status(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, set()).cached_decoder_execution_status()
+
+    def cached_decoder_execution_stop(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, {"operationId"}).cached_decoder_execution_stop(operation_id=params.get("operationId"))
+
+    def native_operation_auto_prepare(self, params, request_id):
+        del request_id
+        brain = self._decoder_loaded_owner(params, {"topology", "acknowledgeCudaCpuTileFallback"})
+        brain._native_operation_auto_cancel_flags = getattr(self, "_cooperative_cancel", None)
+        brain._native_operation_auto_codec_gateway = getattr(self, "_codec_gateway", None)
+        return brain.native_operation_auto_prepare(
+            topology=params.get("topology"), acknowledge_cuda=params.get("acknowledgeCudaCpuTileFallback", False))
+
+    def native_operation_auto_arm(self, params, request_id):
+        del request_id
+        brain = self._decoder_loaded_owner(params, {"operationId", "reviewed", "samplesPerCandidate"})
+        brain._native_operation_auto_cancel_flags = getattr(self, "_cooperative_cancel", None)
+        brain._native_operation_auto_codec_gateway = getattr(self, "_codec_gateway", None)
+        result = brain.native_operation_auto_arm(
+            operation_id=params.get("operationId"), reviewed=params.get("reviewed"), samples=params.get("samplesPerCandidate", 3))
+        import weakref
+        controller = getattr(brain, "_native_operation_auto", None)
+        if controller is not None:
+            previous = tuple(reference for reference in getattr(self, "_private_media_controllers", ())
+                if reference() is not None and reference() is not controller)
+            self._private_media_controllers = (*previous, weakref.ref(controller))
+        return result
+
+    def retire_private_native_work(self):
+        # Reader lane: immutable weak-reference tuple and flags only. The
+        # serial lane owns all tensor, directory and resource-lease cleanup.
+        for reference in getattr(self, "_private_media_controllers", ()):
+            controller = reference()
+            if controller is not None: controller.retire_private_media("new-normal-worker-request")
+
+    def step_private_native_work(self):
+        # The real RPC response has already been sent. Never overlap private
+        # comparisons with inline generation or a new normal neural request.
+        controllers = tuple(reference for reference in getattr(self, "_private_media_controllers", ()) if reference() is not None)
+        self._private_media_controllers = controllers
+        with getattr(self, "_inline_lock", nullcontext()):
+            active_inline = any(not record.finished.is_set() for record in getattr(self, "_inline_generations", {}).values())
+        for reference in controllers:
+            controller = reference()
+            if controller is None: continue
+            if active_inline:
+                controller.retire_private_media("live-inline-generation-has-priority")
+                controller.release_private_media()
+                continue
+            try:
+                if controller.step_private_media(): return True
+            except Exception as error:
+                # An idle comparison has no RPC to fail and must never kill
+                # the loaded worker. The exact-restore-required owner remains
+                # paused for explicit Unload instead of an automatic reload.
+                controller.retire_private_media("private-owner-restore-or-comparison-failed")
+                controller.release_private_media()
+                sys.stderr.write("private native media comparison paused: %s\n" % type(error).__name__)
+                sys.stderr.flush()
+        return False
+
+    def native_operation_auto_status(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, set()).native_operation_auto_status()
+
+    def native_operation_auto_plans(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, {"after", "limit"}).native_operation_auto_plans(after=params.get("after"), limit=params.get("limit", 32))
+
+    def native_operation_auto_stop(self, params, request_id=None):
+        del request_id
+        return self._decoder_control_owner(params, {"operationId"}).native_operation_auto_stop(operation_id=params.get("operationId"))
+
+    def native_operation_auto_release_stopped(self, params, request_id=None):
+        del request_id
+        # Resource/tensor-scope cleanup remains serial, never flags-only.
+        return self._decoder_control_owner(params, {"operationId"}).native_operation_auto_release_stopped(operation_id=params.get("operationId"))
 
     def _stdio_resource_policy(self):
         """Read-only trusted global quota; never load/mutate a brain to parse RPC."""
@@ -1785,7 +2129,23 @@ class Worker:
 
     def load(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
-        brain = self._get(params)
+        brain = self._get(params, allow_load=True, runtime_config=params.get("config"))
+        store = self._execution_store(params, brain=brain)
+        saved = store.current()
+        if "config" in params:
+            try:
+                runtime = self.reviewed_execution_runtime_config(brain, params["config"], store=store)
+            except ValueError as error:
+                raise RpcFault(-32602, str(error)) from error
+            brain.update_config(runtime, persist_if_unchanged=False, include_summary=False)
+            if saved is not None and saved["status"] == "suspended":
+                from omni_core.execution_checkpoint import binding_for
+                if saved["bindingId"] != binding_for(brain, saved["frontier"]["turnId"]):
+                    raise RpcFault(-32602, "Reviewed runtime settings changed the paused neural checkpoint; exact continuation refused")
+        store.mark_loaded()
+        from omni_core.connected_execution import connected_execution_status
+        if not (saved is not None and saved["status"] == "suspended") and not connected_execution_status(brain)["rootMutationHeld"]:
+            brain._owned_activity_clock().resume()
         if self._cooperative_cancel.is_set():
             raise RpcFault(
                 -32800,
@@ -1881,7 +2241,10 @@ class Worker:
         raw = params.get("config")
         if not isinstance(raw, dict):
             raise RpcFault(-32602, "params.config must be an object")
-        return brain.update_config(raw)
+        try:
+            return brain.update_config(self.reviewed_execution_runtime_config(brain, raw))
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def merge_overlay(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -1903,6 +2266,8 @@ class Worker:
         }
         target = self._get(target_params)
         source = self._get(source_params)
+        from omni_core.connected_execution import require_joint_mutation_allowed
+        require_joint_mutation_allowed(target, operation="merge_overlay")
         expected_digest = str(params.get("expectedPreviewDigest", ""))
         if not expected_digest:
             raise RpcFault(
@@ -1912,6 +2277,62 @@ class Worker:
             return target.merge_overlay(source, expected_digest)
         except ValueError as error:
             raise RpcFault(-32009, str(error)) from error
+
+    def full_merge_assemble(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        """Assemble private snapshots; never load or train the live parents."""
+        from omni_core.full_merge import assemble_full_merge
+        brain_id = self._brain_id(params)
+        storage = self._storage(params, brain_id)
+        if brain_id in self.brains:
+            raise RpcFault(-32009, "unload the unpublished merge before resuming its assembly")
+        raw = params.get("config")
+        if not isinstance(raw, dict) or not isinstance(params.get("parents"), list):
+            raise RpcFault(-32602, "full merge requires reviewed config and parent snapshots")
+        if any(name in raw for name in ("foundationModelId", "foundation_model_id")):
+            raise RpcFault(-32602, "full merge cannot import a foreign foundation")
+        settings = OmniConfig.from_external(raw)
+        _lease, newly_acquired = self._owner_lease(brain_id, storage)
+        stream_id = str(params.get("streamId", ""))
+        def progress(phase, data):
+            self.notify("full-merge-progress", brain_id=brain_id, stream_id=stream_id,
+                        data={"phase": phase, **data})
+        try:
+            return assemble_full_merge(storage, brain_id, params["parents"], settings,
+                cancelled=self._request_cancel_check(request_id), progress=progress)
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error), {"cancelled": True, "safeBoundary": True}) from error
+        finally:
+            if newly_acquired:
+                self._release_owner_lease(brain_id)
+
+    def full_merge_verify(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        from omni_core.full_merge import verify_full_merge
+        brain_id = self._brain_id(params)
+        storage = self._storage(params, brain_id)
+        if brain_id in self.brains:
+            raise RpcFault(-32009, "unload the unpublished merge before verifying its restart")
+        _lease, newly_acquired = self._owner_lease(brain_id, storage)
+        try:
+            return verify_full_merge(storage, brain_id, cancelled=self._request_cancel_check(request_id))
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error), {"cancelled": True, "safeBoundary": True}) from error
+        finally:
+            if newly_acquired:
+                self._release_owner_lease(brain_id)
+
+    def full_merge_activate_ingestion(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        from omni_core.connected_runtime import activate_pending_ingestion
+        brain = self._get(params)
+        if brain._connected_regions is None:
+            raise RpcFault(-32602, "source adoption requires a merged native instance")
+        pending_id, source_path, source_name = params.get("pendingId"), params.get("sourcePath"), params.get("sourceName")
+        if not all(isinstance(value, str) and value for value in (pending_id, source_path, source_name)):
+            raise RpcFault(-32602, "pendingId, sourcePath and original sourceName are required")
+        try:
+            return activate_pending_ingestion(brain, pending_id, Path(source_path), source_name,
+                                              cancelled=self._request_cancel_check(request_id))
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error), {"cancelled": True, "safeBoundary": True}) from error
 
     def preview_overlay(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -2043,6 +2464,26 @@ class Worker:
             ),
         }
 
+    def query_whole_brain(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        from omni_core.whole_brain_catalog import InspectionScratch
+        from omni_core.whole_brain_inspection import query_whole_brain
+        brain_id = self._brain_id(params)
+        query = params.get("query", {})
+        if not isinstance(query, dict):
+            raise RpcFault(-32602, "params.query must be an object")
+        storage = self._storage(params, brain_id)
+        loaded = self.brains.get(brain_id)
+        if loaded is not None and loaded.storage_path != storage:
+            raise RpcFault(-32602, "whole-brain inspection storage identity mismatch")
+        try:
+            with InspectionScratch(self.reserve_stdio_memory) as scratch:
+                return query_whole_brain(storage / "engine", brain_id, query,
+                    admit=scratch.admit, cancelled=self._request_cancel_check(request_id))
+        except InterruptedError as error:
+            raise RpcFault(-32800, str(error)) from error
+        except (ValueError, OSError, TypeError) as error:
+            raise RpcFault(-32602, str(error)) from error
+
     def query_cortex(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
         from omni_core.cortical_inspection import query_committed_cortex
@@ -2073,7 +2514,34 @@ class Worker:
         start, count = query.get("start", 0), query.get("count", 64)
         if any(isinstance(value, bool) or not isinstance(value, int) for value in (start, count)):
             raise RpcFault(-32602, "invalid cortical activity viewport")
-        return loaded.core_pager.observation(module, enabled=query.get("enabled", False), start=start, count=count)
+        capture_id = query.get("captureId")
+        if capture_id is not None and (not isinstance(capture_id, str) or not capture_id or len(capture_id) > 128):
+            raise RpcFault(-32602, "invalid cortical activity capture identity")
+        return loaded.core_pager.observation(module, enabled=query.get("enabled", False), start=start, count=count,
+                                             capture_id=capture_id)
+
+    def router_activity(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        del request_id
+        from omni_core.router_spike_capture import query_router_spikes
+        brain_id = self._brain_id(params)
+        loaded = self.brains.get(brain_id)
+        if loaded is not None and self._storage(params, brain_id) != loaded.storage_path:
+            raise RpcFault(-32602, "router spike activity storage identity mismatch")
+        try:
+            return query_router_spikes(loaded, brain_id, params.get("query", {}))
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def router_activity_control(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        from omni_core.router_spike_capture import control_router_spikes
+        brain_id = self._brain_id(params)
+        loaded = self.brains.get(brain_id)
+        if loaded is not None and self._storage(params, brain_id) != loaded.storage_path:
+            raise RpcFault(-32602, "router spike control storage identity mismatch")
+        try:
+            return control_router_spikes(loaded, brain_id, params.get("query", {}))
+        except ValueError as error:
+            raise RpcFault(-32602, str(error)) from error
 
     def query_concept_id_view(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         del request_id
@@ -2512,10 +2980,12 @@ class Worker:
                 ledger = NeuralConversationLedger(storage / "engine" / "conversation.sqlite3", brain_id)
                 try:
                     human = ledger.payload_by_id("message", str(accepted_receipt.get("humanMessageId", "")))
+                    from omni_core.native_audio_chat import observed_input_sha256
                     if (not isinstance(human, Mapping) or human.get("role") != "human"
                         or human.get("input_accepted_before_reply") is not True or human.get("turn_id") != turn_id
                         or not isinstance(human.get("content"), str)
-                        or hashlib.sha256(human["content"].encode("utf-8")).hexdigest() != input_sha256): return False
+                        or observed_input_sha256(human) != input_sha256
+                        or human.get("native_audio_input") != accepted_receipt.get("nativeAudioInput")): return False
                 finally: ledger.close()
             elif not turn_committed and isinstance(prior_ledger_head, Mapping):
                 rollback_head = prior_ledger_head
@@ -2563,6 +3033,7 @@ class Worker:
         try:
             return self._chat(params, request_id, session.requested.is_set)
         finally:
+            self.close_native_mcp_turn(brain_id, stream_id)
             with self._steering_lock:
                 if session.observation_inbox is not None: session.observation_inbox.close()
                 self._chat_steering.pop(key, None)
@@ -2573,22 +3044,25 @@ class Worker:
                             self._inline_generations.pop((brain_id, action_id), None)
 
     def _chat(self, params: Dict[str, Any], request_id: Optional[str],
-              steer_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
-        brain = self._get(params)
+              steer_check: Optional[Callable[[], bool]] = None, *, resume_payload=None, resume_manifest=None,
+              execution_session=None) -> Dict[str, Any]:
+        if params.get("nativeAudioInput") is not None and self._brain_id(params) not in self.brains:
+            raise RpcFault(-32602, "Native audio chat requires the explicitly loaded brain; no implicit Load was performed")
+        brain = execution_session.brain if execution_session is not None else self._get(params)
+        authority_brain = execution_session.root if execution_session is not None else brain
         # The desktop's small, atomic switch is authoritative even when this
         # warm worker still holds a checkpoint from before Pause was pressed.
         # The next chat save persists this setting alongside the neural turn.
-        if "onlineLearning" in params:
+        if "onlineLearning" in params and execution_session is None:
             if not isinstance(params["onlineLearning"], bool):
                 raise RpcFault(-32602, "params.onlineLearning must be a boolean")
             brain.config.online_learning = params["onlineLearning"]
-        value = params.get("input", params.get("message", params.get("text")))
+        value = resume_payload["context"]["clean"] if resume_payload is not None else params.get("input", params.get("message", params.get("text")))
         if not isinstance(value, str):
             raise RpcFault(-32602, "params.input must be a string")
         try:
-            tool_schemas = AdaptiveBrain._normalize_tool_schemas(
-                params.get("toolSchemas", [])
-            )
+            tool_schemas = AdaptiveBrain._normalize_tool_schemas(resume_payload["context"]["normalized_tools"]
+                if resume_payload is not None else params.get("toolSchemas", []))
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
         stream_id = str(params.get("streamId", "")).strip()
@@ -2598,107 +3072,160 @@ class Worker:
             or any(character in "\r\n" for character in stream_id)
         ):
             raise RpcFault(-32602, "params.streamId is invalid")
-        sequence = 0
+        sequence = int(resume_manifest["worker"]["lastStreamSequence"]) + 1 if resume_manifest is not None else 0
         sequence_lock = threading.Lock()
         inline_records: List[InlineGeneration] = []
-        turn_id = stream_id or str(request_id or uuid.uuid4().hex)
+        control_turn_id = stream_id or str(request_id or uuid.uuid4().hex)
+        turn_id = execution_session.original_turn_id if execution_session is not None else control_turn_id
+        control_key = (authority_brain.brain_id, control_turn_id)
+        published_text = str(resume_manifest["worker"]["publishedText"]) if resume_manifest is not None else ""
+        published_actions = copy.deepcopy(resume_manifest["worker"]["actions"]) if resume_manifest is not None else []
+        from omni_core.ponder_self_report import PonderPublicationTracker
+        ponder_publications = PonderPublicationTracker()
         from omni_core.chat_tool_observation import ChatToolObservationInbox
         wait_ms = params.get("toolObservationWaitMs", 30_000)
         if type(wait_ms) is not int or not 0 <= wait_ms <= (1 << 53) - 1:
             raise RpcFault(-32602, "tool observation wait must be a nonnegative safe integer")
-        observation_inbox = ChatToolObservationInbox(brain.brain_id, turn_id,
-            lambda size: not brain.resource_policy.status(estimated_ram_bytes=size).get("memoryPressure"),
-            cancelled=lambda: self._cooperative_cancel.is_set() or bool(steer_check is not None and steer_check()),
-            wait_seconds=wait_ms / 1000.0,
-            reserve_parse=brain.resource_policy.reserve_ram)
+        admit_observation = lambda size: not brain.resource_policy.status(estimated_ram_bytes=size).get("memoryPressure")
+        observation_cancelled = lambda: self._cooperative_cancel.is_set() or bool(steer_check is not None and steer_check())
+        observation_inbox = ChatToolObservationInbox.from_suspension_state(resume_manifest["worker"]["inbox"], brain.brain_id,
+            turn_id, admit_observation, cancelled=observation_cancelled, reserve_parse=brain.resource_policy.reserve_ram) if resume_manifest is not None else \
+            ChatToolObservationInbox(brain.brain_id, turn_id, admit_observation, cancelled=observation_cancelled,
+                wait_seconds=wait_ms / 1000.0, reserve_parse=brain.resource_policy.reserve_ram)
         with self._steering_lock:
-            session = self._chat_steering.get((brain.brain_id, turn_id))
-            if session is not None: session.observation_inbox = observation_inbox
-        input_sha256 = hashlib.sha256(
-            value.replace("\x00", "").strip().encode("utf-8")
-        ).hexdigest()
+            session = self._chat_steering.get(control_key)
+            if session is not None:
+                from worker_lifecycle import RootOwnedObservationInbox
+                session.observation_inbox = RootOwnedObservationInbox(observation_inbox, execution_session) if execution_session is not None else observation_inbox
+                session.minimum_context_tokens = int(resume_manifest["minimumContextTokens"]) if resume_manifest is not None else int(brain.current_context.get("tokenCount", 0))
+        if execution_session is not None:
+            pending = params.get("pendingObservations", [])
+            if not isinstance(pending, list): raise RpcFault(-32602, "pendingObservations must be a list")
+            for observation in pending:
+                inward = execution_session.inward_observation(observation)
+                if not observation_inbox.offer(inward).get("accepted"):
+                    raise RpcFault(-32602, "The inherited result could not enter its retained native inbox")
+        from omni_core.native_audio_chat import validate_native_audio_input, observed_input_sha256
+        audio_input = params.get("nativeAudioInput")
+        if resume_payload is not None:
+            input_sha256 = observed_input_sha256(resume_payload["context"].get("admitted_human_message") or {"content": value})
+        elif audio_input is not None:
+            if value:
+                raise RpcFault(-32602, "Native audio chat must not substitute a transcript")
+            try:
+                audio_input = validate_native_audio_input(audio_input, brain_id=brain.brain_id, turn_id=turn_id)
+            except ValueError as error:
+                raise RpcFault(-32602, str(error)) from error
+            input_sha256 = audio_input["inputSha256"]
+        else:
+            input_sha256 = hashlib.sha256(value.replace("\x00", "").strip().encode("utf-8")).hexdigest()
         ledger_head = brain.conversation.summary()
-        prior_ledger_head = (
+        prior_ledger_head = resume_manifest["worker"]["priorLedgerHead"] if resume_manifest is not None else (
             dict(ledger_head) if isinstance(ledger_head, Mapping) else None
         )
+        grant_schemas = AdaptiveBrain._normalize_tool_schemas(params.get("toolSchemas", [])) if resume_payload is not None else tool_schemas
         imagination_grant = next(
             (
                 str(schema.get("grant", "ask")).strip().lower()
-                for schema in tool_schemas
+                for schema in grant_schemas
                 if schema.get("id") == "modality.imagine"
                 and "generate" in schema.get("actions", [])
             ),
             "off",
         )
         with self._steering_lock:
-            session = self._chat_steering.get((brain.brain_id, turn_id))
+            session = self._chat_steering.get(control_key)
             if session is not None: session.imagination_grant = imagination_grant
 
         def stream(kind: str, payload: Dict[str, Any]) -> None:
-            nonlocal sequence
+            nonlocal sequence, published_text
             if self._cooperative_cancel.is_set():
                 raise ChatGenerationCancelled("chat generation was cancelled")
             if not stream_id:
+                return
+            visible = execution_session.outward_event(kind, payload) if execution_session is not None else payload
+            if visible is None:
                 return
             action: Optional[Dict[str, Any]] = None
             action_id = ""
             with sequence_lock:
                 if kind == "token":
+                    published_text += str(payload.get("delta", ""))
                     self.notify(
                         "chat-token",
-                        brain_id=brain.brain_id,
+                        brain_id=authority_brain.brain_id,
                         stream_id=stream_id,
                         sequence=sequence,
-                        data={"delta": str(payload.get("delta", ""))},
+                        data={"delta": str(payload.get("delta", "")),
+                              **{key: payload[key] for key in ("outputTokens", "outputElapsedMs", "tokensPerSecond")
+                                 if key in payload}},
                     )
                 elif kind == "input-accepted":
                     if (payload.get("turnId") != turn_id or payload.get("inputSha256") != input_sha256
                         or payload.get("committed") is not True or not isinstance(payload.get("humanMessageId"), str)
                         or not isinstance(payload.get("afterimageId"), str)):
                         raise RuntimeError("neural input admission has a different human/turn owner")
-                    self.notify("chat-input-accepted", brain_id=brain.brain_id, stream_id=stream_id,
-                        sequence=sequence, data=dict(payload))
+                    self.notify("chat-input-accepted", brain_id=authority_brain.brain_id, stream_id=stream_id,
+                        sequence=sequence, data=dict(visible))
                 elif kind == "action":
                     raw_action = payload.get("action")
                     action = raw_action if isinstance(raw_action, dict) else None
                     action_id = str(payload.get("actionId", ""))
+                    visible_action, visible_action_id = visible.get("action"), str(visible.get("actionId", ""))
+                    if action is not None:
+                        published_actions.append(copy.deepcopy(action))
                     if action is not None and action.get("kind") == "imagine":
                         with self._steering_lock:
-                            session = self._chat_steering.get((brain.brain_id, turn_id))
-                            if session is not None: session.imagination_actions[action_id] = copy.deepcopy(action)
+                            session = self._chat_steering.get(control_key)
+                            if session is not None: session.imagination_actions[visible_action_id] = copy.deepcopy(visible_action)
                         with self._inline_lock:
-                            key = (brain.brain_id, action_id)
+                            key = (authority_brain.brain_id, visible_action_id)
                             if imagination_grant == "ask" and key not in self._inline_generations:
-                                self._inline_generations[key] = InlineGeneration(brain_id=brain.brain_id, action_id=action_id,
-                                    stream_id=turn_id, signature=self._inline_signature(action["arguments"]),
-                                    staging_root=(brain.engine_path / ".inline-imagination" / action_id).resolve(), events=DeferredEventLog())
+                                self._inline_generations[key] = InlineGeneration(brain_id=authority_brain.brain_id, action_id=visible_action_id,
+                                    stream_id=control_turn_id, signature=self._inline_signature(visible_action["arguments"]),
+                                    staging_root=(authority_brain.engine_path / ".inline-imagination" / visible_action_id).resolve(), events=DeferredEventLog())
                     if action is not None: observation_inbox.register(action_id, action)
                     self.notify(
                         "chat-action",
-                        brain_id=brain.brain_id,
+                        brain_id=authority_brain.brain_id,
                         stream_id=stream_id,
                         sequence=sequence,
-                        action_id=action_id,
-                        data={"action": action},
+                        action_id=visible_action_id,
+                        data={"action": visible_action},
                     )
                 elif kind == "preview":
-                    preview_value = payload.get("preview")
+                    preview_value = visible.get("preview")
                     if not isinstance(preview_value, dict):
                         raise RuntimeError("neural modality preview is invalid")
                     self.notify(
                         "modality-preview",
-                        brain_id=brain.brain_id,
+                        brain_id=authority_brain.brain_id,
                         job_id=str(payload.get("jobId", "")),
                         stream_id=stream_id,
                         sequence=sequence,
-                        action_id=str(payload.get("actionId", "")),
+                        action_id=str(visible.get("actionId", "")),
                         progress=float(preview_value.get("progress", 0.0)),
                         message=str(preview_value.get("statusLabel", "")),
                         data={"preview": preview_value},
                     )
+                elif kind == "cognition-progress":
+                    if payload.get("phase") not in {"ponder", "best-work"}:
+                        raise RuntimeError("neural cognition phase is invalid")
+                    allowed = {"phase", "passes", "step", "branch", "ordinary", "admittedBranches", "completedBranches",
+                               "elapsedMs", "delta", "entropy", "selectedAction", "schedulerYield", "concurrency", "active", "stopReason"}
+                    if set(payload) - allowed:
+                        raise RuntimeError("neural cognition progress contains unsupported fields")
+                    self.notify("chat-cognition", brain_id=authority_brain.brain_id, stream_id=stream_id,
+                                sequence=sequence, data=dict(visible))
+                elif kind == "ponder-self-report":
+                    from omni_core.ponder_self_report import validate_publication_frame
+                    raw_frame = ponder_publications.accept(payload, published_actions)
+                    visible_frame = validate_publication_frame(visible)
+                    self.notify("chat-ponder-self-report", brain_id=authority_brain.brain_id, stream_id=stream_id,
+                                sequence=sequence, action_id=visible_frame["actionId"], data=visible_frame)
                 elif kind == "phase":
                     with self._steering_lock:
-                        session = self._chat_steering.get((brain.brain_id, turn_id))
+                        session = self._chat_steering.get(control_key)
                         if session is not None: session.generation_open = False
                     observation_inbox.close()
                     if payload != {
@@ -2713,15 +3240,15 @@ class Worker:
                         )
                     self.notify(
                         "chat-phase",
-                        brain_id=brain.brain_id,
+                        brain_id=authority_brain.brain_id,
                         stream_id=stream_id,
                         sequence=sequence,
                         data=dict(payload),
                     )
                 elif kind == "inline-started":
-                    self.notify("inline-imagination-started", brain_id=brain.brain_id,
+                    self.notify("inline-imagination-started", brain_id=authority_brain.brain_id,
                                 stream_id=stream_id, sequence=sequence,
-                                action_id=str(payload.get("actionId", "")), data={"requestId": str(request_id or "")})
+                                action_id=str(visible.get("actionId", "")), data={"requestId": str(request_id or "")})
                 else:
                     raise RuntimeError("unsupported neural chat stream event")
                 sequence += 1
@@ -2736,42 +3263,89 @@ class Worker:
             ):
                 record = self._start_inline_generation(
                     brain,
-                    action_id,
+                    str(visible.get("actionId", "")),
                     stream_id,
                     action,
                     lambda current, preview: stream(
                         "preview",
                         {
-                            "actionId": current.action_id,
+                            "actionId": action_id,
                             "jobId": current.job_id,
                             "preview": preview,
                         },
                     ),
-                    lambda current: stream("inline-started", {"actionId": current.action_id}),
+                    lambda current: stream("inline-started", {"actionId": action_id}),
+                    authority_brain=authority_brain, authority_action=visible.get("action"),
                 )
                 if record is not None and record not in inline_records:
                     inline_records.append(record)
 
         def chat_control_tick() -> None:
+            self.service_native_mcp_sampling(authority_brain.brain_id, control_turn_id)
             with self._steering_lock:
-                session = self._chat_steering.get((brain.brain_id, turn_id))
+                session = self._chat_steering.get(control_key)
                 pending = list(session.approved_imagination) if session is not None else []
                 if session is not None: session.approved_imagination.clear()
             for identifier in pending:
                 action = session.imagination_actions[identifier]
+                neural_action = execution_session.argument_owner(identifier)[1] if execution_session is not None else action
+                native_identifier = str(neural_action.get("actionId", neural_action.get("id", identifier)))
                 if self._cooperative_cancel.is_set() or session.requested.is_set():
                     with self._inline_lock:
-                        record = self._inline_generations.get((brain.brain_id, identifier))
+                        record = self._inline_generations.get((authority_brain.brain_id, identifier))
                         if record is not None:
                             record.cancelled = True; record.finished.set(); self._acknowledge_inline_cancellation(record)
                     continue
-                record = self._start_inline_generation(brain, identifier, turn_id, action,
-                    lambda current, preview: stream("preview", {"actionId": current.action_id, "jobId": current.job_id, "preview": preview}),
-                    lambda current: stream("inline-started", {"actionId": current.action_id}))
+                record = self._start_inline_generation(brain, identifier, control_turn_id, neural_action,
+                    lambda current, preview, source_id=native_identifier: stream("preview", {"actionId": source_id, "jobId": current.job_id, "preview": preview}),
+                    lambda current, source_id=native_identifier: stream("inline-started", {"actionId": source_id}),
+                    authority_brain=authority_brain, authority_action=action)
                 if record is not None and record not in inline_records: inline_records.append(record)
 
+        observation_inbox.service_pending = chat_control_tick
+
+        def suspension_boundary() -> bool:
+            with self._steering_lock:
+                session = self._chat_steering.get(control_key)
+                if session is None or not session.suspension_requested.is_set():
+                    return False
+            # A live artifact has its own authorized owner. Never turn Unload
+            # into cancellation or drop it merely to report a released model.
+            with self._inline_lock:
+                return not any(record.brain_id == authority_brain.brain_id for record in self._inline_generations.values())
+
+        def persist_suspension(context, cursor, continuation):
+            store = self._execution_store(params, brain=brain) if execution_session is None else None
+            with self._steering_lock, sequence_lock:
+                session = self._chat_steering.get(control_key)
+                if session is None:
+                    raise RuntimeError("native checkpoint lost its active worker owner")
+                session.suspension_freezing = True
+                worker_state = {"brainId": brain.brain_id, "turnId": turn_id,
+                    "lastStreamSequence": max(0, sequence - 1), "publishedText": published_text,
+                    "actions": published_actions, "inbox": observation_inbox.suspension_state(),
+                    "priorLedgerHead": prior_ledger_head, "imaginationGrant": imagination_grant}
+            try:
+                if execution_session is not None:
+                    return {**execution_session.resuspend(context, cursor, continuation, worker_state), "inputSha256": input_sha256}
+                checkpoint = store.save(brain, context, cursor, phase=continuation["phase"], worker_state=worker_state,
+                    journal=context["before_parameters"], continuation=continuation)
+                return {"brainId": brain.brain_id, "turnId": turn_id, "inputSha256": input_sha256,
+                    "suspended": True, "turnCommitted": False, "resume": checkpoint["frontier"]}
+            except BaseException:
+                session.suspension_freezing = False
+                raise
+
+        from omni_core.reply_execution_planner import bind_reply_controls, retire_reply_controls
+        with self._steering_lock:
+            reply_controls = bind_reply_controls(brain, request_id, control_turn_id,
+                sessions=self._chat_steering, key=control_key, session=self._chat_steering.get(control_key),
+                cancellation=self._cooperative_cancel) if execution_session is None and resume_payload is None else None
         try:
-            result = brain.chat(
+            result = brain.resume_chat(resume_payload, stream_callback=stream if stream_id else None,
+                cancel_check=self._cooperative_cancel.is_set, steer_check=steer_check,
+                tool_observation_provider=observation_inbox, chat_control_callback=chat_control_tick,
+                suspension_check=suspension_boundary, suspend_callback=persist_suspension) if resume_payload is not None else brain.chat(
                 value,
                 max_new_tokens=(
                     int(params["maxNewTokens"])
@@ -2792,6 +3366,10 @@ class Worker:
                 temporary_steering_context=params.get("temporarySteeringContext"),
                 tool_observation_provider=observation_inbox,
                 chat_control_callback=chat_control_tick,
+                suspension_check=suspension_boundary,
+                suspend_callback=persist_suspension,
+                app_input=params.get("appInput"),
+                native_audio_input=audio_input,
             )
         except ChatGenerationCancelled as error:
             # The model raises this only at a pre-commit boundary. Preserve
@@ -2808,18 +3386,22 @@ class Worker:
                 {"cancelled": True, "safeBoundary": True},
             ) from error
         except Exception:
-            self._restore_committed_brain_after_failed_chat(
+            if execution_session is None: self._restore_committed_brain_after_failed_chat(
                 brain,
                 prior_ledger_head=prior_ledger_head,
                 turn_id=turn_id,
                 input_sha256=input_sha256,
             )
             raise
+        finally:
+            retire_reply_controls(brain, reply_controls)
 
+        if result.get("suspended") is True:
+            return result
         if result.get("zeroTokenYield") is True and (result.get("steered") is True or result.get("nativeStopped") is True):
             steered = result.get("steered") is True
             raise RpcFault(-32801 if steered else -32802, "Chat stopped at a safe boundary before visible output.", {
-                "brainId": brain.brain_id, "turnId": turn_id,
+                "brainId": authority_brain.brain_id, "turnId": control_turn_id,
                 "inputSha256": input_sha256, "steered": steered, "nativeStopped": not steered,
                 "zeroTokenYield": True, "safeBoundary": True, "warm": True})
 
@@ -2832,7 +3414,7 @@ class Worker:
         # neural RPC/write boundary after that receipt is ready.
         self.notify(
             "brain-mutated",
-            brain_id=brain.brain_id,
+            brain_id=authority_brain.brain_id,
             progress=1.0,
             message=(
                 "Turn committed to fast episodic neural state; slow replay "
@@ -2866,10 +3448,11 @@ class Worker:
             message="Replaying retained chat activity into slow parameters.",
         )
         try:
-            result = brain.consolidate_pending_chat_learning(
-                job_id,
-                cancel_check=self._cooperative_cancel.is_set,
-            )
+            with self._outer_learning_scope(brain, params, request_id, "queued-chat-replay"):
+                result = brain.consolidate_pending_chat_learning(
+                    job_id,
+                    cancel_check=brain._learning_cancel_check,
+                )
         except ChatGenerationCancelled as error:
             raise RpcFault(
                 -32800,
@@ -2897,13 +3480,54 @@ class Worker:
                 raise RpcFault(-32602, "completed action evidence hash is invalid")
         if not isinstance(params.get("executionId"), str) or not re.fullmatch(r"[a-f0-9-]{36}", params["executionId"], re.I):
             raise RpcFault(-32602, "completed action execution identity is invalid")
-        def progress(value: Dict[str, Any]) -> None:
+        def progress(value: Any, message: str = "", metrics: Any = None) -> None:
             if self._cooperative_cancel.is_set():
                 raise ChatGenerationCancelled("independent evidence learning paused at a committed boundary")
-            self.notify("action-result-learning-progress", brain_id=brain.brain_id, job_id=params["evidenceId"], data=value)
-        return brain.learn_action_result(evidence_id=params["evidenceId"], execution_id=params["executionId"],
-            evidence_path=params.get("evidencePath"), evidence_sha256=params["evidenceSha256"],
-            provenance=params.get("provenance"), progress=progress)
+            self.notify("action-result-learning-progress", brain_id=brain.brain_id, job_id=params["evidenceId"],
+                progress=float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None,
+                message=message, data=metrics if metrics is not None else value)
+        try:
+            with self._outer_learning_scope(brain, params, request_id, "action-result-learning"):
+                return brain.learn_action_result(evidence_id=params["evidenceId"], execution_id=params["executionId"],
+                    evidence_path=params.get("evidencePath"), evidence_sha256=params["evidenceSha256"],
+                    provenance=params.get("provenance"), progress=progress,
+                    merge_continuation=params.get("mergeContinuation"))
+        except Exception:
+            # Evidence learning is a real dataset transaction. Preserve its
+            # last committed record cursor, but never keep a partially applied
+            # uncommitted suffix warm for a retry. No external tool is called.
+            self._restore_committed_brain_after_failed_chat(brain,
+                prior_ledger_head=None, turn_id="", input_sha256="")
+            raise
+
+    def learn_capability_pack(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        brain = self._get(params)  # Explicit Load is required; never _get(...allow_load=True).
+        try:
+            with self._outer_learning_scope(brain, params, request_id, "capability-learning"):
+                receipt = brain.learn_supplementary_capabilities(params.get("pack"),
+                    steps=params.get("steps", 2), cancel_check=brain._learning_cancel_check)
+        except Exception:
+            self._restore_committed_brain_after_failed_chat(brain,
+                prior_ledger_head=None, turn_id="", input_sha256="")
+            raise
+        duplicate = receipt.pop("duplicate", False)
+        self.notify("brain-mutated", brain_id=brain.brain_id, progress=1.0,
+            message="Declared capability teaching settled; learned use remains unverified.", data={"capabilityPack": receipt})
+        return {"brainId": brain.brain_id, "committed": True, "duplicate": duplicate, "capabilityPack": receipt, "metrics": brain.metrics()}
+
+    def rebind_learning_source(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        from omni_core.source_relocation import rebind_retained_source
+        brain = self._get(params)
+        try:
+            return {"brainId": brain.brain_id, **rebind_retained_source(brain,
+                path=str(params.get("path", "")), original_source_identity=str(params.get("originalSourceIdentity", "")),
+                content_hash=str(params.get("contentHash", "")), source_name=str(params.get("sourceName", "")),
+                transaction_id=str(params.get("transactionId", "")), parent_id=str(params.get("parentId", "")),
+                source_identity_aliases=params.get("sourceIdentityAliases", []),
+                cancelled=self._request_cancel_check(request_id))}
+        except Exception:
+            self._restore_committed_brain_after_failed_chat(brain, prior_ledger_head=None, turn_id="", input_sha256="")
+            raise
 
     def learn_tool_route_outcome(
         self, params: Dict[str, Any], request_id: Optional[str]
@@ -2917,22 +3541,23 @@ class Worker:
 
         brain = self._get(params)
         try:
-            result = brain.learn_tool_route_experience(
-                utterance=str(params.get("utterance", "")),
-                tool_id=str(params.get("toolId", "")),
-                action=str(params.get("action", "")),
-                outcome=str(params.get("outcome", "")),
-                source="host-tool-outcome",
-                event_id=str(params.get("eventId", "")),
-                arguments=(
-                    params.get("arguments")
-                    if isinstance(params.get("arguments"), dict)
-                    else None
-                ),
-                cancel_check=self._request_cancel_check(request_id),
-            )
-            if bool(result.get("applied")):
-                brain.save()
+            with self._outer_learning_scope(brain, params, request_id, "tool-route-learning"):
+                result = brain.learn_tool_route_experience(
+                    utterance=str(params.get("utterance", "")),
+                    tool_id=str(params.get("toolId", "")),
+                    action=str(params.get("action", "")),
+                    outcome=str(params.get("outcome", "")),
+                    source="host-tool-outcome",
+                    event_id=str(params.get("eventId", "")),
+                    arguments=(
+                        params.get("arguments")
+                        if isinstance(params.get("arguments"), dict)
+                        else None
+                    ),
+                    cancel_check=brain._learning_cancel_check,
+                )
+                if bool(result.get("applied")):
+                    brain.save()
         except Exception:
             # A failed checkpoint must not leave a trained-but-unsaved route
             # head resident. Reload the last atomic state before a retry.
@@ -3276,17 +3901,18 @@ class Worker:
                 "training requires non-empty text or explicit retained sourceIds",
             )
         brain, job_id, progress = self._job(params, request_id, "training")
-        result = brain.train(
-            texts=texts,
-            epochs=int(params.get("epochs", params.get("steps", 1))),
-            learning_rate=(
-                _number(params.get("learningRate"))
-                if params.get("learningRate") is not None
-                else None
-            ),
-            source_ids=source_ids,
-            progress=progress,
-        )
+        with self._outer_learning_scope(brain, params, request_id, "slow-training"):
+            result = brain.train(
+                texts=texts,
+                epochs=int(params.get("epochs", params.get("steps", 1))),
+                learning_rate=(
+                    _number(params.get("learningRate"))
+                    if params.get("learningRate") is not None
+                    else None
+                ),
+                source_ids=source_ids,
+                progress=progress,
+            )
         self._job_complete(brain, job_id, "training", result)
         return result
 
@@ -3339,29 +3965,35 @@ class Worker:
             raise RpcFault(-32602, "ingestion idempotency keys disagree")
         brain, job_id, progress = self._job(params, request_id, "ingestion")
         try:
-            result = brain.ingest(
-                path=str(params["path"]) if params.get("path") else None,
-                text=(
-                    str(params["text"])
-                    if params.get("text") is not None
-                    else None
-                ),
-                name=str(params.get("name", "")),
-                kind=str(params.get("kind", "")),
-                policy=str(params.get("policy", "encode")),
-                expected_hash=str(
-                    params.get(
-                        "contentHash", params.get("expectedSha256", "")
-                    )
-                ),
-                committed_sqlite_snapshot=bool(
-                    params.get("committedSqliteSnapshot", False)
-                ),
-                allow_replay=bool(params.get("allowReplay", False)),
-                epoch=int(params.get("epoch", 0)),
-                transaction_key=transaction_key,
-                progress=progress,
-            )
+            from omni_core.training_whole_operation import training_job
+            # This actual app submission captures only an explicitly armed
+            # current owner review. A saved job manifest cannot rearm it on
+            # resume/restart, and an unarmed job remains ordinary by default.
+            with self._outer_learning_scope(brain, params, request_id, "dataset-ingestion"), \
+                    training_job(brain, job_id, params):
+                result = brain.ingest(
+                    path=str(params["path"]) if params.get("path") else None,
+                    text=(
+                        str(params["text"])
+                        if params.get("text") is not None
+                        else None
+                    ),
+                    name=str(params.get("name", "")),
+                    kind=str(params.get("kind", "")),
+                    policy=str(params.get("policy", "encode")),
+                    expected_hash=str(
+                        params.get(
+                            "contentHash", params.get("expectedSha256", "")
+                        )
+                    ),
+                    committed_sqlite_snapshot=bool(
+                        params.get("committedSqliteSnapshot", False)
+                    ),
+                    allow_replay=bool(params.get("allowReplay", False)),
+                    epoch=int(params.get("epoch", 0)),
+                    transaction_key=transaction_key,
+                    progress=progress,
+                )
         except Exception as error:
             # Ingestion mutates fast weights and assemblies as records stream,
             # but the durable cursor is committed only after the whole worker
@@ -3704,6 +4336,15 @@ class Worker:
             if session.retention == "neural" and not bool(organic.get("ran")):
                 brain.save()
         except Exception as error:
+            if getattr(brain, "_native_execution_restore_required", False):
+                # Exact placement restoration failed, not ordinary Stop or
+                # transient pressure. Preserve the current learned owner and
+                # uncommitted packet; never silently close/reload it here.
+                raise RpcFault(-32020, "native observation is paused until explicit Unload after failed owner restoration",
+                    {"resourcePause": {"paused": True, "recoverable": True, "reloadRequired": True,
+                        "nativeOwnerRestoreFailed": True, "packetCommitted": False,
+                        "datasetCoverageCommitted": False, "workerRestarted": False,
+                        "failureStage": "live-%s-observation" % modality}}) from error
             if is_allocator_oom_error(error):
                 brain._allocator_oom_count += 1
                 brain._release_training_allocator_cache()
@@ -3821,12 +4462,35 @@ class Worker:
             "trainingState": "needs-speech-training" if not result.get("speechPairedExamples", 0) else "speech-quality-unverified"}
         return result
 
+    def authorize_spontaneous_output(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        brain_id, job_id = params.get("brainId"), params.get("jobId")
+        brain = self.brains.get(brain_id)
+        if brain is None:
+            raise RpcFault(-32602, "spontaneous output authorization requires an explicitly loaded native owner")
+        try:
+            brain.resource_policy.require_disk(65536, "spontaneous output scratch ownership")
+            return self._spontaneous_output_leases.authorize(brain.engine_path, brain_id, job_id, params.get("origin") if isinstance(params.get("origin"), dict) else {})
+        except (ValueError, OSError) as error:
+            raise RpcFault(-32602, str(error)) from error
+
+    def discard_spontaneous_output(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
+        try:
+            return self._spontaneous_output_leases.discard(str(params.get("brainId", "")), str(params.get("jobId", "")), str(params.get("leaseId", "")))
+        except (ValueError, OSError) as error:
+            raise RpcFault(-32602, str(error)) from error
+
     def generate_modality(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
         brain, job_id, progress = self._job(
             params, request_id, "modality-generation"
         )
+        spontaneous_output = None
+        if params.get("spontaneousOutputLeaseId") is not None:
+            try:
+                spontaneous_output = self._spontaneous_output_leases.consume(brain.brain_id, job_id, str(params["spontaneousOutputLeaseId"]))
+            except ValueError as error:
+                raise RpcFault(-32602, str(error)) from error
         if params.get("inlineClaimRequired") is True and (brain.brain_id, self._valid_inline_action_id(params.get("neuralActionId"))) not in self._inline_generations:
             raise RpcFault(-32602, "owned inline artifact is unavailable; it must not be regenerated")
         try:
@@ -3955,6 +4619,7 @@ class Worker:
                 cancel_check=lambda: bool(
                     job_id and job_id in self.cancelled_jobs
                 ) or self._cooperative_cancel.is_set(),
+                owned_output_directory=spontaneous_output,
             )
         except ModalityGenerationCancelled as error:
             raise RpcFault(-32800, "job was cancelled", {"modalityCancelled": True, "safeBoundary": True}) from error
@@ -4042,23 +4707,26 @@ class Worker:
         if geometry_holdouts is not None and not isinstance(geometry_holdouts, dict):
             raise RpcFault(-32602, "params.geometryHoldouts must be a typed object")
         try:
-            result = NeuralEvolutionManager(brain).propose(
-                texts=texts,
-                source_ids=source_ids,
-                epochs=int(params.get("epochs", params.get("steps", 1))),
-                learning_rate=(
-                    _number(params.get("learningRate"))
-                    if params.get("learningRate") is not None
-                    else None
-                ),
-                latent_replay=bool(params.get("latentReplay", False)),
-                objectives=objectives,
-                provenance=provenance,
-                architecture_change=architecture,
-                geometry_holdouts=geometry_holdouts,
-                recursive_parent_candidate_id=params.get("recursiveParentCandidateId"),
-                progress=progress,
-            )
+            with self._outer_learning_scope(brain, params, request_id, "evolution-proposal"), \
+                    learning_phase(brain, "evolution-proposal"):
+                result = NeuralEvolutionManager(brain).propose(
+                    texts=texts,
+                    source_ids=source_ids,
+                    epochs=int(params.get("epochs", params.get("steps", 1))),
+                    learning_rate=(
+                        _number(params.get("learningRate"))
+                        if params.get("learningRate") is not None
+                        else None
+                    ),
+                    latent_replay=bool(params.get("latentReplay", False)),
+                    objectives=objectives,
+                    provenance=provenance,
+                    architecture_change=architecture,
+                    geometry_holdouts=geometry_holdouts,
+                    recursive_parent_candidate_id=params.get("recursiveParentCandidateId"),
+                    progress=progress,
+                    cancel_check=brain._learning_cancel_check,
+                )
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
         self._job_complete(brain, job_id, "neural-evolution-proposal", result)
@@ -4067,14 +4735,14 @@ class Worker:
     def evolution_evaluate(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
-        del request_id
         candidate_id = str(params.get("candidateId", ""))
         if not candidate_id:
             raise RpcFault(-32602, "params.candidateId is required")
+        brain = self._get(params)
         try:
-            return NeuralEvolutionManager(self._get(params)).evaluate(
-                candidate_id
-            )
+            with self._outer_learning_scope(brain, params, request_id, "evolution-evaluation"), \
+                    learning_phase(brain, "evolution-evaluation"):
+                return NeuralEvolutionManager(brain).evaluate(candidate_id)
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
 
@@ -4087,14 +4755,15 @@ class Worker:
     def evolution_promote(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
-        del request_id
         candidate_id = str(params.get("candidateId", ""))
         if not candidate_id:
             raise RpcFault(-32602, "params.candidateId is required")
         brain = self._get(params)
         try:
-            result = NeuralEvolutionManager(brain).promote(candidate_id,
-                geometry_authorization=params.get("geometryAuthorization"))
+            with self._outer_learning_scope(brain, params, request_id, "evolution-promotion"), \
+                    learning_phase(brain, "evolution-promotion"):
+                result = NeuralEvolutionManager(brain).promote(candidate_id,
+                    geometry_authorization=params.get("geometryAuthorization"))
         except (ValueError, PermissionError) as error:
             raise RpcFault(-32602, str(error)) from error
         previous = self.brains.pop(brain.brain_id, None)
@@ -4124,15 +4793,16 @@ class Worker:
     def evolution_rollback(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
-        del request_id
         candidate_id = str(params.get("candidateId", ""))
         if not candidate_id:
             raise RpcFault(-32602, "params.candidateId is required")
         brain = self._get(params)
         try:
-            result = NeuralEvolutionManager(brain).rollback(
-                candidate_id, force=bool(params.get("force", False))
-            )
+            with self._outer_learning_scope(brain, params, request_id, "evolution-rollback"), \
+                    learning_phase(brain, "evolution-rollback"):
+                result = NeuralEvolutionManager(brain).rollback(
+                    candidate_id, force=bool(params.get("force", False))
+                )
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
         previous = self.brains.pop(brain.brain_id, None)
@@ -4155,19 +4825,20 @@ class Worker:
     def snapshot(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
-        del request_id
         brain = self._get(params)
-        return brain.snapshot(str(params.get("label", "snapshot")))
+        with self._outer_learning_scope(brain, params, request_id, "snapshot"):
+            return brain.snapshot(str(params.get("label", "snapshot")))
 
     def checkpoint(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
-        del request_id
         operation_id = str(params.get("operationId", "")).strip()
         if not operation_id:
             raise RpcFault(-32602, "params.operationId is required")
+        brain = self._get(params)
         try:
-            return self._get(params).checkpoint(operation_id)
+            with self._outer_learning_scope(brain, params, request_id, "checkpoint"):
+                return brain.checkpoint(operation_id)
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error
 
@@ -4341,6 +5012,7 @@ class Worker:
     ) -> Dict[str, Any]:
         del params, request_id
         self.running = False
+        self.shutdown_native_mcp_sampling()
         self._shutdown_inline_generations()
         with self._observation_lock:
             self._observation_sessions.clear()
@@ -4372,15 +5044,29 @@ class Worker:
         owner = CodecOwner(correlated_id, str(params.get("brainId", "")), str(params.get("jobId", "")),
             str(params.get("streamId", "")), str(params.get("neuralActionId", "")))
         cooperatively_cancellable = method in {
+            *SPARSE_READ_METHODS,
+            "sparse_substrate_apply",
+            "admit_app_observation",
+            "full_merge_assemble",
+            "full_merge_verify",
+            "full_merge_activate_ingestion",
+            "hardware_topology",
             "hardware_projection_profile",
             "load",
             "chat",
+            "resume_chat",
+            "resume_inherited_chat",
             "consolidate_chat_learning",
             "learn_action_result",
             "learn_tool_route_outcome",
+            "learn_capability_pack",
+            "rebind_learning_source",
             "configure_video_runtime",
             "generate_neural_speech",
             "generate_modality",
+            "train", "ingest", "checkpoint", "snapshot",
+            "evolution.propose", "evolution_propose", "evolution.evaluate", "evolution_evaluate",
+            "evolution.promote", "evolution_promote", "evolution.rollback", "evolution_rollback",
         }
         if cooperatively_cancellable:
             self._cooperative_cancel.clear()
@@ -4391,11 +5077,15 @@ class Worker:
             # Serialized neural dispatch is a quiescent migration boundary.
             # State/inspection/export requests do not move execution devices.
             if self.worker_role == "neural" and method in {
-                "chat", "consolidate_chat_learning", "learn_tool_route_outcome", "learn_action_result",
+                "chat", "consolidate_chat_learning", "learn_tool_route_outcome", "learn_capability_pack", "rebind_learning_source", "learn_action_result",
                 "train", "ingest", "generate_modality", "generate_neural_speech", "idle_cycle", "feedback",
-                "observe_packet", "evolution.evaluate", "evolution_evaluate",
+                "observe_packet", "fresh_attention", "install_modality_pack", "full_merge_activate_ingestion",
+                "evolution.propose", "evolution_propose", "evolution.evaluate", "evolution_evaluate",
+                "evolution.promote", "evolution_promote", "evolution.rollback", "evolution_rollback",
             }:
                 brain = self._get(params)
+                from omni_core.connected_execution import require_joint_mutation_allowed
+                require_joint_mutation_allowed(brain, operation=method)
                 prepare = getattr(brain, "prepare_native_execution", None)
                 if callable(prepare):
                     prepare(operation=method, quiescent=True)
@@ -4403,11 +5093,13 @@ class Worker:
             loaded = getattr(self, "brains", {}).get(str(params.get("brainId", "")))
             policy = getattr(loaded, "resource_policy", None)
             active = getattr(policy, "active_operation", None)
-            with (active(method) if callable(active) else nullcontext()), \
+            with (active(method) if callable(active) else nullcontext()), owned_request_path(loaded, method, correlated_id), \
                     (gateway.scope(owner, lambda: self._cooperative_cancel.is_set() or bool(owner.job_id and owner.job_id in self.cancelled_jobs)) if gateway else nullcontext()):
                 result = handler(params, correlated_id or None)
         except CodecRuntimeCancelled as error:
             raise RpcFault(-32800, str(error), {"codecRuntimeCancelled": True, "safeBoundary": True}) from error
+        except ChatGenerationCancelled as error:
+            raise RpcFault(-32800, str(error), {"cancelled": True, "safeBoundary": True}) from error
         finally:
             if cooperatively_cancellable:
                 with self._active_request_lock:
@@ -4415,6 +5107,12 @@ class Worker:
                         self._active_request = None
                         self._artifact_request_owner = None
                 self._cooperative_cancel.clear()
+            if method in {"resume_chat", "resume_inherited_chat"}:
+                key = (str(params.get("brainId", "")), str(params.get("streamId", "")))
+                with self._steering_lock:
+                    reservation = self._chat_steering.get(key)
+                    if reservation is not None and not reservation.claimed and reservation.request_id == correlated_id:
+                        self._chat_steering.pop(key, None)
         if request_id is None:
             return None
         return {"jsonrpc": "2.0", "id": request_id, "result": result}

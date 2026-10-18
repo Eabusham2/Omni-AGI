@@ -1,0 +1,50 @@
+Window: "Call camera/screen — synthetic UI check", App: Electron.
+0 standard window Call camera/screen — synthetic UI check, Secondary Actions: Raise
+	1 container Call camera/screen — synthetic UI check
+		2 container
+			3 HTML content Call camera/screen — synthetic UI check, URL: 127.0.0.1:5192/tests/e2e/camera-screen-fixture.html
+				4 container
+					5 heading Call camera/screen UI check, Value: 1
+						6 text Call camera/screen UI check
+					7 text Synthetic canvas streams and synthetic acceptance receipts. Your camera, microphone, screen, and models are not accessed.
+					8 button Collapse Call
+					9 button Wide surface
+					10 button Switch appearance
+					11 button Unload fixture
+					12 button Switch fixture instance
+					13 button Toggle synthetic permission denial
+					14 button End synthetic source
+					15 text Instance  1  ·  loaded  · active synthetic tracks:  0
+					16 container Camera and screen sharing
+						17 container
+							18 text Camera & screen Share a source when you choose Needs attention
+						19 text Camera and screen are off.
+						20 container Source
+							21 text Source
+							22 toggle button Camera, Help: Share camera after Start, Value: 1
+							23 toggle button Screen, Help: Share screen after Start, Value: 0
+						24 container Sharing mode
+							25 text Sharing mode
+							26 toggle button Stream, Help: Share frames continuously within the device resource plan, Value: 1
+							27 toggle button Snapshots, Help: Share only audited snapshots requested by you or the brain, Value: 0
+						28 button Start
+						29 text Synthetic fixture: system capture permission denied.
+						30 disclosure triangle Quality, snapshots & activity +
+							31 text Quality, snapshots & activity
+							32 text +
+					33 heading Conversation stays beside Call, Value: 2
+						34 text Conversation stays beside Call
+					35 text No neural chat runs in this UI fixture.
+					36 disclosure triangle Capture receipts
+						37 text Capture receipts
+	38 close button
+	39 full screen button Help: this button also has an action to zoom the window, Secondary Actions: zoom the window
+	40 minimize button
+41 menu bar
+	42 Electron
+	43 File
+	44 Edit
+	45 View
+	46 Window
+
+The focused UI element is 3 HTML content Call camera/screen — synthetic UI check, URL: 127.0.0.1:5192/tests/e2e/camera-screen-fixture.html

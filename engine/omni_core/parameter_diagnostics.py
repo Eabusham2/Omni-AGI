@@ -43,6 +43,29 @@ def active_diagnostic_scopes():
     return tuple(id(journal) for journal in _OBSERVERS.get())
 
 
+@contextmanager
+def native_parameter_read_only():
+    """Reject native learned writes before an outer diagnostic sees them.
+
+    Private inference shares the actual packed owners, not copied weights.
+    Install this boundary before existing observers so an accidental training
+    call cannot even add a private mutation to the live turn's journal.
+    Ordinary activity buffers are separately owned by the private caller.
+    """
+    class ReadOnly:
+        def before_write(self, *_args, **_kwargs):
+            raise RuntimeError("private native inference cannot mutate learned parameters")
+        def register_sparse_zero_owner(self, *_args, **_kwargs):
+            raise RuntimeError("private native inference cannot grow learned parameters")
+        def retire_sparse_zero_owner(self, *_args, **_kwargs):
+            raise RuntimeError("private native inference cannot retire learned parameters")
+    token = _OBSERVERS.set((ReadOnly(), *_OBSERVERS.get()))
+    try:
+        yield
+    finally:
+        _OBSERVERS.reset(token)
+
+
 def register_sparse_zero_owner(parent, key, block):
     """Explicit absent-zero -> registered block boundary, before any write."""
     registered = []
@@ -102,7 +125,7 @@ def packed_diagnostic_write(module, target, replacement, *, start=0):
 
 class ParameterDeltaJournal:
     scope = {"format": "core-module-net-delta-v1", "modules": ["decoder", "memory_bridge", "idea_adapter", "liquid"],
-        "packedUnit": "signed-ternary-level", "floatingUnit": "native-residual-control-value",
+        "packedUnit": "signed-ternary-level-and-integer-connection-strength", "floatingUnit": "native-residual-control-value",
         "substrateDeltaMeasured": False, "includesVsaVectors": False, "includesSparseEdges": False}
 
     def __init__(self, roots, *, directory, reserve_ram, reserve_disk, include_state=False, resource_policy=None):
@@ -117,6 +140,9 @@ class ParameterDeltaJournal:
         self._disk_quota = None
         self._sidecar_quotas = []
         self.original = self.inventory()
+        self._parallel_topology = [module.capture_packed_topology_boundary()
+            for _prefix, root in self.roots for module in root.modules()
+            if hasattr(module, "parallel_connections") and callable(getattr(module, "capture_packed_topology_boundary", None))]
         self._sparse_containers = {id(module): ((prefix + "." + path).rstrip("."), module)
             for prefix, root in self.roots for path, module in root.named_modules()
             if getattr(module, "packed_synapse_container", False)}
@@ -147,6 +173,8 @@ class ParameterDeltaJournal:
                     continue
                 learned = {id(value) for value in getter()} if callable(getter) else set()
                 for name, value in module.named_buffers(recurse=False):
+                    if name in getattr(module, "_non_persistent_buffers_set", ()):
+                        continue  # Rebuilt sort/activity caches are not checkpoint authority.
                     if (id(value) not in learned and not (self.include_state and value.dtype == torch.uint8)) or id(value) in seen:
                         continue
                     if value.dtype != torch.uint8 or not value.is_contiguous():
@@ -155,6 +183,12 @@ class ParameterDeltaJournal:
                     key = prefix + "." + path + "." + name
                     result[key] = {"kind": "packed", "key": key, "module": module, "name": name,
                         "shape": tuple(value.shape), "elements": value.numel()}
+                    if name in {"_connection_state", "_bias_connection_state"}:
+                        result[key]["connection_state"] = True
+                    if id(value) not in learned or name in getattr(module, "_packed_structural_fields", ()):
+                        # include_state preserves native byte controls (such
+                        # as row resistance); they are not packed sign lanes.
+                        result[key]["structural_state"] = True
                     if getattr(module, "_router_sparse_block", False) and name == "_packed_weights":
                         result[key]["logical_columns"] = int(module.columns)
         return result
@@ -167,29 +201,39 @@ class ParameterDeltaJournal:
                 or not getattr(block, "_router_unpublished", False) or not getattr(block, "_router_loaded", False)
                 or key not in parent.blocks or parent.blocks[key] is not block):
             raise RuntimeError("diagnostic sparse birth has no trusted implicit-zero ownership boundary")
-        packed = block._packed_weights
-        if not bool(packed.eq(0x55).all()):
-            raise RuntimeError("a new sparse diagnostic owner must begin at exact zero trits")
-        path = binding[0] + ".blocks." + key + "._packed_weights"
-        if path in self.original:
-            raise RuntimeError("diagnostic sparse birth reuses a still-owned path")
-        self.reserve_ram(2048)
-        item = {"kind": "packed", "key": path, "module": block, "name": "_packed_weights",
-                "shape": tuple(packed.shape), "elements": packed.numel(), "logical_columns": block.columns,
-                "implicit_zero_birth": True, "birth_parent": parent, "birth_key": key}
-        self.original[path] = item
-        self.by_module[id(block), "_packed_weights"] = item
-        self.mark_version(item)
+        fields = [("_packed_weights", block._packed_weights, 0x55, False)]
+        state = getattr(block, "_connection_state", None)
+        if state is not None:
+            fields.append(("_connection_state", state, 0, True))
+        for name, tensor, baseline, connection in fields:
+            if tensor.dtype != torch.uint8 or not bool(tensor.eq(baseline).all()):
+                raise RuntimeError("a new sparse diagnostic owner must begin at zero signs and unit strengths")
+            path = binding[0] + ".blocks." + key + "." + name
+            if path in self.original:
+                raise RuntimeError("sparse diagnostic birth reuses a still-owned path")
+        self.reserve_ram(2048 * len(fields))
+        for name, tensor, baseline, connection in fields:
+            path = binding[0] + ".blocks." + key + "." + name
+            item = {"kind": "packed", "key": path, "module": block, "name": name,
+                    "shape": tuple(tensor.shape), "elements": tensor.numel(),
+                    "implicit_zero_birth": True, "birth_parent": parent, "birth_key": key,
+                    "connection_state": connection}
+            if not connection:
+                item["logical_columns"] = int(block.columns)
+            self.original[path] = item
+            self.by_module[id(block), name] = item
+            self.mark_version(item)
         return True
 
     def retire_sparse_zero_owner(self, parent, key, block):
-        item = self.by_module.get((id(block), "_packed_weights"))
-        if item is None or not item.get("implicit_zero_birth"):
-            return
-        if item["birth_parent"] is not parent or item["birth_key"] != key:
-            raise RuntimeError("diagnostic sparse retirement changed its immutable birth binding")
-        del self.by_module[id(block), "_packed_weights"]
-        del self.original[item["key"]]
+        items = [item for (identity, _name), item in self.by_module.items()
+                 if identity == id(block) and item.get("implicit_zero_birth")]
+        for item in items:
+            if item["birth_parent"] is not parent or item["birth_key"] != key:
+                raise RuntimeError("diagnostic sparse retirement changed its immutable birth binding")
+        for item in items:
+            del self.by_module[id(block), item["name"]]
+            del self.original[item["key"]]
 
     @staticmethod
     def current(item):
@@ -296,7 +340,15 @@ class ParameterDeltaJournal:
         return self.database.execute("SELECT block,positions,codes FROM original WHERE owner=? ORDER BY block", (key,))
 
     @staticmethod
-    def _packed_square(now, prior, *, positions=None, logical_columns=None):
+    def _packed_square(now, prior, *, positions=None, logical_columns=None,
+                       connection_state=False, include_resistance=False, structural_state=False):
+        if structural_state:
+            return 0  # Preserved for rollback; endpoint/control bytes are not weight magnitudes.
+        if connection_state:
+            total = int(((now.to(torch.int16) & 15) - (prior.to(torch.int16) & 15)).to(torch.int64).square().sum())
+            if include_resistance:
+                total += int(((now.to(torch.int16) >> 4) - (prior.to(torch.int16) >> 4)).to(torch.int64).square().sum())
+            return total
         total = 0
         for shift in (0, 2, 4, 6):
             delta = ((now.to(torch.int16) >> shift) & 3) - ((prior.to(torch.int16) >> shift) & 3)
@@ -332,7 +384,9 @@ class ParameterDeltaJournal:
                 for start in range(0, value.numel(), BLOCK_BYTES):
                     self.reserve_ram(min(BLOCK_BYTES, value.numel() - start) * 48 + 131072)
                     block = value[start:start + BLOCK_BYTES].detach().to(device="cpu")
-                    total += self._packed_square(block, torch.full_like(block, 0x55))
+                    total += self._packed_square(block, torch.full_like(block, 0 if item.get("connection_state") else 0x55),
+                        connection_state=item.get("connection_state", False), include_resistance=self.include_state,
+                        structural_state=item.get("structural_state", False))
                 continue
             if original["module"] is not item["module"] or original["shape"] != tuple(self.current(item).shape):
                 raise RuntimeError("core diagnostic owner topology changed; exact delta requires an explicit source migration boundary")
@@ -346,8 +400,9 @@ class ParameterDeltaJournal:
                     count = min(BLOCK_BYTES, value.numel()-start)
                     self.reserve_ram(count * 64 + 131072)
                     block = value[start:start+count].detach().to(device="cpu")
-                    total += self._packed_square(block, torch.full_like(block, 0x55),
-                        positions=torch.arange(start, start+count), logical_columns=original["logical_columns"])
+                    total += self._packed_square(block, torch.full_like(block, 0 if original.get("connection_state") else 0x55),
+                        positions=torch.arange(start, start+count), logical_columns=original.get("logical_columns"),
+                        connection_state=original.get("connection_state", False), include_resistance=self.include_state)
                 continue
             for block, encoded_positions, codes in self._rows(key):
                 self.reserve_ram(BLOCK_BYTES * 192 + 131072)
@@ -356,7 +411,9 @@ class ParameterDeltaJournal:
                 offsets = torch.tensor(indices, dtype=torch.int64)
                 selected = value[block * BLOCK_BYTES:block * BLOCK_BYTES + BLOCK_BYTES].index_select(0, offsets.to(value.device)).detach().cpu()
                 total += self._packed_square(selected, torch.tensor(list(codes), dtype=torch.uint8),
-                    positions=offsets + block*BLOCK_BYTES, logical_columns=original.get("logical_columns"))
+                    positions=offsets + block*BLOCK_BYTES, logical_columns=original.get("logical_columns"),
+                    connection_state=original.get("connection_state", False), include_resistance=self.include_state,
+                    structural_state=original.get("structural_state", False))
                 from .native_core_paging import release_native_tensor_chunk
                 release_native_tensor_chunk(self.current(item), block * BLOCK_BYTES, min(BLOCK_BYTES, value.numel() - block * BLOCK_BYTES))
         missing = set(self.original) - set(current)
@@ -367,6 +424,8 @@ class ParameterDeltaJournal:
     def restore(self):
         """Restore only actual first-original byte changes, resolving live names."""
         if not self.include_state: raise RuntimeError("diagnostic-only journal is not a rollback owner")
+        for owner, keys in self._parallel_topology:
+            owner.restore_topology_boundary(keys)
         for item in self.original.values():
             if item["kind"] != "packed" or item.get("implicit_zero_birth"): continue
             target = self.current(item)
@@ -396,6 +455,24 @@ class ParameterDeltaJournal:
                 break
             birth["birth_parent"]._sparse_state.retire_rollback_birth(birth["birth_key"], birth["module"])
 
+    def export_resume_state(self, destination, *, binding_id):
+        """Seal this diagnostic baseline against a caller-verified checkpoint.
+
+        The caller must hold the neural mutation boundary. Export never closes
+        the live journal; commit the surrounding paused-turn record first.
+        """
+        from .parameter_journal_state import export_journal_state
+        return export_journal_state(self, destination, binding_id=binding_id)
+
+    @classmethod
+    def from_resume_state(cls, roots, source, *, binding_id, expected_manifest_sha256,
+                          directory, reserve_ram, reserve_disk, resource_policy=None):
+        """Bind a sealed baseline to the loaded checkpoint's named owners."""
+        from .parameter_journal_state import import_journal_state
+        return import_journal_state(cls, roots, source, binding_id=binding_id,
+            expected_manifest_sha256=expected_manifest_sha256, directory=directory,
+            reserve_ram=reserve_ram, reserve_disk=reserve_disk, resource_policy=resource_policy)
+
     def close(self):
         if self.closed:
             return
@@ -413,3 +490,10 @@ class ParameterDeltaJournal:
         self.original.clear()
         self.by_module.clear()
         self._sparse_containers.clear()
+        self._parallel_topology.clear()
+        self.roots = ()
+        # A closed journal may remain in an outer diagnostic-call receipt.
+        # Do not keep a cold-unloaded brain alive through bound callbacks.
+        self.reserve_ram = self.reserve_disk = self.resource_policy = None
+        self._disk_quota = None
+        self._sidecar_quotas.clear()

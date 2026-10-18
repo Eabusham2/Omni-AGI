@@ -90,6 +90,9 @@ class PackedMutationSnapshot:
         reserve: Optional[Callable[[int], None]] = None,
         disk_directory: Optional[Path] = None,
         disk_reserve: Optional[Callable[[int, str], Any]] = None,
+        disk_allocate: Optional[Callable[..., Any]] = None,
+        disk_chunk_bytes: int = 4 * 1024 * 1024,
+        include_all_uint8: bool = False,
     ) -> "PackedMutationSnapshot":
         roots = tuple(roots)
         pagers = {getattr(module, "_native_core_pager", None)
@@ -106,9 +109,19 @@ class PackedMutationSnapshot:
                     continue
                 seen.add(id(module))
                 packed_tensors = getattr(module, "authoritative_packed_tensors", None)
-                if not callable(packed_tensors):
+                if not callable(packed_tensors) and not include_all_uint8:
                     continue
-                tensors = list(packed_tensors())
+                tensors = list(packed_tensors()) if callable(packed_tensors) else []
+                if include_all_uint8:
+                    known = {id(value) for value in tensors}
+                    for name, value in module.named_buffers(recurse=False):
+                        if value.dtype == torch.uint8 and name not in getattr(module, "_non_persistent_buffers_set", ()) and id(value) not in known:
+                            tensors.append(value)
+                            known.add(id(value))
+                boundary = getattr(module, "capture_packed_topology_boundary", None)
+                if tensors and callable(boundary):
+                    topology_boundaries.append(boundary())
+                    byte_count += 1024
                 if not tensors and getattr(module, "packed_synapse_container", False):
                     # Dynamic sparse recurrence exposes its actual registered
                     # child owners, never aliases those buffers at the parent.
@@ -120,8 +133,10 @@ class PackedMutationSnapshot:
                     continue
                 for name in ("_row_stability", "_bias_row_stability"):
                     buffer = getattr(module, name, None)
-                    if isinstance(buffer, torch.Tensor):
+                    if isinstance(buffer, torch.Tensor) and all(value is not buffer for value in tensors):
                         tensors.append(buffer)
+                if include_all_uint8 and not tensors:
+                    continue
                 if not tensors or any(
                     not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.uint8
                     for tensor in tensors
@@ -141,10 +156,14 @@ class PackedMutationSnapshot:
                 if disk_directory is None:
                     raise
                 from .native_core_paging import BoundedPackedRollback
-                io_ram_bytes = min(byte_count, 8 * 1024 * 1024) + len(owners) * 2048 + 131072
+                if type(disk_chunk_bytes) is not int or disk_chunk_bytes < 8:
+                    raise ValueError("packed rollback disk chunk must be at least eight bytes")
+                io_ram_bytes = min(byte_count, 2 * disk_chunk_bytes) + len(owners) * 2048 + 131072
                 reserve(io_ram_bytes)
                 disk_snapshot = BoundedPackedRollback.capture(
                     roots, directory=disk_directory, reserve_disk=disk_reserve,
+                    chunk_bytes=disk_chunk_bytes, include_all_uint8=include_all_uint8,
+                    allocate_spill=disk_allocate,
                 )
                 return cls([], disk_snapshot.byte_count, disk_snapshot=disk_snapshot,
                     disk_ram_reserve=reserve, disk_io_ram_bytes=io_ram_bytes, topology_boundaries=topology_boundaries)

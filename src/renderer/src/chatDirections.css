@@ -1,0 +1,6 @@
+.chat-direction-strip { min-width:0; }
+.chat-direction-strip .chat-queue-stack__row small { max-width:35%; font-size:.75rem; line-height:1.35; color:var(--text-2); }
+.chat-direction-strip__expanded { display:flex; flex-direction:column; gap:.45rem; min-width:0; padding:.4rem; }
+.chat-direction-strip__expanded p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.5; font-size:.85rem; }
+.chat-direction-strip__expanded label { display:flex; flex-direction:column; gap:.35rem; color:var(--text-2); font-size:.8rem; }
+.chat-direction-strip__expanded button { align-self:flex-start; white-space:normal; }

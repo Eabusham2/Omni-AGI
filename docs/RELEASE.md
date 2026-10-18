@@ -1,4 +1,4 @@
-# Stable v1 release
+# Stable releases
 
 Omni AGI Studio releases are built from an immutable `vMAJOR.MINOR.PATCH` tag
 whose value exactly matches `package.json`. The tagged commit must be contained
@@ -16,8 +16,8 @@ in `main`; release jobs deliberately reject tags cut from another branch.
 
 Mobile marketing versions exactly match `package.json`. Android `versionCode`
 and iOS `CURRENT_PROJECT_VERSION` share the stable numeric mapping
-`MAJOR * 10000 + MINOR * 100 + PATCH`; release `1.1.0` therefore uses build
-number `10100` on both platforms; candidate `1.1.1` uses `10101`.
+`MAJOR * 10000 + MINOR * 100 + PATCH`; release `2.0.0` uses build number
+`20000` on both platforms.
 
 Electron Builder uses target-native x64 suffixes on Linux: `x86_64` for
 AppImage, `amd64` for DEB, and `x64` for tar.gz. The package smoke, upload
@@ -58,12 +58,12 @@ described as directly installable or signed. Both mobile jobs bind their
 package hashes, variant, emulator evidence, and observed signing state into
 records consumed by the final release verifier.
 
-`windows-11-arm` and `ubuntu-24.04-arm` are GitHub public-preview runner
-labels. They are still native architecture gates, but GitHub does not provide
-the same service-level guarantee as its stable hosted images. Windows ARM64
-uses a native Electron shell and the explicitly labeled x64 PyTorch worker
-through Windows 11 emulation. PyTorch and PyInstaller now provide Windows
-ARM64 builds, but the complete v1 worker dependency set does not: required
+The six desktop labels are listed in GitHub's current
+[hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Each job records its actual platform and architecture in its package evidence.
+Windows ARM64 uses a native Electron shell and the explicitly labeled x64
+PyTorch worker through Windows 11 emulation. PyTorch and PyInstaller now provide
+Windows ARM64 builds, but the complete reviewed worker dependency set does not: required
 binary wheels including `pyarrow` and `imageio-ffmpeg` remain unavailable.
 The worker can move to native ARM64 only after the full binary-only dependency
 probe and packaged-runtime smoke pass, not merely when the core tensor wheel
@@ -96,10 +96,17 @@ Linux and Windows locks select the `2.10.0+cpu` Torch wheels from PyTorch's CPU
 index; macOS locks select their native Torch wheels from PyPI. Hash checking
 applies to both indexes.
 
+The packed CPU library is compiled for the selected Python process. On Windows,
+the builder discovers Visual Studio's C++ tools and initializes the matching
+target, including the x64 worker used by an ARM64 shell. A separate stdlib-only
+process loads the built library, verifies its ABI and required exports, and exits
+before the library is adopted. The worker health check also verifies its packed
+library. These checks do not create a brain or run neural training.
+
 ## Publication gate
 
 Run `npm run verify:release` before creating a new tag, then
-`npm run verify:release -- --tag v1.1.1` once that exact tag exists. Pushing
+`npm run verify:release -- --tag v2.0.0` once that exact tag exists. Pushing
 that tag starts `.github/workflows/release.yml`; it rebuilds every required
 artifact rather than reusing an unverified local package. Publication stops if
 one expected artifact is missing, duplicated, empty, has a hash that disagrees
@@ -137,7 +144,14 @@ notarization tickets. Without those secrets, keychain discovery is disabled
 and the same gates produce artifacts explicitly recorded as
 `unsigned-signed-ready`; they must not be described as signed.
 
-After the release is green and published, merge any remaining verified work
-into `main` before deleting obsolete branches. Branch deletion is a separate,
-explicit repository-maintenance action and is never performed by a package
-job.
+Windows ZIP and installed NSIS layouts also contain a portable-runtime receipt.
+The release gate verifies the actual packaged ASAR hash, application version,
+desktop/worker architectures and source commit. The source commit must match
+the verified release commit in both layouts. These receipts describe the
+packaged launcher; selected-instance transfer, destination reservation and
+neural acceptance remain separate checks.
+
+Commit verified release work to `main` and tag that exact commit before
+publication. After the release is green and published, remove obsolete
+branches and verify the final branch state. Branch deletion is a separate
+repository-maintenance action and is never performed by a package job.

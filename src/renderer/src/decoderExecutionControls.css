@@ -1,0 +1,7 @@
+.decoder-execution{margin-top:14px;min-width:0}
+.decoder-execution summary{font-weight:600}
+.decoder-execution p,.decoder-execution li{overflow-wrap:anywhere}
+.decoder-execution__choice{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:start;margin:10px 0}
+.decoder-execution__choice input{flex:none}
+.decoder-execution__actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.decoder-execution__actions .button{white-space:normal;overflow-wrap:anywhere}

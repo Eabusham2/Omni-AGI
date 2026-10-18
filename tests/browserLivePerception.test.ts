@@ -55,6 +55,8 @@ describe("browser Live Perception capture", () => {
       "camera",
       planLivePerception({ hardwareTier: "personal" })
     );
+    expect(handle.getPreviewStream?.()).toBe(stream);
+    expect(getUserMedia).toHaveBeenCalledOnce();
     const packets: Array<{ mimeType: string; timestampMs: number; bytes: number }> = [];
     handle.start((packet) =>
       packets.push({
@@ -70,7 +72,10 @@ describe("browser Live Perception capture", () => {
     expect(drawImage).toHaveBeenCalled();
     expect(packets[0]).toEqual({ mimeType: "image/jpeg", timestampMs: 123, bytes: 3 });
     await handle.stop();
-    expect(trackStop).toHaveBeenCalled();
+    await handle.stop();
+    expect(trackStop).toHaveBeenCalledOnce();
+    expect(video.srcObject).toBeNull();
+    expect(handle.getPreviewStream?.()).toBeUndefined();
   });
 
   it("restarts MediaRecorder per neural-audio packet so each blob has its own container", async () => {
@@ -346,5 +351,51 @@ describe("browser Live Perception capture", () => {
     });
     expect(applyConstraints.mock.calls.length).toBeGreaterThanOrEqual(5);
     await handle.stop();
+  });
+
+  it.each(["play", "constraints"])("closes the granted device when %s setup fails", async (phase) => {
+    const stop = vi.fn(), track = { stop, getSettings: () => ({ width: 640, height: 360, frameRate: 10 }),
+      applyConstraints: vi.fn(async () => { if (phase === "constraints") throw new Error("constraints denied"); }) } as unknown as MediaStreamTrack;
+    const stream = { getVideoTracks: () => [track], getAudioTracks: () => [], getTracks: () => [track] } as unknown as MediaStream;
+    const video = { srcObject: null, play: vi.fn(async () => { if (phase === "play") throw new Error("play denied"); }), pause: vi.fn() } as unknown as HTMLVideoElement;
+    const adapter = createBrowserLivePerceptionCapture({ mediaDevices: { getUserMedia: vi.fn(async () => stream), getDisplayMedia: vi.fn() },
+      createVideo: () => video, createCanvas: () => ({ width: 0, height: 0 }) as HTMLCanvasElement });
+    await expect(adapter.open("camera", planLivePerception({ hardwareTier: "micro" }))).rejects.toThrow(`${phase} denied`);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(video.srcObject).toBeNull();
+  });
+
+  it("observes the real track-ended event and removes its listener before closing", async () => {
+    const track = new EventTarget() as EventTarget & Partial<MediaStreamTrack>;
+    track.stop = vi.fn(); track.getSettings = () => ({ width: 640, height: 360, frameRate: 10 });
+    const stream = { getVideoTracks: () => [track], getAudioTracks: () => [], getTracks: () => [track] } as unknown as MediaStream;
+    const video = { srcObject: null, play: vi.fn(async () => {}), pause: vi.fn(), removeAttribute: vi.fn() } as unknown as HTMLVideoElement;
+    const handle = await createBrowserLivePerceptionCapture({ mediaDevices: { getUserMedia: vi.fn(), getDisplayMedia: vi.fn(async () => stream) },
+      createVideo: () => video, createCanvas: () => ({ width: 0, height: 0 }) as HTMLCanvasElement }).open("screen", planLivePerception({ hardwareTier: "micro" }));
+    const ended = vi.fn(), unsubscribe = handle.onEnded?.(ended);
+    track.dispatchEvent(new Event("ended"));
+    expect(ended).toHaveBeenCalledOnce();
+    unsubscribe?.(); await handle.stop();
+    track.dispatchEvent(new Event("ended"));
+    expect(ended).toHaveBeenCalledOnce();
+    expect(track.stop).toHaveBeenCalledOnce();
+  });
+
+  it("keeps actual measured inputs through source negotiation instead of treating pixels as RAM bandwidth", async () => {
+    const track = { stop: vi.fn(), getSettings: () => ({ width: 3840, height: 2160, frameRate: 60 }) } as unknown as MediaStreamTrack;
+    const stream = { getVideoTracks: () => [track], getAudioTracks: () => [], getTracks: () => [track] } as unknown as MediaStream;
+    const adapter = createBrowserLivePerceptionCapture({ mediaDevices: { getUserMedia: vi.fn(async () => stream), getDisplayMedia: vi.fn() },
+      createVideo: () => ({ play: vi.fn(async () => {}), pause: vi.fn(), removeAttribute: vi.fn() }) as unknown as HTMLVideoElement,
+      createCanvas: () => ({ width: 0, height: 0 }) as HTMLCanvasElement });
+    const evidence = { hardwareTier: "workstation" as const, memoryBytesPerSecond: 40 * 1024 ** 3,
+      ioBytesPerSecond: 1024 ** 3, generationTokensPerSecond: 80 };
+    const fast = await adapter.open("camera", planLivePerception(evidence));
+    expect(fast.getCapture()).toMatchObject({ width: 3840, height: 2160, fps: 60, benchmarkClass: "native" });
+    expect(fast.getPlan?.().resourceInputs).toEqual(evidence);
+    expect(fast.getPlan?.().resourcePixelsPerSecond).toBe(3840 * 2160 * 60);
+    await fast.stop();
+    const slow = await adapter.open("camera", planLivePerception({ ...evidence, generationTokensPerSecond: 1 }));
+    expect(slow.getCapture()).toMatchObject({ width: 320, height: 180, fps: 1, benchmarkClass: "fallback" });
+    await slow.stop();
   });
 });

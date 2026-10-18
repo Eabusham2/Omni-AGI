@@ -58,6 +58,9 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q engine
 
+      - name: Test bounded Python source contracts without a brain
+        run: npm run test:python:ci:contracts
+
       - name: Test desktop app
         run: npm run test:node:ci
 

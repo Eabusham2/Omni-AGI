@@ -94,14 +94,20 @@ export interface TextFrameBatcher {
 
 /**
  * Coalesce high-frequency token notifications into one state update per
- * animation frame. Terminal events can still force an immediate flush.
+ * animation frame without pacing ordinary output. A finite explicit budget
+ * is reserved for opt-in display pacing; it never throttles native generation.
+ * Terminal events always force an immediate complete flush.
  */
 export function createTextFrameBatcher(
   commit: (delta: string) => void,
   schedule: (callback: () => void) => number,
   cancel: (handle: number) => void,
-  maxCharactersPerFrame = 96
+  maxCharactersPerFrame = Number.POSITIVE_INFINITY
 ): TextFrameBatcher {
+  if (maxCharactersPerFrame !== Number.POSITIVE_INFINITY &&
+      (!Number.isFinite(maxCharactersPerFrame) || maxCharactersPerFrame <= 0)) {
+    throw new Error("A display frame budget must be positive or unlimited.");
+  }
   let buffer = "";
   let handle: number | null = null;
   const frameLimit = Math.max(1, Math.floor(maxCharactersPerFrame));
@@ -111,8 +117,14 @@ export function createTextFrameBatcher(
     handle = schedule(() => {
       handle = null;
       if (!buffer) return;
-      const delta = buffer.slice(0, frameLimit);
-      buffer = buffer.slice(delta.length);
+      let end = Math.min(buffer.length, frameLimit);
+      // Optional pacing must not briefly render half of a Unicode surrogate
+      // pair as a replacement glyph. One scalar may exceed the display budget.
+      if (end < buffer.length && end > 0 &&
+          buffer.charCodeAt(end - 1) >= 0xd800 && buffer.charCodeAt(end - 1) <= 0xdbff &&
+          buffer.charCodeAt(end) >= 0xdc00 && buffer.charCodeAt(end) <= 0xdfff) end++;
+      const delta = buffer.slice(0, end);
+      buffer = buffer.slice(end);
       commit(delta);
       scheduleDrain();
     });

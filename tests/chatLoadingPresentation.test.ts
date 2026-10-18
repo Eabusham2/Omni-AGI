@@ -69,15 +69,36 @@ describe("pending chat output presentation", () => {
       nowMs: 80_000
     })).toEqual({
       phase: "streaming",
-      label: "1 output token used",
+      label: "1 token",
       ariaLabel: "Live response output: 1 output token used",
       outputTokens: 1
     });
     expect(pendingChatOutputPresentation({ outputTokens: 12_345 })).toMatchObject({
       phase: "streaming",
-      label: "12,345 output tokens used",
+      label: "12.345K tokens",
       outputTokens: 12_345
     });
+  });
+
+  it("measures delivered speed after first output without charging cold load time", () => {
+    const output = pendingChatOutputPresentation({
+      outputTokens: 105, initialOutputTokens: 5,
+      startedAtMs: 1_000, nowMs: 100_000,
+      streamStartedAtMs: 2_000, streamNowMs: 4_000
+    });
+    expect(output.tokensPerSecond).toBe(50);
+    expect(output.label).toBe("105 tokens · 50 tok/s");
+    expect(output.ariaLabel).toContain("105 output tokens used");
+    expect(pendingChatOutputPresentation({
+      outputTokens: 105, initialOutputTokens: 5,
+      streamStartedAtMs: 4_000, streamNowMs: 4_100
+    }).tokensPerSecond).toBeUndefined();
+  });
+
+  it("keeps exact counts accessible when compact values cross large units", () => {
+    const output = pendingChatOutputPresentation({ outputTokens: 1_234_567 });
+    expect(output.label).toBe("1.235M tokens");
+    expect(output.ariaLabel).toContain("1,234,567");
   });
 
   it("formats a long measured wait without implying completion", () => {

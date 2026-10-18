@@ -1,10 +1,10 @@
 import rawArchitecture from "../../architecture/omnicortex-ground-up-v1.json";
 import type { HardwareTier, WorkingMemoryMode } from "../shared/types";
 import {
-  nativeCoreInventory, sealNativeArchitecture,
+  nativeCoreInventory, packedOwnerMetadataReserve, sealNativeArchitecture,
   type NativeArchitectureDescriptor, type NativeArchitectureShape
 } from "./nativeCoreInventory";
-import { validateNativeProjectionComputeProfile, type NativeProjectionComputeProfile } from "./nativeComputeMeasurement";
+import { nativeProjectionTensorBudget, validateNativeProjectionComputeProfile, type NativeProjectionComputeProfile } from "./nativeComputeMeasurement";
 
 const MIB = 1024 ** 2;
 
@@ -27,10 +27,17 @@ export interface GroundUpArchitectureProfile {
   exactPackedTableParameterCount: number;
   exactPackedTernaryParameterCount: number;
   packedTernaryWeightBytes: number;
+  connectionStateBytes: number;
+  packedLearnedStateBytes: number;
   packedWorkspaceTableBytes: number;
+  workspaceConnectionStateBytes: number;
+  maximumProjectionBytes: number;
+  pythonOwnerMetadataReserveBytes: number;
   packedMetaplasticityReserveBytes: number;
   fixedControlBufferReserveBytes: number;
   packedUpdateScratchBytes: number;
+  /** Known base-weighted forward buffers, not exact RSS or learned-repeat timing. */
+  packedForwardTensorReserveBytes?: number;
   residentInferenceStateBytes: number;
   minimumTrainingStateBytes: number;
   checkpointTensorBytes: number;
@@ -150,6 +157,19 @@ export function defaultGroundUpWorkingMemoryItems(
   return mode === "extended" ? auto * 4 : auto;
 }
 
+function fixedTierNativeShape(hardwareTier: HardwareTier, items: number): NativeArchitectureShape {
+  const source = architecture.profiles[hardwareTier];
+  const media = { micro: [8, 64, 2, 8], personal: [16, 256, 4, 16],
+    gpu: [32, 512, 6, 24], workstation: [32, 1024, 8, 32] }[hardwareTier]!;
+  return {
+    dModel: source.dModel, layers: source.layers, feedForward: source.feedForward,
+    nHeads: source.dModel <= 64 ? 4 : 8, vsaDimensions: source.vsaDimensions,
+    routerNeurons: source.routerNeurons, modalityChannels: media[3]!, imageSize: media[0]!,
+    audioSamples: media[1]!, videoFrames: media[2]!, workingMemoryItems: items,
+    workspaceLatents: Math.max(8, Math.floor(items / 4)), vocabSize: 261, liquidMode: "cfc"
+  };
+}
+
 export function groundUpArchitectureProfile(
   hardwareTier: HardwareTier,
   workingMemoryItems = defaultGroundUpWorkingMemoryItems(hardwareTier)
@@ -198,6 +218,14 @@ export function groundUpArchitectureProfile(
       packedWorkspaceTableBytes,
     "packed ternary weight byte count"
   );
+  const connectionStateBytes = exactPackedTernaryParameterCount;
+  const packedLearnedStateBytes = packedTernaryWeightBytes + connectionStateBytes;
+  const workspaceConnectionStateBytes = workspaceLatents * source.dModel;
+  const baselineShape = fixedTierNativeShape(hardwareTier, selectedItems);
+  const baselineForward = inventoryWithForwardReserve(baselineShape);
+  const baselineInventory = baselineForward.inventory;
+  const maximumProjectionBytes = baselineInventory.maximumProjectionBytes;
+  const pythonOwnerMetadataReserveBytes = packedOwnerMetadataReserve(baselineInventory.packedOwners);
   // The worker checkpoints one uint8 resistance per packed output row, not
   // per learned weight. A static profile cannot list each modality/module
   // row here, so budget the known workspace rows plus conservative estimates
@@ -211,7 +239,7 @@ export function groundUpArchitectureProfile(
       conservativeRowWidth) +
     16 * 1024;
   const fixedControlBufferReserveBytes =
-    accounting.fixedControlBufferReserveBytes;
+    accounting.fixedControlBufferReserveBytes + baselineInventory.parallelTopologyControlBytes!;
   const routerPlasticityBytes = routerSynapses * (
     accounting.routerEligibilityBytesPerSynapse +
     accounting.routerStabilityAndUsageBytesPerSynapse
@@ -221,24 +249,18 @@ export function groundUpArchitectureProfile(
   // state. The general activation budget is added by ResourcePlanner.
   const packedUpdateScratchBytes = Math.max(
     4 * MIB,
-    accounting.packedProjectionUpdateRowBlock *
-      Math.max(
-        source.dModel,
-        source.feedForward,
-        source.vsaDimensions,
-        source.routerNeurons
-      ) * accounting.packedProjectionScratchBytesPerBlockElement
+    baselineInventory.maximumUpdateScratchBytes!
   );
   const residentInferenceStateBytes = positiveSafeInteger(
-    packedTernaryWeightBytes +
+    packedLearnedStateBytes +
       packedMetaplasticityReserveBytes +
-      fixedControlBufferReserveBytes + routerPlasticityBytes,
+      fixedControlBufferReserveBytes + routerPlasticityBytes + pythonOwnerMetadataReserveBytes,
     "resident inference-state byte count"
   );
   // Bounded packed-update scratch is transient training RAM, not a resident
   // dense master, dense gradient, or optimizer moment for learned weights.
   const minimumTrainingStateBytes = positiveSafeInteger(
-    residentInferenceStateBytes + packedUpdateScratchBytes,
+    residentInferenceStateBytes + packedUpdateScratchBytes + baselineForward.forwardReserveBytes,
     "minimum training-state byte count"
   );
   // Durable generations contain packed learned weights plus non-weight
@@ -246,7 +268,7 @@ export function groundUpArchitectureProfile(
   const checkpointTensorBytes = Math.max(
     MIB,
     positiveSafeInteger(
-      residentInferenceStateBytes + MIB,
+      residentInferenceStateBytes - pythonOwnerMetadataReserveBytes + MIB,
       "checkpoint tensor byte count"
     )
   );
@@ -270,10 +292,16 @@ export function groundUpArchitectureProfile(
     exactPackedTableParameterCount,
     exactPackedTernaryParameterCount,
     packedTernaryWeightBytes,
+    connectionStateBytes,
+    packedLearnedStateBytes,
     packedWorkspaceTableBytes,
+    workspaceConnectionStateBytes,
+    maximumProjectionBytes,
+    pythonOwnerMetadataReserveBytes,
     packedMetaplasticityReserveBytes,
     fixedControlBufferReserveBytes,
     packedUpdateScratchBytes,
+    packedForwardTensorReserveBytes: baselineForward.forwardReserveBytes,
     residentInferenceStateBytes,
     minimumTrainingStateBytes,
     checkpointTensorBytes,
@@ -284,18 +312,9 @@ export function groundUpArchitectureProfile(
 
 /** Preserve the current shipped policy while a NEW sizing policy is unselected. */
 export function legacyNativeArchitectureDescriptor(hardwareTier: HardwareTier, items: number): NativeArchitectureDescriptor {
-  const source = architecture.profiles[hardwareTier];
-  const media = { micro: [8, 64, 2, 8], personal: [16, 256, 4, 16],
-    gpu: [32, 512, 6, 24], workstation: [32, 1024, 8, 32] }[hardwareTier]!;
-  const shape: NativeArchitectureShape = {
-    dModel: source.dModel, layers: source.layers, feedForward: source.feedForward,
-    nHeads: source.dModel <= 64 ? 4 : 8, vsaDimensions: source.vsaDimensions,
-    routerNeurons: source.routerNeurons, modalityChannels: media[3]!, imageSize: media[0]!,
-    audioSamples: media[1]!, videoFrames: media[2]!, workingMemoryItems: items,
-    workspaceLatents: Math.max(8, Math.floor(items / 4)), vocabSize: 261, liquidMode: "cfc"
-  };
+  const shape = fixedTierNativeShape(hardwareTier, items);
   return sealNativeArchitecture({
-    format: "omni-main-selected-native-architecture", formatVersion: 1, architecture: "OmniCortex",
+    format: "omni-main-selected-native-architecture", formatVersion: 2, architecture: "OmniCortex",
     externalPretrainedWeights: false, hardwareTier, shape, inventory: nativeCoreInventory(shape),
     sizing: { policy: "existing-profile-preserved-new-sizing-policy-unpromoted",
       isNewCapacityPolicy: false, throughputMeasured: false },
@@ -344,6 +363,17 @@ export function balancedMeasuredNativeArchitectureProfile(
     maximumTraversalMacsProxy: Number(budget > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : budget) });
 }
 
+function inventoryWithForwardReserve(shape: NativeArchitectureShape, routerStorageLayout?: "block-sparse-v1") {
+  let forwardReserveBytes = 0;
+  const inventory = nativeCoreInventory(shape, routerStorageLayout, 2, layout => {
+    // Embedding/norm tables do not multiply every stored row on lookup.
+    // Visit declared projection geometries, including modality output heads.
+    if (!layout.table) forwardReserveBytes = Math.max(forwardReserveBytes,
+      nativeProjectionTensorBudget(8, layout.inputFeatures, layout.outputFeatures).forwardTensorReserveBytes);
+  });
+  return { inventory, forwardReserveBytes };
+}
+
 function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
   profile: NativeProjectionComputeProfile;
   primitiveWorkBudgetMicroseconds: number;
@@ -388,19 +418,22 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     };
   }
   function cost(shape: NativeArchitectureShape) {
-    const inventory = nativeCoreInventory(shape, "block-sparse-v1");
+    const forward = inventoryWithForwardReserve(shape, "block-sparse-v1");
+    const inventory = forward.inventory, maximumPackedForwardTensorReserve = forward.forwardReserveBytes;
     const derivedControlBytes = 4 * inventory.packedOwners + 8 * (2 * shape.layers + 6)
       + 2 * (shape.dModel / shape.nHeads) * shape.layers;
-    const residentTensorAndStateReserve = inventory.packedWeightBytes + inventory.staticNonweightTensorBytes + derivedControlBytes + 16 * 1024;
+    const residentTensorAndStateReserve = inventory.packedLearnedStateBytes! + inventory.staticNonweightTensorBytes + derivedControlBytes + 16 * 1024;
+    const pythonOwnerMetadataReserveBytes = packedOwnerMetadataReserve(inventory.packedOwners);
     const checkpointReserve = residentTensorAndStateReserve + MIB;
-    const workspaceBytes = shape.workspaceLatents * Math.ceil(shape.dModel / 4);
-    const packedRowScratchReserve = 64 * 32 * Math.max(shape.dModel, shape.feedForward, shape.vsaDimensions, 1024, shape.audioSamples / 4, shape.imageSize ** 2 / 16);
+    const workspaceBytes = shape.workspaceLatents * (Math.ceil(shape.dModel / 4) + shape.dModel);
+    const packedRowScratchReserve = Math.max(4 * MIB, inventory.maximumUpdateScratchBytes!);
     // Same one-query/one-key conservative first-order tile geometry as the
     // activity pager, plus a bounded transfer chunk. Not a neural benchmark.
     const minimumAttentionTileBytes = 80 * shape.dModel + 73 * shape.nHeads;
-    const minimumTransferComputeReserve = packedRowScratchReserve + minimumAttentionTileBytes + 4 * MIB;
+    const minimumTransferComputeReserve = packedRowScratchReserve + minimumAttentionTileBytes + 4 * MIB
+      + maximumPackedForwardTensorReserve;
     const minimumReturnedOutputReserve = 4 * 8 * (shape.dModel * (3 * shape.layers + 12) + 6 * shape.feedForward + shape.vocabSize);
-    const residentModelWithHeadroomReserve = Math.max(Math.ceil(residentTensorAndStateReserve * 1.2), residentTensorAndStateReserve + packedRowScratchReserve);
+    const residentModelWithHeadroomReserve = Math.max(Math.ceil((residentTensorAndStateReserve + pythonOwnerMetadataReserveBytes) * 1.2), residentTensorAndStateReserve + pythonOwnerMetadataReserveBytes + packedRowScratchReserve);
     const residentItemBytesEstimate = Math.max(4096, 4 * shape.dModel + 512);
     const baselineItems = Math.min(shape.workingMemoryItems, input.baselineResidentWorkingMemoryItems ?? shape.workingMemoryItems);
     const baselineLatents = Math.max(8, Math.floor(baselineItems / 4));
@@ -417,11 +450,13 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     // counts all projection entries plus one recurrent traversal, even though
     // an ordinary text turn does not execute every modality or every owner.
     const traversalMacsProxy = inventory.projectionParameters + Math.min(64, shape.routerNeurons) ** 2;
-    return { inventory, checkpointReserve, nativeKernelReserve: checkpointReserve - workspaceBytes, traversalMacsProxy,
+    return { inventory, checkpointReserve, nativeKernelReserve: checkpointReserve - workspaceBytes + pythonOwnerMetadataReserveBytes, traversalMacsProxy,
       residentTensorAndStateReserve, residentModelWithHeadroomReserve, baselineActivityWithHeadroomReserve,
+      pythonOwnerMetadataReserveBytes,
       baselineWorkspaceRuntimeReserve, baselineKvAndIndexReserve, baselineFastItemReserve, residentItemBytesEstimate,
       boundedTrainingWithHeadroomReserve,
-      packedRowScratchReserve, minimumAttentionTileBytes, minimumTransferComputeReserve, minimumReturnedOutputReserve };
+      packedRowScratchReserve, minimumAttentionTileBytes, minimumTransferComputeReserve, minimumReturnedOutputReserve,
+      maximumPackedForwardTensorReserve };
   }
   function fitsPhysical(shape: NativeArchitectureShape): boolean {
     const value = cost(shape);
@@ -467,11 +502,15 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     throw new Error("Selected native architecture exceeds exact integer accounting.");
   }
   const descriptor = sealNativeArchitecture({
-    format: "omni-main-selected-native-architecture", formatVersion: 1,
+    format: "omni-main-selected-native-architecture", formatVersion: 2,
     architecture: "OmniCortex", externalPretrainedWeights: false,
     hardwareTier: tier, shape, inventory,
     sizing: {
       routerStorageLayout: "block-sparse-v1",
+      connectionStateEncoding: "uint4-strength-minus-one-high4-resistance",
+      connectionStateBytesExact: inventory.connectionStateBytes!,
+      repeatedContactsInitiallyAllocated: 0,
+      unitStrengthNativeMigration: "zero-state-bytes-preserve-prior-signed-values",
       policy: ramFirst ? "total-envelope-ram-first-resident-baseline-headroom-v1" : compute ? "shared-envelope-measured-primitive-work-proxy-candidate-v1" : "shared-envelope-physical-capacity-admission-v2",
       selectedSystemRamBudgetBytes: Math.floor(input.selectedSystemRamBudgetBytes),
       runtimeBaselineReserveBytes: Math.floor(input.runtimeBaselineReserveBytes),
@@ -489,14 +528,21 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
       transferPartitionBytes: transferPartition,
       activityPartitionBytes: activityPartition,
       minimumAttentionTileBytes: cost(shape).minimumAttentionTileBytes,
+      minimumPackedForwardTensorReserveBytes: cost(shape).maximumPackedForwardTensorReserve,
+      packedForwardIntegerResultDtype: "int64",
+      packedForwardTensorReserveBasis: "largest-8-sample-declared-projection-int64-blocks-and-concat-plus-quantization-and-float-scaling",
+      packedForwardTensorReserveIsExactRuntimePeak: false,
       packedRowScratchReserveBytes: cost(shape).packedRowScratchReserve,
       minimumTransferComputeReserveBytes: cost(shape).minimumTransferComputeReserve,
       minimumReturnedTrainingOutputReserveBytes: cost(shape).minimumReturnedOutputReserve,
       packedWorkspaceTableBytesExact: shape.workspaceLatents * Math.ceil(shape.dModel / 4),
+      workspaceConnectionStateBytesExact: shape.workspaceLatents * shape.dModel,
       workspaceReserveSeparatelyCharged: true,
       selectedNativeKernelReserveBytes: cost(shape).nativeKernelReserve,
       selectedCheckpointReserveBytes: checkpointReserve,
       staticDerivedControlTensorBytesExact: derivedControlBytes,
+      pythonOwnerMetadataReserveBytes: cost(shape).pythonOwnerMetadataReserveBytes,
+      pythonOwnerMetadataIsExact: false,
       rngAndPlatformStateReserveBytes: 16 * 1024,
       allocatorAndDynamicActivityBytesExact: false,
       minimumShapeCheckpointReserveBytes: cost(minimum).checkpointReserve,
@@ -533,6 +579,13 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
         primitiveMeasuredAt: compute.profile.measuredAt, primitiveRequestedDevice: compute.profile.requestedDevice,
         primitiveActualDevice: compute.profile.actualDevice, primitiveFallbackReason: compute.profile.fallbackReason,
         primitiveActivityDtype: compute.profile.activityDtype, primitiveIntegerResultDtype: compute.profile.integerResultDtype,
+        primitiveSampleTensorBytes: compute.profile.sampleTensorBytes,
+        primitiveForwardTensorReserveBytes: compute.profile.forwardTensorReserveBytes,
+        primitiveAdmittedBytes: compute.profile.admittedBytes,
+        primitiveConnectionStateBytes: compute.profile.connectionStateBytes,
+        primitiveRepeatedContacts: compute.profile.repeatedContacts,
+        primitiveRepeatedContactPages: compute.profile.repeatedContactPages,
+        primitiveRepeatedContactTimingMeasured: compute.profile.repeatedContactTimingMeasured,
         intermediateAccumulationDtypeVerified: false,
         primitiveMacsPerRunExact: compute.profile.projectionMacsPerRun,
         primitiveMedianRunMicroseconds: compute.profile.medianRunMicroseconds,
@@ -551,10 +604,9 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     },
     qualityEvidence: "unmeasured-native-quality-deferred"
   });
-  const scratch = Math.max(4 * MIB, 64 * Math.max(shape.dModel, shape.feedForward,
-    shape.vsaDimensions, shape.routerNeurons, 1024, shape.imageSize ** 2 / 16,
-    shape.audioSamples / 4) * 32);
-  const inference = inventory.packedWeightBytes + inventory.staticNonweightTensorBytes + derivedControlBytes + 16 * 1024;
+  const scratch = Math.max(4 * MIB, inventory.maximumUpdateScratchBytes!);
+  const pythonOwnerMetadataReserveBytes = cost(shape).pythonOwnerMetadataReserveBytes;
+  const inference = inventory.packedLearnedStateBytes! + inventory.staticNonweightTensorBytes + derivedControlBytes + 16 * 1024 + pythonOwnerMetadataReserveBytes;
   return {
     format: "omni-ground-up-architecture-profile", formatVersion: 1,
     architecture: "OmniCortex", origin: "ground-up-random-initialization",
@@ -567,11 +619,18 @@ function deriveNativeArchitectureProfile(input: NativeSizingInput, compute?: {
     exactPackedTableParameterCount: inventory.tableParameters,
     exactPackedTernaryParameterCount: inventory.logicalParameters,
     packedTernaryWeightBytes: inventory.packedWeightBytes,
+    connectionStateBytes: inventory.connectionStateBytes!,
+    packedLearnedStateBytes: inventory.packedLearnedStateBytes!,
     packedWorkspaceTableBytes: shape.workspaceLatents * Math.ceil(shape.dModel / 4),
+    workspaceConnectionStateBytes: shape.workspaceLatents * shape.dModel,
+    maximumProjectionBytes: inventory.maximumProjectionBytes,
+    pythonOwnerMetadataReserveBytes,
     packedMetaplasticityReserveBytes: inventory.resistanceBytes,
     fixedControlBufferReserveBytes: inventory.staticNonweightTensorBytes - inventory.resistanceBytes + derivedControlBytes + 16 * 1024,
     packedUpdateScratchBytes: scratch,
-    residentInferenceStateBytes: inference, minimumTrainingStateBytes: inference + scratch,
+    packedForwardTensorReserveBytes: cost(shape).maximumPackedForwardTensorReserve,
+    residentInferenceStateBytes: inference,
+    minimumTrainingStateBytes: inference + scratch + cost(shape).maximumPackedForwardTensorReserve,
     checkpointTensorBytes: checkpointReserve,
     parameterCountBasis: "architecture-logical-neural-elements",
     checkpointByteBasis: "packed-weights-plus-nonweight-state-reserve",

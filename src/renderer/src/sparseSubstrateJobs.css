@@ -1,0 +1,25 @@
+.sparse-jobs, .sparse-job { min-width: 0; }
+.sparse-jobs__heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.sparse-jobs h3 { margin: 0; }
+.sparse-job { margin-top: 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); }
+.sparse-job > summary { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 14px; cursor: pointer; }
+.sparse-job > summary > span { display: grid; gap: 3px; min-width: 0; }
+.sparse-job > summary strong { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.sparse-job > summary small, .sparse-job > summary time { color: var(--text-muted); font-size: 12px; }
+.sparse-job > summary time { white-space: nowrap; }
+.sparse-job > summary .sparse-job__stamp { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.sparse-job > summary:hover { background: var(--surface-hover); color: var(--text); border-radius: 12px; }
+.sparse-job > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sparse-job__body { padding: 0 14px 14px; display: grid; gap: 10px; min-width: 0; }
+.sparse-job__body p { margin: 0; overflow-wrap: anywhere; }
+.sparse-job__body details > summary { padding: 6px 0; overflow-wrap: anywhere; }
+.sparse-job__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.sparse-job__facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px 18px; margin: 8px 0; }
+.sparse-job__facts > div { min-width: 0; }
+.sparse-job__facts dt { color: var(--text-muted); font-size: 12px; }
+.sparse-job__facts dd { margin: 3px 0 0; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.sparse-job__operation, .sparse-job__preview { display: grid; gap: 10px; min-width: 0; }
+.sparse-job__operation .button { justify-self: start; }
+.sparse-job pre { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: var(--surface-solid); color: var(--text); }
+.sparse-job [role="alert"] { color: var(--danger); }
+.sparse-job__preview h4 { margin: 0; }

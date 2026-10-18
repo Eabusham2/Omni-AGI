@@ -249,7 +249,7 @@ def migrate_live_substrate_to_paged(
         # before switching authority. This reads one row at a time.
         for identifier in source_vectors:
             if (
-                index._vectors.packed_row(identifier) != source_vectors.packed_row(identifier)
+                index._vectors.row_payload(identifier) != source_vectors.row_payload(identifier)
                 or index._vectors.update_count(identifier) != source_vectors.update_count(identifier)
             ):
                 raise ValueError("live paging migration changed a packed vector")

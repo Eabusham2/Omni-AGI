@@ -1,0 +1,26 @@
+{
+  "scope": "paged recall graph endpoint SQL only; ReadSession enabled in both",
+  "modelConstructed": false,
+  "edges": 384,
+  "knownNodes": 32,
+  "pairs": 3,
+  "pageEdges": 64,
+  "maxMembershipIds": 128,
+  "samples": {
+    "single_membership_ms": [237.246917, 292.074958, 283.749708],
+    "batched_membership_ms": [16.076625, 16.470417, 16.167125]
+  },
+  "medianMs": {
+    "single_membership_ms": 283.749708,
+    "batched_membership_ms": 16.167125
+  },
+  "membershipQueries": {
+    "single_membership_ms": [757, 757, 757],
+    "batched_membership_ms": [6, 6, 6]
+  },
+  "componentSpeedup": 17.551031,
+  "sourceSha256BeforeAndAfter": "2194f231348b08cfd8e127521b58393bcd52ec95f678ac6ca70672371599863b",
+  "exactOrderedGraphSha256": "7c72d6bbf495a9bf358297c775d6268378a634e490bee080af69e61f519b9870",
+  "wholeLoadMeasured": false,
+  "processRssMeasured": false
+}

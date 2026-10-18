@@ -75,6 +75,7 @@ function harness(overrides?: {
   captureAvailable?: boolean;
   captureRequest?: LiveVoiceCaptureAdapter["request"];
   send?: LiveVoiceChatAdapter["send"];
+  sendAudio?: LiveVoiceChatAdapter["sendAudio"];
   scheduleRecognitionRestart?: (callback: () => void) => void;
   onAcceptedReply?: ConstructorParameters<typeof LiveVoiceController>[0]["onAcceptedReply"];
   preferences?: LiveVoicePreferences;
@@ -120,6 +121,7 @@ function harness(overrides?: {
     })
   };
   const chat: LiveVoiceChatAdapter = {
+    ...(overrides?.sendAudio ? { sendAudio: overrides.sendAudio } : {}),
     send:
       overrides?.send ??
       vi.fn(async () => result("A spoken brain reply.")),
@@ -607,40 +609,46 @@ describe("LiveVoiceController", () => {
     );
   });
 
-  it("routes selected neural listening through same-brain audio while retaining literal platform transcription", async () => {
+  it("routes selected native audio directly and never retains a platform transcript boundary", async () => {
     const neuralStop = vi.fn();
+    let nativeHandlers: import("../src/shared/liveVoice").LiveVoiceNativeAudioHandlers | undefined;
     const neural: LiveVoiceNeuralAdapter = {
       inspect: vi.fn(async () => ({
         listening: true,
+        nativeAudioChatInput: true,
         voice: false,
         detail:
-          "Waveforms enter this brain's assemblies; Web Speech remains the transcript boundary."
+          "Synthetic raw input adapter; no platform recognizer."
       })),
-      startListening: vi.fn(async () => ({ stop: neuralStop }))
+      startListening: vi.fn(async (_brainId, handlers) => { nativeHandlers = handlers; return { stop: neuralStop }; })
     };
     const voice = harness({
       preferences: preferences({ neuralListening: true }),
+      sendAudio: vi.fn(async () => result("Synthetic native reply fixture.")),
       neural
     });
 
     await voice.controller.start();
     expect(neural.inspect).toHaveBeenCalledWith("brain-one");
-    expect(neural.startListening).toHaveBeenCalledWith("brain-one");
+    expect(neural.startListening).toHaveBeenCalledWith("brain-one", expect.any(Object), expect.any(AbortSignal));
     expect(voice.capture.request).not.toHaveBeenCalled();
-    expect(voice.recognition.start).toHaveBeenCalledOnce();
+    expect(voice.recognition.start).not.toHaveBeenCalled();
     expect(voice.controller.getState().capabilities).toMatchObject({
       neuralListening: true,
       neuralVoice: false
     });
 
-    voice.handlers().onFinal({ transcript: "literal recognized words" });
+    const audio = { format: "omni-native-audio-chat" as const, version: 1 as const, captureSessionId: "owned-lease",
+      utteranceId: "owned-clip", sequence: 0, mimeType: "audio/wav", dataBase64: "UklGRg==", capturedAt: "2026-10-11T14:00:00Z" };
+    nativeHandlers!.onFinalAudio(audio);
     await vi.waitFor(() =>
-      expect(voice.chat.send).toHaveBeenCalledWith(
+      expect(voice.chat.sendAudio).toHaveBeenCalledWith(
         "brain-one",
-        "literal recognized words",
+        audio,
         "voice-utterance-1"
       )
     );
+    expect(voice.chat.send).not.toHaveBeenCalled();
     await voice.controller.stop();
     expect(neuralStop).toHaveBeenCalledOnce();
   });

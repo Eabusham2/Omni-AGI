@@ -11,7 +11,34 @@ import json
 from typing import Any, Mapping
 
 
-def native_core_inventory(shape: Mapping[str, Any], router_storage_layout=None) -> dict[str, int]:
+NATIVE_INVENTORY_VERSION = 2
+PACKED_LEARNING_ROW_BLOCK = 64
+# Conservative live scratch admission, not another learned-weight allocation.
+# Includes tensor intermediates plus the worst-case saturated-contact index
+# tensor/Python coordinate list in model._apply_packed_gradient_rows. Dynamic
+# contact allocation and its pager backing are admitted separately by owners.
+WEIGHTED_LEARNING_SCRATCH_BYTES_PER_ELEMENT = 256
+PACKED_OWNER_METADATA_RESERVE_BYTES = 16 * 1024
+
+
+def packed_owner_metadata_reserve(owners: int) -> int:
+    """Conservative empty-owner/module/registry allowance; not exact tensor bytes."""
+    if type(owners) is not int or owners < 0:
+        raise ValueError("packed owner count must use a nonnegative integer")
+    return owners * PACKED_OWNER_METADATA_RESERVE_BYTES
+
+
+def packed_learning_scratch_bytes(rows: int, width: int) -> int:
+    if type(rows) is not int or type(width) is not int or rows < 0 or width < 0:
+        raise ValueError("packed scratch geometry must use nonnegative integers")
+    return min(PACKED_LEARNING_ROW_BLOCK, rows) * ((width + 3) // 4 * 4) * WEIGHTED_LEARNING_SCRATCH_BYTES_PER_ELEMENT
+
+
+def native_core_inventory(shape: Mapping[str, Any], router_storage_layout=None,
+                          inventory_version: int = NATIVE_INVENTORY_VERSION) -> dict[str, int]:
+    if type(inventory_version) is not int or inventory_version not in {1, 2}:
+        raise ValueError("unsupported native inventory version")
+    weighted = inventory_version == 2
     if router_storage_layout not in {None, "block-sparse-v1"}:
         raise ValueError("unsupported native router storage layout")
     sparse = router_storage_layout == "block-sparse-v1"
@@ -23,6 +50,8 @@ def native_core_inventory(shape: Mapping[str, Any], router_storage_layout=None) 
     counts = {"logicalParameters": 0, "projectionParameters": 0, "tableParameters": 0,
               "routerSynapseParameters": 0 if sparse else router * router, "packedWeightBytes": 0,
               "resistanceBytes": 0, "packedOwners": 0, "maximumProjectionBytes": 0}
+    if weighted:
+        counts["maximumUpdateScratchBytes"] = 0
 
     def matrix(width, rows, bias=0, *, table=False, repeat=1):
         parameters = width * rows + bias
@@ -32,7 +61,13 @@ def native_core_inventory(shape: Mapping[str, Any], router_storage_layout=None) 
         counts["packedWeightBytes"] += repeat * packed
         counts["resistanceBytes"] += repeat * (rows + bool(bias))
         counts["packedOwners"] += repeat
-        counts["maximumProjectionBytes"] = max(counts["maximumProjectionBytes"], packed + rows + bool(bias) + 8)
+        # v1 arithmetic is immutable descriptor evidence. v2 adds every base
+        # contact byte and the transient autograd trigger retained by an owner.
+        counts["maximumProjectionBytes"] = max(counts["maximumProjectionBytes"],
+            packed + rows + bool(bias) + 8 + (parameters + 4 if weighted else 0))
+        if weighted:
+            counts["maximumUpdateScratchBytes"] = max(counts["maximumUpdateScratchBytes"],
+                packed_learning_scratch_bytes(rows, width), packed_learning_scratch_bytes(1, bias))
 
     def linear(width, rows, bias=False, **kwargs):
         matrix(width, rows, rows if bias else 0, **kwargs)
@@ -136,6 +171,13 @@ def native_core_inventory(shape: Mapping[str, Any], router_storage_layout=None) 
     counts["liquidStateBytes"] = 4 * d
     counts["staticNonweightTensorBytes"] = (counts["resistanceBytes"] + counts["gainAndRateBytes"]
         + counts["routerNonweightTensorBytes"] + counts["freshRouteControlBytes"] + counts["liquidStateBytes"])
+    if weighted:
+        # Learned strength and metaplastic resistance share a byte; they are
+        # neither an extra synapse nor a floating master-weight replica.
+        counts["connectionStateBytes"] = counts["logicalParameters"]
+        counts["packedLearnedStateBytes"] = counts["packedWeightBytes"] + counts["connectionStateBytes"]
+        counts["parallelTopologyControlBytes"] = 8 * counts["packedOwners"]
+        counts["staticNonweightTensorBytes"] += counts["parallelTopologyControlBytes"]
     return counts
 
 
@@ -146,7 +188,8 @@ def native_architecture_sha256(descriptor: Mapping[str, Any]) -> str:
 
 
 def validate_native_architecture(descriptor: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(descriptor, Mapping) or descriptor.get("format") != "omni-main-selected-native-architecture" or descriptor.get("formatVersion") != 1:
+    if (not isinstance(descriptor, Mapping) or descriptor.get("format") != "omni-main-selected-native-architecture"
+        or type(descriptor.get("formatVersion")) is not int or descriptor.get("formatVersion") not in {1, 2}):
         raise ValueError("invalid main-selected native architecture descriptor")
     if descriptor.get("architecture") != "OmniCortex" or descriptor.get("externalPretrainedWeights") is not False:
         raise ValueError("native architecture cannot name external/foundation weights")
@@ -172,7 +215,8 @@ def validate_native_architecture(descriptor: Mapping[str, Any]) -> dict[str, Any
         or shape["workspaceLatents"] != max(8, shape["workingMemoryItems"] // 4)):
         raise ValueError("native architecture shape violates the constructor contract")
     sizing_value = descriptor.get("sizing")
-    actual = native_core_inventory(shape, sizing_value.get("routerStorageLayout") if isinstance(sizing_value, Mapping) else None)
+    actual = native_core_inventory(shape, sizing_value.get("routerStorageLayout") if isinstance(sizing_value, Mapping) else None,
+                                   inventory_version=descriptor["formatVersion"])
     if dict(inventory) != actual or any(value > (1 << 53) - 1 for value in actual.values()):
         raise ValueError("native architecture exact inventory does not match its shape")
     if descriptor.get("sha256") != native_architecture_sha256(descriptor):

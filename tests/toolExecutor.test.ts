@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   mkdir,
@@ -62,17 +62,34 @@ describe("ToolExecutor release gates", () => {
   afterEach(async () => {
     await rm(temporaryRoot, { recursive: true, force: true });
   });
+  it("delivers an exact stored native effect before new permission or dispatch without running it again", async () => {
+    const retained = { id: randomUUID(), toolId: "web.fetch", action: "fetch", state: "complete" as const,
+      startedAt: "2026-10-01T00:00:00.000Z", finishedAt: "2026-10-01T00:00:01.000Z", output: { actual: "stored" },
+      recoveredEffectReceipt: { evidenceId: "b".repeat(64), originalActionEventId: "old-event", originalBrainId: brain.id } };
+    service.recoverCompletedNativeEffect = vi.fn(async () => retained);
+    const permission = vi.spyOn(service, "listToolPermissions");
+    const dispatch = vi.spyOn(executor as unknown as { dispatch(...args: unknown[]): Promise<unknown> }, "dispatch");
+    vi.spyOn(executor as unknown as { audit(...args: unknown[]): Promise<void> }, "audit").mockResolvedValue(undefined);
+    const completed = vi.fn(async () => undefined);
+    const result = await executor.execute({ brainId: brain.id, toolId: "web.fetch", action: "fetch", arguments: { url: "https://example.org" } },
+      undefined, "restored-turn", completed, { actionEventId: "new-event", chatTurnId: "restored-turn", nativeActionId: "a".repeat(32) });
+    expect(result).toBe(retained); expect(completed).toHaveBeenCalledWith(retained);
+    expect(permission).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+    expect(service.recoverCompletedNativeEffect).toHaveBeenCalledWith(expect.objectContaining({ brainId: brain.id }),
+      { turnId: "restored-turn", neuralActionId: "a".repeat(32) });
+  });
 
   async function setPermission(
     toolId: string,
     level: ToolPermissionLevel
   ): Promise<void> {
-    const current = await repository.get(brain.id);
-    const permission = current.toolPermissions?.find((entry) => entry.toolId === toolId);
-    if (!permission) throw new Error(`Missing fixture permission for ${toolId}.`);
-    permission.level = level;
-    permission.updatedAt = new Date().toISOString();
-    await repository.save(current);
+    await repository.updateToolPermission(
+      brain.id,
+      toolId,
+      toolId,
+      level,
+      { requestId: randomUUID() }
+    );
   }
 
   it("blocks Off tools before dispatch and records a failed audit event", async () => {
@@ -120,6 +137,57 @@ describe("ToolExecutor release gates", () => {
     const expires = Date.parse(pending.approvalExpiresAt ?? "");
     expect(expires - before).toBeGreaterThanOrEqual(29_000);
     expect(expires - before).toBeLessThanOrEqual(31_000);
+  });
+
+  it("requires exact human approval for unknown-effect automation review even under Full", async () => {
+    await setPermission("studio.automation", "full");
+    service.authorizeInlineImagination = vi.fn(async () => undefined);
+    service.queueCompletedToolExecution = vi.fn(async () => undefined);
+    vi.spyOn(executor as unknown as { audit(...args: unknown[]): Promise<void> }, "audit").mockResolvedValue(undefined);
+    const execute = vi.fn(async () => ({ state: "reviewed" }));
+    executor.setAutomationService({ execute });
+    const invocation = {
+      brainId: brain.id,
+      toolId: "studio.automation",
+      action: "review",
+      arguments: {
+        runId: "run-one",
+        resolution: "skip",
+        acknowledgePossibleEffects: true,
+        reason: "The user inspected the retained receipt."
+      }
+    };
+
+    const pending = await executor.execute(invocation);
+    expect(pending.state).toBe("approval-required");
+    expect(execute).not.toHaveBeenCalled();
+
+    const substitutedArguments = {
+      ...invocation.arguments,
+      resolution: "retry-confirmed"
+    };
+    const substituted = await executor.execute({
+      ...invocation,
+      arguments: substitutedArguments,
+      approvalToken: pending.approvalToken
+    });
+    expect(substituted.state).toBe("approval-required");
+    expect(execute).not.toHaveBeenCalled();
+
+    const approved = await executor.execute({
+      ...invocation,
+      arguments: substitutedArguments,
+      approvalToken: substituted.approvalToken
+    });
+    expect(approved.state).toBe("complete");
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledWith(
+      brain.id,
+      "review",
+      substitutedArguments,
+      expect.any(String),
+      expect.any(AbortSignal)
+    );
   });
 
   it("canonicalizes a legacy file invocation before approval, result, and audit", async () => {
@@ -580,13 +648,8 @@ describe("ToolExecutor release gates", () => {
     expect(resurrected.approvalToken).not.toBe(challenge.approvalToken);
     expect(resurrected.output).toBeUndefined();
 
-    const current = await repository.get(brain.id);
-    const permission = current.toolPermissions?.find(
-      (entry) => entry.toolId === "system.files"
-    );
-    expect(permission).toBeTruthy();
-    permission!.updatedAt = new Date(Date.now() + 1_000).toISOString();
-    await repository.save(current);
+    await setPermission("system.files", "off");
+    await setPermission("system.files", "ask");
 
     const staleRevision = await executor.execute({
       ...invocation,

@@ -1,0 +1,83 @@
+.camera-screen-panel {
+  min-width: 0;
+  color: var(--text-2);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+  overflow: hidden;
+}
+.camera-screen-panel > header {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.camera-screen-panel > header > span:nth-child(2) { display: grid; min-width: 0; gap: 3px; }
+.camera-screen-panel > header strong { color: var(--text-1); font-size: 12px; }
+.camera-screen-panel > header small { color: var(--text-3); font-size: 11px; overflow-wrap: anywhere; }
+.camera-screen-panel > header em {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+  font-size: 11px;
+  font-style: normal;
+}
+.camera-screen-panel > header em i, .camera-screen-preview figcaption i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-4);
+}
+.camera-screen-panel > header em.is-active { color: var(--text-1); }
+.camera-screen-panel > header em.is-active i, .camera-screen-preview figcaption i { background: var(--accent-alt); }
+.camera-screen-panel__body { display: grid; gap: 10px; padding: 10px; min-width: 0; }
+.camera-screen-panel .live-perception-toolbar { gap: 8px; }
+.camera-screen-panel .live-perception-toolbar button, .camera-screen-panel .live-perception-snapshot button,
+.camera-screen-quality button { min-height: 34px; font-size: 11px; }
+.camera-screen-panel button:focus-visible, .camera-screen-panel summary:focus-visible,
+.camera-screen-panel input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.camera-screen-panel .live-perception-error { align-items: flex-start; overflow-wrap: anywhere; color: var(--text-1); }
+.camera-screen-panel .live-perception-error > svg { flex-shrink: 0; margin-top: 2px; color: var(--accent-strong); }
+.camera-screen-panel .live-perception-toolbar button.is-primary:hover:not(:disabled),
+.camera-screen-panel .live-perception-snapshot button.is-primary:hover:not(:disabled) {
+  color: var(--on-accent); background: var(--accent-strong); border-color: var(--accent);
+}
+.camera-screen-panel .live-perception-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.camera-screen-panel .live-perception-facts strong { white-space: normal; overflow-wrap: anywhere; }
+.camera-screen-panel .live-perception-audit dd { overflow-wrap: anywhere; }
+.camera-screen-quality { display: flex; flex-wrap: wrap; min-width: 0; gap: 4px; border: 0; padding: 0; }
+.camera-screen-quality legend { margin-bottom: 6px; color: var(--text-3); font-size: 11px; }
+.camera-screen-quality button {
+  flex: 1 1 auto;
+  padding: 5px 8px;
+  color: var(--text-2);
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+}
+.camera-screen-quality button:hover:not(:disabled) { color: var(--text-1); background: var(--card-surface-hover); }
+.camera-screen-quality button[aria-pressed="true"] { color: var(--text-1); border-color: var(--accent); background: var(--panel-raised); }
+.camera-screen-quality button:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
+.camera-screen-preview { display: grid; min-width: 0; gap: 6px; }
+.camera-screen-preview figure { margin: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--control-radius); }
+.camera-screen-preview__live { background: var(--canvas-raised); }
+.camera-screen-preview video { display: block; width: 100%; max-height: 240px; aspect-ratio: 16 / 9; object-fit: contain; background: #101214; }
+.camera-screen-preview__empty { display: grid; min-height: 120px; padding: 16px; gap: 8px; place-content: center; justify-items: center; color: var(--text-3); text-align: center; font-size: 12px; }
+.camera-screen-preview figcaption { display: flex; align-items: center; gap: 6px; padding: 6px 8px; color: var(--text-3); font-size: 11px; }
+.camera-screen-preview p { margin: 0; color: var(--text-2); font-size: 11px; overflow-wrap: anywhere; }
+.camera-screen-preview__snapshot { min-width: 0; border: 1px solid var(--border); border-radius: var(--control-radius); }
+.camera-screen-preview__snapshot summary { padding: 7px; cursor: pointer; color: var(--text-2); font-size: 11px; overflow-wrap: anywhere; }
+.camera-screen-preview__snapshot img { display: block; width: 100%; max-height: 260px; object-fit: contain; background: #101214; }
+.camera-screen-preview__snapshot:not([open]) > img { display: none; }
+@media (max-width: 480px) {
+  .camera-screen-panel .live-perception-actions { flex-wrap: wrap; margin-left: 0; }
+  .camera-screen-panel .live-perception-snapshot > div:first-child { min-width: 0; }
+  .camera-screen-panel .live-perception-custom-size, .camera-screen-panel .live-perception-burst-values { width: 100%; }
+  .camera-screen-panel .live-perception-custom-size label, .camera-screen-panel .live-perception-burst-values label { flex: 1; min-width: 0; }
+  .camera-screen-panel .live-perception-custom-size input, .camera-screen-panel .live-perception-burst-values input { width: 100%; min-width: 0; box-sizing: border-box; }
+}

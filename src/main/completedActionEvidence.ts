@@ -1,16 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
+import { DatabaseSync } from "node:sqlite";
 import type { ActionEvent, ToolExecutionResult, ToolInvocation } from "../shared/types";
 
 export interface CompletedActionEvidenceReceipt {
   brainId: string; evidenceId: string; executionId: string; evidenceSha256: string;
   committed: true; processed: boolean; duplicate: boolean;
   sourceIdentity?: string; commitSequence?: number;
+  webImage?: import("../shared/webImages").WebImageLearningReceipt;
 }
 export interface CompletedActionEvidenceJob {
   format: "omni-action-result-learning-job-v1";
@@ -22,12 +24,23 @@ export interface CompletedActionEvidenceJob {
   routeComplete: boolean;
   receipt?: CompletedActionEvidenceReceipt;
   error?: string;
+  /** Learning-only continuation of a retained native cursor, never an effect/grant. */
+  mergeContinuation?: { pendingId: string; originalEvidenceId: string; parentId: string };
 }
 
 const digest = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 const hex = /^[a-f0-9]{64}$/;
 const uuid = /^[a-f0-9-]{36}$/i;
 const CHUNK = 64 * 1024;
+
+function effectArguments(value: Record<string, unknown>, toolId: string): string {
+  const normalized = { ...value };
+  if (toolId === "modality.imagine") { delete normalized.neuralActionId; delete normalized.chatTurnId; }
+  const canonical = (item: unknown): string => Array.isArray(item) ? `[${item.map(canonical).join(",")}]` : item && typeof item === "object"
+    ? `{${Object.keys(item).filter(key => (item as Record<string, unknown>)[key] !== undefined).sort().map(key => `${JSON.stringify(key)}:${canonical((item as Record<string, unknown>)[key])}`).join(",")}}`
+    : JSON.stringify(item);
+  return digest(canonical(normalized));
+}
 
 export function actualTerminalToolOutcome(value: ToolExecutionResult | undefined): value is ToolExecutionResult {
   return Boolean(value && typeof value.finishedAt === "string" && Number.isFinite(Date.parse(value.finishedAt)) &&
@@ -140,9 +153,29 @@ export function validateActionEvidenceJob(value: unknown, brainId?: string): Com
       !Number.isSafeInteger(job.attempts) || job.attempts < 0 || typeof job.routeComplete !== "boolean") {
     throw new Error("Invalid durable completed-action evidence job.");
   }
+  if (job.mergeContinuation && (!hex.test(job.mergeContinuation.pendingId) || !hex.test(job.mergeContinuation.originalEvidenceId) ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(job.mergeContinuation.parentId) ||
+    Object.keys(job.mergeContinuation).sort().join(",") !== "originalEvidenceId,parentId,pendingId")) {
+    throw new Error("Invalid merged action-result learning continuation.");
+  }
   if (job.receipt) validateActionEvidenceReceipt(job.receipt, job);
   if (job.state === "complete" && (!job.receipt || !job.routeComplete)) throw new Error("Completed evidence job lacks exact neural/route receipts.");
   return job;
+}
+
+export { readSavedEvidenceJob as readSavedActionEvidenceJob };
+
+/** Recover an immutable captured outcome without modifying its source queue. */
+export async function readUnmanifestedActionEvidence(path: string, brainId: string, evidenceId: string,
+  admit: (bytes: number) => Promise<void>): Promise<CompletedActionEvidenceJob> {
+  const header = await evidenceHeader(path, admit);
+  if (header.format !== "omni-completed-action-result-v1" || header.evidenceId !== evidenceId || !uuid.test(String(header.executionId)) ||
+    typeof header.completedAt !== "string" || !Number.isFinite(Date.parse(header.completedAt))) throw new Error("Orphan evidence has invalid identity.");
+  const { executionId, evidenceId: _id, startedAt: _started, arguments: _arguments, learningRoute, ...provenance } = header;
+  const route = learningRoute as CompletedActionEvidenceJob["route"];
+  return validateActionEvidenceJob({ format: "omni-action-result-learning-job-v1", brainId, evidenceId,
+    executionId: String(executionId), evidenceSha256: await actionEvidenceFileHash(path), state: "pending",
+    createdAt: header.completedAt, updatedAt: header.completedAt, attempts: 0, provenance, ...(route ? { route } : {}), routeComplete: !route });
 }
 
 export function validateActionEvidenceReceipt(value: unknown, expected: Pick<CompletedActionEvidenceJob,
@@ -152,18 +185,100 @@ export function validateActionEvidenceReceipt(value: unknown, expected: Pick<Com
       result.executionId !== expected.executionId || result.evidenceSha256 !== expected.evidenceSha256 ||
       result.committed !== true || typeof result.processed !== "boolean" || typeof result.duplicate !== "boolean" ||
       (!result.processed && !result.duplicate)) throw new Error("Completed-action learning receipt has a different owner or is not committed.");
+  if (result.webImage) {
+    const image = result.webImage;
+    if (image.format !== "omni-web-image-learning" || image.version !== 1 || ![image.selectionSha256, image.referenceId, image.sourceSha256, image.sourceIdentity, image.transactionId].every(value => hex.test(value)) ||
+      !Number.isSafeInteger(image.sourceBytes) || image.sourceBytes < 1 || image.committed !== true || image.duplicate !== result.duplicate || image.sourceIdentity !== result.sourceIdentity) throw new Error("Selected image has no exact committed native media receipt.");
+  }
   return result;
 }
 
 export class CompletedActionEvidenceStore {
   readonly directory: string;
   private readonly staged = new Map<string, Promise<CompletedActionEvidenceJob>>();
+  private recoveryIndexTail: Promise<unknown> = Promise.resolve();
+  private recoveryIndexFresh = false;
   constructor(readonly enginePath: string, readonly brainId: string,
     private readonly admit: (bytes: number, directory: string, writing?: boolean) => Promise<void>) {
     this.directory = join(enginePath, "action-result-learning");
   }
   evidencePath(id: string): string { if (!hex.test(id)) throw new Error("Invalid evidence ID."); return join(this.directory, "evidence", `${id}.jsonl`); }
   jobPath(id: string): string { if (!hex.test(id)) throw new Error("Invalid evidence ID."); return join(this.directory, "jobs", `${id}.json`); }
+  /** Exact operational replay prevention, not neural memory or text retrieval. */
+  recoverNativeEffect(invocation: ToolInvocation, owner: { turnId: string; neuralActionId: string }): Promise<ToolExecutionResult | undefined> {
+    const operation = this.recoveryIndexTail.then(() => this.recoverNativeEffectOwned(invocation, owner));
+    this.recoveryIndexTail = operation.catch(() => undefined); return operation;
+  }
+  private async recoverNativeEffectOwned(invocation: ToolInvocation, owner: { turnId: string; neuralActionId: string }): Promise<ToolExecutionResult | undefined> {
+    if (invocation.brainId !== this.brainId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(owner.turnId) || !/^[a-f0-9]{32}$/.test(owner.neuralActionId)) {
+      throw new Error("Retained effect lookup requires a controller-owned native turn/action.");
+    }
+    const directory = join(this.directory, "evidence"), info = await lstat(directory, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined; throw error;
+    });
+    if (!info) return undefined;
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Retained effect directory is unsafe.");
+    const indexPath = join(this.directory, "native-effect-index.sqlite3");
+    const prior = await lstat(indexPath).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+    if (prior && (!prior.isFile() || prior.isSymbolicLink())) throw new Error("Retained effect index is not an owned regular cache.");
+    await this.admit(131072, this.directory, true);
+    const database = new DatabaseSync(indexPath);
+    try {
+      database.exec("PRAGMA cache_size=-256; PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS effects(evidence_id TEXT PRIMARY KEY,sha256 TEXT NOT NULL,turn_id TEXT,native_id TEXT,tool_id TEXT,action TEXT,args_sha256 TEXT) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS by_native ON effects(turn_id,native_id)");
+      const epoch = [info.dev, info.ino, info.mtimeNs, info.ctimeNs].join(":"), indexed = database.prepare("SELECT value FROM state WHERE key='evidence-mtime'").get();
+      if (!this.recoveryIndexFresh || indexed?.value !== epoch) {
+        for await (const entry of await opendir(directory)) {
+          if (entry.name.endsWith(".tmp")) continue;
+          if (!/^[a-f0-9]{64}\.jsonl$/.test(entry.name) || !entry.isFile() || entry.isSymbolicLink()) throw new Error("Retained effect evidence inventory is unsafe.");
+          const evidenceId = entry.name.slice(0, -6);
+          if (database.prepare("SELECT 1 FROM effects WHERE evidence_id=?").get(evidenceId)) continue;
+          const path = this.evidencePath(evidenceId), header = await evidenceHeader(path, bytes => this.admit(bytes, this.directory, false));
+          if (header.format !== "omni-completed-action-result-v1" || header.evidenceId !== evidenceId || !uuid.test(String(header.executionId)) ||
+              typeof header.originBrainId !== "string" || digest(`${header.originBrainId}\0${header.executionId}\0completed-action-result-v1`) !== evidenceId) {
+            throw new Error("Retained completed effect has invalid immutable provenance.");
+          }
+          const sha = await actionEvidenceFileHash(path), job = await this.read(evidenceId);
+          if (job && job.evidenceSha256 !== sha) throw new Error("Retained effect differs from its durable queue seal.");
+          // Fork/import rekeys queue ownership only. Immutable executed data
+          // stays attributable to its original owner and cannot grant access.
+          if (job && job.brainId !== this.brainId) throw new Error("Retained effect queue belongs to another instance.");
+          const args = header.arguments;
+          if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Retained effect lost its actual operands.");
+          await this.admit(4096, this.directory, true);
+          database.prepare("INSERT INTO effects VALUES(?,?,?,?,?,?,?)").run(evidenceId, sha,
+            typeof header.chatTurnId === "string" ? header.chatTurnId : null, typeof header.neuralActionId === "string" ? header.neuralActionId : null,
+            String(header.toolId), String(header.action), effectArguments(args as Record<string, unknown>, String(header.toolId)));
+        }
+        database.prepare("INSERT OR REPLACE INTO state VALUES('evidence-mtime',?)").run(epoch);
+        this.recoveryIndexFresh = true;
+      }
+      const rows = [...database.prepare("SELECT * FROM effects WHERE turn_id=? AND native_id=? LIMIT 2").iterate(owner.turnId, owner.neuralActionId)];
+      if (!rows.length) return undefined;
+      const argumentsSha = effectArguments(invocation.arguments, invocation.toolId);
+      if (rows.some(row => row.tool_id !== invocation.toolId || row.action !== invocation.action || row.args_sha256 !== argumentsSha)) {
+        throw new Error("A restored native action changed the operands of its already-performed external effect; it will not be repeated.");
+      }
+      if (rows.length !== 1) throw new Error("Conflicting completed receipts exist for this native action; review them instead of repeating the effect.");
+      const row = rows[0]!, path = this.evidencePath(String(row.evidence_id)), stat = await lstat(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Retained effect body is unsafe.");
+      await this.admit(stat.size * 12 + 131072, this.directory, false);
+      const bytes = await readFile(path);
+      if (createHash("sha256").update(bytes).digest("hex") !== row.sha256) throw new Error("Retained effect body lost its exact immutable seal.");
+      const body = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+      if (body.format !== "omni-completed-action-result-v1" || body.evidenceId !== row.evidence_id ||
+          digest(`${body.originBrainId}\0${body.executionId}\0completed-action-result-v1`) !== body.evidenceId ||
+          !body.arguments || typeof body.arguments !== "object" || Array.isArray(body.arguments) || effectArguments(body.arguments as Record<string, unknown>, invocation.toolId) !== argumentsSha ||
+          body.chatTurnId !== owner.turnId || body.neuralActionId !== owner.neuralActionId || body.toolId !== invocation.toolId || body.action !== invocation.action ||
+          !uuid.test(String(body.executionId)) || !["complete", "failed"].includes(String(body.executionState)) ||
+          typeof body.startedAt !== "string" || !Number.isFinite(Date.parse(body.startedAt)) || typeof body.completedAt !== "string" || !Number.isFinite(Date.parse(body.completedAt)) ||
+          typeof body.outputPresent !== "boolean" || body.outputPresent !== Object.hasOwn(body, "output") ||
+          body.executionState === "failed" && body.dispatchStarted !== true) throw new Error("Retained effect body is not a terminal execution receipt.");
+      return { id: String(body.executionId), toolId: invocation.toolId, action: invocation.action, state: body.executionState as "complete" | "failed",
+        startedAt: body.startedAt, finishedAt: body.completedAt, ...(body.dispatchStarted === true ? { dispatchStarted: true } : {}),
+        ...(body.outputPresent ? { output: body.output } : {}), ...(typeof body.executionError === "string" ? { error: body.executionError } : {}),
+        recoveredEffectReceipt: { evidenceId: String(row.evidence_id), originalActionEventId: String(body.actionEventId), originalBrainId: String(body.originBrainId) } };
+    } finally { database.close(); }
+  }
   private async prepare(): Promise<void> {
     const engine = await lstat(this.enginePath);
     if (!engine.isDirectory() || engine.isSymbolicLink()) throw new Error("Evidence owner no longer has a real engine directory.");
@@ -246,16 +361,18 @@ export class CompletedActionEvidenceStore {
         !uuid.test(execution.id) || execution.output !== output) return Promise.reject(new Error("Only an actual completed execution can enter result learning."));
     return this.stageReceipt(execution, event.action.arguments, event.id, event.neuralActionId, route, chatTurnId);
   }
-  stageTool(invocation: ToolInvocation, execution: ToolExecutionResult, chatTurnId?: string): Promise<CompletedActionEvidenceJob> {
+  stageTool(invocation: ToolInvocation, execution: ToolExecutionResult, chatTurnId?: string, actionEventId?: string): Promise<CompletedActionEvidenceJob> {
     if (invocation.brainId !== this.brainId || !actualTerminalToolOutcome(execution) || !uuid.test(execution.id)) {
       return Promise.reject(new Error("Only an actual completed execution can enter result learning."));
     }
-    return this.stageReceipt(execution, invocation.arguments, execution.id,
+    if (actionEventId !== undefined && (!actionEventId || actionEventId.includes("\0"))) return Promise.reject(new Error("Trusted completed action context is invalid."));
+    return this.stageReceipt(execution, invocation.arguments, actionEventId ?? execution.id,
       typeof invocation.arguments.neuralActionId === "string" ? invocation.arguments.neuralActionId : undefined,
       undefined, chatTurnId);
   }
   private stageReceipt(execution: ToolExecutionResult, args: Record<string, unknown>, actionEventId: string,
     neuralActionId?: string, route?: CompletedActionEvidenceJob["route"], chatTurnId?: string): Promise<CompletedActionEvidenceJob> {
+    this.recoveryIndexFresh = false;
     const output = execution.output;
     if (execution.state !== "complete") route = undefined; // a failed observation is not positive route supervision
     const evidenceId = digest(`${this.brainId}\0${execution.id}\0completed-action-result-v1`);

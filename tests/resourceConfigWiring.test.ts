@@ -8,6 +8,12 @@ import type { EngineSupervisor } from "../src/main/engineSupervisor";
 import { GIB, MIB, ResourcePlanner } from "../src/main/resourcePlanner";
 import { DEFAULT_CONFIG } from "../src/shared/types";
 
+function checkpointBytes(name: string, size: number): Buffer {
+  const prefix = Buffer.alloc(8); prefix.writeBigUInt64LE(248n);
+  const header = Buffer.from(JSON.stringify({ [name]: { dtype: "U8", shape: [size - 256], data_offsets: [0, size - 256] } }).padEnd(248, " "));
+  return Buffer.concat([prefix, header, Buffer.alloc(size - 256)]);
+}
+
 describe("resource configuration wiring", () => {
   let temporaryRoot: string;
   let repository: BrainRepository;
@@ -170,9 +176,12 @@ describe("resource configuration wiring", () => {
     const tryRequest = vi.fn(async () => undefined);
     const service = new BrainService(
       repository,
-      { request, tryRequest } as unknown as EngineSupervisor,
+      { request, tryRequest, instanceStatus: vi.fn(async (brainId: string) => ({ brainId, learnedRuntimeResident: true, minimumContextTokens: 0, reconnect: [] })) } as unknown as EngineSupervisor,
       planner
     );
+    // This case covers an already explicitly loaded runtime's policy update;
+    // the lifecycle suite separately proves the offline path does not load.
+    vi.spyOn(service.instanceLifecycle, "isLoaded").mockReturnValue(true);
     const brain = await repository.create({
       ...DEFAULT_CONFIG,
       name: "Preflighted resource mind"
@@ -318,7 +327,7 @@ describe("resource configuration wiring", () => {
     });
   });
 
-  it("cold-loads and steers an existing brain without reserving future growth again", async () => {
+  it("explicitly loads once and chats on an existing brain without reserving future growth again", async () => {
     const planner = new ResourcePlanner(repository.root, {
       readResources: async () => ({
         totalMemoryBytes: 16 * GIB,
@@ -353,11 +362,12 @@ describe("resource configuration wiring", () => {
           n_layers: 8
         }
       })),
-      writeFile(join(engineDirectory, "core.safetensors"), Buffer.alloc(MIB)),
-      writeFile(join(engineDirectory, "plasticity.safetensors"), Buffer.alloc(MIB))
+      writeFile(join(engineDirectory, "core.safetensors"), checkpointBytes("core.fixture", MIB)),
+      writeFile(join(engineDirectory, "plasticity.safetensors"), checkpointBytes("plasticity.fixture", MIB))
     ]);
     let turn = 0;
-    const request = vi.fn(async (_method: string) => ({}));
+    let resident = false;
+    const request = vi.fn(async (method: string) => { if (method === "load") resident = true; return {}; });
     const requestStream = vi.fn(async (_method: string, params: Record<string, unknown>) => ({
       text: `reply ${++turn}: ${String(params.input)}`,
       trace: { id: `trace-${turn}` },
@@ -367,6 +377,7 @@ describe("resource configuration wiring", () => {
       repository,
       {
         claimForeground: vi.fn(async () => undefined),
+        instanceStatus: vi.fn(async () => ({ brainId: brain.id, learnedRuntimeResident: resident, minimumContextTokens: 0, reconnect: [] })),
         request,
         requestStream
       } as unknown as EngineSupervisor,
@@ -381,13 +392,14 @@ describe("resource configuration wiring", () => {
     expect(admission?.diskSpace.futureGrowthBytes).toBe(0);
     expect(admission?.diskSpace.checkpointBytes).toBeGreaterThan(0);
 
+    expect((await service.loadInstance(brain.id)).phase).toBe("loaded");
     await expect(service.chat(brain.id, "first turn")).resolves.toMatchObject({
       brainMessage: { content: "reply 1: first turn" }
     });
     await expect(service.chat(brain.id, "steer toward saved evidence")).resolves.toMatchObject({
       brainMessage: { content: "reply 2: steer toward saved evidence" }
     });
-    expect(request.mock.calls.filter(([method]) => method === "load")).toHaveLength(2);
+    expect(request.mock.calls.filter(([method]) => method === "load")).toHaveLength(1);
     expect(requestStream).toHaveBeenCalledTimes(2);
   });
 });

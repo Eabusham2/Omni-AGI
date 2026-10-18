@@ -6,16 +6,19 @@ quality of a large pretrained image, audio, or video model.
 """
 
 import math
+from contextlib import contextmanager, nullcontext
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
+from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
 
 from .config import OmniConfig
-from .packed_collective_hooks import packed_row_owner
+from .packed_collective_hooks import packed_row_owner, defer_packed_tile
+from .packed_gradient_tiles import apply_packed_gradient_tile, finish_row_resistance
 from .media_planning import (
     MediaOutputPlan,
     MediaPlanError,
@@ -35,14 +38,19 @@ from .model import (
     PackedAdaptiveBitConvTranspose3d as BitConvTranspose3d,
     PackedAdaptiveBitLinear as BitLinear,
     _apply_packed_gradient_rows,
+    _packed_ternary_input_gradient,
 )
+from .working_attention_paging import current_working_attention_pager
+from .operation_auto_policy import measured_perception
+from .media_randomness import media_generator, media_randn, media_codec_sample
+from .media_canvas import MediaCanvasView
 
 
 IMAGINATION_MODALITIES = ("image", "audio", "video")
 
 
 ScaledPreviewCallback = Callable[
-    [float, torch.Tensor, Dict[str, Any]], None
+    [float, Union[torch.Tensor, MediaCanvasView], Dict[str, Any]], None
 ]
 
 
@@ -50,7 +58,7 @@ ScaledPreviewCallback = Callable[
 class ScaledMediaOutput:
     """An actual neural decode plus an explicit non-quality-claiming receipt."""
 
-    tensor: torch.Tensor
+    tensor: Union[torch.Tensor, MediaCanvasView]
     metadata: Dict[str, Any]
 
 
@@ -175,39 +183,52 @@ def _should_publish(completed: int, total: int, every: int) -> bool:
 
 
 class _PackedTernaryTableRead(torch.autograd.Function):
-    """Expose a transient table while keeping its learned state packed.
+    """Read requested codes only, then update their authoritative contacts."""
 
-    This is an embedding-style read, not a second floating-point parameter.
-    Backward updates the same packed synapses that supplied the forward values.
+    @staticmethod
+    def forward(ctx, indices: torch.Tensor, trigger: torch.Tensor, owner: "PackedTernaryTable") -> torch.Tensor:
+        ctx.owner = owner
+        ctx.save_for_backward(indices)
+        return owner._read_values(indices)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient: torch.Tensor):  # type: ignore[override]
+        (indices,) = ctx.saved_tensors
+        if ctx.owner.training:
+            ctx.owner.learn_selected(indices, gradient)
+        return None, torch.zeros_like(ctx.owner.projection._autograd_trigger), None
+
+
+class _PackedTernaryTableScores(torch.autograd.Function):
+    """Exact distance logits; only activity receives gradients here.
+
+    VQ commitment teaches the selected code rows separately. Audio token loss
+    must not move its target codebook to make a prediction appear correct.
     """
 
     @staticmethod
-    def forward(ctx, trigger: torch.Tensor, owner: "PackedTernaryTable") -> torch.Tensor:
-        ctx.owner = owner
-        projection = owner.projection
-        device = (projection._native_compute_device
-                  if projection._native_core_pager is not None else trigger.device)
-        with projection._packed_residency_scope(device):
-            levels = projection.effective_weight().transpose(0, 1)
-            return levels.float() * projection._packed_forward_scale
+    def forward(ctx, inputs: torch.Tensor, owner: "PackedTernaryTable") -> torch.Tensor:
+        ctx.owner, ctx.input_dtype = owner, inputs.dtype
+        return owner._scores(inputs)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, gradient: torch.Tensor):  # type: ignore[override]
-        owner = ctx.owner
-        if owner.training:
-            owner.learn_from_gradient(gradient)
-        return torch.zeros_like(owner.projection._autograd_trigger), None
+        return ctx.owner._score_input_gradient(gradient).to(ctx.input_dtype), None
 
 
 class PackedTernaryTable(nn.Module):
     """A learned code/position table with one authoritative ternary substrate.
 
-    The wrapped projection owns two-bit packed synapses. A float table exists
-    only as an activation for the current forward/backward, never as a learned
-    master copy or optimizer moment. This is suitable for VQ codebooks and
-    latent positions, whose entries are used like embeddings rather than a
-    dense matrix multiplication.
+    Checkpoint orientation remains [dimensions, codes]. Reads gather only
+    requested code columns and include integer gains and parallel contacts.
+    Scoring reads packed synapses directly; norm/backward tiles are bounded in
+    both axes. No full decoded codebook or floating learned master is kept.
     """
+
+    _CODE_BLOCK = 64
+    _SAMPLE_BLOCK = 256
 
     def __init__(self, rows: int, dimensions: int, *, scale: float) -> None:
         super().__init__()
@@ -216,12 +237,238 @@ class PackedTernaryTable(nn.Module):
         self.projection = BitLinear(
             self.rows, self.dimensions, bias=False, scale=float(scale)
         )
+        # Transient execution capability, not checkpoint geometry or weights.
+        self.projection._packed_column_learning = True
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("ternary table indices must be integers")
+        if bool((indices < 0).any()) or bool((indices >= self.rows).any()):
+            raise IndexError("ternary table index is out of range")
         trigger = self.projection._autograd_trigger
         if not self.training:
             trigger = trigger.detach()
-        return _PackedTernaryTableRead.apply(trigger, self)
+        return _PackedTernaryTableRead.apply(indices.to(torch.long), trigger, self)
+
+    @contextmanager
+    def _compute_scope(self, device: torch.device, byte_count: int, label: str):
+        projection = self.projection
+        with projection._packed_residency_scope(device):
+            activity = current_working_attention_pager()
+            if activity is not None:
+                activity.admit_compute(int(byte_count), label, device=device)
+            pager = projection._native_core_pager
+            if pager is not None and pager.reserve_admission is not None:
+                pager.reserve_admission(int(byte_count), device)
+            policy = getattr(pager, "shared_resource_policy", None)
+            reserve = getattr(policy, "reserve_ram", None)
+            lease = reserve(int(byte_count), label) if callable(reserve) and device.type != "cuda" else nullcontext()
+            with lease:
+                yield
+
+    def _column_tile(self, packed, indices, start, end):
+        """Decode only a touched dimension/code tile to integer contributions."""
+        projection = self.projection
+        selected = packed[start:end].index_select(1, indices // 4)
+        codes = (selected >> (2 * (indices % 4))[None, :]) & 3
+        strengths = (projection._connection_state[start:end].index_select(1, indices) & 15).to(torch.int64) + 1
+        values = (codes.to(torch.int64) - 1) * strengths
+        for _key, row, column, sign, state in projection.iter_parallel_connection_records(start=start, end=end):
+            gain = ((sign & 3) - 1) * ((state & 15) + 1)
+            if gain:
+                values[row - start].add_(indices.eq(column).to(values.dtype) * gain)
+        return values.transpose(0, 1)
+
+    @torch.no_grad()
+    def _read_values(self, indices):
+        flat = indices.reshape(-1)
+        scratch = min(flat.numel(), self._SAMPLE_BLOCK) * min(self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK) * 32
+        with self._compute_scope(indices.device, indices.numel() * self.dimensions * 4 + scratch, "native modality selected-code activity"):
+            packed = self.projection.packed_forward_weight()
+            output = torch.empty((flat.numel(), self.dimensions), device=indices.device, dtype=torch.float32)
+            for sample in range(0, flat.numel(), self._SAMPLE_BLOCK):
+                stop = min(flat.numel(), sample + self._SAMPLE_BLOCK)
+                for start in range(0, self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK):
+                    end = min(self.dimensions, start + PACKED_TERNARY_OUTPUT_BLOCK)
+                    values = self._column_tile(packed, flat[sample:stop], start, end)
+                    output[sample:stop, start:end].copy_(values.float() * self.projection._packed_forward_scale)
+            return output.reshape(*indices.shape, self.dimensions)
+
+    def _squared_norms(self, packed):
+        norms = torch.zeros(self.rows, dtype=torch.float32, device=packed.device)
+        for code in range(0, self.rows, self._CODE_BLOCK):
+            stop = min(self.rows, code + self._CODE_BLOCK)
+            indices = torch.arange(code, stop, device=packed.device)
+            for start in range(0, self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK):
+                end = min(self.dimensions, start + PACKED_TERNARY_OUTPUT_BLOCK)
+                values = self._column_tile(packed, indices, start, end).float() * self.projection._packed_forward_scale
+                norms[code:stop].add_(values.square().sum(-1))
+        return norms
+
+    def _score_samples(self, inputs, packed, norms):
+        # The table is stored transposed, so the native input-gradient kernel
+        # is exactly inputs @ codebook.T with no activation quantization.
+        product = _packed_ternary_input_gradient(inputs, packed, self.rows,
+            self.dimensions, self.projection._packed_forward_scale,
+            self.projection._connection_state, self.projection)
+        return product.mul_(2.).sub_(norms)
+
+    def _validate_activity(self, inputs):
+        if not inputs.is_floating_point() or inputs.ndim < 2 or inputs.shape[-1] != self.dimensions:
+            raise ValueError("ternary table activity shape or dtype is invalid")
+        if not bool(torch.isfinite(inputs).all()):
+            raise ValueError("ternary table activity must be finite")
+
+    def scores(self, inputs):
+        """Negative squared distance, omitting the code-independent input norm."""
+        self._validate_activity(inputs)
+        return _PackedTernaryTableScores.apply(inputs, self)
+
+    @torch.no_grad()
+    def _scores(self, inputs):
+        flat = inputs.reshape(-1, self.dimensions)
+        samples = max(1, min(self._SAMPLE_BLOCK, (1024 * 1024) // max(1, self.rows)))
+        scratch = (self.rows + min(samples, flat.shape[0]) * self.rows + min(self.rows, self._CODE_BLOCK) * min(self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK) * 8) * 4
+        with self._compute_scope(inputs.device, flat.shape[0] * self.rows * 4 + scratch, "native modality distance logits"):
+            packed = self.projection.packed_forward_weight()
+            norms = self._squared_norms(packed)
+            output = torch.empty((flat.shape[0], self.rows), dtype=torch.float32, device=inputs.device)
+            for start in range(0, flat.shape[0], samples):
+                end = min(flat.shape[0], start + samples)
+                output[start:end].copy_(self._score_samples(flat[start:end].float(), packed, norms))
+            return output.reshape(*inputs.shape[:-1], self.rows)
+
+    @torch.no_grad()
+    def nearest_indices(self, inputs):
+        self._validate_activity(inputs)
+        flat = inputs.reshape(-1, self.dimensions)
+        samples = max(1, min(self._SAMPLE_BLOCK, (1024 * 1024) // max(1, self.rows)))
+        scratch = (self.rows + min(samples, flat.shape[0]) * self.rows + min(self.rows, self._CODE_BLOCK) * min(self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK) * 8) * 4
+        with self._compute_scope(inputs.device, flat.shape[0] * 8 + scratch, "native modality nearest-code search"):
+            packed = self.projection.packed_forward_weight()
+            norms = self._squared_norms(packed)
+            indices = torch.empty(flat.shape[0], dtype=torch.long, device=inputs.device)
+            for start in range(0, flat.shape[0], samples):
+                end = min(flat.shape[0], start + samples)
+                indices[start:end].copy_(self._score_samples(flat[start:end].float(), packed, norms).argmax(-1))
+            return indices.reshape(inputs.shape[:-1])
+
+    @torch.no_grad()
+    def _score_input_gradient(self, gradient):
+        flat = gradient.reshape(-1, self.rows)
+        scratch = (min(self.rows, self._CODE_BLOCK) * min(self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK) * 8 + min(flat.shape[0], self._SAMPLE_BLOCK) * min(self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK)) * 4
+        with self._compute_scope(gradient.device, flat.shape[0] * self.dimensions * 4 + scratch, "native modality score backward"):
+            packed = self.projection.packed_forward_weight()
+            output = torch.zeros((flat.shape[0], self.dimensions), dtype=torch.float32, device=gradient.device)
+            for code in range(0, self.rows, self._CODE_BLOCK):
+                stop = min(self.rows, code + self._CODE_BLOCK)
+                indices = torch.arange(code, stop, device=gradient.device)
+                for start in range(0, self.dimensions, PACKED_TERNARY_OUTPUT_BLOCK):
+                    end = min(self.dimensions, start + PACKED_TERNARY_OUTPUT_BLOCK)
+                    values = self._column_tile(packed, indices, start, end).float() * self.projection._packed_forward_scale
+                    for sample in range(0, flat.shape[0], self._SAMPLE_BLOCK):
+                        last = min(flat.shape[0], sample + self._SAMPLE_BLOCK)
+                        output[sample:last, start:end].add_(2. * flat[sample:last, code:stop].float() @ values)
+            return output.reshape(*gradient.shape[:-1], self.dimensions)
+
+    @torch.no_grad()
+    def learn_selected(self, indices, gradient):
+        if (tuple(gradient.shape) != (*indices.shape, self.dimensions)
+                or indices.dtype not in (torch.int32, torch.int64) or indices.device != gradient.device):
+            raise ValueError("ternary selected-code gradient shape or values are invalid")
+        projection = self.projection
+        row_block, code_block, sample_block, scratch = self._learning_tile_shape(indices.numel())
+        with self._compute_scope(gradient.device, scratch, "native modality selected-code learning"), packed_row_owner(projection):
+            packed = projection.packed_forward_weight()
+            rate = projection.online_learning_rate
+            if not indices.numel() or rate == 0.:
+                return 0
+            flat_ids = indices.reshape(-1)
+            flat_gradient = gradient.detach().reshape(-1, self.dimensions)
+            # Check every input before mutating any tile, without a boolean
+            # allocation spanning all examples/dimensions or code columns.
+            for sample in range(0, flat_ids.numel(), sample_block):
+                ids = flat_ids[sample:sample + sample_block]
+                if bool(((ids < 0) | (ids >= self.rows)).any()):
+                    raise IndexError("ternary table index is out of range")
+                for start in range(0, self.dimensions, row_block):
+                    if not bool(torch.isfinite(flat_gradient[sample:sample + sample_block, start:start + row_block]).all()):
+                        raise ValueError("ternary selected-code gradient shape or values are invalid")
+            changed = 0
+            for start in range(0, self.dimensions, row_block):
+                end = min(self.dimensions, start + row_block)
+                grew = torch.zeros(end - start, dtype=torch.bool, device=gradient.device)
+                for code in self._selected_code_starts(flat_ids, code_block, sample_block):
+                    activity = current_working_attention_pager()
+                    if activity is not None:
+                        activity.check_cancelled()
+                    stop = min(self.rows, code + code_block)
+                    derivative = torch.zeros((end - start, stop - code), dtype=torch.float32, device=gradient.device)
+                    for sample in range(0, flat_ids.numel(), sample_block):
+                        last = min(flat_ids.numel(), sample + sample_block)
+                        ids = flat_ids[sample:last]
+                        present = (ids >= code) & (ids < stop)
+                        local_ids = ids[present] - code
+                        values = flat_gradient[sample:last, start:end][present].float().transpose(0, 1)
+                        derivative.index_add_(1, local_ids, values)
+                    if not bool(torch.isfinite(derivative).all()):
+                        raise ValueError("ternary selected-code derivative accumulation overflowed")
+                    if not bool(derivative.ne(0).any()):
+                        continue
+                    deferred = defer_packed_tile(packed, self.rows, start, code, derivative, rate,
+                        projection._packed_forward_scale, projection._row_stability, projection._packed_stability_strength)
+                    if deferred is not None:
+                        continue
+                    count, moved = apply_packed_gradient_tile(projection, packed, self.rows, start, code, derivative, rate,
+                        projection._packed_forward_scale, row_stability=projection._row_stability,
+                        stability_strength=projection._packed_stability_strength, connection_state=projection._connection_state)
+                    changed += count
+                    grew |= moved
+                finish_row_resistance(projection, projection._row_stability, start, grew, projection._packed_stability_strength)
+            projection._packed_validated_version = int(packed._version)
+            if changed and projection._packed_stability_strength > 0.:
+                projection._pending_stability_events += 1
+            return changed
+
+    def _selected_code_starts(self, ids, block, samples):
+        """Ascending touched tiles with bounded input scans, no full-code index.
+
+        Preserve duplicate occurrence order within derivative accumulation.
+        A small selected gather should not visit millions of absent code tiles.
+        """
+        lower = 0
+        while lower < self.rows:
+            first = self.rows
+            for start in range(0, ids.numel(), samples):
+                part = ids[start:start + samples]
+                remaining = part[part >= lower]
+                if remaining.numel():
+                    first = min(first, int(remaining.min()))
+            if first == self.rows:
+                break
+            code = first // block * block
+            yield code
+            lower = code + block
+
+    def _learning_tile_shape(self, samples):
+        rows, codes, examples = min(self.dimensions, 64), min(self.rows, self._CODE_BLOCK), min(max(1, samples), self._SAMPLE_BLOCK)
+        activity = current_working_attention_pager()
+        budget = int(activity.device_tile_budget_bytes) if activity is not None else 1024 * 1024
+        # A native pager's I/O chunk is a sizing hint, not an additional hard
+        # RAM grant; actual live admission remains in _compute_scope.
+        pager = self.projection._native_core_pager
+        if pager is not None:
+            budget = min(budget, max(16 * 1024, int(pager.chunk_bytes)))
+        def required():
+            return rows * codes * 96 + examples * (rows * 8 + 32) + rows * 32 + 2048
+        while required() > budget and (rows > 1 or examples > 1 or codes > 4):
+            if rows > 1:
+                rows = max(1, rows // 2)
+            elif examples > 1:
+                examples = max(1, examples // 2)
+            else:
+                codes = max(4, codes // 8 * 4)
+        return rows, codes, examples, required()
 
     @torch.no_grad()
     def learn_from_gradient(self, gradient: torch.Tensor) -> int:
@@ -254,6 +501,7 @@ class PackedTernaryTable(nn.Module):
                 projection._packed_forward_scale,
                 row_stability=projection._row_stability,
                 stability_strength=projection._packed_stability_strength,
+                connection_state=getattr(projection, "_connection_state", None),
             )
         projection._packed_validated_version = int(packed._version)
         if changed and projection._packed_stability_strength > 0.0:
@@ -276,14 +524,10 @@ class VectorQuantizer(nn.Module):
         batch, channels = latents.shape[:2]
         spatial = latents.shape[2:]
         flat = latents.reshape(batch, channels, -1).transpose(1, 2)
-        codebook = self.codebook().to(flat.dtype)
-        distances = (
-            flat.pow(2).sum(dim=-1, keepdim=True)
-            - 2.0 * flat @ codebook.t()
-            + codebook.pow(2).sum(dim=-1)[None, None, :]
-        )
-        indices = distances.argmin(dim=-1)
-        quantized = F.embedding(indices, codebook)
+        if channels != self.codebook.dimensions:
+            raise ValueError("quantizer channels do not match its codebook")
+        indices = self.codebook.nearest_indices(flat)
+        quantized = self.codebook(indices).to(flat.dtype)
         commitment = F.mse_loss(flat, quantized.detach()) + 0.25 * F.mse_loss(
             quantized, flat.detach()
         )
@@ -296,17 +540,16 @@ class VectorQuantizer(nn.Module):
         return quantized, commitment
 
 
-def _codec_token_logits(predicted: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+def _codec_token_logits(predicted: torch.Tensor, codebook: PackedTernaryTable) -> torch.Tensor:
     """Project a learned latent onto actual packed-codebook IDs, with no new head."""
-    if (predicted.ndim != 3 or codebook.ndim != 2 or
-            predicted.shape[1] != codebook.shape[1]):
+    if (predicted.ndim != 3 or not isinstance(codebook, PackedTernaryTable) or
+            predicted.shape[1] != codebook.dimensions):
         raise ValueError("audio codec token projection has incompatible shapes")
     tokens = predicted.transpose(1, 2).float()
-    codes = codebook.to(device=predicted.device, dtype=torch.float32)
     # The token-independent squared norm of the prediction cancels in softmax.
     # Keeping the remaining exact squared-distance terms bounds the projection
     # to the same residual-VQ table used by the waveform decoder.
-    return (2.0 * tokens @ codes.t() - codes.square().sum(dim=-1)) * (
+    return codebook.scores(tokens) * (
         16.0 / math.sqrt(max(1, predicted.shape[1]))
     )
 
@@ -316,8 +559,8 @@ def _codec_token_loss(
     first_ids: torch.Tensor,
     residual_ids: torch.Tensor,
     first_quantized: torch.Tensor,
-    first_codebook: torch.Tensor,
-    residual_codebook: torch.Tensor,
+    first_codebook: PackedTernaryTable,
+    residual_codebook: PackedTernaryTable,
     unknown: torch.Tensor,
 ) -> torch.Tensor:
     """Train both actual code IDs only where their target vectors were hidden."""
@@ -327,9 +570,9 @@ def _codec_token_loss(
             first_quantized.shape != predicted.shape or
             not bool(unknown.any())):
         raise ValueError("audio codec token targets or mask are invalid")
-    first_logits = _codec_token_logits(predicted, first_codebook.detach())
+    first_logits = _codec_token_logits(predicted, first_codebook)
     residual_logits = _codec_token_logits(
-        predicted - first_quantized.detach(), residual_codebook.detach()
+        predicted - first_quantized.detach(), residual_codebook
     )
     return (
         F.cross_entropy(first_logits[unknown], first_ids[unknown])
@@ -340,9 +583,7 @@ def _codec_token_loss(
 def _sample_codec_ids(logits: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
     if logits.ndim != 3 or logits.shape[-1] < 2 or not bool(torch.isfinite(logits).all()):
         raise ValueError("audio codec token logits are invalid")
-    batch, length, choices = logits.shape
-    probabilities = F.softmax(logits.float(), dim=-1).reshape(batch * length, choices)
-    return torch.multinomial(probabilities, 1, generator=generator).reshape(batch, length)
+    return media_codec_sample(logits, generator)
 
 
 class TinyVisionEncoder(nn.Module):
@@ -450,7 +691,7 @@ class TernaryLatentTransformer(nn.Module):
         )
         tokens = (
             tokens
-            + self.positions()[: tokens.shape[1]].to(tokens.dtype)[None, :, :]
+            + self.positions(torch.arange(tokens.shape[1], device=tokens.device)).to(tokens.dtype)[None, :, :]
             + self.condition(idea)[:, None, :]
             + self.diffusion_time(time)[:, None, :]
         )
@@ -571,7 +812,7 @@ class TinyImageImagination(nn.Module):
         maximum_previews: Optional[int] = None,
     ) -> torch.Tensor:
         _check_cancelled(cancel_check)
-        latent = torch.randn(
+        latent = media_randn(
             idea.shape[0],
             self.channels,
             self.latent_size,
@@ -658,7 +899,7 @@ class TinyAudioCodec(nn.Module):
         predicted_tokens = self.token_generator(quantized.detach() * known, idea, timestep=0.0)
         token_loss = _codec_token_loss(
             predicted_tokens, first_ids, residual_ids, first,
-            self.quantizer_a.codebook(), self.quantizer_b.codebook(), unknown,
+            self.quantizer_a.codebook, self.quantizer_b.codebook, unknown,
         )
         reconstruction = self.decoder(
             quantized
@@ -698,8 +939,8 @@ class TinyAudioCodec(nn.Module):
         maximum_previews: Optional[int] = None,
     ) -> torch.Tensor:
         _check_cancelled(cancel_check)
-        codebook_a = self.quantizer_a.codebook().to(dtype=idea.dtype)
-        codebook_b = self.quantizer_b.codebook().to(dtype=idea.dtype)
+        codebook_a = self.quantizer_a.codebook
+        codebook_b = self.quantizer_b.codebook
         latent = torch.zeros(
             idea.shape[0], self.channels, self.latent_samples,
             device=idea.device, dtype=idea.dtype,
@@ -721,12 +962,12 @@ class TinyAudioCodec(nn.Module):
             predicted = self.token_generator(latent, idea, timestep=0.0)
             first_logits = _codec_token_logits(predicted[:, :, filled:end], codebook_a)
             first_ids = _sample_codec_ids(first_logits, generator)
-            first = F.embedding(first_ids, codebook_a).transpose(1, 2)
+            first = codebook_a(first_ids).to(idea.dtype).transpose(1, 2)
             residual_logits = _codec_token_logits(
                 predicted[:, :, filled:end] - first, codebook_b
             )
             residual_ids = _sample_codec_ids(residual_logits, generator)
-            residual = F.embedding(residual_ids, codebook_b).transpose(1, 2)
+            residual = codebook_b(residual_ids).to(idea.dtype).transpose(1, 2)
             latent[:, :, filled:end] = first + residual
             filled = end
             if preview_callback is not None and index in preview_steps:
@@ -877,7 +1118,7 @@ class TinyVideoImagination(nn.Module):
     ) -> torch.Tensor:
         _check_cancelled(cancel_check)
         condition = self._condition(idea)
-        latent = torch.randn(
+        latent = media_randn(
             condition.shape,
             generator=generator,
             device=condition.device,
@@ -968,6 +1209,7 @@ class ModalityHub(nn.Module):
             for index, name in enumerate(IMAGINATION_MODALITIES)
         }
 
+    @measured_perception
     def perception_embedding(
         self,
         modality: str,
@@ -1005,8 +1247,7 @@ class ModalityHub(nn.Module):
     ) -> torch.Tensor:
         _check_cancelled(cancel_check)
         self.eval()
-        generator = torch.Generator(device=idea.device)
-        generator.manual_seed(int(seed))
+        generator = media_generator(idea.device, seed)
         if modality == "image":
             return self.image.generate(
                 idea,
@@ -1094,6 +1335,7 @@ class ModalityHub(nn.Module):
         preview_callback: Optional[ScaledPreviewCallback] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         resource_watermark: Optional[MediaResourceWatermark] = None,
+        canvas_factory=None,
     ) -> ScaledMediaOutput:
         """Compose arbitrary admitted output from checkpoint-native units.
 
@@ -1141,6 +1383,13 @@ class ModalityHub(nn.Module):
             self._unit_demand(plan, "output-allocation", 0),
         )
         self.eval()
+        canvas = None if canvas_factory is None else canvas_factory(plan, idea, cancel_check)
+        if canvas is not None:
+            from .media_canvas_generation import generate_file_canvas
+            tensor = generate_file_canvas(self, plan, idea, seed, canvas, scaled_preview, cancel_check, resource_watermark)
+            return ScaledMediaOutput(tensor=tensor, metadata={**self._scaled_metadata(plan,
+                training_steps=training_steps, installed_pack_id=installed_pack_id,
+                composition="file-backed-native-overlap-activity"), "activityStorage": "file"})
         if plan.modality == "image":
             tensor = self._generate_scaled_image(
                 plan,
@@ -1250,8 +1499,7 @@ class ModalityHub(nn.Module):
             y_position = top / float(max(1, plan.height - patch))
             x_position = left / float(max(1, plan.width - patch))
             positioned = _positioned_idea(idea, y_position, x_position)
-            generator = torch.Generator(device=idea.device)
-            generator.manual_seed(_derived_seed(seed, top, left))
+            generator = media_generator(idea.device, _derived_seed(seed, top, left))
             tile = self.image.generate(
                 positioned,
                 generator,
@@ -1351,8 +1599,7 @@ class ModalityHub(nn.Module):
             positioned = _positioned_idea(idea, time_position)
             if carry is not None:
                 positioned = F.normalize(0.82 * positioned + 0.18 * carry, dim=-1)
-            generator = torch.Generator(device=idea.device)
-            generator.manual_seed(_derived_seed(seed, start))
+            generator = media_generator(idea.device, _derived_seed(seed, start))
             chunk = self.audio.generate(
                 positioned,
                 generator,
@@ -1488,10 +1735,7 @@ class ModalityHub(nn.Module):
                         0.84 * positioned + 0.16 * carry,
                         dim=-1,
                     )
-                generator = torch.Generator(device=idea.device)
-                generator.manual_seed(
-                    _derived_seed(seed, frame_start, top, left)
-                )
+                generator = media_generator(idea.device, _derived_seed(seed, frame_start, top, left))
                 block = self.video.generate(
                     positioned,
                     generator,

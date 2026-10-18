@@ -13,7 +13,7 @@ from omni_core.bounded_tensor_io import BoundedTensorFile, atomic_save_tensors_b
 from omni_core.offload import NeuralStateResourcePause
 from omni_core.parameter_diagnostics import ParameterDeltaJournal
 from omni_core.persistence import tensor_checksum
-from omni_core.router_state_paging import MATRIX_FIELDS, RouterStatePager
+from omni_core.router_state_paging import MATRIX_FIELDS, RouterStatePager, pack_tile
 from omni_core.sparse_router_state import SparseRouterState, block_key, parse_block_key
 from omni_core.spiking import STDPSynapses
 from omni_core.optimizers import PackedMutationSnapshot
@@ -158,7 +158,7 @@ class SparseRouterStateFixtures(unittest.TestCase):
         self.assertEqual(value.historical_checksum_with_controls(), tensor_checksum((levels, virtual_field(value, "stability"),
             virtual_field(value, "uses"), value.plasticity_events)))
 
-    def test_exact_causal_anti_causal_and_quiet_pair_controls(self):
+    def test_causal_anti_causal_controls_preserve_subthreshold_pressure_in_v2(self):
         old = dense_owner(rows=3, columns=5)
         levels = torch.tensor([[1, 0, -1, 0, 1], [0, 1, 0, -1, 0], [-1, 0, 1, 0, -1]], dtype=torch.int8)
         old.set_effective_weights(levels)
@@ -169,11 +169,29 @@ class SparseRouterStateFixtures(unittest.TestCase):
         value.load_recurrent_state_bounded(self.native_file(old), "router.synapses.")
         pre, post = torch.tensor([1., 0., .25, 0., .5]), torch.tensor([.5, 0., 1.])
         expected, delta = dense_step(old, pre, post)
+        # V2 keeps the original timing/stability equation, but timing pressure
+        # now persists below threshold and a positive contact may strengthen
+        # beyond one before allocating an independent repeated connection.
+        pressure = old.eligibility_accumulator.to(torch.int32).clone()
+        amplitudes = levels.to(torch.int32).clone()
+        connection_state = torch.zeros_like(levels, dtype=torch.uint8)
+        for row in range(3):
+            for column in range(5):
+                increment = int((delta[row, column]/old.learning_rate*256).round().clamp(-256, 256))
+                pressure[row, column] += increment
+                amount = 1 if int(pressure[row, column]) >= 256 else -1 if int(pressure[row, column]) <= -256 else 0
+                amplitudes[row, column] += amount
+                pressure[row, column] -= amount*256
+                strengthened = int(levels[row, column]) != 0 and int(levels[row, column])*amount > 0
+                connection_state[row, column] = (max(1, abs(int(amplitudes[row, column]))) - 1) | (int(strengthened) << 4)
+        expected["_packed_weights"] = pack_tile(amplitudes.sign().to(torch.int8))
+        expected["eligibility_accumulator"] = pressure.to(torch.int16)
         summary = value.step(pre, post)
         self.assertEqual(summary.active_pairs, int((delta != 0).sum()))
         for field in MATRIX_FIELDS:
             actual = value.blocks["r0_c0"]._buffers[field]
             self.assertTrue(torch.equal(actual, expected[field]), field)
+        self.assertTrue(torch.equal(value.blocks["r0_c0"]._connection_state, connection_state))
         for field in ("pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
             self.assertTrue(torch.equal(getattr(value, field), expected[field]), field)
 
@@ -323,10 +341,10 @@ class SparseRouterStateFixtures(unittest.TestCase):
                          {"router.blocks.r1_c1.weights": ((3, 5), "dynamic-synapse")})
         self.assertEqual(value.logical_ternary_parameter_count, 15)
         self.assertEqual(value.authoritative_packed_tensors(), ())
-        self.assertEqual(sum(tensor.numel() for tensor in value.iter_authoritative_packed_tensors()), 6)
+        self.assertEqual(sum(tensor.numel() for tensor in value.iter_authoritative_packed_tensors()), 21)
         self.assertEqual(sum(tensor.numel() for child in value.modules()
                              if callable(getattr(child, "authoritative_packed_tensors", None))
-                             for tensor in child.authoritative_packed_tensors()), 6)
+                             for tensor in child.authoritative_packed_tensors()), 21)
 
     def test_block_keys_are_canonical_and_out_of_range_blocks_are_rejected(self):
         self.assertEqual(parse_block_key(block_key(10, 1000)), (10, 1000))
@@ -438,7 +456,7 @@ class SparseRouterStateFixtures(unittest.TestCase):
         value = sparse_owner(pager)
         journal = self.journal(value)
         def refuse_birth(size):
-            if size == 2048:
+            if size == 4096:  # Sign owner plus the new compact connection-state owner.
                 raise NeuralStateResourcePause("fixture birth metadata ceiling", {})
         journal.reserve_ram = refuse_birth
         levels = torch.zeros(3, 5, dtype=torch.int8); levels[0, 0] = 1

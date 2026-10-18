@@ -23,7 +23,7 @@ describe("fresh total-RAM-first baseline with working-set headroom", () => {
     expect(small.nativeArchitecture!.shape.dModel).toBeGreaterThan(64);
     expect(large.nativeArchitecture!.shape.dModel).toBeGreaterThan(small.nativeArchitecture!.shape.dModel);
     expect(large.nativeArchitecture!.shape.layers).toBeGreaterThan(small.nativeArchitecture!.shape.layers);
-    expect(large.nativeArchitecture!.inventory).toEqual(nativeCoreInventory(large.nativeArchitecture!.shape));
+    expect(large.nativeArchitecture!.inventory).toEqual(nativeCoreInventory(large.nativeArchitecture!.shape, "block-sparse-v1"));
     expect(large.nativeArchitecture!.sizing).toMatchObject({ isAutomaticDefault: true,
       transientAvailableRamUsedForShape: false, ramPercentageIsCeilingNotUsageTarget: true,
       workingSetIsOsRssGuarantee: false, selectionMode: "ram-first-headroom-default" });

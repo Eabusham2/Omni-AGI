@@ -1,0 +1,11 @@
+.mcp-authentication { min-width: 0; display: grid; gap: 12px; padding-block: 12px; grid-column: 1 / -1; }
+.mcp-authentication__status { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; }
+.mcp-authentication__status small, .mcp-authentication__scopes, .mcp-authentication__message { overflow-wrap: anywhere; }
+.mcp-authentication__fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 12px; padding-top: 12px; }
+.mcp-authentication__fields label { display: grid; gap: 6px; min-width: 0; }
+.mcp-authentication__fields input, .mcp-authentication__fields textarea { width: 100%; min-width: 0; box-sizing: border-box; }
+.mcp-authentication__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.mcp-authentication__scopes, .mcp-authentication__message { margin: 0; }
+.mcp-server-list > div:has(.mcp-authentication) { flex-wrap: wrap; }
+.mcp-server-list > div > .mcp-authentication { flex: 1 1 100%; }
+.mcp-credential-panel > form { display: grid; gap: 12px; }

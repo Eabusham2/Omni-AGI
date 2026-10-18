@@ -149,6 +149,14 @@ export class BuildInitializationCoordinator {
     if (plan.tasks.some((task) => task.state !== "complete")) {
       throw new Error("Initial neural learning is still running or requires retry.");
     }
+    // Public manuals are ordinary attributable text learning, separate from
+    // the frozen origin curriculum and from declared action-head examples.
+    // Content-hash receipts make a lost acknowledgement safe to retry.
+    await this.service.teachInitialDocumentation(brainId);
+    // This is learning, not a readiness quiz. A declined candidate retains
+    // the prior native heads and its honest receipt; chat is not blocked on
+    // answering tool questions correctly.
+    await this.service.teachInitialCapabilities(brainId);
     const completed = await this.repository.completeInitialization(brainId);
     this.jobs.completeInitialization(brainId);
     await Promise.allSettled([
@@ -186,7 +194,8 @@ export class BuildInitializationCoordinator {
   async recoverAll(
     onError: (brainId: string, error: unknown) => void = () => undefined,
     onFoundationProgress?: (brainId: string, event: EngineEvent) => void,
-    onLearningProgress?: (brainId: string, event: InitialLearningProgress) => void
+    onLearningProgress?: (brainId: string, event: InitialLearningProgress) => void,
+    onComplete?: (brainId: string, brain: BrainDocument) => void
   ): Promise<void> {
     const initializing: string[] = [];
     for (const summary of await this.repository.list()) {
@@ -209,11 +218,12 @@ export class BuildInitializationCoordinator {
               : task
           )
         }));
-        await this.run(
+        const completed = await this.run(
           brainId,
           (event) => onFoundationProgress?.(brainId, event),
           (event) => onLearningProgress?.(brainId, event)
         );
+        onComplete?.(brainId, completed);
       } catch (error) {
         await this.recordFailure(brainId, error);
         onError(brainId, error);

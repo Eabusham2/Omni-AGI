@@ -28,6 +28,33 @@ function actual(output: unknown): ActionEvent {
 const route = (event: ActionEvent) => ({ eventId: event.id, utterance: "actual current human request", toolId: "web.fetch", action: "fetch", arguments: { url: "https://example.org" } });
 
 describe("exact independent completed-outcome spool", () => {
+  it("recovers a stored terminal native effect across process restart without repeating it or reading another turn", async () => {
+    const { store, engine, admit } = await setup(), output = { observed: "actual past result", nested: [1, "文"] }, event = actual(output);
+    const job = await store.stage(event, output, undefined, "original-turn"), before = await readFile(store.evidencePath(job.evidenceId));
+    const invocation = { brainId: "brain", toolId: "web.fetch", action: "fetch", arguments: { url: "https://example.org" } };
+    expect(await store.recoverNativeEffect(invocation, { turnId: "different-turn", neuralActionId: event.neuralActionId! })).toBeUndefined();
+    const restarted = new CompletedActionEvidenceStore(engine, "brain", admit);
+    const recovered = await restarted.recoverNativeEffect(invocation, { turnId: "original-turn", neuralActionId: event.neuralActionId! });
+    expect(recovered).toMatchObject({ id: event.execution!.id, state: "complete", output,
+      recoveredEffectReceipt: { evidenceId: job.evidenceId, originalActionEventId: event.id, originalBrainId: "brain" } });
+    expect(await readFile(store.evidencePath(job.evidenceId))).toEqual(before);
+    expect((await savedActionEvidenceFiles(engine)).size).toBe(2); // Derived lookup cache is not authoritative/exported state.
+  });
+  it("refuses changed operands, conflicting receipts and corrupted cached evidence instead of retrying a native effect", async () => {
+    const { store } = await setup(), event = actual("original actual result");
+    const job = await store.stage(event, event.execution!.output, undefined, "original-turn");
+    const invocation = { brainId: "brain", toolId: "web.fetch", action: "fetch", arguments: { url: "https://example.org" } };
+    const owner = { turnId: "original-turn", neuralActionId: event.neuralActionId! };
+    await expect(store.recoverNativeEffect({ ...invocation, arguments: { url: "https://changed.example" } }, owner)).rejects.toThrow(/operands/);
+    expect((await store.recoverNativeEffect(invocation, owner))?.output).toBe("original actual result");
+    const bytes = await readFile(store.evidencePath(job.evidenceId));
+    await writeFile(store.evidencePath(job.evidenceId), bytes.toString().replace("original actual result", "altered actual result"));
+    await expect(store.recoverNativeEffect(invocation, owner)).rejects.toThrow(/seal/);
+    await writeFile(store.evidencePath(job.evidenceId), bytes);
+    const second = actual("another external execution");
+    await store.stage(second, second.execution!.output, undefined, "original-turn");
+    await expect(store.recoverNativeEffect(invocation, owner)).rejects.toThrow(/Conflicting/);
+  });
   it("streams complete Unicode result bytes beyond the old display slice without one full-result stringify", async () => {
     const { store, admit } = await setup();
     const output = { body: `${"actual 文🧠\n".repeat(16_000)}EXACT-END`, controls: "\0\t\"\\", lone: "\uD800", scalar: 7 };

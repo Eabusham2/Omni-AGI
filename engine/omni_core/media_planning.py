@@ -30,6 +30,11 @@ INLINE_MEDIA_BINARY_BYTES = 512 * 1024
 def inline_media_data_url(mime_type: str, payload: bytes) -> Optional[str]:
     """Embed bounded media for native playback without exposing local paths."""
 
+    if not isinstance(payload, bytes):
+        from .media_streaming_codec import EncodedMediaFile
+        if not isinstance(payload, EncodedMediaFile): raise TypeError("inline media requires actual bytes or an owned encoded file")
+        payload = payload.inline_bytes(INLINE_MEDIA_BINARY_BYTES)
+        if payload is None: return None
     if len(payload) > INLINE_MEDIA_BINARY_BYTES:
         return None
     return "data:%s;base64,%s" % (
@@ -204,6 +209,8 @@ class MediaOutputPlan:
     limiting_resource: Optional[str]
     measurement_source: str
     model_defined_maximum: None = None
+    canvas_storage: str = "device"
+    canvas_bytes: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -235,6 +242,8 @@ class MediaOutputPlan:
             "limitingResource": self.limiting_resource,
             "measurementSource": self.measurement_source,
             "modelDefinedMaximum": None,
+            "canvasStorage": self.canvas_storage,
+            "canvasBytes": self.canvas_bytes,
         }
 
 
@@ -367,6 +376,7 @@ def _shape_demand(
     total_samples: Optional[int],
     total_frames: Optional[int],
     parallel_units: int,
+    canvas_spill: bool = False,
 ) -> tuple[int, int, int, int, int]:
     spatial_overlap = _overlap(windows.image_patch)
     temporal_window = (
@@ -406,7 +416,7 @@ def _shape_demand(
         output_memory = 7 * total_frames * width * height * 4
         # Raw RGB is a conservative reservation for either MP4 staging or APNG.
         artifact_bytes = 3 * total_frames * width * height + 64 * 1_024
-    peak = output_memory + _unit_peak_bytes(modality, windows) * parallel_units
+    peak = (8 * 1024 * 1024 if canvas_spill else output_memory) + _unit_peak_bytes(modality, windows) * parallel_units
     return (
         work_units,
         peak,
@@ -525,6 +535,8 @@ def plan_media_output(
     windows: NeuralMediaWindows,
     measurements: MediaGenerationMeasurements,
     request: Optional[MediaOutputRequest] = None,
+    *,
+    allow_canvas_spill: bool = False,
 ) -> MediaOutputPlan:
     """Resolve an exact or automatic output without a model-size ceiling."""
 
@@ -585,6 +597,18 @@ def plan_media_output(
         sample_rate = None
 
     parallel = measurements.parallel_units
+    # Keep the in-memory path when it fits. Spill changes activity placement,
+    # not the requested dimensions, trained window or decoder work.
+    _initial_units, resident_peak, _artifact, _spatial, _temporal = _shape_demand(
+        modality, windows, width, height, total_samples, total_frames, 1)
+    canvas_spill = bool(allow_canvas_spill and resident_peak > measurements.available_memory_bytes)
+    def canvas_bytes():
+        return (int(total_samples or 0) * 8 if modality == "audio" else
+                int(width or 0) * int(height or 0) * (int(total_frames or 1) if modality == "video" else 1) * 16) if canvas_spill else 0
+    def canvas_index_bytes():
+        if not canvas_spill or modality == "audio": return 0
+        return 131072 + 128 * axis_window_count(int(width), windows.image_patch, _overlap(windows.image_patch)) * axis_window_count(
+            int(height), windows.image_patch, _overlap(windows.image_patch))
     while parallel > 1:
         _units, candidate_peak, _artifact, _spatial, _temporal = _shape_demand(
             modality,
@@ -594,6 +618,7 @@ def plan_media_output(
             total_samples,
             total_frames,
             parallel,
+            canvas_spill,
         )
         if candidate_peak <= measurements.available_memory_bytes:
             break
@@ -606,11 +631,12 @@ def plan_media_output(
         total_samples,
         total_frames,
         parallel,
+        canvas_spill,
     )
     unit_ms = _unit_ms(modality, measurements)
     preview_every = max(1, int(round(measurements.preview_interval_ms / unit_ms)))
     previews = _preview_count(work_units, preview_every)
-    peak_storage_bytes = artifact_bytes * (previews + 1)
+    peak_storage_bytes = artifact_bytes * (previews + 1) + canvas_bytes() + canvas_index_bytes()
     # Auto is allowed to scale down to the native neural unit. Explicit
     # dimensions/duration are never silently rewritten: an oversized request
     # remains intact and returns ``admitted=False`` with its limiting resource.
@@ -667,10 +693,11 @@ def plan_media_output(
                     total_samples,
                     total_frames,
                     parallel,
+                    canvas_spill,
                 )
             )
             previews = _preview_count(work_units, preview_every)
-            peak_storage_bytes = artifact_bytes * (previews + 1)
+            peak_storage_bytes = artifact_bytes * (previews + 1) + canvas_bytes() + canvas_index_bytes()
     generation_ms = work_units * unit_ms
     memory_ok = peak <= measurements.available_memory_bytes
     storage_ok = peak_storage_bytes <= measurements.available_storage_bytes
@@ -720,4 +747,6 @@ def plan_media_output(
         useful_floor_met=useful,
         limiting_resource=limiting,
         measurement_source=measurements.source,
+        canvas_storage="file" if canvas_spill else "device",
+        canvas_bytes=canvas_bytes(),
     )

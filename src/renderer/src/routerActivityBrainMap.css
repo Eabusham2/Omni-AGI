@@ -1,0 +1,9 @@
+.router-activity-map { display: grid; gap: 10px; min-width: 0; }
+.router-activity-map__heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.router-activity-map__heading h3, .router-activity-map__heading p { margin: 0; }
+.router-activity-map__heading p, .router-activity-map__heading span, .router-activity-map__scope { color: var(--text-3); font-size: 12px; overflow-wrap: anywhere; }
+.router-activity-map__paging { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.router-activity-map__paging > span { margin-right: auto; font-variant-numeric: tabular-nums; }
+.router-activity-map [data-transmission="excitatory"] { stroke: var(--graph-edge-positive); }
+.router-activity-map [data-transmission="inhibitory"] { stroke: var(--graph-edge-negative); }
+.router-activity-map [data-transmission="zero"] { stroke: var(--graph-edge-neutral); }

@@ -1,0 +1,58 @@
+import { _electron as electron, expect, test } from "@playwright/test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+test("device allocations retain safe RAM sync and native-picker-only drive authority", async () => {
+  const data = await mkdtemp(join(tmpdir(), "omni-device-ui-"));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name, value]) => name !== "ELECTRON_RUN_AS_NODE" && value !== undefined)) as Record<string, string>;
+  const application = await electron.launch({ args: [resolve("tests/e2e/device-allocation-main.cjs")], env: { ...env, OMNI_DEVICE_UI_DATA: data, OMNI_DEVICE_UI_REPO: process.cwd() } });
+  try {
+    const page = await application.firstWindow(); const errors: string[] = []; page.on("pageerror", (error) => errors.push(error.message));
+    await expect(page.getByRole("heading", { name: "System RAM", exact: true })).toBeVisible();
+    await page.screenshot({ path: test.info().outputPath("device-allocation-memory-dark.png"), fullPage: true });
+    await expect(page.getByLabel("Enable Unavailable NPU", { exact: true })).toBeDisabled();
+    await page.getByLabel("Discrete GPU allocation policy", { exact: true }).selectOption("manual");
+    const gpu = page.getByLabel("Discrete GPU allocation percent", { exact: true });
+    await gpu.focus(); await gpu.press("Home"); await gpu.press("ArrowRight");
+    await page.getByLabel("Allow automatic increases for Discrete GPU", { exact: true }).check();
+    await page.getByLabel("System RAM allocation policy", { exact: true }).selectOption("manual");
+    const ram = page.getByLabel("System RAM allocation percent", { exact: true });
+    await ram.focus(); await ram.press("Home"); await ram.press("ArrowRight");
+    await expect(page.getByLabel("Existing RAM percentage")).toHaveValue("31");
+    await page.getByLabel("Existing RAM percentage").press("End"); await expect(ram).toHaveValue("100");
+    await page.getByRole("button", { name: "Select spill drives or folders…" }).click();
+    await expect(page.getByRole("heading", { name: "Chosen drive", exact: true })).toBeVisible();
+    const chosen = page.getByRole("article", { name: "Chosen drive allocation", exact: true });
+    await expect(chosen.getByText("Shared volume ceiling", { exact: true })).toBeVisible();
+    await expect(chosen.getByText("48.0 GiB", { exact: true })).toBeVisible();
+    await expect(chosen.getByText("96.0 GiB", { exact: true })).toHaveCount(0);
+    await expect(chosen.getByText("Charged storage", { exact: true })).not.toBeVisible();
+    await chosen.getByText("Identity and measured speed", { exact: true }).click();
+    await expect(chosen.getByText("Charged storage", { exact: true })).toBeVisible();
+    await expect(chosen.getByText("2.0 GiB", { exact: true })).toBeVisible();
+    await expect(chosen.getByText("Pending storage", { exact: true })).toBeVisible();
+    await expect(chosen.getByText("Unmaterialized sparse promises", { exact: true })).toBeVisible();
+    await chosen.getByText("Identity and measured speed", { exact: true }).click();
+    await expect(page.getByRole("article", { name: "Primary drive allocation", exact: true }).getByText("Shared volume ceiling", { exact: true })).toHaveCount(0);
+    const reviewed = await page.evaluate(() => (window as unknown as { __deviceReviewed: any }).__deviceReviewed);
+    expect(reviewed.selectionId).toBe("native-picker-only"); expect(reviewed.settings.storageDirectories).toEqual(["/fixture/chosen"]);
+    expect(reviewed.settings).not.toHaveProperty("selectionId");
+    expect(reviewed.settings.allocations.find((value: any) => value.deviceId === "gpu:cuda:0")).toMatchObject({ mode: "manual", percent: 2, autoIncrease: true });
+    await page.screenshot({ path: test.info().outputPath("device-allocation-dark.png"), fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 }); await page.evaluate(() => { document.documentElement.dataset.colorScheme = "light"; });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0);
+    await page.getByRole("button", { name: "Switch to runtime" }).click();
+    await page.getByRole("heading", { name: "System RAM", exact: true }).scrollIntoViewIfNeeded();
+    await page.screenshot({ path: test.info().outputPath("device-allocation-memory-light.png"), fullPage: true });
+    await page.getByRole("button", { name: "Select spill drives or folders…" }).click();
+    const calls = await page.evaluate(() => (window as unknown as { __deviceCalls: any[] }).__deviceCalls);
+    expect(calls.filter((value) => value.kind === "picker").map((value) => value.input)).toEqual([null, "existing-brain"]);
+    expect(await page.evaluate(() => (window as unknown as { __deviceReviewed: any }).__deviceReviewed.selectionId)).toBeUndefined();
+    await page.getByRole("button", { name: "Measure transfer rates" }).click();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __deviceCalls: any[] }).__deviceCalls.some((value) => value.kind === "topology" && value.input.measure === true))).toBe(true);
+    await page.getByLabel("Allow automatic storage budget increases", { exact: true }).check();
+    await page.screenshot({ path: test.info().outputPath("device-allocation-light-narrow.png"), fullPage: true });
+    expect(errors).toEqual([]);
+  } finally { await application.close(); await rm(data, { recursive: true, force: true }); }
+});

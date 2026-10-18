@@ -240,6 +240,14 @@ for (const arch of ["x64", "arm64"]) {
   );
   validateWorkerSmoke(windows.zip?.rpcSmoke, `Windows ${arch} ZIP worker`, version);
   validateWorkerSmoke(windows.nsis?.rpcSmoke, `Windows ${arch} installed worker`, version);
+  for (const [kind, layout] of [["ZIP", windows.zip], ["NSIS", windows.nsis]]) {
+    const portable = layout?.portableRuntime;
+    requireValue(portable?.portableProtocol === 1 && portable?.runtimeReceiptVerified === true &&
+      portable?.appVersion === version && portable?.sourceCommit === sourceCommit &&
+      portable?.desktopArchitecture === arch && portable?.workerArchitecture === layout.packagedWorkerArchitecture &&
+      portable?.selectedInstanceTested === false && portable?.destinationReservationTested === false && portable?.neuralAcceptanceTested === false,
+    `Windows ${arch} ${kind} lacks commit-bound portable runtime evidence.`);
+  }
   const windowsSigning = windows.signing;
   requireValue(
     typeof windowsSigning?.expectedSigned === "boolean" &&
@@ -269,6 +277,8 @@ for (const arch of ["x64", "arm64"]) {
   platformStatus.windows[arch] = {
     shellArchitecture: arch,
     workerArchitecture: windows.nsis.packagedWorkerArchitecture,
+    portableProtocol: 1,
+    runtimeReceiptVerified: true,
     signing: windowsSigning.state
   };
 

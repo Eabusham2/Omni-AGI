@@ -14,12 +14,15 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from .packed_collective_hooks import packed_derivative_sink
+from .packed_collective_hooks import packed_derivative_sink, packed_row_owner
 from .text_spool import DatasetResourcePause
 from .parameter_diagnostics import packed_diagnostic_write
+from .packed_collective_tiles import PackedColumnCollective
+from .native_core_paging import release_native_tensor_chunk
 
 
 ROW_BLOCK = 32
+CONTACT_BATCH = 128
 
 
 class PackedCollectiveController:
@@ -44,12 +47,22 @@ class PackedCollectiveController:
             CREATE TABLE IF NOT EXISTS rollback (
               owner TEXT, role TEXT, row_start INTEGER, packed BLOB, stability BLOB,
               PRIMARY KEY(owner, role, row_start));
+            CREATE TABLE IF NOT EXISTS parallel_rollback (
+              owner TEXT, role TEXT, row_start INTEGER, sequence INTEGER, payload BLOB,
+              PRIMARY KEY(owner,role,row_start,sequence)) WITHOUT ROWID;
         ''')
+        if "connections" not in {row[1] for row in self.database.execute("PRAGMA table_info(rollback)")}:
+            self.database.execute("ALTER TABLE rollback ADD COLUMN connections BLOB")
+        if "parallel" not in {row[1] for row in self.database.execute("PRAGMA table_info(rollback)")}:
+            self.database.execute("ALTER TABLE rollback ADD COLUMN parallel BLOB")
         self.database.execute("DELETE FROM derivatives")
         self.database.execute("DELETE FROM rollback")
+        self.database.execute("DELETE FROM parallel_rollback")
+        self.column_tiles = PackedColumnCollective(self)
         self.database.commit()
         self.step_id = ""
         self.pending_events = {}
+        self.pending_topology = {}
 
     def _scope(self, owner):
         return owner._packed_residency_scope(self.context.device) if hasattr(owner, "_packed_residency_scope") else nullcontext()
@@ -60,6 +73,9 @@ class PackedCollectiveController:
     def _stability(self, owner, role):
         return getattr(owner, "_row_stability" if role == "weight" else "_bias_row_stability", None)
 
+    def _connections(self, owner, role):
+        return getattr(owner, "_connection_state" if role == "weight" else "_bias_connection_state", None)
+
     def _objects(self, value):
         if not self.context.distributed:
             return [value]
@@ -69,6 +85,16 @@ class PackedCollectiveController:
 
     def identity(self):
         digest = hashlib.sha256()
+        def hash_tensor(value):
+            flat = value.detach().reshape(-1)
+            step = max(1, 4096 // value.element_size())
+            for start in range(0, flat.numel(), step):
+                count = min(step, flat.numel() - start)
+                self.reserve(ram_bytes=count * value.element_size() * 2, disk_bytes=0)
+                try:
+                    digest.update(flat[start:start + count].cpu().contiguous().numpy().tobytes())
+                finally:
+                    release_native_tensor_chunk(value, start * value.element_size(), count * value.element_size())
         for name, owner in sorted(self.owners.items()):
             with self._scope(owner):
                 digest.update(name.encode("utf-8"))
@@ -81,14 +107,27 @@ class PackedCollectiveController:
                     if packed.dtype != torch.uint8 or packed.ndim != 2:
                         raise ValueError("packed collective owner has no authoritative uint8 rows")
                     digest.update(json.dumps([role, list(packed.shape)]).encode("ascii"))
-                    for start in range(0, packed.shape[0], ROW_BLOCK):
-                        digest.update(packed[start:start + ROW_BLOCK].detach().cpu().contiguous().numpy().tobytes())
+                    hash_tensor(packed)
                     stability = self._stability(owner, role)
                     if stability is not None:
                         digest.update(json.dumps([str(stability.dtype), list(stability.shape)]).encode("ascii"))
-                        for start in range(0, stability.numel(), ROW_BLOCK):
-                            digest.update(stability[start:start + ROW_BLOCK].detach().cpu().contiguous().numpy().tobytes())
+                        hash_tensor(stability)
+                    connections = self._connections(owner, role)
+                    if connections is not None:
+                        digest.update(json.dumps(["connections", str(connections.dtype), list(connections.shape)]).encode("ascii"))
+                        hash_tensor(connections)
                 scale = getattr(owner, "_packed_forward_scale", None)
+                pool = getattr(owner, "parallel_connections", None)
+                structure = getattr(pool, "iter_identity_structure", None)
+                if callable(structure):
+                    for item in structure():
+                        digest.update(json.dumps(item, separators=(",", ":")).encode("ascii"))
+                parallel = getattr(owner, "iter_parallel_connection_records", None)
+                if callable(parallel):
+                    for bias in (False, True):
+                        digest.update(b"bias-parallel" if bias else b"weight-parallel")
+                        for record in parallel(bias=bias):
+                            digest.update(json.dumps(record, separators=(",", ":")).encode("ascii"))
                 if scale is not None:
                     digest.update(scale.detach().cpu().contiguous().numpy().tobytes())
         return digest.hexdigest()
@@ -113,6 +152,44 @@ class PackedCollectiveController:
             raise RuntimeError(message)
         return value
 
+    def _contact_batches(self, owner, role, start, rows):
+        iterator = getattr(owner, "iter_parallel_connection_records", None)
+        if not callable(iterator):
+            return
+        batch = []
+        for record in iterator(bias=role == "bias", start=start, end=start + rows):
+            batch.append(record)
+            if len(batch) == CONTACT_BATCH:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def _snapshot_contacts(self, owner, name, role, start, rows):
+        self.reserve(ram_bytes=CONTACT_BATCH * 1024, disk_bytes=0)
+        for sequence, batch in enumerate(self._contact_batches(owner, role, start, rows)):
+            payload = json.dumps(batch, separators=(",", ":")).encode("ascii")
+            self.reserve(ram_bytes=0, disk_bytes=len(payload) + 8192)
+            self.database.execute("INSERT OR IGNORE INTO parallel_rollback VALUES (?,?,?,?,?)",
+                (name, role, start, sequence, payload))
+        self.database.commit()
+
+    def _install_contact_stream(self, owner, role, start, rows):
+        # Only rank zero walks canonical state. Each broadcast is bounded,
+        # including for millions of repeated contacts on one output row.
+        stream = iter(self._contact_batches(owner, role, start, rows)) if self.context.is_rank_zero else None
+        self._phase(lambda: self.reserve(ram_bytes=CONTACT_BATCH * 1024 * (2 + self.context.world_size), disk_bytes=0))
+        while True:
+            batch = self._phase(lambda: next(stream, None) if stream is not None else None)
+            shared = self._objects(batch)[0]
+            if shared is None:
+                break
+            if not self.context.is_rank_zero:
+                self._phase(lambda: owner.install_parallel_connection_records_(shared,
+                    bias=role == "bias", start=start, end=start + rows))
+            else:
+                self._phase(lambda: None)
+
     def begin(self, step_id):
         if self.step_id:
             raise RuntimeError("packed collective step is already active")
@@ -124,13 +201,19 @@ class PackedCollectiveController:
         def clear_scratch():
             self.database.execute("DELETE FROM derivatives")
             self.database.execute("DELETE FROM rollback")
+            self.database.execute("DELETE FROM parallel_rollback")
+            self.column_tiles.clear()
             self.database.commit()
         self._phase(clear_scratch)
         self.step_id = str(step_id)
         self.pending_events = {name: int(getattr(owner, "_pending_stability_events", 0)) for name, owner in self.owners.items()}
+        self.pending_topology = {name: owner.capture_packed_topology_boundary() for name, owner in self.owners.items()
+            if callable(getattr(owner, "capture_packed_topology_boundary", None))}
 
     def stage(self, owner, packed, width, row_start, gradient, rate, scale,
               row_stability, stability_strength):
+        if getattr(owner, "_packed_column_learning", False):
+            return self.stage_tile(owner, packed, width, row_start, 0, gradient, rate, scale, row_stability, stability_strength)
         if not self.step_id or id(owner) not in self.names:
             raise RuntimeError("packed derivative owner is not in the active collective inventory")
         name = self.names[id(owner)]
@@ -167,12 +250,18 @@ class PackedCollectiveController:
         self.database.commit()
         return 0
 
+    def stage_tile(self, owner, packed, width, row_start, column_start, gradient, rate, scale,
+                   row_stability=None, stability_strength=0.):
+        return self.column_tiles.stage(owner, packed, width, row_start, column_start, gradient, rate, scale,
+                                       row_stability, stability_strength)
+
     def commit(self, *, retain_rollback=False):
         if not self.step_id:
             raise RuntimeError("packed collective step is not active")
         last_key = None
         changed_owners = set()
         try:
+            changed_owners.update(self.column_tiles.commit())
             while True:
                 if last_key is None:
                     row = self.database.execute("SELECT owner,role,row_start,width,rows,rate,scale,strength FROM derivatives ORDER BY owner,role,row_start LIMIT 1").fetchone()
@@ -204,30 +293,39 @@ class PackedCollectiveController:
                         scopes.enter_context(self._scope(owner))
                         packed = self._buffer(owner, role)
                         stability = self._stability(owner, role)
+                        connections = self._connections(owner, role)
                         if packed is None or packed.dtype != torch.uint8 or packed.ndim != 2 or start + rows > packed.shape[0] or (width + 3) // 4 != packed.shape[1]:
                             raise ValueError("collective packed topology changed during backward")
                         if stability is not None and (stability.dtype != torch.uint8 or stability.ndim != 1 or stability.numel() != packed.shape[0]):
                             raise ValueError("collective row-resistance topology changed during backward")
-                        self.reserve(ram_bytes=rows * packed.shape[1] * 3 + rows * 3,
-                                     disk_bytes=rows * packed.shape[1] + rows + 4096)
-                        self.database.execute("INSERT OR IGNORE INTO rollback VALUES (?,?,?,?,?)", (
+                        if connections is not None and (connections.dtype != torch.uint8 or tuple(connections.shape) != (packed.shape[0], width)):
+                            raise ValueError("collective connection state topology changed during backward")
+                        self.reserve(ram_bytes=rows * (packed.shape[1] + (width if connections is not None else 0)) * 3 + rows * 3,
+                                     disk_bytes=rows * (packed.shape[1] + (width if connections is not None else 0)) + rows + 4096)
+                        self.database.execute("INSERT OR IGNORE INTO rollback VALUES (?,?,?,?,?,?,?)", (
                             name, role, start, packed[start:start + rows].detach().cpu().contiguous().numpy().tobytes(),
-                            stability[start:start + rows].detach().cpu().numpy().tobytes() if stability is not None else None))
+                            stability[start:start + rows].detach().cpu().numpy().tobytes() if stability is not None else None,
+                            connections[start:start + rows].detach().cpu().contiguous().numpy().tobytes() if connections is not None else None,
+                            None))
                         self.database.commit()
-                        return packed, stability, packed[start:start + rows].to(device).clone(), (
-                            stability[start:start + rows].to(device).clone() if stability is not None else None)
-                    packed, stability, block, stable_block = self._phase(prepare_owner)
+                        self._snapshot_contacts(owner, name, role, start, rows)
+                        return packed, stability, connections, packed[start:start + rows].to(device).clone(), (
+                            stability[start:start + rows].to(device).clone() if stability is not None else None), (
+                            connections[start:start + rows].to(device).clone() if connections is not None else None)
+                    packed, stability, connections, block, stable_block, connection_block = self._phase(prepare_owner)
                     def canonical_update():
                         if self.context.is_rank_zero:
                             seed = int.from_bytes(hashlib.sha256((self.step_id + "\0" + json.dumps(key)).encode()).digest()[:8], "little") % (1 << 63)
                             generator = torch.Generator(device=packed.device).manual_seed(seed)
-                            with packed_derivative_sink(None):
+                            with packed_derivative_sink(None), packed_row_owner(owner):
                                 changed = self.apply_rows(packed, width, start, gradient.to(packed.device), rate,
                                     torch.tensor(scale_value, device=packed.device), generator,
                                     stability, strength)
                             block.copy_(packed[start:start + rows].to(device))
                             if stable_block is not None:
                                 stable_block.copy_(stability[start:start + rows].to(device))
+                            if connection_block is not None:
+                                connection_block.copy_(connections[start:start + rows].to(device))
                             return int(changed)
                         return 0
                     changed = self._phase(canonical_update)
@@ -236,14 +334,21 @@ class PackedCollectiveController:
                         dist.broadcast(block, src=0)
                         if stability is not None:
                             dist.broadcast(stable_block, src=0)
+                        if connections is not None:
+                            dist.broadcast(connection_block, src=0)
                     def install_rows():
                         replacement = block.to(packed.device)
                         with packed_diagnostic_write(owner, packed, replacement, start=start * packed.shape[1]):
                             packed[start:start + rows].copy_(replacement)
                         if stability is not None:
                             stability[start:start + rows].copy_(stable_block.to(stability.device))
+                        if connections is not None:
+                            replacement = connection_block.to(connections.device)
+                            with packed_diagnostic_write(owner, connections, replacement, start=start * width):
+                                connections[start:start + rows].copy_(replacement)
                         setattr(owner, "_packed_validated_version" if role == "weight" else "_bias_validated_version", int(packed._version))
                     self._phase(install_rows)
+                    self._install_contact_stream(owner, role, start, rows)
                     self._phase(scopes.close)
                 if any(changed_values):
                     changed_owners.add(name)
@@ -262,7 +367,8 @@ class PackedCollectiveController:
             raise
 
     def rollback(self):
-        for name, role, start, packed_bytes, stable_bytes in self.database.execute("SELECT owner,role,row_start,packed,stability FROM rollback ORDER BY owner,role,row_start"):
+        self.column_tiles.rollback()
+        for name, role, start, packed_bytes, stable_bytes, connection_bytes, parallel_bytes in self.database.execute("SELECT owner,role,row_start,packed,stability,connections,parallel FROM rollback ORDER BY owner,role,row_start"):
             owner = self.owners[name]
             with self._scope(owner):
                 packed = self._buffer(owner, role)
@@ -273,21 +379,38 @@ class PackedCollectiveController:
                 stability = self._stability(owner, role)
                 if stable_bytes is not None:
                     stability[start:start + rows].copy_(torch.frombuffer(bytearray(stable_bytes), dtype=torch.uint8).to(stability.device))
+                if connection_bytes is not None:
+                    connections = self._connections(owner, role)
+                    replacement = torch.frombuffer(bytearray(connection_bytes), dtype=torch.uint8).reshape(rows, connections.shape[1]).to(connections.device)
+                    with packed_diagnostic_write(owner, connections, replacement, start=start * connections.shape[1]):
+                        connections[start:start + rows].copy_(replacement)
+                if parallel_bytes is not None:
+                    owner.restore_parallel_connections_(json.loads(parallel_bytes), bias=role == "bias", start=start, end=start + rows)
+                for (payload,) in self.database.execute("SELECT payload FROM parallel_rollback WHERE owner=? AND role=? AND row_start=? ORDER BY sequence", (name, role, start)):
+                    owner.install_parallel_connection_records_(json.loads(payload), bias=role == "bias", start=start, end=start + rows)
                 setattr(owner, "_packed_validated_version" if role == "weight" else "_bias_validated_version", int(packed._version))
+        for owner, boundary in self.pending_topology.values():
+            owner.restore_topology_boundary(boundary)
         self.database.execute("DELETE FROM derivatives")
         self.database.execute("DELETE FROM rollback")
+        self.database.execute("DELETE FROM parallel_rollback")
+        self.column_tiles.clear()
         self.database.commit()
         self.step_id = ""
         for name, count in self.pending_events.items():
             self.owners[name]._pending_stability_events = count
         self.pending_events = {}
+        self.pending_topology = {}
 
     def finalize(self):
         self.database.execute("DELETE FROM derivatives")
         self.database.execute("DELETE FROM rollback")
+        self.database.execute("DELETE FROM parallel_rollback")
+        self.column_tiles.clear()
         self.database.commit()
         self.step_id = ""
         self.pending_events = {}
+        self.pending_topology = {}
 
     def close(self):
         self.database.close()

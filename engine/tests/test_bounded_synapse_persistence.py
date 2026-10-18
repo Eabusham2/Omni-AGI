@@ -33,6 +33,7 @@ class BoundedSynapsePersistenceTests(unittest.TestCase):
             neurons={"a": {"region": "semantic"}, "b": {"region": "semantic"}},
             state_revision=0,
             growth_guard=None,
+            _weighted_migration_groups=lambda: {"neurons": set(), "synapses": set()},
         )
 
     def _callbacks(self):

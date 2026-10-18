@@ -16,7 +16,8 @@ describe("BrainMap cortical viewer source contracts (no UI/brain run)", () => {
     expect(viewer).toContain('data-trit={element.value}');
     expect(viewer).toContain("firing map");
     const app = source("../src/renderer/src/App.tsx");
-    expect(app).toContain("Packed cortical model");
+    expect(app).toContain('import { WholeBrainMap } from "./WholeBrainMap"');
+    expect(app).toContain("return <WholeBrainMap brainId={brain.id}");
     expect(app).not.toContain("activation: assembly.confidence");
     expect(app).toContain("assembly.activationObserved === true");
   });

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   chatActionSearchActivity,
+  chatActionMcpAppViewId,
   chatActionStateLabel,
   chatActionTitle,
   cleanChatActionStatus
 } from "../src/renderer/src/chatActionPresentation";
-import type { StructuredAction } from "../src/shared/types";
+import type { ActionEvent, StructuredAction } from "../src/shared/types";
 
 const ponder: StructuredAction = {
   kind: "ponder",
@@ -16,6 +17,37 @@ const ponder: StructuredAction = {
 };
 
 describe("plain chat action presentation", () => {
+  const connectedApp = (): ActionEvent => ({ id: "action", brainId: "brain", state: "complete", createdAt: "2026-10-11T00:00:00Z", updatedAt: "2026-10-11T00:00:00Z",
+    action: { kind: "tool", source: "brain", toolId: "mcp.server.fixture.hash", action: "call", arguments: {} },
+    execution: { id: "execution", toolId: "mcp.server.fixture.hash", action: "call", state: "complete", startedAt: "2026-10-11T00:00:00Z",
+      output: { _meta: { "omni/mcpApp": { id: "opaque-view-id", brainId: "brain", toolId: "mcp.server.fixture.hash", untrusted: true } } } } });
+  it("shows only a matching completed MCP app hint and leaves authority to main-owned lookup", () => {
+    const event = connectedApp(); expect(chatActionMcpAppViewId(event)).toBe("opaque-view-id");
+    expect(chatActionMcpAppViewId({ ...event, state: "running" })).toBeUndefined();
+    expect(chatActionMcpAppViewId({ ...event, execution: { ...event.execution!, state: "failed" } })).toBeUndefined();
+    expect(chatActionMcpAppViewId({ ...event, execution: { ...event.execution!, toolId: "different-tool" } })).toBeUndefined();
+    expect(chatActionMcpAppViewId({ ...event, brainId: "other" })).toBeUndefined();
+  });
+  it("does not treat malformed metadata, arbitrary URLs or a model's proposed action as a view", () => {
+    const event = connectedApp();
+    for (const descriptor of [null, [], { id: "https://untrusted.example/", brainId: "brain", toolId: event.action.toolId, untrusted: true },
+      { id: "opaque", brainId: "brain", toolId: "different-tool", untrusted: true }, { id: "opaque", brainId: "brain", toolId: event.action.toolId, untrusted: false }]) {
+      expect(chatActionMcpAppViewId({ ...event, execution: { ...event.execution!, output: { _meta: { "omni/mcpApp": descriptor } } } })).toBeUndefined();
+    }
+    expect(chatActionMcpAppViewId({ ...event, state: "proposed", execution: undefined })).toBeUndefined();
+  });
+  it("prefers a verified saved-artifact owner projection without rewriting the original result", () => {
+    const event = connectedApp();
+    const original = JSON.stringify(event.execution);
+    const copied: ActionEvent = { ...event, brainId: "copy", mcpAppView: { id: "copied-view", brainId: "copy", serverId: "server", serverLabel: "Fixture",
+      resourceUri: "ui://fixture/editor", toolId: event.action.toolId!, remoteToolName: "editor", observedAt: event.createdAt,
+      untrusted: true, savedArtifact: true, artifactSha256: "a".repeat(64), needsMappingReview: true,
+      originalSource: { brainId: "brain", serverId: "server", serverLabel: "Original fixture", endpoint: "https://fixture.invalid/mcp" } } };
+    expect(chatActionMcpAppViewId(copied)).toBe("copied-view");
+    expect(JSON.stringify(copied.execution)).toBe(original);
+    expect(chatActionMcpAppViewId({ ...copied, mcpAppView: { ...copied.mcpAppView!, brainId: "other" } })).toBeUndefined();
+    expect(chatActionMcpAppViewId({ ...copied, mcpAppView: { ...copied.mcpAppView!, artifactSha256: "not-a-hash" } })).toBeUndefined();
+  });
   it("never exposes legacy ponder or creativity protocol strings", () => {
     expect(chatActionTitle(ponder)).toBe("Pondering");
     expect(cleanChatActionStatus("ponder.ponder: running.", ponder)).toBe(

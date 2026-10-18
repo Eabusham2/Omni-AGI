@@ -51,7 +51,7 @@ export function verifyReleaseTagBinding(tag, { cwd = process.cwd() } = {}) {
   if (tagged !== current) {
     throw new Error(
       `Release tag ${tag} already points to ${tagged}, not current commit ${current}. ` +
-        "Use a new stable-v1 patch version; do not move or reuse an immutable tag."
+        "Use a new stable release version; do not move or reuse an immutable tag."
     );
   }
   return { state: "current", tag, commit: current };

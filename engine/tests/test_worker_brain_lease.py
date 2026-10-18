@@ -30,7 +30,7 @@ class WorkerBrainLeaseTests(unittest.TestCase):
                     mock.patch.object(worker, "_prune_verified_abandoned_live_caches"),
                     mock.patch("worker.AdaptiveBrain.load", return_value=fake_brain) as load,
                 ):
-                    self.assertIs(worker._get(params), fake_brain)
+                    self.assertIs(worker._get(params, allow_load=True), fake_brain)
                     lease = worker._brain_leases["brain-a"]
                     lease.assert_exclusive()
                     self.assertIs(worker._get(params), fake_brain)

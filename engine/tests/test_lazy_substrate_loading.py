@@ -29,6 +29,56 @@ class LazySubstrateLoadingTests(unittest.TestCase):
         memory.save_sharded(root, records_per_shard=3)
         return memory, memory.metadata(include_records=False)
 
+    def test_attention_membership_reads_each_shard_once_and_preserves_overlays(self):
+        with tempfile.TemporaryDirectory(prefix="omni-attention-membership-") as folder:
+            store = Path(folder) / "substrate"
+            original, metadata = self.saved_memory(store)
+            lazy = NeuralSubstrate.load_sharded(store, metadata, lazy_synapses=True)
+            identifiers = sorted(original.synapses)
+            removed, edited = identifiers[:2]
+            del lazy.synapses[removed]
+            record = dict(lazy.synapses[edited])
+            record["uses"] += 1
+            lazy.synapses[edited] = record
+            new_id = edited + "-additional-contact"
+            lazy.synapses[new_id] = {**record, "id": new_id}
+            lazy.synapses._cache.clear()
+            lazy.synapses._locations.clear()
+            reserve = mock.Mock(return_value=True)
+            expected = set(identifiers) - {removed} | {new_id}
+            with mock.patch.object(lazy.synapses, "_read_shard", wraps=lazy.synapses._read_shard) as read:
+                actual = lazy.synapses.contains_many([*identifiers, new_id, "missing", new_id], memory_reserve=reserve)
+            self.assertEqual(actual, expected)
+            self.assertEqual(read.call_count, len({call.args[0] for call in read.call_args_list}))
+            self.assertLessEqual(read.call_count, len(lazy.synapses._ordered_keys))
+            self.assertGreater(reserve.call_args.args[0], len(identifiers) * 96)
+            overlay = {"format": "omni-substrate-attention-overlay", "formatVersion": 1,
+                "epoch": 0, "legacyRawActive": True, "activeNeuronIds": [],
+                "recalledAssemblyIds": [], "eligibleSynapseIds": sorted(expected)}
+            lazy.configure_attention_overlay(0, overlay)
+            self.assertEqual(lazy.attention_eligible_synapse_ids, expected)
+            with self.assertRaisesRegex(ValueError, "ids are invalid"):
+                lazy.configure_attention_overlay(0, {**overlay, "eligibleSynapseIds": [removed]})
+
+    def test_bulk_membership_keeps_checksum_and_ram_admission_checks(self):
+        with tempfile.TemporaryDirectory(prefix="omni-attention-integrity-") as folder:
+            store = Path(folder) / "substrate"
+            original, metadata = self.saved_memory(store)
+            lazy = NeuralSubstrate.load_sharded(store, metadata, lazy_synapses=True)
+            identifiers = sorted(original.synapses)
+            with mock.patch.object(lazy.synapses, "_read_shard", wraps=lazy.synapses._read_shard) as read:
+                with self.assertRaisesRegex(RuntimeError, "resource reserve"):
+                    lazy.synapses.contains_many(identifiers, memory_reserve=lambda *_: False)
+                read.assert_not_called()
+            key = lazy.synapses._ordered_keys[0]
+            path = store / lazy.synapses._descriptors[key]["records"]["path"]
+            path.write_bytes(b"corrupt")
+            lazy.synapses._cache.clear()
+            lazy.synapses._locations.clear()
+            lazy.synapses._verified_shards.clear()
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                lazy.synapses.contains_many(identifiers)
+
     def test_hot_first_load_preserves_exact_recall_without_resident_cold_dicts(self):
         with tempfile.TemporaryDirectory(prefix="omni-lazy-substrate-") as folder:
             store = Path(folder) / "substrate"
@@ -300,7 +350,7 @@ class LazySubstrateLoadingTests(unittest.TestCase):
             self.assertEqual(lazy.synapses.resident_record_count, 0)
             self.assertEqual(len(lazy.synapses), len(memory.synapses))
 
-    def test_forward_index_publication_groups_hot_locations_in_one_pass(self):
+    def test_forward_index_publication_reuses_bounded_groups_without_scanning_hot_locations(self):
         with tempfile.TemporaryDirectory(prefix="omni-forward-linear-") as folder:
             store = Path(folder) / "substrate"
             _memory, metadata = self.saved_memory(store)
@@ -328,18 +378,19 @@ class LazySubstrateLoadingTests(unittest.TestCase):
 
             locations = CountingLocations(lazy.synapses._hot_locations)
             lazy.synapses._hot_locations = locations
-            entries = lazy.synapses.forward_index_entries(
-                descriptors,
-                {},
-                {
-                    str(record.get("id", ""))
-                    for record in lazy.assemblies
-                    if record.get("id")
-                },
-            )
+            with mock.patch.object(lazy.synapses, "_group_records", side_effect=AssertionError("unchanged indexed groups must stay cold")):
+                entries = list(lazy.synapses.forward_index_entries(
+                    descriptors,
+                    {},
+                    {
+                        str(record.get("id", ""))
+                        for record in lazy.assemblies
+                        if record.get("id")
+                    },
+                ))
 
             self.assertEqual(len(entries), len(descriptors))
-            self.assertEqual(locations.items_calls, 1)
+            self.assertEqual(locations.items_calls, 0)
 
     def test_lazy_load_still_rejects_a_corrupt_cold_shard(self):
         with tempfile.TemporaryDirectory(prefix="omni-lazy-integrity-") as folder:

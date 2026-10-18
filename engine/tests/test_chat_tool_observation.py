@@ -2,6 +2,7 @@
 import hashlib
 import json
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -96,6 +97,44 @@ class ChatToolObservationTests(unittest.TestCase):
     def test_stop_or_timeout_never_manufactures_result_data(self):
         self.assertEqual(self.inbox(cancelled=lambda: True, wait_seconds=1000).wait_pending(), [])
         self.assertEqual(self.inbox(wait_seconds=0).wait_pending(), [])
+
+    def test_nested_writer_compute_does_not_spend_the_external_result_wait_budget(self):
+        # No model. The private writer callback intentionally lasts longer
+        # than the external wait allowance; its result arrives just afterwards.
+        inbox = self.inbox(wait_seconds=.015)
+        invoked = []
+        def service():
+            if not invoked:
+                invoked.append(True)
+                time.sleep(.025)
+                timer = threading.Timer(.002, lambda: inbox.offer(observation()))
+                timer.start()
+        inbox.service_pending = service
+        self.assertEqual(inbox.wait_pending(), [observation()])
+
+    def test_suspended_consumed_and_pending_evidence_preserve_exact_seen_receipts(self):
+        inbox = self.inbox(wait_seconds=0)
+        first = observation("already consumed")
+        self.assertTrue(inbox.offer(first)["accepted"])
+        inbox.drain()
+        second = observation("not yet consumed")
+        self.assertTrue(inbox.offer(second)["accepted"])
+        saved = inbox.suspension_state()
+        inbox.close()
+        restored = ChatToolObservationInbox.from_suspension_state(saved, "brain", "turn", lambda _size: True)
+        self.assertTrue(restored.offer(first)["duplicate"])
+        self.assertTrue(restored.offer(second)["duplicate"])
+        self.assertEqual(restored.drain(), [second])
+        self.assertEqual(set(restored.receipts), {first["observationId"], second["observationId"]})
+        restored.close()
+
+    def test_suspension_rejects_a_missing_consumed_effect_receipt(self):
+        inbox = self.inbox(wait_seconds=0)
+        inbox.offer(observation())
+        saved = inbox.suspension_state()
+        saved["receipts"] = {}
+        with self.assertRaisesRegex(ValueError, "suspension ownership"):
+            ChatToolObservationInbox.from_suspension_state(saved, "brain", "turn", lambda _size: True)
 
     def test_live_conditioning_is_applied_before_forward_and_eos_not_just_queued(self):
         fixture = ScriptedTokenLoop(lambda _step, _bias: 2)

@@ -1,0 +1,21 @@
+{
+  "format": "omni-paged-read-io-comparison",
+  "version": 1,
+  "componentOnly": true,
+  "brainConstructed": false,
+  "edgesPerTraversal": 384,
+  "pairedRepetitions": 3,
+  "milliseconds": {
+    "original": [2356.205667, 2949.679875, 3264.005292],
+    "keeper": [676.034041, 228.008667, 264.254]
+  },
+  "medianMilliseconds": {"original": 2949.679875, "keeper": 264.254},
+  "speedRatio": 11.162290353220763,
+  "exactOrderedGraphSha256": "e90b5db87e24e8fa3ff4c6292959475eef67bc2e962c0b0347df78693f340b07",
+  "keeperConnectionsPerTraversal": [1, 1, 1],
+  "keeperCacheRamEnvelopeBytes": 327680,
+  "wholeProcessRssMeasured": false,
+  "modelLoadSpeedClaim": false,
+  "ordering": "three alternating original-keeper pairs",
+  "scope": "actual PagedRecallGraph.load with PagedNeuronMetadata endpoint validation; no model, curriculum, user data or CI"
+}

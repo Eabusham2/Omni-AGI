@@ -239,6 +239,8 @@ describe("project integrity", () => {
     const voiceTypes = read("src/shared/liveVoice.ts");
     const voice = read("src/renderer/src/liveVoiceController.ts");
     const renderer = read("src/renderer/src/App.tsx");
+    const routes = read("src/renderer/src/VoiceRoutingControls.tsx");
+    const submit = read("src/renderer/src/ComposerSubmitControl.tsx");
     const controller = read("src/main/chatActionController.ts");
 
     expect(voiceTypes).toContain('LiveVoiceDeliveryMode = "live" | "buffered"');
@@ -246,17 +248,23 @@ describe("project integrity", () => {
     expect(voice).toContain("maxLiveSpeechQueue");
     expect(voice).toContain("skippedCharacters");
     expect(voice).toContain("LIVE_VOICE_PACE_RATES");
-    expect(renderer).toContain("Neural listening");
-    expect(renderer).toContain("Own neural voice");
-    expect(renderer).toContain("platform STT + TTS");
+    expect(renderer).toContain("<VoiceRoutingControls");
+    expect(renderer).toContain("useInstanceVoice");
+    expect(renderer).toContain("instanceVoice.prepareCall()");
+    expect(routes).toContain("This brain’s raw audio input");
+    expect(routes).toContain("This brain’s audio output");
+    expect(routes).toContain("platform speech through 200B");
     expect(types).toContain('kind: "steer"');
     expect(types).toContain("replacesTurnId");
     expect(controller).toContain("turnMetadata");
-    expect(renderer).toContain("Ctrl/Cmd Enter steers");
     expect(renderer).toContain('kind: "steer"');
-    expect(renderer).toContain('className="composer__steer-choice"');
-    expect(renderer).toContain('className="send-button composer__queue-choice"');
-    expect(renderer).toContain("the prior request remains visible and the loaded mind stays warm");
+    expect(renderer).toContain("<ComposerSubmitControl");
+    expect(submit).toContain('const label = active ? steering ? "Steer" : "Queue" : "Send"');
+    expect(submit).toContain("event.ctrlKey || event.metaKey");
+    const steer = renderer.slice(renderer.indexOf("const steerCurrentTurn ="), renderer.indexOf("const queueCurrentTurn ="));
+    expect(steer).toContain("retainUncommittedChatOutput");
+    expect(steer).not.toContain("chat.cancel");
+    expect(renderer).not.toContain('className="composer__steer-choice"');
     expect(renderer).not.toContain("[Steer]");
   });
 
@@ -423,7 +431,7 @@ describe("project integrity", () => {
     );
   });
 
-  it("defines the stable v1 release across Windows, macOS, and Linux", () => {
+  it("defines the stable v2 release across Windows, macOS, and Linux", () => {
     const packageDocument = readJson<{
       version: string;
       description: string;
@@ -445,7 +453,7 @@ describe("project integrity", () => {
     const linux = read(".github/workflows/linux.yml");
     const release = read(".github/workflows/release.yml");
 
-    expect(packageDocument.version).toMatch(/^1\.1\.\d+$/);
+    expect(packageDocument.version).toMatch(/^2\.\d+\.\d+$/);
     expect(packageLock.version).toBe(packageDocument.version);
     expect(packageLock.packages[""]?.version).toBe(packageDocument.version);
     expect(packageDocument.description).toContain("cross-platform");

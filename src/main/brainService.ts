@@ -2,12 +2,28 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { createReadStream, existsSync } from "node:fs";
 import { normalizeConceptIdView } from "../shared/conceptIdView";
+import { chatTurnKey } from "../shared/chatTurnKey";
+import { completedInheritedTurn, type InheritedInputAlias } from "./inheritedChatReconciliation";
 import { chatInputCapacity, cleanChatInput } from "../shared/chatInput";
+import { checkedChatInputProvenance, type ChatInputProvenance, type NativeAppChatInput } from "../shared/chatInputProvenance";
+import { normalizeCognitionProgress } from "../shared/cognition";
+import { normalizePonderSelfReportDelta, validatePonderSelfReport,
+  type PonderSelfReport } from "../shared/ponderSelfReport";
+import { nativeMediaTimeline } from "../shared/nativeMediaTimeline";
+import { apiTeacherMediaFiles, checkedApiTeacherMediaCoverage, validateApiTeacherMediaLesson,
+  verifyApiTeacherMediaFile } from "./apiTeacherMedia";
+import type { ApiTeacherMediaLesson, ApiTeacherMediaCoverage, ApiTeacherMediaKind } from "../shared/apiTeacherMedia";
 import type { TemporarySteeringContext } from "./temporarySteeringContext";
-import { createChatToolObservation, type ChatToolObservationReceipt } from "./chatToolObservation";
+import { createChatToolObservation, type ChatToolObservation, type ChatToolObservationReceipt } from "./chatToolObservation";
+import { readWebImageActionEvidence } from "./webImageService";
+import type { WebImageSelection } from "../shared/webImages";
 import { CompletedActionEvidenceStore, actionEvidenceFileHash, validateActionEvidenceReceipt,
   type CompletedActionEvidenceJob, type CompletedActionEvidenceReceipt } from "./completedActionEvidence";
 import { receivedChatInput, receivedChatInputFromLedger } from "./chatInputReceipt";
+import { expectedChatInputHash, observedChatInputHash, nativeAudioMessageSource, verifiedNativeAudioInput, verifiedNativeAudioReceipt } from "./nativeAudioIdentity";
+import type { NativeAudioInput } from "../shared/nativeAudioChat";
+import { nativeAudioMessageInfo } from "../shared/nativeAudioChat";
+import type { NativeAudioCaptureLeaseRequest } from "./nativeAudioChat";
 import {
   lstat,
   mkdir,
@@ -27,10 +43,16 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import { performance } from "node:perf_hooks";
 import { EventEmitter } from "node:events";
 import { cleanupCancelledInlineStage } from "./inlineCancellationCleanup";
+import { InstanceLifecycleController } from "./instanceLifecycleController";
+import { InstanceContinuationDetachedError } from "./instanceContinuationDetached";
+import type { NativeTurnStatus } from "./nativeTurnStatus";
+import type { InstanceLifecycleState, InstanceResumeFrontier } from "../shared/instanceLifecycle";
+import type { InstanceLoadFit, InstanceResumeAttachment, NativeInstanceStatus, NativeInheritedPresentation } from "../shared/instanceLifecycleApi";
 import { savedRuntimeShape } from "./savedRuntimeShape";
 import { getHeapStatistics } from "node:v8";
 import { DatabaseSync } from "node:sqlite";
 import toolCatalog from "../../tools/catalog.json";
+import { describeRegisteredTools } from "./toolDescriptions";
 import type {
   ActionEvent,
   AgentMergeFilePreview,
@@ -97,6 +119,8 @@ import type {
   WorkingMemoryResourcePlan
 } from "../shared/types";
 import type { CortexPage, CortexQuery, CortexActivityQuery, CortexActivity } from "../shared/cortexInspection";
+import type { RouterSpikeActivity, RouterSpikeQuery } from "../shared/routerActivity";
+import { checkedRouterSpikeActivity, validateRouterSpikeQuery } from "./routerSpikeProtocol";
 import { INLINE_MEDIA_DATA_URL_CHARACTER_LIMIT } from "../shared/mediaTransport";
 import { recordNeuralChat } from "./presentationChat";
 import {
@@ -106,10 +130,47 @@ import {
   stageModalityPack,
   validateBuildRecipe
 } from "./catalogInstaller";
-import { BrainRepository, DEFAULT_TOOL_PERMISSIONS } from "./brainRepository";
+import { BrainRepository, DEFAULT_TOOL_PERMISSIONS, assertNativeOmniEngineState } from "./brainRepository";
+import { FullBrainMergeCoordinator } from "./fullBrainMerge";
+import type { FullMergeProgress, FullMergeStartRequest, FullMergePendingIngestion, FullMergeResumeIngestionRequest } from "../shared/fullMerge";
+import { adoptFullMergeHostState, fullMergeHistory, mergeCanonical, sealFullMergeParent, validateFullMergeReview, verifyConnectedNativeOrigin } from "./fullMergeHost";
+import { adoptFullMergeActionEvidence } from "./fullMergeActionEvidence";
+import { adoptFullMergeLearningWorkspace } from "./fullMergeLearningWorkspace";
+import { adoptFullMergeMcpApps } from "./fullMergeMcpApps";
 import type { SharedRamSelection, SharedResourceRegistry } from "./sharedResourceRegistry";
 import { withBrainWrite } from "./brainWriteCoordinator";
-import { acquireCrawlSourceLease, releaseCrawlSourceLease } from "./crawlSourceLease";
+import { acquireCrawlSourceLease, releaseCrawlSourceLease, type CrawlSourceLease } from "./crawlSourceLease";
+import { decideWebSource, guardLeasedWebSource, makeWebLearningPolicy, normalizeLearningUrl, publicationFromHtml,
+  webUrlWithinScope, WebScopeExclusion, type WebCrawlControl, type WebIngestContext } from "./webLearningPolicy";
+import type { WebLearningPolicy, WebSourceProvenance } from "../shared/learning";
+import { admittedExperienceLearning, type AdmittedExperienceLearningReceipt } from "./admittedExperienceLearning";
+import { declaredLearningCapabilityPack, type DeclaredCapabilityPack } from "./learningCapabilityPack";
+import { declaredClockCapabilityPack } from "./clockCapabilityPack";
+import { declaredAutomationCapabilityPack } from "./automationCapabilityPack";
+import { declaredMapCapabilityPack } from "./mapCapabilityPack";
+import { declaredMapBasemapCapabilityPack } from "./mapBasemapCapabilityPack";
+import { declaredAssemblyCapabilityPack } from "./assemblyCapabilityPack";
+import { declaredEnvironmentCapabilityPack } from "./environmentCapabilityPack";
+import { declaredClipboardCapabilityPack } from "./clipboardCapabilityPack";
+import { declaredWebImageCapabilityPack } from "./webImageCapabilityPack";
+import { declaredFileCapabilityPack } from "./fileCapabilityPack";
+import {
+  declaredDocumentationCurriculumPack,
+  type DocumentationCurriculumPack,
+  type DocumentationCurriculumReceipt
+} from "./documentationCurriculumPack";
+import type { LearningTask } from "../shared/learning";
+import { validPluginTrainingFormatSelection, type PluginParserExecutionProvenance, type PluginPreparedTrainingSource, type PluginTrainingFormatLease, type PluginTrainingFormatResolver } from "../shared/plugins";
+import { normalizeSourceMediaType } from "../shared/sourceMediaType";
+import { observeLocalSourceMediaType } from "./sourceMediaType";
+import type { ChatTaskAttachmentHandle, ChatTaskAttachmentResolved } from "../shared/taskAttachments";
+import type { TaskAttachmentService } from "./taskAttachmentService";
+import type { TaskContinuationAttachments, TaskAttachmentVisibleReference } from "./taskContinuationAttachments";
+import { verifiedTaskContinuationResume } from "./taskContinuationResume";
+import type { InheritedTaskFileNativeContext } from "./inheritedTaskFileClosure";
+import { connectedExecutionEntries } from "./connectedExecutionPortability";
+import { projectTaskAttachmentIds } from "./taskAttachmentProjection";
+import { openLearningRelocations, type LearningSourceRelocation } from "./learningSourceRelocation";
 import {
   BackgroundRequestDeferredError,
   ENGINE_REQUEST_NO_DEADLINE,
@@ -120,7 +181,7 @@ import {
 } from "./engineSupervisor";
 import { normalizeStructuredAction, parseModelActions } from "./actionProtocol";
 import { ResourcePlanner } from "./resourcePlanner";
-import { calculateDiskSpaceReport } from "./diskSpace";
+import { calculateDiskSpaceReport, requireDiskWrite } from "./diskSpace";
 import type { InitialFoundationPlan } from "./buildInitializationPlan";
 import type { MediaArtifactRegistry } from "./mediaArtifactRegistry";
 import type { BrainStorageOperationHooks } from "./brainStorageOperations";
@@ -132,6 +193,7 @@ import {
 } from "./mergeEvidenceStore";
 import {
   assertManifestEntryStable,
+  assertPluginManifestSourceStable,
   CrawlFrontierStore,
   DatasetManifestStore,
   detectDatasetFormat,
@@ -176,10 +238,23 @@ const CRAWL_DISK_RESERVE_MINIMUM = 512 * 1024 * 1024;
 const CRAWL_DIAGNOSTIC_WINDOW = 32;
 const CRAWL_USER_AGENT = "OmniAGIStudio/1.0 (+local research crawler)";
 const TOOL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
+  "system.time": ["now"],
+  "studio.stopwatch": ["start", "status", "list", "laps", "lap", "pause", "resume", "reset", "performance"],
+  "studio.schedule": ["create", "status", "list", "occurrences", "occurrence", "edit", "pause", "resume", "resume-occurrence", "cancel", "signal"],
+  "studio.automation": ["list", "status", "export", "runs", "steps", "current-step", "save", "activate", "disable", "run", "pause", "resume", "stop", "approve", "review"],
+  "data.learn": ["start", "status", "pause", "resume", "stop", "steer"],
+  "data.distill-local": ["selections", "plan", "start", "list", "status", "items", "pause", "resume", "stop"],
+  "data.fact-check": ["start", "status", "record", "pause", "resume", "stop", "steer"],
   "system.files": ["list", "read", "write"],
+  "studio.clipboard": ["capabilities", "read", "write", "clear"],
+  "system.clipboard": ["capabilities", "read", "write", "clear"],
+  "system.memory": ["capabilities", "attach", "regions", "read", "write", "detach"],
   "system.shell": ["run"],
   "code.execute": ["run"],
-  "web.fetch": ["fetch"],
+  "runtime.sandbox": ["capabilities", "create", "list", "status", "load", "run", "stop"],
+  "runtime.vm": ["capabilities", "create", "list", "status", "load", "run", "stop"],
+  "code.assembly": ["inspect", "compile", "run"],
+  "web.fetch": ["fetch", "inspect-image"],
   "web.search": ["search"],
   "browser.automation": ["task"],
   "device.input": ["move-pointer", "click", "scroll", "key-press", "text"],
@@ -280,6 +355,12 @@ function canonicalToolPermissionId(toolId: string): string {
  */
 const LOCAL_STUDIO_SCHEMAS = [
   {
+    id: "studio.question",
+    actions: ["ask", "status"] as const,
+    grant: "auto" as const,
+    actionInputSchemas: CATALOG_ACTION_INPUT_SCHEMAS.get("studio.question")!
+  },
+  {
     id: "studio.ui",
     actions: ["open-creativity"] as const,
     grant: "auto" as const
@@ -295,9 +376,9 @@ function effectiveToolPermissions(
   records: ToolPermissionRecord[] | undefined
 ): ToolPermissionRecord[] {
   const stored = new Map<string, ToolPermissionRecord>();
-  // A current system.* record wins over its legacy alias. Otherwise migrate
-  // the old grant in memory so imported brains keep authority without showing
-  // Windows-only protocols on macOS/Linux.
+  // A current system.* record wins over its legacy alias. Otherwise project a
+  // locally managed legacy grant without showing Windows-only protocols on
+  // macOS/Linux. External imports are reset at their authority boundary.
   for (const record of records ?? []) {
     if (canonicalToolPermissionId(record.toolId) !== record.toolId) continue;
     stored.set(record.toolId, record);
@@ -331,6 +412,7 @@ export interface ExternalToolSchema {
   id: string;
   actions: readonly string[];
   inputSchema?: Record<string, unknown>;
+  actionInputSchemas?: Record<string, Record<string, unknown>>;
 }
 
 function enabledToolSchemas(
@@ -357,7 +439,7 @@ function enabledToolSchemas(
               ...(external?.inputSchema ? { inputSchema: external.inputSchema } : {}),
               ...(CATALOG_ACTION_INPUT_SCHEMAS.has(permission.toolId)
                 ? { actionInputSchemas: CATALOG_ACTION_INPUT_SCHEMAS.get(permission.toolId)! }
-                : {})
+                : external?.actionInputSchemas ? { actionInputSchemas: external.actionInputSchemas } : {})
             }
           ]
         : [];
@@ -369,6 +451,11 @@ function enabledToolSchemas(
 }
 
 interface WorkerChatResult {
+  suspended?: boolean;
+  brainId?: string;
+  turnId?: string;
+  inputSha256?: string;
+  resume?: InstanceResumeFrontier;
   text?: string;
   response?: string;
   content?: string;
@@ -390,6 +477,7 @@ interface WorkerChatResult {
     train_loss?: number;
     generation_entropy?: number;
     ponder_steps?: number;
+    ponder_self_reports?: PonderSelfReport[];
     steps?: Array<{ stage?: string; detail?: string; value?: string }>;
     note?: string;
     attention_epoch?: number;
@@ -415,7 +503,9 @@ interface WorkerChatResult {
   steered?: boolean;
   nativeStopped?: boolean;
   noReply?: boolean;
+  inheritedInputAlias?: unknown;
 }
+
 
 interface WorkerChatReceiptResult {
   format?: string;
@@ -466,6 +556,8 @@ interface ValidatedWorkerChatPresentation {
 }
 
 export type NeuralChatStreamEvent =
+  | { type: "chat-cognition"; sequence: number; progress: import("../shared/cognition").CognitionProgress }
+  | { type: "chat-ponder-self-report"; sequence: number; report: import("../shared/ponderSelfReport").PonderSelfReportDelta }
   | { type: "chat-input-accepted"; sequence: number; inputReceipt: import("../shared/types").ChatInputAcceptedReceipt; humanMessage: ChatMessage }
   | {
       type: "runtime-activity";
@@ -477,6 +569,9 @@ export type NeuralChatStreamEvent =
       type: "chat-token";
       sequence: number;
       delta: string;
+      outputTokens?: number;
+      outputElapsedMs?: number;
+      tokensPerSecond?: number;
     }
   | {
       type: "chat-action";
@@ -1311,6 +1406,7 @@ export function normalizeModalityPreview(
     ...(hardwareTier ? { hardwareTier } : {}),
     ...(cadence ? { cadence } : {}),
     ...(producer ? { producer } : {}),
+    ...(producer && nativeMediaTimeline(record.mediaTimeline) ? { mediaTimeline: nativeMediaTimeline(record.mediaTimeline) } : {}),
     ...(payloadSha256 ? { payloadSha256 } : {}),
     ...(record.actualDecoderOutput === true
       ? { actualDecoderOutput: true as const }
@@ -1354,7 +1450,7 @@ export function normalizeModalityPreview(
 export function normalizeChatEngineEvent(
   event: EngineEvent,
   brainId: string,
-  inputOwner?: { turnId: string; input: string }
+  inputOwner?: { turnId: string; input: string; inputProvenance?: ChatInputProvenance; nativeAudioInput?: NativeAudioInput }
 ): NeuralChatStreamEvent | undefined {
   if (event.brainId !== undefined && event.brainId !== brainId) return undefined;
   const sequence = event.sequence;
@@ -1366,6 +1462,15 @@ export function normalizeChatEngineEvent(
     return undefined;
   }
   const data = objectRecord(event.data);
+  if (event.type === "chat-cognition") {
+    const progress = normalizeCognitionProgress(data);
+    return progress ? { type: "chat-cognition", sequence, progress } : undefined;
+  }
+  if (event.type === "chat-ponder-self-report") {
+    const report = normalizePonderSelfReportDelta(data);
+    if (!report || event.actionId !== report.actionId) return undefined;
+    return { type: "chat-ponder-self-report", sequence, report };
+  }
   if (event.type === "chat-input-accepted") {
     if (!inputOwner) return undefined;
     return { type: "chat-input-accepted", sequence, ...receivedChatInput(data, inputOwner) };
@@ -1376,7 +1481,16 @@ export function normalizeChatEngineEvent(
   }
   if (event.type === "chat-token") {
     const delta = boundedWorkerText(data?.delta, 64 * 1024);
-    return delta ? { type: "chat-token", sequence, delta } : undefined;
+    const outputTokens = typeof data?.outputTokens === "number" && Number.isSafeInteger(data.outputTokens) && data.outputTokens >= 0
+      ? data.outputTokens : undefined;
+    const elapsed = typeof data?.outputElapsedMs === "number" && Number.isFinite(data.outputElapsedMs) && data.outputElapsedMs >= 0
+      ? data.outputElapsedMs : undefined;
+    const rate = typeof data?.tokensPerSecond === "number" && Number.isFinite(data.tokensPerSecond) && data.tokensPerSecond >= 0
+      ? data.tokensPerSecond : undefined;
+    return delta || outputTokens !== undefined ? { type: "chat-token", sequence, delta: delta ?? "",
+      ...(outputTokens !== undefined ? { outputTokens } : {}),
+      ...(elapsed !== undefined ? { outputElapsedMs: elapsed } : {}),
+      ...(rate !== undefined ? { tokensPerSecond: rate } : {}) } : undefined;
   }
   if (event.type === "chat-phase") {
     if (
@@ -1438,6 +1552,7 @@ interface WorkerIngestResult {
   };
   source?: {
     kind?: string;
+    content_hash?: string;
     learned_ideas?: number;
     learned_concepts?: number;
     plasticity_events?: number;
@@ -1446,6 +1561,8 @@ interface WorkerIngestResult {
     parameter_checksum_changed?: boolean;
     warnings?: string[];
     coverage?: WorkerTrainingCoverage;
+    modality_trained?: boolean;
+    media_coverage?: Record<string, unknown>;
   };
   warnings?: string[];
   coverage?: WorkerTrainingCoverage;
@@ -1843,6 +1960,9 @@ interface LiveObservationRecord {
   pending: Set<Promise<LiveObservationPacketResult>>;
   controls: Map<string, LiveObservationControl>;
   controlBurstFrames: Map<string, Set<number>>;
+  workerPid?: number;
+  nativeAudioClaims?: Map<number, string>;
+  nativeAudioLastSequence?: number;
 }
 
 interface WorkerObservationResult {
@@ -2434,6 +2554,93 @@ function datasetParserKind(entry: DatasetManifestEntry): string {
   }
 }
 
+export function pluginParserBindingSha256(binding: NonNullable<DatasetManifestEntry["pluginFormat"]>): string {
+  if (binding.executable?.kind === "runtime-stream" && binding.executable.outputFormat === "media-assets") return sha256([
+    "omni-plugin-parser-binding-v4",
+    binding.pluginId,
+    binding.contentSha256,
+    binding.formatId,
+    binding.parserFormat,
+    ...(binding.inputMediaType ? [binding.inputMediaType] : []),
+    binding.executable.kind,
+    binding.executable.moduleId,
+    binding.executable.moduleSha256,
+    binding.executable.abi,
+    binding.executable.outputFormat,
+    ...(binding.executable.outputMediaTypes ?? [])
+  ].join("\0"));
+  if (binding.executable) return sha256([
+    binding.inputMediaType ? "omni-plugin-parser-binding-v3" : "omni-plugin-parser-binding-v2",
+    binding.pluginId,
+    binding.contentSha256,
+    binding.formatId,
+    binding.parserFormat,
+    ...(binding.inputMediaType ? [binding.inputMediaType] : []),
+    binding.executable.kind,
+    binding.executable.moduleId,
+    binding.executable.moduleSha256,
+    binding.executable.abi,
+    binding.executable.outputFormat
+  ].join("\0"));
+  return sha256([
+    binding.inputMediaType ? "omni-plugin-parser-binding-v2" : "omni-plugin-parser-binding-v1",
+    binding.pluginId,
+    binding.contentSha256,
+    binding.formatId,
+    binding.parserFormat,
+    ...(binding.inputMediaType ? [binding.inputMediaType] : [])
+  ].join("\0"));
+}
+
+function datasetParserBindingSha256(entry: DatasetManifestEntry): string | undefined {
+  return entry.pluginFormat ? pluginParserBindingSha256(entry.pluginFormat) : undefined;
+}
+
+function sameParserExecution(
+  left: PluginParserExecutionProvenance | undefined,
+  right: PluginParserExecutionProvenance | undefined
+): boolean {
+  if (!left || !right) return left === right;
+  return left.format === right.format && left.version === right.version && left.pluginId === right.pluginId &&
+    left.packageSha256 === right.packageSha256 && left.formatId === right.formatId && left.moduleId === right.moduleId &&
+    left.moduleSha256 === right.moduleSha256 && left.abi === right.abi && left.sourceSha256 === right.sourceSha256 &&
+    left.sourceBytes === right.sourceBytes && left.inputMediaType === right.inputMediaType && left.outputSha256 === right.outputSha256 &&
+    left.outputBytes === right.outputBytes && left.outputRecords === right.outputRecords && left.outputKind === right.outputKind &&
+    left.outputAssets === right.outputAssets && left.assetManifestSha256 === right.assetManifestSha256 &&
+    JSON.stringify(left.outputModalityCounts) === JSON.stringify(right.outputModalityCounts) && left.complete === right.complete;
+}
+
+interface WebPluginParserSelectionPlan {
+  binding: NonNullable<DatasetManifestEntry["pluginFormat"]>;
+  bindingSha256: string;
+  inputMediaType?: string;
+  sourceName: string;
+}
+
+interface WebPluginParserPlan extends WebPluginParserSelectionPlan {
+  transactionKey: string;
+}
+
+interface ActiveWebPluginParser {
+  lease: PluginTrainingFormatLease;
+  prepared?: PluginPreparedTrainingSource;
+  signal: AbortSignal;
+  workerPath: string;
+  workerKind: string;
+  workerContentHash: string;
+  noAssets: boolean;
+}
+
+function webPluginParserTransactionKey(
+  brainId: string,
+  url: string,
+  contentHash: string,
+  bindingSha256: string,
+  policy: PersistedDataIngestionPolicy
+): string {
+  return sha256(["omni-web-plugin-parser-v1", brainId, url, contentHash, bindingSha256, policy].join("\0"));
+}
+
 function workerText(result: WorkerChatResult | undefined): string | undefined {
   if (!result) return undefined;
   for (const candidate of [result.text, result.response, result.content]) {
@@ -2507,6 +2714,18 @@ function generationPresentationEnd(human: Record<string, unknown>, assistant: Re
   return disposition;
 }
 
+function committedPonderSelfReports(value: unknown): PonderSelfReport[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("Committed Ponder self-reports are invalid.");
+  const ids = new Set<string>(), actions = new Set<string>();
+  return value.map(entry => {
+    const report = validatePonderSelfReport(entry, text => createHash("sha256").update(text).digest("hex"));
+    if (report.state !== "complete" || ids.has(report.id) || actions.has(report.actionId))
+      throw new Error("Committed Ponder self-report identity is duplicated or incomplete.");
+    ids.add(report.id); actions.add(report.actionId); return report;
+  });
+}
+
 function validateCommittedChatReceipt(
   value: WorkerChatReceiptResult,
   expected: {
@@ -2515,6 +2734,7 @@ function validateCommittedChatReceipt(
     input: string;
     inputSha256: string;
     minimumInferenceCount: number;
+    inheritedInputAlias?: InheritedInputAlias;
   }
 ): ValidatedChatReceipt | undefined {
   if (
@@ -2557,8 +2777,17 @@ function validateCommittedChatReceipt(
   const humanId = receiptIdentifier(human.id, "human message");
   const brainMessageId = receiptIdentifier(assistant.id, "brain message");
   const traceId = receiptIdentifier(rawTrace.id, "trace");
+  const inheritedAlias = expected.inheritedInputAlias;
+  if (inheritedAlias && (humanId !== inheritedAlias.humanMessageId || human.turnId !== inheritedAlias.originalTurnId ||
+      (human.attention_epoch ?? human.attentionEpoch ?? 0) !== inheritedAlias.attentionEpoch || inheritedAlias.inputSha256 !== expected.inputSha256)) {
+    throw new Error("Committed inherited input lost its original human turn and attention owner.");
+  }
   const humanContent = human.content;
   const brainContent = assistant.content;
+  const ponderSelfReports = committedPonderSelfReports(assistant.ponder_self_reports ?? assistant.ponderSelfReports);
+  const tracePonderSelfReports = committedPonderSelfReports(rawTrace.ponder_self_reports ?? rawTrace.ponderSelfReports);
+  if (JSON.stringify(ponderSelfReports) !== JSON.stringify(tracePonderSelfReports))
+    throw new Error("Committed Ponder self-reports differ between message and trace custody.");
   const generationEnd = generationPresentationEnd(human, assistant, rawTrace, value.generationEnd);
   if ((value.noReply === true) !== (generationEnd === "no-reply")) {
     throw new Error("Committed no-reply flag is not bound to its durable receipt.");
@@ -2567,10 +2796,10 @@ function validateCommittedChatReceipt(
     human.role !== "human" ||
     assistant.role !== "brain" ||
     typeof humanContent !== "string" ||
-    !humanContent.trim() ||
+    (!humanContent.trim() && human.native_audio_input === undefined && human.nativeAudioInput === undefined) ||
     humanContent.includes("\0") ||
     humanContent !== expected.input ||
-    sha256(humanContent) !== expected.inputSha256 ||
+    observedChatInputHash(humanContent, human.native_audio_input ?? human.nativeAudioInput) !== expected.inputSha256 ||
     typeof brainContent !== "string" ||
     (generationEnd === "no-reply" ? brainContent !== "" :
       (!brainContent.length || (!generationEnd && !brainContent.trim()))) ||
@@ -2596,7 +2825,7 @@ function validateCommittedChatReceipt(
     "trace"
   );
   const epoch = receiptAttentionEpoch(
-    human.attention_epoch ?? human.attentionEpoch,
+    ...(inheritedAlias ? [] : [human.attention_epoch ?? human.attentionEpoch]),
     assistant.attention_epoch ?? assistant.attentionEpoch,
     rawTrace.attention_epoch ?? rawTrace.attentionEpoch
   );
@@ -2649,10 +2878,11 @@ function validateCommittedChatReceipt(
       role: "human",
       content: humanContent,
       createdAt: humanCreatedAt,
-      ...(value.legacyMatched === false ? { turnId: expected.turnId } : {}),
+      ...(inheritedAlias ? { turnId: inheritedAlias.originalTurnId } : value.legacyMatched === false ? { turnId: expected.turnId } : {}),
       runtime: "adaptive-core",
       status: "complete",
-      attentionEpoch: epoch,
+      attentionEpoch: inheritedAlias?.attentionEpoch ?? epoch,
+      ...taskInputSource(human, expected.inputSha256),
       ...(generationEnd && human.generation_end !== undefined ? { generationEnd } : {})
     },
     brainMessage: {
@@ -2665,6 +2895,7 @@ function validateCommittedChatReceipt(
       runtime: "adaptive-core",
       status: "complete",
       attentionEpoch: epoch,
+      ...(ponderSelfReports.length ? { ponderSelfReports } : {}),
       ...(generationEnd ? { generationEnd } : {})
     },
     trace: {
@@ -2691,6 +2922,7 @@ function validateCommittedChatReceipt(
       generation_decoder_stop_reason: typeof rawTrace.generation_decoder_stop_reason === "string" ? rawTrace.generation_decoder_stop_reason : undefined,
       generation_no_reply_reason: typeof rawTrace.generation_no_reply_reason === "string" ? rawTrace.generation_no_reply_reason : undefined,
       generated_token_count: finiteOptional("generated_token_count"),
+      ponder_self_reports: ponderSelfReports,
       generation_printable_text_characters: finiteOptional("generation_printable_text_characters")
     },
     inferenceCount,
@@ -2702,6 +2934,16 @@ function validateCommittedChatReceipt(
   };
 }
 
+function taskInputSource(value: Record<string, unknown>, inputSha256: string, expected?: ChatInputProvenance): { inputProvenance?: ChatInputProvenance; nativeAudioInput?: import("../shared/nativeAudioChat").NativeAudioMessageInfo } {
+  const raw = value.input_provenance ?? value.inputProvenance;
+  const inputProvenance = raw === undefined ? undefined : checkedChatInputProvenance(raw);
+  if (inputProvenance && inputProvenance.inputSha256 !== inputSha256 || expected &&
+    JSON.stringify(inputProvenance) !== JSON.stringify(checkedChatInputProvenance(expected))) throw new Error("Native task presentation lost its reviewed App source binding.");
+  const audio = nativeAudioMessageSource(value);
+  if (audio.nativeAudioInput && (inputProvenance || audio.nativeAudioInput.inputSha256 !== inputSha256)) throw new Error("Native audio source differs from its committed input.");
+  return { ...(inputProvenance ? { inputProvenance } : {}), ...audio };
+}
+
 export function validateWorkerChatPresentation(
   value: WorkerChatResult,
   expected: {
@@ -2709,6 +2951,9 @@ export function validateWorkerChatPresentation(
     input: string;
     inputSha256: string;
     response: string;
+    inheritedInputAlias?: InheritedInputAlias;
+    inputProvenance?: ChatInputProvenance;
+    nativeAudioInput?: NativeAudioInput;
   }
 ): ValidatedWorkerChatPresentation | undefined {
   const fields = [value.humanMessage, value.message, value.turnReceipt];
@@ -2728,13 +2973,25 @@ export function validateWorkerChatPresentation(
     receipt.formatVersion !== 1 ||
     receipt.turnId !== expected.turnId ||
     receipt.inputSha256 !== expected.inputSha256 ||
-    human.turn_id !== expected.turnId ||
+    human.turn_id !== (expected.inheritedInputAlias?.originalTurnId ?? expected.turnId) ||
     assistant.turn_id !== expected.turnId ||
     trace.turn_id !== expected.turnId
   ) {
     throw new Error("The neural worker returned an invalid committed turn presentation.");
   }
+  const inheritedAlias = objectRecord(value.inheritedInputAlias);
+  if (expected.inheritedInputAlias && (human.id !== expected.inheritedInputAlias.humanMessageId ||
+      (human.attention_epoch ?? human.attentionEpoch ?? 0) !== expected.inheritedInputAlias.attentionEpoch ||
+      expected.inheritedInputAlias.inputSha256 !== expected.inputSha256 ||
+      !inheritedAlias || Object.keys(inheritedAlias).sort().join(",") !== "attentionEpoch,humanMessageId,inputSha256,originalTurnId" ||
+      Object.entries(expected.inheritedInputAlias).some(([key, item]) => inheritedAlias[key] !== item))) {
+    throw new Error("Inherited input no longer matches its already-adopted root history row.");
+  }
   const generationEnd = generationPresentationEnd(human, assistant, trace, receipt.generationEnd);
+  const ponderSelfReports = committedPonderSelfReports(assistant.ponder_self_reports ?? assistant.ponderSelfReports);
+  const tracePonderSelfReports = committedPonderSelfReports(trace.ponder_self_reports ?? trace.ponderSelfReports);
+  if (JSON.stringify(ponderSelfReports) !== JSON.stringify(tracePonderSelfReports))
+    throw new Error("The neural worker Ponder self-reports differ between message and trace custody.");
   if (generationEnd && (human.generation_end !== generationEnd &&
       !(human.input_accepted_before_reply === true && trace.input_accepted_before_reply === true && human.generation_end === undefined) ||
       assistant.generation_end !== generationEnd || receipt.generationEnd !== generationEnd)) {
@@ -2762,7 +3019,7 @@ export function validateWorkerChatPresentation(
     human.role !== "human" ||
     assistant.role !== "brain" ||
     human.content !== expected.input ||
-    sha256(String(human.content)) !== expected.inputSha256 ||
+    observedChatInputHash(String(human.content), human.native_audio_input ?? human.nativeAudioInput) !== expected.inputSha256 ||
     assistant.content !== expected.response ||
     (generationEnd === "no-reply" ? expected.response !== "" :
       (!expected.response.length || (!generationEnd && !expected.response.trim()))) ||
@@ -2772,6 +3029,13 @@ export function validateWorkerChatPresentation(
     trace.parameter_checksum_after !== receipt.parameterChecksumAfter
   ) {
     throw new Error("The neural worker committed turn presentation is not receipt-bound.");
+  }
+  const rawAudioSource = human.native_audio_input ?? human.nativeAudioInput;
+  const audioSource = rawAudioSource === undefined ? undefined : verifiedNativeAudioReceipt(rawAudioSource);
+  if ((audioSource === undefined) !== (expected.nativeAudioInput === undefined) || audioSource &&
+      JSON.stringify(audioSource.input) !== JSON.stringify(expected.nativeAudioInput) ||
+      JSON.stringify(receipt.nativeAudioInput) !== JSON.stringify(human.native_audio_input ?? human.nativeAudioInput)) {
+    throw new Error("The native audio completion lost its original typed input receipt.");
   }
   const humanCreatedAt = receiptTimestamp(
     human.created_at ?? human.createdAt,
@@ -2787,7 +3051,7 @@ export function validateWorkerChatPresentation(
   );
   const committedAt = receiptTimestamp(receipt.committedAt, "worker receipt");
   const epoch = receiptAttentionEpoch(
-    human.attention_epoch ?? human.attentionEpoch,
+    ...(expected.inheritedInputAlias ? [] : [human.attention_epoch ?? human.attentionEpoch]),
     assistant.attention_epoch ?? assistant.attentionEpoch,
     trace.attention_epoch ?? trace.attentionEpoch
   );
@@ -2811,10 +3075,11 @@ export function validateWorkerChatPresentation(
       role: "human",
       content: expected.input,
       createdAt: humanCreatedAt,
-      turnId: expected.turnId,
+      turnId: expected.inheritedInputAlias?.originalTurnId ?? expected.turnId,
       runtime: "adaptive-core",
       status: "complete",
-      attentionEpoch: epoch,
+      attentionEpoch: expected.inheritedInputAlias?.attentionEpoch ?? epoch,
+      ...taskInputSource(human, expected.inputSha256, expected.inputProvenance),
       ...(generationEnd && human.generation_end !== undefined ? { generationEnd } : {})
     },
     brainMessage: {
@@ -2827,6 +3092,7 @@ export function validateWorkerChatPresentation(
       runtime: "adaptive-core",
       status: "complete",
       attentionEpoch: epoch,
+      ...(ponderSelfReports.length ? { ponderSelfReports } : {}),
       ...(generationEnd ? { generationEnd } : {})
     },
     inferenceCount
@@ -2848,6 +3114,11 @@ function applyWorkerTracePresentation(
   if (trace.created_at) result.trace.createdAt = trace.created_at;
   if (typeof trace.attention_epoch === "number") {
     result.trace.attentionEpoch = trace.attention_epoch;
+  }
+  const ponderSelfReports = committedPonderSelfReports(trace.ponder_self_reports);
+  if (ponderSelfReports.length) {
+    result.trace.ponderSelfReports = ponderSelfReports;
+    result.brainMessage.ponderSelfReports = ponderSelfReports;
   }
   const disposition = result.brainMessage.generationEnd;
   if (disposition || trace.generation_decoder_stop_reason !== undefined || trace.generated_token_count !== undefined) {
@@ -2934,6 +3205,7 @@ function mergeCommittedChatPresentation(
       existingBrain?.role !== "brain" ||
       existingBrain.content !== brainMessage.content ||
       existingBrain.createdAt !== brainMessage.createdAt ||
+      JSON.stringify(existingBrain.ponderSelfReports ?? []) !== JSON.stringify(brainMessage.ponderSelfReports ?? []) ||
       (brainMessage.generationEnd === "no-reply" && existingBrain.generationEnd !== "no-reply") ||
       existingBrain.traceId !== workerTrace.id ||
       existingTrace?.input !== humanMessage.content ||
@@ -3012,6 +3284,7 @@ interface ChatReconciliationRequest {
   input: string;
   inputSha256: string;
   minimumInferenceCount: number;
+  inheritedExecutionId?: string;
 }
 
 async function committedEngineMetadata(
@@ -3088,6 +3361,30 @@ function metadataPayloadById(
     .find((value) => value?.id === identifier);
 }
 
+/** Conservative fallback after a bounded receipt tail or identity-safe copy.
+ * This is operational input ownership, never model-facing history retrieval. */
+function committedTurnHuman(brainDirectory: string, brainId: string, turnId: string): Record<string, unknown> | undefined {
+  const path = join(brainDirectory, "engine", "conversation.sqlite3");
+  if (!existsSync(path)) throw new Error("Native turn history is unavailable; absence is unverifiable.");
+  const database = new DatabaseSync(path, { readOnly: true });
+  let identifier: string | undefined;
+  try {
+    database.exec("PRAGMA query_only=ON; PRAGMA cache_size=-256");
+    if (database.prepare("SELECT value FROM meta WHERE key='brain_id'").get()?.value !== brainId) {
+      throw new Error("Native turn history belongs to another instance.");
+    }
+    const rows = database.prepare("SELECT entry_key FROM entries WHERE kind='message' AND json_extract(payload_json,'$.role')='human' AND COALESCE(json_extract(payload_json,'$.turn_id'),json_extract(payload_json,'$.turnId'))=? LIMIT 2")
+      .all(turnId);
+    if (rows.length > 1) throw new Error("Native turn history has conflicting human inputs.");
+    if (rows[0]) {
+      const key = rows[0].entry_key;
+      if (typeof key !== "string" || !key.startsWith("message:")) throw new Error("Native turn history key is invalid.");
+      identifier = key.slice("message:".length);
+    }
+  } finally { database.close(); }
+  return identifier ? committedLedgerPayload(brainDirectory, brainId, "message", identifier) : undefined;
+}
+
 function persistedChatReceipt(
   brainDirectory: string,
   brainId: string,
@@ -3133,13 +3430,18 @@ function persistedChatReceipt(
     id: value.id,
     role: value.role,
     content: value.content,
+    ...((value.turn_id ?? value.turnId) === undefined ? {} : { turnId: value.turn_id ?? value.turnId }),
     createdAt: value.created_at ?? value.createdAt,
     ...(traceValue ? { traceId: traceValue } : {}),
     ...((value.attention_epoch ?? value.attentionEpoch) !== undefined
       ? { attentionEpoch: value.attention_epoch ?? value.attentionEpoch }
       : {}),
     ...(value.generation_end !== undefined ? { generation_end: value.generation_end } : {}),
-    ...(value.input_accepted_before_reply === true ? { input_accepted_before_reply: true } : {})
+    ...(value.input_accepted_before_reply === true ? { input_accepted_before_reply: true } : {}),
+    ...((value.ponder_self_reports ?? value.ponderSelfReports) === undefined ? {} :
+      { ponder_self_reports: value.ponder_self_reports ?? value.ponderSelfReports }),
+    ...((value.input_provenance ?? value.inputProvenance) === undefined ? {} : { input_provenance: value.input_provenance ?? value.inputProvenance }),
+    ...((value.native_audio_input ?? value.nativeAudioInput) === undefined ? {} : { native_audio_input: value.native_audio_input ?? value.nativeAudioInput })
   });
   return {
     format: "omni-chat-turn-receipt-query",
@@ -3201,7 +3503,7 @@ async function latestChatReconciliationRequest(
     if (
       !human ||
       typeof human.content !== "string" ||
-      sha256(human.content) !== inputSha256
+      observedChatInputHash(human.content, human.native_audio_input ?? human.nativeAudioInput) !== inputSha256
     ) return undefined;
     return {
       turnId,
@@ -3245,7 +3547,7 @@ async function latestChatReconciliationRequest(
   ) {
     return undefined;
   }
-  const inputSha256 = sha256(human.content);
+  const inputSha256 = observedChatInputHash(human.content, human.native_audio_input ?? human.nativeAudioInput);
   if (trace.input_sha256 !== inputSha256) return undefined;
   const recordedTurnId = trace.turn_id;
   const turnId =
@@ -3932,19 +4234,837 @@ type ChatParameterLearningRuntime = Pick<
 >>;
 
 export class BrainService {
+  readonly instanceLifecycle: InstanceLifecycleController;
+  private readonly instanceSuspendBoundaries = new Set<(brainId: string, report: (waiting: InstanceLifecycleState["waitingFor"]) => void) => Promise<void>>();
+  private readonly instanceUnloadBoundaries = new Set<(brainId: string) => void>();
+  private readonly instanceDetachBoundaries = new Set<(brainId: string) => Promise<void>>();
+  private readonly instanceRecoveryBoundaries = new Set<(brainId: string) => Promise<void>>();
+  private readonly runtimeShutdownHolds = new Set<object>();
+  private runtimeAdmissionGuard?: () => void;
+  private nativeAudioAdmissionGuard?: (brainId: string, input: NativeAudioInput) => Promise<void>;
+
+  setNativeAudioAdmissionGuard(guard: (brainId: string, input: NativeAudioInput) => Promise<void>): void { this.nativeAudioAdmissionGuard = guard; }
+  private readonly suspendedTurnWaiters = new Map<string, () => void>();
+  private readonly suspendedObservations = new Map<string, Map<string, ChatToolObservation>>();
+
+  onInstanceLifecycle(listener: (state: InstanceLifecycleState) => void): () => void { return this.instanceLifecycle.onChange(listener); }
+  addInstanceSuspendBoundary(boundary: (brainId: string, report: (waiting: InstanceLifecycleState["waitingFor"]) => void) => Promise<void>): () => void {
+    this.instanceSuspendBoundaries.add(boundary); return () => { this.instanceSuspendBoundaries.delete(boundary); };
+  }
+  addInstanceUnloadBoundary(boundary: (brainId: string) => void): () => void {
+    this.instanceUnloadBoundaries.add(boundary); return () => { this.instanceUnloadBoundaries.delete(boundary); };
+  }
+  addInstanceDetachBoundary(boundary: (brainId: string) => Promise<void>): () => void {
+    this.instanceDetachBoundaries.add(boundary); return () => { this.instanceDetachBoundaries.delete(boundary); };
+  }
+  addInstanceRecoveryBoundary(boundary: (brainId: string) => Promise<void>): () => void {
+    this.instanceRecoveryBoundaries.add(boundary); return () => { this.instanceRecoveryBoundaries.delete(boundary); };
+  }
+  beginRuntimeShutdown(): () => void {
+    const owner = {}; this.runtimeShutdownHolds.add(owner);
+    return () => { this.runtimeShutdownHolds.delete(owner); };
+  }
+  /** Main-owned destination admission; never restored from a brain export. */
+  setRuntimeAdmissionGuard(guard: () => void): void { this.runtimeAdmissionGuard = guard; }
+  requireRuntimeAdmissionOpen(): void {
+    if (this.runtimeShutdownHolds.size) throw new Error("The application is checkpointing before exit. New neural work waits until that exit is dismissed.");
+    this.runtimeAdmissionGuard?.();
+  }
+  async detachInstanceHostContinuations(brainId: string): Promise<void> {
+    const native = await this.inspectNativeInstance(brainId);
+    if (native.learnedRuntimeResident) throw new Error("A native unload acknowledgement is required before replacing its host attachment.");
+    const owned = [...this.liveChatTurns.values()].filter((turn) => turn.brainId === brainId);
+    for (const turn of owned) {
+      if (turn.chatDispatched) throw new Error("An active native writer cannot be detached before its saved boundary.");
+      const inherited = turn.inheritedExecutionId && native.inheritedExecutions?.entries.find(entry => entry.id === turn.inheritedExecutionId &&
+        entry.turnId === turn.turnId && ["queued", "suspended"].includes(entry.status));
+      const retained = inherited ? await this.engine.inheritedExecutionPresentation(brainId, this.repository.brainDirectory(brainId), inherited.id) : undefined;
+      const frontier = retained?.frontier ?? (native.resume?.turnId === turn.turnId && native.resumeCompatibility?.compatible !== false ? native.resume : undefined);
+      if (frontier && frontier.inputSha256 !== turn.inputSha256) throw new Error("Saved turn input changed before its host detach.");
+      turn.detach(new InstanceContinuationDetachedError(brainId, turn.turnId, frontier, inherited ? inherited.id : undefined));
+    }
+    await Promise.all(owned.map((turn) => turn.settled));
+    for (const boundary of this.instanceDetachBoundaries) await boundary(brainId);
+  }
+  requireInstanceLoaded(brainId: string, turnId?: string): void { this.requireRuntimeAdmissionOpen(); this.instanceLifecycle.requireLoaded(brainId, turnId); }
+  waitUntilInstanceLoaded(brainId: string, signal?: AbortSignal, turnId?: string): Promise<void> { return this.instanceLifecycle.waitUntilLoaded(brainId, signal, turnId); }
+  instanceStatus(brainId: string): Promise<InstanceLifecycleState> { return this.instanceLifecycle.status(brainId); }
+  instanceLoadFit(brainId: string): Promise<InstanceLoadFit> { return this.instanceLifecycle.fit(brainId); }
+  loadInstance(brainId: string, expectedCheckpointId?: string): Promise<InstanceLifecycleState> { this.requireRuntimeAdmissionOpen(); return this.instanceLifecycle.load(brainId, expectedCheckpointId); }
+  unloadInstance(brainId: string): Promise<InstanceLifecycleState> { return this.instanceLifecycle.unload(brainId); }
+  setInstanceAutoLoad(brainId: string, enabled: boolean): Promise<InstanceLifecycleState> { return this.instanceLifecycle.setAutoLoad(brainId, enabled); }
+  async instanceResumePresentation(brainId: string): Promise<InstanceResumeAttachment | null> {
+    const native = await this.inspectNativeInstance(brainId);
+    if (!native.resume) return null;
+    const audio = objectRecord(native.presentation?.inputReceipt)?.nativeAudioInput;
+    const nativeAudioInput = audio === undefined ? undefined : verifiedNativeAudioReceipt(audio).input;
+    if (!native.presentation || typeof native.presentation.input !== "string" || typeof native.presentation.publishedText !== "string" ||
+        expectedChatInputHash(native.presentation.input, nativeAudioInput) !== native.resume.inputSha256 || native.resume.exactSupportedResume !== true) {
+      throw new Error("The saved turn presentation is not bound to its native continuation.");
+    }
+    return { brainId, frontier: native.resume, input: native.presentation.input, publishedText: native.presentation.publishedText,
+      ...(audio === undefined ? {} : { nativeAudioInput: nativeAudioMessageInfo(verifiedNativeAudioReceipt(audio)) }),
+      hostAttached: this.liveChatTurns.has(chatTurnKey(brainId, native.resume.turnId)), priorActions: parseModelActions("", native.presentation.actions) };
+  }
+  /** Inspect durable scheduling ownership without loading, admitting or replaying input. */
+  async queryNativeTurnStatus(brainId: string, turnId: string, input: string): Promise<NativeTurnStatus> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(turnId) || cleanMessage(input) !== input) {
+      throw new Error("A scheduled native turn needs its exact validated turn ID and input.");
+    }
+    await this.repository.get(brainId);
+    const directory = this.repository.brainDirectory(brainId), metadata = await committedEngineMetadata(directory);
+    if (metadata?.brain_id !== brainId || !Array.isArray(metadata.completed_chat_turns) || !Array.isArray(metadata.accepted_chat_inputs)) {
+      throw new Error("Native turn ownership is unverifiable; no input will be replayed.");
+    }
+    const inputSha256 = sha256(input), key = chatTurnKey(brainId, turnId);
+    const base = { format: "omni-native-turn-status" as const, formatVersion: 1 as const, brainId, turnId, inputSha256,
+      loaded: this.instanceLifecycle.isLoaded(brainId), admissionOpen: this.runtimeShutdownHolds.size === 0 && this.instanceLifecycle.canRun(brainId, turnId) };
+    const completedRows = metadata.completed_chat_turns.map(objectRecord), acceptedRows = metadata.accepted_chat_inputs.map(objectRecord);
+    if ([...completedRows, ...acceptedRows].some(value => !value || typeof value.turnId !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.turnId) || typeof value.inputSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.inputSha256))) {
+      throw new Error("Native turn ownership contains invalid receipt identities; absence is unverifiable.");
+    }
+    const completed = completedRows.filter(value => value?.turnId === turnId);
+    if (completed.length > 1 || completed.some(value => value?.inputSha256 !== inputSha256)) {
+      throw new Error("The scheduled turn conflicts with a committed native input; it will not be replayed.");
+    }
+    if (completed[0]) {
+      const receipt = completed[0];
+      const humanMessageId = receiptIdentifier(receipt.humanMessageId, "scheduled human"),
+        brainMessageId = receiptIdentifier(receipt.brainMessageId, "scheduled response"), traceId = receiptIdentifier(receipt.traceId, "scheduled trace");
+      const human = committedLedgerPayload(directory, brainId, "message", humanMessageId),
+        assistant = committedLedgerPayload(directory, brainId, "message", brainMessageId), trace = committedLedgerPayload(directory, brainId, "trace", traceId);
+      if (receipt.format !== "omni-completed-chat-turn" || receipt.formatVersion !== 1 ||
+          human?.role !== "human" || human.content !== input || assistant?.role !== "brain" || typeof assistant.content !== "string" ||
+          trace?.turn_id !== turnId || trace.input_sha256 !== inputSha256 || trace.parameter_checksum_after !== receipt.parameterChecksumAfter ||
+          typeof receipt.parameterChecksumAfter !== "string" || !/^[a-f0-9]{64}$/.test(receipt.parameterChecksumAfter)) {
+        throw new Error("The scheduled turn's committed native receipt is not bound to its ledger.");
+      }
+      const inferenceCount = receiptCount(receipt.inferenceCount, "scheduled inference");
+      if (inferenceCount < 1) throw new Error("The scheduled turn's committed inference count is invalid.");
+      return { ...base, status: "committed", receipt: { humanMessageId, brainMessageId, traceId, inferenceCount,
+        parameterChecksumAfter: receipt.parameterChecksumAfter, committedAt: receiptTimestamp(receipt.committedAt, "scheduled receipt") } };
+    }
+    const native = await this.inspectNativeInstance(brainId);
+    const inherited = native.inheritedExecutions?.entries.find(value => value.turnId === turnId && ["queued", "suspended"].includes(value.status));
+    const attachment = inherited ? await this.instanceInheritedResumePresentation(brainId, inherited.id) :
+      native.resume?.turnId === turnId ? await this.instanceResumePresentation(brainId) : null;
+    if (attachment) {
+      if (attachment.input !== input || attachment.frontier.inputSha256 !== inputSha256) throw new Error("The retained scheduled turn owns a different input.");
+      return { ...base, status: "retained", attachment };
+    }
+    const live = this.liveChatTurns.get(key);
+    if (live) {
+      if (live.inputSha256 !== inputSha256) throw new Error("The active scheduled turn owns a different input.");
+      return { ...base, status: "active" };
+    }
+    const rawAccepted = acceptedRows.filter(value => value?.turnId === turnId);
+    const acceptedTrace = committedLedgerPayload(directory, brainId, "trace", sha256(`${brainId}\0${turnId}\0accepted-input-v1`));
+    const accepted = rawAccepted[0] ?? objectRecord(acceptedTrace?.inputAccepted);
+    if (rawAccepted.length > 1) throw new Error("The scheduled turn has duplicated input admission receipts.");
+    if (accepted) {
+      const human = committedLedgerPayload(directory, brainId, "message", receiptIdentifier(accepted.humanMessageId, "scheduled admitted human"));
+      receivedChatInputFromLedger(accepted, human, { turnId, input });
+      // A hard crash after admission without an exact cursor is never absence.
+      return { ...base, status: "accepted-unfinished" };
+    }
+    const oldHuman = committedTurnHuman(directory, brainId, turnId);
+    if (oldHuman) {
+      if (oldHuman.role !== "human" || oldHuman.content !== input) throw new Error("The scheduled turn conflicts with a previously saved human input.");
+      return { ...base, status: "accepted-unfinished" };
+    }
+    return { ...base, status: "absent" };
+  }
+  async instanceInheritedResumePresentation(brainId: string, executionId: string): Promise<InstanceResumeAttachment> {
+    if (!/^[a-f0-9]{64}$/.test(executionId)) throw new Error("Invalid inherited execution identity.");
+    const status = await this.inspectNativeInstance(brainId);
+    const entry = status.inheritedExecutions?.entries.find((value) => value.id === executionId);
+    if (!entry || !["queued", "suspended"].includes(entry.status)) throw new Error("The requested inherited frontier is not pending.");
+    const value = await this.engine.inheritedExecutionPresentation(brainId, this.repository.brainDirectory(brainId), executionId);
+    const rawAudio = objectRecord(value.presentation.inputReceipt)?.nativeAudioInput;
+    const nativeAudioInput = rawAudio === undefined ? undefined : verifiedNativeAudioReceipt(rawAudio).input;
+    if (value.frontier.turnId !== entry.turnId || value.frontier.exactSupportedResume !== true ||
+        expectedChatInputHash(value.presentation.input, nativeAudioInput) !== value.frontier.inputSha256 || typeof value.presentation.publishedText !== "string") {
+      throw new Error("The inherited presentation has another exact native frontier.");
+    }
+    await this.inheritedInputAlias(brainId, executionId, value.frontier.turnId, value.presentation.input);
+    const attachment: InstanceResumeAttachment = { brainId, frontier: value.frontier, input: value.presentation.input, publishedText: value.presentation.publishedText,
+      ...(rawAudio === undefined ? {} : { nativeAudioInput: nativeAudioMessageInfo(verifiedNativeAudioReceipt(rawAudio)) }),
+      priorActions: parseModelActions("", value.presentation.actions), inheritedExecutionId: executionId,
+      hostAttached: this.liveChatTurns.has(chatTurnKey(brainId, entry.turnId)) };
+    this.nativeInheritedPresentations.set(attachment, value); return attachment;
+  }
+  private readonly nativeInheritedPresentations = new WeakMap<InstanceResumeAttachment, NativeInheritedPresentation>();
+  private async taskFileContextFromInherited(brainId: string, executionId: string, attachment: InstanceResumeAttachment): Promise<InheritedTaskFileNativeContext> {
+    const observed = this.nativeInheritedPresentations.get(attachment);
+    if (!observed) throw new Error("Inherited file review requires the actual current native presentation, not renderer metadata.");
+    const proof = verifiedTaskContinuationResume({ brainId, frontier: attachment.frontier, input: attachment.input,
+      inputSha256: attachment.frontier.inputSha256, inheritedExecutionId: executionId }, observed);
+    const metadata = await committedEngineMetadata(this.repository.brainDirectory(brainId));
+    const entry = metadata && connectedExecutionEntries(metadata).find(value => value.id === executionId);
+    const descriptor = objectRecord(metadata?.connected_regions), epoch = objectRecord(metadata?.fresh_attention_boundary)?.epoch ?? 0;
+    if (metadata?.brain_id !== brainId || !entry || !["queued", "suspended"].includes(entry.status) ||
+        entry.rootTurnId !== attachment.frontier.turnId || entry.parentId !== observed.parentId || entry.originalTurnId !== observed.originalTurnId ||
+        typeof descriptor?.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(descriptor.sha256) || !Number.isSafeInteger(epoch) || Number(epoch) < 0) throw new Error("Inherited file source differs from the actual registered root execution.");
+    return { brainId, executionId, frontier: structuredClone(attachment.frontier), inputSha256: proof.inputSha256,
+      sourceBrainId: observed.parentId, sourceTurnId: observed.originalTurnId, sourceAttentionEpoch: proof.attentionEpoch,
+      rootAttentionEpoch: Number(epoch), descriptorSha256: descriptor.sha256, regionPath: [...entry.regionPath],
+      sourceManifestSha256: entry.sourceManifestSha256, sourceBindingId: entry.sourceBindingId };
+  }
+  /** Metadata-only, no Load or model generation. The WeakMap keeps the authenticated source object main-owned. */
+  async inheritedTaskFileContext(brainId: string, executionId: string): Promise<InheritedTaskFileNativeContext> {
+    return this.taskFileContextFromInherited(brainId, executionId, await this.instanceInheritedResumePresentation(brainId, executionId));
+  }
+  assertActiveInheritedTaskFileContext(context: InheritedTaskFileNativeContext): void {
+    const current = this.liveChatTurns.get(chatTurnKey(context.brainId, context.frontier.turnId));
+    this.requireInstanceLoaded(context.brainId, context.frontier.turnId);
+    if (!current || current.inheritedExecutionId !== context.executionId || current.inputSha256 !== context.inputSha256 ||
+        current.inputSignal?.aborted || current.detached) throw new Error("This file lease is not owned by the current actual inherited task.");
+  }
+  private async inheritedInputAlias(brainId: string, executionId: string, turnId: string, input: string): Promise<InheritedInputAlias> {
+    const directory = this.repository.brainDirectory(brainId), metadata = await committedEngineMetadata(directory);
+    const state = objectRecord(metadata?.connected_executions);
+    const entry = Array.isArray(state?.entries) ? state.entries.map(objectRecord).find(value => value?.id === executionId && value.rootTurnId === turnId) : undefined;
+    if (metadata?.brain_id !== brainId || !entry || typeof entry.rootHumanMessageId !== "string") throw new Error("Inherited input ownership is unavailable.");
+    const human = committedLedgerPayload(directory, brainId, "message", entry.rootHumanMessageId);
+    if (!human || human.role !== "human" || human.content !== input || typeof human.turn_id !== "string" ||
+        !Number.isSafeInteger(human.attention_epoch ?? 0) || Number(human.attention_epoch ?? 0) < 0) {
+      throw new Error("The inherited turn has no exact already-adopted root human row.");
+    }
+    return { humanMessageId: entry.rootHumanMessageId, originalTurnId: human.turn_id,
+      attentionEpoch: Number(human.attention_epoch ?? 0), inputSha256: observedChatInputHash(input, human.native_audio_input ?? human.nativeAudioInput) };
+  }
+  async resumeInheritedTurn(brainId: string, executionId: string, signal?: AbortSignal,
+    onStream?: (event: NeuralChatStreamEvent) => void, toolObservationWaitMs?: number): Promise<ChatResult> {
+    signal?.throwIfAborted();
+    const metadata = await committedEngineMetadata(this.repository.brainDirectory(brainId));
+    const completed = completedInheritedTurn(metadata, brainId, executionId);
+    if (completed) {
+      const human = committedLedgerPayload(this.repository.brainDirectory(brainId), brainId, "message", completed.humanMessageId);
+      if (!human || human.role !== "human" || typeof human.content !== "string") throw new Error("Inherited completion has no exact adopted human input.");
+      const recovered = await this.reconcileCommittedChat(brainId, { ...completed, input: human.content,
+        minimumInferenceCount: completed.inferenceCount - 1, inheritedExecutionId: executionId });
+      if (!recovered) throw new Error("The completed inherited turn could not be reconciled without replay.");
+      await this.instanceLifecycle.status(brainId); this.instanceLifecycle.completed(brainId); return recovered;
+    }
+    const attachment = await this.instanceInheritedResumePresentation(brainId, executionId);
+    return this.chat(brainId, attachment.input, signal, onStream, attachment.frontier.turnId,
+      undefined, undefined, toolObservationWaitMs, attachment.frontier, executionId);
+  }
+  async stopSavedTurn(request: { brainId: string; turnId: string; checkpointId?: string; executionId?: string }): Promise<InstanceLifecycleState> {
+    const { brainId, turnId, checkpointId, executionId } = request;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(turnId) || Boolean(checkpointId) === Boolean(executionId) ||
+        checkpointId && !/^[a-f0-9]{32}$/.test(checkpointId) || executionId && !/^[a-f0-9]{64}$/.test(executionId)) {
+      throw new Error("Stop needs one exact saved turn and checkpoint identity.");
+    }
+    if (this.liveChatTurns.has(chatTurnKey(brainId, turnId))) throw new Error("Use the active chat's Stop control for this attached turn.");
+    return withBrainWrite(this.repository, brainId, async () => {
+      const native = await this.inspectNativeInstance(brainId);
+      const inherited = native.inheritedExecutions?.entries.find(value => value.id === executionId && value.turnId === turnId && ["queued", "suspended"].includes(value.status));
+      if (executionId ? !inherited : native.resume?.checkpointId !== checkpointId || native.resume?.turnId !== turnId) {
+        throw new Error("The saved frontier changed before explicit Stop; review its current state.");
+      }
+      const stopped = objectRecord(await this.engine.request(executionId ? "stop_inherited_chat" : "stop_suspended_chat", {
+        brainId, storagePath: this.repository.brainDirectory(brainId), turnId, ...(executionId ? { executionId } : { checkpointId })
+      }, ENGINE_REQUEST_NO_DEADLINE));
+      if (stopped?.stopped !== true || stopped.brainId !== brainId || stopped.turnId !== turnId ||
+          (executionId ? stopped.executionId !== executionId : stopped.checkpointId !== checkpointId || stopped.inputReceiptRetained !== true)) {
+        throw new Error("Explicit Stop did not acknowledge the exact saved frontier.");
+      }
+      this.instanceLifecycle.completed(brainId);
+      return this.instanceLifecycle.status(brainId);
+    });
+  }
+
+  private async inspectNativeInstance(brainId: string): Promise<NativeInstanceStatus> {
+    await this.repository.get(brainId);
+    return this.engine.instanceStatus(brainId, this.repository.brainDirectory(brainId));
+  }
+  private async fitInstance(brainId: string, native: NativeInstanceStatus): Promise<InstanceLoadFit> {
+    const brain = await this.repository.get(brainId);
+    const blockers: string[] = [];
+    if (native.resumeCompatibility?.compatible === false) blockers.push(native.resumeCompatibility.reason ?? "The saved turn is incompatible with this exact runtime.");
+    if (brain.readiness.state !== "ready") blockers.push("Finish or resume initial learning before loading this instance for chat.");
+    const minimumContextTokens = native.minimumContextTokens;
+    if (!Number.isSafeInteger(minimumContextTokens) || minimumContextTokens < 0) throw new Error("Native active-context occupancy is unavailable.");
+    if (brain.config.contextWindowTokens < minimumContextTokens) blockers.push(`The paused execution uses ${minimumContextTokens.toLocaleString()} context tokens; the selected context cannot be lower.`);
+    const plan = this.resourcePlanner ? await this.resourcePlanner.plan({ brainId, mode: "manual",
+      requestedItems: String(brain.config.workingMemorySlots), requestedContextTokens: String(brain.config.contextWindowTokens),
+      systemRamMode: brain.config.systemRamMode, systemRamSharePercent: brain.config.systemRamSharePercent,
+      deviceResources: brain.config.deviceResources }, { config: brain.config, brainDirectory: this.repository.brainDirectory(brainId),
+      admissionScope: "existing-runtime", enforceContextFloor: false }) : undefined;
+    if (plan && !plan.allowed) blockers.push(...plan.blockers);
+    return { brainId, checkedAt: new Date().toISOString(), allowed: blockers.length === 0, minimumContextTokens, blockers, ...(plan ? { plan } : {}) };
+  }
+  private async suspendInstanceRuntime(brainId: string, report: (waiting: InstanceLifecycleState["waitingFor"]) => void): Promise<NativeInstanceStatus> {
+    this.engine.holdInstanceDispatch?.(brainId);
+    // Stop scheduling optional work. In-flight work retains its promise and
+    // finishes at its own safe boundary; no cancellation authority is used.
+    for (const timers of [this.chatSlowLearningTimers, this.actionEvidenceRetries]) {
+      const timer = timers.get(brainId); if (timer) { clearTimeout(timer); timers.delete(brainId); }
+    }
+    for (const turn of this.liveChatTurns.values()) {
+      if (turn.brainId !== brainId || !turn.chatDispatched || turn.outputEnded) continue;
+      const turnId = turn.turnId, key = chatTurnKey(brainId, turnId);
+      let ready!: () => void; const boundary = new Promise<void>((resolve) => { ready = resolve; });
+      this.suspendedTurnWaiters.set(key, ready);
+      try {
+        const acknowledgement = await this.engine.suspendChat(brainId, turnId);
+        if (acknowledgement.waitingFor) report(acknowledgement.waitingFor);
+        if (acknowledgement.requested) await boundary;
+      } finally { this.suspendedTurnWaiters.delete(key); }
+    }
+    for (const boundary of this.instanceSuspendBoundaries) await boundary(brainId, report);
+    await Promise.all([this.chatSlowLearning.get(brainId), this.actionEvidenceDrains.get(brainId)].filter(Boolean));
+    const result = await withBrainWrite(this.repository, brainId, async () => {
+      const native = await this.inspectNativeInstance(brainId);
+      return this.engine.request<NativeInstanceStatus>("suspend_instance", { brainId, storagePath: this.repository.brainDirectory(brainId),
+        pendingInheritedObservations: (native.inheritedExecutions?.entries ?? []).filter(entry => ["queued", "suspended"].includes(entry.status))
+          .map(entry => ({ executionId: entry.id, observations: [...(this.suspendedObservations.get(chatTurnKey(brainId, entry.turnId))?.values() ?? [])] }))
+          .filter(entry => entry.observations.length > 0),
+        ...(native.resume ? { expectedCheckpointId: native.resume.checkpointId,
+          pendingObservations: [...(this.suspendedObservations.get(chatTurnKey(brainId, native.resume.turnId))?.values() ?? [])] } : {}) }, ENGINE_REQUEST_NO_DEADLINE);
+    });
+    if (result.unloaded === true && !result.learnedRuntimeResident) {
+      for (const boundary of this.instanceUnloadBoundaries) boundary(brainId);
+    }
+    return result;
+  }
+  private fullMergeCoordinator?: FullBrainMergeCoordinator;
+  private readonly fullMergeOperations = new Map<string, Promise<FullMergeProgress>>();
+  private readonly fullMergeSignals = new Map<string, AbortController>();
+  private readonly fullMergeCancelling = new Set<string>();
+  private readonly fullMergeListeners = new Set<(progress: FullMergeProgress) => void>();
+  private fullMergeAccessInitializer?: (brainId: string) => Promise<void>;
+  private fullMergePluginInitializer?: (brainId: string, parentBrainIds: readonly string[]) => Promise<void>;
+  private fullMergePluginRemover?: (brainId: string) => Promise<void>;
+
+  /** Install the account/catalog boundary; tests may inject an isolated registry. */
+  configureFullMergeAccess(initializer: (brainId: string) => Promise<void>): void {
+    this.fullMergeAccessInitializer = initializer;
+  }
+
+  configureFullMergePlugins(
+    initializer: (brainId: string, parentBrainIds: readonly string[]) => Promise<void>,
+    remover: (brainId: string) => Promise<void>
+  ): void {
+    this.fullMergePluginInitializer = initializer;
+    this.fullMergePluginRemover = remover;
+  }
+
+  onFullMerge(listener: (progress: FullMergeProgress) => void): () => void {
+    this.fullMergeListeners.add(listener);
+    return () => { this.fullMergeListeners.delete(listener); };
+  }
+
+  private fullMerges(): FullBrainMergeCoordinator {
+    if (this.fullMergeCoordinator) return this.fullMergeCoordinator;
+    this.fullMergeCoordinator = new FullBrainMergeCoordinator(this.repository.root, {
+      withParentsFrozen: async (ids, action, signal, existingSeals) => {
+        const previouslyPaused = new Set(ids.filter((id) => this.pausedChatLearning.has(id)));
+        for (const id of ids) {
+          this.pausedChatLearning.add(id);
+          const timer = this.chatSlowLearningTimers.get(id);
+          if (timer) { clearTimeout(timer); this.chatSlowLearningTimers.delete(id); }
+        }
+        try {
+          await this.engine.claimForeground?.();
+          await Promise.all(ids.flatMap((id) => [this.chatSlowLearning.get(id), this.actionEvidenceDrains.get(id)])
+            .filter((operation): operation is Promise<void> => Boolean(operation)).map((operation) => operation.catch(() => undefined)));
+          for (const id of ids) {
+            signal?.throwIfAborted();
+            if (existingSeals?.length) {
+              // A resumed merge already owns immutable sealed parents. Merely
+              // reading its host document through get() may migrate it.
+              const native = await this.engine.instanceStatus(id, this.repository.brainDirectory(id));
+              if (native.learnedRuntimeResident || [...this.liveChatTurns.values()].some((turn) => turn.brainId === id)) {
+                throw new Error("A sealed parent acquired new active work; resume cannot silently replace its frozen generation.");
+              }
+            } else {
+              const suspended = await this.unloadInstance(id);
+              if (suspended.learnedRuntimeResident || !["unloaded", "suspended"].includes(suspended.phase)) {
+                throw new Error("Parent freeze waits for an acknowledged native checkpoint boundary.");
+              }
+              await this.detachInstanceHostContinuations(id);
+            }
+          }
+          return await withBrainWrite(this.repository, [...ids].sort(), async () => {
+            for (const id of ids) {
+              signal?.throwIfAborted();
+              // get() may migrate display ledgers; a paused snapshot must be
+              // compared without rewriting even an equivalent SQLite page.
+              const brain = existingSeals?.length
+                ? JSON.parse(await readFile(join(this.repository.brainDirectory(id), "brain.json"), "utf8")) as BrainDocument
+                : await this.repository.get(id);
+              if (brain.readiness.state !== "ready") throw new Error("Finish or resume the parent's initial learning before merging.");
+            }
+            return action();
+          }, signal);
+        } finally {
+          for (const id of ids) if (!previouslyPaused.has(id)) this.pausedChatLearning.delete(id);
+        }
+      },
+      sealParent: async (id, signal) => {
+        const root = this.repository.brainDirectory(id);
+        const brain = JSON.parse(await readFile(join(root, "brain.json"), "utf8")) as BrainDocument;
+        const native = JSON.parse(await readFile(join(root, "engine", "brain.json"), "utf8"));
+        assertNativeOmniEngineState(native, "Full merge parent");
+        if (native.brain_id !== id || brain.id !== id) throw new Error("Parent host/native identity changed.");
+        if (native.connected_regions) await verifyConnectedNativeOrigin(join(root, "engine"), id, { allowAncestralIdentity: true });
+        return sealFullMergeParent(root, brain, signal,
+          async (bytes) => { await requireDiskWrite(this.repository.root, { operationWriteBytes: bytes }); },
+          (bytes, purpose) => this.repository.admitMetadataTransfer(bytes, purpose));
+      },
+      validateSettings: async (config) => {
+        if (mergeCanonical(this.repository.prepareConfig(config)) !== mergeCanonical(config)) {
+          throw new Error("Review a complete valid destination configuration; settings cannot change during merge.");
+        }
+        this.sharedResources?.requireSynchronized();
+        await requireDiskWrite(this.repository.root, { operationWriteBytes: 4096 });
+      },
+      reserve: async (bytes) => { await requireDiskWrite(this.repository.root, { operationWriteBytes: bytes }); },
+      admit: (bytes, purpose) => this.repository.admitMetadataTransfer(bytes, purpose),
+      assemble: async (input) => {
+        validateFullMergeReview(input.request as FullMergeStartRequest);
+        if (!this.fullMergeAccessInitializer) throw new Error("The destination-local access registry is unavailable.");
+        // Install an explicit disabled MCP record before publication. Neither
+        // prior-instance defaults nor parent credentials can bind this identity.
+        await this.fullMergeAccessInitializer(input.targetBrainId);
+        if (input.request.spillPoolSelectionId) this.claimSpillPoolSelection(input.request.spillPoolSelectionId,
+          input.targetBrainId, input.request.config.deviceResources?.storageDirectories ?? []);
+        if (this.resourcePlanner) {
+          const config = input.request.config;
+          const envelope = await this.resourcePlanner.reviewedRamEnvelope(config, input.request.hardwareTier);
+          // This selects only the reviewed RAM envelope. A generic stack's
+          // estimated fit is not evidence about the connected regional graph;
+          // native construction admits its actual owners and backing bytes.
+          this.sharedResources?.selectActiveRuntime(input.targetBrainId, config.storagePoolBytes, envelope.systemRamBudgetBytes);
+        }
+        const parents = [];
+        for (const parent of input.parents) {
+          const root = await input.materializeParent(parent.brainId);
+          parents.push({ brainId: parent.brainId, generationSha256: parent.generationSha256,
+            enginePath: relative(input.targetDirectory, join(root, "engine")).split(sep).join("/") });
+        }
+        const receipt = objectRecord(await this.engine.request<unknown>("full_merge_assemble", {
+          brainId: input.targetBrainId, storagePath: input.targetDirectory, parents,
+          config: { ...input.request.config, hardwareTier: input.request.hardwareTier }, streamId: input.request.operationId
+        }, ENGINE_REQUEST_NO_DEADLINE, input.signal, "foreground", {
+          requestId: input.request.operationId, owner: "system", brainId: input.targetBrainId, label: "Assembling complete native parents"
+        }));
+        if (receipt?.format !== "omni-full-native-assembly" || receipt.formatVersion !== 1 || receipt.brainId !== input.targetBrainId ||
+          !/^[a-f0-9]{64}$/.test(String(receipt.descriptorSha256)) || objectRecord(receipt.origin)?.initialCurriculumRerun !== false) {
+          throw new Error("The native worker did not acknowledge the assembled merged origin.");
+        }
+        await adoptFullMergeHostState(input, (sha) => join(this.repository.root, ".blobs", sha));
+        await adoptFullMergeActionEvidence(input);
+        await adoptFullMergeLearningWorkspace(input);
+        await adoptFullMergeMcpApps(input);
+        await this.repository.createMergedDocument(input);
+        await this.fullMergePluginInitializer?.(
+          input.targetBrainId,
+          input.parents.map((parent) => parent.brainId)
+        );
+      },
+      verify: async (input) => {
+        const receipt = objectRecord(await this.engine.request<unknown>("full_merge_verify", {
+          brainId: input.targetBrainId, storagePath: input.targetDirectory
+        }, ENGINE_REQUEST_NO_DEADLINE, input.signal, "foreground", {
+          requestId: randomUUID(), owner: "system", brainId: input.targetBrainId, label: "Reloading and verifying the merged native instance"
+        }));
+        const marker = await verifyConnectedNativeOrigin(join(input.targetDirectory, "engine"), input.targetBrainId);
+        if (receipt?.brainId !== input.targetBrainId || receipt.verified !== true || receipt.descriptorSha256 !== marker.descriptorSha256) {
+          throw new Error("The native merge reload did not verify the same connected origin.");
+        }
+      },
+      onProgress: (progress) => {
+        for (const listener of this.fullMergeListeners) { try { listener(structuredClone(progress)); } catch { /* UI listeners cannot undo a commit. */ } }
+      }
+    });
+    return this.fullMergeCoordinator;
+  }
+
+  private runFullMerge(operationId: string, operation: (signal: AbortSignal) => Promise<FullMergeProgress>): Promise<FullMergeProgress> {
+    this.requireRuntimeAdmissionOpen();
+    if (this.fullMergeOperations.has(operationId) || this.fullMergeCancelling.has(operationId)) throw new Error("This full merge is already running or stopping.");
+    const controller = new AbortController();
+    this.fullMergeSignals.set(operationId, controller);
+    const promise = Promise.resolve().then(() => operation(controller.signal)).then(async (result) => {
+      if (result.state === "complete") {
+        const brain = await this.repository.get(result.targetBrainId);
+        this.sharedResources?.observeSaved(result.targetBrainId, brain.config.storagePoolBytes);
+      }
+      return result;
+    }).finally(() => { this.fullMergeOperations.delete(operationId); this.fullMergeSignals.delete(operationId); });
+    this.fullMergeOperations.set(operationId, promise);
+    return promise;
+  }
+
+  startFullMerge(request: FullMergeStartRequest): Promise<FullMergeProgress> {
+    validateFullMergeReview(request);
+    return this.runFullMerge(request.operationId, (signal) => this.fullMerges().start(request, signal));
+  }
+  resumeFullMerge(operationId: string): Promise<FullMergeProgress> {
+    return this.runFullMerge(operationId, (signal) => this.fullMerges().resume(operationId, signal));
+  }
+  listFullMerges(): Promise<FullMergeProgress[]> { return this.fullMerges().list(); }
+  fullMergeStatus(operationId: string): Promise<FullMergeProgress> { return this.fullMerges().status(operationId); }
+  async pauseFullMerge(operationId: string): Promise<FullMergeProgress> {
+    this.fullMergeSignals.get(operationId)?.abort(new Error("Full merge paused by user."));
+    this.fullMerges().pause(operationId);
+    await this.fullMergeOperations.get(operationId)?.catch(() => undefined);
+    return this.fullMerges().status(operationId);
+  }
+  async cancelFullMerge(operationId: string): Promise<FullMergeProgress> {
+    if (this.fullMergeCancelling.has(operationId)) throw new Error("This full merge is already stopping.");
+    this.fullMergeCancelling.add(operationId);
+    try {
+      await this.pauseFullMerge(operationId);
+      await this.fullMerges().cancel(operationId);
+      const result = await this.fullMerges().status(operationId);
+      await this.fullMergePluginRemover?.(result.targetBrainId).catch((error) =>
+        console.warn("Cancelled full-merge plugin custody cleanup is pending:", error)
+      );
+      this.sharedResources?.observeRemoved(result.targetBrainId);
+      return result;
+    } finally { this.fullMergeCancelling.delete(operationId); }
+  }
+  fullMergeHistory(brainId: string, after?: number, limit?: number) {
+    return fullMergeHistory(this.repository.brainDirectory(brainId), brainId, after, limit);
+  }
+
+  async fullMergePendingIngestions(brainId: string): Promise<FullMergePendingIngestion[]> {
+    await this.repository.get(brainId);
+    const metadata = await committedEngineMetadata(this.repository.brainDirectory(brainId));
+    const queue = metadata?.connected_pending_ingestions;
+    if (!Array.isArray(queue)) return [];
+    return queue.map((value) => {
+      const item = objectRecord(value), checkpoint = objectRecord(item?.destinationCheckpoint ?? item?.checkpoint);
+      if (!item || !checkpoint || !/^[a-f0-9]{64}$/.test(String(item.id)) || !["queued", "active", "complete"].includes(String(item.status))) throw new Error("Invalid merged source queue.");
+      return { id: String(item.id), status: item.status as FullMergePendingIngestion["status"], parentId: String(item.parentId),
+        sourceNameSha256: String(checkpoint.sourceNameHash), contentSha256: String(checkpoint.contentHash),
+        committedRecords: Number(checkpoint.committedRecords), epoch: Number(checkpoint.epoch), policy: String(checkpoint.policy) };
+    });
+  }
+
+  async resumeFullMergeIngestion(request: FullMergeResumeIngestionRequest, sourcePath: string, jobId: string,
+    signal?: AbortSignal, onProgress?: (progress: number, message: string) => void): Promise<unknown> {
+    if (!/^[a-f0-9]{64}$/.test(request.pendingId) || !request.sourceName || request.sourceName.includes("\0")) throw new Error("Invalid retained source selection.");
+    await this.engine.claimForeground?.();
+    return withBrainWrite(this.repository, request.brainId, async () => {
+      await this.preflightStart(request.brainId);
+      const brain = await this.repository.get(request.brainId);
+      const storagePath = this.repository.brainDirectory(request.brainId);
+      const activated = objectRecord(await this.engine.request<unknown>("full_merge_activate_ingestion", {
+        brainId: request.brainId, storagePath, pendingId: request.pendingId, sourcePath, sourceName: request.sourceName
+      }, ENGINE_REQUEST_NO_DEADLINE, signal));
+      if (activated?.id !== request.pendingId || !["active", "complete"].includes(String(activated.state))) throw new Error("The worker did not acknowledge this retained source.");
+      if (activated.state === "complete") return activated;
+      const checkpoint = objectRecord(activated.checkpoint);
+      if (!checkpoint || !/^[a-f0-9]{64}$/.test(String(checkpoint.transactionId))) throw new Error("The worker did not retain the original source transaction.");
+      const listener = (event: EngineEvent): void => {
+        if (event.type === "job-progress" && event.jobId === jobId && typeof event.progress === "number") onProgress?.(event.progress, event.message ?? "Resuming retained source");
+      };
+      this.engine.on("event", listener);
+      try {
+        const result = await this.engine.request<WorkerIngestResult>("ingest", {
+          brainId: request.brainId, storagePath, config: brain.config, jobId, path: sourcePath, name: request.sourceName,
+          kind: checkpoint.resolvedKind, policy: checkpoint.policy, epoch: checkpoint.epoch,
+          contentHash: checkpoint.contentHash, transactionKey: checkpoint.transactionId, idempotencyKey: checkpoint.transactionId,
+          allowReplay: true, committedSqliteSnapshot: checkpoint.resolvedKind === "sqlite"
+        }, ENGINE_REQUEST_NO_DEADLINE, signal);
+        const queue = await this.fullMergePendingIngestions(request.brainId);
+        if (queue.find((item) => item.id === request.pendingId)?.status !== "complete") throw new Error("The retained source remains incomplete at its committed cursor.");
+        synchronizeWorkerSummary(brain, result);
+        await this.repository.save(brain);
+        return { ...result, pendingId: request.pendingId, state: "complete" };
+      } finally { this.engine.off("event", listener); }
+    }, signal);
+  }
+
   private readonly actionEvidenceStores = new Map<string, CompletedActionEvidenceStore>();
   private readonly actionEvidenceDrains = new Map<string, Promise<void>>();
   private readonly actionEvidenceRetries = new Map<string, NodeJS.Timeout>();
   private completedActionLearningOwner?: string;
+  private webImageObservationValidator?: (brainId: string, turnId: string, value: unknown, signal?: AbortSignal) => Promise<WebImageSelection>;
+  setWebImageObservationValidator(validate: NonNullable<BrainService["webImageObservationValidator"]>): void { this.webImageObservationValidator = validate; }
   readonly datasets: DatasetManifestStore;
+  private pluginTrainingFormats?: PluginTrainingFormatResolver;
+  private taskAttachmentService?: Pick<TaskAttachmentService,
+    "bindToTurn" | "resolveForTurn" | "list" | "handlesForTurn"> &
+    { listForTurn(brainId: string, turnId: string): Promise<TaskAttachmentVisibleReference[]> } &
+    Partial<Pick<TaskContinuationAttachments, "projectMessage" | "hasContinuationScope" | "activateRetained" | "validateCurrentInput" | "activateInheritedResume" | "finishInheritedExecution" | "reviewedAccess">>;
   private readonly externalToolSchemas = new Map<string, ExternalToolSchema>();
   private readonly chatSlowLearning = new Map<string, Promise<void>>();
   private readonly chatSlowLearningTimers = new Map<string, NodeJS.Timeout>();
+  private readonly preferredExperienceLearning = new Map<string, Map<string, AdmittedExperienceLearningReceipt>>();
+  private readonly experienceLearningListeners = new Set<(receipt: AdmittedExperienceLearningReceipt) => void>();
+
+  onExperienceLearning(listener: (receipt: AdmittedExperienceLearningReceipt) => void): () => void {
+    this.experienceLearningListeners.add(listener); return () => this.experienceLearningListeners.delete(listener);
+  }
+
+  /** Trusted main composition only; package code never receives this seam. */
+  setPluginTrainingFormatResolver(resolver: PluginTrainingFormatResolver): void {
+    this.pluginTrainingFormats = resolver;
+  }
+
+  /** Trusted main composition; handles remain main/native-owned and never become prompt text. */
+  setTaskAttachmentService(service: Pick<TaskAttachmentService,
+    "bindToTurn" | "resolveForTurn" | "list" | "handlesForTurn"> &
+    { listForTurn(brainId: string, turnId: string): Promise<TaskAttachmentVisibleReference[]> } &
+    Partial<Pick<TaskContinuationAttachments, "projectMessage" | "hasContinuationScope" | "activateRetained" | "validateCurrentInput" | "activateInheritedResume" | "finishInheritedExecution" | "reviewedAccess">>): void {
+    this.taskAttachmentService = service;
+  }
+
+  bindTaskAttachments(brainId: string, turnId: string, attachmentIds: readonly string[]): Promise<ChatTaskAttachmentResolved[]> {
+    if (!this.taskAttachmentService) throw new Error("Task attachment service is unavailable.");
+    return this.taskAttachmentService.bindToTurn(brainId, turnId, attachmentIds);
+  }
+
+  private async taskAttachmentHandles(brainId: string, turnId: string): Promise<ChatTaskAttachmentHandle[]> {
+    if (!this.taskAttachmentService) return [];
+    return (await this.taskAttachmentService.handlesForTurn(brainId, turnId))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  }
+
+  private taskAttachmentMessage(
+    message: ChatMessage,
+    attachments: readonly ChatTaskAttachmentHandle[]
+  ): ChatMessage {
+    return this.taskAttachmentService?.projectMessage
+      ? this.taskAttachmentService.projectMessage(message, attachments)
+      : projectTaskAttachmentIds(message, attachments);
+  }
+
+  async teachSupplementaryCapabilities(brainId: string, pack: DeclaredCapabilityPack, signal: AbortSignal): Promise<NonNullable<LearningTask["capabilityPack"]>["receipt"]> {
+    this.requireInstanceLoaded(brainId);
+    return this.commitSupplementaryCapabilities(brainId, pack, signal, () => this.requireInstanceLoaded(brainId));
+  }
+
+  /**
+   * Learn the separately versioned public manuals as ordinary attributable
+   * text before first chat. This neither changes the frozen origin curriculum
+   * nor supplies action targets, persona instructions, or fabricated outcomes.
+   */
+  async teachInitialDocumentation(
+    brainId: string,
+    suppliedPack: DocumentationCurriculumPack = declaredDocumentationCurriculumPack()
+  ): Promise<DocumentationCurriculumReceipt> {
+    const { BuildInitializationPlanStore } = await import("./buildInitializationPlan");
+    const plans = new BuildInitializationPlanStore(this.repository);
+    const plan = await plans.get(brainId);
+    const brain = await this.repository.get(brainId);
+    if (
+      brain.readiness.state !== "initializing" ||
+      !plan ||
+      plan.phase !== "initial-learning" ||
+      plan.tasks.some((task) => task.state !== "complete")
+    ) {
+      throw new Error(
+        "Initial documentation learning requires this Build's completed, owned initial-learning plan."
+      );
+    }
+    const expected = declaredDocumentationCurriculumPack();
+    if (
+      suppliedPack.format !== expected.format ||
+      suppliedPack.version !== expected.version ||
+      suppliedPack.id !== expected.id ||
+      suppliedPack.sha256 !== expected.sha256 ||
+      suppliedPack.hiddenPrompt !== false ||
+      suppliedPack.behavioralPersona !== false ||
+      suppliedPack.executedHostActions !== false ||
+      suppliedPack.records.length !== expected.records.length ||
+      suppliedPack.records.some((record, index) => {
+        const reference = expected.records[index];
+        return (
+          !reference ||
+          record.id !== reference.id ||
+          record.contentSha256 !== reference.contentSha256 ||
+          sha256(record.content) !== reference.contentSha256
+        );
+      })
+    ) {
+      throw new Error("The initial documentation curriculum declaration is invalid.");
+    }
+
+    // Explicit Build recovery, never a foreign foundation fallback. The
+    // already committed native origin is loaded idempotently.
+    await this.resumeFoundation(brainId, plan.foundation);
+    return withBrainWrite(this.repository, brainId, async () => {
+      const current = await this.repository.get(brainId);
+      const currentPlan = await plans.get(brainId);
+      if (
+        current.readiness.state !== "initializing" ||
+        !currentPlan ||
+        currentPlan.phase !== "initial-learning" ||
+        currentPlan.tasks.some((task) => task.state !== "complete")
+      ) {
+        throw new Error("The Build owner changed before initial documentation learning.");
+      }
+      const records: DocumentationCurriculumReceipt["records"] = [];
+      for (const record of suppliedPack.records) {
+        const prior = await this.repository.trainingSourceByContentHash(
+          brainId,
+          record.contentSha256
+        );
+        const learned = await this.learnStructuredExperienceUnlocked(brainId, {
+          content: record.content,
+          name: `${record.name} [${suppliedPack.id}]`,
+          sourceLabel: `${suppliedPack.id}/${record.id}`,
+          provenanceUrl: record.provenanceUrl,
+          license: suppliedPack.license,
+          licenseUrl: `${suppliedPack.repository}/blob/main/LICENSE.md`
+        });
+        if (
+          learned.source.contentHash !== record.contentSha256 ||
+          learned.source.rawTextRetained !== false ||
+          learned.source.policy !== "pretrain"
+        ) {
+          throw new Error(
+            `Documentation record ${record.id} did not commit its exact ordinary-learning receipt.`
+          );
+        }
+        if (
+          !prior &&
+          learned.source.parametersChanged !== true &&
+          (learned.source.learnedParameterSteps ?? 0) <= 0 &&
+          learned.source.learnedSynapses <= 0 &&
+          learned.source.learnedIdeas <= 0 &&
+          learned.source.learnedConcepts <= 0
+        ) {
+          throw new Error(
+            `Documentation record ${record.id} completed without a measured neural mutation.`
+          );
+        }
+        records.push({
+          id: record.id,
+          contentSha256: record.contentSha256,
+          trainingSourceId: learned.source.id,
+          duplicate: Boolean(prior),
+          parametersChanged: learned.source.parametersChanged === true,
+          learnedParameterSteps: learned.source.learnedParameterSteps ?? 0
+        });
+      }
+      const marker = `documentationPack=${suppliedPack.id}; version=${suppliedPack.version}; sha256=${suppliedPack.sha256}`;
+      const persisted = await this.repository.get(brainId);
+      if (!(persisted.journal ?? []).some((entry) => entry.detail === marker)) {
+        persisted.journal = [
+          ...(persisted.journal ?? []),
+          {
+            id: randomUUID(),
+            createdAt: new Date().toISOString(),
+            kind: "learning",
+            summary: "Learned the versioned Omni Studio user documentation pack.",
+            detail: marker
+          }
+        ];
+        await this.repository.save(persisted);
+      }
+      return {
+        format: "omni-documentation-curriculum-receipt",
+        version: 1,
+        packId: suppliedPack.id,
+        packVersion: suppliedPack.version,
+        packSha256: suppliedPack.sha256,
+        complete: true,
+        records
+      };
+    });
+  }
+
+  /** The explicit, still-initializing Build owner may teach before first chat. */
+  async teachInitialCapabilities(brainId: string): Promise<NonNullable<LearningTask["capabilityPack"]>["receipt"]> {
+    const { BuildInitializationPlanStore } = await import("./buildInitializationPlan");
+    const plan = await new BuildInitializationPlanStore(this.repository).get(brainId);
+    const brain = await this.repository.get(brainId);
+    if (brain.readiness.state !== "initializing" || !plan || plan.phase !== "initial-learning" || plan.tasks.some(task => task.state !== "complete"))
+      throw new Error("Initial tool teaching requires this Build's completed, owned initial-learning plan.");
+    const pack = declaredLearningCapabilityPack();
+    // Explicit Build recovery, not a generic allow_load bypass. Existing
+    // committed origins are loaded idempotently; their curriculum is frozen.
+    await this.resumeFoundation(brainId, plan.foundation);
+    // The native duplicate path validates its saved receipt. A JSON boolean
+    // alone cannot stand in for the real already-committed teaching phase.
+    const authorize = async (): Promise<void> => {
+      const current = await this.repository.get(brainId);
+      if (current.readiness.state !== "initializing") throw new Error("The Build owner changed before initial tool teaching.");
+    };
+    const signal = new AbortController().signal;
+    const receipt = await this.commitSupplementaryCapabilities(brainId, pack, signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredClockCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredAutomationCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredMapCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredMapBasemapCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredAssemblyCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredEnvironmentCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredClipboardCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredWebImageCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredFileCapabilityPack(), signal, authorize);
+    return receipt;
+  }
+
+  private async commitSupplementaryCapabilities(brainId: string, pack: DeclaredCapabilityPack, signal: AbortSignal,
+    authorize: () => void | Promise<void>): Promise<NonNullable<LearningTask["capabilityPack"]>["receipt"]> {
+    return withBrainWrite(this.repository, brainId, async () => {
+      await authorize(); signal.throwIfAborted();
+      const result = await this.engine.request<{ brainId: string; committed: boolean; capabilityPack: NonNullable<NonNullable<LearningTask["capabilityPack"]>["receipt"]> }>(
+        "learn_capability_pack", { brainId, pack, storagePath: this.repository.brainDirectory(brainId), steps: 2 }, ENGINE_REQUEST_NO_DEADLINE, signal);
+      const receipt = result.capabilityPack;
+      const metadata = await committedEngineMetadata(this.repository.brainDirectory(brainId));
+      const committed = objectRecord(objectRecord(metadata?.supplementary_capability_receipts)?.[pack.sha256]);
+      if (result.brainId !== brainId || result.committed !== true || !receipt || receipt.packSha256 !== pack.sha256 ||
+          !committed || committed.sha256 !== receipt.sha256 || committed.packId !== pack.id) throw new Error("Supplementary tool teaching did not match its actual committed native receipt.");
+      return receipt;
+    }, signal);
+  }
+
+  private async rebindLearningSource(brainId: string, path: string, sourceName: string, signal?: AbortSignal,
+    transactionId?: string, selected?: LearningSourceRelocation): Promise<void> {
+    let relocation = selected;
+    if (!relocation) {
+      const reader = await openLearningRelocations(this.repository.brainDirectory(brainId), brainId);
+      try { relocation = reader?.generic(path); } finally { reader?.close(); }
+    }
+    if (!relocation) return;
+    this.requireInstanceLoaded(brainId); signal?.throwIfAborted();
+    const receipt = await this.engine.request<{ brainId: string; state: string; recordsReplayed?: number }>("rebind_learning_source", {
+      brainId, storagePath: this.repository.brainDirectory(brainId), path, sourceName,
+      originalSourceIdentity: relocation.originalSourceIdentity, contentHash: relocation.contentSha256,
+      sourceIdentityAliases: (relocation.identityPaths ?? []).map(path => sha256(`file\0${path}`)),
+      ...(relocation.parentId ? { parentId: relocation.parentId } : {}), ...(transactionId ? { transactionId } : {})
+    }, ENGINE_REQUEST_NO_DEADLINE, signal);
+    if (receipt.brainId !== brainId || !["not-started", "active", "complete"].includes(receipt.state) ||
+        receipt.recordsReplayed !== undefined && receipt.recordsReplayed !== 0) throw new Error("Retained source relocation did not acknowledge its exact no-replay boundary.");
+  }
+
+  async prioritizeAdmittedExperience(brainId: string, turnId: string): Promise<AdmittedExperienceLearningReceipt> {
+    this.requireInstanceLoaded(brainId, turnId);
+    const metadata = await committedEngineMetadata(this.repository.brainDirectory(brainId));
+    const receipt = admittedExperienceLearning(metadata ?? {}, brainId, turnId);
+    if (receipt.jobId && receipt.state === "queued") {
+      const preferred = this.preferredExperienceLearning.get(brainId) ?? new Map();
+      preferred.set(receipt.jobId, receipt); this.preferredExperienceLearning.set(brainId, preferred);
+      if (this.pausedChatLearning.has(brainId) || this.backgroundLearningSuspendedForLaunch || !(await this.repository.get(brainId)).config.onlineLearning) {
+        return { ...receipt, state: "paused", detail: "The admitted replay remains queued while continuous learning is paused." };
+      }
+      this.schedulePendingChatLearning(brainId, 1, receipt.jobId);
+    }
+    return receipt;
+  }
+
+  private publishExperienceLearning(receipt: AdmittedExperienceLearningReceipt): void {
+    for (const listener of this.experienceLearningListeners) { try { listener(receipt); } catch (error) { console.warn("Experience learning listener failed", error); } }
+  }
   private readonly chatSlowLearningFailures = new Map<string, number>();
   private readonly pausedChatLearning = new Set<string>();
   private readonly liveChatTurns = new Map<string, {
-    brainId: string; inputSha256: string; chatDispatched: boolean;
+    brainId: string; turnId: string; inputSha256: string; chatDispatched: boolean;
     outputEnded: boolean; steerSuccessor?: string;
+    inheritedExecutionId?: string; inputSignal?: AbortSignal;
+    detached?: InstanceContinuationDetachedError;
+    detach(error: InstanceContinuationDetachedError): void;
+    settled: Promise<void>;
   }>();
   private readonly inlineCancellationOwners = new Map<string, {
     brainId: string; turnId: string; actionId: string; pid?: number;
@@ -3952,12 +5072,53 @@ export class BrainService {
   private readonly inlineCancellationListeners = new Set<(event: {
     brainId: string; turnId: string; actionId: string;
   }) => void>();
+  private readonly toolPermissionListeners = new Set<(event: {
+    brainId: string;
+    toolId: string;
+    level: ToolPermissionLevel;
+    revision: number;
+  }) => void>();
   private inlineCancellationHooksInstalled = false;
   /** Development/live-QA override; never changes a saved brain configuration. */
   private readonly backgroundLearningSuspendedForLaunch =
     process.env.OMNI_SUSPEND_BACKGROUND_LEARNING === "1";
   private readonly chatParameterLearningRuntime =
     new Map<string, ChatParameterLearningRuntime>();
+  private spillSelectionClaimer?: (selectionId: string, brainId: string, paths: readonly string[]) => void;
+
+  setSpillSelectionClaimer(handler: (selectionId: string, brainId: string, paths: readonly string[]) => void): void {
+    this.spillSelectionClaimer = handler;
+  }
+
+  claimSpillPoolSelection(selectionId: string, brainId: string, paths: readonly string[]): void {
+    if (!this.spillSelectionClaimer) throw new Error("Local spill-root selection cannot be applied in this runtime.");
+    this.spillSelectionClaimer(selectionId, brainId, paths);
+  }
+
+  onToolPermissionChanged(listener: (event: {
+    brainId: string;
+    toolId: string;
+    level: ToolPermissionLevel;
+    revision: number;
+  }) => void): () => void {
+    this.toolPermissionListeners.add(listener);
+    return () => this.toolPermissionListeners.delete(listener);
+  }
+
+  private publishToolPermissionChanged(event: {
+    brainId: string;
+    toolId: string;
+    level: ToolPermissionLevel;
+    revision: number;
+  }): void {
+    for (const listener of this.toolPermissionListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        console.warn("Tool permission listener failed", error);
+      }
+    }
+  }
 
   isChatParameterLearningActive(brainId: string): boolean {
     return this.chatSlowLearning.has(brainId) ||
@@ -3974,9 +5135,25 @@ export class BrainService {
     readonly mediaArtifacts?: MediaArtifactRegistry,
     readonly sharedResources?: SharedResourceRegistry
   ) {
-    this.datasets = new DatasetManifestStore((brainId) =>
-      this.repository.brainDirectory(brainId)
+    this.datasets = new DatasetManifestStore(
+      (brainId) => this.repository.brainDirectory(brainId),
+      {
+        resolvePluginTrainingFormat: (brainId, path, mediaType, selection) =>
+          this.pluginTrainingFormats?.resolveTrainingFormat(brainId, path, mediaType, selection) ?? Promise.resolve(undefined)
+      }
     );
+    this.instanceLifecycle = new InstanceLifecycleController(repository.root, {
+      inspect: (id) => this.inspectNativeInstance(id), fit: (id, native) => this.fitInstance(id, native),
+      load: (id) => withBrainWrite(this.repository, id, async () => {
+        const brain = await this.repository.get(id); await this.preflightStart(id);
+        await this.engine.request("load", { brainId: id, config: brain.config, storagePath: this.repository.brainDirectory(id) },
+          await foregroundLoadTimeoutMs(this.repository.brainDirectory(id)));
+      }),
+      suspend: (id, report) => this.suspendInstanceRuntime(id, report),
+      releaseDispatch: (id) => this.engine.releaseInstanceDispatch?.(id),
+      resumeBackground: (id) => { if (![...this.liveChatTurns.values()].some((turn) => turn.brainId === id)) this.selectCompletedActionLearningOwner(id); }
+    });
+    this.engine.on?.("worker-closed", () => this.instanceLifecycle.workerClosed());
   }
 
   registerExternalToolSchemas(schemas: readonly ExternalToolSchema[]): void {
@@ -3989,7 +5166,11 @@ export class BrainService {
       this.externalToolSchemas.set(id, {
         id,
         actions,
-        ...(schema.inputSchema ? { inputSchema: structuredClone(schema.inputSchema) } : {})
+        ...(schema.inputSchema ? { inputSchema: structuredClone(schema.inputSchema) } : {}),
+        ...(schema.actionInputSchemas ? { actionInputSchemas: Object.fromEntries(Object.entries(schema.actionInputSchemas).map(([action, value]) => {
+          if (!actions.includes(action) || !value || typeof value !== "object" || Array.isArray(value)) throw new Error("External action schema does not match its declared action.");
+          return [action, structuredClone(value)];
+        })) } : {})
       });
     }
   }
@@ -4016,7 +5197,7 @@ export class BrainService {
     preserveFailure = false,
     retryDelayMs?: number
   ): void {
-    if (this.pausedChatLearning.has(brainId) || this.backgroundLearningSuspendedForLaunch) {
+    if (!this.instanceLifecycle.canRun(brainId) || this.pausedChatLearning.has(brainId) || this.backgroundLearningSuspendedForLaunch) {
       this.updateChatParameterLearningRuntime(brainId, { state: "paused" });
       return;
     }
@@ -4045,6 +5226,7 @@ export class BrainService {
    * the worker's atomic generation and pending-job tombstone make retry exact.
    */
   resumePendingChatLearning(brainId: string): void {
+    if (!this.instanceLifecycle.canRun(brainId)) return;
     if (brainId !== this.completedActionLearningOwner) return; // dormant library enumeration is not neural ownership
     if (this.pausedChatLearning.has(brainId) || this.backgroundLearningSuspendedForLaunch) {
       this.updateChatParameterLearningRuntime(brainId, { state: "paused" });
@@ -4090,12 +5272,14 @@ export class BrainService {
         // replay. Failed preflight keeps the durable job pending and reports
         // its reason; the bounded retry resumes when resources recover.
         await this.preflightStart(brainId, { selectActiveRuntime: false });
-        if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) return;
+        if (!this.instanceLifecycle.canRun(brainId) || brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) return;
         this.updateChatParameterLearningRuntime(brainId, {
           state: "running",
           startedAt: new Date().toISOString(),
           error: undefined
         });
+        const selectedExperience = this.preferredExperienceLearning.get(brainId)?.values().next().value as AdmittedExperienceLearningReceipt | undefined;
+        if (selectedExperience) this.publishExperienceLearning({ ...selectedExperience, state: "running", detail: "Replaying this admitted experience in the same native brain." });
         const result = await this.engine.request<{
           processed?: boolean;
           jobComplete?: boolean;
@@ -4109,6 +5293,7 @@ export class BrainService {
           "consolidate_chat_learning",
           {
             brainId,
+            ...(selectedExperience?.jobId ? { jobId: selectedExperience.jobId } : {}),
             onlineLearning: true,
             storagePath: this.repository.brainDirectory(brainId)
           },
@@ -4122,6 +5307,12 @@ export class BrainService {
             brainId
           }
         );
+        if (selectedExperience) {
+          const committed = admittedExperienceLearning(await committedEngineMetadata(this.repository.brainDirectory(brainId)) ?? {}, brainId, selectedExperience.turnId);
+          if (committed.state === "complete" || committed.state === "retained" || committed.state === "unresolved") this.preferredExperienceLearning.get(brainId)?.delete(selectedExperience.jobId!);
+          this.publishExperienceLearning({ ...committed,
+            parameterChanged: typeof result.parameterChecksumBefore === "string" && typeof result.parameterChecksumAfter === "string" ? result.parameterChecksumBefore !== result.parameterChecksumAfter : undefined });
+        }
         if (result.processed === true && Number(result.pending ?? 0) > 0) {
           retryPriority = Number(result.nextPriority ?? 0);
         }
@@ -4236,12 +5427,17 @@ export class BrainService {
   }
 
   async queueCompletedToolExecution(invocation: import("../shared/types").ToolInvocation,
-    execution: import("../shared/types").ToolExecutionResult, chatTurnId?: string): Promise<void> {
-    await this.actionEvidenceStore(invocation.brainId).stageTool(invocation, execution, chatTurnId);
+    execution: import("../shared/types").ToolExecutionResult, chatTurnId?: string, actionEventId?: string): Promise<void> {
+    await this.actionEvidenceStore(invocation.brainId).stageTool(invocation, execution, chatTurnId, actionEventId);
     this.resumeCompletedActionLearning(invocation.brainId);
+  }
+  recoverCompletedNativeEffect(invocation: import("../shared/types").ToolInvocation,
+    owner: { turnId: string; neuralActionId: string }): Promise<import("../shared/types").ToolExecutionResult | undefined> {
+    return this.actionEvidenceStore(invocation.brainId).recoverNativeEffect(invocation, owner);
   }
 
   resumeCompletedActionLearning(brainId: string): void {
+    if (!this.instanceLifecycle.canRun(brainId)) return;
     if (brainId !== this.completedActionLearningOwner || this.backgroundLearningSuspendedForLaunch || this.pausedChatLearning.has(brainId)) return;
     if (this.actionEvidenceDrains.has(brainId)) return;
     const timer = this.actionEvidenceRetries.get(brainId);
@@ -4252,7 +5448,7 @@ export class BrainService {
         const owner = await this.repository.get(brainId); // never resurrect a removed owner through a retry timer
         if (!owner.config.onlineLearning) return;
         for (const job of await store.pending()) {
-          if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) break;
+          if (!this.instanceLifecycle.canRun(brainId) || brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) break;
           job.attempts += 1; job.updatedAt = new Date().toISOString();
           await store.save(job);
           try {
@@ -4261,13 +5457,24 @@ export class BrainService {
               const receipt = await withBrainWrite(this.repository, brainId, async () => {
                 if (brainId !== this.completedActionLearningOwner || this.pausedChatLearning.has(brainId)) throw new Error("Evidence owner yielded to another selected identity.");
                 await this.preflightStart(brainId, { selectActiveRuntime: false });
-                return this.engine.request<CompletedActionEvidenceReceipt>("learn_action_result", {
+                let selectedImage: WebImageSelection | undefined;
+                if (job.provenance.toolId === "web.fetch" && job.provenance.action === "inspect-image" && job.provenance.executionState === "complete") {
+                  if (!this.webImageObservationValidator) throw new Error("Selected image native admission is unavailable.");
+                  selectedImage = await readWebImageActionEvidence(store.evidencePath(job.evidenceId), brainId, job.evidenceId, job.executionId, job.evidenceSha256,
+                    async bytes => { if (!hasTextMemoryHeadroom(bytes) || freemem() - memoryReserveBytes() < bytes) throw new Error("Selected image action descriptor awaits transfer RAM."); });
+                  await this.webImageObservationValidator(brainId, selectedImage.turnId, selectedImage);
+                }
+                const learned = await this.engine.request<CompletedActionEvidenceReceipt>("learn_action_result", {
                   brainId, evidenceId: job.evidenceId, executionId: job.executionId,
                   evidencePath: store.evidencePath(job.evidenceId), evidenceSha256: job.evidenceSha256,
-                  provenance: job.provenance, storagePath: this.repository.brainDirectory(brainId)
+                  provenance: job.provenance, ...(job.mergeContinuation ? { mergeContinuation: job.mergeContinuation } : {}),
+                  storagePath: this.repository.brainDirectory(brainId)
                 }, ENGINE_REQUEST_NO_DEADLINE, undefined, "background", {
                   requestId: job.evidenceId, owner: "training", label: "Confirmed action evidence learning", brainId
                 });
+                if (selectedImage && (!learned.webImage || learned.webImage.selectionSha256 !== selectedImage.selectionSha256 || learned.webImage.referenceId !== selectedImage.reference.id ||
+                  learned.webImage.sourceSha256 !== selectedImage.download.sha256 || learned.webImage.sourceBytes !== selectedImage.download.bytes)) throw new Error("Selected image result has no matching native pixel-learning receipt.");
+                return learned;
               });
               job.receipt = validateActionEvidenceReceipt(receipt, job);
               await store.save(job); // native committed receipt survives route retry/lost host ACK
@@ -4316,6 +5523,7 @@ export class BrainService {
     actions: readonly string[];
     grant: ToolPermissionLevel;
     inputSchema?: Record<string, unknown>;
+    actionInputSchemas?: Record<string, Record<string, unknown>>;
   }> {
     return enabledToolSchemas(brain, this.externalToolSchemas);
   }
@@ -4332,7 +5540,7 @@ export class BrainService {
       ? await this.repository.get(scopedBrainId)
       : undefined;
     const saved = brain ? await savedRuntimeShape(this.repository.brainDirectory(brain.id), brain.id, brain.config) : undefined;
-    return this.resourcePlanner.plan(request, {
+    return this.resourcePlanner.plan({ ...request, ...(scopedBrainId ? { brainId: scopedBrainId } : {}) }, {
       hardwareTier: brain ? undefined : options.hardwareTier,
       config: brain ? { ...brain.config, ...saved } : undefined,
       brainDirectory: brain
@@ -4346,6 +5554,7 @@ export class BrainService {
     brainId: string,
     options: { selectActiveRuntime?: boolean } = {}
   ): Promise<WorkingMemoryResourcePlan | undefined> {
+    this.requireRuntimeAdmissionOpen();
     this.sharedResources?.requireSynchronized();
     if (!this.resourcePlanner) return undefined;
     const brain = await this.repository.get(brainId);
@@ -4355,6 +5564,7 @@ export class BrainService {
       {
         // Startup must validate the persisted selection, not silently resize
         // an Auto/Extended instance to today's recommendation.
+        brainId,
         mode: "manual",
         requestedItems: String(brain.config.workingMemorySlots),
         requestedContextTokens: String(brain.config.contextWindowTokens),
@@ -4390,6 +5600,8 @@ export class BrainService {
   async updateConfig(brainId: string, config: BrainConfig): Promise<BrainDocument> {
     return withBrainWrite(this.repository, brainId, async () => {
       const current = await this.repository.get(brainId);
+      const native = await this.inspectNativeInstance(brainId);
+      const runtimeLoaded = this.instanceLifecycle.isLoaded(brainId);
       if (typeof config !== "object" || config === null || Array.isArray(config)) {
         throw new Error("Invalid brain configuration.");
       }
@@ -4423,6 +5635,8 @@ export class BrainService {
       if (!Number.isSafeInteger(config.contextWindowTokens) || config.contextWindowTokens < 8) {
         throw new Error("Active context must contain at least eight tokens.");
       }
+      if (!Number.isSafeInteger(native.minimumContextTokens) || native.minimumContextTokens < 0) throw new Error("The current execution context occupancy is unavailable.");
+      if (config.contextWindowTokens < native.minimumContextTokens) throw new Error(`The paused execution already uses ${native.minimumContextTokens} context tokens. Its context cannot be reduced below that frontier.`);
 
       let resolvedConfig = this.repository.prepareConfig({
         ...config,
@@ -4439,6 +5653,7 @@ export class BrainService {
           {
             // Settings already carries the user's resolved context choice.
             // Revalidate that exact choice instead of silently resizing it.
+            brainId,
             mode: "manual",
             requestedItems: String(resolvedConfig.workingMemorySlots),
             requestedContextTokens: String(resolvedConfig.contextWindowTokens),
@@ -4484,13 +5699,13 @@ export class BrainService {
       this.sharedResources?.observeSaved(current.id, current.config.storagePoolBytes);
       this.sharedResources?.requireSynchronized();
       let resourceSelection: SharedRamSelection | undefined;
-      if (selectedRamBudget !== undefined) {
+      if (runtimeLoaded && selectedRamBudget !== undefined) {
         resourceSelection = this.sharedResources?.selectActiveRuntime(
           brainId, current.config.storagePoolBytes, selectedRamBudget
         );
       }
       try {
-        await this.engine.request(
+        if (runtimeLoaded) await this.engine.request(
           "update_config",
           { brainId, config: resolvedConfig, storagePath },
           300_000
@@ -4510,7 +5725,7 @@ export class BrainService {
         // The worker persists its own config, so restore it if the desktop
         // document's atomic commit unexpectedly fails.
         try {
-          await this.engine.tryRequest(
+          if (runtimeLoaded) await this.engine.tryRequest(
             "update_config",
             { brainId, config: current.config, storagePath },
             300_000
@@ -4580,6 +5795,7 @@ export class BrainService {
       foundation: InitialFoundationPlan
     ) => Promise<void>
   ): Promise<BrainDocument> {
+    this.requireRuntimeAdmissionOpen();
     const supplied = request as unknown as Record<string, unknown>;
     if (["origin", "starterUrl", "foundationModelId", "foundationRiskAcknowledged"]
       .some((field) => Object.hasOwn(supplied, field))) {
@@ -4638,6 +5854,8 @@ export class BrainService {
     const memoryPlan = await this.resourcePlanner.plan(
       {
         mode: memoryMode,
+        deviceResources: request.config.deviceResources,
+        spillPoolSelectionId: request.spillPoolSelectionId,
         requestedItems: request.workingMemory?.requestedItems,
         requestedContextTokens:
           request.workingMemory?.requestedContextTokens,
@@ -4713,6 +5931,9 @@ export class BrainService {
       initializing: true,
       recovery
     });
+    if (request.spillPoolSelectionId !== undefined) {
+      this.claimSpillPoolSelection(request.spillPoolSelectionId, brain.id, brain.config.deviceResources?.storageDirectories ?? []);
+    }
     if (request.initialToolPermissions) {
       const selected = new Map(
         request.initialToolPermissions.map((permission) => [
@@ -4720,21 +5941,15 @@ export class BrainService {
           permission.level
         ])
       );
-      brain.toolPermissions = (brain.toolPermissions ?? []).map((permission) => ({
-        ...permission,
-        level: selected.get(permission.toolId) ?? permission.level,
-        updatedAt: new Date().toISOString()
-      }));
       for (const [toolId, level] of selected) {
-        if (!brain.toolPermissions.some((permission) => permission.toolId === toolId)) {
-          brain.toolPermissions.push({
-            toolId,
-            label: displayToolLabel(toolId),
-            level,
-            updatedAt: new Date().toISOString()
-          });
-        }
+        await this.setToolPermission(
+          brain.id,
+          toolId,
+          level,
+          `build-${randomUUID()}`
+        );
       }
+      brain = await this.repository.get(brain.id);
     }
     brain.journal = [
       ...(brain.journal ?? []),
@@ -4843,6 +6058,18 @@ export class BrainService {
     return brain;
   }
 
+  async queryWholeBrain(brainId: string, input: import("../shared/wholeBrainInspection").WholeBrainInspectionQuery = {}, signal?: AbortSignal): Promise<import("../shared/wholeBrainInspection").WholeBrainInspectionPage> {
+    this.requireRuntimeAdmissionOpen();
+    // Inspection must not select another active runtime or demand a model Load.
+    await this.repository.get(brainId, false);
+    const { checkedWholeBrainInspectionQuery, checkedWholeBrainInspectionPage } = await import("./wholeBrainInspectionProtocol");
+    const query = checkedWholeBrainInspectionQuery(input);
+    const result = await this.engine.request<unknown>("query_whole_brain", {
+      brainId, storagePath: this.repository.brainDirectory(brainId), query
+    }, 30_000, signal);
+    return checkedWholeBrainInspectionPage(result, brainId, query);
+  }
+
   async queryCortex(brainId: string, query: CortexQuery = {}, signal?: AbortSignal): Promise<CortexPage> {
     await this.preflightStart(brainId);
     await this.repository.get(brainId);
@@ -4872,12 +6099,20 @@ export class BrainService {
     await this.repository.get(brainId);
     if (typeof query.module !== "string" || query.module.length > 512 || typeof query.enabled !== "boolean"
         || (query.start !== undefined && (!Number.isSafeInteger(query.start) || query.start < 0))
-        || (query.count !== undefined && (!Number.isSafeInteger(query.count) || query.count < 1))) {
+        || (query.count !== undefined && (!Number.isSafeInteger(query.count) || query.count < 1))
+        || (query.captureId !== undefined && (typeof query.captureId !== "string" || !query.captureId || query.captureId.length > 128))) {
       throw new Error("Invalid observed cortical activity viewport.");
     }
     return this.engine.request<CortexActivity>("cortex_activity", {
       brainId, storagePath: this.repository.brainDirectory(brainId), query
     }, 10_000);
+  }
+
+  async routerActivity(brainId: string, input: RouterSpikeQuery): Promise<RouterSpikeActivity> {
+    const query = validateRouterSpikeQuery(input);
+    await this.repository.get(brainId);
+    const value = await this.engine.routerActivity(brainId, this.repository.brainDirectory(brainId), query);
+    return checkedRouterSpikeActivity(value, brainId, query);
   }
 
   async querySubstrate(
@@ -5072,47 +6307,31 @@ export class BrainService {
     operation?: BrainStorageOperationHooks
   ): Promise<BrainDocument> {
     await this.engine.claimForeground?.();
-    const reload = async (
-      requestId: string,
-      signal?: AbortSignal
-    ): Promise<void> => {
-      const result = await this.engine.request<unknown>(
-        "reload",
-        {
-          brainId,
-          storagePath: this.repository.brainDirectory(brainId)
-        },
-        ENGINE_REQUEST_NO_DEADLINE,
-        signal,
-        "foreground",
-        {
-          requestId,
-          owner: "system",
-          label: "Reloading neural recovery point",
-          brainId
-        }
-      );
-      const record = objectRecord(result);
-      if (record?.brainId !== brainId) {
-        throw new Error(
-          "The neural worker did not acknowledge the restored identity."
-        );
+    const unloaded = await this.unloadInstance(brainId);
+    if (unloaded.learnedRuntimeResident || !["unloaded", "suspended"].includes(unloaded.phase)) {
+      throw new Error("Recovery waits for an acknowledged native unload; its current turn has not been discarded.");
+    }
+    await this.detachInstanceHostContinuations(brainId);
+    for (const boundary of this.instanceRecoveryBoundaries) await boundary(brainId);
+    const verifyUnloaded = async (): Promise<void> => {
+      operation?.signal.throwIfAborted();
+      const native = await this.inspectNativeInstance(brainId);
+      if (native.brainId !== brainId || native.learnedRuntimeResident) {
+        throw new Error("The recovered identity has not remained explicitly unloaded.");
       }
+      await this.instanceLifecycle.status(brainId);
     };
     try {
       return await this.repository.restoreSnapshot(
         brainId,
         snapshotId,
         operation,
-        () => reload(operationId, operation?.signal)
+        verifyUnloaded
       );
     } catch (error) {
-      // The repository rolls disk and host ledgers back before this point. If
-      // reload failed after evicting the worker cache, restore the rolled-back
-      // live checkpoint when cancellation did not explicitly stop the work.
-      if (!operation?.signal.aborted) {
-        await reload(randomUUID()).catch(() => undefined);
-      }
+      // Repository rollback restores the durable prior frontier. It still
+      // requires explicit Load; never allocate a model as error recovery.
+      await this.instanceLifecycle.status(brainId).catch(() => undefined);
       throw error;
     }
   }
@@ -5180,6 +6399,7 @@ export class BrainService {
     brainId: string,
     operationId: string = randomUUID()
   ): Promise<FreshAttentionResult> {
+    this.requireInstanceLoaded(brainId);
     await this.engine.claimForeground?.();
     return withBrainWrite(this.repository, brainId, async () => {
       await this.preflightStart(brainId);
@@ -5278,17 +6498,50 @@ export class BrainService {
     turnId: string = randomUUID(),
     responseTokenBudget?: number,
     temporarySteeringContext?: TemporarySteeringContext,
-    toolObservationWaitMs?: number
+    toolObservationWaitMs?: number,
+    initialResume?: InstanceResumeFrontier,
+    inheritedExecutionId?: string,
+    appInput?: NativeAppChatInput,
+    nativeAudioInput?: NativeAudioInput
   ): Promise<ChatResult> {
-    const message = cleanMessage(input);
+    if (input === "" && initialResume && nativeAudioInput === undefined) {
+      this.requireInstanceLoaded(id, initialResume.turnId);
+      const retained = inheritedExecutionId
+        ? (await this.engine.inheritedExecutionPresentation(id, this.repository.brainDirectory(id), inheritedExecutionId)).presentation
+        : (await this.inspectNativeInstance(id)).presentation;
+      const raw = objectRecord(retained?.inputReceipt)?.nativeAudioInput;
+      if (raw === undefined) throw new Error("The saved empty-input turn has no authenticated native audio source.");
+      nativeAudioInput = verifiedNativeAudioReceipt(raw).input;
+    }
+    nativeAudioInput = nativeAudioInput === undefined ? undefined : verifiedNativeAudioInput(nativeAudioInput);
+    const message = nativeAudioInput ? input === "" ? "" : (() => { throw new Error("Native audio cannot contain a transcript substitute."); })() : cleanMessage(input);
+    const inputSha256 = expectedChatInputHash(message, nativeAudioInput);
+    if (nativeAudioInput && (appInput || !initialResume && (nativeAudioInput.attachment.turnId !== turnId || nativeAudioInput.attachment.brainId !== id))) throw new Error("Native audio input belongs to another turn or source.");
+    if (appInput && (checkedChatInputProvenance(appInput.provenance).inputSha256 !== sha256(message) || initialResume || inheritedExecutionId)) throw new Error("App task proof does not match this original input boundary.");
     signal?.throwIfAborted();
     const sizingBrain = await this.repository.get(id);
+    if (sizingBrain.readiness.state !== "ready") throw new Error("This mind is still completing its initial learning and cannot chat yet.");
+    this.requireInstanceLoaded(id, initialResume?.turnId);
+    if (initialResume) {
+      const current = inheritedExecutionId ? await this.instanceInheritedResumePresentation(id, inheritedExecutionId) : await this.instanceResumePresentation(id);
+      if (!current || current.frontier.checkpointId !== initialResume.checkpointId || current.frontier.turnId !== turnId ||
+          current.input !== message || current.frontier.inputSha256 !== inputSha256) throw new Error("The original saved turn changed before reattachment.");
+      if (inheritedExecutionId && this.taskAttachmentService?.activateInheritedResume) {
+        await this.taskAttachmentService.activateInheritedResume(await this.taskFileContextFromInherited(id, inheritedExecutionId, current));
+      } else if (this.taskAttachmentService?.activateRetained && await this.taskAttachmentService.hasContinuationScope?.(id, turnId)) {
+        // Scope activation is AFTER exact native frontier/current-owner verification, never a Load click or renderer turn ID.
+        const inherited = inheritedExecutionId ? await this.engine.inheritedExecutionPresentation(id, this.repository.brainDirectory(id), inheritedExecutionId) : undefined;
+        const native = inherited ? undefined : await this.inspectNativeInstance(id);
+        await this.taskAttachmentService.activateRetained(verifiedTaskContinuationResume({ brainId: id,
+          frontier: initialResume, input: message, inputSha256, inheritedExecutionId }, inherited ?? native!));
+      }
+    }
+    await this.taskAttachmentService?.validateCurrentInput?.(id, turnId, inputSha256, signal);
     const inputCapacity = chatInputCapacity(message, sizingBrain.config.contextWindowTokens);
     if (!inputCapacity.fits) {
       // Recover an already committed exact turn without admitting it again.
       // Changing the selected context must not invalidate a lost acknowledgement.
       const metadata = await committedEngineMetadata(this.repository.brainDirectory(id));
-      const inputSha256 = sha256(message);
       const completed = metadata?.brain_id === id && Array.isArray(metadata.completed_chat_turns)
         ? metadata.completed_chat_turns.map(objectRecord).find((receipt) =>
           receipt?.turnId === turnId && receipt.inputSha256 === inputSha256)
@@ -5304,51 +6557,89 @@ export class BrainService {
       throw new Error(inputCapacity.reason);
     }
     signal?.throwIfAborted();
-    if (this.liveChatTurns.has(turnId)) throw new Error("This chat turn already owns the neural write boundary.");
-    const ownership = { brainId: id, inputSha256: sha256(message),
-      chatDispatched: false, outputEnded: false } as {
-      brainId: string; inputSha256: string; chatDispatched: boolean;
+    const turnKey = chatTurnKey(id, turnId);
+    if (this.liveChatTurns.has(turnKey)) throw new Error("This chat turn already owns the neural write boundary.");
+    let rejectDetached!: (error: InstanceContinuationDetachedError) => void, resolveSettled!: () => void;
+    const detached = new Promise<never>((_resolve, reject) => { rejectDetached = reject; });
+    void detached.catch(() => undefined); // The native boundary may be reached before its host wait is installed.
+    const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    const ownership = { brainId: id, turnId, inputSha256, inheritedExecutionId, inputSignal: signal,
+      chatDispatched: false, outputEnded: false, settled,
+      detach(error: InstanceContinuationDetachedError) { this.detached = error; rejectDetached(error); } } as {
+      brainId: string; turnId: string; inputSha256: string; chatDispatched: boolean;
       outputEnded: boolean; steerSuccessor?: string;
+      inheritedExecutionId?: string; inputSignal?: AbortSignal;
+      detached?: InstanceContinuationDetachedError; detach(error: InstanceContinuationDetachedError): void; settled: Promise<void>;
     };
-    this.liveChatTurns.set(turnId, ownership);
+    this.liveChatTurns.set(turnKey, ownership);
     let minimumInferenceCount: number | undefined;
     let neuralRequestStarted = false;
+    let resume = initialResume;
     try {
       await this.engine.claimForeground?.();
       signal?.throwIfAborted();
-      return await withBrainWrite(
-        this.repository,
-        id,
-        async () => {
-          minimumInferenceCount = (
-            await this.repository.get(id)
-          ).counters.inferenceCount;
-          return this.chatUnlocked(
-            id,
-            message,
-            signal,
-            onStream,
-            turnId,
-            responseTokenBudget,
-            () => {
-              neuralRequestStarted = true;
-            },
-            temporarySteeringContext,
-            toolObservationWaitMs
-          );
-        },
-        signal
-      );
+      while (true) {
+        const waitController = new AbortController();
+        const abortWait = (): void => waitController.abort(signal?.reason);
+        signal?.addEventListener("abort", abortWait, { once: true });
+        if (signal?.aborted) abortWait();
+        try { await Promise.race([this.waitUntilInstanceLoaded(id, waitController.signal, turnId), detached]); }
+        finally {
+          signal?.removeEventListener("abort", abortWait);
+          waitController.abort(new Error("This host attachment left its Load wait."));
+        }
+        if (ownership.detached) throw ownership.detached;
+        const result = await withBrainWrite(this.repository, id, async () => {
+          if (!this.instanceLifecycle.isLoaded(id)) return { hostPaused: true as const };
+          minimumInferenceCount ??= (await this.repository.get(id)).counters.inferenceCount;
+          return this.chatUnlocked(id, message, signal, onStream, turnId, responseTokenBudget,
+            () => { neuralRequestStarted = true; }, temporarySteeringContext, toolObservationWaitMs, resume, inheritedExecutionId, appInput, nativeAudioInput);
+        }, signal);
+        if ("hostPaused" in result) continue;
+        if (!("suspended" in result)) {
+          if (inheritedExecutionId) await this.instanceLifecycle.status(id);
+          this.instanceLifecycle.completed(id); return result;
+        }
+        resume = result.resume;
+        ownership.chatDispatched = false;
+        if (inheritedExecutionId) {
+          const current = await this.inspectNativeInstance(id);
+          if (!current.inheritedExecutions) throw new Error("The inherited pause has no durable root queue receipt.");
+          this.instanceLifecycle.noteInheritedFrontier(id, current.inheritedExecutions);
+        } else this.instanceLifecycle.noteFrontier(id, resume);
+        this.suspendedTurnWaiters.get(turnKey)?.();
+        // No brain writer or neural reservation is held during this wait.
+        // Load wakes this same turn; Stop alone may abort the original signal.
+      }
     } catch (error) {
+      if (ownership.detached) throw ownership.detached; // No Stop, tombstone, replay, or old-state reconciliation.
+      if (signal?.aborted && resume && !ownership.chatDispatched) {
+        try {
+          const stopped = objectRecord(await this.engine.request(inheritedExecutionId ? "stop_inherited_chat" : "stop_suspended_chat", {
+            brainId: id, storagePath: this.repository.brainDirectory(id), ...(inheritedExecutionId ? { executionId: inheritedExecutionId } : { checkpointId: resume.checkpointId }), turnId
+          }, ENGINE_REQUEST_NO_DEADLINE));
+          if (stopped?.stopped !== true || stopped.brainId !== id || stopped.turnId !== turnId ||
+              (inheritedExecutionId ? stopped.executionId !== inheritedExecutionId : stopped.checkpointId !== resume.checkpointId)) {
+            throw new Error("Stop did not acknowledge this exact suspended turn.");
+          }
+          if (inheritedExecutionId) await this.instanceLifecycle.status(id);
+          this.instanceLifecycle.completed(id);
+          onStream?.({ type: "runtime-activity", state: "cancelled", cancellation: { phase: "running", unrelatedActivityContinues: false, workerTerminationAcknowledged: false } });
+        } catch (stopError) {
+          onStream?.({ type: "runtime-activity", state: "failed", cancellation: { phase: "running", unrelatedActivityContinues: false, workerTerminationAcknowledged: false } });
+          throw stopError; // A missing tombstone is never a successful Stop.
+        }
+      }
       if (minimumInferenceCount !== undefined && neuralRequestStarted) {
         try {
           const reconciled = await this.reconcileCommittedChat(id, {
             turnId,
             input: message,
-            inputSha256: sha256(message),
-            minimumInferenceCount
+            inputSha256,
+            minimumInferenceCount,
+            ...(inheritedExecutionId ? { inheritedExecutionId } : {})
           });
-          if (reconciled) return reconciled;
+          if (reconciled) { if (inheritedExecutionId) await this.instanceLifecycle.status(id); this.instanceLifecycle.completed(id); return reconciled; }
         } catch (reconciliationError) {
           console.warn(
             `Committed chat reconciliation failed for ${id}:`,
@@ -5358,9 +6649,9 @@ export class BrainService {
           );
         }
       }
-      if (neuralRequestStarted) {
+      if (neuralRequestStarted && !inheritedExecutionId) {
         try {
-          const accepted = await this.reconcileReceivedChatInput(id, { turnId, input: message });
+          const accepted = await this.reconcileReceivedChatInput(id, { turnId, input: message, ...(nativeAudioInput ? { nativeAudioInput } : {}) });
           if (accepted) onStream?.({ type: "chat-input-accepted", sequence: 0, ...accepted });
         } catch (reconciliationError) {
           console.warn("Received input reconciliation awaits authoritative state:", reconciliationError);
@@ -5368,12 +6659,17 @@ export class BrainService {
       }
       throw error;
     } finally {
-      if (this.liveChatTurns.get(turnId) === ownership) this.liveChatTurns.delete(turnId);
+      this.suspendedTurnWaiters.get(turnKey)?.();
+      this.suspendedObservations.delete(turnKey);
+      if (this.liveChatTurns.get(turnKey) === ownership) this.liveChatTurns.delete(turnKey);
+      this.taskAttachmentService?.finishInheritedExecution?.(id, turnId);
+      resolveSettled();
+      if (this.instanceLifecycle.canRun(id) && ![...this.liveChatTurns.values()].some((turn) => turn.brainId === id)) this.selectCompletedActionLearningOwner(id);
     }
   }
 
   async steerChat(brainId: string, turnId: string, successorTurnId: string): Promise<void> {
-    const ownership = this.liveChatTurns.get(turnId);
+    const ownership = this.liveChatTurns.get(chatTurnKey(brainId, turnId));
     if (!ownership || ownership.brainId !== brainId || ownership.outputEnded) return;
     ownership.steerSuccessor = successorTurnId;
     // A queued/pre-dispatch turn yields at the main admission boundary. Loading
@@ -5385,12 +6681,29 @@ export class BrainService {
 
   async observeChatActionResult(brainId: string, turnId: string, event: ActionEvent,
     output: unknown): Promise<ChatToolObservationReceipt | undefined> {
-    const owner = this.liveChatTurns.get(turnId);
-    if (!owner || owner.brainId !== brainId || !owner.chatDispatched || owner.outputEnded || owner.steerSuccessor) return undefined;
+    const owner = this.liveChatTurns.get(chatTurnKey(brainId, turnId));
+    if (!owner || owner.brainId !== brainId || owner.outputEnded || owner.steerSuccessor) return undefined;
+    if (event.action.toolId === "web.fetch" && event.action.action === "inspect-image" && event.execution?.state === "complete") {
+      if (!this.webImageObservationValidator) throw new Error("Selected image native perception is unavailable.");
+      const selected = await this.webImageObservationValidator(brainId, turnId, output);
+      if (event.action.arguments?.referenceId !== selected.reference.id) throw new Error("Selected image differs from the actual native action operands.");
+    }
     const observation = createChatToolObservation(brainId, turnId, event, output,
       (bytes) => hasTextMemoryHeadroom(bytes) && freemem() - memoryReserveBytes() >= bytes);
     if (!observation) return undefined;
-    return this.engine.observeChatAction(observation);
+    if (!owner.chatDispatched) {
+      const key = chatTurnKey(brainId, turnId), pending = this.suspendedObservations.get(key) ?? new Map<string, ChatToolObservation>();
+      pending.set(observation.observationId, observation); this.suspendedObservations.set(key, pending);
+      return { brainId, turnId, observationId: observation.observationId, accepted: false, reason: "supported-turn-suspended" };
+    }
+    const receipt = await this.engine.observeChatAction(observation);
+    if (!receipt.accepted && receipt.reason === "supported-turn-suspending") {
+      // The native cursor froze after this effect completed. Retain its
+      // exact evidence for the same saved turn; never rerun the effect.
+      const key = chatTurnKey(brainId, turnId), pending = this.suspendedObservations.get(key) ?? new Map<string, ChatToolObservation>();
+      pending.set(observation.observationId, observation); this.suspendedObservations.set(key, pending);
+    }
+    return receipt;
   }
 
   async authorizeInlineImagination(invocation: import("../shared/types").ToolInvocation,
@@ -5404,7 +6717,7 @@ export class BrainService {
   }
 
   private chatSteerAdmissionBoundary(brainId: string, turnId: string): void {
-    const ownership = this.liveChatTurns.get(turnId);
+    const ownership = this.liveChatTurns.get(chatTurnKey(brainId, turnId));
     if (!ownership?.steerSuccessor) return;
     throw new EngineRequestError("Chat yielded before decoding to a warm steering direction.", -32801, {
       brainId, turnId, inputSha256: ownership.inputSha256,
@@ -5479,6 +6792,12 @@ export class BrainService {
   ): Promise<ChatResult | undefined> {
     const brainDirectory = this.repository.brainDirectory(brainId);
     const metadata = await committedEngineMetadata(brainDirectory);
+    const completedInherited = request.inheritedExecutionId ? completedInheritedTurn(metadata, brainId, request.inheritedExecutionId) : undefined;
+    if (request.inheritedExecutionId && !completedInherited) return undefined;
+    if (completedInherited && (completedInherited.turnId !== request.turnId || completedInherited.inputSha256 !== request.inputSha256 ||
+        completedInherited.inferenceCount !== request.minimumInferenceCount + 1)) throw new Error("Inherited reconciliation has another committed root turn.");
+    const inheritedInputAlias = request.inheritedExecutionId
+      ? await this.inheritedInputAlias(brainId, request.inheritedExecutionId, request.turnId, request.input) : undefined;
     const persisted = metadata
       ? persistedChatReceipt(
           brainDirectory,
@@ -5491,7 +6810,7 @@ export class BrainService {
     // replacement neural worker merely to rediscover that an interrupted turn
     // never committed. Legacy checkpoints without the receipt field retain
     // the old load-free worker query for one-way migration.
-    if (!persisted && Array.isArray(metadata?.completed_chat_turns)) {
+    if (!persisted && (request.inheritedExecutionId || Array.isArray(metadata?.completed_chat_turns))) {
       return undefined;
     }
     const raw = persisted ?? await this.engine.request<WorkerChatReceiptResult>(
@@ -5510,14 +6829,17 @@ export class BrainService {
       turnId: request.turnId,
       input: request.input,
       inputSha256: request.inputSha256,
-      minimumInferenceCount: request.minimumInferenceCount
+      minimumInferenceCount: request.minimumInferenceCount,
+      ...(inheritedInputAlias ? { inheritedInputAlias } : {})
     });
     if (!receipt) return undefined;
+    const taskAttachments = await this.taskAttachmentHandles(brainId, request.turnId);
     return withBrainWrite(this.repository, brainId, async () => {
       const brain = await this.repository.get(brainId);
+      const humanMessage = this.taskAttachmentMessage(receipt.humanMessage, taskAttachments);
       const result = mergeCommittedChatPresentation(
         brain,
-        receipt.humanMessage,
+        humanMessage,
         receipt.brainMessage,
         receipt.trace
       );
@@ -5547,7 +6869,7 @@ export class BrainService {
     });
   }
 
-  private async reconcileReceivedChatInput(brainId: string, expected?: { turnId: string; input: string }): Promise<{
+  private async reconcileReceivedChatInput(brainId: string, expected?: { turnId: string; input: string; nativeAudioInput?: NativeAudioInput }): Promise<{
     inputReceipt: import("../shared/types").ChatInputAcceptedReceipt; humanMessage: ChatMessage;
   } | undefined> {
     const directory = this.repository.brainDirectory(brainId), metadata = await committedEngineMetadata(directory);
@@ -5563,6 +6885,9 @@ export class BrainService {
       if (!receipt || expected && receipt.turnId !== expected.turnId) continue;
       const human = committedLedgerPayload(directory, brainId, "message", receiptIdentifier(receipt.humanMessageId, "received human"));
       const current = receivedChatInputFromLedger(receipt, human, expected);
+      const taskAttachments = await this.taskAttachmentHandles(brainId, current.inputReceipt.turnId);
+      current.humanMessage = this.taskAttachmentMessage(current.humanMessage, taskAttachments);
+      current.inputReceipt = current.humanMessage.inputReceipt ?? current.inputReceipt;
       await this.repository.appendReceivedChatInput(brainId, current.humanMessage);
       accepted = current;
     }
@@ -5578,8 +6903,12 @@ export class BrainService {
     responseTokenBudget?: number,
     onNeuralRequestStarted?: () => void,
     temporarySteeringContext?: TemporarySteeringContext,
-    toolObservationWaitMs?: number
-  ): Promise<ChatResult> {
+    toolObservationWaitMs?: number,
+    resume?: InstanceResumeFrontier,
+    inheritedExecutionId?: string,
+    appInput?: NativeAppChatInput,
+    nativeAudioInput?: NativeAudioInput
+  ): Promise<ChatResult | { suspended: true; resume: InstanceResumeFrontier }> {
     signal?.throwIfAborted();
     this.chatSteerAdmissionBoundary(id, turnId);
     if (
@@ -5599,12 +6928,53 @@ export class BrainService {
       );
     }
     await this.preflightStart(id);
-    const message = cleanMessage(input);
-    const toolSchemas = this.neuralToolSchemas(brain);
+    if (nativeAudioInput && !resume) {
+      if (!this.nativeAudioAdmissionGuard) throw new Error("Native audio input admission is unavailable.");
+      const metadata = await committedEngineMetadata(this.repository.brainDirectory(id));
+      const priorTrace = committedLedgerPayload(this.repository.brainDirectory(id), id, "trace", sha256(`${id}\0${turnId}\0accepted-input-v1`));
+      const candidates = [
+        ...(Array.isArray(metadata?.accepted_chat_inputs) ? metadata.accepted_chat_inputs : []),
+        ...(Array.isArray(metadata?.completed_chat_turns) ? metadata.completed_chat_turns : []), priorTrace?.inputAccepted
+      ];
+      const alreadyAdmitted = metadata?.brain_id === id && candidates.some(value => {
+        const receipt = objectRecord(value);
+        return receipt?.turnId === turnId && receipt.inputSha256 === nativeAudioInput.inputSha256 &&
+          (receipt.committed === true || receipt.format === "omni-completed-chat-turn") && receipt.nativeAudioInput !== undefined &&
+          verifiedNativeAudioReceipt(receipt.nativeAudioInput).input.inputSha256 === nativeAudioInput.inputSha256;
+      });
+      if (!alreadyAdmitted) await this.nativeAudioAdmissionGuard(id, nativeAudioInput);
+    }
+    if (!resume && temporarySteeringContext?.audioInputs?.length && temporarySteeringContext.attentionEpoch === await this.currentChatAttentionEpoch(id)) {
+      if (!this.nativeAudioAdmissionGuard) throw new Error("Temporary audio handoff admission is unavailable.");
+      for (const audio of temporarySteeringContext.audioInputs) await this.nativeAudioAdmissionGuard(id, audio);
+    }
+    const message = nativeAudioInput ? input === "" ? "" : (() => { throw new Error("Native audio cannot contain a transcript substitute."); })() : cleanMessage(input);
+    const inputSha256 = expectedChatInputHash(message, nativeAudioInput);
+    const taskAttachments = this.taskAttachmentService
+      ? await this.taskAttachmentService.listForTurn(id, turnId)
+      : [];
+    const taskAttachmentHandles = await this.taskAttachmentHandles(id, turnId);
+    const toolSchemas = this.neuralToolSchemas(brain).filter((schema) =>
+      schema.id !== "task.attachments" || taskAttachments.length > 0
+    );
+    // A current explicit saved-copy review is narrower than global file
+    // permission. Publish only this task's exact retained IDs, never an ambient
+    // attachment/host-files grant or old parent's permission.
+    if (taskAttachments.length && !toolSchemas.some(schema => schema.id === "task.attachments") &&
+        await this.taskAttachmentService?.reviewedAccess?.(id, turnId, "list", {}, signal)) {
+      toolSchemas.push({ id: "task.attachments", actions: ["list", "read"], grant: "auto",
+        actionInputSchemas: {
+          list: { type: "object", properties: {}, additionalProperties: false },
+          read: { type: "object", properties: {
+            attachmentId: { type: "string", enum: taskAttachments.map(file => file.attachmentId) },
+            offset: { type: "integer", minimum: 0 }, maxBytes: { type: "integer", minimum: 1, maximum: 1024 * 1024 }
+          }, required: ["attachmentId"], additionalProperties: false }
+        } });
+    }
     const brainDirectory = this.repository.brainDirectory(id);
     const onRuntimeActivity = (transition: EngineActivityTransition): void => {
-      if (transition.method === "chat" && transition.state === "running") {
-        const ownership = this.liveChatTurns.get(turnId);
+      if (["chat", "resume_chat", "resume_inherited_chat"].includes(transition.method) && transition.state === "running") {
+        const ownership = this.liveChatTurns.get(chatTurnKey(id, turnId));
         if (ownership) ownership.chatDispatched = true;
       }
       const normalized = neuralChatRuntimeActivity(transition);
@@ -5618,30 +6988,22 @@ export class BrainService {
       turnId,
       onTransition: onRuntimeActivity
     };
-    await this.engine.request(
-      "load",
-      {
-        brainId: id,
-        config: brain.config,
-        storagePath: brainDirectory
-      },
-      await foregroundLoadTimeoutMs(brainDirectory),
-      signal,
-      "foreground",
-      activityContext
-    );
     signal?.throwIfAborted();
     this.chatSteerAdmissionBoundary(id, turnId);
     onNeuralRequestStarted?.();
     const workerResult = await this.engine.requestStream<WorkerChatResult>(
-      "chat",
-      {
+      inheritedExecutionId ? "resume_inherited_chat" : resume ? "resume_chat" : "chat",
+      resume ? { brainId: id, storagePath: brainDirectory, ...(inheritedExecutionId ? { executionId: inheritedExecutionId } : { checkpointId: resume.checkpointId }), toolSchemas,
+        pendingObservations: [...(this.suspendedObservations.get(chatTurnKey(id, turnId))?.values() ?? [])] } : {
         brainId: id,
         input: message,
         toolSchemas,
         config: brain.config,
         onlineLearning: brain.config.onlineLearning,
         storagePath: brainDirectory,
+        ...(taskAttachments.length ? { taskAttachments } : {}),
+        ...(appInput ? { appInput } : {}),
+        ...(nativeAudioInput ? { nativeAudioInput } : {}),
         ...(temporarySteeringContext ? { temporarySteeringContext } : {}),
         ...(toolObservationWaitMs === undefined ? {} : { toolObservationWaitMs }),
         ...(responseTokenBudget === undefined
@@ -5649,10 +7011,14 @@ export class BrainService {
           : { maxNewTokens: responseTokenBudget })
       },
       (event) => {
-        const normalized = normalizeChatEngineEvent(event, id, { turnId, input: message });
+        const normalized = normalizeChatEngineEvent(event, id, { turnId, input: message, ...(appInput ? { inputProvenance: appInput.provenance } : {}), ...(nativeAudioInput ? { nativeAudioInput } : {}) });
         if (!normalized) return;
+        if (normalized.type === "chat-input-accepted" && taskAttachmentHandles.length) {
+          normalized.humanMessage = this.taskAttachmentMessage(normalized.humanMessage, taskAttachmentHandles);
+          normalized.inputReceipt = normalized.humanMessage.inputReceipt ?? normalized.inputReceipt;
+        }
         if (normalized.type === "chat-phase") {
-          const ownership = this.liveChatTurns.get(turnId);
+          const ownership = this.liveChatTurns.get(chatTurnKey(id, turnId));
           if (ownership) ownership.outputEnded = true;
         }
         if (normalized.type === "modality-preview" && this.mediaArtifacts) {
@@ -5675,6 +7041,17 @@ export class BrainService {
       "foreground",
       { ...activityContext, beforeDispatch: () => this.chatSteerAdmissionBoundary(id, turnId) }
     );
+    if (workerResult.suspended === true) {
+      const frontier = workerResult.resume;
+      if (workerResult.turnCommitted !== false || workerResult.brainId !== id || workerResult.turnId !== turnId ||
+          workerResult.inputSha256 !== inputSha256 || !frontier || frontier.turnId !== turnId ||
+          frontier.inputSha256 !== inputSha256 || frontier.exactSupportedResume !== true ||
+          frontier.phase !== "native-text-token-boundary" || !frontier.checkpointId ||
+          [frontier.lastStreamSequence, frontier.sampledTokens, frontier.publishedTokens].some((value) => !Number.isSafeInteger(value) || value < 0)) {
+        throw new Error("The worker did not provide an exact owned suspension frontier.");
+      }
+      return { suspended: true, resume: frontier };
+    }
     signal?.throwIfAborted();
     const noReply = workerResult.noReply === true;
     if (noReply && [workerResult.text, workerResult.response, workerResult.content]
@@ -5691,10 +7068,16 @@ export class BrainService {
       {
         turnId,
         input: message,
-        inputSha256: sha256(message),
-        response: generated
+        inputSha256,
+        response: generated,
+        ...(appInput ? { inputProvenance: appInput.provenance } : {}),
+        ...(nativeAudioInput ? { nativeAudioInput } : {}),
+        ...(inheritedExecutionId ? { inheritedInputAlias: await this.inheritedInputAlias(id, inheritedExecutionId, turnId, message) } : {})
       }
     );
+    if (inheritedExecutionId && !authoritativePresentation) throw new Error("The inherited turn has no exact root-owned completion receipt.");
+    if (appInput && !authoritativePresentation) throw new Error("The App task has no genuine source-bound native turn receipt.");
+    if (nativeAudioInput && !authoritativePresentation) throw new Error("The audio task has no genuine source-bound native turn receipt.");
     if ((workerResult.steered === true || workerResult.nativeStopped === true || noReply) && !authoritativePresentation) {
       throw new Error("Typed neural completion has no exact durable turn presentation.");
     }
@@ -5706,6 +7089,12 @@ export class BrainService {
           workerResult.trace!
         )
       : recordNeuralChat(brain, message, generated);
+    if (taskAttachmentHandles.length) {
+      result.humanMessage = this.taskAttachmentMessage(result.humanMessage, taskAttachmentHandles);
+      result.brain.messages = result.brain.messages.map((entry) =>
+        entry.id === result.humanMessage.id ? result.humanMessage : entry
+      );
+    }
     if (!authoritativePresentation) {
       applyWorkerTracePresentation(result, workerResult?.trace);
     } else {
@@ -5789,6 +7178,7 @@ export class BrainService {
         actions: []
       };
     }
+    if (!this.instanceLifecycle.canRun(brainId)) return { brainId, ran: false, reason: "instance-unloaded", actions: [] };
     await this.preflightStart(brainId);
     if (
       !Number.isFinite(minimumIdleSeconds) ||
@@ -6061,16 +7451,92 @@ export class BrainService {
     signal?: AbortSignal
   ): Promise<IngestResult> {
     return withBrainWrite(this.repository, brainId, () =>
-      this.learnStructuredExperienceUnlocked(brainId, experience, signal)
+      this.learnStructuredExperienceUnlocked(brainId, experience, signal), signal
     );
+  }
+
+  /** Explicit teacher-job learning of verified assets by this same native brain. */
+  async learnTeacherMediaExperience(brainId: string, input: { lesson: ApiTeacherMediaLesson; prompt: string },
+    signal?: AbortSignal): Promise<IngestResult & { mediaCoverage: ApiTeacherMediaCoverage }> {
+    const lesson = validateApiTeacherMediaLesson(input.lesson, input.prompt);
+    return withBrainWrite(this.repository, brainId, async () => {
+      await this.preflightStart(brainId); signal?.throwIfAborted();
+      const directory = this.repository.brainDirectory(brainId);
+      for (const [path, expected] of apiTeacherMediaFiles(lesson, input.prompt)) {
+        await verifyApiTeacherMediaFile(directory, path, expected, { signal,
+          admitMetadata: (bytes, purpose) => this.repository.admitMetadataTransfer(bytes, purpose) });
+      }
+      const transactionKey = sha256(`api-teacher-media\0${brainId}\0${lesson.deliveryId}\0${lesson.manifestSha256}`);
+      const worker = await this.engine.request<WorkerIngestResult>("ingest", {
+        brainId, path: join(directory, ...lesson.manifestPath.split("/")), kind: "jsonl", policy: "pretrain",
+        name: `Teacher lesson ${lesson.deliveryId}`, contentHash: lesson.manifestSha256,
+        transactionKey, idempotencyKey: transactionKey, storagePath: directory
+      }, ENGINE_REQUEST_NO_DEADLINE, signal);
+      // The native ACK is already durable. A late Stop must not erase it and
+      // make this successful transaction look eligible for blind replay.
+      const native = worker.source?.media_coverage, byModality = objectRecord(native?.byModality);
+      const expected = new Map<ApiTeacherMediaKind, number>();
+      for (const part of lesson.parts) if (part.type !== "text") expected.set(part.type, (expected.get(part.type) ?? 0) + 1);
+      if (worker.transactionKey !== transactionKey || worker.source?.content_hash !== lesson.manifestSha256 || worker.source?.modality_trained !== true || native?.complete !== true ||
+          worker.source?.coverage?.complete !== true || !byModality || Number(native.failedRecords) !== 0)
+        throw new Error("Teacher media native ACK did not prove the exact complete transaction and asset coverage.");
+      const counted: ApiTeacherMediaCoverage["byModality"] = {};
+      for (const [kind, records] of expected) {
+        const row = objectRecord(byModality[kind]);
+        if (!row || row.complete !== true || row.records !== records || row.trainedRecords !== records || row.failedRecords !== 0 ||
+            !Number.isSafeInteger(row.windows) || Number(row.windows) < records ||
+            !Number.isSafeInteger(row.processedUnits) || Number(row.processedUnits) < records)
+          throw new Error(`Teacher ${kind} assets have no complete native modality learning receipt.`);
+        counted[kind] = { records: Number(row.records), windows: Number(row.windows), processedUnits: Number(row.processedUnits), complete: true };
+      }
+      const mediaCoverage = checkedApiTeacherMediaCoverage({ complete: true, manifestSha256: lesson.manifestSha256, byModality: counted }, lesson);
+      let brain = await this.repository.get(brainId); synchronizeWorkerSummary(brain, worker);
+      const prior = await this.repository.trainingSourceByContentHash(brainId, lesson.manifestSha256);
+      const source: TrainingSource = prior ?? {
+        id: randomUUID(), name: `${lesson.provider}:${lesson.model} media lesson`, kind: "json", bytes: apiTeacherMediaFiles(lesson, input.prompt).get(lesson.manifestPath)!.bytes,
+        contentHash: lesson.manifestSha256, policy: "pretrain", importedAt: new Date().toISOString(), rawTextRetained: false,
+        learnedIdeas: coverageCount(worker.source?.learned_ideas, 0), learnedConcepts: coverageCount(worker.source?.learned_concepts, 0),
+        learnedSynapses: coverageCount(worker.source?.synaptic_update_events ?? worker.source?.plasticity_events, 0),
+        learnedParameterSteps: coverageCount(worker.source?.parameter_update_steps, 0), parametersChanged: workerParametersChanged(worker),
+        license: "User-authorized API media lesson", provenanceUrl: lesson.sourceEndpoint
+      };
+      if (!prior) brain.trainingSources.push(source);
+      brain.journal = [...(brain.journal ?? []), { id: randomUUID(), createdAt: new Date().toISOString(), kind: "learning",
+        summary: `Learned verified ${[...expected.keys()].join("/")} teacher assets.`, detail: `delivery=${lesson.deliveryId}; manifest=${lesson.manifestSha256}; hiddenPrompt=false` }];
+      brain = await this.repository.save(brain);
+      return { brain, source, mediaCoverage, warnings: worker.source?.warnings ?? [] };
+    }, signal);
+  }
+
+  /**
+   * Trusted background integration learning for an identity that is already
+   * Load'ed. The second lifecycle check runs under the neural writer so an
+   * unload race cannot turn catalog work into an implicit Load/spawn.
+   */
+  async learnLoadedStructuredExperience(
+    brainId: string,
+    experience: StructuredNeuralExperience,
+    signal?: AbortSignal,
+    beforeAdmission?: () => Promise<void>
+  ): Promise<IngestResult> {
+    this.requireInstanceLoaded(brainId);
+    return withBrainWrite(this.repository, brainId, async () => {
+      this.requireInstanceLoaded(brainId);
+      signal?.throwIfAborted();
+      await beforeAdmission?.();
+      signal?.throwIfAborted(); this.requireInstanceLoaded(brainId);
+      return this.learnStructuredExperienceUnlocked(brainId, experience, signal, { loadedOnly: true, beforeAdmission });
+    }, signal);
   }
 
   private async learnStructuredExperienceUnlocked(
     brainId: string,
     experience: StructuredNeuralExperience,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    admission?: { loadedOnly: true; beforeAdmission?: () => Promise<void> }
   ): Promise<IngestResult> {
-    await this.preflightStart(brainId);
+    if (admission?.loadedOnly) this.requireInstanceLoaded(brainId);
+    else await this.preflightStart(brainId);
     signal?.throwIfAborted();
     const content = experience.content.replace(/\0/g, "").trim();
     if (!content || Buffer.byteLength(content) > 64 * 1024 * 1024) {
@@ -6089,6 +7555,10 @@ export class BrainService {
         warnings: ["This neural experience was already learned."]
       };
     }
+    if (admission?.loadedOnly) {
+      await admission.beforeAdmission?.();
+      signal?.throwIfAborted(); this.requireInstanceLoaded(brainId);
+    }
     const worker = await this.engine.request<WorkerIngestResult>(
       "ingest",
       {
@@ -6103,7 +7573,9 @@ export class BrainService {
       86_400_000,
       signal
     );
-    signal?.throwIfAborted();
+    // A loaded-only integration's genuine native ACK is already committed.
+    // A late Stop must not erase its host receipt or cause replay next time.
+    if (!admission?.loadedOnly) signal?.throwIfAborted();
     synchronizeWorkerSummary(brain, worker);
     const source: TrainingSource = {
       id: randomUUID(),
@@ -6274,7 +7746,7 @@ export class BrainService {
         const entryContentHash =
           entry.contentSha256 ?? sha256(`rejected\0${entry.path}\0${entry.rejection ?? ""}`);
         const transactionKey = datasetTransactionKey(
-          manifestId,
+          manifest.continuationIdentity?.manifestId ?? manifestId,
           entry.index,
           cursor.currentEpoch ?? 0,
           entryContentHash,
@@ -6541,6 +8013,7 @@ export class BrainService {
           lastEntryReceipt = {
             schemaVersion: 1,
             manifestId,
+            ...(manifest.continuationIdentity ? { continuationManifestId: manifest.continuationIdentity.manifestId } : {}),
             ...(cursor.runId ? { runId: cursor.runId } : {}),
             manifestHash: manifest.manifestHash,
             transactionKey,
@@ -6619,25 +8092,54 @@ export class BrainService {
     ) => void | Promise<void> = () => undefined,
     signal?: AbortSignal
   ): Promise<{ result: IngestResult; receipt: DatasetEntryReceipt }> {
-    await this.engine.claimForeground?.();
-    return withBrainWrite(this.repository, brainId, () =>
-      this.ingestOnePathUnlocked(
-        brainId,
-        manifest,
-        entry,
-        policy,
-        epoch,
-        forceReplay,
-        jobId,
-        transactionKey,
-        runId,
-        completedReceipt,
-        onWorkerCompleted,
-        onWorkerProgress,
-        signal
-      ),
-      signal
-    );
+    await assertPluginManifestSourceStable(entry, signal);
+    const formatLease = entry.pluginFormat
+      ? await this.pluginTrainingFormats?.acquireTrainingFormat(brainId, entry.pluginFormat, {
+          path: entry.parserSourceName ?? entry.sourceRelocation?.originalPath ?? entry.sourcePath ?? entry.path, mediaType: entry.sourceMediaType?.value
+        })
+      : undefined;
+    if (entry.pluginFormat && !formatLease) {
+      throw new Error("This dataset needs its reviewed plugin training-format binding.");
+    }
+    const effectiveSignal = formatLease
+      ? (signal ? AbortSignal.any([signal, formatLease.signal]) : formatLease.signal)
+      : signal;
+    let prepared: PluginPreparedTrainingSource | undefined;
+    try {
+      if (formatLease?.prepare) {
+        if (!entry.contentSha256) throw new Error("Executable parser source has no committed manifest checksum.");
+        prepared = await formatLease.prepare({ sourcePath: entry.path, sourceSha256: entry.contentSha256,
+          sourceBytes: entry.bytes, transactionKey,
+          ...(entry.sourceMediaType ? { inputMediaType: entry.sourceMediaType.value } : {}),
+          workspaceRoot: join(this.repository.brainDirectory(brainId), "datasets"), signal: effectiveSignal,
+          onProgress: (value, message, detail) => onWorkerProgress(value, message, { pluginParser: detail }) });
+        if (prepared.provenance.inputMediaType !== entry.sourceMediaType?.value) throw new Error("Prepared parser MIME provenance differs from the exact selected source.");
+      }
+      await this.engine.claimForeground?.();
+      const result = await withBrainWrite(this.repository, brainId, () =>
+        this.ingestOnePathUnlocked(
+          brainId,
+          manifest,
+          entry,
+          policy,
+          epoch,
+          forceReplay,
+          jobId,
+          transactionKey,
+          runId,
+          completedReceipt,
+          onWorkerCompleted,
+          onWorkerProgress,
+          prepared,
+          effectiveSignal
+        ),
+        effectiveSignal
+      );
+      await prepared?.cleanup().catch(() => undefined);
+      return result;
+    } finally {
+      formatLease?.release();
+    }
   }
 
   private async ingestOnePathUnlocked(
@@ -6657,16 +8159,20 @@ export class BrainService {
       message: string,
       data?: unknown
     ) => void | Promise<void>,
+    prepared: PluginPreparedTrainingSource | undefined,
     signal?: AbortSignal
   ): Promise<{ result: IngestResult; receipt: DatasetEntryReceipt }> {
-    await this.preflightStart(brainId);
+    const noAssets = prepared !== undefined && "state" in prepared && prepared.state === "no-assets";
+    if (!noAssets) await this.preflightStart(brainId);
     let brain = await this.repository.get(brainId);
     const path = entry.path;
+    const workerPath = prepared && "path" in prepared ? prepared.path : path;
     const fileInfo = await stat(path);
     if (!fileInfo.isFile()) throw new Error(`${path} is not a regular file.`);
     const contentHash = entry.contentSha256 ?? (await hashFile(path));
+    const parserBindingSha256 = datasetParserBindingSha256(entry);
     const expectedTransactionKey = datasetTransactionKey(
-      manifest.id,
+      manifest.continuationIdentity?.manifestId ?? manifest.id,
       entry.index,
       epoch,
       contentHash,
@@ -6678,7 +8184,8 @@ export class BrainService {
     }
     const duplicate = await this.repository.trainingSourceByContentHash(
       brainId,
-      contentHash
+      contentHash,
+      parserBindingSha256
     );
     const kind = trainingKind(path);
     const parserKind = datasetParserKind(entry);
@@ -6692,22 +8199,41 @@ export class BrainService {
         receipt.entryIndex !== entry.index ||
         receipt.epoch !== epoch ||
         receipt.contentHash !== contentHash ||
+        receipt.parserBindingSha256 !== parserBindingSha256 ||
+        !sameParserExecution(receipt.parserExecution, prepared?.provenance) ||
         receipt.policy !== policy ||
-        receipt.outcome !== "learned" ||
+        receipt.outcome !== (noAssets ? "no-assets" : "learned") ||
         !receipt.sourceId
       ) {
         throw new Error("Completed dataset receipt does not match the requested transaction.");
       }
+    } else if (noAssets) {
+      const completedAt = new Date().toISOString();
+      const coverage: TrainingCoverage = { schemaVersion: 1, manifestId: manifest.id, discoveredFiles: 1, processedFiles: 1,
+        rejectedFiles: 0, discoveredRecords: 0, processedRecords: 0, rejectedRecords: 0, discoveredBytes: fileInfo.size,
+        processedBytes: fileInfo.size, shards: 1, modalityCounts: {}, errors: [], errorCount: 0, complete: true, updatedAt: completedAt };
+      receipt = { schemaVersion: 1, manifestId: manifest.id,
+        ...(manifest.continuationIdentity ? { continuationManifestId: manifest.continuationIdentity.manifestId } : {}),
+        ...(runId ? { runId } : {}), manifestHash: manifest.manifestHash, transactionKey, entryIndex: entry.index, epoch,
+        contentHash, ...(parserBindingSha256 ? { parserBindingSha256 } : {}), parserExecution: prepared.provenance, policy,
+        outcome: "no-assets", sourceId: duplicate?.id ?? randomUUID(), journalId: randomUUID(), sourceKind: "archive",
+        sourceBytes: fileInfo.size, learnedIdeas: 0, learnedConcepts: 0, learnedSynapses: 0, learnedParameterSteps: 0,
+        parametersChanged: false, warnings: ["The reviewed runtime parser traversed the complete source but emitted no modality assets; no neural or modality update ran."],
+        coverage, completedAt };
+      await onWorkerCompleted(receipt);
     } else if (duplicate && !forceReplay && epoch === 0) {
       receipt = {
         schemaVersion: 1,
         manifestId: manifest.id,
+        ...(manifest.continuationIdentity ? { continuationManifestId: manifest.continuationIdentity.manifestId } : {}),
         ...(runId ? { runId } : {}),
         manifestHash: manifest.manifestHash,
         transactionKey,
         entryIndex: entry.index,
         epoch,
         contentHash,
+        ...(parserBindingSha256 ? { parserBindingSha256 } : {}),
+        ...(prepared ? { parserExecution: prepared.provenance } : {}),
         policy,
         outcome: "learned",
         sourceId: duplicate.id,
@@ -6751,22 +8277,25 @@ export class BrainService {
       eventSource.on?.("event", workerEvent);
       let worker: WorkerIngestResult;
       try {
+        await this.rebindLearningSource(brainId, workerPath, entry.sourceRelocation?.sourceName ?? basename(path), signal,
+          transactionKey, prepared ? undefined : entry.sourceRelocation);
         worker = await this.engine.request<WorkerIngestResult>(
           "ingest",
           {
             jobId,
             brainId,
-            path,
-            kind: parserKind,
+            path: workerPath,
+            ...(entry.sourceRelocation ? { name: entry.sourceRelocation.sourceName } : {}),
+            kind: prepared?.parserFormat ?? parserKind,
             policy,
-            contentHash,
+            contentHash: prepared?.provenance.outputSha256 ?? contentHash,
             transactionKey,
             idempotencyKey: transactionKey,
-            manifestId: manifest.id,
+            manifestId: manifest.continuationIdentity?.manifestId ?? manifest.id,
             manifestHash: manifest.manifestHash,
             entryIndex: entry.index,
             committedSqliteSnapshot: entry.snapshotKind === "sqlite",
-            allowReplay: forceReplay || epoch > 0,
+            allowReplay: Boolean(entry.pluginFormat) || forceReplay || epoch > 0,
             epoch,
             config: brain.config,
             storagePath: this.repository.brainDirectory(brainId)
@@ -6835,12 +8364,15 @@ export class BrainService {
       receipt = {
         schemaVersion: 1,
         manifestId: manifest.id,
+        ...(manifest.continuationIdentity ? { continuationManifestId: manifest.continuationIdentity.manifestId } : {}),
         ...(runId ? { runId } : {}),
         manifestHash: manifest.manifestHash,
         transactionKey,
         entryIndex: entry.index,
         epoch,
         contentHash,
+        ...(parserBindingSha256 ? { parserBindingSha256 } : {}),
+        ...(prepared ? { parserExecution: prepared.provenance } : {}),
         policy,
         outcome: "learned",
         sourceId: duplicate?.id ?? randomUUID(),
@@ -6919,6 +8451,8 @@ export class BrainService {
       importedAt: receipt.completedAt,
       rawTextRetained: preserveBlob,
       contentHash,
+      ...(parserBindingSha256 ? { parserBindingSha256 } : {}),
+      ...(receipt.parserExecution ? { parserExecution: receipt.parserExecution } : {}),
       blobHash: preserveBlob ? await this.repository.storeFileAsBlob(path) : undefined,
       policy,
       license: "User-provided source; license not declared"
@@ -6938,8 +8472,10 @@ export class BrainService {
           id: receipt.journalId,
           createdAt: source.importedAt,
           kind: "learning",
-          summary: `${policy === "archive" ? "Archived" : "Learned from"} ${source.name}.`,
-          detail: `${source.learnedIdeas} ideas, ${source.learnedConcepts} concepts, ${source.learnedSynapses} synapses`
+          summary: receipt.outcome === "no-assets" ? `Visited ${source.name}; the reviewed parser emitted no modality assets.` :
+            `${policy === "archive" ? "Archived" : "Learned from"} ${source.name}.`,
+          detail: receipt.outcome === "no-assets" ? "0 assets, 0 neural updates, complete source traversal" :
+            `${source.learnedIdeas} ideas, ${source.learnedConcepts} concepts, ${source.learnedSynapses} synapses`
         }
       ];
     }
@@ -6955,11 +8491,226 @@ export class BrainService {
     };
   }
 
+  private async resolveWebPluginParser(
+    request: IngestWebRequest,
+    finalUrl: URL,
+    contentType: string
+  ): Promise<WebPluginParserSelectionPlan | undefined> {
+    const sourceName = finalUrl.pathname || finalUrl.hostname;
+    if (request.parserSelection === undefined && detectDatasetFormat(sourceName) !== "unknown") return undefined;
+    const inputMediaType = normalizeSourceMediaType(contentType);
+    const binding = await this.pluginTrainingFormats?.resolveTrainingFormat(
+      request.brainId,
+      sourceName,
+      inputMediaType,
+      request.parserSelection
+    );
+    if (request.parserSelection && !binding) {
+      throw new Error("The explicitly selected immutable plugin parser is unavailable for this web source.");
+    }
+    if (!binding) return undefined;
+    if (contentType.trim() && inputMediaType === undefined) {
+      throw new Error("The downloaded web source returned an invalid Content-Type for parser binding.");
+    }
+    if (binding.inputMediaType !== inputMediaType) {
+      throw new Error("The downloaded web source MIME differs from its immutable parser binding.");
+    }
+    const bindingSha256 = pluginParserBindingSha256(binding);
+    return {
+      binding,
+      bindingSha256,
+      ...(inputMediaType ? { inputMediaType } : {}),
+      sourceName
+    };
+  }
+
+  private async acquireWebPluginParser(
+    brainId: string,
+    plan: WebPluginParserPlan,
+    source: CrawlSourceLease,
+    signal?: AbortSignal
+  ): Promise<ActiveWebPluginParser> {
+    const lease = await this.pluginTrainingFormats?.acquireTrainingFormat(brainId, plan.binding, {
+      path: plan.sourceName,
+      mediaType: plan.inputMediaType
+    });
+    if (!lease) throw new Error("This web source needs its reviewed plugin training-format binding.");
+    const effectiveSignal = signal ? AbortSignal.any([signal, lease.signal]) : lease.signal;
+    let prepared: PluginPreparedTrainingSource | undefined;
+    try {
+      if (lease.prepare) {
+        prepared = await lease.prepare({
+          sourcePath: source.path,
+          sourceSha256: source.contentHash,
+          sourceBytes: source.bytes,
+          ...(plan.inputMediaType ? { inputMediaType: plan.inputMediaType } : {}),
+          transactionKey: plan.transactionKey,
+          workspaceRoot: join(this.repository.brainDirectory(brainId), "datasets"),
+          signal: effectiveSignal
+        });
+        if (prepared.provenance.inputMediaType !== plan.inputMediaType ||
+            prepared.provenance.sourceSha256 !== source.contentHash ||
+            prepared.provenance.sourceBytes !== source.bytes) {
+          throw new Error("Prepared web parser provenance differs from its exact downloaded source.");
+        }
+      }
+      return {
+        lease,
+        ...(prepared ? { prepared } : {}),
+        signal: effectiveSignal,
+        workerPath: prepared && "path" in prepared ? prepared.path : source.path,
+        workerKind: prepared?.parserFormat ?? plan.binding.parserFormat,
+        workerContentHash: prepared?.provenance.outputSha256 ?? source.contentHash,
+        noAssets: prepared !== undefined && "state" in prepared && prepared.state === "no-assets"
+      };
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
+  }
+
+  private async ingestWebPluginSource(
+    request: IngestWebRequest,
+    finalUrl: URL,
+    stagedPath: string,
+    contentType: string,
+    sourceKind: CrawlSourceLease["kind"],
+    expected: WebPluginParserSelectionPlan,
+    signal?: AbortSignal,
+    jobId = "",
+    webContext?: WebIngestContext
+  ): Promise<IngestResult> {
+    return withBrainWrite(this.repository, request.brainId, async () => {
+      await this.preflightStart(request.brainId);
+      signal?.throwIfAborted();
+      const stagedHash = await hashFile(stagedPath);
+      const extension = extname(finalUrl.pathname).toLocaleLowerCase();
+      const source = await acquireCrawlSourceLease({
+        directory: await this.webLeaseDirectory(request.brainId, finalUrl.toString(), webContext),
+        url: finalUrl.toString(),
+        kind: sourceKind,
+        contentHash: stagedHash,
+        contentType,
+        extension: /^\.[a-z0-9]{1,12}$/.test(extension) ? extension : sourceKind === "text" ? ".response" : `.${sourceKind}`,
+        sourcePath: stagedPath,
+        publication: webContext?.publication,
+        fetchedAt: webContext?.fetchedAt
+      });
+      if (source.contentHash !== stagedHash || source.contentType !== contentType || source.kind !== sourceKind) {
+        throw new Error("An unfinished web source owns different bytes, MIME, or parser input; resume its original learning transaction first.");
+      }
+      await guardLeasedWebSource(finalUrl, source.contentType, source, webContext);
+      const current = await this.resolveWebPluginParser(request, finalUrl, source.contentType);
+      if (!current || current.binding.pluginId !== expected.binding.pluginId ||
+          current.binding.contentSha256 !== expected.binding.contentSha256 ||
+          current.binding.formatId !== expected.binding.formatId) {
+        throw new Error("The selected web parser changed before its exact downloaded source could start.");
+      }
+      const policy = request.policy ?? "encode";
+      const quarantined = request.quarantine ?? true;
+      const effectivePolicy = quarantined ? "archive" : policy;
+      const plan: WebPluginParserPlan = {
+        ...current,
+        transactionKey: webPluginParserTransactionKey(
+          request.brainId,
+          finalUrl.toString(),
+          source.contentHash,
+          current.bindingSha256,
+          effectivePolicy
+        )
+      };
+      let brain = await this.repository.get(request.brainId);
+      const duplicate = await this.repository.trainingSourceByContentHash(
+        request.brainId,
+        source.contentHash,
+        plan.bindingSha256
+      );
+      if (duplicate && (quarantined || duplicate.policy !== "archive")) {
+        await releaseCrawlSourceLease(source);
+        return { brain, source: duplicate, warnings: ["This parser-bound web source was already ingested; no duplicate synapses were created."] };
+      }
+      const before = { ideas: brain.ideas.length, concepts: Object.keys(brain.concepts).length, synapses: Object.keys(brain.synapses).length };
+      let active: ActiveWebPluginParser | undefined;
+      let worker: WorkerIngestResult | undefined;
+      try {
+        active = await this.acquireWebPluginParser(request.brainId, plan, source, signal);
+        if (!active.noAssets) {
+          await this.rebindLearningSource(brain.id, active.workerPath, finalUrl.toString(), active.signal, plan.transactionKey);
+          worker = await this.engine.request<WorkerIngestResult>("ingest", {
+            jobId,
+            brainId: brain.id,
+            url: finalUrl.toString(),
+            path: active.workerPath,
+            name: finalUrl.toString(),
+            kind: active.workerKind,
+            policy: effectivePolicy,
+            quarantine: quarantined,
+            allowReplay: true,
+            contentHash: active.workerContentHash,
+            transactionKey: plan.transactionKey,
+            idempotencyKey: plan.transactionKey,
+            storagePath: this.repository.brainDirectory(brain.id)
+          }, ENGINE_REQUEST_NO_DEADLINE, active.signal);
+        }
+      } catch (error) {
+        throw crawlResourcePauseFromEngineError(error) ?? error;
+      } finally {
+        active?.lease.release();
+      }
+      if (worker) synchronizeWorkerSummary(brain, worker);
+      const returnedKind = active?.noAssets ? "archive" : typeof worker?.source?.kind === "string" && [
+        "pdf", "text", "markdown", "code", "json", "csv", "parquet", "arrow", "archive", "sqlite",
+        "dataset", "image", "audio", "video", "unknown"
+      ].includes(worker.source.kind) ? worker.source.kind as TrainingSource["kind"] : sourceKind;
+      const preserveBlob = quarantined || ((brain.config.memoryRecipe ?? "adaptive-retention") === "total-recall" && brain.config.retainSourceText);
+      const trainingSource: TrainingSource = {
+        id: duplicate?.id ?? randomUUID(),
+        name: basename(finalUrl.pathname) || `${finalUrl.hostname}-${sourceKind}`,
+        kind: returnedKind,
+        bytes: source.bytes,
+        learnedIdeas: active?.noAssets ? 0 : worker?.source?.learned_ideas ?? brain.ideas.length - before.ideas,
+        learnedConcepts: active?.noAssets ? 0 : worker?.source?.learned_concepts ?? Object.keys(brain.concepts).length - before.concepts,
+        learnedSynapses: active?.noAssets ? 0 : worker?.source?.synaptic_update_events ?? worker?.source?.plasticity_events ?? Object.keys(brain.synapses).length - before.synapses,
+        learnedParameterSteps: active?.noAssets ? 0 : coverageCount(worker?.source?.parameter_update_steps, 0),
+        parametersChanged: active?.noAssets ? false : workerParametersChanged(worker),
+        importedAt: new Date().toISOString(),
+        rawTextRetained: false,
+        contentHash: source.contentHash,
+        parserBindingSha256: plan.bindingSha256,
+        ...(active?.prepared ? { parserExecution: active.prepared.provenance } : {}),
+        blobHash: preserveBlob ? await this.repository.storeFileAsBlob(source.path) : undefined,
+        policy: effectivePolicy,
+        requestedUrl: webContext?.requestedUrl ?? request.url,
+        provenanceUrl: finalUrl.toString(),
+        license: "Web source; verify the publisher's terms",
+        licenseUrl: finalUrl.toString()
+      };
+      brain.trainingSources = [...brain.trainingSources.filter(value => value.id !== trainingSource.id), trainingSource];
+      brain.journal = [...(brain.journal ?? []), { id: randomUUID(), createdAt: trainingSource.importedAt, kind: "learning",
+        summary: active?.noAssets ? `Visited parser-bound web source ${trainingSource.name}; no modality assets were emitted.` :
+          quarantined ? `Quarantined parser-bound web source ${trainingSource.name}.` : `Learned parser-bound web source ${trainingSource.name}.`,
+        detail: `${plan.inputMediaType ?? "MIME unavailable"}; parser=${plan.binding.pluginId}/${plan.binding.formatId}; binding=${plan.bindingSha256}; ` +
+          (active?.noAssets ? "0 assets, 0 neural updates" :
+            `${trainingSource.learnedIdeas} ideas, ${trainingSource.learnedConcepts} concepts, ${trainingSource.learnedSynapses} synapses`) }];
+      brain = await this.repository.save(brain);
+      await active?.prepared?.cleanup().catch(() => undefined);
+      await releaseCrawlSourceLease(source);
+      return { brain, source: trainingSource, warnings: [
+        ...(worker?.warnings ?? []), ...(worker?.source?.warnings ?? []),
+        ...(active?.noAssets ? ["The reviewed runtime parser traversed the source but emitted no modality assets; no modality update ran."] : []),
+        ...(quarantined ? ["The downloaded parser-bound source is quarantined and has not changed neural parameters."] : [])
+      ] };
+    }, signal);
+  }
+
   async ingestWeb(request: IngestWebRequest): Promise<IngestResult> {
     request = {
       ...request,
       policy: requireNewDataIngestionPolicy(request.policy ?? "encode")
     };
+    if (request.parserSelection !== undefined && !validPluginTrainingFormatSelection(request.parserSelection)) {
+      throw new Error("Explicit web parser selection is invalid.");
+    }
     const url = new URL(request.url);
     const response = await safeFetch(
       url,
@@ -6994,8 +8745,19 @@ export class BrainService {
     );
     try {
       const bytes = await streamResponseToFile(response, spoolPath, spoolDirectory);
+      const pluginParser = await this.resolveWebPluginParser(request, finalUrl, contentType);
+      if (pluginParser) {
+        return await this.ingestWebPluginSource(
+          request,
+          finalUrl,
+          spoolPath,
+          contentType,
+          mediaKind ?? "text",
+          pluginParser
+        );
+      }
       if (mediaKind) {
-        return this.ingestCrawledMedia(
+        return await this.ingestCrawledMedia(
           request,
           finalUrl,
           spoolPath,
@@ -7009,10 +8771,22 @@ export class BrainService {
         );
       }
       const raw = await readSpoolText(spoolPath, bytes);
-      return this.ingestWebContent(request, finalUrl, raw, contentType);
+      return await this.ingestWebContent(request, finalUrl, raw, contentType);
     } finally {
       await rm(spoolPath, { force: true });
     }
+  }
+
+  private async webLeaseDirectory(brainId: string, url: string, context?: WebIngestContext): Promise<string> {
+    const root = join(this.repository.brainDirectory(brainId), "datasets", "web-cache");
+    if (!context?.cacheNamespace) return root;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(context.cacheNamespace)) throw new Error("Invalid host-owned web source namespace.");
+    const selected = join(root, context.cacheNamespace), lease = `${sha256(url)}.lease.json`;
+    const exists = async (path: string): Promise<boolean> => lstat(path).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
+    if (await exists(join(selected, lease))) return selected;
+    // Existing exact leases finish at their original transaction identity.
+    // Newly admitted pages isolate bytes by owned frontier, not by URL alone.
+    return await exists(join(root, lease)) ? root : selected;
   }
 
   private async ingestWebContent(
@@ -7021,10 +8795,11 @@ export class BrainService {
     raw: string,
     contentType: string,
     signal?: AbortSignal,
-    jobId = ""
+    jobId = "",
+    webContext?: WebIngestContext
   ): Promise<IngestResult> {
     return withBrainWrite(this.repository, request.brainId, () =>
-      this.ingestWebContentUnlocked(request, finalUrl, raw, contentType, signal, jobId),
+      this.ingestWebContentUnlocked(request, finalUrl, raw, contentType, signal, jobId, webContext),
       signal
     );
   }
@@ -7035,20 +8810,23 @@ export class BrainService {
     raw: string,
     contentType: string,
     signal?: AbortSignal,
-    jobId = ""
+    jobId = "",
+    webContext?: WebIngestContext
   ): Promise<IngestResult> {
     await this.preflightStart(request.brainId);
     let text = contentType.includes("html") ? htmlToText(raw) : raw.replace(/\0/g, "");
-    const webCache = join(this.repository.brainDirectory(request.brainId), "datasets", "web-cache");
+    const webCache = await this.webLeaseDirectory(request.brainId, finalUrl.toString(), webContext);
     const lease = await acquireCrawlSourceLease({
       directory: webCache, url: finalUrl.toString(), kind: "text",
       contentHash: sha256(text), contentType, extension: ".txt", text,
+      publication: webContext?.publication, fetchedAt: webContext?.fetchedAt,
     });
     if (lease.kind !== "text") {
       throw new Error("This URL has an unfinished binary learning lease; resume its original source first.");
     }
     text = await readSpoolText(lease.path, lease.bytes);
     contentType = lease.contentType;
+    await guardLeasedWebSource(finalUrl, contentType, lease, webContext);
     const contentHash = lease.contentHash;
     let brain = await this.repository.get(request.brainId);
     const policy = request.policy ?? "encode";
@@ -7072,6 +8850,7 @@ export class BrainService {
     };
     let worker: WorkerIngestResult;
     try {
+      await this.rebindLearningSource(brain.id, lease.path, finalUrl.toString(), signal);
       worker = await this.engine.request<WorkerIngestResult>(
         "ingest",
         {
@@ -7148,10 +8927,11 @@ export class BrainService {
     contentType: string,
     kind: "image" | "audio" | "video",
     signal?: AbortSignal,
-    jobId = ""
+    jobId = "",
+    webContext?: WebIngestContext
   ): Promise<IngestResult> {
     return withBrainWrite(this.repository, request.brainId, () =>
-      this.ingestCrawledMediaUnlocked(request, finalUrl, path, contentType, kind, signal, jobId),
+      this.ingestCrawledMediaUnlocked(request, finalUrl, path, contentType, kind, signal, jobId, webContext),
       signal
     );
   }
@@ -7163,13 +8943,15 @@ export class BrainService {
     contentType: string,
     kind: "image" | "audio" | "video",
     signal?: AbortSignal,
-    jobId = ""
+    jobId = "",
+    webContext?: WebIngestContext
   ): Promise<IngestResult> {
     await this.preflightStart(request.brainId);
     const lease = await acquireCrawlSourceLease({
-      directory: join(this.repository.brainDirectory(request.brainId), "datasets", "web-cache"),
+      directory: await this.webLeaseDirectory(request.brainId, finalUrl.toString(), webContext),
       url: finalUrl.toString(), kind, contentHash: await hashFile(path), contentType,
       extension: extname(path) || `.${kind}`, sourcePath: path,
+      publication: webContext?.publication, fetchedAt: webContext?.fetchedAt,
     });
     if (lease.kind === "text") {
       throw new Error("This URL has an unfinished text learning lease; resume its original source first.");
@@ -7177,6 +8959,7 @@ export class BrainService {
     const contentHash = lease.contentHash;
     kind = lease.kind;
     contentType = lease.contentType;
+    await guardLeasedWebSource(finalUrl, contentType, lease, webContext);
     let brain = await this.repository.get(request.brainId);
     const policy = request.policy ?? "encode";
     const quarantined = request.quarantine ?? true;
@@ -7202,6 +8985,7 @@ export class BrainService {
     };
     let worker: WorkerIngestResult;
     try {
+      await this.rebindLearningSource(brain.id, lease.path, finalUrl.toString(), signal);
       worker = await this.engine.request<WorkerIngestResult>(
         "ingest",
         {
@@ -7300,13 +9084,17 @@ export class BrainService {
     cancelled: () => boolean = () => false,
     progress: (value: number, message: string) => void = () => undefined,
     cancellationSignal?: AbortSignal,
-    jobId = ""
+    jobId = "",
+    learningControl?: WebCrawlControl
   ): Promise<WebCrawlResult> {
     request = {
       ...request,
       policy: requireNewDataIngestionPolicy(request.policy ?? "encode")
     };
-    const start = new URL(request.url);
+    if (request.parserSelection !== undefined && !validPluginTrainingFormatSelection(request.parserSelection)) {
+      throw new Error("Explicit crawl parser selection is invalid.");
+    }
+    const start = new URL(normalizeLearningUrl(request.url));
     const startUrlClass = await assertSafeRemoteUrl(start, {
       allowLoopback: true
     });
@@ -7339,6 +9127,13 @@ export class BrainService {
       request.crawlId,
       request.resume ?? true
     );
+    const initialPolicy = frontier.policy() ?? makeWebLearningPolicy(request.constraints ?? {}, request.instructions ?? "", 1);
+    const currentPolicy = async (): Promise<WebLearningPolicy> => {
+      const policy = learningControl ? await learningControl.policy() : initialPolicy;
+      frontier.recordPolicy(policy);
+      return policy;
+    };
+    await currentPolicy();
     const scheduler = new DomainRequestScheduler();
     const robotsByOrigin = new Map<string, Promise<string[]>>();
     const rulesFor = async (url: URL): Promise<string[]> => {
@@ -7407,6 +9202,12 @@ export class BrainService {
           (prefix.length > 1 && `${url.pathname}${url.search}`.startsWith(prefix))
       );
     const assertCrawlPolicy = async (url: URL): Promise<void> => {
+      const policy = await currentPolicy();
+      if (!webUrlWithinScope(url, policy.constraints)) {
+        const provenance = decideWebSource(url.toString(), url, "", publicationFromHtml(""), policy);
+        delete provenance.fetchedAt;
+        throw new WebScopeExclusion(provenance);
+      }
       if (sameOrigin && url.origin !== start.origin) {
         throw new CrawlPolicyError(
           `Redirect target ${url.origin} is outside the same-site crawl origin.`
@@ -7427,6 +9228,7 @@ export class BrainService {
     let stopped = false;
     try {
       while (true) {
+        await currentPolicy();
         const before = frontier.counts();
         if (cancelled()) {
           stopped = true;
@@ -7518,13 +9320,15 @@ export class BrainService {
                 contentType,
                 mediaKind,
                 bodyPath,
-                bytes
+                bytes,
+                fetchedAt: new Date().toISOString()
               };
             } catch (error) {
               return {
                 entry,
                 error: error instanceof Error ? error.message : String(error),
-                skipped: error instanceof CrawlPolicyError,
+                skipped: error instanceof CrawlPolicyError || error instanceof WebScopeExclusion,
+                scopeExclusion: error instanceof WebScopeExclusion ? error.provenance : undefined,
                 resourcePaused: error instanceof CrawlResourcePause
               };
             }
@@ -7556,7 +9360,11 @@ export class BrainService {
               await retryAndClean(fetched.slice(index));
               break;
             }
-            frontier.skipped(page.entry.url, page.error);
+            if (page.scopeExclusion) {
+              const provenance = { ...page.scopeExclusion, requestedUrl: page.entry.url };
+              frontier.excluded(page.entry, provenance);
+              await learningControl?.onSource?.(provenance);
+            } else frontier.skipped(page.entry.url, page.error);
             continue;
           }
           try {
@@ -7564,10 +9372,37 @@ export class BrainService {
               brainId: request.brainId,
               url: page.finalUrl.toString(),
               policy: request.policy,
-              quarantine: request.quarantine ?? true
+              quarantine: request.quarantine ?? true,
+              ...(request.parserSelection ? { parserSelection: request.parserSelection } : {})
             };
             let raw: string | undefined;
-            const result = page.mediaKind
+            if (!page.mediaKind && isCrawledText(page.contentType, page.finalUrl)) raw = await readSpoolText(page.bodyPath, page.bytes);
+            // An undated index may lead to dated articles. Discover links even
+            // when the index itself cannot be admitted under a date filter.
+            if (raw !== undefined && page.entry.depth < maximumDepth && page.contentType.includes("html")) {
+              frontier.enqueue(linksFromHtml(raw, page.finalUrl).filter(link => !sameOrigin || link.origin === start.origin)
+                .map(link => ({ url: link.toString(), depth: page.entry.depth + 1 })));
+            }
+            const publication = publicationFromHtml(page.contentType.includes("html") ? raw ?? "" : "");
+            let provenance: WebSourceProvenance = decideWebSource(page.entry.url, page.finalUrl, page.contentType,
+              publication, await currentPolicy(), page.fetchedAt);
+            if (provenance.decision !== "admitted") throw new WebScopeExclusion(provenance);
+            const webContext: WebIngestContext = { requestedUrl: page.entry.url, publication, fetchedAt: page.fetchedAt, cacheNamespace: frontier.id,
+              policy: currentPolicy, accepted: value => { provenance = value; } };
+            const pluginParser = await this.resolveWebPluginParser(ingestRequest, page.finalUrl, page.contentType);
+            const result = pluginParser
+              ? await this.ingestWebPluginSource(
+                  ingestRequest,
+                  page.finalUrl,
+                  page.bodyPath,
+                  page.contentType,
+                  page.mediaKind ?? "text",
+                  pluginParser,
+                  cancellationSignal,
+                  jobId,
+                  webContext
+                )
+              : page.mediaKind
               ? await this.ingestCrawledMedia(
                   ingestRequest,
                   page.finalUrl,
@@ -7575,7 +9410,8 @@ export class BrainService {
                   page.contentType,
                   page.mediaKind,
                   cancellationSignal,
-                  jobId
+                  jobId,
+                  webContext
                 )
               : await (async (): Promise<IngestResult> => {
                   if (!isCrawledText(page.contentType, page.finalUrl)) {
@@ -7585,34 +9421,23 @@ export class BrainService {
                       }`
                     );
                   }
-                  raw = await readSpoolText(page.bodyPath, page.bytes);
+                  raw ??= await readSpoolText(page.bodyPath, page.bytes);
                   return this.ingestWebContent(
                     ingestRequest,
                     page.finalUrl,
                     raw,
                     page.contentType,
                     cancellationSignal,
-                    jobId
+                    jobId,
+                    webContext
                   );
                 })();
             if (recentResults.length >= CRAWL_DIAGNOSTIC_WINDOW) {
               recentResults.shift();
             }
             recentResults.push(result);
-            if (
-              raw !== undefined &&
-              page.entry.depth < maximumDepth &&
-              page.contentType.includes("html")
-            ) {
-              frontier.enqueue(
-                linksFromHtml(raw, page.finalUrl)
-                  .filter((link) => !sameOrigin || link.origin === start.origin)
-                  .map((link) => ({
-                    url: link.toString(),
-                    depth: page.entry.depth + 1
-                  }))
-              );
-            }
+            frontier.provenance(provenance);
+            await learningControl?.onSource?.(provenance, result);
             const receiptKind =
               result.source.kind === "image" ||
               result.source.kind === "audio" ||
@@ -7631,6 +9456,11 @@ export class BrainService {
               warnings: result.warnings
             });
           } catch (error) {
+            if (error instanceof WebScopeExclusion) {
+              frontier.excluded(page.entry, error.provenance);
+              await learningControl?.onSource?.(error.provenance);
+              continue;
+            }
             if (!(error instanceof CrawlPolicyError)) {
               stopped = true;
               frontier.recordWarning(
@@ -7679,6 +9509,7 @@ export class BrainService {
           !stopped && (counts.queued === 0 || counts.visited >= maximumPages),
         updatedAt: new Date().toISOString()
       };
+      learningControl?.onCoverage?.(coverage);
       return {
         crawlId: frontier.id,
         startUrl: start.toString(),
@@ -7693,7 +9524,8 @@ export class BrainService {
         warningsTruncated: counts.warningCount > warnings.length,
         frontierRemaining: counts.queued,
         stopped,
-        coverage
+        coverage,
+        policy: frontier.policy()
       };
     } finally {
       frontier.close();
@@ -7840,49 +9672,77 @@ export class BrainService {
   }
 
   async listToolPermissions(brainId: string): Promise<ToolPermissionRecord[]> {
-    const brain = await this.repository.get(brainId);
-    return effectiveToolPermissions(brain.toolPermissions);
+    const snapshot = await this.repository.toolPermissionSnapshot(brainId);
+    return effectiveToolPermissions(snapshot.records);
+  }
+
+  async describeTools(brainId: string): Promise<import("../shared/toolDescriptions").ToolDescriptionPage> {
+    return describeRegisteredTools(brainId, await this.listToolPermissions(brainId),
+      TOOL_ACTIONS, CATALOG_ACTION_INPUT_SCHEMAS, this.externalToolSchemas);
   }
 
   async setToolPermission(
     brainId: string,
     toolId: string,
-    level: ToolPermissionLevel
+    level: ToolPermissionLevel,
+    requestId: string = randomUUID(),
+    expectedRevision?: number
   ): Promise<ToolPermissionRecord[]> {
-    return withBrainWrite(this.repository, brainId, () =>
-      this.setToolPermissionUnlocked(brainId, toolId, level)
+    if (!(["off", "ask", "auto", "full"] as const).includes(level)) {
+      throw new Error("Invalid permission level.");
+    }
+    const id = canonicalToolPermissionId(normalizeToolId(toolId));
+    const before = await this.repository.toolPermissionSnapshot(brainId);
+    const snapshot = await this.repository.updateToolPermission(
+      brainId,
+      id,
+      before.records.find(record => record.toolId === id)?.label ?? displayToolLabel(id),
+      level,
+      {
+        requestId,
+        ...(expectedRevision !== undefined ? { expectedRevision } : {})
+      }
     );
+    const previous = before.records.find((record) => record.toolId === id);
+    const current = snapshot.records.find((record) => record.toolId === id);
+    if (current && (previous?.level !== current.level || previous?.revision !== current.revision)) {
+      this.publishToolPermissionChanged({
+        brainId,
+        toolId: id,
+        level: current.level,
+        revision: current.revision ?? snapshot.revision
+      });
+    }
+    return effectiveToolPermissions(snapshot.records);
   }
 
-  private async setToolPermissionUnlocked(
+  async ensureToolPermission(
     brainId: string,
     toolId: string,
-    level: ToolPermissionLevel
+    level: ToolPermissionLevel,
+    requestId: string = randomUUID(),
+    displayLabel?: string
   ): Promise<ToolPermissionRecord[]> {
-    if (!["off", "ask", "auto", "full"].includes(level)) throw new Error("Invalid permission level.");
-    const brain = await this.repository.get(brainId);
     const id = canonicalToolPermissionId(normalizeToolId(toolId));
-    const records = brain.toolPermissions ?? [];
-    const record = records.find((entry) => entry.toolId === id);
-    const updatedAt = new Date().toISOString();
-    if (record) {
-      record.level = level;
-      record.updatedAt = updatedAt;
-    } else {
-      records.push({ toolId: id, label: displayToolLabel(id), level, updatedAt });
+    const before = await this.repository.toolPermissionSnapshot(brainId);
+    const snapshot = await this.repository.ensureToolPermission(
+      brainId,
+      id,
+      displayLabel?.trim().replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 256) || displayToolLabel(id),
+      level,
+      requestId
+    );
+    const previous = before.records.find((record) => record.toolId === id);
+    const current = snapshot.records.find((record) => record.toolId === id);
+    if (!previous && current) {
+      this.publishToolPermissionChanged({
+        brainId,
+        toolId: id,
+        level: current.level,
+        revision: current.revision ?? snapshot.revision
+      });
     }
-    brain.toolPermissions = records.sort((left, right) => left.label.localeCompare(right.label));
-    brain.journal = [
-      ...(brain.journal ?? []),
-      {
-        id: randomUUID(),
-        createdAt: updatedAt,
-        kind: "tool",
-        summary: `${displayToolLabel(id)} permission changed to ${level}.`
-      }
-    ];
-    const saved = await this.repository.save(brain);
-    return effectiveToolPermissions(saved.toolPermissions);
+    return effectiveToolPermissions(snapshot.records);
   }
 
   private async planMergeFile(
@@ -8685,6 +10545,7 @@ export class RuntimeJobManager extends EventEmitter {
   private readonly initializingBrains = new Set<string>();
   private readonly cancellationControllers = new Map<string, AbortController>();
   private readonly preparationOnlyJobs = new Set<string>();
+  private readonly waitingForInstanceLoadJobs = new Set<string>();
   private readonly jobOperations = new Map<string, Promise<void>>();
   private readonly jobCancellationOperations = new Map<string, Promise<RuntimeJob>>();
   private readonly jobResumeLabels = new Map<string, string>();
@@ -8699,6 +10560,22 @@ export class RuntimeJobManager extends EventEmitter {
     engine.on("activity", (event: EngineActivityTransition) =>
       this.consumeEngineActivity(event)
     );
+    service.addInstanceSuspendBoundary?.(async (brainId, report) => {
+      const active = this.list(brainId).filter((job) => ["running", "cancelling"].includes(job.state));
+      if (active.length) report({ kind: "checkpoint", label: "Waiting for the current learning/media job's supported checkpoint boundary" });
+      await Promise.all(active.map((job) => this.jobOperations.get(job.id)).filter(Boolean));
+      for (const record of this.observationSessions.values()) {
+        if (record.session.brainId !== brainId || !["active", "stopping"].includes(record.session.state)) continue;
+        const source = record.session.permission.source;
+        service.instanceLifecycle.rememberReconnect(brainId, { id: record.session.id,
+          kind: source === "mixed" ? "remote-session" : source,
+          label: `${source} capture session`, reason: "The session-scoped external capture handle cannot be restored by a native checkpoint. Start a new permitted session explicitly.", permissionRequired: true });
+      }
+      while ([...this.observationSessions.values()].some((record) => record.session.brainId === brainId && ["starting", "active", "stopping"].includes(record.session.state))) {
+        report({ kind: "external-effect", label: "End the live microphone, camera or screen session before Unload. Its external handle requires explicit reconnection." });
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      }
+    });
   }
 
   list(brainId?: string): RuntimeJob[] {
@@ -8706,6 +10583,19 @@ export class RuntimeJobManager extends EventEmitter {
       .filter((job) => !brainId || job.brainId === brainId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .map((job) => ({ ...job }));
+  }
+
+  resumeFullMergeIngestion(request: FullMergeResumeIngestionRequest, sourcePath: string): RuntimeJob {
+    const job = this.createJob(request.brainId, "ingestion", "Resuming retained parent source", undefined, "traversing-dataset");
+    this.launch(job, () => this.service.resumeFullMergeIngestion(request, sourcePath, job.id,
+      this.cancellationControllers.get(job.id)?.signal, (progress, message) => {
+        if (job.cancelled) return;
+        job.progress = Math.max(0, Math.min(0.99, progress));
+        job.label = message;
+        job.updatedAt = new Date().toISOString();
+        this.publish(job);
+      }));
+    return { ...job };
   }
 
   listArtifacts(brainId: string, cursor?: string, limit?: number) {
@@ -9067,17 +10957,32 @@ export class RuntimeJobManager extends EventEmitter {
       await this.service.preflightStart(normalizedRequest.brainId);
       const signal = this.cancellationControllers.get(job.id)?.signal;
       const inlineClaimRequired = await this.engine.awaitInlineArtifact(normalizedRequest as unknown as Record<string, unknown>, signal);
-      const output = await this.engine.request<unknown>(
+      const captureOrigin = this.mediaArtifacts?.captureOrigin(`job:${job.brainId}:${job.id}`);
+      const spontaneousOutput = captureOrigin?.kind === "spontaneous" ? objectRecord(await this.engine.request("authorize_spontaneous_output", {
+        brainId: job.brainId, jobId: job.id, origin: captureOrigin
+      }, ENGINE_REQUEST_NO_DEADLINE, signal)) : undefined;
+      if (spontaneousOutput && (spontaneousOutput.brainId !== job.brainId || spontaneousOutput.jobId !== job.id ||
+          typeof spontaneousOutput.leaseId !== "string" || !/^[a-f0-9]{64}$/.test(spontaneousOutput.leaseId))) throw new Error("Native spontaneous-output ownership was not acknowledged.");
+      if (spontaneousOutput) this.mediaArtifacts?.noteSpontaneousOutputLease(job.brainId, job.id, String(spontaneousOutput.leaseId));
+      let output: unknown;
+      try { output = await this.engine.request<unknown>(
         "generate_modality",
         {
           jobId: job.id,
           ...normalizedRequest,
           ...(inlineClaimRequired ? { inlineClaimRequired: true } : {}),
+          ...(spontaneousOutput ? { spontaneousOutputLeaseId: spontaneousOutput.leaseId } : {}),
           storagePath: this.service.repository.brainDirectory(normalizedRequest.brainId)
         },
         3_600_000,
         signal
-      );
+      ); } catch (error) {
+        if (spontaneousOutput && this.service.instanceLifecycle.canRun(job.brainId)) void this.engine.request("discard_spontaneous_output", { brainId: job.brainId, jobId: job.id, leaseId: spontaneousOutput.leaseId }, ENGINE_REQUEST_NO_DEADLINE).catch(() => undefined);
+        throw error;
+      }
+      if (spontaneousOutput && (job.cancelled || signal?.aborted)) {
+        void this.engine.request("discard_spontaneous_output", { brainId: job.brainId, jobId: job.id, leaseId: spontaneousOutput.leaseId }, ENGINE_REQUEST_NO_DEADLINE).catch(() => undefined);
+      }
       return output;
     });
     return { ...job };
@@ -9124,6 +11029,7 @@ export class RuntimeJobManager extends EventEmitter {
   async startObservation(
     request: LiveObservationSessionStartRequest
   ): Promise<LiveObservationSession> {
+    this.service.requireInstanceLoaded?.(request?.brainId);
     if (
       !request ||
       typeof request.brainId !== "string" ||
@@ -9185,11 +11091,7 @@ export class RuntimeJobManager extends EventEmitter {
     }
     await this.service.preflightStart(brain.id);
     const storagePath = this.service.repository.brainDirectory(brain.id);
-    await this.engine.request(
-      "load",
-      { brainId: brain.id, config: brain.config, storagePath },
-      300_000
-    );
+    this.service.requireInstanceLoaded?.(brain.id);
     const sessionId = randomUUID();
     const baseToolSchemas = this.service.neuralToolSchemas(brain);
     const studioSchema = baseToolSchemas.find((schema) => schema.id === "studio.ui");
@@ -9260,19 +11162,49 @@ export class RuntimeJobManager extends EventEmitter {
       },
       capture
     };
+    this.service.instanceLifecycle?.acknowledgeReconnect(brain.id, [...this.observationSessions.values()]
+      .filter((record) => record.session.brainId === brain.id && record.session.permission.source === permission.source &&
+        ["stopped", "cancelled"].includes(record.session.state)).map((record) => record.session.id));
     this.observationSessions.set(session.id, {
       session,
       lastReceivedSequence: -1,
       lastReceivedTimestampMs: -1,
       pending: new Set(),
       controls: new Map(),
-      controlBurstFrames: new Map()
+      controlBurstFrames: new Map(),
+      workerPid: this.engine.pid
     });
     this.publishObservation({
       type: "started",
       session: cloneObservationSession(session)
     });
     return cloneObservationSession(session);
+  }
+
+  /** Current main-owned microphone lease; a renderer ID never creates a grant. */
+  requireNativeAudioCaptureLease(request: NativeAudioCaptureLeaseRequest): { permissionRevision: number; maxBytes: number } {
+    const record = this.observationSessions.get(request.sessionId);
+    this.service.requireInstanceLoaded(request.brainId);
+    if (!record || record.session.brainId !== request.brainId || record.session.state !== "active" ||
+        record.session.permission.granted !== true || record.session.permission.scope !== "session" ||
+        !["microphone", "mixed"].includes(record.session.permission.source) || !record.session.modalities.includes("audio") ||
+        record.workerPid !== this.engine.pid || !Number.isSafeInteger(request.bytes) || request.bytes < 1 || request.bytes > record.session.maxPacketBytes) {
+      throw new Error("Native audio requires this mind's current active microphone capture lease and source/resource byte envelope.");
+    }
+    if (request.contentSha256) {
+      if (!/^[a-f0-9]{64}$/.test(request.contentSha256) || !Number.isSafeInteger(request.sequence) || request.sequence < 0) throw new Error("Native audio capture sequence/hash is invalid.");
+      const signature = sha256(JSON.stringify([request.turnId, request.utteranceId, request.capturedAt, request.bytes, request.contentSha256]));
+      const claims = record.nativeAudioClaims ??= new Map<number, string>();
+      const previous = claims.get(request.sequence);
+      if (previous !== undefined && previous !== signature) throw new Error("This microphone sequence already belongs to different audio bytes or a different turn.");
+      if (previous === undefined) {
+        if (request.sequence <= (record.nativeAudioLastSequence ?? -1)) throw new Error("Microphone utterance sequence must increase.");
+        if (!hasTextMemoryHeadroom(2048)) throw new Error("Microphone receipt admission awaits host RAM; this utterance was not silently discarded.");
+        claims.set(request.sequence, signature);
+        record.nativeAudioLastSequence = request.sequence;
+      }
+    }
+    return { permissionRevision: 1, maxBytes: record.session.maxPacketBytes };
   }
 
   async pushObservation(
@@ -9616,7 +11548,7 @@ export class RuntimeJobManager extends EventEmitter {
     const job = this.jobs.get(jobId);
     if (!job) throw new Error("The runtime job was not found.");
     if (["complete", "failed", "cancelled"].includes(job.state)) return { ...job };
-    const preparationOnly = this.preparationOnlyJobs.has(job.id);
+    const preparationOnly = this.preparationOnlyJobs.has(job.id) || this.waitingForInstanceLoadJobs.has(job.id);
     const operation = this.jobOperations.get(job.id);
     job.cancelled = true;
     this.mediaArtifacts?.cancelJob(job.brainId, job.id);
@@ -9961,6 +11893,7 @@ export class RuntimeJobManager extends EventEmitter {
       return cloneObservationSession(record.session);
     }
     record.session.state = "stopping";
+    record.nativeAudioClaims?.clear();
     record.session.updatedAt = new Date().toISOString();
     await Promise.allSettled([...record.pending]);
     for (const control of record.controls.values()) {
@@ -10061,13 +11994,22 @@ export class RuntimeJobManager extends EventEmitter {
 
   private async run(job: JobRecord, operation: () => Promise<unknown>): Promise<void> {
     if (job.cancelled) return;
-    job.state = "running";
-    if (job.phase !== "preparing-neural-substrate") {
-      job.progress = Math.max(job.progress, 0.01);
-    }
-    job.updatedAt = new Date().toISOString();
-    this.publish(job);
     try {
+      if (!this.initializingBrains.has(job.brainId) && this.service.waitUntilInstanceLoaded) {
+        const label = job.label;
+        this.waitingForInstanceLoadJobs.add(job.id);
+        if (this.service.instanceLifecycle && !this.service.instanceLifecycle.canRun(job.brainId)) {
+          job.label = "Waiting for Load or the retained turn's completion";
+          job.updatedAt = new Date().toISOString(); this.publish(job);
+        }
+        try { await this.service.waitUntilInstanceLoaded(job.brainId, this.cancellationControllers.get(job.id)?.signal); }
+        finally { this.waitingForInstanceLoadJobs.delete(job.id); }
+        job.label = label;
+      }
+      if (job.cancelled) return;
+      job.state = "running";
+      if (job.phase !== "preparing-neural-substrate") job.progress = Math.max(job.progress, 0.01);
+      job.updatedAt = new Date().toISOString(); this.publish(job);
       let output = await operation();
       if (job.cancelled) return;
       if (

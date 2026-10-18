@@ -63,6 +63,12 @@ async function selectAppearance(
           layout: layoutValue
         })
       );
+      // Workspace arrangement is an independent setting, not a surface pack.
+      // Keep this matrix on the same explicit split arrangement; a separate
+      // test below asserts all four actual workspace topologies.
+      window.localStorage.setItem("omni.appearance.workspace.v1", JSON.stringify({
+        schemaVersion: 1, arrangement: "split", notificationsEnabled: false, profiles: []
+      }));
     },
     { modeValue: mode, paletteValue: palette, layoutValue: layout }
   );
@@ -75,23 +81,29 @@ async function selectAppearance(
   await expect(page.locator(".conversation")).toBeVisible();
 }
 
-async function installAuditFixtures(page: Page): Promise<void> {
+/** Inert markup exercises CSS states only; it performs no action or capture. */
+async function installCssStateSamples(page: Page): Promise<void> {
   await page.evaluate(() => {
     document.querySelector("[data-theme-audit-fixture]")?.remove();
     const host = document.createElement("div");
-    host.dataset.themeAuditFixture = "true";
+    host.dataset.themeAuditFixture = "css-only";
+    host.setAttribute("aria-label", "Synthetic CSS state samples; no action or device capture performed");
     host.className = "chat-action-stream";
     host.innerHTML = `
-      <article class="chat-action-card chat-action-card--complete">
-        <span class="chat-action-card__icon" aria-hidden="true">✓</span>
+      <p>CSS-only state samples · not completed runtime actions</p>
+      <details class="chat-action-card chat-action-card--complete" open>
+        <summary aria-label="Synthetic files action: complete. Expand action details">
+          <span class="chat-action-card__icon" aria-hidden="true">✓</span>
+          <span class="chat-action-card__summary-copy"><strong>files / inspect</strong><small>Complete · CSS sample</small></span>
+        </summary>
         <div class="chat-action-card__body">
           <div class="chat-action-card__head">
-            <span><small>CHAT ACTION</small><strong>files / inspect</strong></span>
+            <span><small>BRAIN ACTION · CSS SAMPLE</small><strong>files / inspect</strong></span>
             <em><i></i> complete</em>
           </div>
           <code>{"path":"theme-audit.txt"}</code>
         </div>
-      </article>
+      </details>
       <button class="button" disabled>Disabled action</button>
       <label class="simple-name-field">
         <span>Brain name</span>
@@ -99,7 +111,7 @@ async function installAuditFixtures(page: Page): Promise<void> {
         <small>Names remain local to this identity.</small>
       </label>
       <section class="simple-review-card">
-        <div><span><small>READY TO BUILD</small><strong>Readable review</strong></span></div>
+        <div><span><small>READY TO CREATE</small><strong>Readable review · CSS sample</strong></span></div>
         <dl>
           <div><dt>Native core</dt><dd>Locally initialized</dd></div>
           <div><dt>Working memory</dt><dd>Automatic</dd></div>
@@ -110,29 +122,46 @@ async function installAuditFixtures(page: Page): Promise<void> {
         <input type="checkbox" disabled /><i><b></b></i>
       </label>
       <div class="workspace-meter">
-        <div><span>Workspace memory</span><strong>4.8 GB available</strong></div>
+        <div><span>Retained meter style</span><strong>4.8 GB · CSS sample</strong></div>
         <i><b style="width: 62%"></b></i>
-        <small>Automatic allocation remains inside the live-safe pool.</small>
+        <small>No allocation was measured or performed by this CSS sample.</small>
       </div>
-      <details class="live-perception-panel" open>
-        <summary>
+      <section class="camera-screen-panel" aria-label="Synthetic camera and screen CSS sample">
+        <header>
           <span class="live-perception-panel__icon"></span>
-          <span><strong>Live Perception</strong><small>Camera · 1920×1080 @ 24 FPS</small></span>
-          <em class="is-active"><i></i> Observing</em>
-        </summary>
-        <div class="live-perception-panel__body">
+          <span><strong>Camera &amp; screen</strong><small>CSS sample · 1920×1080 @ 24 FPS</small></span>
+          <em class="is-active"><i></i> Synthetic status</em>
+        </header>
+        <div class="camera-screen-panel__body">
           <div class="live-perception-facts">
-            <span><small>Applied capture</small><strong>1920×1080 @ 24 FPS</strong></span>
-            <span><small>Resource class</small><strong>High</strong></span>
+            <span><small>Capture</small><strong>1920×1080 @ 24 FPS</strong></span>
+            <span><small>Resources</small><strong>High · sample</strong></span>
             <span><small>Accepted</small><strong>1,248</strong></span>
             <span><small>Backpressure</small><strong>2</strong></span>
           </div>
-          <p class="live-perception-control-status"><span>Brain configure · applied · r4</span></p>
-          <p class="live-perception-privacy">Raw packets are not stored and dataset coverage is not committed.</p>
+          <dl class="live-perception-audit"><div><dt>Last control</dt><dd>Synthetic control receipt · no device was opened</dd></div></dl>
+          <p class="live-perception-privacy">CSS-only sample. No raw packets, neural state, or dataset coverage were created.</p>
         </div>
-      </details>
+      </section>
     `;
     document.querySelector(".message-stream")?.append(host);
+  });
+}
+
+/** Retain SVG-label contrast coverage without inventing an inspection API. */
+async function installGraphCssSample(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const map = document.querySelector(".whole-brain-map");
+    if (!map) throw new Error("The current whole-brain map is missing.");
+    const sample = document.createElement("div");
+    sample.dataset.themeGraphCssFixture = "true";
+    sample.className = "brain-map-graph";
+    sample.setAttribute("aria-label", "Synthetic graph label CSS sample; no neural records or firing measured");
+    sample.innerHTML = `<svg viewBox="0 0 1000 650" aria-label="CSS-only graph sample">
+      <g class="graph-node"><text x="500" y="325" text-anchor="middle" fill="var(--graph-label)" font-size="12">Synthetic label · CSS only</text></g>
+    </svg>`;
+    map.querySelector("[data-theme-graph-css-fixture]")?.remove();
+    map.append(sample);
   });
 }
 
@@ -168,12 +197,12 @@ async function measureContrast(
       { id: "workspace-meter-label", selector: "[data-theme-audit-fixture] .workspace-meter span", minimum: 4.5 },
       { id: "workspace-meter-value", selector: "[data-theme-audit-fixture] .workspace-meter strong", minimum: 4.5 },
       { id: "workspace-meter-detail", selector: "[data-theme-audit-fixture] .workspace-meter small", minimum: 4.5 },
-      { id: "perception-title", selector: "[data-theme-audit-fixture] .live-perception-panel > summary strong", minimum: 4.5 },
-      { id: "perception-detail", selector: "[data-theme-audit-fixture] .live-perception-panel > summary small", minimum: 4.5 },
-      { id: "perception-status", selector: "[data-theme-audit-fixture] .live-perception-panel > summary em", minimum: 4.5 },
+      { id: "perception-title", selector: "[data-theme-audit-fixture] .camera-screen-panel > header strong", minimum: 4.5 },
+      { id: "perception-detail", selector: "[data-theme-audit-fixture] .camera-screen-panel > header small", minimum: 4.5 },
+      { id: "perception-status", selector: "[data-theme-audit-fixture] .camera-screen-panel > header em", minimum: 4.5 },
       { id: "perception-fact-label", selector: "[data-theme-audit-fixture] .live-perception-facts small", minimum: 4.5 },
       { id: "perception-fact-value", selector: "[data-theme-audit-fixture] .live-perception-facts strong", minimum: 4.5 },
-      { id: "perception-control", selector: "[data-theme-audit-fixture] .live-perception-control-status", minimum: 4.5 },
+      { id: "perception-control", selector: "[data-theme-audit-fixture] .live-perception-audit dd", minimum: 4.5 },
       { id: "perception-privacy", selector: "[data-theme-audit-fixture] .live-perception-privacy", minimum: 4.5 }
     ];
 
@@ -398,7 +427,7 @@ test("fresh platform defaults are native while a saved preference always wins", 
   }
 });
 
-test("all appearance packs meet representative contrast at desktop and mobile sizes", async () => {
+test("appearance controls and explicit CSS-only state samples meet contrast at desktop and mobile sizes", async () => {
   const application = await launchAppearanceApplication();
   const failures: Array<{ matrix: string; result: ContrastResult }> = [];
   const report: Record<string, ContrastResult[]> = {};
@@ -411,7 +440,7 @@ test("all appearance packs meet representative contrast at desktop and mobile si
         for (const pack of packs) {
           const matrix = `${viewport.id}/${mode}/${pack.id}`;
           await selectAppearance(page, mode, pack.palette, pack.layout);
-          await installAuditFixtures(page);
+          await installCssStateSamples(page);
           await page.getByRole("button", { name: "Appearance settings" }).click();
           const panel = page.getByRole("dialog", { name: "Appearance settings" });
           await expect(panel).toBeVisible();
@@ -421,6 +450,9 @@ test("all appearance packs meet representative contrast at desktop and mobile si
           expect(bounds!.y, `${matrix} appearance panel top edge`).toBeGreaterThanOrEqual(0);
           expect(bounds!.x + bounds!.width, `${matrix} appearance panel right edge`).toBeLessThanOrEqual(viewport.width + 1);
           expect(bounds!.y + bounds!.height, `${matrix} appearance panel bottom edge`).toBeLessThanOrEqual(viewport.height + 1);
+          const lowerControl = panel.getByRole("switch", { name: /Desktop task alerts/ });
+          await lowerControl.scrollIntoViewIfNeeded();
+          await expect(lowerControl).toBeVisible();
           const results = await measureContrast(page);
           report[matrix] = results;
           for (const result of results) {
@@ -445,47 +477,47 @@ test("all appearance packs meet representative contrast at desktop and mobile si
   ).toEqual([]);
 });
 
-test("Brain Map labels, inspector copy, status, and controls meet contrast in every pack", async () => {
+test("whole-brain unavailable state and isolated graph-label CSS meet contrast in every pack", async () => {
   const application = await launchAppearanceApplication();
   const failures: Array<{ matrix: string; result: ContrastResult }> = [];
   const report: Record<string, ContrastResult[]> = {};
   const targets: ContrastTarget[] = [
     {
       id: "graph-label",
-      selector: ".graph-node text:last-of-type",
+      selector: "[data-theme-graph-css-fixture] .graph-node text",
       minimum: 4.5,
-      backgroundSelector: ".brain-graph",
+      backgroundSelector: ".whole-brain-map",
       foregroundProperty: "fill"
     },
     {
       id: "graph-legend",
-      selector: ".graph-legend span",
+      selector: ".whole-brain-map__layers legend",
       minimum: 4.5,
-      backgroundSelector: ".graph-surface"
+      backgroundSelector: ".whole-brain-map"
     },
     {
       id: "graph-inspector-title",
-      selector: ".map-inspector h2",
+      selector: ".whole-brain-map__details aside h2",
       minimum: 4.5,
-      backgroundSelector: ".map-inspector"
+      backgroundSelector: ".whole-brain-map"
     },
     {
       id: "graph-inspector-section",
-      selector: ".map-inspector .panel-section__head span",
+      selector: ".whole-brain-map__details section h2",
       minimum: 4.5,
-      backgroundSelector: ".map-inspector"
+      backgroundSelector: ".whole-brain-map"
     },
     {
       id: "graph-status",
-      selector: ".graph-status span",
+      selector: ".whole-brain-map > p[role='status']",
       minimum: 4.5,
-      backgroundSelector: ".graph-surface"
+      backgroundSelector: ".whole-brain-map"
     },
     {
       id: "graph-controls",
-      selector: ".map-viewport-controls span",
+      selector: ".whole-brain-map__navigation > span",
       minimum: 4.5,
-      backgroundSelector: ".map-viewport-controls"
+      backgroundSelector: ".whole-brain-map"
     }
   ];
 
@@ -499,7 +531,12 @@ test("Brain Map labels, inspector copy, status, and controls meet contrast in ev
           const matrix = `${viewport.id}/${mode}/${pack.id}`;
           await selectAppearance(page, mode, pack.palette, pack.layout);
           await page.getByRole("button", { name: "Brain map", exact: true }).click();
-          await expect(page.locator(".map-page")).toBeVisible();
+          const map = page.getByRole("region", { name: "Whole brain map", exact: true });
+          await expect(map).toBeVisible();
+          await expect(map.getByRole("heading", { name: "Brain Map", exact: true })).toBeVisible();
+          await expect(map.getByRole("button", { name: "Refresh whole brain", exact: true })).toBeDisabled();
+          await expect(map.locator(".brain-map-graph")).toHaveCount(0);
+          await installGraphCssSample(page);
           const results = await measureContrast(page, targets);
           report[matrix] = results;
           for (const result of results) {
@@ -524,7 +561,7 @@ test("Brain Map labels, inspector copy, status, and controls meet contrast in ev
   ).toEqual([]);
 });
 
-test("layout packs produce distinct workspace topology, proportions, spacing, and typography", async () => {
+test("surface packs retain distinct proportions, spacing, and typography without overriding workspace arrangement", async () => {
   const application = await launchAppearanceApplication();
   try {
     const page = await application.firstWindow();
@@ -532,7 +569,8 @@ test("layout packs produce distinct workspace topology, proportions, spacing, an
     const signatures = new Map<string, Awaited<ReturnType<typeof layoutSignature>>>();
     for (const pack of packs) {
       await selectAppearance(page, "dark", pack.palette, pack.layout);
-      await installAuditFixtures(page);
+      await installCssStateSamples(page);
+      await expect(page.locator("html")).toHaveAttribute("data-workspace-arrangement", "split");
       signatures.set(pack.id, await layoutSignature(page));
     }
 
@@ -560,10 +598,11 @@ test("layout packs produce distinct workspace topology, proportions, spacing, an
       new Set([standard.messageInset, classic.messageInset, colorful.messageInset, glass.messageInset]).size,
       "Layout packs must change content placement/inset"
     ).toBeGreaterThanOrEqual(3);
-    expect(
-      new Set([standard.chatColumns, classic.chatColumns, colorful.chatColumns, glass.chatColumns]).size,
-      "At least one layout must alter the conversation/inspector area topology"
-    ).toBeGreaterThanOrEqual(2);
+    // Explicit workspace arrangement wins over a surface pack's older grid
+    // defaults. The following test measures all four real arrangements.
+    expect([standard.chatColumns, classic.chatColumns, colorful.chatColumns, glass.chatColumns]
+      .every(columns => columns.trim().split(/\s+/).length === 2),
+    "The selected split arrangement must keep both actual chat/inspector tracks").toBe(true);
     expect(
       new Set([standard.cardGap, classic.cardGap, colorful.cardGap, glass.cardGap]).size,
       "Layout packs must change spatial rhythm"

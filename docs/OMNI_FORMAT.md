@@ -1,19 +1,32 @@
 # `.omni` portable brain format
 
-## Version 1 status
+## Version 2 status
 
-An `.omni` file is a non-executable ZIP container for OmniCortex state. The current contract remains format version 1:
+An `.omni` file is a non-executable ZIP container for OmniCortex state. New
+exports use format version 2, with complete saved whole-brain catalog custody:
 
 ```json
 {
   "format": "omni-brain",
-  "formatVersion": 1,
+  "formatVersion": 2,
+  "requiredFeatures": ["whole-brain-catalog-closure-v1"],
   "architecture": "OmniCortex",
   "architectureSchemaVersion": 1
 }
 ```
 
-The schema-version value above is illustrative of the current build constant; import requires an exact match with that build. The importer never loads pickle objects and never executes repository code or setup scripts from a bundle.
+The schema-version value above is illustrative of the current build constant;
+import requires an exact match with that build. Unknown required features are
+rejected before any identity adoption. Older apps are not an export
+compatibility constraint. The importer never loads pickle objects and never
+executes repository code or setup scripts from a bundle.
+
+Read-only format-1 import is limited to otherwise-valid, currently supported
+native OmniCortex state without whole-brain catalog pointers or a catalog
+payload namespace. Catalog-bearing or dangling format-1 archives are rejected
+with a format-2-required error. Typed API-teacher media custody also requires
+format2 and its conditional required-feature declaration below. This is not a foreign-model or legacy-hybrid
+compatibility mode, and existing external files are never rewritten or erased.
 
 This format carries a brain's saved neural identity and immutable origin.
 The local source correction preserves saved content **unsanitized**, including
@@ -28,7 +41,7 @@ contracts documented in [CATALOG_FORMATS.md](CATALOG_FORMATS.md).
 
 ## Required entries
 
-Every version-1 bundle contains both a selected payload and an immutable-origin payload:
+Every version-2 bundle contains both a selected payload and an immutable-origin payload:
 
 ```text
 manifest.json
@@ -43,6 +56,64 @@ origin/state/engine.json
 origin/tensors/core.safetensors
 origin/tensors/plastic.safetensors
 ```
+
+Both selected and immutable-origin states also require their exact saved
+whole-brain catalog closure, including reachable retained lineage:
+
+```text
+catalog/current/whole-brain-catalog/blobs/<sha256>.json
+catalog/current/whole-brain-catalog/index/<sha256>.sqlite3
+catalog/current/whole-brain-catalog/lineage/blobs/<sha256>.json
+catalog/current/whole-brain-catalog/lineage/sources/<entry-sha256>/whole-brain-catalog/...
+catalog/origin/whole-brain-catalog/...
+```
+
+Only the exact chain and immutable location index named by saved metadata are
+included; local orphan/history files are not globbed into a bundle. A direct
+catalog pointer binds the source identity, committed core/substrate generations,
+attention-overlay digest and both connected-region descriptor digests. Every
+catalog record and retained lineage entry keeps its original source identity.
+Missing or empty source registries are rejected; export never loads a model,
+invents an empty map, or rewrites the immutable origin to fill this gap.
+
+A copied checkpoint may have no current destination registry while preserving
+the real source registry as lineage. In that case its archive includes
+`catalog/current/projection.json` (or the corresponding origin scope when
+applicable). This checksummed, archive-only `preserved-current-state`
+projection binds the actual saved owner/state to one exact retained source
+entry. It requires an exact match of all non-owner state-binding fields;
+distinct matching registries are ambiguous and rejected. Identical source
+pointers may be deduplicated for selection, but all lineage provenance stays.
+Import re-derives the projection rather than trusting its claim. It is not
+persisted as a live destination registry or activation record. Subsequent
+copy/re-export derives it again without a model Load or source mutation.
+
+When saved current, origin, recovery or connected-parent state contains MCP
+task receipts, the manifest additionally requires `mcp-task-custody-v1`:
+
+```text
+mcp-tasks/current/operational-mcp-tasks/<task-ref>.json
+mcp-tasks/current/operational-mcp-tasks/history/<sha256>.json
+mcp-tasks/current/operational-mcp-tasks/payloads/<sha256>.json
+mcp-tasks/current/operational-mcp-tasks/lineage/<closure-sha256>/...
+mcp-tasks/origin/operational-mcp-tasks/...
+```
+
+Recovery points retain the same exact paths beneath their saved `engine/`;
+connected-parent payloads remain opaque ZIP blobs whose authenticated logical
+paths are checked as complete task closures. Current folders are first
+captured coherently under a short canonical task-store lease, then immutable
+staged files stream without a model-export-long lease. Import validates exact
+record/history/content addresses and final payload receipts before reserving
+an identity. Unknown files, missing payloads, injected live-authority
+fields or missing feature declarations fail closed. Original task IDs, source
+owners, observed receiver IDs and raw persisted content remain unchanged.
+The records are historical, not live server sessions, keys, request leases,
+permissions or replay grants. Copies/imports cannot regain task control merely
+from matching an old ID. See [MCP task custody](v2/mcp-task-portability.md).
+Known interrupted-publication `.json.<UUID>.next` fragments are retained as
+exact inert bytes without parsing or promoting them into task state. Arbitrary
+unknown partial-file names still fail validation.
 
 When `engineMaterialized` is true, both exact inference payloads are also
 required:
@@ -110,11 +181,62 @@ joint-generation manifests/index snapshots and declared recovery history.
 Every payload is checksum-bound. A missing historical cold-page/joint payload
 is explicitly listed, not recreated or described as a restorable checkpoint.
 
+The checksum-bound `learning-workspace/` inventory also carries host-owned
+current-task attachment registries and their content-addressed raw blobs. An
+attachment record binds brain, turn, immutable handle, MIME, byte length,
+content hash, private source provenance, and state. External import/fork rekeys
+the current owner without rewriting the original source bytes; recovery selects
+the saved registry; full merge imports parent attachments only as inert
+attributed history. Unsent handles explicitly removed before binding are not
+portable. Attachment staging alone is not a dataset or neural-learning receipt.
+
+When the learning inventory retains typed API-teacher media requests, received
+response envelopes, lessons or assets, the manifest additionally requires
+`api-teacher-typed-media-v1`. This is a supported conditional feature, not a
+mandatory token for teacher-free archives. Exact logical custody includes:
+
+```text
+api-teachers/workspace.sqlite3
+api-teachers/archives/<sha256>.sqlite3
+api-teachers/envelopes/<sha256>.json
+api-teachers/assets/<sha256>.<verified-media-extension>
+api-teachers/lesson-<sha256>.jsonl
+```
+
+These logical files are carried by the existing learning-workspace inventory
+and checksummed blobs, including historical recovery inventories and opaque
+connected-parent `portable-learning-workspace` inventories. The importer checks
+the complete current/sealed-history teacher reference closure before reserving
+an identity; missing declarations, files, byte counts, signatures or hashes
+refuse adoption. Current and origin export modes preserve this unsanitized
+operational history. A same-ID external import still makes copied teacher jobs
+dormant; it does not turn a saved job into provider authority merely because the
+ID was unused. Explicit same-owner recovery preserves its genuine selected
+paused prefix instead. Credentials, live leases and grants are not copied.
+See [typed teacher media](v2/api-teacher-media.md) for exact states and evidence.
+
+Current, private-archive, and referenced-local bundles with declarative plugin
+history additionally carry:
+
+```text
+plugins/manifest.json
+plugins/packages/<content-sha256>.json
+```
+
+The plugin manifest binds each immutable package, its public documentation,
+reviewed selection, ordinary semantic-learning receipt, and install provenance.
+Origin-only bundles omit later mutable plugin selections. Installation
+credential-store records, live sessions, approval tokens, and catalog database
+paths are never plugin payloads. User-authored documentation is preserved
+exactly and may itself contain sensitive text, so it still requires review.
+
 ## Manifest contract
 
 The manifest records and validates:
 
 - exact `format`, `formatVersion`, `architecture`, and `architectureSchemaVersion`;
+- format-2 `requiredFeatures`, including complete catalog-closure support;
+- conditional typed API-teacher media and MCP task-custody feature requirements;
 - export timestamp, brain ID, display name, and lineage;
 - one declared export mode;
 - materialized-engine status, memory recipe, raw-episode status, and `ternary-effective` quantization;
@@ -122,9 +244,13 @@ The manifest records and validates:
   counts, and—only for referenced-local mode—per-file object references;
 - descriptors and checksums for the current and immutable-origin substrate
   pointers, generation manifests, and every referenced bounded shard;
+- complete current/origin catalog chains, immutable indexes, retained lineage
+  closures and any exact re-derived archive-only copied-state projection;
 - `savedInstance: {version: 1, content: "unsanitized"}`, zero replacements in
   the retained `secretRedaction` envelope, and included conversation state;
 - declared recovery points and any exact already-missing historical references;
+- when present, one plugin-portability declaration with exact selection/package
+  counts and the SHA-256 of `plugins/manifest.json`;
 - an application-license declaration and normalized per-source provenance/license ledger;
 - SHA-256 and exact byte length for every payload entry except `manifest.json` and `checksums.sha256`;
 - for referenced-local mode, the SHA-256 object IDs for current and origin
@@ -154,6 +280,13 @@ Before materializing a brain, the importer:
 - compares both the manifest SHA-256 and exact byte count with the streamed
   extracted file;
 - requires the exact supported architecture, schema, export mode, redaction policy, and license-ledger shape;
+- rejects unknown required features before adoption; requires the exact catalog
+  current/origin/lineage namespace with no missing or orphan payloads, validates
+  every catalog checksum and index-to-record location, and re-derives copied
+  current-state projections from the authenticated metadata;
+- validates exact typed API-teacher closure in ordinary, historical and opaque
+  connected-parent inventories before identity adoption, with selected-family,
+  physical and heap parsing admission;
 - requires both current state and immutable origin to prove native ground-up
   OmniCortex (`origin_kind: ground-up`, no foundation model/adapter, no retired
   Starter manifest, and no random-only Blank or legacy-hybrid marker);
@@ -168,6 +301,9 @@ Before materializing a brain, the importer:
   content-addressed blob name and checksum, and the effective ternary value of
   every sparse synapse;
 - verifies content-addressed object names against their bytes;
+- validates plugin package canonical hashes, declarations, selection/provenance
+  identity and semantic receipt hashes; rejects undeclared plugin files,
+  unreferenced packages, and credential-like immutable delegate constants;
 - validates replay SQLite integrity, every tensor-row payload checksum, and
   the declared committed count/high-water/content digest before publishing an
   imported identity; pending rows are validated too;
@@ -177,6 +313,13 @@ If an imported brain ID already exists, the importer assigns a new ID and
 advances lineage instead of overwriting the existing brain. Extraction and
 validation occur in temporary storage; any failed check removes the candidate
 before it becomes a visible brain.
+
+An external import installs verified missing plugin dependencies inactive and
+stores selections as dormant history. It creates no per-instance plugin access
+and imports no grant. Trusted local duplicate/fork is a different authority
+boundary: it may preserve the exact current reviewed selection while giving the
+new identity independent host-policy revisions. Full merge preserves each
+parent's plugin selection as a distinct dormant provenance record.
 
 ## Export modes
 
@@ -216,6 +359,16 @@ validation into a temporary directory. “No fixed archive cap” does not mean
 infinite storage: host filesystem limits, available address space, configured
 free-disk reserve, user cancellation, and corrupt or unsupported ZIP structures
 remain explicit stopping conditions.
+
+Catalog JSON is read through an admitted, exact-sized file descriptor before
+decoding. Physical free memory, available V8 heap and the host's selected app
+RAM ceiling must admit its conservative scratch requirement. Source size,
+device/inode, timestamps, canonical path and checksum are rechecked around the
+read. JSON shards are traversed one at a time; SQLite uses a bounded page cache
+and file-backed temporary work, not a full index-to-array load. These are
+cooperative allocation checks, not a claimed OS-enforced whole-process RSS
+limit. Resource pressure pauses/refuses the operation; there is no fixed total
+brain, archive, record or lineage-count product cap.
 
 ## Saved content and privacy
 

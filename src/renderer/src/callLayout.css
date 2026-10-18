@@ -1,0 +1,12 @@
+.conversation { container-type:inline-size; }
+.call-layout { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
+.call-layout__conversation { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
+.call-layout > .chat-call-panel { min-width:0; max-height:min(40vh,400px); }
+@container(min-width:720px) {
+  .call-layout.is-open { display:grid; grid-template-columns:minmax(240px,300px) minmax(0,1fr); }
+  .call-layout.is-open > .chat-call-panel { max-height:none; margin:0 0 10px 12px; overflow:auto; }
+  .call-layout.is-open > .call-layout__conversation { min-width:0; }
+}
+@container(max-width:719px) {
+  .call-layout > .chat-call-panel { margin:0 10px 8px; }
+}

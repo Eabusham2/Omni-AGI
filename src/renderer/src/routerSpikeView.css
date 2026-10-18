@@ -1,0 +1,16 @@
+.router-spike-view { margin:18px 28px; padding:18px; display:flex; flex-direction:column; gap:12px; min-width:0; }
+.brain-map-domains { flex-wrap:wrap; }
+.brain-map-domains>button { white-space:normal; }
+.router-spike-view h2,.router-spike-view p { margin:0; overflow-wrap:anywhere; }
+.router-spike-view__controls { display:flex; flex-wrap:wrap; align-items:end; gap:8px; }
+.router-spike-view__controls label { display:flex; flex:1 1 120px; max-width:220px; min-width:0; flex-direction:column; gap:4px; }
+.router-spike-view input { width:100%; box-sizing:border-box; padding:8px; color:var(--text); background:var(--surface-2); border:1px solid var(--border); border-radius:6px; }
+.router-spike-view__channels { display:grid; grid-template-columns:repeat(auto-fit,minmax(44px,1fr)); gap:5px; }
+.router-spike-view__channels button { min-height:36px; border:1px solid var(--border); border-radius:5px; background:var(--surface-2); color:var(--text); font-size:12px; }
+.router-spike-view__channels button[data-spike="1"] { background:var(--accent-soft); border-color:var(--accent); }
+.router-spike-view__channels button[aria-pressed="true"] { outline:2px solid var(--accent); outline-offset:1px; }
+.router-spike-view__scope { font-size:12px; color:var(--text-2); line-height:1.5; }
+.router-spike-view__identity,.router-spike-view dd { overflow-wrap:anywhere; }
+.router-spike-view dl>div { display:flex; flex-wrap:wrap; justify-content:space-between; gap:6px; margin-block:6px; }
+.router-spike-view dd { margin:0; }
+@media(max-width:600px) { .router-spike-view { margin:12px; padding:12px; } }

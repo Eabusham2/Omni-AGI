@@ -78,6 +78,8 @@ class OmniConfig:
     # Trusted main-selected Build descriptor. Legacy saved/research shapes
     # omit it and retain their exact explicit tensor dimensions unchanged.
     native_architecture: Optional[Dict[str, Any]] = None
+    # Operational device choices only; no renderer-provided capacity or model geometry.
+    device_resource_settings: Optional[Dict[str, Any]] = None
     train_batch_size: int = 2
     gradient_accumulation: int = 2
     gradient_checkpointing: bool = False
@@ -118,6 +120,8 @@ class OmniConfig:
     slow_importance_decay: float = 0.97
     temperature: float = 0.9
     top_k: int = 40
+    best_work_enabled: bool = False
+    best_work_exploration_branches: int = 16
 
     membrane_leak: float = 0.88
     firing_threshold: float = 0.55
@@ -166,6 +170,13 @@ class OmniConfig:
     working_attention_scratch_budget_bytes: Optional[int] = None
 
     def validate(self) -> None:
+        if type(self.best_work_enabled) is not bool:
+            raise ValueError("best_work_enabled must be boolean")
+        if type(self.best_work_exploration_branches) is not int or not 1 <= self.best_work_exploration_branches <= 16:
+            raise ValueError("Best Work exploration branch budget must be 1 through 16")
+        if self.best_work_enabled and (not isinstance(self.temperature, (int, float)) or isinstance(self.temperature, bool)
+                or not math.isfinite(self.temperature) or not 0 < self.temperature <= .95):
+            raise ValueError("Best Work ordinary temperature must be positive and at most 0.95")
         # Stable v1 treats prompt-free recurrence/Ponder as a permanent
         # architectural pathway. Learned neural state can select zero passes,
         # but neither a legacy import nor a direct research constructor may
@@ -259,6 +270,9 @@ class OmniConfig:
             and (isinstance(self.working_attention_scratch_budget_bytes, bool)
                  or self.working_attention_scratch_budget_bytes < 0)):
             raise ValueError("working attention scratch bytes must be nonnegative")
+        if self.device_resource_settings is not None:
+            from .device_resources import validate_device_resource_settings
+            self.device_resource_settings = validate_device_resource_settings(self.device_resource_settings)
         if self.native_architecture is not None:
             descriptor = validate_native_architecture(self.native_architecture)
             from .architecture_migration import validate_compatible_architecture_lineage
@@ -283,6 +297,7 @@ class OmniConfig:
             if key not in _DEPRECATED_BETA_CONTROL_FIELDS
             and key != "long_term_threshold"
             and not (key == "native_architecture" and value is None)
+            and not (key == "device_resource_settings" and value is None)
             and not (key == "storage_pool_bytes" and value == 0)
             and not (key == "working_attention_scratch_budget_bytes" and value is None)
         }
@@ -483,6 +498,7 @@ class OmniConfig:
                 raw.get("trainingResourceMode", "auto")
             ),
             "system_ram_share_percent": system_ram_share_percent,
+            "device_resource_settings": raw.get("deviceResources"),
             "training_ram_budget_bytes": max(
                 0, int(raw.get("trainingRamBudgetBytes", 0))
             ),
@@ -506,6 +522,8 @@ class OmniConfig:
             "liquid_mode": str(raw.get("liquidMode", "cfc")),
             "vector_symbolic_memory": True,
             "online_learning": bool(raw.get("onlineLearning", True)),
+            "best_work_enabled": raw.get("bestWorkEnabled", False),
+            "best_work_exploration_branches": raw.get("bestWorkExplorationBranches", 16),
             "consolidation_enabled": True,
             "metaplasticity": True,
             "vision_enabled": bool(raw.get("vision_enabled", True)),
@@ -560,6 +578,13 @@ class OmniConfig:
         }
         if values["memory_recipe"] in {"human", "human-consolidation"}:
             values["memory_recipe"] = "adaptive-retention"
+        if values["device_resource_settings"] is not None:
+            from .device_resources import validate_device_resource_settings
+            selected = validate_device_resource_settings(values["device_resource_settings"])
+            values["device_resource_settings"] = selected
+            ram = next((entry for entry in selected["allocations"] if entry["deviceId"] == "ram:system"), None)
+            if ram is not None:
+                values["system_ram_share_percent"] = float(ram["percent"]) if ram["mode"] == "manual" else 0.0
         if descriptor is not None:
             resolved = descriptor["shape"]
             values.update({

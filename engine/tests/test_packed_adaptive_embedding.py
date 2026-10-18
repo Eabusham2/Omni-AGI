@@ -42,7 +42,7 @@ class PackedAdaptiveEmbeddingTests(unittest.TestCase):
         self.assertEqual(packed_runtime_status(layer)["packedAuthoritativeEmbeddingModules"], 1)
         self.assertEqual(
             set(layer.state_dict()),
-            {"_packed_forward_weight", "_packed_forward_scale", "_online_learning_rate", "_row_stability"},
+            {"_packed_forward_weight", "_packed_forward_scale", "_online_learning_rate", "_row_stability", "_connection_state", "parallel_connections._next_page"},
         )
         with torch.no_grad():
             layer._packed_forward_weight[3:4].copy_(

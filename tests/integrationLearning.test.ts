@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import { ChatActionController } from "../src/main/chatActionController";
 import { McpClientService } from "../src/main/mcpClient";
 import { SecureSecretStore, type SecretProtector } from "../src/main/secureSecretStore";
 import { ApiTeacherTrainingService } from "../src/main/teacherTraining";
+import { apiTeacherSha256 } from "../src/main/apiTeacherStore";
 import { ToolExecutor } from "../src/main/toolExecutor";
 import type { RuntimeJobEvent, ToolPermissionRecord } from "../src/shared/types";
 
@@ -28,6 +29,16 @@ describe("API teacher and MCP neural integrations", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  const teacherOptions = () => ({
+    brainRoot: async (brainId: string) => { const path = join(root, brainId); await mkdir(path, { recursive: true }); return path; },
+    admitWrite: async () => undefined
+  });
+  const learnedReceipt = (brainId: string, content: string) => ({ brain: { id: brainId }, source: {
+    id: "fixture-source", name: "fixture", kind: "text", bytes: Buffer.byteLength(content), learnedIdeas: 1,
+    learnedConcepts: 1, learnedSynapses: 1, learnedParameterSteps: 1, parametersChanged: true,
+    importedAt: new Date().toISOString(), rawTextRetained: false, contentHash: apiTeacherSha256(content), policy: "pretrain"
+  }, warnings: [] });
+
   it("serializes concurrent encrypted credential updates without losing records", async () => {
     await Promise.all([
       secrets.set("teacher:openai", "openai-key"),
@@ -49,7 +60,7 @@ describe("API teacher and MCP neural integrations", () => {
       preflightStart: vi.fn(async () => undefined),
       learnStructuredExperience: vi.fn(async (_brainId: string, value: { content: string }) => {
         learned.push(value.content);
-        return {};
+        return learnedReceipt(_brainId, value.content);
       })
     };
     const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -65,6 +76,7 @@ describe("API teacher and MCP neural integrations", () => {
     const service = new ApiTeacherTrainingService(
       brain as never,
       secrets,
+      teacherOptions(),
       fetcher as typeof fetch
     );
     const statuses = await service.saveCredential({
@@ -82,7 +94,7 @@ describe("API teacher and MCP neural integrations", () => {
         if (["complete", "failed", "cancelled"].includes(event.job.state)) resolve(event);
       });
     });
-    service.start({
+    await service.start({
       brainId: "brain-1",
       provider: "openai",
       model: "gpt-test",
@@ -130,16 +142,16 @@ describe("API teacher and MCP neural integrations", () => {
       preflightStart: vi.fn(async () => undefined),
       learnStructuredExperience: vi.fn(async (_brainId: string, value: { content: string }) => {
         learned.push(value.content);
-        return {};
+        return learnedReceipt(_brainId, value.content);
       })
-    } as never, secrets, fetcher as typeof fetch);
+    } as never, secrets, teacherOptions(), fetcher as typeof fetch);
     await service.saveCredential({ provider, apiKey: "provider-secret-key" });
     const terminal = new Promise<RuntimeJobEvent>((resolve) => {
       service.on("event", (event: RuntimeJobEvent) => {
         if (["complete", "failed", "cancelled"].includes(event.job.state)) resolve(event);
       });
     });
-    service.start({ brainId: "brain-1", provider, model, prompts: ["provider prompt"] });
+    await service.start({ brainId: "brain-1", provider, model, prompts: ["provider prompt"] });
     expect((await terminal).job.state).toBe("complete");
     expect(learned[0]).toContain(expected);
     expect(learned[0]).not.toContain("provider-secret-key");
@@ -149,7 +161,7 @@ describe("API teacher and MCP neural integrations", () => {
     const service = new ApiTeacherTrainingService({
       preflightStart: vi.fn(async () => undefined),
       learnStructuredExperience: vi.fn()
-    } as never, secrets, vi.fn(async () => new Response(JSON.stringify({
+    } as never, secrets, teacherOptions(), vi.fn(async () => new Response(JSON.stringify({
       error: { message: "credential provider-secret-key was rejected" }
     }), { status: 401 })) as typeof fetch);
     await service.saveCredential({ provider: "openai", apiKey: "provider-secret-key" });
@@ -160,7 +172,7 @@ describe("API teacher and MCP neural integrations", () => {
         if (["complete", "failed", "cancelled"].includes(event.job.state)) resolve(event);
       });
     });
-    service.start({
+    await service.start({
       brainId: "brain-1",
       provider: "openai",
       model: "gpt-test",
@@ -177,12 +189,16 @@ describe("API teacher and MCP neural integrations", () => {
     const registered: Array<{ id: string; actions: readonly string[] }> = [];
     const learned: string[] = [];
     const auditDocument = { journal: [], traces: [] };
+    await mkdir(join(root, "brain-1"));
     const repository = {
+      brainDirectory: (brainId: string) => join(root, brainId),
       get: vi.fn(async () => auditDocument),
       save: vi.fn(async (value: unknown) => value)
     };
     const brain = {
       repository,
+      authorizeInlineImagination: vi.fn(async () => undefined),
+      queueCompletedToolExecution: vi.fn(async () => undefined),
       registerExternalToolSchemas: vi.fn((schemas: typeof registered) => registered.push(...schemas)),
       unregisterExternalToolSchemas: vi.fn(),
       learnStructuredExperience: vi.fn(async (_brainId: string, value: { content: string }) => {
@@ -273,7 +289,7 @@ describe("API teacher and MCP neural integrations", () => {
       state: "complete",
       output: { content: [{ type: "text", text: "visible MCP evidence" }] }
     });
-    expect(repository.save).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(repository.save).toHaveBeenCalledOnce());
 
     // The worker emits MCP actions with schema arguments only. The chat path
     // must bind approval/audit to that same payload and send it unchanged.
@@ -310,7 +326,7 @@ describe("API teacher and MCP neural integrations", () => {
       name: "read_project",
       arguments: { path: "/chat-project" }
     });
-    expect(repository.save).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(repository.save).toHaveBeenCalledTimes(2));
 
     const callsBeforeInvalidArguments = calls.filter((method) => method === "tools/call").length;
     await expect(service.execute(

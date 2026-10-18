@@ -35,6 +35,8 @@ export interface LivePerceptionPlan {
   maxTemporaryConfigureMs: number;
   realtime: true;
   reason: string;
+  /** Original measured inputs, never inferred from an already-clamped pixel budget. */
+  resourceInputs?: Pick<LivePerceptionPlanInput, "hardwareTier" | "generationTokensPerSecond" | "memoryBytesPerSecond" | "ioBytesPerSecond">;
 }
 
 export interface LivePerceptionPlanInput {
@@ -212,6 +214,10 @@ function fitExactPixelBudget(
 
 export function planLivePerception(input: LivePerceptionPlanInput): LivePerceptionPlan {
   const mode = input.mode ?? "auto";
+  const resourceInputs = { hardwareTier: input.hardwareTier,
+    ...(positiveFinite(input.generationTokensPerSecond) ? { generationTokensPerSecond: input.generationTokensPerSecond } : {}),
+    ...(positiveFinite(input.memoryBytesPerSecond) ? { memoryBytesPerSecond: input.memoryBytesPerSecond } : {}),
+    ...(positiveFinite(input.ioBytesPerSecond) ? { ioBytesPerSecond: input.ioBytesPerSecond } : {}) };
   const benchmarkClass = benchmarkFor(input);
   const initial = INITIAL_CAPTURE_TARGETS[input.hardwareTier];
   if (benchmarkClass === "fallback") {
@@ -233,6 +239,7 @@ export function planLivePerception(input: LivePerceptionPlanInput): LivePercepti
       minSnapshotIntervalMs: 1_000,
       maxTemporaryConfigureMs: 15_000,
       realtime: true,
+      resourceInputs,
       reason: "Measured resources selected the 320x180 at 1 FPS continuity fallback."
     };
   }
@@ -293,6 +300,7 @@ export function planLivePerception(input: LivePerceptionPlanInput): LivePercepti
     maxTemporaryConfigureMs:
       benchmarkClass === "balanced" ? 30_000 : benchmarkClass === "high" ? 60_000 : 120_000,
     realtime: true,
+    resourceInputs,
     reason:
       input.sourceNativeWidth && input.sourceNativeHeight
         ? `Scaled ${mode} capture from measured resources and the source-native signal.`
@@ -321,6 +329,10 @@ export interface LivePerceptionSnapshotCaptureRequest {
 
 export interface LivePerceptionCaptureHandle {
   getCapture(): Readonly<LivePerceptionNegotiatedCapture>;
+  getPlan?(): Readonly<LivePerceptionPlan>;
+  /** Renderer-only borrowed view. The capture handle remains the sole track owner. */
+  getPreviewStream?(): MediaStream | undefined;
+  onEnded?(listener: () => void): () => void;
   setPacketByteLimit(bytes: number): void;
   start(listener: (packet: LivePerceptionCapturePacket) => void): void;
   reconfigure(
@@ -359,6 +371,7 @@ export interface LivePerceptionState {
   enabled: boolean;
   phase: "idle" | "requesting" | "observing" | "stopping" | "error";
   source?: LivePerceptionSource;
+  delivery?: "continuous" | "snapshots";
   plan?: LivePerceptionPlan;
   negotiatedCapture?: LivePerceptionNegotiatedCapture;
   session?: LiveObservationSession;
@@ -370,6 +383,12 @@ export interface LivePerceptionState {
   snapshot?: LivePerceptionSnapshotState;
   lastSnapshot?: LivePerceptionSnapshotActual;
   error?: string;
+}
+
+/** Ephemeral presentation only: never persisted or sent through IPC. */
+export interface LivePerceptionPreview {
+  stream?: MediaStream;
+  snapshot?: LivePerceptionCapturePacket;
 }
 
 export interface LivePerceptionControllerOptions {
@@ -393,6 +412,7 @@ export interface LivePerceptionControllerOptions {
 }
 
 type StateListener = (state: Readonly<LivePerceptionState>) => void;
+type PreviewListener = (preview: Readonly<LivePerceptionPreview>) => void;
 
 function modalitiesFor(source: LivePerceptionSource): LiveObservationModality[] {
   if (source === "microphone") return ["audio"];
@@ -498,16 +518,19 @@ function configurationBounds(
   const nativeHeight = capture.sourceNativeHeight ?? capture.height ?? plan.height;
   const nativeFps = capture.sourceNativeFps ?? capture.fps ?? plan.framesPerSecond;
   const mode = request.mode ?? capture.mode;
+  const priorityPlan = request.mode
+    ? planForNative({ ...plan, mode }, { width: nativeWidth, height: nativeHeight, fps: nativeFps })
+    : undefined;
   let width = Math.min(
-    request.width === undefined ? capture.width ?? plan.width : positiveInteger(request.width, "Capture width"),
+    request.width === undefined ? priorityPlan?.width ?? capture.width ?? plan.width : positiveInteger(request.width, "Capture width"),
     nativeWidth
   );
   let height = Math.min(
-    request.height === undefined ? capture.height ?? plan.height : positiveInteger(request.height, "Capture height"),
+    request.height === undefined ? priorityPlan?.height ?? capture.height ?? plan.height : positiveInteger(request.height, "Capture height"),
     nativeHeight
   );
   let fps = Math.min(
-    request.fps === undefined ? capture.fps ?? plan.framesPerSecond : positiveInteger(request.fps, "Capture FPS"),
+    request.fps === undefined ? priorityPlan?.framesPerSecond ?? capture.fps ?? plan.framesPerSecond : positiveInteger(request.fps, "Capture FPS"),
     nativeFps
   );
   ({ width, height, fps } = fitExactPixelBudget(
@@ -515,7 +538,7 @@ function configurationBounds(
       evenDimension(width),
       evenDimension(height),
       Math.max(1, Math.floor(fps)),
-      plan.resourcePixelsPerSecond,
+      Math.min(plan.resourcePixelsPerSecond, priorityPlan?.resourcePixelsPerSecond ?? plan.resourcePixelsPerSecond),
       mode
     ),
     plan.resourcePixelsPerSecond
@@ -535,7 +558,12 @@ export class LivePerceptionController {
     lastActions: []
   };
   private readonly listeners = new Set<StateListener>();
+  private readonly previewListeners = new Set<PreviewListener>();
+  private preview: LivePerceptionPreview = {};
   private captureHandle?: LivePerceptionCaptureHandle;
+  private removeCaptureEnded?: () => void;
+  private closing?: Promise<void>;
+  private opening = false;
   private lifecycle = 0;
   private sequence = 0;
   private localInFlight = 0;
@@ -560,13 +588,33 @@ export class LivePerceptionController {
     return () => this.listeners.delete(listener);
   }
 
+  subscribePreview(listener: PreviewListener): () => void {
+    this.previewListeners.add(listener);
+    listener(this.preview);
+    return () => this.previewListeners.delete(listener);
+  }
+
+  getPreview(): Readonly<LivePerceptionPreview> {
+    return this.preview;
+  }
+
   async start(
     source: LivePerceptionSource,
     plan: LivePerceptionPlan,
-    retention: "working" | "neural" = "working"
+    retention: "working" | "neural" = "working",
+    delivery: "continuous" | "snapshots" = "continuous"
   ): Promise<void> {
     if (this.disposed) throw new Error("Live Perception has been disposed.");
     if (this.state.enabled) return;
+    if (this.state.session?.state === "active") {
+      throw new Error("The previous capture session has not closed. Choose Stop again before starting another source.");
+    }
+    if (delivery === "snapshots" && source !== "camera" && source !== "screen") {
+      throw new Error("Snapshot-only capture requires a camera or screen source.");
+    }
+    if (this.opening || this.closing) {
+      throw new Error("The previous capture request is still closing. Finish the system permission dialog before trying again.");
+    }
     if (
       (source === "camera" || source === "mixed") &&
       !this.options.capture.capabilities.camera
@@ -586,10 +634,13 @@ export class LivePerceptionController {
       return;
     }
     const lifecycle = ++this.lifecycle;
+    this.opening = true;
+    this.updatePreview({});
     this.patch({
       enabled: false,
       phase: "requesting",
       source,
+      delivery,
       plan,
       negotiatedCapture: undefined,
       session: undefined,
@@ -597,7 +648,9 @@ export class LivePerceptionController {
       lastPacket: undefined,
       lastActions: [],
       activeControl: undefined,
+      lastControl: undefined,
       snapshot: undefined,
+      lastSnapshot: undefined,
       error: undefined
     });
     let capture: LivePerceptionCaptureHandle | undefined;
@@ -609,6 +662,7 @@ export class LivePerceptionController {
         return;
       }
       const negotiated = capture.getCapture();
+      const negotiatedPlan = capture.getPlan?.() ?? plan;
       const session = await this.options.modality.startObservation({
         brainId: this.options.brainId,
         modalities: modalitiesFor(source),
@@ -629,29 +683,40 @@ export class LivePerceptionController {
       }
       capture.setPacketByteLimit(session.maxPacketBytes);
       this.captureHandle = capture;
+      this.removeCaptureEnded = capture.onEnded?.(() => {
+        if (lifecycle === this.lifecycle) void this.stop();
+      });
+      this.updatePreview({ stream: capture.getPreviewStream?.() });
       this.sequence = 0;
       this.localInFlight = 0;
       this.patch({
         enabled: true,
         phase: "observing",
-        plan: session.maxInFlight === plan.maxInFlight
-          ? plan
+        plan: session.maxInFlight === negotiatedPlan.maxInFlight
+          ? negotiatedPlan
           : {
-            ...plan,
+            ...negotiatedPlan,
             maxInFlight: session.maxInFlight,
-            reason: `${plan.reason} Transport concurrency adapted to the current device envelope.`
+            reason: `${negotiatedPlan.reason} Transport concurrency adapted to the current device envelope.`
           },
         session,
         negotiatedCapture: session.capture
       });
-      capture.start((packet) => this.pushPacket(lifecycle, packet));
+      if (delivery === "continuous") capture.start((packet) => this.pushPacket(lifecycle, packet));
     } catch (error) {
-      await capture?.stop();
+      await Promise.resolve().then(() => capture?.stop()).catch(() => undefined);
       if (openedSession) {
-        await this.options.modality.cancelObservation(openedSession.id).catch(() => undefined);
+        const cancelled = await this.options.modality.cancelObservation(openedSession.id).catch(() => undefined);
+        if (lifecycle === this.lifecycle && cancelled) this.patch({ session: cancelled });
       }
       if (lifecycle !== this.lifecycle) return;
+      this.removeCaptureEnded?.();
+      this.removeCaptureEnded = undefined;
+      this.captureHandle = undefined;
+      this.updatePreview({});
       this.fail(livePerceptionErrorMessage(error));
+    } finally {
+      this.opening = false;
     }
   }
 
@@ -730,6 +795,7 @@ export class LivePerceptionController {
       throw new Error("Snapshot capture requires an audited observation control.");
     }
     const controller = new AbortController();
+    const lifecycle = this.lifecycle;
     this.snapshotAbort = controller;
     const abort = (): void => controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
@@ -749,7 +815,7 @@ export class LivePerceptionController {
         bounded,
         async (packet) => {
           await this.pushSnapshotPacket(
-            this.lifecycle,
+            lifecycle,
             packet,
             controller.signal,
             {
@@ -759,6 +825,9 @@ export class LivePerceptionController {
               burstCount: bounded.burstCount
             }
           );
+          if (lifecycle !== this.lifecycle) throw abortError();
+          // Retain only the latest actually accepted image, not the whole burst.
+          this.updatePreview({ ...this.preview, snapshot: packet });
           burstIndex += 1;
           const current = this.state.snapshot;
           if (current?.state === "capturing") {
@@ -769,7 +838,7 @@ export class LivePerceptionController {
         },
         controller.signal
       );
-      this.patch({
+      if (lifecycle === this.lifecycle) this.patch({
         negotiatedCapture: handle.getCapture(),
         snapshot: {
           state: "complete",
@@ -783,7 +852,7 @@ export class LivePerceptionController {
       return actual;
     } catch (error) {
       const cancelled = controller.signal.aborted || isAbort(error);
-      this.patch({
+      if (lifecycle === this.lifecycle) this.patch({
         negotiatedCapture: handle.getCapture(),
         snapshot: {
           state: cancelled ? "cancelled" : "failed",
@@ -809,66 +878,59 @@ export class LivePerceptionController {
   }
 
   async stop(): Promise<void> {
-    const session = this.state.session;
-    if (!session && !this.captureHandle) {
-      this.patch({ enabled: false, phase: "idle" });
-      return;
-    }
-    ++this.lifecycle;
-    this.cancelLocalActivity();
-    this.patch({ enabled: false, phase: "stopping" });
-    await this.controlQueue.catch(() => undefined);
-    const capture = this.captureHandle;
-    this.captureHandle = undefined;
-    await capture?.stop();
-    try {
-      const stopped = session
-        ? await this.options.modality.stopObservation(session.id)
-        : undefined;
-      this.patch({
-        enabled: false,
-        phase: "idle",
-        session: stopped,
-        negotiatedCapture: stopped?.capture,
-        source: undefined,
-        activeControl: undefined
-      });
-    } catch (error) {
-      this.fail(error instanceof Error ? error.message : "Live Perception could not stop.");
-    }
+    return this.closeCapture("stop");
   }
 
   async cancel(): Promise<void> {
+    return this.closeCapture("cancel");
+  }
+
+  private closeCapture(kind: "stop" | "cancel", externalSession?: LiveObservationSession): Promise<void> {
+    if (this.closing) return this.closing;
     const session = this.state.session;
     ++this.lifecycle;
     this.cancelLocalActivity();
-    await this.controlQueue.catch(() => undefined);
+    this.removeCaptureEnded?.();
+    this.removeCaptureEnded = undefined;
     const capture = this.captureHandle;
     this.captureHandle = undefined;
-    await capture?.stop();
-    try {
-      const cancelled = session
-        ? await this.options.modality.cancelObservation(session.id)
-        : undefined;
+    this.updatePreview({});
+    this.patch({ enabled: false, phase: "stopping", ...(this.state.snapshot?.state === "capturing"
+      ? { snapshot: { ...this.state.snapshot, state: "cancelled" as const } } : {}) });
+    const close = async (): Promise<void> => {
+      await this.controlQueue.catch(() => undefined);
+      let failure: unknown;
+      await Promise.resolve().then(() => capture?.stop()).catch((error: unknown) => { failure = error; });
+      let terminal = externalSession;
+      if (!terminal && session?.state === "active") {
+        try {
+          terminal = kind === "stop"
+            ? await this.options.modality.stopObservation(session.id)
+            : await this.options.modality.cancelObservation(session.id);
+        } catch (error) { failure ??= error; }
+      }
       this.patch({
         enabled: false,
-        phase: "idle",
-        session: cancelled,
-        negotiatedCapture: cancelled?.capture,
+        phase: failure ? "error" : "idle",
+        session: terminal ?? session,
+        negotiatedCapture: terminal?.capture ?? session?.capture,
         source: undefined,
-        activeControl: undefined
+        activeControl: undefined,
+        ...(failure ? { error: livePerceptionErrorMessage(failure) } : {})
       });
-    } catch (error) {
-      this.fail(error instanceof Error ? error.message : "Live Perception cancellation failed.");
-    }
+    };
+    const pending = close().finally(() => { if (this.closing === pending) this.closing = undefined; });
+    this.closing = pending;
+    return pending;
   }
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
-    await this.cancel();
     this.disposed = true;
     this.removeEvents();
     this.listeners.clear();
+    await this.cancel();
+    this.previewListeners.clear();
   }
 
   private async pushSnapshotPacket(
@@ -941,7 +1003,7 @@ export class LivePerceptionController {
         this.patch({ error: error instanceof Error ? error.message : "A live packet was rejected." });
       })
       .finally(() => {
-        this.localInFlight = Math.max(0, this.localInFlight - 1);
+        if (lifecycle === this.lifecycle) this.localInFlight = Math.max(0, this.localInFlight - 1);
       });
   }
 
@@ -957,7 +1019,9 @@ export class LivePerceptionController {
   }
 
   private handleEvent(event: LiveObservationEvent): void {
+    if (this.disposed) return;
     if (event.session.brainId !== this.options.brainId) return;
+    if (!this.state.session && this.state.phase !== "requesting") return;
     if (this.state.session && event.session.id !== this.state.session.id) return;
     const actions = event.actions ?? event.packet?.actions ?? [];
     this.patch({
@@ -968,6 +1032,10 @@ export class LivePerceptionController {
       ...(event.control ? { lastControl: event.control } : {})
     });
     if (actions.length > 0) this.options.onActions?.(actions);
+    if (event.session.state === "stopped" || event.session.state === "cancelled") {
+      void this.closeCapture("cancel", event.session);
+      return;
+    }
     if (
       event.type === "control" &&
       event.control?.state === "requested" &&
@@ -1139,6 +1207,11 @@ export class LivePerceptionController {
     this.patch({ enabled: false, phase: "error", error: message });
   }
 
+  private updatePreview(preview: LivePerceptionPreview): void {
+    this.preview = preview;
+    this.previewListeners.forEach((listener) => listener(preview));
+  }
+
   private patch(patch: Partial<LivePerceptionState>): void {
     this.state = { ...this.state, ...patch };
     this.listeners.forEach((listener) => listener(this.state));
@@ -1192,19 +1265,19 @@ function nativeBounds(track?: MediaStreamTrack): NativeCaptureBounds {
 function planForNative(plan: LivePerceptionPlan, bounds: NativeCaptureBounds): LivePerceptionPlan {
   if (!bounds.width || !bounds.height) return plan;
   return planLivePerception({
+    ...plan.resourceInputs,
     hardwareTier:
-      plan.benchmarkClass === "fallback"
+      plan.resourceInputs?.hardwareTier ?? (plan.benchmarkClass === "fallback"
         ? "micro"
         : plan.benchmarkClass === "balanced"
           ? "personal"
           : plan.benchmarkClass === "high"
             ? "gpu"
-            : "workstation",
+            : "workstation"),
     mode: plan.mode,
     sourceNativeWidth: bounds.width,
     sourceNativeHeight: bounds.height,
-    sourceNativeFps: bounds.fps ?? plan.framesPerSecond,
-    memoryBytesPerSecond: plan.resourcePixelsPerSecond * 32
+    sourceNativeFps: bounds.fps ?? plan.framesPerSecond
   });
 }
 
@@ -1291,276 +1364,310 @@ export function createBrowserLivePerceptionCapture(
               : false,
           audio: source === "microphone" || source === "mixed"
         });
-      const videoTracks = stream.getVideoTracks();
-      const audioTracks = stream.getAudioTracks();
-      const videoTrack = videoTracks[0];
-      const bounds = nativeBounds(videoTrack);
-      const plan = planForNative(requestedPlan, bounds);
-      const createVideo = environment.createVideo ?? (() => document.createElement("video"));
-      const createCanvas = environment.createCanvas ?? (() => document.createElement("canvas"));
-      const video = videoTrack ? createVideo() : undefined;
-      const canvas = video ? createCanvas() : undefined;
-      if (video && canvas) {
-        video.srcObject = stream;
-        video.muted = true;
-        video.playsInline = true;
-        await video.play();
-      }
-      const interval = environment.setInterval ?? globalThis.setInterval.bind(globalThis);
-      const clearIntervalHandle =
-        environment.clearInterval ?? globalThis.clearInterval.bind(globalThis);
-      const timeout = environment.setTimeout ?? globalThis.setTimeout.bind(globalThis);
-      const clearTimeoutHandle =
-        environment.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
-      const now = environment.now ?? (() => performance.now());
-      let timer: ReturnType<typeof globalThis.setInterval> | undefined;
-      let audioTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
-      let audioRecorder: MediaRecorder | undefined;
-      let listener: ((packet: LivePerceptionCapturePacket) => void) | undefined;
-      let stopped = false;
-      let encoding = false;
-      let maxPacketBytes = Number.MAX_SAFE_INTEGER;
-      let revision = 0;
-      let activeCapture: LivePerceptionNegotiatedCapture = {
-        mode: plan.mode,
-        ...(videoTrack ? { width: plan.width, height: plan.height, fps: plan.framesPerSecond } : {}),
-        ...(bounds.width ? { sourceNativeWidth: bounds.width } : {}),
-        ...(bounds.height ? { sourceNativeHeight: bounds.height } : {}),
-        ...(bounds.fps ? { sourceNativeFps: bounds.fps } : {}),
-        ...(audioTracks[0]?.getSettings().sampleRate
-          ? { audioSampleRate: audioTracks[0]!.getSettings().sampleRate }
-          : {}),
-        benchmarkClass: plan.benchmarkClass,
-        revision
-      };
-
-      const constraintsFor = (
-        request: Required<Pick<LivePerceptionConfigureRequest, "mode" | "width" | "height" | "fps">>
-      ): MediaTrackConstraints => ({
-        width: { ideal: request.width },
-        height: { ideal: request.height },
-        frameRate: { ideal: request.fps }
-      });
-
-      const applyCapture = async (
-        request: Required<Pick<LivePerceptionConfigureRequest, "mode" | "width" | "height" | "fps">>,
-        nextRevision = revision + 1
-      ): Promise<LivePerceptionNegotiatedCapture> => {
-        if (!videoTrack || !canvas) throw new Error("The active source has no visual track.");
-        await videoTrack.applyConstraints?.(constraintsFor(request));
-        const settings = videoTrack.getSettings?.() ?? {};
-        const width = evenDimension(Math.min(request.width, settings.width ?? request.width));
-        const height = evenDimension(Math.min(request.height, settings.height ?? request.height));
-        const fps = Math.max(1, Math.min(request.fps, settings.frameRate ?? request.fps));
-        canvas.width = width;
-        canvas.height = height;
-        revision = nextRevision;
-        activeCapture = {
-          ...activeCapture,
-          mode: request.mode,
-          width,
-          height,
-          fps,
+      let video: HTMLVideoElement | undefined;
+      try {
+        const videoTracks = stream.getVideoTracks();
+        const audioTracks = stream.getAudioTracks();
+        const videoTrack = videoTracks[0];
+        const bounds = nativeBounds(videoTrack);
+        const plan = planForNative(requestedPlan, bounds);
+        const createVideo = environment.createVideo ?? (() => document.createElement("video"));
+        const createCanvas = environment.createCanvas ?? (() => document.createElement("canvas"));
+        video = videoTrack ? createVideo() : undefined;
+        const canvas = video ? createCanvas() : undefined;
+        if (video && canvas) {
+          video.srcObject = stream;
+          video.muted = true;
+          video.playsInline = true;
+          await video.play();
+        }
+        const interval = environment.setInterval ?? globalThis.setInterval.bind(globalThis);
+        const clearIntervalHandle =
+          environment.clearInterval ?? globalThis.clearInterval.bind(globalThis);
+        const timeout = environment.setTimeout ?? globalThis.setTimeout.bind(globalThis);
+        const clearTimeoutHandle =
+          environment.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
+        const now = environment.now ?? (() => performance.now());
+        let timer: ReturnType<typeof globalThis.setInterval> | undefined;
+        let audioTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+        let audioRecorder: MediaRecorder | undefined;
+        let listener: ((packet: LivePerceptionCapturePacket) => void) | undefined;
+        let stopped = false;
+        let encoding = false;
+        let maxPacketBytes = Number.MAX_SAFE_INTEGER;
+        let revision = 0;
+        let activeCapture: LivePerceptionNegotiatedCapture = {
+          mode: plan.mode,
+          ...(videoTrack ? { width: plan.width, height: plan.height, fps: plan.framesPerSecond } : {}),
+          ...(bounds.width ? { sourceNativeWidth: bounds.width } : {}),
+          ...(bounds.height ? { sourceNativeHeight: bounds.height } : {}),
+          ...(bounds.fps ? { sourceNativeFps: bounds.fps } : {}),
+          ...(audioTracks[0]?.getSettings().sampleRate
+            ? { audioSampleRate: audioTracks[0]!.getSettings().sampleRate }
+            : {}),
+          benchmarkClass: plan.benchmarkClass,
           revision
         };
-        return { ...activeCapture };
-      };
 
-      if (videoTrack && canvas) {
-        await applyCapture({
-          mode: plan.mode,
-          width: plan.width,
-          height: plan.height,
-          fps: plan.framesPerSecond
-        }, 0);
-      }
+        const constraintsFor = (
+          request: Required<Pick<LivePerceptionConfigureRequest, "mode" | "width" | "height" | "fps">>
+        ): MediaTrackConstraints => ({
+          width: { ideal: request.width },
+          height: { ideal: request.height },
+          frameRate: { ideal: request.fps }
+        });
 
-      const captureFrame = async (
-        capture: LivePerceptionNegotiatedCapture,
-        packetLimit: number
-      ): Promise<LivePerceptionCapturePacket> => {
-        if (stopped || !video || !canvas || video.readyState < 2) {
-          throw new Error("The visual source is not ready.");
-        }
-        const context = canvas.getContext("2d", { alpha: false });
-        if (!context || !capture.width || !capture.height) {
-          throw new Error("The visual encoder is unavailable.");
-        }
-        context.drawImage(video, 0, 0, capture.width, capture.height);
-        const blob = await canvasBlob(canvas, packetLimit);
-        return {
-          modality: "video",
-          timestampMs: now(),
-          mimeType: blob.type || "image/jpeg",
-          data: new Uint8Array(await blob.arrayBuffer()),
-          settings: { width: capture.width, height: capture.height }
-        };
-      };
-
-      const clearVideoTimer = (): void => {
-        if (timer !== undefined) clearIntervalHandle(timer);
-        timer = undefined;
-      };
-      const beginVideoTimer = (): void => {
-        clearVideoTimer();
-        if (!listener || !videoTrack || !activeCapture.fps || stopped) return;
-        const run = async (): Promise<void> => {
-          if (encoding || stopped || !listener) return;
-          encoding = true;
-          try {
-            listener(await captureFrame(activeCapture, maxPacketBytes));
-          } catch {
-            // A later frame can recover from a transient not-ready encoder.
-          } finally {
-            encoding = false;
-          }
-        };
-        timer = interval(() => void run(), Math.max(1, 1_000 / activeCapture.fps));
-        void run();
-      };
-
-      const audioMimeType = (() => {
-        if (!Recorder) return "";
-        for (const candidate of [
-          "audio/webm;codecs=opus",
-          "audio/ogg;codecs=opus",
-          "audio/mp4",
-          "audio/webm"
-        ]) {
-          if (typeof Recorder.isTypeSupported !== "function" || Recorder.isTypeSupported(candidate)) {
-            return candidate;
-          }
-        }
-        return "";
-      })();
-
-      return {
-        getCapture: () => ({ ...activeCapture }),
-        setPacketByteLimit(bytes) {
-          maxPacketBytes = positiveInteger(bytes, "Live packet byte limit");
-        },
-        start(nextListener) {
-          if (stopped) return;
-          listener = nextListener;
-          beginVideoTimer();
-          if (audioTracks.length > 0) {
-            if (!Recorder || !environment.createMediaStream) {
-              throw new Error(
-                "Direct neural audio capture is unavailable; platform STT remains available separately."
-              );
-            }
-            const audioStream = environment.createMediaStream(audioTracks);
-            const recordClip = (): void => {
-              if (stopped) return;
-              const chunks: Blob[] = [];
-              const recorder = audioMimeType
-                ? new Recorder(audioStream, { mimeType: audioMimeType })
-                : new Recorder(audioStream);
-              audioRecorder = recorder;
-              recorder.ondataavailable = (event) => {
-                if (event.data.size > 0) chunks.push(event.data);
-              };
-              recorder.onstop = () => {
-                if (stopped) return;
-                const blob = new Blob(chunks, {
-                  type: recorder.mimeType || audioMimeType || "audio/webm"
-                });
-                if (blob.size > 0 && blob.size <= maxPacketBytes) {
-                  void blob.arrayBuffer().then((buffer) => {
-                    if (stopped || !listener) return;
-                    const settings = audioTracks[0]?.getSettings();
-                    listener({
-                      modality: "audio",
-                      timestampMs: now(),
-                      mimeType: blob.type,
-                      data: new Uint8Array(buffer),
-                      settings: {
-                        durationMs: plan.audioChunkMs,
-                        ...(settings?.sampleRate ? { sampleRate: settings.sampleRate } : {}),
-                        ...(settings?.channelCount ? { channels: settings.channelCount } : {})
-                      }
-                    });
-                  });
-                }
-                if (!stopped) recordClip();
-              };
-              recorder.start();
-              audioTimer = timeout(() => {
-                if (recorder.state !== "inactive") recorder.stop();
-              }, plan.audioChunkMs);
-            };
-            recordClip();
-          }
-        },
-        async reconfigure(request) {
-          const actual = await applyCapture(request);
-          beginVideoTimer();
-          return actual;
-        },
-        async snapshotBurst(request, emit, signal) {
+        const applyCapture = async (
+          request: Required<Pick<LivePerceptionConfigureRequest, "mode" | "width" | "height" | "fps">>,
+          nextRevision = revision + 1
+        ): Promise<LivePerceptionNegotiatedCapture> => {
           if (!videoTrack || !canvas) throw new Error("The active source has no visual track.");
-          clearVideoTimer();
-          while (encoding) {
-            await abortableBrowserDelay(2, signal, timeout, clearTimeoutHandle);
+          await videoTrack.applyConstraints?.(constraintsFor(request));
+          const settings = videoTrack.getSettings?.() ?? {};
+          const width = evenDimension(Math.min(request.width, settings.width ?? request.width));
+          const height = evenDimension(Math.min(request.height, settings.height ?? request.height));
+          const fps = Math.max(1, Math.min(request.fps, settings.frameRate ?? request.fps));
+          canvas.width = width;
+          canvas.height = height;
+          revision = nextRevision;
+          activeCapture = {
+            ...activeCapture,
+            mode: request.mode,
+            width,
+            height,
+            fps,
+            revision
+          };
+          return { ...activeCapture };
+        };
+
+        if (videoTrack && canvas) {
+          await applyCapture({
+            mode: plan.mode,
+            width: plan.width,
+            height: plan.height,
+            fps: plan.framesPerSecond
+          }, 0);
+        }
+
+        const captureFrame = async (
+          capture: LivePerceptionNegotiatedCapture,
+          packetLimit: number
+        ): Promise<LivePerceptionCapturePacket> => {
+          if (stopped || !video || !canvas || video.readyState < 2) {
+            throw new Error("The visual source is not ready.");
           }
-          const previous = { ...activeCapture };
-          const snapshotRevision = previous.revision + 1;
-          let snapshotCapture: LivePerceptionNegotiatedCapture | undefined;
-          let accepted = 0;
-          try {
-            snapshotCapture = await applyCapture({
-              mode: request.mode,
-              width: request.width,
-              height: request.height,
-              fps: request.fps ?? previous.fps ?? 1
-            }, snapshotRevision);
-            for (let index = 0; index < request.burstCount; index += 1) {
-              if (signal.aborted) throw abortError();
-              await emit(await captureFrame(snapshotCapture, request.maxPacketBytes));
-              accepted += 1;
-              if (index + 1 < request.burstCount) {
-                await abortableBrowserDelay(
-                  request.intervalMs,
-                  signal,
-                  timeout,
-                  clearTimeoutHandle
+          const context = canvas.getContext("2d", { alpha: false });
+          if (!context || !capture.width || !capture.height) {
+            throw new Error("The visual encoder is unavailable.");
+          }
+          context.drawImage(video, 0, 0, capture.width, capture.height);
+          const blob = await canvasBlob(canvas, packetLimit);
+          return {
+            modality: "video",
+            timestampMs: now(),
+            mimeType: blob.type || "image/jpeg",
+            data: new Uint8Array(await blob.arrayBuffer()),
+            settings: { width: capture.width, height: capture.height }
+          };
+        };
+
+        const clearVideoTimer = (): void => {
+          if (timer !== undefined) clearIntervalHandle(timer);
+          timer = undefined;
+        };
+        const beginVideoTimer = (): void => {
+          clearVideoTimer();
+          if (!listener || !videoTrack || !activeCapture.fps || stopped) return;
+          const run = async (): Promise<void> => {
+            if (encoding || stopped || !listener) return;
+            encoding = true;
+            try {
+              const packet = await captureFrame(activeCapture, maxPacketBytes);
+              if (!stopped) listener?.(packet);
+            } catch {
+              // A later frame can recover from a transient not-ready encoder.
+            } finally {
+              encoding = false;
+            }
+          };
+          timer = interval(() => void run(), Math.max(1, 1_000 / activeCapture.fps));
+          void run();
+        };
+
+        const audioMimeType = (() => {
+          if (!Recorder) return "";
+          for (const candidate of [
+            "audio/webm;codecs=opus",
+            "audio/ogg;codecs=opus",
+            "audio/mp4",
+            "audio/webm"
+          ]) {
+            if (typeof Recorder.isTypeSupported !== "function" || Recorder.isTypeSupported(candidate)) {
+              return candidate;
+            }
+          }
+          return "";
+        })();
+
+        const endedListeners = new Set<() => void>();
+        let ended = false;
+        const onTrackEnded = (): void => {
+          if (stopped || ended) return;
+          ended = true;
+          endedListeners.forEach((notify) => notify());
+        };
+        const tracks = stream.getTracks();
+        for (const track of tracks) track.addEventListener?.("ended", onTrackEnded);
+
+        return {
+          getCapture: () => ({ ...activeCapture }),
+          getPlan: () => ({ ...plan }),
+          getPreviewStream: () => !stopped && videoTrack ? stream : undefined,
+          onEnded(notify) {
+            endedListeners.add(notify);
+            if (ended || tracks.some((track) => track.readyState === "ended")) {
+              queueMicrotask(() => { if (!stopped && endedListeners.has(notify)) notify(); });
+            }
+            return () => { endedListeners.delete(notify); };
+          },
+          setPacketByteLimit(bytes) {
+            maxPacketBytes = positiveInteger(bytes, "Live packet byte limit");
+          },
+          start(nextListener) {
+            if (stopped) return;
+            listener = nextListener;
+            beginVideoTimer();
+            if (audioTracks.length > 0) {
+              if (!Recorder || !environment.createMediaStream) {
+                throw new Error(
+                  "Direct neural audio capture is unavailable; platform STT remains available separately."
                 );
               }
+              const audioStream = environment.createMediaStream(audioTracks);
+              const recordClip = (): void => {
+                if (stopped) return;
+                const chunks: Blob[] = [];
+                const recorder = audioMimeType
+                  ? new Recorder(audioStream, { mimeType: audioMimeType })
+                  : new Recorder(audioStream);
+                audioRecorder = recorder;
+                recorder.ondataavailable = (event) => {
+                  if (event.data.size > 0) chunks.push(event.data);
+                };
+                recorder.onstop = () => {
+                  if (stopped) return;
+                  const blob = new Blob(chunks, {
+                    type: recorder.mimeType || audioMimeType || "audio/webm"
+                  });
+                  if (blob.size > 0 && blob.size <= maxPacketBytes) {
+                    void blob.arrayBuffer().then((buffer) => {
+                      if (stopped || !listener) return;
+                      const settings = audioTracks[0]?.getSettings();
+                      listener({
+                        modality: "audio",
+                        timestampMs: now(),
+                        mimeType: blob.type,
+                        data: new Uint8Array(buffer),
+                        settings: {
+                          durationMs: plan.audioChunkMs,
+                          ...(settings?.sampleRate ? { sampleRate: settings.sampleRate } : {}),
+                          ...(settings?.channelCount ? { channels: settings.channelCount } : {})
+                        }
+                      });
+                    });
+                  }
+                  if (!stopped) recordClip();
+                };
+                recorder.start();
+                audioTimer = timeout(() => {
+                  if (recorder.state !== "inactive") recorder.stop();
+                }, plan.audioChunkMs);
+              };
+              recordClip();
             }
-            return {
-              mode: snapshotCapture.mode,
-              resolutionMode: request.resolutionMode,
-              width: snapshotCapture.width!,
-              height: snapshotCapture.height!,
-              fps: snapshotCapture.fps,
-              ...(request.resolutionMode === "native" ? { fullResolution: true as const } : {}),
-              burstCount: request.burstCount,
-              intervalMs: request.intervalMs,
-              framesAccepted: accepted,
-              revision: snapshotRevision
-            };
-          } finally {
-            if (!stopped) {
-              await applyCapture({
-                mode: previous.mode,
-                width: previous.width!,
-                height: previous.height!,
-                fps: previous.fps ?? 1
-              }, snapshotRevision).catch(() => undefined);
-              beginVideoTimer();
+          },
+          async reconfigure(request) {
+            const actual = await applyCapture(request);
+            beginVideoTimer();
+            return actual;
+          },
+          async snapshotBurst(request, emit, signal) {
+            if (!videoTrack || !canvas) throw new Error("The active source has no visual track.");
+            clearVideoTimer();
+            while (encoding) {
+              await abortableBrowserDelay(2, signal, timeout, clearTimeoutHandle);
             }
+            const previous = { ...activeCapture };
+            const snapshotRevision = previous.revision + 1;
+            let snapshotCapture: LivePerceptionNegotiatedCapture | undefined;
+            let accepted = 0;
+            try {
+              snapshotCapture = await applyCapture({
+                mode: request.mode,
+                width: request.width,
+                height: request.height,
+                fps: request.fps ?? previous.fps ?? 1
+              }, snapshotRevision);
+              for (let index = 0; index < request.burstCount; index += 1) {
+                if (signal.aborted) throw abortError();
+                await emit(await captureFrame(snapshotCapture, request.maxPacketBytes));
+                accepted += 1;
+                if (index + 1 < request.burstCount) {
+                  await abortableBrowserDelay(
+                    request.intervalMs,
+                    signal,
+                    timeout,
+                    clearTimeoutHandle
+                  );
+                }
+              }
+              return {
+                mode: snapshotCapture.mode,
+                resolutionMode: request.resolutionMode,
+                width: snapshotCapture.width!,
+                height: snapshotCapture.height!,
+                fps: snapshotCapture.fps,
+                ...(request.resolutionMode === "native" ? { fullResolution: true as const } : {}),
+                burstCount: request.burstCount,
+                intervalMs: request.intervalMs,
+                framesAccepted: accepted,
+                revision: snapshotRevision
+              };
+            } finally {
+              if (!stopped) {
+                await applyCapture({
+                  mode: previous.mode,
+                  width: previous.width!,
+                  height: previous.height!,
+                  fps: previous.fps ?? 1
+                }, snapshotRevision).catch(() => undefined);
+                beginVideoTimer();
+              }
+            }
+          },
+          stop() {
+            if (stopped) return;
+            stopped = true;
+            listener = undefined;
+            for (const track of tracks) track.removeEventListener?.("ended", onTrackEnded);
+            endedListeners.clear();
+            clearVideoTimer();
+            if (audioTimer !== undefined) clearTimeoutHandle(audioTimer);
+            if (audioRecorder && audioRecorder.state !== "inactive") audioRecorder.stop();
+            video?.pause();
+            video?.removeAttribute("src");
+            if (video) video.srcObject = null;
+            tracks.forEach((track) => track.stop());
           }
-        },
-        stop() {
-          stopped = true;
-          clearVideoTimer();
-          if (audioTimer !== undefined) clearTimeoutHandle(audioTimer);
-          if (audioRecorder && audioRecorder.state !== "inactive") audioRecorder.stop();
-          video?.pause();
-          video?.removeAttribute("src");
-          stream.getTracks().forEach((track) => track.stop());
-        }
-      };
+        };
+      } catch (error) {
+        // A granted device is already ours even if play/constraints/encoding setup fails.
+        video?.pause();
+        if (video) video.srcObject = null;
+        stream.getTracks().forEach((track) => track.stop());
+        throw error;
+      }
     }
   };
 }

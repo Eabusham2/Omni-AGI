@@ -1,0 +1,5 @@
+.ponder-self-report{min-width:0;margin:10px 0;border-top:1px solid var(--border);padding-top:10px}
+.ponder-self-report__heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;min-width:0}
+.ponder-self-report__heading small{overflow-wrap:anywhere;color:var(--text-muted)}
+.ponder-self-report__heading .button{white-space:normal;font-size:12px;padding:5px 9px}
+.ponder-self-report__text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;user-select:text;color:var(--text)}

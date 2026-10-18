@@ -9,7 +9,7 @@ const inheritedEnvironment = Object.fromEntries(
   )
 );
 
-test("Open gallery reaches the selected brain's persisted imagination gallery", async () => {
+test("offline preview opens the selected instance's empty gallery without claiming persisted media", async () => {
   const application = await electron.launch({
     args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
     env: {
@@ -35,6 +35,9 @@ test("Open gallery reaches the selected brain's persisted imagination gallery", 
     await expect(gallery.getByText("PERSISTED LOCAL OUTPUTS", { exact: true })).toBeVisible();
     await expect(gallery.getByText("No persisted artifacts for Aster", { exact: true }))
       .toBeVisible();
+    await expect(gallery.getByText("The browser design preview does not create local files.", { exact: true })).toBeVisible();
+    await expect(gallery.locator(".imagination-gallery__item")).toHaveCount(0);
+    await expect(gallery.locator("img, video, audio")).toHaveCount(0);
     await expect(gallery.getByText("Design preview", { exact: true })).toBeVisible();
 
     await page.keyboard.press("Escape");

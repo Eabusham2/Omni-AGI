@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
+import { MapAdapterError, type MapsService } from "./mapsService";
+import { MapBasemapError, type MapBasemapService } from "./mapBasemapService";
+import { McpTaskCustodyError, mcpTaskReceiptFromFailure } from "./mcpTaskFailure";
 import { spawn, type ChildProcess } from "node:child_process";
 import { isUtf8 } from "node:buffer";
+import { FileToolEffectError, type FileToolService } from "./fileToolService";
 import { normalizeConceptIdView } from "../shared/conceptIdView";
+import { isNativeCandidateKind } from "../shared/nativeCandidateTool";
 import {
   lstat,
   mkdir,
@@ -68,6 +73,23 @@ import {
 import { withBrainWrite } from "./brainWriteCoordinator";
 import { persistAuthorizedToolIntent } from "./toolIntentJournal";
 import type { ToolPreferencesStore } from "./toolPreferences";
+import type { UserQuestionService } from "./userQuestions";
+import type { UserQuestionRequest } from "../shared/userQuestions";
+import type { LearningCoordinator } from "./learningCoordinator";
+import type { SpecificLearnRequest, FactCheckRequest, FactCheckReviewRequest, LearningTaskSteerRequest } from "../shared/learning";
+import type { LearningExecutionContext, ToolExecutionContext } from "./learningExecutionContext";
+import { decideWebSource, normalizeLearningUrl, publicationFromHtml, webUrlWithinScope } from "./webLearningPolicy";
+import type {
+  PluginApprovalReview,
+  PluginResolvedInvocation
+} from "../shared/plugins";
+import { AssemblyExecutionError } from "./assemblyRuntime";
+import { ProcessMemoryOperationError } from "./processMemoryBridge";
+import { ClipboardOperationError } from "./clipboardService";
+import { htmlImageCandidates, searchImageCandidates } from "./webImageReferences";
+import { ActionReviewer, actionReviewerProposalSha256, type ActionReviewerProposal } from "./actionReviewer";
+import type { ActionReviewerApprovalReview } from "../shared/actionReviewer";
+import type { HostActionOriginAuthority } from "../shared/hostActionAuthority";
 
 export interface ExternalToolBridge {
   hasTool(toolId: string): boolean;
@@ -75,8 +97,48 @@ export interface ExternalToolBridge {
     toolId: string,
     action: string,
     args: Record<string, unknown>,
+    signal: AbortSignal,
+    callerBrainId?: string,
+    context?: Partial<Pick<ToolExecutionContext, "chatTurnId" | "actionEventId" | "mcpAppViewId">> & {
+      requestId?: string; requireCurrentPermission?: () => Promise<void>
+    }
+  ): Promise<unknown>;
+}
+
+export interface CustomToolResolver {
+  /** Non-plugin tools return undefined; unavailable plugin tools reject visibly. */
+  resolve(invocation: ToolInvocation): Promise<PluginResolvedInvocation | undefined>;
+}
+
+export interface AutomationToolService {
+  execute(
+    brainId: string,
+    action: string,
+    args: Record<string, unknown>,
+    requestId: string,
     signal: AbortSignal
   ): Promise<unknown>;
+}
+export interface ProcessMemoryToolService {
+  execute(brainId: string, action: string, args: Record<string, unknown>, requestId: string, signal: AbortSignal): Promise<unknown>;
+}
+export interface ClipboardToolService {
+  execute(brainId: string, toolId: "studio.clipboard" | "system.clipboard", action: string,
+    args: Record<string, unknown>, requestId: string, signal: AbortSignal): Promise<unknown>;
+}
+export interface EnvironmentToolService {
+  execute(
+    brainId: string,
+    toolId: "runtime.sandbox" | "runtime.vm",
+    action: string,
+    args: Record<string, unknown>,
+    requestId: string,
+    signal: AbortSignal,
+    context?: { chatTurnId?: string }
+  ): Promise<unknown>;
+}
+export interface AssemblyToolService {
+  execute(brainId: string, action: string, args: Record<string, unknown>, requestId: string, signal: AbortSignal): Promise<unknown>;
 }
 
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
@@ -134,10 +196,13 @@ const SOURCE_EDIT_PROTECTED_SEGMENTS = new Set([
 
 interface Approval {
   brainId: string;
+  requestId: string;
   toolId: string;
   action: string;
   argumentSha256: string;
   permissionRevision: string;
+  permissionToolIds: string[];
+  actionReview?: ActionReviewerApprovalReview;
   expiresAt: number;
 }
 
@@ -204,11 +269,11 @@ function absolutePath(value: string): string {
   return resolve(value);
 }
 
-async function atomicWrite(path: string, contents: string): Promise<void> {
+async function atomicWrite(path: string, contents: string, beforePublish?: () => Promise<void>): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.omni-next`;
-  await writeFile(temporary, contents, { encoding: "utf8", flag: "wx", mode: 0o600 });
-  await rename(temporary, path);
+  try { await writeFile(temporary, contents, { encoding: "utf8", flag: "wx", mode: 0o600 }); await beforePublish?.(); await rename(temporary, path); }
+  catch (error) { await unlink(temporary).catch(() => undefined); throw error; }
 }
 
 function normalizeSourceEditPath(value: unknown): string {
@@ -305,9 +370,15 @@ function boundedTimeout(value: unknown, fallback = 60_000): number {
 
 function riskyInvocation(toolId: string, action: string): boolean {
   return (
-    (["system.files", "windows.files"].includes(toolId) && action === "write") ||
+    (["system.files", "windows.files"].includes(toolId) && ["write", "materialize-task"].includes(action)) ||
     ["system.shell", "windows.powershell"].includes(toolId) ||
     toolId === "code.execute" ||
+    (toolId === "data.distill-local" && ["start", "resume"].includes(action)) ||
+    (toolId === "brain.substrate" && action === "apply") ||
+    (toolId === "system.clipboard" && ["read", "write", "clear"].includes(action)) ||
+    (toolId === "system.memory" && ["attach", "regions", "read", "write"].includes(action)) ||
+    (["runtime.sandbox", "runtime.vm"].includes(toolId) && ["create", "load", "run", "stop"].includes(action)) ||
+    (toolId === "code.assembly" && ["compile", "run"].includes(action)) ||
     toolId === "browser.automation" ||
     toolId === "device.input" ||
     toolId === "agent.fork" ||
@@ -382,13 +453,14 @@ function terminateProcessTree(
   }
 }
 
-async function runProcess(
+export async function runProcess(
   command: string,
   args: string[],
   cwd: string,
   timeoutMs: number,
   environment?: Record<string, string>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onSpawn?: (pid: number) => void
 ): Promise<{ exitCode: number; stdout: string; stderr: string; truncated: boolean }> {
   return new Promise((resolveProcess, rejectProcess) => {
     if (signal?.aborted) {
@@ -449,6 +521,7 @@ async function runProcess(
       cleanup();
       rejectProcess(error);
     };
+    child.once("spawn", () => { if (child.pid && onSpawn) try { onSpawn(child.pid); } catch (error) { terminateProcessTree(child, false); rejectOnce(error instanceof Error ? error : new Error(String(error))); } });
     child.once("error", (error) => {
       if (termination === "cancelled") rejectOnce(toolCancellationError());
       else if (termination === "timed-out") {
@@ -617,11 +690,91 @@ export function parsePublicSearchRss(value: string, limit = 10): PublicSearchRes
 }
 
 export class ToolExecutor {
+  private actionReviewer?: ActionReviewer;
+  private disposeActionReviewerSubscription?: () => void;
+  /** Trusted main composition only. An adviser never receives tool authority. */
+  setActionReviewer(reviewer: ActionReviewer | undefined): void {
+    if (this.actionReviewer === reviewer) return;
+    this.disposeActionReviewerSubscription?.();
+    this.actionReviewer = reviewer;
+    this.invalidateReviewerState();
+    this.disposeActionReviewerSubscription = reviewer?.onConfigurationChanged(brainId => this.invalidateReviewerState(brainId));
+  }
+  private invalidateReviewerState(brainId?: string): void {
+    void this.sparseSubstrateService?.authorityChanged?.(brainId).catch(() => undefined);
+    void this.nativeCandidateToolService?.authorityChanged?.(brainId).catch(() => undefined);
+    for (const [token, approval] of this.approvals) if (brainId === undefined || approval.brainId === brainId) this.approvals.delete(token);
+    for (const execution of this.activeExecutions.values()) if ((brainId === undefined || execution.brainId === brainId) &&
+      !execution.dispatchStarted && !execution.controller.signal.aborted) execution.controller.abort(new Error("Reviewer owner/configuration changed before dispatch; review the current action again."));
+  }
+  private clipboardService?: ClipboardToolService;
+  setClipboardService(service: ClipboardToolService): void { this.clipboardService = service; }
+  private processMemoryService?: ProcessMemoryToolService;
+  setProcessMemoryService(service: ProcessMemoryToolService): void { this.processMemoryService = service; }
+  private mapsService?: Pick<MapsService, "execute">;
+  setMapsService(service: Pick<MapsService, "execute">): void { this.mapsService = service; }
+  private mapBasemapService?: Pick<MapBasemapService, "execute">;
+  setMapBasemapService(service: Pick<MapBasemapService, "execute">): void { this.mapBasemapService = service; }
+  private clockService?: import("./clockService").ClockService;
+  setClockService(clock: import("./clockService").ClockService): void { this.clockService = clock; }
+  private learningCoordinator?: LearningCoordinator;
+  private localTeacherService?: import("./localTeacherService").LocalTeacherToolService;
+  private sparseSubstrateService?: Pick<import("./sparseSubstrateTransferService").SparseSubstrateTransferService, "execute"> &
+    Partial<Pick<import("./sparseSubstrateTransferService").SparseSubstrateTransferService, "authorityChanged">>;
+  setSparseSubstrateService(service: NonNullable<ToolExecutor["sparseSubstrateService"]>): void { this.sparseSubstrateService = service; }
+  private nativeCandidateToolService?: Pick<import("./nativeCandidateToolService").NativeCandidateToolService, "execute"> &
+    Partial<Pick<import("./nativeCandidateToolService").NativeCandidateToolService, "authorityChanged">>;
+  setNativeCandidateToolService(service: NonNullable<ToolExecutor["nativeCandidateToolService"]>): void { this.nativeCandidateToolService = service; }
+  private runtimeAdmissionGuard?: () => void;
+  /** Main-only destination policy gate, not a serialized permission token. */
+  setRuntimeAdmissionGuard(guard: () => void): void { this.runtimeAdmissionGuard = guard; }
+  setLocalTeacherService(service: import("./localTeacherService").LocalTeacherToolService): void { this.localTeacherService = service; }
+  setLearningCoordinator(learning: LearningCoordinator): void { this.learningCoordinator = learning; }
+  private questionService?: UserQuestionService;
+  setQuestionService(questions: UserQuestionService): void { this.questionService = questions; }
   private agentChatRunner?: (brainId: string, objective: string, signal: AbortSignal, turnId: string) => Promise<ChatResult>;
 
   /** Trusted main composition only; no renderer setter or behavior prompt. */
   setAgentChatRunner(runner: NonNullable<ToolExecutor["agentChatRunner"]>): void {
     this.agentChatRunner = runner;
+  }
+  private automationService?: AutomationToolService;
+  private environmentService?: EnvironmentToolService;
+  private assemblyService?: AssemblyToolService;
+  private taskAttachmentService?: Pick<import("./taskAttachmentService").TaskAttachmentService, "execute"> &
+    Partial<Pick<import("./taskContinuationAttachments").TaskContinuationAttachments, "reviewedAccess">>;
+  private fileToolService?: FileToolService;
+  setFileToolService(service: FileToolService): void { this.fileToolService = service; }
+  private webImageService?: import("./webImageService").WebImageService;
+  setWebImageService(service: import("./webImageService").WebImageService): void { this.webImageService = service; }
+  private htmlArtifactService?: Pick<import("./htmlArtifactService").HtmlArtifactService, "execute">;
+  setEnvironmentService(service: EnvironmentToolService): void { this.environmentService = service; }
+  setAssemblyService(service: AssemblyToolService): void { this.assemblyService = service; }
+  setTaskAttachmentService(service: NonNullable<ToolExecutor["taskAttachmentService"]>): void {
+    this.taskAttachmentService = service;
+  }
+  setHtmlArtifactService(service: Pick<import("./htmlArtifactService").HtmlArtifactService, "execute">): void {
+    this.htmlArtifactService = service;
+  }
+  /** Trusted main composition only; automation steps still re-enter ToolExecutor. */
+  setAutomationService(service: AutomationToolService): void {
+    this.automationService = service;
+  }
+  /** Trusted host invalidation for one retained automation approval token. */
+  invalidateApproval(brainId: string, token: string): boolean {
+    const approval = this.approvals.get(token);
+    if (!approval || approval.brainId !== brainId) return false;
+    return this.approvals.delete(token);
+  }
+  /** Registration retirement is not a permission preference change. */
+  retireToolProtocols(brainId: string, toolIds: readonly string[]): void {
+    const retired = new Set(toolIds);
+    for (const toolId of retired) this.revokeApprovals(brainId, toolId);
+    for (const execution of this.activeExecutions.values()) {
+      if (execution.brainId === brainId && [...execution.permissionToolIds].some(id => retired.has(id))) {
+        execution.controller.abort(new Error("The exact tool registration was retired."));
+      }
+    }
   }
   private readonly approvals = new Map<string, Approval>();
   private readonly activeExecutions = new Map<
@@ -630,6 +783,8 @@ export class ToolExecutor {
       brainId: string;
       requestId: string;
       controller: AbortController;
+      permissionToolIds: Set<string>;
+      dispatchStarted: boolean;
       settled: Promise<void>;
       resolveSettled(): void;
     }
@@ -642,8 +797,28 @@ export class ToolExecutor {
     private readonly deviceInput: Pick<HostDeviceInputBackend, "execute"> =
       new HostDeviceInputBackend(),
     private readonly externalTools?: ExternalToolBridge,
-    private readonly preferencesStore?: ToolPreferencesStore
-  ) {}
+    private readonly preferencesStore?: ToolPreferencesStore,
+    private readonly customTools?: CustomToolResolver
+  ) {
+    this.service.onToolPermissionChanged?.(({ brainId, toolId }) => {
+      // Approval tokens are host authority, not neural state. Invalidate them
+      // immediately on every policy revision; Off -> Ask can never resurrect
+      // a token minted before the revocation.
+      this.revokeApprovals(brainId, toolId);
+      for (const execution of this.activeExecutions.values()) {
+        if (execution.brainId === brainId && execution.permissionToolIds.has(toolId) &&
+          !execution.controller.signal.aborted) {
+          // Dispatch adapters may await their own validation before the first
+          // effect. Abort the shared signal on every relevant revision. If an
+          // effect already started, dispatchStarted remains true and the
+          // actual/partial outcome follows the normal durable receipt path.
+          execution.controller.abort(new Error(
+            "Tool permission changed before dispatch; review the current access setting and retry."
+          ));
+        }
+      }
+    });
+  }
 
   preferences(): ToolRuntimePreferences {
     return this.preferencesStore?.get() ?? { approvalTimeoutSeconds: 30 };
@@ -658,12 +833,13 @@ export class ToolExecutor {
     invocation: ToolInvocation,
     onProgress?: (job: RuntimeJob) => void,
     requestedRequestId?: string,
-    onCompleted?: (result: ToolExecutionResult) => Promise<void>
+    onCompleted?: (result: ToolExecutionResult) => Promise<void>,
+    context?: ToolExecutionContext
   ): Promise<ToolExecutionResult> {
     // Imported brains can still emit historical protocol IDs. Canonicalize
     // once before permission, approval, execution, result, and learning audit
     // so aliases cannot leak back into new visible/deep experience.
-    invocation = canonicalSystemInvocation(invocation);
+    invocation = structuredClone(canonicalSystemInvocation(invocation));
     const id = randomUUID();
     const startedAt = new Date().toISOString();
     const base: ToolExecutionResult = {
@@ -677,7 +853,34 @@ export class ToolExecutor {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(requestId)) {
       throw new Error("Tool execution requestId is invalid.");
     }
+    if (context && (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(context.actionEventId) ||
+        context.learning && context.learning.brainId !== invocation.brainId ||
+        context.nativeActionId !== undefined && (!context.chatTurnId || !/^[a-f0-9]{32}$/.test(context.nativeActionId)))) throw new Error("Invalid host-owned learning action context.");
     const controller = new AbortController();
+    const origin = context?.originAuthority;
+    const originRevision = origin?.revision;
+    const originAssert = origin?.assertCurrent;
+    const originSignal = origin?.signal;
+    if (origin && (!originRevision || typeof originAssert !== "function" || !originSignal ||
+        typeof originSignal.addEventListener !== "function")) throw new Error("Invalid main-owned action origin authority.");
+    const abortFromOrigin = (): void => controller.abort(originSignal?.reason);
+    originSignal?.addEventListener("abort", abortFromOrigin, { once: true });
+    if (originSignal?.aborted) abortFromOrigin();
+    const requireCurrentOrigin = async (): Promise<void> => {
+      controller.signal.throwIfAborted();
+      this.runtimeAdmissionGuard?.();
+      if (!origin) return;
+      originSignal!.throwIfAborted();
+      if (origin.revision !== originRevision || origin.assertCurrent !== originAssert || origin.signal !== originSignal) {
+        throw new Error("Action origin authority changed before dispatch.");
+      }
+      await originAssert!.call(origin);
+      controller.signal.throwIfAborted(); originSignal!.throwIfAborted();
+      this.runtimeAdmissionGuard?.();
+      if (origin.revision !== originRevision || origin.assertCurrent !== originAssert || origin.signal !== originSignal) {
+        throw new Error("Action origin authority changed during authorization.");
+      }
+    };
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
       resolveSettled = resolve;
@@ -686,6 +889,8 @@ export class ToolExecutor {
       brainId: invocation.brainId,
       requestId,
       controller,
+      permissionToolIds: new Set([invocation.toolId]),
+      dispatchStarted: false,
       settled,
       resolveSettled
     });
@@ -693,9 +898,12 @@ export class ToolExecutor {
     const retainAndAuditTerminal = async (result: ToolExecutionResult): Promise<void> => {
       if (result.state === "complete" || result.dispatchStarted === true) {
         try {
+          if (result.state === "complete") await context?.learning?.observe(invocation, result);
           if (onCompleted) await onCompleted(result);
           else await this.service.queueCompletedToolExecution(invocation, result,
-            typeof invocation.arguments.chatTurnId === "string" ? invocation.arguments.chatTurnId : undefined);
+            invocation.toolId === "web.fetch" && invocation.action === "inspect-image" ? context?.chatTurnId :
+              typeof invocation.arguments.chatTurnId === "string" ? invocation.arguments.chatTurnId : undefined,
+            invocation.toolId === "web.fetch" && invocation.action === "inspect-image" ? context?.actionEventId : undefined);
         } catch (error) {
           result.error = `${result.error ? `${result.error}; ` : ""}Actual outcome retention needs attention: ${error instanceof Error ? error.message : String(error)}`;
         }
@@ -705,47 +913,158 @@ export class ToolExecutor {
       });
     };
     try {
-      const permissionDecision = await this.permission(
-        invocation.brainId,
-        invocation.toolId
-      );
+      if (context?.chatTurnId && context.nativeActionId) {
+        const retained = await this.service.recoverCompletedNativeEffect?.(invocation,
+          { turnId: context.chatTurnId, neuralActionId: context.nativeActionId });
+        if (retained) {
+          // This is historical outcome delivery, never new permission or a
+          // retry of an already completed/partially completed external effect.
+          await retainAndAuditTerminal(retained); return retained;
+        }
+      }
+      await requireCurrentOrigin();
+      const rawResolvedPlugin = await this.customTools?.resolve(invocation);
+      const resolvedPlugin = rawResolvedPlugin ? structuredClone(rawResolvedPlugin) : undefined;
+      const effectiveInvocation = resolvedPlugin?.nested ?? invocation;
+      if (resolvedPlugin) {
+        this.activeExecutions.get(id)?.permissionToolIds.add(effectiveInvocation.toolId);
+      }
+      const permissionDecision = await this.invocationPermission(invocation, context?.chatTurnId, controller.signal);
+      const nestedPermissionDecision = resolvedPlugin
+        ? await this.invocationPermission(effectiveInvocation, context?.chatTurnId, controller.signal)
+        : undefined;
+      await requireCurrentOrigin();
       controller.signal.throwIfAborted();
       const permission = permissionDecision.level;
-      if (permission === "off") {
+      if (permission === "off" || nestedPermissionDecision?.level === "off") {
         // A denied use is also an explicit revocation boundary. Otherwise an
         // Ask token could survive Off, become valid again after Ask is
         // restored, and resurrect authority the user already withdrew.
         this.revokeApprovals(invocation.brainId, invocation.toolId);
-        throw new Error("This tool is disabled for the current brain.");
+        if (resolvedPlugin) this.revokeApprovals(invocation.brainId, effectiveInvocation.toolId);
+        throw new Error(resolvedPlugin && nestedPermissionDecision?.level === "off"
+          ? `The plugin's nested ${effectiveInvocation.toolId}.${effectiveInvocation.action} capability is disabled for this brain.`
+          : "This tool is disabled for the current brain.");
       }
+      const authorityRevision = resolvedPlugin
+        ? sha256(JSON.stringify({
+            pluginId: resolvedPlugin.pluginId,
+            contentSha256: resolvedPlugin.contentSha256,
+            catalogRevision: resolvedPlugin.catalogRevision,
+            instanceRevision: resolvedPlugin.instanceRevision,
+            outerToolId: invocation.toolId,
+            outerAction: invocation.action,
+            outerPermissionRevision: permissionDecision.revision,
+            nestedToolId: effectiveInvocation.toolId,
+            nestedAction: effectiveInvocation.action,
+            nestedArgumentsSha256: resolvedPlugin.nestedArgumentsSha256,
+            nestedPermissionRevision: nestedPermissionDecision!.revision
+          }))
+        : permissionDecision.revision;
+      // Re-read host policy/resolution after review and at every subsequent
+      // authorization/effect boundary. The review itself cannot grant access.
+      const requireCurrentPermission = async (): Promise<void> => {
+        await requireCurrentOrigin();
+        const currentResolved = await this.customTools?.resolve(invocation);
+        const current = await this.invocationPermission(invocation, context?.chatTurnId, controller.signal);
+        const currentNested = currentResolved ? await this.invocationPermission(currentResolved.nested, context?.chatTurnId, controller.signal) : undefined;
+        const currentAuthorityRevision = currentResolved ? sha256(JSON.stringify({
+          pluginId: currentResolved.pluginId, contentSha256: currentResolved.contentSha256,
+          catalogRevision: currentResolved.catalogRevision, instanceRevision: currentResolved.instanceRevision,
+          outerToolId: invocation.toolId, outerAction: invocation.action, outerPermissionRevision: current.revision,
+          nestedToolId: currentResolved.nested.toolId, nestedAction: currentResolved.nested.action,
+          nestedArgumentsSha256: currentResolved.nestedArgumentsSha256, nestedPermissionRevision: currentNested!.revision
+        })) : current.revision;
+        if (current.level === "off" || current.level !== permission || currentNested?.level === "off" ||
+          currentNested?.level !== nestedPermissionDecision?.level || Boolean(currentResolved) !== Boolean(resolvedPlugin) || currentAuthorityRevision !== authorityRevision) {
+          this.revokeApprovals(invocation.brainId, invocation.toolId);
+          if (resolvedPlugin) this.revokeApprovals(invocation.brainId, effectiveInvocation.toolId);
+          throw new Error("Tool permission changed before dispatch; review the current access setting and retry.");
+        }
+        await requireCurrentOrigin();
+      };
       const outsideAutomaticFileScope =
-        permission === "auto" &&
-        ["system.files", "windows.files"].includes(invocation.toolId) &&
-        !(await this.insideAutomaticFileScope(invocation.brainId, invocation.arguments));
+        (permission === "auto" || nestedPermissionDecision?.level === "auto") &&
+        ["system.files", "windows.files"].includes(effectiveInvocation.toolId) &&
+        !(await this.insideAutomaticFileScope(invocation.brainId, effectiveInvocation.arguments));
       const autonomousEvolutionExperiment =
+        !resolvedPlugin &&
         invocation.toolId === "source.self-modify" &&
         ["propose", "diff", "test"].includes(invocation.action);
-      const needsApproval =
+      // Resolving an automation attempt whose effect is unknown is an
+      // explicit human acknowledgement, not ordinary model/tool authority.
+      // Require the exact one-use ToolExecutor approval even when the current
+      // outer (or plugin-nested) policy is Auto or Full.
+      const requiresExplicitHumanReview =
+        effectiveInvocation.toolId === "studio.automation" &&
+        ["review", "approve"].includes(effectiveInvocation.action);
+      const policyNeedsApproval =
+        requiresExplicitHumanReview ||
         (permission === "ask" && !autonomousEvolutionExperiment) ||
-        (permission === "auto" &&
-          (riskyInvocation(invocation.toolId, invocation.action) || outsideAutomaticFileScope));
-      if (
-        needsApproval &&
-        !this.consumeApproval(invocation, permissionDecision.revision)
-      ) {
+        (nestedPermissionDecision?.level === "ask") ||
+        ((permission === "auto" || nestedPermissionDecision?.level === "auto") &&
+          (riskyInvocation(effectiveInvocation.toolId, effectiveInvocation.action) || outsideAutomaticFileScope));
+      const pluginReview: PluginApprovalReview | undefined = resolvedPlugin
+        ? {
+            kind: "plugin-nested-operation",
+            pluginId: resolvedPlugin.pluginId,
+            pluginName: resolvedPlugin.pluginName,
+            contentSha256: resolvedPlugin.contentSha256,
+            outer: { toolId: invocation.toolId, action: invocation.action },
+            resolved: {
+              toolId: effectiveInvocation.toolId,
+              action: effectiveInvocation.action,
+              arguments: structuredClone(effectiveInvocation.arguments)
+            },
+            permissionSources: [
+              { toolId: invocation.toolId, level: permission, inherited: false },
+              { toolId: effectiveInvocation.toolId, level: nestedPermissionDecision!.level, inherited: true }
+            ]
+          }
+        : undefined;
+      const reviewer = this.actionReviewer;
+      const reviewerSnapshot = reviewer ? await reviewer.snapshot(invocation.brainId, controller.signal) : undefined;
+      const proposal: ActionReviewerProposal = { invocation, ...(resolvedPlugin ? { resolvedInvocation: effectiveInvocation } : {}),
+        permissionRevision: authorityRevision, permissionLevels: [{ toolId: invocation.toolId, level: permission },
+          ...(nestedPermissionDecision ? [{ toolId: effectiveInvocation.toolId, level: nestedPermissionDecision.level }] : [])],
+        requestId, chatTurnId: context?.chatTurnId, actionEventId: context?.actionEventId };
+      const approvalRevision = reviewerSnapshot
+        ? sha256(JSON.stringify({ authorityRevision, reviewerRevision: reviewerSnapshot.bindingRevision, proposalSha256: actionReviewerProposalSha256(proposal) }))
+        : authorityRevision;
+      const approved = this.consumeApproval(invocation, approvalRevision);
+      let actionReview = approved?.actionReview;
+      if (reviewer && reviewerSnapshot?.configuration.enabled && !actionReview) actionReview = await reviewer.inspect(proposal, reviewerSnapshot, controller.signal);
+      if (actionReview) base.actionReview = structuredClone(actionReview);
+      const requireCurrentReviewer = async (): Promise<void> => {
+        if (this.actionReviewer !== reviewer) throw new Error("Reviewer changed before dispatch; review the current action again.");
+        if (reviewer && reviewerSnapshot) await reviewer.assertCurrent(invocation.brainId, reviewerSnapshot, controller.signal);
+      };
+      await requireCurrentPermission();
+      // Unknown settings can produce a visible Ask, but can never authorize
+      // dispatch until a fresh verified configuration becomes available.
+      if (reviewerSnapshot?.available) await requireCurrentReviewer();
+      controller.signal.throwIfAborted();
+      const needsApproval = policyNeedsApproval || actionReview?.verdict === "ask";
+      if (needsApproval && !approved) {
         const approvalToken = randomUUID();
         const expiresAt = Date.now() + this.preferences().approvalTimeoutSeconds * 1_000;
         this.approvals.set(approvalToken, {
           brainId: invocation.brainId,
+          requestId,
           toolId: invocation.toolId,
           action: invocation.action,
           argumentSha256: sha256(JSON.stringify(invocation.arguments)),
-          permissionRevision: permissionDecision.revision,
+          permissionRevision: approvalRevision,
+          permissionToolIds: resolvedPlugin
+            ? [invocation.toolId, effectiveInvocation.toolId]
+            : [invocation.toolId],
+          ...(actionReview ? { actionReview: structuredClone(actionReview) } : {}),
           expiresAt
         });
         return {
           ...base,
           state: "approval-required",
+          ...(pluginReview ? { output: pluginReview } : {}),
           approvalToken,
           approvalExpiresAt: new Date(expiresAt).toISOString()
         };
@@ -755,28 +1074,75 @@ export class ToolExecutor {
       if (!needsApproval && invocation.approvalToken) {
         this.approvals.delete(invocation.approvalToken);
       }
+      await requireCurrentReviewer();
+      controller.signal.throwIfAborted();
       // Persist independent authorization intent before any external effect.
       // Whole-brain result auditing remains serialized after the chat's
       // atomic checkpoint; this receipt cannot overwrite a live draft brain.
       const intentPath = await persistAuthorizedToolIntent(
         this.service.repository.brainDirectory(invocation.brainId), invocation,
-        { id, requestId, startedAt, permission, permissionRevision: permissionDecision.revision }
+        {
+          id,
+          requestId,
+          startedAt,
+          permission:
+            requiresExplicitHumanReview || actionReview?.verdict === "ask" || permission === "ask" || nestedPermissionDecision?.level === "ask"
+              ? "ask"
+              : permission === "auto" || nestedPermissionDecision?.level === "auto"
+                ? "auto"
+                : "full",
+          permissionRevision: authorityRevision,
+          ...(resolvedPlugin ? {
+            resolvedPlugin: {
+              pluginId: resolvedPlugin.pluginId,
+              contentSha256: resolvedPlugin.contentSha256,
+              toolId: effectiveInvocation.toolId,
+              action: effectiveInvocation.action,
+              argumentSha256: resolvedPlugin.nestedArgumentsSha256
+            }
+          } : {})
+        }
       );
       controller.signal.throwIfAborted();
-      await this.service.authorizeInlineImagination(invocation, id, requestId, intentPath);
+      await requireCurrentPermission();
+      await requireCurrentReviewer();
+      controller.signal.throwIfAborted();
+      await this.service.authorizeInlineImagination(effectiveInvocation, id, requestId, intentPath);
+      controller.signal.throwIfAborted();
+      await requireCurrentPermission();
+      await requireCurrentReviewer();
       controller.signal.throwIfAborted();
       let output: unknown;
       try {
         dispatchStarted = true;
+        const active = this.activeExecutions.get(id);
+        if (active) active.dispatchStarted = true;
         output = await this.dispatch(
-          invocation,
+          effectiveInvocation,
           controller.signal,
+          requestId,
           onProgress,
-          permission,
-          id
+          nestedPermissionDecision?.level ?? permission,
+          context?.actionEventId ?? id,
+          context?.learning,
+          context?.chatTurnId,
+          context?.mcpAppViewId,
+          async () => { await requireCurrentPermission(); await requireCurrentReviewer(); controller.signal.throwIfAborted(); },
+          {
+            // Detached jobs bind the live origin as well as policy/review.
+            // Persisted ordinary effect receipts deliberately keep the stable
+            // policy revision above, not an ephemeral module session identity.
+            revision: sha256(JSON.stringify({ approvalRevision, originRevision: originRevision ?? null })),
+            signal: originSignal ?? controller.signal,
+            assertCurrent: async () => { await requireCurrentPermission(); await requireCurrentReviewer(); controller.signal.throwIfAborted(); }
+          },
+          resolvedPlugin ? sha256(JSON.stringify({ pluginId: resolvedPlugin.pluginId, contentSha256: resolvedPlugin.contentSha256,
+            catalogRevision: resolvedPlugin.catalogRevision, instanceRevision: resolvedPlugin.instanceRevision,
+            outerToolId: invocation.toolId, outerPermissionRevision: permissionDecision.revision,
+            nestedToolId: effectiveInvocation.toolId, nestedPermissionRevision: nestedPermissionDecision!.revision })) : permissionDecision.revision
         );
       } catch (error) {
-        if (controller.signal.aborted) throw toolCancellationError();
+        if (controller.signal.aborted && !(error instanceof AssemblyExecutionError) && !(error instanceof ProcessMemoryOperationError) && !(error instanceof ClipboardOperationError) && !(error instanceof FileToolEffectError) && !(error instanceof McpTaskCustodyError)) throw toolCancellationError();
         throw error;
       }
       const result: ToolExecutionResult = {
@@ -793,9 +1159,15 @@ export class ToolExecutor {
       await retainAndAuditTerminal(result);
       return result;
     } catch (error) {
+      const taskReceipt = mcpTaskReceiptFromFailure(error, invocation.brainId, invocation.toolId);
       const result: ToolExecutionResult = {
         ...base,
         state: "failed",
+        ...(error instanceof AssemblyExecutionError ? { output: error.receipt } : {}),
+        ...(error instanceof ProcessMemoryOperationError ? { output: error.receipt } : {}),
+        ...(error instanceof ClipboardOperationError ? { output: error.receipt } : {}),
+        ...(error instanceof FileToolEffectError ? { output: error.receipt } : {}),
+        ...(taskReceipt ? { mcpTaskReceipt: taskReceipt, output: taskReceipt } : {}),
         ...(dispatchStarted ? { dispatchStarted: true } : {}),
         finishedAt: new Date().toISOString(),
         ...(error instanceof ToolDispatchFailure ? { output: error.output } : {}),
@@ -804,6 +1176,7 @@ export class ToolExecutor {
       await retainAndAuditTerminal(result);
       return result;
     } finally {
+      originSignal?.removeEventListener("abort", abortFromOrigin);
       const execution = this.activeExecutions.get(id);
       if (execution) {
         this.activeExecutions.delete(id);
@@ -813,7 +1186,10 @@ export class ToolExecutor {
   }
 
   cancel(brainId: string, requestId?: string): number {
+    this.fileToolService?.cancelBrain(brainId, requestId);
     let cancelled = 0;
+    for (const [token, approval] of this.approvals) if (approval.brainId === brainId &&
+      (requestId === undefined || approval.requestId === requestId)) this.approvals.delete(token);
     for (const execution of this.activeExecutions.values()) {
       if (
         execution.brainId !== brainId ||
@@ -836,6 +1212,7 @@ export class ToolExecutor {
     );
     this.cancel(brainId, requestId);
     await Promise.all(matching.map((execution) => execution.settled));
+    await this.fileToolService?.settle(brainId, requestId);
     return matching.length;
   }
 
@@ -855,6 +1232,18 @@ export class ToolExecutor {
     );
   }
 
+  private async invocationPermission(invocation: ToolInvocation, turnId: string | undefined, signal: AbortSignal): Promise<PermissionDecision> {
+    const policy = await this.permission(invocation.brainId, invocation.toolId);
+    if (policy.level !== "off" || invocation.toolId !== "task.attachments" || !turnId) return policy;
+    // Only a main-owned, currently active exact-file review can override this
+    // one task read. Never trust a review token or turn ID in model arguments.
+    const reviewed = await this.taskAttachmentService?.reviewedAccess?.(
+      invocation.brainId, turnId, invocation.action, invocation.arguments, signal);
+    signal.throwIfAborted();
+    if (!reviewed) return policy;
+    return { level: "auto", revision: sha256(JSON.stringify({ policy: policy.revision, retainedFileReview: reviewed.revision })) };
+  }
+
   private async permission(
     brainId: string,
     toolId: string
@@ -862,7 +1251,7 @@ export class ToolExecutor {
     // A workspace route changes only local renderer state and is immediately
     // reversible. It must never inherit Full Authority or require an approval
     // token intended for external side effects.
-    if (toolId === "studio.ui" || toolId === "studio.settings") {
+    if (toolId === "studio.ui" || toolId === "studio.settings" || toolId === "studio.question") {
       return { level: "auto", revision: `local-reversible:${toolId}:1` };
     }
     const permissions = await this.service.listToolPermissions(brainId);
@@ -881,7 +1270,8 @@ export class ToolExecutor {
         JSON.stringify({
           toolId: canonical,
           level: permission.level,
-          updatedAt: permission.updatedAt
+          updatedAt: permission.updatedAt,
+          revision: permission.revision ?? 0
         })
       )
     };
@@ -889,7 +1279,8 @@ export class ToolExecutor {
 
   private revokeApprovals(brainId: string, toolId: string): void {
     for (const [token, approval] of this.approvals) {
-      if (approval.brainId === brainId && approval.toolId === toolId) {
+      if (approval.brainId === brainId &&
+        (approval.toolId === toolId || approval.permissionToolIds.includes(toolId))) {
         this.approvals.delete(token);
       }
     }
@@ -898,11 +1289,11 @@ export class ToolExecutor {
   private consumeApproval(
     invocation: ToolInvocation,
     permissionRevision: string
-  ): boolean {
-    if (!invocation.approvalToken) return false;
+  ): Approval | undefined {
+    if (!invocation.approvalToken) return undefined;
     const approval = this.approvals.get(invocation.approvalToken);
     this.approvals.delete(invocation.approvalToken);
-    return Boolean(
+    return (
       approval &&
         approval.expiresAt >= Date.now() &&
         approval.brainId === invocation.brainId &&
@@ -910,7 +1301,7 @@ export class ToolExecutor {
         approval.action === invocation.action &&
         approval.argumentSha256 === sha256(JSON.stringify(invocation.arguments)) &&
         approval.permissionRevision === permissionRevision
-    );
+    ) ? approval : undefined;
   }
 
   private async insideAutomaticFileScope(
@@ -933,23 +1324,137 @@ export class ToolExecutor {
   private async dispatch(
     invocation: ToolInvocation,
     signal: AbortSignal,
+    requestId: string,
     onProgress?: (job: RuntimeJob) => void,
     permission?: ToolPermissionLevel,
-    policyDecisionId?: string
+    policyDecisionId?: string,
+    learningContext?: LearningExecutionContext,
+    chatTurnId?: string,
+    mcpAppViewId?: string,
+    requireCurrentPermission?: () => Promise<void>,
+    detachedAuthority?: HostActionOriginAuthority,
+    stablePolicyRevision?: string
   ): Promise<unknown> {
     switch (invocation.toolId) {
+      case "brain.substrate":
+        if (!this.sparseSubstrateService || !detachedAuthority) throw new Error("Native substrate transfer authority is unavailable.");
+        return this.sparseSubstrateService.execute(invocation.brainId, invocation.action, invocation.arguments,
+          requestId, signal, detachedAuthority, { ...(chatTurnId ? { chatTurnId } : {}), actionEventId: policyDecisionId ?? requestId });
+      case "maps.search":
+      case "maps.display":
+        if (invocation.toolId === "maps.display" && ["basemaps", "basemap"].includes(invocation.action)) {
+          if (!this.mapBasemapService || !requireCurrentPermission) throw new Error("Permissioned optional map imagery is unavailable.");
+          try { return await this.mapBasemapService.execute(invocation.brainId, invocation.action, invocation.arguments, signal, requireCurrentPermission); }
+          catch (error) { if (error instanceof MapBasemapError) throw new ToolDispatchFailure(error.message, error.output); throw error; }
+        }
+        if (!this.mapsService) throw new Error("Map adapters are unavailable.");
+        try { return await this.mapsService.execute(invocation.brainId, invocation.toolId, invocation.action, invocation.arguments, signal); }
+        catch (error) { if (error instanceof MapAdapterError) throw new ToolDispatchFailure(error.message, error.output); throw error; }
+      case "system.time":
+      case "studio.stopwatch":
+      case "studio.schedule":
+        if (!this.clockService) throw new Error("Host clocks and schedules are unavailable.");
+        return this.clockService.execute(invocation.brainId, invocation.toolId, invocation.action,
+          invocation.arguments, policyDecisionId ?? randomUUID(), signal);
+      case "data.distill-local": {
+        const teacher = this.localTeacherService; if (!teacher) throw new Error("Local GGUF teacher jobs are unavailable.");
+        const args = invocation.arguments, brainId = invocation.brainId; signal.throwIfAborted();
+        if (invocation.action === "selections") return teacher.selections(brainId);
+        if (invocation.action === "plan") return teacher.plan({ brainId, teacherId: argumentString(args, "teacherId", 128), ...(Array.isArray(args.prompts) ? { prompts: args.prompts as string[] } : {}) });
+        if (invocation.action === "start") return teacher.start({ ...args, brainId, requestId: policyDecisionId ?? requestId } as unknown as import("../shared/localTeacher").LocalTeacherStartRequest);
+        if (invocation.action === "list") return teacher.jobs(brainId);
+        const jobId = argumentString(args, "jobId", 128);
+        if (invocation.action === "status") return teacher.get(brainId, jobId);
+        if (invocation.action === "items") return teacher.items(brainId, jobId, args.afterIndex as number | undefined, args.limit as number | undefined);
+        if (invocation.action === "pause") return teacher.pause(brainId, jobId);
+        if (invocation.action === "resume") return teacher.resume(brainId, jobId);
+        if (invocation.action === "stop") return teacher.stop(brainId, jobId);
+        throw new Error("Unknown local teacher operation; runtime/model paths and setup flags are never model-supplied authority.");
+      }
+      case "data.learn":
+      case "data.fact-check": {
+        const learning = this.learningCoordinator;
+        if (!learning) throw new Error("Learning jobs are unavailable.");
+        const args = { ...invocation.arguments }, brainId = invocation.brainId;
+        if (learningContext?.originalTaskId && args.taskId === learningContext.originalTaskId) args.taskId = learningContext.taskId;
+        signal.throwIfAborted();
+        if (learningContext && invocation.toolId === "data.fact-check" && invocation.action === "record" &&
+            (args.taskId !== learningContext.taskId || args.claimId !== learningContext.claimId)) throw new Error("This native assessment may record only its controller-owned task and claim.");
+        if (invocation.action === "start") return invocation.toolId === "data.learn"
+          ? learning.start({ ...args, brainId, requestId: policyDecisionId } as SpecificLearnRequest, learningContext?.taskId)
+          : learning.startFactCheck({ ...args, brainId, requestId: policyDecisionId } as FactCheckRequest);
+        const taskId = argumentString(args, "taskId", 128);
+        if (invocation.action === "status") return invocation.toolId === "data.learn" ? learning.get(brainId, taskId) : learning.factCheck(brainId, taskId);
+        if (invocation.action === "pause") return learning.pause(brainId, taskId, learningContext?.taskId !== taskId);
+        if (invocation.action === "resume") return learning.resume(brainId, taskId);
+        if (invocation.action === "stop") return learning.stop(brainId, taskId, learningContext?.taskId !== taskId);
+        if (invocation.action === "steer") return learning.steer({ ...args, brainId, taskId } as LearningTaskSteerRequest, true);
+        if (invocation.toolId === "data.fact-check" && invocation.action === "record") return learning.review({ ...args, brainId, taskId,
+          requestId: policyDecisionId ?? randomUUID() } as FactCheckReviewRequest, "model");
+        throw new Error("Unknown learning job operation.");
+      }
+      case "studio.question": {
+        if (!this.questionService) throw new Error("Questions are unavailable.");
+        if (invocation.action === "status") return this.questionService.get(invocation.brainId,
+          argumentString(invocation.arguments, "questionId", 64));
+        if (invocation.action !== "ask") throw new Error("Unknown question action.");
+        return this.questionService.request({
+          ...invocation.arguments,
+          brainId: invocation.brainId,
+          requestId: policyDecisionId,
+          source: { kind: "brain", actionId: policyDecisionId }
+        } as UserQuestionRequest);
+      }
+      case "system.memory":
+        if (!this.processMemoryService) throw new Error("OS process-memory service is unavailable.");
+        return this.processMemoryService.execute(invocation.brainId, invocation.action, invocation.arguments, requestId, signal);
+      case "studio.clipboard":
+      case "system.clipboard":
+        if (!this.clipboardService) throw new Error("Clipboard service is unavailable.");
+        return this.clipboardService.execute(invocation.brainId, invocation.toolId, invocation.action, invocation.arguments, requestId, signal);
       case "system.files":
       case "windows.files":
-        return this.files(invocation.action, invocation.arguments);
+        if (!this.fileToolService || !requireCurrentPermission || !stablePolicyRevision) throw new Error("Permissioned bounded file service is unavailable.");
+        if (invocation.action === "write") return this.files(invocation.brainId, invocation.arguments, signal, requireCurrentPermission, stablePolicyRevision);
+        return this.fileToolService.execute(invocation.brainId, invocation.action, invocation.arguments, requestId, signal,
+          { ...(chatTurnId ? { chatTurnId } : {}), policyRevision: stablePolicyRevision, assertCurrent: requireCurrentPermission });
       case "system.shell":
       case "windows.powershell":
         return this.shell(invocation.action, invocation.arguments, signal);
       case "code.execute":
         return this.code(invocation.action, invocation.arguments, signal);
+      case "runtime.sandbox":
+      case "runtime.vm":
+        if (!this.environmentService) throw new Error("Managed environment service is unavailable.");
+        return this.environmentService.execute(invocation.brainId, invocation.toolId, invocation.action,
+          invocation.arguments, requestId, signal, { ...(chatTurnId ? { chatTurnId } : {}) });
+      case "code.assembly":
+        if (!this.assemblyService) throw new Error("Assembly toolchain service is unavailable.");
+        return this.assemblyService.execute(invocation.brainId, invocation.action, invocation.arguments, requestId, signal);
+      case "task.attachments":
+        if (!this.taskAttachmentService) throw new Error("Task attachment service is unavailable.");
+        return this.taskAttachmentService.execute(
+          invocation.brainId, chatTurnId, invocation.action, invocation.arguments, signal
+        );
+      case "studio.artifact":
+        if (!this.htmlArtifactService) throw new Error("Saved HTML artifacts are unavailable.");
+        return this.htmlArtifactService.execute(
+          invocation.brainId,
+          invocation.action,
+          invocation.arguments,
+          policyDecisionId ?? requestId,
+          signal
+        );
       case "web.fetch":
-        return this.fetch(invocation.action, invocation.arguments, signal);
+        if (invocation.action === "inspect-image") {
+          if (!this.webImageService || !requireCurrentPermission) throw new Error("Selected native web-image inspection is unavailable.");
+          return this.webImageService.inspect(invocation.brainId, chatTurnId, policyDecisionId ?? requestId,
+            argumentString(invocation.arguments, "referenceId", 64), signal, requireCurrentPermission, learningContext,
+            invocation.arguments.maxBytes === undefined ? undefined : invocation.arguments.maxBytes as number);
+        }
+        return this.fetch(invocation.action, invocation.arguments, signal, learningContext, invocation.brainId, chatTurnId);
       case "web.search":
-        return this.search(invocation.action, invocation.arguments, signal);
+        return this.search(invocation.action, invocation.arguments, signal, learningContext, invocation.brainId, chatTurnId);
       case "modality.imagine":
         return this.imagine(
           invocation.brainId,
@@ -973,7 +1478,7 @@ export class ToolExecutor {
           signal
         );
       case "browser.automation":
-        return this.browser(invocation.brainId, invocation.action, invocation.arguments, signal);
+        return this.browser(invocation.brainId, invocation.action, invocation.arguments, signal, learningContext);
       case "device.input":
         return this.hostInput(
           invocation.action,
@@ -994,7 +1499,25 @@ export class ToolExecutor {
         };
       case "studio.settings":
         return this.studioSettings(invocation.brainId, invocation.action);
+      case "studio.automation":
+        if (!this.automationService) throw new Error("Automation service is unavailable.");
+        return this.automationService.execute(
+          invocation.brainId,
+          invocation.action,
+          invocation.arguments,
+          requestId,
+          signal
+        );
       case "source.self-modify":
+        if (["native-status", "native-stop"].includes(invocation.action) ||
+            invocation.action === "propose" && isNativeCandidateKind(invocation.arguments.candidateKind)) {
+          if (!this.nativeCandidateToolService) throw new Error("The native candidate tool service is unavailable; this request cannot fall back to Git source edits.");
+          return this.nativeCandidateToolService.execute(invocation.brainId, invocation.action,
+            invocation.arguments, requestId, signal, detachedAuthority);
+        }
+        if (invocation.action === "propose" && invocation.arguments.candidateKind !== undefined && invocation.arguments.candidateKind !== "source") {
+          throw new Error("Unknown candidate kind; native proposals cannot fall through into Git source evolution.");
+        }
         return this.sourceEvolution(
           invocation.brainId,
           invocation.action,
@@ -1008,7 +1531,10 @@ export class ToolExecutor {
             invocation.toolId,
             invocation.action,
             invocation.arguments,
-            signal
+            signal,
+            invocation.brainId,
+            { requestId, ...(requireCurrentPermission ? { requireCurrentPermission } : {}), ...(chatTurnId ? { chatTurnId } : {}),
+              ...(mcpAppViewId ? { mcpAppViewId } : {}), ...(policyDecisionId ? { actionEventId: policyDecisionId } : {}) }
           );
         }
         throw new Error("Unknown tool protocol.");
@@ -1068,90 +1594,20 @@ export class ToolExecutor {
     return result;
   }
 
-  private async files(action: string, args: Record<string, unknown>): Promise<unknown> {
+  private async files(brainId: string, args: Record<string, unknown>, signal: AbortSignal, assertCurrent: () => Promise<void>, policyRevision: string): Promise<unknown> {
     const path = absolutePath(argumentString(args, "path", 32_000));
-    if (action === "list") {
-      const cursorValue = args.cursor ?? "0";
-      if (
-        typeof cursorValue !== "string" ||
-        !/^(0|[1-9]\d*)$/.test(cursorValue) ||
-        cursorValue.length > 16
-      ) {
-        throw new Error("cursor must be a non-negative decimal string.");
-      }
-      const offset = Number(cursorValue);
-      if (!Number.isSafeInteger(offset)) {
-        throw new Error("cursor exceeds the supported integer range.");
-      }
-      const requestedPageSize = args.pageSize ?? 512;
-      if (
-        typeof requestedPageSize !== "number" ||
-        !Number.isSafeInteger(requestedPageSize) ||
-        requestedPageSize < 1
-      ) {
-        throw new Error("pageSize must be a positive safe integer.");
-      }
-      // This is a transport-page bound, not a directory-size bound. The next
-      // cursor makes every entry addressable without constructing an enormous
-      // JSON action result or silently dropping the tail of a large folder.
-      const pageSize = Math.min(requestedPageSize, 5_000);
-      const entries = (await readdir(path, { withFileTypes: true })).sort((left, right) =>
-        left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: "base" })
-      );
-      if (offset > entries.length) {
-        throw new Error("cursor is beyond the current directory listing.");
-      }
-      const page = entries.slice(offset, offset + pageSize);
-      const nextOffset = offset + page.length;
-      return {
-        entries: await Promise.all(
-          page.map(async (entry) => {
-            const childPath = resolve(path, entry.name);
-            const info = await lstat(childPath);
-            return {
-              name: entry.name,
-              path: childPath,
-              kind: info.isSymbolicLink()
-                ? "link"
-                : info.isDirectory()
-                  ? "directory"
-                  : info.isFile()
-                    ? "file"
-                    : "other",
-              bytes: info.size,
-              modifiedAt: info.mtime.toISOString()
-            };
-          })
-        ),
-        offset,
-        returned: page.length,
-        total: entries.length,
-        hasMore: nextOffset < entries.length,
-        ...(nextOffset < entries.length ? { nextCursor: String(nextOffset) } : {})
-      };
-    }
-    if (action === "read") {
-      const info = await stat(path);
-      const requested =
-        typeof args.maxBytes === "number" ? Math.round(args.maxBytes) : MAX_TEXT_BYTES;
-      const maximum = Math.max(1, Math.min(MAX_TEXT_BYTES, requested));
-      if (!info.isFile() || info.size > maximum) throw new Error("File exceeds the allowed read size.");
-      const contents = await readFile(path);
-      return { content: contents.toString("utf8"), sha256: sha256(contents), bytes: contents.byteLength };
-    }
-    if (action === "write") {
       const content = argumentString(args, "content", MAX_TEXT_BYTES);
       const expected = typeof args.expectedSha256 === "string" ? args.expectedSha256 : undefined;
       if (expected) {
-        const current = await readFile(path);
-        if (sha256(current) !== expected.toLocaleLowerCase()) {
+        const current = await this.fileToolService!.hashFile(brainId, path, signal, { assertCurrent, policyRevision });
+        if (current.sha256 !== expected.toLocaleLowerCase()) {
           throw new Error("File changed since the tool read it; expected checksum does not match.");
         }
       }
-      await atomicWrite(path, content);
+      signal.throwIfAborted(); await assertCurrent();
+      await requireDiskWrite(dirname(path), { operationWriteBytes: Buffer.byteLength(content) * 2 + 65536 });
+      await atomicWrite(path, content, async () => { signal.throwIfAborted(); await assertCurrent(); signal.throwIfAborted(); });
       return { sha256: sha256(content), bytes: Buffer.byteLength(content) };
-    }
-    throw new Error("Unknown system files action.");
   }
 
   private async history(
@@ -1319,42 +1775,69 @@ export class ToolExecutor {
   private async fetch(
     action: string,
     args: Record<string, unknown>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    learningContext?: LearningExecutionContext,
+    brainId?: string,
+    turnId?: string
   ): Promise<unknown> {
     if (action !== "fetch") throw new Error("Unknown web.fetch action.");
-    const url = new URL(argumentString(args, "url", 16_000));
+    const url = new URL(normalizeLearningUrl(argumentString(args, "url", 16_000)));
     const response = await safeFetch(url, {
       signal: AbortSignal.any([
         signal,
         AbortSignal.timeout(boundedTimeout(args.timeoutMs, 120_000))
       ]),
       headers: { Accept: "text/*, application/json;q=0.9" }
-    });
+    }, 5, { beforeRequest: learningContext ? async current => {
+      if (!webUrlWithinScope(current, (await learningContext.policy()).constraints)) throw new Error("This URL is outside the current learning task's web scope.");
+    } : undefined });
     const maximum =
       typeof args.maxBytes === "number"
         ? Math.max(1, Math.min(MAX_WEB_BYTES, Math.round(args.maxBytes)))
         : MAX_WEB_BYTES;
     const contents = await readResponseBounded(response, maximum);
+    const contentType = response.headers.get("content-type") ?? "application/octet-stream";
+    if (learningContext) {
+      const provenance = decideWebSource(url.toString(), new URL(response.url), contentType,
+        publicationFromHtml(contentType.includes("html") ? contents.toString("utf8") : ""), await learningContext.policy());
+      if (provenance.decision !== "admitted") throw new Error(`This fetched source was not admitted under the current learning scope: ${provenance.decision}.`);
+    }
+    const finalUrl = response.url || url.toString();
+    if (["image/png", "image/jpeg", "image/webp", "image/gif"].includes(contentType.toLowerCase().split(";", 1)[0]!.trim())) {
+      const imageReferences = this.webImageService && brainId ? await this.webImageService.register(brainId, turnId, {
+        kind: "image-response", url: finalUrl, sha256: sha256(contents), fetchedAt: new Date().toISOString()
+      }, [{ url: finalUrl, pageUrl: finalUrl }], signal) : [];
+      return { status: response.status, finalUrl, contentType, sha256: sha256(contents), imageReferences,
+        contentWithheld: "binary-image-not-text; explicit inspect-image required for native pixel observation" };
+    }
+    const imageReferences = this.webImageService && brainId && contentType.toLowerCase().includes("html") ? await this.webImageService.register(brainId, turnId, {
+      kind: "html-response", url: finalUrl, sha256: sha256(contents), fetchedAt: new Date().toISOString()
+    }, htmlImageCandidates(contents.toString("utf8"), finalUrl), signal) : [];
     return {
       status: response.status,
       finalUrl: response.url,
-      contentType: response.headers.get("content-type") ?? "application/octet-stream",
+      contentType,
       content: contents.toString("utf8"),
-      sha256: sha256(contents)
+      sha256: sha256(contents),
+      imageReferences
     };
   }
 
   private async search(
     action: string,
     args: Record<string, unknown>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    learningContext?: LearningExecutionContext,
+    brainId?: string,
+    turnId?: string
   ): Promise<unknown> {
     if (action !== "search") throw new Error("Unknown web.search action.");
+    await learningContext?.policy();
     const query = argumentString(args, "query", 4_000);
     const endpoint = process.env.OMNI_SEARXNG_URL?.trim();
     const url = new URL(endpoint || "https://www.bing.com/search");
     url.searchParams.set("q", query);
-    if (endpoint) url.searchParams.set("format", "json");
+    if (endpoint) { url.searchParams.set("format", "json"); if (args.images === true) url.searchParams.set("categories", "images"); }
     else url.searchParams.set("format", "rss");
     const response = await safeFetch(url, {
       signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
@@ -1364,14 +1847,32 @@ export class ToolExecutor {
     const limit =
       typeof args.limit === "number" ? Math.max(1, Math.min(50, Math.round(args.limit))) : 10;
     const raw = (await readResponseBounded(response, 4 * 1024 * 1024)).toString("utf8");
-    if (!endpoint) {
-      return { provider: "public-rss", query, results: parsePublicSearchRss(raw, limit) };
+    const data = endpoint ? JSON.parse(raw) as { results?: unknown[] } : undefined;
+    let results: unknown[] = endpoint ? Array.isArray(data?.results) ? data.results.slice(0, limit) : [] : parsePublicSearchRss(raw, limit);
+    let excludedResults = 0;
+    if (learningContext) {
+      const policy = await learningContext.policy();
+      results = results.flatMap(value => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) { excludedResults++; return []; }
+        const row = value as Record<string, unknown>;
+        let target: URL; try { target = new URL(normalizeLearningUrl(row.url ?? row.link)); } catch { excludedResults++; return []; }
+        const provenance = decideWebSource(target.toString(), target, "", publicationFromHtml(""), policy);
+        if (provenance.decision === "excluded-domain") { excludedResults++; return []; }
+        // Search snippets do not establish the publisher's publication date.
+        // Keep a scoped navigation reference, not undated training content.
+        return provenance.decision === "unknown-date" ? [{ url: target.toString(), publication: provenance.publication,
+          contentWithheld: "publication-date-unverified" }] : [row];
+      });
     }
-    const data = JSON.parse(raw) as { results?: unknown[] };
+    const imageReferences = this.webImageService && brainId ? await this.webImageService.register(brainId, turnId, {
+      kind: "search-response", url: response.url || url.toString(), sha256: sha256(Buffer.from(raw)), fetchedAt: new Date().toISOString()
+    }, searchImageCandidates(results), signal) : [];
     return {
-      provider: "searxng",
+      provider: endpoint ? "searxng" : "public-rss",
       query,
-      results: Array.isArray(data.results) ? data.results.slice(0, limit) : []
+      results,
+      imageReferences,
+      ...(learningContext ? { excludedResults } : {})
     };
   }
 
@@ -1379,13 +1880,15 @@ export class ToolExecutor {
     brainId: string,
     action: string,
     args: Record<string, unknown>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    learningContext?: LearningExecutionContext
   ): Promise<unknown> {
     if (!["task", "open"].includes(action)) {
       throw new Error("Browser automation supports task or open.");
     }
     const requested = new URL(argumentString(args, "url", 16_000));
     await assertSafeRemoteUrl(requested);
+    if (learningContext && !webUrlWithinScope(requested, (await learningContext.policy()).constraints)) throw new Error("Browser URL is outside this learning task's scope.");
     const steps: Array<Record<string, unknown>> = [];
     if (args.steps !== undefined) {
       if (!Array.isArray(args.steps) || args.steps.length > 200) {
@@ -1495,7 +1998,10 @@ export class ToolExecutor {
         url.protocol === "wss:"
           ? new URL(`https://${url.host}${url.pathname}${url.search}`)
           : url;
-      void assertSafeRemoteUrl(validation).then(
+      void (async () => {
+        await assertSafeRemoteUrl(validation);
+        if (learningContext && !webUrlWithinScope(validation, (await learningContext.policy()).constraints)) throw new Error("Browser request is outside this learning task's scope.");
+      })().then(
         () => callback({ cancel: false }),
         () => callback({ cancel: true })
       );
@@ -1533,12 +2039,23 @@ export class ToolExecutor {
     };
     const selector = (step: Record<string, unknown>): string =>
       argumentString(step, "selector", 2_000);
+    const assertScopedPage = async (): Promise<void> => {
+      if (!learningContext) return;
+      const current = new URL(browser.webContents.getURL());
+      const declarations = await browser.webContents.executeJavaScript(`(() =>
+        Array.from(document.querySelectorAll('meta, script[type="application/ld+json"]'))
+          .map(node => node.outerHTML).join('\\n').slice(0, 1048576))()`, true) as unknown;
+      const provenance = decideWebSource(requested.href, current, "text/html",
+        publicationFromHtml(typeof declarations === "string" ? declarations : ""), await learningContext.policy());
+      if (provenance.decision !== "admitted") throw new Error(`Browser page was not admitted under the current learning scope: ${provenance.decision}.`);
+    };
     const pageSnapshot = async (): Promise<{
       title: string;
       text: string;
       links: Array<{ label: string; href: string }>;
-    }> =>
-      browser.webContents.executeJavaScript(
+    }> => {
+      await assertScopedPage();
+      return browser.webContents.executeJavaScript(
         `(() => ({
           title: document.title.slice(0, 1000),
           text: (document.body?.innerText || "").slice(0, 200000),
@@ -1553,19 +2070,23 @@ export class ToolExecutor {
         text: string;
         links: Array<{ label: string; href: string }>;
       }>;
+    };
     try {
       assertToolActive(signal);
       await browser.loadURL(requested.href);
       assertToolActive(signal);
+      await assertScopedPage();
       const stepResults: unknown[] = [];
       let finalScreenshotPath: string | undefined;
       for (const [index, step] of steps.entries()) {
         assertToolActive(signal);
+        await assertScopedPage();
         const kind = argumentString(step, "kind", 32).toLocaleLowerCase();
         if (kind === "navigate") {
           const destination = new URL(argumentString(step, "url", 16_000));
           await assertSafeRemoteUrl(destination);
           await browser.loadURL(destination.href);
+          await assertScopedPage();
           stepResults.push({ index, kind, finalUrl: browser.webContents.getURL() });
           continue;
         }

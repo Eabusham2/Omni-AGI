@@ -773,6 +773,11 @@ def due_rehearsal_phase(
 def eligible_ground_up_rehearsal(brain: Any) -> bool:
     """Authenticate the project curriculum before ordinary-training replay."""
 
+    if getattr(brain, "_connected_regions", None) is not None:
+        inherited = getattr(brain, "_inherited_capability_curriculum", None)
+        return bool(brain._can_retain_native_action_policy()
+            and isinstance(inherited, Mapping)
+            and resolve_ground_up_curriculum_manifest(inherited.get("curriculum")) is not None)
     manifest = getattr(brain, "ground_up_training_manifest", None)
     expected = resolve_ground_up_curriculum_manifest(manifest)
     if not isinstance(manifest, Mapping):
@@ -1780,24 +1785,6 @@ def rehearse_public_capability_routes(
     }
 
 
-@torch.no_grad()
-def _reset_action_heads_from_ground_up_seed(brain: Any) -> None:
-    """Recover a catastrophically collapsed head without imported weights."""
-
-    devices = [brain.device] if brain.device.type == "cuda" else []
-    with torch.random.fork_rng(devices=devices):
-        torch.manual_seed(int(brain.config.seed) + 0x0A71C0)
-        for head in (
-            brain.decoder.action_policy,
-            brain.decoder.internal_action_policy,
-        ):
-            head.norm.scale.fill_(1.0)
-            for layer in (head.hidden, head.projection):
-                nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    layer.bias.zero_()
-
-
 def rehearse_capabilities(
     brain: Any,
     *,
@@ -1806,265 +1793,213 @@ def rehearse_capabilities(
     policy: CapabilityRehearsalPolicy,
     baseline_minimum_probability: float = 0.0,
 ) -> Dict[str, Any]:
-    """Apply one rank-zero/single-device curriculum transaction and gate it."""
+    """Bounded declared head replay; decline regressions without a chat quiz.
 
+    The feature-producing cortex and ordinary experience/substrate are not
+    trained by this maintenance transaction. Only the native action, route and
+    argument owners change. Failed candidates restore the exact current owners,
+    not the original seed or an older brain checkpoint.
+    """
     if phase not in {"start", "middle", "final"}:
         raise ValueError("capability rehearsal phase is invalid")
     policy.validate()
+    if getattr(brain, "_connected_regions", None) is not None:
+        from .connected_capabilities import rehearse_inherited_capabilities
+        return rehearse_inherited_capabilities(brain, phase=phase,
+            committed_global_waves=committed_global_waves, policy=policy)
     curriculum = resolve_ground_up_curriculum_manifest(
         getattr(brain, "ground_up_training_manifest", None)
     )
-    if (
-        brain.config.origin_kind != "ground-up"
-        or curriculum is None
-    ):
+    if brain.config.origin_kind != "ground-up" or curriculum is None:
         raise RuntimeError("capability rehearsal requires a locally initialized OmniCortex native core")
-    v3_protocol = int(curriculum.get("formatVersion", 0)) >= 3
-    before = probe_capabilities(brain)
-    from . import vsa as vsa_module
+    baseline = float(baseline_minimum_probability)
+    if not math.isfinite(baseline) or not 0.0 <= baseline <= 1.0:
+        raise ValueError("capability rehearsal baseline is invalid")
 
-    original_now = vsa_module._now
-    logical_time = 1_710_000_000.0 + float(max(0, committed_global_waves)) / 1_000_000.0
-    records_visited = 0
+    from contextlib import nullcontext
+    from .connected_capabilities import _samples, _measure
+    from .persistence import tensor_checksum
+
+    names = ("action_policy", "internal_action_policy", "tool_route_head", "action_argument_head")
+    heads = {name: getattr(brain.decoder, name) for name in names}
+    protected: Dict[str, str] = {}
+    if int(getattr(heads["tool_route_head"], "experience_updates", 0)) > 0:
+        protected["tool_route_head"] = "independent-experience-route-learning"
+    argument_owner = heads["action_argument_head"]
+    grounded_routes = getattr(argument_owner, "grounded_route_updates", None)
+    if (int(getattr(argument_owner, "grounded_steps", 0)) > 0
+            or (isinstance(grounded_routes, torch.Tensor) and bool((grounded_routes > 0).any()))):
+        protected["action_argument_head"] = "confirmed-grounded-argument-learning"
+    active_heads = {name: head for name, head in heads.items() if name not in protected}
+    if any(tuple(head.parameters()) for head in heads.values()):
+        raise RuntimeError("native capability replay cannot introduce floating learned head parameters")
+    from .capability_rollback import CapabilityRollbackSnapshot
+    snapshot = CapabilityRollbackSnapshot(brain, heads, label="native capability retention transaction")
+    restored = False
+
+    @torch.no_grad()
+    def retention_rows(samples) -> Dict[str, Any]:
+        language, internal, targets, routes, route_targets, arguments = samples
+        action_logits = 0.35 * heads["action_policy"](language) + 0.65 * heads["internal_action_policy"](internal)
+        route_logits = heads["tool_route_head"].forward_internal(routes)
+        return {
+            "actionCorrect": action_logits.argmax(-1).eq(targets).tolist(),
+            "routeCorrect": route_logits.argmax(-1).eq(route_targets).tolist(),
+            "actionTargetProbabilities": action_logits.softmax(-1).gather(1, targets[:, None]).flatten().tolist(),
+            "routeTargetProbabilities": route_logits.softmax(-1).gather(1, route_targets[:, None]).flatten().tolist(),
+            "argumentLosses": [float(heads["action_argument_head"].supervised_loss(*row)) for row in arguments],
+        }
+
+    def restore() -> None:
+        nonlocal restored
+        snapshot.restore()
+        restored = True
+
     try:
-        vsa_module._now = lambda: logical_time
-        for trajectory in GROUND_UP_TOOL_TRAJECTORIES:
-            experience = json.dumps(
-                {
-                    "capability": {
-                        "id": trajectory["toolId"],
-                        "action": trajectory["action"],
-                    },
-                    "arguments": trajectory["arguments"],
-                    "outcome": trajectory["outcome"],
-                    "utterance": trajectory["utterance"],
-                    "visibleResult": trajectory["result"],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            brain.memory.learn(
-                experience,
-                kind="ground-up-capability-rehearsal",
-                source="project-authored-capability-curriculum",
-                source_label="omni-ground-up-capability-rehearsal",
-                retain_source_text=False,
-                importance=0.84,
-            )
-            records_visited += 1
-        for negative in GROUND_UP_TOOL_NEGATIVE_EXAMPLES:
-            brain.memory.learn(
-                json.dumps(
-                    {
-                        "noAction": negative["utterance"],
-                        "reason": negative["reason"],
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                kind="ground-up-capability-negative-rehearsal",
-                source="project-authored-capability-curriculum",
-                source_label="omni-ground-up-capability-rehearsal",
-                retain_source_text=False,
-                importance=0.76,
-            )
-            records_visited += 1
-        action_reinitialized = False
-        reinitialization_calibration: Optional[Dict[str, Any]] = None
-        action_head_snapshot = {
-            "language": copy.deepcopy(
-                brain.decoder.action_policy.state_dict()
-            ),
-            "internal": copy.deepcopy(
-                brain.decoder.internal_action_policy.state_dict()
-            ),
+        for head in heads.values():
+            head.eval()
+        samples = _samples(brain)
+        before = _measure(brain, samples)
+        before_rows = retention_rows(samples)
+        before_checksum = snapshot.before_checksum
+        language, internal, targets, routes, route_targets, arguments = samples
+        budget = min(32, int(policy.maximum_action_steps))
+        argument_steps = 0
+        last_losses: Dict[str, float] = {}
+        pager_method = getattr(brain.decoder, "_working_pager", None)
+        pager = pager_method() if callable(pager_method) else None
+        scratch = sum(int(getattr(module, "logical_ternary_parameter_count", 0))
+            for head in active_heads.values() for module in head.modules())
+        for step in range(budget):
+            boundary = getattr(brain, "_check_neural_learning_boundary", None)
+            if callable(boundary):
+                boundary("declared-capability-replay")
+            for name, head in heads.items():
+                # Generic placeholders are not evidence for replacing real
+                # private routes/values. This read-only mode lasts only for
+                # maintenance; ordinary confirmed/schema learning is unchanged.
+                head.train(name not in protected)
+            if pager is not None:
+                # A packed logical step holds bounded transient derivatives,
+                # never a persistent floating learned weight master.
+                feature_bytes = sum(value.numel() * value.element_size()
+                    for value in (language, internal, targets, routes, route_targets))
+                pager.admit_compute(scratch * 5 + feature_bytes * 4 + 8192,
+                    "declared capability packed-gradient transaction", device=brain.device)
+            with pager.activate() if pager is not None else nullcontext():
+                action_loss = 0.5 * (F.cross_entropy(heads["action_policy"](language), targets)
+                    + F.cross_entropy(heads["internal_action_policy"](internal), targets))
+                route_loss = F.cross_entropy(heads["tool_route_head"].forward_internal(routes), route_targets)
+                terms = [action_loss]
+                if "tool_route_head" not in protected:
+                    terms.append(route_loss)
+                if arguments and "action_argument_head" not in protected:
+                    terms.append(heads["action_argument_head"].supervised_loss(*arguments[step % len(arguments)]))
+                    argument_steps += 1
+                loss = torch.stack(terms).mean()
+                if not bool(torch.isfinite(loss)):
+                    raise RuntimeError("non-finite declared capability replay loss")
+                with packed_online_step(tuple(active_heads.values()), max_scratch_synapses=max(1, scratch)):
+                    loss.backward()
+                last_losses = {"actionLoss": float(action_loss.detach()),
+                    "routeLoss": float(route_loss.detach()), "jointLoss": float(loss.detach())}
+        for head in heads.values():
+            head.eval()
+        candidate = _measure(brain, samples)
+        candidate_rows = retention_rows(samples)
+        candidate_checksum = tensor_checksum(value for head in heads.values() for value in head.state_dict().values())
+        local_retention = (all(candidate[key] <= before[key] + max(1e-7, before[key] * policy.regression_tolerance)
+                for key in ("actionLoss", "routeLoss", "argumentLoss"))
+            and candidate["correctActions"] >= before["correctActions"]
+            and candidate["correctRoutes"] >= before["correctRoutes"]
+            and candidate["minimumExpectedProbability"] >= before["minimumExpectedProbability"] - policy.regression_tolerance)
+        # Counts alone could exchange one retained route for a newly learned
+        # route. Bind the floor to each declared record as well.
+        local_retention = local_retention and all(
+            not old or new for key in ("actionCorrect", "routeCorrect")
+            for old, new in zip(before_rows[key], candidate_rows[key]))
+        local_retention = local_retention and all(
+            new >= old - policy.regression_tolerance
+            for key in ("actionTargetProbabilities", "routeTargetProbabilities")
+            for old, new in zip(before_rows[key], candidate_rows[key]))
+        local_retention = local_retention and all(new <= old + max(1e-7, old * policy.regression_tolerance)
+            for old, new in zip(before_rows["argumentLosses"], candidate_rows["argumentLosses"]))
+        candidate_baseline_ok = (phase != "final" or baseline <= 0.0
+            or candidate["minimumExpectedProbability"] >= baseline - policy.regression_tolerance)
+        if not local_retention or not candidate_baseline_ok:
+            restore()
+        after = before if restored else candidate
+        if not restored:
+            with torch.no_grad():
+                if "tool_route_head" not in protected:
+                    heads["tool_route_head"].internal_training_steps.add_(budget)
+                if "action_argument_head" not in protected:
+                    heads["action_argument_head"].training_steps.add_(argument_steps)
+            brain.counters["training_steps"] = int(brain.counters.get("training_steps", 0)) + budget
+            # Only replay owners are drained: unrelated learning events retain
+            # their accounting and ordinary memory dynamics.
+            events = sum(int(module.drain_packed_stability_events())
+                for head in active_heads.values() for module in head.modules()
+                if callable(getattr(module, "drain_packed_stability_events", None)))
+            brain.counters["metaplastic_updates"] = int(brain.counters.get("metaplastic_updates", 0)) + events
+        brain.counters["action_retention_checks"] = int(brain.counters.get("action_retention_checks", 0)) + 1
+        brain.counters["action_retention_replays"] = int(brain.counters.get("action_retention_replays", 0)) + (0 if restored else budget)
+        after_checksum = tensor_checksum(value for head in heads.values() for value in head.state_dict().values())
+        if restored and after_checksum != before_checksum:
+            raise RuntimeError("native capability rollback did not restore exact owner state")
+        baseline_after_ok = (phase != "final" or baseline <= 0.0
+            or after["minimumExpectedProbability"] >= baseline - policy.regression_tolerance)
+        receipt = {
+            "format": REHEARSAL_FORMAT, "formatVersion": 3, "phase": phase,
+            "committedGlobalWaves": max(0, int(committed_global_waves)), "appliedRank": 0,
+            "curriculumId": curriculum["id"], "curriculumSha256": curriculum["sha256"],
+            "trainingProtocol": GROUND_UP_V3_TRAINING_PROTOCOL_ID,
+            "trainingDataSha256": _canonical_sha256({"actions": GROUND_UP_ACTION_EXAMPLES,
+                "trajectories": GROUND_UP_TOOL_TRAJECTORIES, "negatives": GROUND_UP_TOOL_NEGATIVE_EXAMPLES}),
+            "recordsVisited": len(GROUND_UP_ACTION_EXAMPLES) + len(GROUND_UP_TOOL_TRAJECTORIES) + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES),
+            "expectedRecords": len(GROUND_UP_ACTION_EXAMPLES) + len(GROUND_UP_TOOL_TRAJECTORIES) + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES),
+            "before": before, "candidate": candidate, "after": after,
+            "beforePerRecord": before_rows, "candidatePerRecord": candidate_rows,
+            "ownerChecksumBefore": before_checksum, "ownerChecksumCandidate": candidate_checksum,
+            "ownerChecksumAfter": after_checksum, "rollbackVerified": restored,
+            "candidateAccepted": not restored, "candidateRetentionPassed": local_retention,
+            "candidateBaselineRetentionPassed": candidate_baseline_ok,
+            "regressionGatePassed": baseline_after_ok,
+            "regressionGateBasis": "declared-measurements-and-exact-current-owner-rollback",
+            "baselineMinimumExpectedProbability": baseline,
+            "baselineRetentionMet": baseline_after_ok, "regressionTolerance": policy.regression_tolerance,
+            "action": {"mode": "bounded-declared-native-head-replay", "steps": 0 if restored else budget,
+                "attemptedSteps": budget, "applied": not restored and candidate_checksum != before_checksum, "rolledBack": restored,
+                "calibrationClaimed": False, "lastTrainingLosses": last_losses},
+            "updatedOwners": list(active_heads) if not restored else [],
+            "candidateOwners": list(active_heads), "measuredOwners": list(names), "protectedOwners": protected,
+            "ownerProtectionScope": "generic-maintenance-replay-only",
+            "ordinarySchemaAndExperienceLearningChanged": False,
+            "parameterSteps": 0 if restored else budget,
+            "argumentStepsAttempted": argument_steps,
+            "argumentCoverage": {"declaredRecords": len(GROUND_UP_TOOL_TRAJECTORIES),
+                "eligibleRecords": len(arguments), "visitedRecords": min(argument_steps, len(arguments)),
+                "deferredRecords": len(GROUND_UP_TOOL_TRAJECTORIES) - min(argument_steps, len(arguments)),
+                "maximumEncodedBytes": int(brain.config.max_seq_len)},
+            "detachedCorticalFeatures": True, "corticalLanguageTrainingApplied": False,
+            "episodicMemoryRecordsAdded": 0, "ordinaryExperienceLearningChanged": False,
+            "actionHeadReinitializedFromGroundUpSeed": False,
+            "initialCurriculumRerun": False, "readinessProbeExecuted": False,
+            "readinessProbesAreOptimizerInputs": False, "capabilityOutcomeVerified": False,
+            "executedActions": False, "permissionChanges": False,
+            "sameBrain": True, "systemPrompt": False, "toolDescriptionProse": False,
+            "preferenceLabels": False, "rewardModel": False, "rlhf": False,
         }
-        slow_anchor_snapshot = {
-            name: value.detach().clone()
-            for name, value in brain.slow_anchors.items()
-        }
-        slow_importance_snapshot = {
-            name: value.detach().clone()
-            for name, value in brain.slow_importance.items()
-        }
-        counter_snapshot = dict(brain.counters)
-        try:
-            public_routes = _rehearse_probe_action_routes(
-                brain,
-                maximum_steps=policy.maximum_action_steps,
-                minimum_steps=policy.minimum_action_steps,
-                declared_training_only=v3_protocol,
-            )
-        except RuntimeError:
-            # A late corpus should normally need only a brief rehearsal. A
-            # completely collapsed head has a symmetric zero-gradient saddle;
-            # restore the failed attempt, recover it from the brain's own
-            # recorded random seed, and train again from scratch. Both attempts
-            # consume only canonicalized detached fixture features; the real
-            # unrounded deployed route remains the final readiness gate.
-            brain.decoder.action_policy.load_state_dict(
-                action_head_snapshot["language"]
-            )
-            brain.decoder.internal_action_policy.load_state_dict(
-                action_head_snapshot["internal"]
-            )
-            brain.slow_anchors = slow_anchor_snapshot
-            brain.slow_importance = slow_importance_snapshot
-            brain.counters.update(counter_snapshot)
-            _reset_action_heads_from_ground_up_seed(brain)
-            action_reinitialized = True
-            # V3 route rehearsal deliberately keeps an already calibrated
-            # language head fixed.  A catastrophic reset must therefore
-            # replay the declared 35-action calibration first, exactly as a
-            # new Build does, before internal/tool-route specialization.
-            reinitialization_calibration = (
-                brain._train_starter_action_policy()
-            )
-            public_routes = _rehearse_probe_action_routes(
-                brain,
-                maximum_steps=max(384, policy.maximum_action_steps * 2),
-                minimum_steps=max(16, policy.minimum_action_steps),
-                declared_training_only=v3_protocol,
-            )
-        public_probe = public_routes["probe"]
-        reinitialization_steps = int(
-            (reinitialization_calibration or {}).get("steps", 0)
-        )
-        public_route_steps = int(public_routes.get("steps", 0))
-        action = {
-            "mode": "canonicalized-joint-structural-action-replay",
-            "calibrated": bool(
-                public_routes.get("canonicalReplayReady", False)
-                and public_probe.get("passed", False)
-            ),
-            "rolledBack": False,
-            "steps": reinitialization_steps + public_route_steps,
-            "attemptedSteps": reinitialization_steps + public_route_steps,
-            "applied": reinitialization_steps + public_route_steps > 0,
-            "canonicalReinitializationSteps": reinitialization_steps,
-            "publicRouteSteps": public_route_steps,
-            "canonicalActionRecordsReplayed": (
-                len(GROUND_UP_ACTION_EXAMPLES)
-                if reinitialization_calibration is not None
-                else 0
-            ),
-            "canonicalReplayReady": bool(
-                public_routes.get("canonicalReplayReady", False)
-            ),
-            "canonicalReplayMetrics": dict(
-                public_probe.get("canonicalReplayMetrics", {})
-            ),
-            "realUnroundedProbePassed": bool(public_probe.get("passed", False)),
-            "preferenceLabels": False,
-            "rewardModel": False,
-            "rlhf": False,
-        }
-        imagination = (
-            {
-                "trainingApplied": False,
-                "trainingRecords": 0,
-                "parametersChanged": False,
-                "source": "selected-user-data-only",
-            }
-            if v3_protocol
-            else _rehearse_imagination_selector(
-                brain, policy.maximum_imagination_steps
-            )
-        )
-        cleared_main_optimizer_states = 0
-        for parameter in (
-            *brain.decoder.action_policy.parameters(),
-            *brain.decoder.internal_action_policy.parameters(),
-        ):
-            if parameter in brain._optimizer.state:
-                brain._optimizer.state.pop(parameter)
-                cleared_main_optimizer_states += 1
-        brain.counters["action_retention_checks"] += 1
-        brain.counters["action_retention_replays"] += int(
-            action.get("steps", 0)
-        )
+        receipt["contentSha256"] = _canonical_sha256(receipt)
+        return receipt
+    except BaseException:
+        restore()
+        raise
     finally:
-        vsa_module._now = original_now
-    after = probe_capabilities(brain)
-    baseline = max(0.0, float(baseline_minimum_probability))
-    probability_regression_ok = (
-        phase != "final"
-        or baseline <= 0.0
-        or float(after["minimumExpectedProbability"])
-        >= baseline - policy.regression_tolerance
-    )
-    # A deterministic seed reset intentionally replaces a catastrophically
-    # destroyed head, so its raw softmax calibration is not comparable with
-    # the lost checkpoint. In that exceptional path, require the stronger
-    # complete structural/canonical readiness gate rather than pretending a
-    # numerically similar probability proves retention.
-    structural_reset_regression_ok = bool(
-        action_reinitialized
-        and after.get("passed") is True
-        and action.get("calibrated") is True
-    )
-    regression_ok = bool(
-        probability_regression_ok or structural_reset_regression_ok
-    )
-    if not bool(after["passed"]) or not bool(action.get("calibrated")) or not regression_ok:
-        raise RuntimeError("capability retention gate rejected promotion")
-    receipt = {
-        "format": REHEARSAL_FORMAT,
-        "formatVersion": 2 if v3_protocol else REHEARSAL_VERSION,
-        "phase": phase,
-        "committedGlobalWaves": max(0, int(committed_global_waves)),
-        "appliedRank": 0,
-        "recordsVisited": records_visited,
-        "expectedRecords": len(GROUND_UP_TOOL_TRAJECTORIES)
-        + len(GROUND_UP_TOOL_NEGATIVE_EXAMPLES),
-        "curriculumId": curriculum["id"],
-        "curriculumSha256": curriculum["sha256"],
-        "probeSha256": _canonical_sha256(
-            [probe.__dict__ for probe in capability_probes()]
-        ),
-        **(
-            {
-                "symbolicReadinessProbeSha256": (
-                    GROUND_UP_READINESS_PROBE_FIXTURES_SHA256
-                ),
-                "readinessProbesAreOptimizerInputs": False,
-            }
-            if v3_protocol
-            else {}
-        ),
-        "before": before,
-        "after": after,
-        "action": action,
-        "publicRoutes": public_routes,
-        "mainOptimizerHeadStatesCleared": cleared_main_optimizer_states,
-        "actionHeadReinitializedFromGroundUpSeed": action_reinitialized,
-        "imagination": imagination,
-        **(
-            {"imaginationSelectorTraining": False}
-            if v3_protocol
-            else {}
-        ),
-        "baselineMinimumExpectedProbability": baseline,
-        "regressionTolerance": policy.regression_tolerance,
-        "regressionGatePassed": regression_ok,
-        "regressionGateBasis": (
-            "complete-structural-readiness-after-deterministic-seed-reset"
-            if structural_reset_regression_ok
-            and not probability_regression_ok
-            else "minimum-expected-probability"
-        ),
-        "sameBrain": True,
-        "systemPrompt": False,
-        "toolDescriptionProse": False,
-        "preferenceLabels": False,
-        "rewardModel": False,
-        "rlhf": False,
-    }
-    receipt["contentSha256"] = _canonical_sha256(receipt)
-    return receipt
-
+        try:
+            snapshot.restore_modes()
+        finally:
+            snapshot.close()
 
 def advance_schedule_state(
     state: CapabilityScheduleState,

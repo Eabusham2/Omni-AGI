@@ -7,21 +7,21 @@ from pathlib import Path
 
 from omni_core.config import OmniConfig
 from omni_core.native_architecture import (
-    native_architecture_sha256, native_core_inventory, validate_native_architecture,
+    native_architecture_sha256, native_core_inventory, packed_learning_scratch_bytes, validate_native_architecture,
 )
 from omni_core.native_compute_profile import profile_native_projection_compute
 from worker import Worker, RpcFault
 
 
-def fixture_descriptor():
+def fixture_descriptor(version=2):
     shape = {"dModel": 64, "layers": 2, "feedForward": 192, "nHeads": 4,
              "vsaDimensions": 256, "routerNeurons": 64, "modalityChannels": 16,
              "imageSize": 16, "audioSamples": 256, "videoFrames": 4,
              "workingMemoryItems": 32768, "workspaceLatents": 8192,
              "vocabSize": 261, "liquidMode": "cfc"}
-    value = {"format": "omni-main-selected-native-architecture", "formatVersion": 1,
+    value = {"format": "omni-main-selected-native-architecture", "formatVersion": version,
              "architecture": "OmniCortex", "externalPretrainedWeights": False,
-             "hardwareTier": "personal", "shape": shape, "inventory": native_core_inventory(shape),
+             "hardwareTier": "personal", "shape": shape, "inventory": native_core_inventory(shape, inventory_version=version),
              "sizing": {"policy": "fixture", "selectedSystemRamBudgetBytes": 8589934592},
              "qualityEvidence": "unmeasured-native-quality-deferred"}
     value["sha256"] = native_architecture_sha256(value)
@@ -68,9 +68,31 @@ class NativeArchitectureMathTests(unittest.TestCase):
         self.assertEqual(ltc["logicalParameters"] - expected, -d * d + 2 * d)
 
     def test_hash_matches_mirrored_node_fixture(self):
-        descriptor = fixture_descriptor()
+        descriptor = fixture_descriptor(1)
         self.assertEqual(descriptor["sha256"], "7caef23bd630bb834fe0c03bad59472466ebe4814e423060b872f1cb9e9dc7a2")
         self.assertEqual(validate_native_architecture(descriptor), descriptor)
+        current = fixture_descriptor(2)
+        self.assertEqual(current["sha256"], "461e65e7b9289a1a5a3803c44bd6cc29b7ebe170f9f64c02e56caf25ae76128d")
+        self.assertEqual(validate_native_architecture(current), current)
+
+    def test_weighted_state_counts_include_biases_but_do_not_invent_synapses(self):
+        descriptor = fixture_descriptor()
+        old = native_core_inventory(descriptor["shape"], inventory_version=1)
+        counts = descriptor["inventory"]
+        self.assertEqual(counts["connectionStateBytes"], 1301695)
+        self.assertEqual(counts["packedLearnedStateBytes"], 1627149)
+        self.assertEqual(counts["maximumProjectionBytes"], 663564)
+        self.assertEqual(counts["maximumUpdateScratchBytes"], 17825792)
+        self.assertEqual(counts["logicalParameters"], old["logicalParameters"])
+        self.assertEqual(counts["packedWeightBytes"], old["packedWeightBytes"])
+        self.assertEqual(counts["parallelTopologyControlBytes"], 832)
+        self.assertEqual(counts["staticNonweightTensorBytes"], old["staticNonweightTensorBytes"] + 832)
+        self.assertEqual(packed_learning_scratch_bytes(80, 17), 64 * 20 * 256)
+        forged = copy.deepcopy(descriptor)
+        forged["formatVersion"] = 1
+        forged["sha256"] = native_architecture_sha256(forged)
+        with self.assertRaisesRegex(ValueError, "inventory"):
+            validate_native_architecture(forged)
 
     def test_main_shape_persists_and_renderer_descriptor_is_rejected(self):
         descriptor = fixture_descriptor()

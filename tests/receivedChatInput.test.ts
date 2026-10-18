@@ -19,6 +19,10 @@ const human = { id: receipt.humanMessageId, role: "human", content: input, turn_
 afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
 
 describe("durable received input is distinct from a reply", () => {
+  it("accepts the genuine initial attention epoch zero while rejecting negative epochs", () => {
+    expect(receivedChatInput({ ...receipt, attentionEpoch: 0 }, { turnId, input }).inputReceipt.attentionEpoch).toBe(0);
+    expect(() => receivedChatInput({ ...receipt, attentionEpoch: -1 }, { turnId, input })).toThrow();
+  });
   it("renders exactly the received human entry without a reply/trace/inference or model-facing synthetic message", () => {
     const value = receivedChatInput(receipt, { turnId, input });
     expect(value.humanMessage).toMatchObject({ id: receipt.humanMessageId, content: input, role: "human", inputReceipt: receipt });
@@ -72,6 +76,21 @@ describe("durable received input is distinct from a reply", () => {
     expect(presentation.humanMessage.generationEnd).toBeUndefined(); // original input never acquires reply disposition
     expect(() => validateWorkerChatPresentation({ ...value, trace: { ...value.trace, input_accepted_before_reply: false } },
       { turnId, input, inputSha256: receipt.inputSha256, response: "" })).toThrow("no-reply");
+  });
+  it("binds an inherited reply to the exact adopted human without rewriting its original turn or epoch", () => {
+    const rootTurn = "ancestral-root-turn", checksum = "e".repeat(64);
+    const alias = { humanMessageId: human.id, originalTurnId: turnId, attentionEpoch: 1, inputSha256: receipt.inputSha256 };
+    const value = { text: "Reply", turnCommitted: true, idempotentCompletion: false, inheritedInputAlias: alias, humanMessage: human,
+      message: { id: "reply", role: "brain", content: "Reply", turn_id: rootTurn, created_at: createdAt, attention_epoch: 3 },
+      trace: { id: "trace", input_sha256: receipt.inputSha256, turn_id: rootTurn, created_at: createdAt, attention_epoch: 3, parameter_checksum_after: checksum },
+      turnReceipt: { format: "omni-completed-chat-turn", formatVersion: 1, turnId: rootTurn, inputSha256: receipt.inputSha256,
+        humanMessageId: human.id, brainMessageId: "reply", traceId: "trace", inferenceCount: 10, parameterChecksumAfter: checksum, committedAt: createdAt } };
+    const expected = { turnId: rootTurn, input, inputSha256: receipt.inputSha256, response: "Reply", inheritedInputAlias: alias };
+    const presentation = validateWorkerChatPresentation(value, expected)!;
+    expect(presentation.humanMessage).toMatchObject({ id: human.id, turnId, attentionEpoch: 1 });
+    expect(presentation.brainMessage).toMatchObject({ turnId: rootTurn, attentionEpoch: 3 });
+    expect(() => validateWorkerChatPresentation(value, { ...expected, inheritedInputAlias: undefined })).toThrow();
+    expect(() => validateWorkerChatPresentation({ ...value, inheritedInputAlias: { ...alias, humanMessageId: "another-human" } }, expected)).toThrow(/adopted/);
   });
 });
 

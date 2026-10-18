@@ -25,13 +25,15 @@ def fixture():
         "modalityChannels": config.modality_channels, "imageSize": config.image_size, "audioSamples": config.audio_samples,
         "videoFrames": config.video_frames, "workingMemoryItems": 128, "workspaceLatents": 32,
         "vocabSize": config.vocab_size, "liquidMode": config.liquid_mode}
-    descriptor = {"format": "omni-main-selected-native-architecture", "formatVersion": 1,
+    descriptor = {"format": "omni-main-selected-native-architecture", "formatVersion": 2,
         "architecture": "OmniCortex", "externalPretrainedWeights": False, "hardwareTier": "micro",
         "shape": shape, "inventory": native_core_inventory(shape), "sizing": {"policy": "fixture"},
         "qualityEvidence": "unmeasured-native-quality-deferred"}
     descriptor["sha256"] = native_architecture_sha256(descriptor)
     config.native_architecture = descriptor
     brain = AdaptiveBrain.__new__(AdaptiveBrain)
+    brain.brain_id = "runtime-resource-fixture"
+    brain.device = torch.device("cpu")
     brain.config, brain.engine_path = config, Path("/fixture")
     rotary = SimpleNamespace(configure_max_seq_len=Mock())
     brain.decoder = SimpleNamespace(blocks=[SimpleNamespace(attention=SimpleNamespace(rotary=rotary))])
@@ -47,6 +49,7 @@ def fixture():
     brain.paged_working_memory = SimpleNamespace(policy=brain.resource_policy)
     brain._configure_working_attention_resources = Mock()
     brain.core_pager = SimpleNamespace(refresh_budget=Mock())
+    brain.router_state_pager = SimpleNamespace(status=lambda: {"cpuHeapBytes": 0, "mappedHotRetainedBytesEstimate": 0})
     brain._optimizer = object()
     brain._replace_optimizer = Mock(side_effect=AssertionError("runtime resources must not rebuild the optimizer"))
     brain.population_controls_from_config = Mock()
@@ -61,7 +64,7 @@ class RuntimeSettingsShapeFixtures(unittest.TestCase):
     def test_stale_auto_extended_item_derivation_does_not_resize_learned_tables(self):
         brain, descriptor, rotary = fixture()
         before_optimizer, before_descriptor = brain._optimizer, brain.config.native_architecture
-        with patch("omni_core.brain.ResourcePolicy", side_effect=lambda *args, **kwargs: SimpleNamespace(**kwargs)):
+        with patch("omni_core.brain.ResourcePolicy", side_effect=lambda *args, **kwargs: SimpleNamespace(**kwargs, require_disk=Mock())):
             result = brain.update_config({"workingMemorySlots": 65_536, "contextWindowTokens": 64,
                 "workingMemoryMode": "extended", "extendedWorkingMemory": True,
                 "systemRamMode": "manual", "systemRamSharePercent": 54,
@@ -85,7 +88,7 @@ class RuntimeSettingsShapeFixtures(unittest.TestCase):
     def test_pool_only_update_rebinds_policy_and_context_allowance(self):
         brain, _, _ = fixture()
         original_policy = brain.resource_policy
-        with patch("omni_core.brain.ResourcePolicy", side_effect=lambda *args, **kwargs: SimpleNamespace(**kwargs)):
+        with patch("omni_core.brain.ResourcePolicy", side_effect=lambda *args, **kwargs: SimpleNamespace(**kwargs, require_disk=Mock())):
             brain.update_config({"storagePoolBytes": 987_654, "contextOffloadBudgetBytes": 65_536})
         self.assertIsNot(original_policy, brain.resource_policy)
         self.assertEqual(brain.config.storage_pool_bytes, 987_654)

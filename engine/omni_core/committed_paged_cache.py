@@ -37,7 +37,7 @@ from .paged_assembly_view import PagedAssemblyView
 from .paged_neuron_metadata import PagedNeuronMetadata
 from .paged_packed_vectors import MAX_EXPORT_ROWS, PagedPackedVectors
 from .paged_dirty_journal import install_generation_journal
-from .authenticated_paged_cache import AuthenticatedCacheSession, cache_session
+from .authenticated_paged_cache import AuthenticatedCacheSession, cache_session, bounded_proof_io_window
 from .paged_synapse_endpoints import SynapseEndpointIndex
 from .vsa import (
     LazyPersistedSynapses,
@@ -171,6 +171,7 @@ def _stage_checked_forward_entry(
             ))
     group = [
         (record["id"], {**record, "effective_weight": int(effective[position].item()),
+                         "connection_strength": int(tensors["connection_strength"][position].item()),
                          "uses": int(tensors["uses"][position].item())})
         for position, record in enumerate(records)
     ]
@@ -181,6 +182,7 @@ def _stage_checked_forward_entry(
     )
 
 
+@bounded_proof_io_window
 def _verified_forward_from_staging(
     verification_path: Path, store: Path, pointer: Mapping[str, Any],
     expected: Mapping[str, int], generation: Mapping[str, Any], index: PagedAssemblyIndex,
@@ -498,9 +500,7 @@ def rebuild_committed_paged_cache(
             store, neuron_shards[0], max_blob_bytes=max_blob_bytes,
             memory_reserve=memory_reserve,
         )
-        if payload["vectorIds"] != ids or set(tensors) != {
-            "packed_rows", "update_counters_le"
-        }:
+        if payload["vectorIds"] != ids or set(tensors) != PackedTernaryVectors.tensor_names(payload["packedVectorState"]):
             raise ValueError("neuron shard lacks exact packed vector state")
         verified = PackedTernaryVectors.from_state(payload["packedVectorState"], tensors)
         if list(verified) != ids or verified.seed != generation["seed"] or verified.dimensions != generation["dimensions"]:
@@ -550,9 +550,7 @@ def rebuild_committed_paged_cache(
                     store, descriptor, max_blob_bytes=max_blob_bytes,
                     memory_reserve=memory_reserve,
                 )
-            if payload["vectorIds"] != ids or set(tensors) != {
-                "packed_rows", "update_counters_le"
-            }:
+            if payload["vectorIds"] != ids or set(tensors) != PackedTernaryVectors.tensor_names(payload["packedVectorState"]):
                 raise ValueError("neuron shard lacks exact packed vector state")
             observed["neurons"] += vectors.import_state(payload["packedVectorState"], tensors)
             neurons.import_page(_records, max_rows=max_shard_rows,
@@ -608,7 +606,7 @@ def rebuild_committed_paged_cache(
                     store, descriptor, max_blob_bytes=max_blob_bytes,
                     memory_reserve=memory_reserve,
                 )
-                if set(tensors) != {
+                if set(tensors) - {"packed_connection_strength"} != {
                     "packed_effective_weight", "eligibility", "plasticity",
                     "uses", "stability", "last_updated_at",
                 }:
@@ -616,9 +614,9 @@ def rebuild_committed_paged_cache(
                 effective = _unpack_persisted_synapse_weights(tensors, len(ids), 3)
                 if (
                     any(tensor.numel() != len(ids) for name, tensor in tensors.items()
-                        if name != "packed_effective_weight")
+                        if name not in {"packed_effective_weight", "packed_connection_strength"})
                     or any(not bool(torch.isfinite(tensor).all()) for name, tensor in tensors.items()
-                           if name not in {"packed_effective_weight", "uses"})
+                           if name not in {"packed_effective_weight", "packed_connection_strength", "uses"})
                     or not bool(((effective >= -1) & (effective <= 1)).all())
                 ):
                     raise ValueError("synapse shard tensor count or value is invalid")
@@ -974,7 +972,7 @@ def finish_verified_index_from_loaded_vectors(
                 store, descriptor, max_blob_bytes=prepared.max_blob_bytes,
                 memory_reserve=prepared.memory_reserve,
             )
-            if set(tensors) != {
+            if set(tensors) - {"packed_connection_strength"} != {
                 "packed_effective_weight", "eligibility", "plasticity",
                 "uses", "stability", "last_updated_at",
             }:
@@ -982,9 +980,9 @@ def finish_verified_index_from_loaded_vectors(
             effective = _unpack_persisted_synapse_weights(tensors, len(ids), 3)
             if (
                 any(tensor.numel() != len(ids) for name, tensor in tensors.items()
-                    if name != "packed_effective_weight")
+                    if name not in {"packed_effective_weight", "packed_connection_strength"})
                 or any(not bool(torch.isfinite(tensor).all()) for name, tensor in tensors.items()
-                       if name not in {"packed_effective_weight", "uses"})
+                       if name not in {"packed_effective_weight", "packed_connection_strength", "uses"})
                 or not bool(((effective >= -1) & (effective <= 1)).all())
             ):
                 raise ValueError("synapse shard tensor count or value is invalid")

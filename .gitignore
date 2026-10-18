@@ -9,6 +9,7 @@ playwright-report/
 .venv/
 .engine-build/
 engine-dist/
+engine/omni_core/native/
 __pycache__/
 *.py[cod]
 .codex/

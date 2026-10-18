@@ -1,0 +1,48 @@
+{
+  "seed": 947,
+  "backend": "cpu",
+  "threads": 1,
+  "pairsPerProfile": 3,
+  "scope": "VSA cue composition only; calculated tensor scratch is not measured RSS or whole-brain speed",
+  "results": [
+    {
+      "dimensions": 64,
+      "labelsVisited": 32,
+      "blockRows": 32,
+      "referenceMedianMs": 3.661208,
+      "streamedMedianMs": 2.489625,
+      "throughputRatio": 1.470586,
+      "maxAbsoluteCueDifference": 0.0,
+      "bitIdenticalCue": true,
+      "referenceRetainedAndStackTensorBytes": 16384,
+      "streamedReductionScratchEstimateBytes": 25088,
+      "packedStateUnchanged": true
+    },
+    {
+      "dimensions": 64,
+      "labelsVisited": 1025,
+      "blockRows": 32,
+      "referenceMedianMs": 82.590708,
+      "streamedMedianMs": 70.403417,
+      "throughputRatio": 1.173107,
+      "maxAbsoluteCueDifference": 0.0,
+      "bitIdenticalCue": true,
+      "referenceRetainedAndStackTensorBytes": 524800,
+      "streamedReductionScratchEstimateBytes": 25088,
+      "packedStateUnchanged": true
+    },
+    {
+      "dimensions": 256,
+      "labelsVisited": 4097,
+      "blockRows": 32,
+      "referenceMedianMs": 658.663833,
+      "streamedMedianMs": 679.141125,
+      "throughputRatio": 0.969848,
+      "maxAbsoluteCueDifference": 0.0,
+      "bitIdenticalCue": true,
+      "referenceRetainedAndStackTensorBytes": 8390656,
+      "streamedReductionScratchEstimateBytes": 81920,
+      "packedStateUnchanged": true
+    }
+  ]
+}

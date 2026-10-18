@@ -20,6 +20,7 @@ import type {
 import type { BrainRepository } from "./brainRepository";
 import type {
   EngineCancellationAcknowledgement,
+  EngineRequestContext,
   EngineSupervisor
 } from "./engineSupervisor";
 import {
@@ -31,6 +32,22 @@ import {
 } from "./evolutionPolicy";
 import { persistAuthorizedToolIntent } from "./toolIntentJournal";
 import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
+import type { HostActionOriginAuthority } from "../shared/hostActionAuthority";
+import { isNativeCandidateKind, validateNativeCandidateToolJob, type NativeCandidateToolJob } from "../shared/nativeCandidateTool";
+
+/** Main-only live operation scope. Never archived, imported or model-supplied. */
+export interface AuthorizedNativeCandidateOperation {
+  authority: HostActionOriginAuthority;
+  onRunCreated?(runId: string, candidateId: string): void | Promise<void>;
+  /** Stages the genuine outcome; delivery must occur after the outer writer releases. */
+  deferReassessment?(event: RecursiveEvolutionReassessment): void | Promise<void>;
+}
+/** Main-only delivery scope, never supplied in model data or archived as a grant. */
+export interface AuthorizedReassessmentContext {
+  signal: AbortSignal;
+  assertCurrent(): Promise<void>;
+  loadedOnly: true;
+}
 
 export type EvolutionLimitationKind =
   | "prediction-error"
@@ -155,6 +172,8 @@ export interface EvolutionCandidateRecord extends EvolutionCandidate {
   promotionPolicy?: ToolPermissionLevel;
   recursiveNextRunId?: string;
   recursiveError?: string;
+  /** Exact observed result awaiting normal ordinary-learning admission. */
+  pendingReassessment?: RecursiveEvolutionReassessment;
 }
 
 export interface EvolutionRunRecord extends EvolutionRun {
@@ -170,6 +189,8 @@ interface EvolutionArchive {
   schemaVersion: 1;
   runs: EvolutionRunRecord[];
   candidates: EvolutionCandidateRecord[];
+  /** Complete inert tool requests/results travel with the existing archive. */
+  nativeToolJobs?: NativeCandidateToolJob[];
 }
 
 export interface EvolutionToolExecutor {
@@ -183,6 +204,8 @@ export interface EvolutionToolExecutor {
 }
 
 type EvolutionEngine = Pick<EngineSupervisor, "request"> & {
+  requestLoadedNativeCandidate?<T>(method: string, params: Record<string, unknown>, timeoutMs: number,
+    signal: AbortSignal, context: EngineRequestContext): Promise<T>;
   cancelRequest?(
     requestId: string
   ): Promise<EngineCancellationAcknowledgement>;
@@ -509,14 +532,15 @@ function workerState(status: string | undefined): EvolutionCandidateRecord["stat
 }
 
 export class EvolutionController {
-  private recursiveReassessmentHandler?: (event: RecursiveEvolutionReassessment) => Promise<void>;
+  private recursiveReassessmentHandler?: (event: RecursiveEvolutionReassessment, context?: AuthorizedReassessmentContext) => Promise<void>;
   private readonly trustedReassessmentParents = new Map<string, string>();
 
-  setRecursiveReassessmentHandler(handler: (event: RecursiveEvolutionReassessment) => Promise<void>): void {
+  setRecursiveReassessmentHandler(handler: (event: RecursiveEvolutionReassessment, context?: AuthorizedReassessmentContext) => Promise<void>): void {
     this.recursiveReassessmentHandler = handler;
   }
 
-  private async requestRecursiveReassessment(candidate: EvolutionCandidateRecord): Promise<void> {
+  private async requestRecursiveReassessment(candidate: EvolutionCandidateRecord,
+    defer?: AuthorizedNativeCandidateOperation["deferReassessment"]): Promise<void> {
     const configuration = candidate.continuationRequest;
     if (!configuration) throw new Error("Recursive candidate lost its exact authorized configuration.");
     const evaluation = candidate.evaluations[candidate.evaluations.length - 1];
@@ -529,6 +553,18 @@ export class EvolutionController {
       ...(candidate.processMeasurement ? { processMeasurement: clone(candidate.processMeasurement) } : {})
     };
     this.trustedReassessmentParents.set(candidate.brainId, candidate.id);
+    if (defer) {
+      await this.mutateArchive(candidate.brainId, archive => {
+        const current = archive.candidates.find(entry => entry.id === candidate.id);
+        if (!current || current.state !== "promoted") throw new Error("The completed recursive candidate disappeared.");
+        current.pendingReassessment = clone(event);
+        current.recursiveError = "Observed reassessment is pending the normal loaded neural writer.";
+        current.updatedAt = new Date().toISOString();
+        return current;
+      });
+      await defer(clone(event));
+      return;
+    }
     if (!this.recursiveReassessmentHandler) {
       await this.mutateArchive(candidate.brainId, (archive) => {
         const current = archive.candidates.find((entry) => entry.id === candidate.id);
@@ -537,6 +573,39 @@ export class EvolutionController {
       return;
     }
     await this.recursiveReassessmentHandler(event);
+  }
+
+  /** Called only after the outer candidate writer has released, never reentrantly. */
+  async deliverNativeToolReassessment(brainId: string, candidateId: string,
+    context: AuthorizedReassessmentContext): Promise<void> {
+    const candidate = (await this.loadArchive(brainId)).candidates.find(entry => entry.id === candidateId);
+    const event = candidate?.pendingReassessment;
+    if (!candidate || candidate.brainId !== brainId || candidate.state !== "promoted" || !event ||
+        event.brainId !== brainId || event.parentCandidateId !== candidate.id ||
+        event.workerCandidateId !== candidate.workerCandidateId) throw new Error("No exact completed native reassessment is pending for this owner.");
+    try {
+      context.signal.throwIfAborted(); await context.assertCurrent(); context.signal.throwIfAborted();
+      if (!this.recursiveReassessmentHandler) throw new Error("Observed reassessment is pending the normal idle neural scheduler.");
+      await this.recursiveReassessmentHandler(clone(event), context);
+      // Delivery's real ACK is authoritative even if the live scope expires afterward.
+      await this.mutateArchive(brainId, archive => {
+        const current = archive.candidates.find(entry => entry.id === candidateId);
+        if (!current || JSON.stringify(current.pendingReassessment) !== JSON.stringify(event)) throw new Error("Pending native reassessment changed before its outcome receipt.");
+        delete current.pendingReassessment; delete current.recursiveError;
+        current.updatedAt = new Date().toISOString();
+        return current;
+      });
+    } catch (error) {
+      await this.mutateArchive(brainId, archive => {
+        const current = archive.candidates.find(entry => entry.id === candidateId);
+        if (current && current.pendingReassessment) {
+          current.recursiveError = `Observed reassessment remains pending: ${errorMessage(error)}`;
+          current.updatedAt = new Date().toISOString();
+        }
+        return current ?? null;
+      });
+      throw error;
+    }
   }
   private readonly archiveLocks = new Map<string, Promise<void>>();
   private readonly activeRuns = new Map<string, string>();
@@ -636,7 +705,8 @@ export class EvolutionController {
     brainId: string,
     params: Record<string, unknown> = {},
     timeoutMs = 120_000,
-    requestId?: string
+    requestId?: string,
+    authority?: HostActionOriginAuthority
   ): Promise<T> {
     if (!this.engine) {
       throw new Error("The supervised neural evolution worker is unavailable.");
@@ -646,6 +716,17 @@ export class EvolutionController {
       storagePath: this.repository.brainDirectory(brainId),
       ...params
     };
+    if (authority) {
+      authority.signal.throwIfAborted(); await authority.assertCurrent(); authority.signal.throwIfAborted();
+      if (!this.engine.requestLoadedNativeCandidate) throw new Error("The loaded-only native candidate transport is unavailable; no worker will be started.");
+      // Preserve the real committed reply even if revocation arrives afterward.
+      // Every subsequent effect rechecks this same live, nonpersisted scope.
+      return this.engine.requestLoadedNativeCandidate<T>(method, requestParams, timeoutMs, authority.signal, {
+        requestId: requestId ?? randomUUID(), owner: "evolution", label: "Authorized native candidate", brainId,
+        jobId: String(params.jobId ?? requestId ?? "native-candidate"),
+        beforeDispatch: async () => { authority.signal.throwIfAborted(); await authority.assertCurrent(); authority.signal.throwIfAborted(); }
+      });
+    }
     // Older embedded/test transports do not expose request-id cancellation.
     // Preserve their three-argument request surface while the production
     // supervisor receives explicit activity ownership.
@@ -710,6 +791,10 @@ export class EvolutionController {
           return migrated;
         });
       }
+      if (value.nativeToolJobs !== undefined) {
+        if (!Array.isArray(value.nativeToolJobs)) throw new Error("Saved native tool job history is invalid.");
+        value.nativeToolJobs.forEach(validateNativeCandidateToolJob);
+      }
       return value;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -752,6 +837,42 @@ export class EvolutionController {
       release();
       if (this.archiveLocks.get(brainId) === queued) this.archiveLocks.delete(brainId);
     }
+  }
+
+  async nativeToolJob(brainId: string, jobId: string): Promise<NativeCandidateToolJob> {
+    const value = (await this.loadArchive(brainId)).nativeToolJobs?.find(job => job.id === jobId);
+    if (!value) throw new Error("Native candidate tool job was not found.");
+    return clone(validateNativeCandidateToolJob(value));
+  }
+  async nativeToolJobForRequest(brainId: string, requestId: string): Promise<NativeCandidateToolJob | undefined> {
+    const value = (await this.loadArchive(brainId)).nativeToolJobs?.find(job => job.brainId === brainId && job.requestId === requestId);
+    return value ? clone(validateNativeCandidateToolJob(value)) : undefined;
+  }
+  /** Archived operation evidence only: no worker synchronization or hidden Load. */
+  async nativeToolRun(brainId: string, runId: string): Promise<EvolutionRunRecord | undefined> {
+    const run = (await this.loadArchive(brainId)).runs.find(entry => entry.id === runId && entry.brainId === brainId);
+    return run ? clone(run) : undefined;
+  }
+  async putNativeToolJob(brainId: string, job: NativeCandidateToolJob): Promise<NativeCandidateToolJob> {
+    validateNativeCandidateToolJob(job);
+    if (job.brainId !== brainId) throw new Error("Native tool job belongs to another current owner.");
+    return this.mutateArchive(brainId, archive => {
+      archive.nativeToolJobs ??= [];
+      const prior = archive.nativeToolJobs.find(item => item.brainId === brainId && item.requestId === job.requestId);
+      if (prior) { if (prior.requestSha256 !== job.requestSha256) throw new Error("Native candidate request changed operands."); return prior; }
+      archive.nativeToolJobs.push(clone(job)); return job;
+    });
+  }
+  async updateNativeToolJob(brainId: string, jobId: string,
+    patch: Partial<Pick<NativeCandidateToolJob, "state" | "runId" | "candidateId" | "run" | "error" | "reassessmentPending" | "reassessmentError">>): Promise<NativeCandidateToolJob> {
+    return this.mutateArchive(brainId, archive => {
+      const index = archive.nativeToolJobs?.findIndex(job => job.id === jobId) ?? -1;
+      if (index < 0 || !archive.nativeToolJobs) throw new Error("Native candidate tool job was not found.");
+      const previous = archive.nativeToolJobs[index]!;
+      if (previous.brainId !== brainId) throw new Error("Historical imported native job is not executable current authority.");
+      const next = validateNativeCandidateToolJob(clone({ ...previous, ...patch, revision: previous.revision + 1, updatedAt: new Date().toISOString() }));
+      archive.nativeToolJobs[index] = next; return next;
+    });
   }
 
   async detectLimitations(brainId: string): Promise<EvolutionLimitationEvidence[]> {
@@ -910,9 +1031,17 @@ export class EvolutionController {
     return this.startWithPolicy(request, true);
   }
 
+  /** Same controller/evaluator as normal evolution, with an exact module lease. */
+  async startAuthorized(request: EvolutionStartRequest, operation: AuthorizedNativeCandidateOperation): Promise<EvolutionRunRecord> {
+    if (!isNativeCandidateKind(request.candidateKind) || request.sourceEdits !== undefined) throw new Error("Authorized native proposals cannot enter the Git source route.");
+    await operation.authority.assertCurrent(); operation.authority.signal.throwIfAborted();
+    return this.startWithPolicy(request, true, operation);
+  }
+
   private async startWithPolicy(
     request: EvolutionStartRequest,
-    allowAutomaticPromotion: boolean
+    allowAutomaticPromotion: boolean,
+    operation?: AuthorizedNativeCandidateOperation
   ): Promise<EvolutionRunRecord> {
     const sourceEdits = cleanSourceEdits(request.sourceEdits);
     const kind =
@@ -929,13 +1058,14 @@ export class EvolutionController {
     // Reject a revoked/Off capability before creating even an experimental
     // archive. Per-operation checks remain in the existing source/worker
     // pipelines and promotion still uses the immutable evaluator policies.
+    await operation?.authority.assertCurrent(); operation?.authority.signal.throwIfAborted();
     await this.assertWorkerPermission(request.brainId, "experiment");
     return kind === "source"
       ? this.startSource(
           { ...request, sourceEdits },
           allowAutomaticPromotion
         )
-      : this.startWorker(request, kind, allowAutomaticPromotion);
+      : this.startWorker(request, kind, allowAutomaticPromotion, operation);
   }
 
   private async startSource(
@@ -1141,12 +1271,13 @@ export class EvolutionController {
   private async startWorker(
     request: EvolutionStartRequest,
     kind: "neural" | "data" | "substrate" | "architecture",
-    allowAutomaticPromotion: boolean
+    allowAutomaticPromotion: boolean,
+    operation?: AuthorizedNativeCandidateOperation
   ): Promise<EvolutionRunRecord> {
     const objective = cleanObjective(request.objective);
-    const texts = cleanStringArray(request.texts, "texts") ?? [];
-    const sourceIds = cleanStringArray(request.sourceIds, "sourceIds") ?? [];
-    const objectives = cleanStringArray(request.objectives, "objectives");
+    const texts = operation ? clone(request.texts ?? []) : cleanStringArray(request.texts, "texts") ?? [];
+    const sourceIds = operation ? clone(request.sourceIds ?? []) : cleanStringArray(request.sourceIds, "sourceIds") ?? [];
+    const objectives = operation ? request.objectives === undefined ? undefined : clone(request.objectives) : cleanStringArray(request.objectives, "objectives");
     const architectureChange =
       kind === "architecture"
         ? normalizeCompatibleArchitectureMutation(request.architectureChange ?? {
@@ -1266,11 +1397,13 @@ export class EvolutionController {
       archive.candidates.push(candidate);
       return run;
     });
+    await operation?.onRunCreated?.(ids.run, ids.candidate);
 
     let proposal: Record<string, unknown>;
     let policy: ToolPermissionLevel;
     this.activeRuns.set(ids.run, request.brainId);
     try {
+      await operation?.authority.assertCurrent(); operation?.authority.signal.throwIfAborted();
       policy = await this.assertWorkerPermission(request.brainId, "experiment");
       const permissionRecord = (await this.repository.get(request.brainId)).toolPermissions?.find((value) => value.toolId === "source.self-modify");
       await persistAuthorizedToolIntent(this.repository.brainDirectory(request.brainId), {
@@ -1283,6 +1416,7 @@ export class EvolutionController {
         }
       }, { id: ids.run, requestId: ids.run, startedAt: now, permission: policy, permissionRevision: JSON.stringify(permissionRecord ?? { level: policy }) });
       await this.assertWorkerPermission(request.brainId, "experiment");
+      await operation?.authority.assertCurrent(); operation?.authority.signal.throwIfAborted();
       const recursiveParent = request.parentCandidateId
         ? (await this.loadArchive(request.brainId)).candidates.find((entry) => entry.id === request.parentCandidateId)
         : undefined;
@@ -1310,7 +1444,8 @@ export class EvolutionController {
           ,recursiveParentCandidateId: recursiveParent?.workerCandidateId
         },
         30 * 60_000,
-        ids.run
+        ids.run,
+        operation?.authority
       );
     } catch (error) {
       const message = errorMessage(error);
@@ -1405,10 +1540,11 @@ export class EvolutionController {
         (kind === "architecture" && policy === "full")
       );
     if (automaticPromotion) {
+      await operation?.authority.assertCurrent(); operation?.authority.signal.throwIfAborted();
       await this.approve({
         brainId: request.brainId,
         candidateId: ids.candidate
-      });
+      }, operation?.authority, operation?.deferReassessment);
       const archive = await this.loadArchive(request.brainId);
       return (
         archive.runs.find((entry) => entry.id === proposedRun.id) ??
@@ -1483,11 +1619,11 @@ export class EvolutionController {
     });
   }
 
-  async stop(brainId: string, runId: string): Promise<EvolutionRunRecord> {
+  async stop(brainId: string, runId: string, authority?: HostActionOriginAuthority): Promise<EvolutionRunRecord> {
     const key = `${brainId}\0${runId}`;
     const existing = this.stopOperations.get(key);
     if (existing) return existing;
-    const operation = this.stopRun(brainId, runId).finally(() => {
+    const operation = this.stopRun(brainId, runId, authority).finally(() => {
       if (this.stopOperations.get(key) === operation) {
         this.stopOperations.delete(key);
       }
@@ -1496,7 +1632,8 @@ export class EvolutionController {
     return operation;
   }
 
-  private async stopRun(brainId: string, runId: string): Promise<EvolutionRunRecord> {
+  private async stopRun(brainId: string, runId: string, authority?: HostActionOriginAuthority): Promise<EvolutionRunRecord> {
+    await authority?.assertCurrent(); authority?.signal.throwIfAborted();
     const stopping = await this.mutateArchive(brainId, (archive) => {
       const run = archive.runs.find((entry) => entry.id === runId);
       if (!run) throw new Error("The evolution run was not found.");
@@ -1535,12 +1672,15 @@ export class EvolutionController {
         .filter((value): value is string => Boolean(value));
 
       if (this.tools.cancelAndWait) {
+        await authority?.assertCurrent(); authority?.signal.throwIfAborted();
         await this.tools.cancelAndWait(brainId, runId);
       } else {
+        await authority?.assertCurrent(); authority?.signal.throwIfAborted();
         this.tools.cancel(brainId, runId);
       }
 
       if (workerCandidates.length > 0 && this.engine?.cancelRequest) {
+        await authority?.assertCurrent(); authority?.signal.throwIfAborted();
         const termination = await this.engine.cancelRequest(runId);
         if (termination.phase !== "not-found" && !termination.acknowledged) {
           throw new Error(
@@ -1569,7 +1709,8 @@ export class EvolutionController {
             candidateIds: workerCandidateIds
           },
           30_000,
-          `${runId}.cancel`
+          `${runId}.cancel`,
+          authority
         );
         if (
           acknowledgement.jobId !== runId ||
@@ -1658,13 +1799,18 @@ export class EvolutionController {
     );
   }
 
-  async approve(request: EvolutionApprovalRequest): Promise<EvolutionCandidateRecord> {
-    const candidate = (await this.listCandidates(request.brainId)).find(
+  async approve(request: EvolutionApprovalRequest, authority?: HostActionOriginAuthority,
+    deferReassessment?: AuthorizedNativeCandidateOperation["deferReassessment"]): Promise<EvolutionCandidateRecord> {
+    await authority?.assertCurrent(); authority?.signal.throwIfAborted();
+    // A detached authorized operation already owns the loaded writer. Its exact
+    // archive must not trigger an unscoped sync RPC (or revive an unloaded brain).
+    const candidates = authority ? (await this.loadArchive(request.brainId)).candidates : await this.listCandidates(request.brainId);
+    const candidate = candidates.find(
       (entry) => entry.id === request.candidateId
     );
     if (!candidate) throw new Error("The evolution candidate was not found.");
     if (candidate.candidateKind !== "source") {
-      return this.approveWorker(request, candidate);
+      return this.approveWorker(request, candidate, authority, deferReassessment);
     }
     if (!candidate.worktree) throw new Error("The evolution candidate has no isolated worktree.");
     if (!candidate.evaluatorSha256 || !candidate.proposalParentCommit) {
@@ -1888,7 +2034,9 @@ export class EvolutionController {
 
   private async approveWorker(
     request: EvolutionApprovalRequest,
-    candidate: EvolutionCandidateRecord
+    candidate: EvolutionCandidateRecord,
+    authority?: HostActionOriginAuthority,
+    deferReassessment?: AuthorizedNativeCandidateOperation["deferReassessment"]
   ): Promise<EvolutionCandidateRecord> {
     if (!candidate.workerCandidateId) {
       throw new Error("The worker evolution candidate has no isolated overlay identity.");
@@ -1904,6 +2052,7 @@ export class EvolutionController {
     if (["stopping", "stopped", "promoted", "rolled-back"].includes(candidate.state)) {
       throw new Error(`The ${candidate.state} evolution candidate cannot be promoted.`);
     }
+    await authority?.assertCurrent(); authority?.signal.throwIfAborted();
     await this.assertWorkerPermission(request.brainId, "promote");
     const timeout =
       typeof request.timeoutMs === "number" &&
@@ -1918,7 +2067,9 @@ export class EvolutionController {
         "evolution.evaluate",
         request.brainId,
         { candidateId: candidate.workerCandidateId },
-        timeout
+        timeout,
+        authority ? `${candidate.runId}.evaluate` : undefined,
+        authority
       );
     } catch (error) {
       evaluationError = errorMessage(error);
@@ -1995,7 +2146,7 @@ export class EvolutionController {
         await this.workerRequest("evolution.reject", request.brainId, {
           candidateId: candidate.workerCandidateId,
           reason: evaluation.rejectionReason || "Neural evaluation failed."
-        });
+        }, 120_000, authority ? `${candidate.runId}.reject` : undefined, authority);
       } catch (error) {
         await this.mutateArchive(request.brainId, (archive) => {
           const current = archive.candidates.find((entry) => entry.id === candidate.id);
@@ -2005,7 +2156,7 @@ export class EvolutionController {
         });
       }
       return (
-        (await this.listCandidates(request.brainId)).find(
+        (authority ? (await this.loadArchive(request.brainId)).candidates : await this.listCandidates(request.brainId)).find(
           (entry) => entry.id === candidate.id
         ) ?? candidate
       );
@@ -2017,6 +2168,7 @@ export class EvolutionController {
       // source permission is reread after evaluation, so a revoked grant
       // cannot be used from a stale candidate card.
       const currentPermission = await this.assertWorkerPermission(request.brainId, "promote");
+      await authority?.assertCurrent(); authority?.signal.throwIfAborted();
       const architectureMutation = recordValue(candidate.workerSnapshot?.architectureMutation);
       const geometry = candidate.candidateKind === "architecture" &&
         ["resize-width", "repartition-heads"].includes(outputString(architectureMutation, "mutation") ?? "");
@@ -2041,7 +2193,9 @@ export class EvolutionController {
         request.brainId,
         { candidateId: candidate.workerCandidateId,
           ...(geometryAuthorization ? { geometryAuthorization } : {}) },
-        timeout
+        timeout,
+        authority ? `${candidate.runId}.promote` : undefined,
+        authority
       );
     } catch (error) {
       const message = errorMessage(error);
@@ -2111,7 +2265,7 @@ export class EvolutionController {
     const run = archive.runs.find((entry) => entry.id === candidate.runId);
     if (updated.state === "promoted" && run?.recursive) {
       try {
-        await this.requestRecursiveReassessment(updated);
+        await this.requestRecursiveReassessment(updated, deferReassessment);
       } catch (error) {
         await this.mutateArchive(request.brainId, (currentArchive) => {
           const current = currentArchive.candidates.find((entry) => entry.id === updated.id);
@@ -2123,7 +2277,7 @@ export class EvolutionController {
       }
     }
     return (
-      (await this.listCandidates(request.brainId)).find(
+      (authority ? (await this.loadArchive(request.brainId)).candidates : await this.listCandidates(request.brainId)).find(
         (entry) => entry.id === updated.id
       ) ?? updated
     );

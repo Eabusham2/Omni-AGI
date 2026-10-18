@@ -5,7 +5,7 @@ import type {
 } from "../../shared/types";
 
 export interface BrainProvenancePresentation {
-  originLabel: "Locally initialized";
+  originLabel: "Locally initialized" | "Merged native instance";
   compactLabel: string;
   ariaLabel: string;
 }
@@ -31,8 +31,13 @@ export function brainProvenancePresentation(input: {
     !Object.hasOwn(runtime, "foundationModelId") &&
     !cortex;
   if (runtime && !nativeRuntime) return undefined;
-  if (input.provenance && input.provenance.originKind !== "ground-up") {
+  if (input.provenance && !["ground-up", "merged-native"].includes(input.provenance.originKind)) {
     return undefined;
+  }
+  if (input.provenance?.originKind === "merged-native" && input.provenance.merge) {
+    const compactLabel = `OmniCortex · ${input.provenance.merge.parentIds.length} native parents`;
+    return { originLabel: "Merged native instance", compactLabel,
+      ariaLabel: `${compactLabel}. Complete parent state retained; no initial curriculum was rerun.` };
   }
   if (!nativeRuntime && input.provenance?.originKind !== "ground-up") {
     return undefined;

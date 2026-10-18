@@ -14,17 +14,26 @@ const styles = readFileSync(
   resolve(process.cwd(), "src/renderer/src/styles.css"),
   "utf8"
 );
+const callLayout = readFileSync(resolve(process.cwd(), "src/renderer/src/CallLayout.tsx"), "utf8");
+const preview = readFileSync(resolve(process.cwd(), "src/renderer/src/LiveCapturePreview.tsx"), "utf8");
+const captureStyles = readFileSync(resolve(process.cwd(), "src/renderer/src/cameraScreenPanel.css"), "utf8");
 
 describe("Live Perception renderer surface", () => {
   it("stays reachable without live voice and binds only to typed observation controls", () => {
-    expect(app).toContain(
-      '</>\n          ) : null}\n          <LivePerceptionPanel brain={brain} />'
-    );
+    expect(app).toContain('<LivePerceptionPanel brain={brain} runtimeLoaded={runtimeLoaded} />');
+    expect(app).toContain('hidden={!callOpen}');
+    expect(callLayout).toContain('{controls}<div');
+    expect(callLayout).not.toContain('open ? controls');
     expect(panel).toContain("controller.requestConfigure");
     expect(panel).toContain("controller.requestSnapshot");
     expect(panel).toContain("controllerRef.current?.cancelSnapshot()");
-    expect(panel).toContain("controller.start(source, plan, \"neural\")");
+    expect(panel).toContain("controller.start(source, plan, \"neural\", delivery)");
     expect(panel).toContain("livePerceptionErrorMessage(error)");
+    expect(panel).toContain('key={brain.id}');
+    expect(panel).toContain('controller.subscribePreview(setPreview)');
+    expect(panel).toContain('if (runtimeLoaded) return;');
+    expect(panel).toContain('void controller?.cancel()');
+    expect(panel).not.toContain('<strong>Live Perception</strong>');
     expect(panel).not.toContain("fetch(");
   });
 
@@ -39,12 +48,16 @@ describe("Live Perception renderer surface", () => {
     expect(panel).not.toContain("720p");
   });
 
-  it("removes collapsed perception and snapshot controls from layout", () => {
-    expect(styles).toContain(
-      ".live-perception-panel:not([open]) > .live-perception-panel__body"
-    );
+  it("keeps real previews accessible inside Call and collapses advanced/snapshot layout only", () => {
+    expect(preview).toContain('attachOwnedCapturePreview(video.current, stream, setPlayError)');
+    expect(preview).toContain('return owned.release');
+    expect(preview).toContain('Latest accepted snapshot');
+    expect(preview).toContain('{snapshot ? <details'); // Keep the disclosure mounted while each new frame URL replaces the last.
+    expect(preview).not.toContain('{still ? <details');
     expect(styles).toContain(
       ".live-perception-advanced:not([open]) > div"
     );
+    expect(captureStyles).toContain('.camera-screen-preview__snapshot:not([open]) > img');
+    expect(captureStyles).toContain(':focus-visible');
   });
 });

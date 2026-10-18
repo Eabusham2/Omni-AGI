@@ -35,11 +35,12 @@ from .architecture_migration import (
     verify_geometry_checkpoint_migration,
     verify_preserved_tensor_prefixes,
 )
-from .native_architecture import validate_native_architecture
+from .native_architecture import packed_learning_scratch_bytes, packed_owner_metadata_reserve, validate_native_architecture
 from .registered_geometry_holdouts import load_registered_geometry_holdouts, register_geometry_holdouts
 from .paired_geometry_statistics import paired_improvement_statistics, file_sha as paired_file_sha
 from .bounded_tensor_io import BoundedTensorFile
 from .evolution_anchors import RetentionAnchorFile, save_retention_anchors
+from .outer_learning_pipeline import learning_pipeline
 from .persistence import (
     atomic_write_json,
     copy_substrate_snapshot,
@@ -64,6 +65,71 @@ UNSAFE_TENSOR_SUFFIXES = {
     ".pt",
     ".pth",
 }
+
+
+def _native_growth_reserve(config, mutation, router=None):
+    """Account weighted owners before allocation; fresh contacts are zero.
+
+    Growth can retain old and replacement projections while publishing an
+    isolated candidate, so three new-owner copies remain a conservative
+    admission allowance. Recurrent state charges only allocated block shapes,
+    including expanded border blocks, rather than an invented dense N×N map.
+    """
+    d, ff = int(config.d_model), int(config.d_ff)
+    old_neurons = int(config.router_neurons)
+    _, new_neurons = growth_dimensions(config, mutation)
+    kind = mutation["mutation"]
+    packed_bytes = connection_bytes = owner_controls = owners = 0
+    maximum_scratch = 0
+
+    def projection(width, rows, bias=0, repeat=1):
+        nonlocal packed_bytes, connection_bytes, owner_controls, maximum_scratch, owners
+        packed_bytes += repeat * (rows * ((width + 3) // 4) + (bias + 3) // 4)
+        connection_bytes += repeat * (rows * width + bias)
+        owner_controls += repeat * (rows + bool(bias) + 20)
+        owners += repeat
+        maximum_scratch = max(maximum_scratch, packed_learning_scratch_bytes(rows, width), packed_learning_scratch_bytes(1, bias))
+
+    if kind == "grow-experts":
+        additions = int(mutation["addExperts"])
+        hidden = max(16, ff // 2)
+        projection(d, 1, repeat=2 * additions)  # norm and prototype
+        projection(d, 2 * hidden, repeat=additions)
+        projection(hidden, d, repeat=additions)
+        nonweight_transient = 0
+    elif kind == "grow-depth":
+        additions = int(mutation["addLayers"])
+        projection(d, 1, repeat=2 * additions)
+        projection(d, 3 * d, repeat=additions)
+        projection(d, d, repeat=additions)
+        projection(d, 2 * ff, repeat=additions)
+        projection(ff, d, repeat=additions)
+        nonweight_transient = 0
+    elif kind in {"grow-router", "grow-regions"}:
+        additions = new_neurons - old_neurons
+        # Both complete new projections coexist with their previous versions.
+        projection(d, new_neurons, new_neurons)
+        projection(new_neurons, d, d)
+        from .sparse_router_state import BLOCK_ROWS, BLOCK_COLUMNS, BLOCK_METADATA_BYTES, parse_block_key
+        blocks = getattr(getattr(router, "synapses", None), "blocks", {})
+        allocated_replacement_bytes = 0
+        for key in blocks:
+            row, column = parse_block_key(key)
+            rows = min(BLOCK_ROWS, new_neurons - row * BLOCK_ROWS)
+            columns = min(BLOCK_COLUMNS, new_neurons - column * BLOCK_COLUMNS)
+            # Packed sign + strength/resistance + int16 eligibility + two FP32 counters.
+            allocated_replacement_bytes += rows * ((columns + 3) // 4) + 11 * rows * columns + BLOCK_METADATA_BYTES
+        regions = len(getattr(router, "region_ends", ())) + (int(mutation["addRegions"]) if kind == "grow-regions" else 1)
+        nonweight_transient = 2 * (allocated_replacement_bytes + 16 * new_neurons + 72 + 8 * regions)
+    else:
+        raise ValueError("unsupported native growth memory estimate")
+    nonweight_transient += packed_owner_metadata_reserve(owners)
+    scratch = max(1_048_576, maximum_scratch)
+    return {"additions": additions, "packedWeightBytes": packed_bytes,
+            "connectionStateBytes": connection_bytes, "packedLearnedStateBytes": packed_bytes + connection_bytes,
+            "ownerControlBytes": owner_controls, "nonweightTransientBytes": nonweight_transient,
+            "packedUpdateScratchBytes": scratch,
+            "estimatedBytes": 3 * (packed_bytes + connection_bytes + owner_controls) + nonweight_transient + scratch}
 
 
 def _iso_now() -> str:
@@ -1028,23 +1094,10 @@ class NeuralEvolutionManager:
                 d, ff, old_neurons = int(candidate.config.d_model), int(candidate.config.d_ff), int(candidate.config.router_neurons)
                 old_layers = int(candidate.config.n_layers)
                 new_layers, new_neurons = growth_dimensions(candidate.config, architecture_mutation)
-                if kind == "grow-experts":
-                    additions = int(architecture_mutation["addExperts"])
-                    hidden = max(16, ff // 2)
-                    packed_bytes = (additions * (2 * d + 3 * d * hidden) + 3) // 4
-                    nonweight_transient = additions * 64 * 1024
-                elif kind == "grow-depth":
-                    additions = int(architecture_mutation["addLayers"])
-                    packed_bytes = additions * ((4 * d * d + 3 * d * ff + 3) // 4 + 2 * ((d + 3) // 4))
-                    nonweight_transient = additions * (5 * d + 2 * ff + 64 * 1024)
-                else:
-                    additions = new_neurons - old_neurons
-                    packed_bytes = (2 * d * additions + new_neurons * new_neurons - old_neurons * old_neurons + 3) // 4
-                    # Router timing/stability/use buffers are not packed
-                    # weights. Charge complete new buffers while the old
-                    # instance still exists, including transfer/load margin.
-                    nonweight_transient = 2 * (10 * new_neurons * new_neurons + 16 * new_neurons + 32) + 64 * 1024
-                estimated_bytes = packed_bytes * 3 + nonweight_transient + max(1_048_576, 256 * max(d, ff, new_neurons))
+                growth_reserve = _native_growth_reserve(candidate.config, architecture_mutation, candidate.router)
+                additions = growth_reserve["additions"]
+                nonweight_transient = growth_reserve["nonweightTransientBytes"]
+                estimated_bytes = growth_reserve["estimatedBytes"]
                 if not candidate._allow_substrate_growth(estimated_bytes):
                     raise ValueError(
                         "architecture growth paused at the host resource reserve"
@@ -1119,18 +1172,20 @@ class NeuralEvolutionManager:
                         dict(data) if isinstance(data, Mapping) else None,
                     )
 
-                training = candidate.train(
-                    texts=clean_texts,
-                    epochs=epochs,
-                    learning_rate=learning_rate,
-                    progress=(
-                        (
-                            scaled_progress
-                        )
-                        if progress is not None
-                        else None
-                    ),
-                )
+                with learning_pipeline(candidate, "isolated-evolution-training", cancelled=cancel_check,
+                        cancel_error=getattr(self.brain, "_outer_learning_cancel_error", None)):
+                    training = candidate.train(
+                        texts=clean_texts,
+                        epochs=epochs,
+                        learning_rate=learning_rate,
+                        progress=(
+                            (
+                                scaled_progress
+                            )
+                            if progress is not None
+                            else None
+                        ),
+                    )
             elif latent_replay and anchors.numel() > 0:
                 def scaled_replay_progress(
                     value: float,
@@ -1144,16 +1199,18 @@ class NeuralEvolutionManager:
                         dict(data) if isinstance(data, Mapping) else None,
                     )
 
-                training = candidate._train_evolution_replay_candidate(
-                    steps=epochs,
-                    progress=(
-                        (
-                            scaled_replay_progress
-                        )
-                        if progress is not None
-                        else None
-                    ),
-                )
+                with learning_pipeline(candidate, "isolated-evolution-replay", cancelled=cancel_check,
+                        cancel_error=getattr(self.brain, "_outer_learning_cancel_error", None)):
+                    training = candidate._train_evolution_replay_candidate(
+                        steps=epochs,
+                        progress=(
+                            (
+                                scaled_replay_progress
+                            )
+                            if progress is not None
+                            else None
+                        ),
+                    )
             else:
                 if geometry_change:
                     raise ValueError("geometry insertion is not training; the requested native learner is unavailable")

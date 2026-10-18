@@ -208,6 +208,33 @@ describe("hardware-scaled media request validation", () => {
   });
 });
 
+describe("native output measurement validation", () => {
+  const token = {
+    type: "chat-token", brainId: "brain-metrics", sequence: 3,
+    data: { delta: "hi", outputTokens: 2, outputElapsedMs: 125, tokensPerSecond: 8 }
+  } as const;
+
+  it("preserves exact native token counts and measured speed", () => {
+    expect(normalizeChatEngineEvent(token, "brain-metrics")).toEqual({
+      type: "chat-token", sequence: 3, ...token.data
+    });
+    expect(normalizeChatEngineEvent({ ...token, data: { ...token.data, delta: "", outputTokens: 3 } }, "brain-metrics"))
+      .toEqual({ type: "chat-token", sequence: 3, ...token.data, delta: "", outputTokens: 3 });
+  });
+
+  it("does not manufacture counts from visible text or accept malformed measurements", () => {
+    for (const invalid of [-1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(normalizeChatEngineEvent({ ...token, data: { delta: "hi", outputTokens: invalid,
+        outputElapsedMs: invalid, tokensPerSecond: invalid === Number.MAX_SAFE_INTEGER + 1 ? Infinity : invalid }
+      }, "brain-metrics")).toEqual({ type: "chat-token", sequence: 3, delta: "hi",
+        ...(invalid === Number.MAX_SAFE_INTEGER + 1 ? { outputElapsedMs: invalid } : {}) });
+    }
+    expect(normalizeChatEngineEvent({ ...token, data: { delta: "", outputTokens: 1.5 } }, "brain-metrics"))
+      .toBeUndefined();
+    expect(normalizeChatEngineEvent(token, "different-brain")).toBeUndefined();
+  });
+});
+
 describe("post-reply chat phase validation", () => {
   const validPhase = {
     type: "chat-phase",
@@ -592,26 +619,13 @@ describe("BrainService ground-up creation", () => {
     } as unknown as Parameters<typeof service.create>[0])).rejects.toThrow(/native OmniCortex origin/i);
   });
 
-  it("projects legacy Windows grants onto platform-neutral system capabilities", async () => {
-    let legacy = await repository.create({
+  it("projects legacy Windows permission ids onto platform-neutral system capabilities", async () => {
+    const legacy = await repository.create({
       ...DEFAULT_CONFIG,
       name: "Imported legacy permissions"
     });
-    legacy.toolPermissions = [
-      {
-        toolId: "windows.files",
-        label: "Windows files",
-        level: "full",
-        updatedAt: legacy.createdAt
-      },
-      {
-        toolId: "windows.powershell",
-        label: "PowerShell",
-        level: "off",
-        updatedAt: legacy.createdAt
-      }
-    ];
-    legacy = await repository.save(legacy);
+    await service.setToolPermission(legacy.id, "windows.files", "full");
+    await service.setToolPermission(legacy.id, "windows.powershell", "off");
 
     const projected = await service.listToolPermissions(legacy.id);
     expect(projected).toEqual(

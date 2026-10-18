@@ -9,7 +9,7 @@ export function advanceChatGenerationPhase(
 ): ChatGenerationPhase {
   if (phase === "settled") return phase;
   if (event.type === "chat-state" &&
-      ["complete", "steered", "stopped", "no-reply", "failed", "cancelled"].includes(event.state)) return "settled";
+      ["complete", "steered", "stopped", "no-reply", "failed", "cancelled", "suspended", "detached"].includes(event.state)) return "settled";
   if (event.type === "chat-phase" || event.type === "chat-reply-committed") {
     return "reply-complete";
   }
@@ -19,7 +19,7 @@ export function advanceChatGenerationPhase(
 export interface UncommittedChatOutput {
   turnId: string;
   message: ChatMessage;
-  state: "saving" | "steering" | "failed" | "cancelled";
+  state: "saving" | "steering" | "failed" | "cancelled" | "suspended" | "detached";
 }
 
 /** Final output stays visible, explicitly provisional, until its exact save. */
@@ -48,7 +48,7 @@ export function reconcileUncommittedChatOutputs(
 export function settleUncommittedChatOutput(
   outputs: UncommittedChatOutput[],
   turnId: string,
-  state: "failed" | "cancelled"
+  state: "failed" | "cancelled" | "suspended" | "detached"
 ): UncommittedChatOutput[] {
   return outputs.map((output) => output.turnId === turnId ? { ...output, state } : output);
 }

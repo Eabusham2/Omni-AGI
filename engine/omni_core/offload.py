@@ -146,6 +146,16 @@ def _apply_memory_limit(
 
 def _mac_memory() -> Tuple[Optional[int], Optional[int]]:
     try:
+        from .darwin_memory import memory_reading
+        return memory_reading()
+    except (OSError, ValueError, AttributeError):
+        # Unsupported OS interfaces retain the previous measured fallback;
+        # neither an API failure nor a cached success fabricates free RAM.
+        return _mac_memory_command_fallback()
+
+
+def _mac_memory_command_fallback() -> Tuple[Optional[int], Optional[int]]:
+    try:
         total = int(
             subprocess.check_output(
                 ["sysctl", "-n", "hw.memsize"],
@@ -451,7 +461,7 @@ def _process_memory(*, fresh: bool = False) -> Tuple[Optional[int], Optional[int
         return None, None
 
 
-def _accelerator_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+def _accelerator_memory(device: Optional[str] = None) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """Return best-effort accelerator totals without allocating a probe tensor.
 
     CUDA has a dedicated allocator. Apple silicon is unified memory, but MPS'
@@ -460,16 +470,20 @@ def _accelerator_memory() -> Tuple[Optional[int], Optional[int], Optional[int]]:
     deliberately falls back to the physical-RAM watermark.
     """
 
+    if device == "cpu":
+        return None, None, None
     try:
-        if torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info()
-            allocated = torch.cuda.memory_allocated()
+        if (device is None or str(device).startswith("cuda")) and torch.cuda.is_available():
+            selected = None if device is None else torch.device(device)
+            free, total = torch.cuda.mem_get_info(selected)
+            allocated = torch.cuda.memory_allocated(selected)
             return int(total), int(free), int(allocated)
     except (RuntimeError, ValueError, AttributeError):
         pass
     try:
         if (
-            hasattr(torch.backends, "mps")
+            (device is None or str(device).startswith("mps"))
+            and hasattr(torch.backends, "mps")
             and torch.backends.mps.is_available()
             and hasattr(torch, "mps")
         ):
@@ -513,6 +527,7 @@ class _PolicyResourceLease:
 
     def release(self): return self._call("release")
     def backing_closed(self): return self._call("backing_closed")
+    def refresh_physical(self): return self._call("refresh_physical")
     def __enter__(self): return self
     def __exit__(self, kind, value, traceback): return self._call("__exit__", kind, value, traceback)
 
@@ -534,6 +549,8 @@ class ResourcePolicy:
         shared_resource_owner_id: Optional[str] = None,
         shared_storage_pool_bytes: int = 0,
         shared_ledger: Optional[SharedResourceLedger] = None,
+        device_resource_settings: Optional[Dict[str, Any]] = None,
+        execution_device: Optional[str] = None,
     ):
         self.probe_path = Path(probe_path)
         self.configured_ram_reserve = max(0, int(ram_reserve_bytes))
@@ -561,6 +578,45 @@ class ResourcePolicy:
         self._active_ram_thread: Optional[threading.Thread] = None
         self._active_ram_status: Optional[Dict[str, Any]] = None
         self._active_ram_sampled_at = float("-inf")
+        self.execution_device = execution_device
+        self.device_resources = None
+        if device_resource_settings is not None:
+            from .device_resources import DeviceResourceManager
+            self.device_resources = DeviceResourceManager(device_resource_settings, policy=self)
+            ram = next((entry for entry in self.device_resources.settings["allocations"] if entry["deviceId"] == "ram:system"), None)
+            if ram is not None:
+                self.configured_system_ram_share_percent = float(ram["percent"]) if ram["mode"] == "manual" else 0.0
+
+    def device_budget(self, device, host_status=None, *, fresh=False):
+        if self.device_resources is None:
+            return None
+        from .device_resources import DeviceResourceAdmissionError
+        try:
+            return self.device_resources.device_budget(str(device), host_status or self.status(), fresh=fresh)
+        except DeviceResourceAdmissionError as error:
+            raise NeuralStateResourcePause(str(error), error.status) from error
+
+    def require_device(self, device, byte_count, operation):
+        if type(byte_count) is not int or byte_count < 0:
+            raise ValueError("device reservation requires a nonnegative byte count")
+        if self.device_resources is None:
+            return None
+        from .device_resources import DeviceResourceAdmissionError
+        try:
+            return self.device_resources.require_device(str(device), byte_count, operation, self.status(fresh_memory_sample=True))
+        except DeviceResourceAdmissionError as error:
+            raise NeuralStateResourcePause(str(error), error.status) from error
+
+    def device_resource_status(self):
+        return self.device_resources.status(self.status()) if self.device_resources is not None else None
+
+    def allocate_spill_file(self, byte_count, operation, suffix, *, cancelled=None):
+        if self.device_resources is None:
+            return None
+        try:
+            return self.device_resources.allocate_spill_file(byte_count, operation, suffix, cancelled=cancelled)
+        except SharedQuotaPause as error:
+            raise NeuralStateResourcePause(str(error), {**error.status, "recoverable": True}) from error
 
     @property
     def shared_ledger(self) -> SharedResourceLedger:
@@ -738,7 +794,7 @@ class ResourcePolicy:
             total = total if total is not None else fallback_total
             available = available if available is not None else fallback_available
         accelerator_total, accelerator_free, accelerator_allocated = (
-            _accelerator_memory()
+            _accelerator_memory(self.execution_device)
             if self.include_accelerator_memory
             else (None, None, None)
         )
@@ -1125,6 +1181,24 @@ class ResourcePolicy:
                     "Manual accelerator budget was clamped to the live safe-memory watermark."
                 )
 
+        selected_device_budget = None
+        if self.device_resources is not None and self.execution_device not in (None, "cpu"):
+            # Planning may reduce exhaustive physical windows/batches, never
+            # silently exceed a selected GPU share or drop source records.
+            # The subsequent allocation still receives its own fresh check.
+            selected_device_budget = self.device_budget(self.execution_device, {
+                "systemRamBudgetBytes": system_ram_budget,
+                "diskReserveBytes": max(self.configured_disk_reserve, self._adaptive_disk_reserve(reading.disk_total_bytes)),
+                "admissionResidentMemoryBytes": admission_resident,
+                "availableSafeRamBytes": max(0, int(reading.available_memory_bytes or 0) - ram_reserve),
+                "ramAdmissionVerified": accounting_verified and reading.total_memory_bytes is not None and reading.available_memory_bytes is not None,
+            }, fresh=True)
+            selected_remaining = (selected_device_budget["remainingBytes"]
+                if selected_device_budget["enabled"] and selected_device_budget["capacityMeasured"] else 0)
+            accelerator_budget = min(accelerator_budget, selected_remaining) if accelerator_budget is not None else selected_remaining
+            if not selected_device_budget["enabled"] or not selected_device_budget["capacityMeasured"]:
+                warnings.append("The selected execution-device allocation is disabled or unmeasured; training awaits admission.")
+
         # AdamW creates two moments and gradients in addition to the already
         # resident mutable parameters. The margin absorbs allocator
         # fragmentation, routing state, Python record objects, and OS jitter.
@@ -1302,6 +1376,7 @@ class ResourcePolicy:
                 "acceleratorBudgetBytes": accelerator_budget,
                 "acceleratorHeadroomBytes": accelerator_headroom,
                 "acceleratorReserveBytes": int(accelerator_reserve),
+                "selectedDeviceBudget": selected_device_budget,
                 "optimizerAndGradientBytes": int(
                     optimizer_and_gradient_bytes
                 ),
@@ -2358,6 +2433,8 @@ class PagedWorkingMemory:
     def __init__(self, path: Path, policy: ResourcePolicy):
         self.path = Path(path)
         self.policy = policy
+        self._activity_now: Optional[Callable[[], float]] = None
+        self._activity_baseline: Optional[Dict[str, Any]] = None
         self._metrics_lock = threading.Lock()
         self._reads = 0
         self._read_misses = 0
@@ -2397,6 +2474,64 @@ class PagedWorkingMemory:
                 ON working_pages(updated_at)
                 """
             )
+
+    def bind_activity_clock(self, now: Callable[[], float], *, checkpoint_wall_at: Optional[float]) -> None:
+        """Bind the owner clock without rewriting old payloads or audit dates.
+
+        A baseline is minted once from authenticated checkpoint coordinates.
+        Reopening a copy retains it; current file time is never a substitute.
+        Unbound low-level stores retain their legacy standalone interface.
+        """
+        from .working_activity import checked_activity_baseline, read_activity_baseline
+        baseline = checked_activity_baseline(now(), checkpoint_wall_at)
+        with self._connect() as connection:
+            saved = read_activity_baseline(connection)
+        self._activity_now, self._activity_baseline = now, saved or baseline
+
+    def persist_activity_baseline(self) -> None:
+        """Publish only in the owner's mutable cache at an actual write/save."""
+        if self._activity_now is None:
+            return
+        from .working_activity import BASELINE_FORMAT, read_activity_baseline
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                saved = read_activity_baseline(connection)
+                if saved is None:
+                    self.policy.require_disk(65536, "cold working activity baseline")
+                    connection.execute("CREATE TABLE working_activity_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format TEXT NOT NULL,version INTEGER NOT NULL,activity_at REAL NOT NULL,wall_at REAL)")
+                    connection.execute("INSERT INTO working_activity_clock VALUES(1,?,1,?,?)", (BASELINE_FORMAT, self._activity_baseline["activityAt"], self._activity_baseline["wallAt"]))
+                elif saved != self._activity_baseline:
+                    raise ValueError("cold working baseline changed while its owner was active")
+                connection.execute("COMMIT")
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+
+    @property
+    def activity_clock_bound(self) -> bool:
+        return self._activity_now is not None
+
+    def _ranking_now(self) -> float:
+        value = time.time() if self._activity_now is None else self._activity_now()
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError("cold working recency clock is invalid")
+        return float(value)
+
+    def activity_timestamp(self, metadata: Mapping[str, Any], updated_at: float) -> Optional[float]:
+        if self._activity_now is None:
+            return float(updated_at)
+        from .working_activity import page_activity_at
+        return page_activity_at(metadata, updated_at, self._activity_baseline)
+
+    def _stamp_activity(self, metadata: Mapping[str, Any]) -> Dict[str, Any]:
+        output = dict(metadata)
+        if self._activity_now is not None:
+            from .working_activity import ACTIVITY_FIELD
+            output[ACTIVITY_FIELD] = self._ranking_now()
+            output.pop("activityRecencyUnknown", None)
+        return output
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -2459,7 +2594,7 @@ class PagedWorkingMemory:
         *,
         assembly_id: str,
         metadata: Mapping[str, Any],
-        updated_at: float,
+        updated_at: Optional[float],
         active_ids: frozenset[str],
         unfinished_ids: frozenset[str],
         now: float,
@@ -2485,7 +2620,7 @@ class PagedWorkingMemory:
             salience = 0.0
             retention = 0.0
             rehearsals = 0
-        recency = math.exp(-max(0.0, now - float(updated_at)) / 3600.0)
+        recency = 0.0 if updated_at is None else math.exp(-max(0.0, now - float(updated_at)) / 3600.0)
         return (
             5.0 * float(assembly_id in active_ids)
             + 5.5 * float(assembly_id in unfinished_ids)
@@ -2532,9 +2667,10 @@ class PagedWorkingMemory:
         self.policy.require_disk(
             max(64 * 1024, len(payload) * 3), "working-memory page spill"
         )
+        self.persist_activity_baseline()
         page_id = uuid.uuid4().hex
         metadata_json = json.dumps(
-            dict(metadata), sort_keys=True, separators=(",", ":")
+            self._stamp_activity(metadata), sort_keys=True, separators=(",", ":"), allow_nan=False
         )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2603,10 +2739,19 @@ class PagedWorkingMemory:
                 raise KeyError("working-memory page not found: %s" % page_key)
             value, metadata = self._decode_page_row(row)
             if touch:
-                connection.execute(
-                    "UPDATE working_pages SET updated_at = ? WHERE page_id = ?",
-                    (time.time(), page_key),
-                )
+                if self._activity_now is not None:
+                    # Validate the previous coordinate before replacing it.
+                    self.activity_timestamp(metadata, float(row[8]))
+                    self.persist_activity_baseline()
+                    stored = self._stamp_activity(json.loads(str(row[3])))
+                    connection.execute("UPDATE working_pages SET metadata_json=?,updated_at=? WHERE page_id=?",
+                        (json.dumps(stored, sort_keys=True, separators=(",", ":"), allow_nan=False), time.time(), page_key))
+                    metadata.update(stored)
+                else:
+                    connection.execute(
+                        "UPDATE working_pages SET updated_at = ? WHERE page_id = ?",
+                        (time.time(), page_key),
+                    )
         self._note_io(read=True, bytes_read=value.numel() * value.element_size())
         return value, metadata
 
@@ -2666,7 +2811,7 @@ class PagedWorkingMemory:
         maximum = max(0, int(limit))
         if not candidates or maximum == 0:
             return []
-        now = time.time()
+        now = self._ranking_now()
         ranked: List[Tuple[float, int, str]] = []
         # SQLite builds before 3.32 may allow only 999 bound variables. The
         # chunk size is a query parameter budget, not a candidate/recall cap.
@@ -2696,7 +2841,7 @@ class PagedWorkingMemory:
                     priority = self._cold_priority(
                         assembly_id=assembly_key,
                         metadata=metadata,
-                        updated_at=float(updated_at),
+                        updated_at=self.activity_timestamp(metadata, float(updated_at)),
                         active_ids=active,
                         unfinished_ids=unfinished,
                         now=now,
@@ -2805,7 +2950,8 @@ class PagedWorkingMemory:
             count = len(rows)
             remove = max(0, count - maximum)
             if remove:
-                now = time.time()
+                self.persist_activity_baseline()
+                now = self._ranking_now()
                 ranked: List[Tuple[float, int]] = []
                 for sequence, _page_id, assembly_id, metadata_json, updated_at in rows:
                     try:
@@ -2822,7 +2968,7 @@ class PagedWorkingMemory:
                             self._cold_priority(
                                 assembly_id=str(assembly_id),
                                 metadata=metadata,
-                                updated_at=float(updated_at),
+                                updated_at=self.activity_timestamp(metadata, float(updated_at)),
                                 active_ids=frozenset(),
                                 unfinished_ids=frozenset(),
                                 now=now,

@@ -33,14 +33,19 @@ async function fixture() {
   const metadata = { brain_id: brain.id, config: { hardware_tier: "micro", d_model: shape.dModel, n_layers: shape.layers,
     working_memory_slots: 128, native_architecture: current } };
   await writeFile(join(engine, "brain.json"), JSON.stringify(metadata));
-  await writeFile(join(engine, "core.safetensors"), Buffer.alloc(1024));
-  await writeFile(join(engine, "plasticity.safetensors"), Buffer.alloc(1024));
+  for (const name of ["core", "plasticity"]) {
+    const header = Buffer.from(JSON.stringify({ [`${name}.fixture`]: { dtype: "U8", shape: [768], data_offsets: [0, 768] } }).padEnd(248, " "));
+    const prefix = Buffer.alloc(8); prefix.writeBigUInt64LE(248n);
+    await writeFile(join(engine, `${name}.safetensors`), Buffer.concat([prefix, header, Buffer.alloc(768)]));
+  }
   const planner = new ResourcePlanner(repository.root, {
     readResources: async () => ({ totalMemoryBytes: 32 * GIB, availableMemoryBytes: 24 * GIB, diskTotalBytes: 500 * GIB, diskFreeBytes: 300 * GIB }),
     benchmark: async () => ({ measuredAt: "2026-09-30T00:00:00Z", sampleBytes: 4096, memoryBytesPerSecond: 20 * GIB, storageBytesPerSecond: GIB, cacheHit: true })
   });
   const request = vi.fn(async () => ({}));
-  const service = new BrainService(repository, { request, tryRequest: vi.fn(async () => undefined) } as unknown as EngineSupervisor, planner);
+  const service = new BrainService(repository, { request, tryRequest: vi.fn(async () => undefined),
+    instanceStatus: vi.fn(async () => ({ brainId: brain.id, learnedRuntimeResident: false, minimumContextTokens: 0, reconnect: [] }))
+  } as unknown as EngineSupervisor, planner);
   return { root, repository, brain, original, current, engine, metadata, planner, request, service };
 }
 
@@ -58,19 +63,19 @@ describe("runtime settings preserve saved learned geometry", () => {
     }
   });
 
-  it("applies context, RAM and pool changes while preserving current and original hashes", async () => {
+  it("saves offline context, RAM and pool changes without loading while preserving current and original hashes", async () => {
     const value = await fixture();
     const updated = await value.service.updateConfig(value.brain.id, {
       ...value.brain.config, workingMemorySlots: 65_536, nativeArchitecture: value.original,
       workingMemoryMode: "extended", extendedWorkingMemory: true, contextWindowTokens: 512,
+      bestWorkEnabled: true, bestWorkExplorationBranches: 8,
       systemRamMode: "manual", systemRamSharePercent: 54, storagePoolMode: "manual", storagePoolBytes: 2 * GIB
     });
     expect(updated.config).toMatchObject({ workingMemorySlots: 128, contextWindowTokens: 512,
+      bestWorkEnabled: true, bestWorkExplorationBranches: 8,
       workingMemoryMode: "extended", systemRamSharePercent: 54, storagePoolBytes: 2 * GIB,
       nativeArchitecture: { sha256: value.current.sha256 } });
-    expect(value.request).toHaveBeenCalledWith("update_config", expect.objectContaining({ config: expect.objectContaining({
-      workingMemorySlots: 128, nativeArchitecture: { ...value.current }, contextWindowTokens: 512
-    }) }), 300_000);
+    expect(value.request).not.toHaveBeenCalled();
     const origin = JSON.parse(await readFile(join(value.repository.brainDirectory(value.brain.id), "origin.json"), "utf8"));
     expect(origin.config.nativeArchitecture.sha256).toBe(value.original.sha256);
     expect(origin.config.workingMemorySlots).toBe(128);

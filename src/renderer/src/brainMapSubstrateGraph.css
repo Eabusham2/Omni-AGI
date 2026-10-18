@@ -1,0 +1,14 @@
+.brain-map-graph{position:relative;width:100%;max-width:100%;min-width:0}
+.brain-map-graph>svg{display:block;width:100%;max-width:100%;min-width:0;aspect-ratio:1000/650;height:auto;min-height:220px;max-height:440px}
+.brain-map-graph[data-dimension="3d"]>svg{touch-action:none;cursor:grab}
+.brain-map-graph[data-dimension="3d"]>svg:active{cursor:grabbing}
+.brain-map-graph__dimensions{position:absolute;right:12px;top:12px;z-index:1;max-width:calc(100% - 24px);flex-wrap:wrap}
+.brain-map-graph__dimensions button{color:var(--text);border:1px solid var(--border);background:var(--surface-2,var(--surface-solid));min-height:32px}
+.brain-map-graph__dimensions button:focus-visible,.brain-map-graph>svg:focus-visible{outline:2px solid var(--graph-node-stroke-selected);outline-offset:3px}
+.brain-map-graph__scope{display:block;position:static;margin:8px 12px 4px;max-width:calc(100% - 24px);color:var(--text-2);font-size:12px;overflow-wrap:anywhere}
+.brain-map-graph .graph-node:focus-visible{outline:none}
+.brain-map-graph .graph-node:focus-visible>circle{stroke:var(--graph-node-stroke-selected);stroke-width:3px}
+.brain-map-graph [data-contact-id][data-firing="observed"]{stroke:var(--graph-node-ink)}
+.brain-map-graph .graph-edge--structural{stroke:var(--text-3);stroke-dasharray:3 5;stroke-opacity:.65}
+.brain-map-graph .graph-edge--structural[aria-pressed="true"]{stroke-opacity:.95}
+@media(max-width:600px){.brain-map-graph__dimensions{right:6px;top:6px}}

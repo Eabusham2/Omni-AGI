@@ -85,7 +85,9 @@ describe("cross-workspace chat activity", () => {
     expect(workspaceViewWaitsForForegroundTurn("map", active)).toBe(false);
     expect(workspaceViewWaitsForForegroundTurn("trace", active)).toBe(false);
     expect(workspaceViewWaitsForForegroundTurn("data", active)).toBe(false);
-    expect(workspaceViewWaitsForForegroundTurn("tools", active)).toBe(true);
+    expect(workspaceViewWaitsForForegroundTurn("schedule", active)).toBe(false);
+    expect(workspaceViewWaitsForForegroundTurn("tools", active)).toBe(false);
+    expect(workspaceViewWaitsForForegroundTurn("settings", active)).toBe(false);
     expect(workspaceViewWaitsForForegroundTurn("imagine", active)).toBe(true);
     expect(dataActionAvailableDuringTurn("queue-long-job", true)).toBe(true);
     expect(dataActionAvailableDuringTurn("immediate-write", true)).toBe(false);

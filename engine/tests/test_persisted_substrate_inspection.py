@@ -64,6 +64,20 @@ def synapse(identifier, source, target, effective=1):
 
 
 class PersistedSubstrateInspectionTests(unittest.TestCase):
+    def test_weighted_graph_inspection_reports_actual_gains_and_repeated_contacts(self):
+        substrate = NeuralSubstrate(16, seed=7)
+        first = substrate._ensure_neuron('first', 1.)
+        second = substrate._ensure_neuron('second', 1.)
+        for moment in range(18):
+            substrate._strengthen_synapse(first, second, moment + 2., kind='association', amount=10.)
+        self.persist(substrate)
+        page = query_persisted_substrate(self.engine, self.brain_id, {'entity': 'synapses', 'zoom': 1, 'pageSize': 10})
+        records = page['synapses']
+        self.assertEqual([row['effectiveContribution'] for row in records], [16, 2])
+        self.assertEqual([row['connectionStrength'] for row in records], [16, 2])
+        self.assertEqual([row['parallelOrdinal'] for row in records], [0, 1])
+        self.assertEqual(records[1]['parallelRootId'], records[0]['id'])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="omni-inspection-test-")
         self.brain = Path(self.temporary.name) / "brain"
@@ -192,7 +206,7 @@ class PersistedSubstrateInspectionTests(unittest.TestCase):
             worker = Worker()
         self.assertEqual(
             set(worker.methods),
-            {"health", "query_substrate", "cancel", "shutdown"},
+            {"health", "query_substrate", "query_cortex", "query_concept_id_view", "cancel", "shutdown"},
         )
         self.assertFalse(worker.health({}, "health")["capabilities"]["neuralMutation"])
 
@@ -203,7 +217,7 @@ class PersistedSubstrateInspectionTests(unittest.TestCase):
         view = PersistedSubstrateView.open(self.engine, self.brain_id)
         shard = view.kind_shards("neurons")[0]
         self.assertEqual(
-            set(view.tensors(shard)), {"packed_rows", "update_counters_le"}
+            set(view.tensors(shard)), {"packed_rows", "update_counters_le", "connection_state", "parallel_offsets_le", "parallel_records"}
         )
         altered = view.records(shard)
         altered["packedVectorState"]["packedSha256"] = "0" * 64
@@ -349,9 +363,9 @@ class PersistedSubstrateInspectionTests(unittest.TestCase):
         adjacency_path = (
             self.store
             / "inspection"
-            / "adjacency"
-            / "generations"
-            / (pointer["activeGeneration"] + ".json")
+            / "query-generations"
+            / pointer["activeGeneration"]
+            / "manifest.json"
         )
         self.assertTrue(adjacency_path.is_file())
         manifest = json.loads(adjacency_path.read_text("utf-8"))

@@ -64,7 +64,6 @@ class TernaryPackingTests(unittest.TestCase):
             {
                 "cortex.image.weight": ((2, 1, 3, 3), "projection"),
                 "cortex.input.weight": ((3, 5), "projection"),
-                "cortex.recurrent.weights": ((3, 3), "dynamic-synapse"),
                 "substrate.grown.weights": ((3,), "dynamic-synapse"),
             },
         )
@@ -115,7 +114,7 @@ class TernaryPackingTests(unittest.TestCase):
             {
                 "cortex.image.weight",
                 "cortex.input.weight",
-                "cortex.recurrent.weights",
+                "cortex.recurrent.blocks.r0_c0.weights",
                 "substrate.grown.weights",
             },
         )
@@ -151,7 +150,8 @@ class TernaryPackingTests(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(
                         verified.tensors[spec.name],
-                        spec.values.detach().cpu().to(torch.int8),
+                        (spec.values.detach().cpu().to(torch.int8) if isinstance(spec.values, torch.Tensor)
+                         else decode_ternary_2bit(b"".join(__import__("omni_core.streamed_ternary", fromlist=["source_chunks"]).source_chunks(spec.values)), spec.values.shape)),
                     )
                 )
             entries = {
@@ -163,7 +163,7 @@ class TernaryPackingTests(unittest.TestCase):
                 entries["cortex.input.weight"]["scale"], expected_scale
             )
             self.assertEqual(
-                entries["cortex.recurrent.weights"]["kind"],
+                entries["cortex.recurrent.blocks.r0_c0.weights"]["kind"],
                 "dynamic-synapse",
             )
             self.assertEqual(
@@ -181,7 +181,7 @@ class TernaryPackingTests(unittest.TestCase):
             model.input._packed_forward_scale.fill_(float("nan"))
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaisesRegex(
-                ValueError, "packed-authoritative scale must be finite"
+                ValueError, "cortex.input.weight has an invalid scale"
             ):
                 export_module_ternary_shards(Path(folder), {"cortex": model})
 
@@ -226,7 +226,7 @@ class TernaryPackingTests(unittest.TestCase):
             projection = manifest["tensors"][0]
             shard = path / projection["shard"]
             payload = bytearray(shard.read_bytes())
-            payload[0] ^= 0x01
+            payload[0] ^= 0x02  # Original +1 becomes -1: valid codes, wrong checksum.
             shard.write_bytes(payload)
             with self.assertRaisesRegex(TernaryIntegrityError, "shard checksum mismatch"):
                 verify_ternary_shards(path, retain_names=())
@@ -237,8 +237,6 @@ class TernaryPackingTests(unittest.TestCase):
 
             # Even a valid ternary change with repaired outer hashes must fail
             # the unretained tensor's decoded-content checksum.
-            payload[0] ^= 0x03  # Original +1 lane becomes a valid -1 lane.
-            shard.write_bytes(payload)
             packed_sha = hashlib.sha256(payload).hexdigest()
             projection["packedSha256"] = packed_sha
             next(

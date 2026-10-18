@@ -41,6 +41,10 @@ from .paged_assembly_view import PagedAssemblyView
 from .paged_packed_vectors import PagedPackedVectors
 from .paged_neuron_metadata import PagedNeuronMetadata
 from .paged_vector_scoring import prepare_exact_paged_similarity
+from .weighted_substrate_state import (
+    synapse_strength, synapse_contribution, pack_strengths, unpack_strengths,
+    WeightedForwardSigns, forward_contribution,
+)
 from .substrate_inspection import (
     neuron_shard_inspection,
     synapse_shard_inspection,
@@ -59,6 +63,7 @@ _SUBSTRATE_STORE_VERSION = 3
 _READABLE_SUBSTRATE_STORE_VERSIONS = frozenset((1, 2, 3))
 _SYNAPSE_TENSOR_FIELDS = (
     "effective_weight",
+    "connection_strength",
     "eligibility",
     "plasticity",
     "uses",
@@ -157,19 +162,23 @@ class _RevisionedNodes(dict):
 class _TrackedSynapseRecord(dict):
     """Notify its owner when a forward edge or endpoint changes in place."""
 
-    _FORWARD_FIELDS = frozenset(("source_id", "target_id", "effective_weight"))
+    _FORWARD_FIELDS = frozenset(("source_id", "target_id", "effective_weight", "connection_strength"))
 
     def __init__(
         self, value: Mapping[str, Any], changed: Callable[[], None],
         metadata_changed: Optional[Callable[[], None]] = None,
+        before_changed: Optional[Callable[[], None]] = None,
     ):
         super().__init__(value)
         self._changed = changed
         self._metadata_changed = metadata_changed
+        self._before_changed = before_changed
 
     def __setitem__(self, key: str, value: Any) -> None:
         updated = key not in self or self[key] != value
         changed = key in self._FORWARD_FIELDS and updated
+        if updated and self._before_changed is not None:
+            self._before_changed()
         super().__setitem__(key, value)
         if changed:
             self._changed()
@@ -177,6 +186,8 @@ class _TrackedSynapseRecord(dict):
             self._metadata_changed()
 
     def __delitem__(self, key: str) -> None:
+        if self._before_changed is not None:
+            self._before_changed()
         super().__delitem__(key)
         if key in self._FORWARD_FIELDS:
             self._changed()
@@ -197,6 +208,8 @@ class _TrackedSynapseRecord(dict):
         return default
 
     def popitem(self) -> Tuple[str, Any]:
+        if self._before_changed is not None:
+            self._before_changed()
         key, value = super().popitem()
         if key in self._FORWARD_FIELDS:
             self._changed()
@@ -207,6 +220,8 @@ class _TrackedSynapseRecord(dict):
     def clear(self) -> None:
         updated = bool(self)
         changed = any(key in self for key in self._FORWARD_FIELDS)
+        if updated and self._before_changed is not None:
+            self._before_changed()
         super().clear()
         if changed:
             self._changed()
@@ -312,11 +327,23 @@ def _unpack_ternary_level(packed: bytes, index: int) -> int:
     return code - 1
 
 
+def _weighted_forward_signs(entry, structures, packed):
+    encoded = entry.get("packedConnectionStrengths")
+    if encoded is None:
+        strengths = bytes((int(entry["count"]) + 1) // 2)
+    else:
+        if not isinstance(encoded, str):
+            raise ValueError("forward memory connection strength encoding is invalid")
+        strengths = base64.b64decode(encoded, validate=True)
+    return WeightedForwardSigns(packed, strengths, int(entry["count"]), positions=tuple(row[0] for row in structures))
+
+
 def _unpack_persisted_synapse_weights(
     tensors: Dict[str, torch.Tensor], count: int, version: int
 ) -> torch.Tensor:
     """Normalize one bounded shard for in-memory use after exact validation."""
 
+    tensors["connection_strength"] = unpack_strengths(tensors.get("packed_connection_strength"), count)
     if version == 1:
         weights = tensors.get("effective_weight")
         if weights is None or int(weights.numel()) != count:
@@ -390,6 +417,7 @@ def _forward_index_entry(
 ) -> Dict[str, Any]:
     structures: List[List[Any]] = []
     levels: List[int] = []
+    strengths: List[int] = []
     hot_locations: List[List[Any]] = []
     synaptic_uses = 0
     for index, (record_id, record) in enumerate(group):
@@ -402,6 +430,7 @@ def _forward_index_entry(
         if isinstance(uses, bool) or not isinstance(uses, int) or uses < 0:
             raise ValueError("substrate forward index synaptic uses are invalid")
         synaptic_uses += uses
+        strengths.append(synapse_strength(record))
         if weight:
             structures.append([index, record_id, source, target])
             levels.append(weight)
@@ -427,6 +456,7 @@ def _forward_index_entry(
         "packedEffectiveWeights": base64.b64encode(
             _pack_ternary_levels(levels)
         ).decode("ascii"),
+        "packedConnectionStrengths": base64.b64encode(pack_strengths(strengths)).decode("ascii"),
         "hotLocations": sorted(hot_locations),
     }
 
@@ -635,6 +665,13 @@ def _load_forward_index(
         seen.add(key)
     if observed != int(synapse_count):
         raise ValueError("substrate forward index count diverges")
+    if index_version == 4 and any(
+        entry.get("connectionStateVersion") != 1 or entry.get("strengthBytes") != (entry["count"] + 1) // 2
+        for entry in entries
+    ):
+        # A pre-strength derived cache cannot establish the current gain of
+        # every contact. Rebuild once from the actual checked neural shards.
+        return None
     if legacy_index:
         # A valid v1 cache can be upgraded only by scanning its checksummed
         # authoritative shards. Tampered/stale v1 content already failed above.
@@ -792,6 +829,8 @@ class NeuralSubstrate:
         self.state_revision = 0
         self.growth_guard = growth_guard
         self.persistence_manifest: Optional[Dict[str, Any]] = None
+        self._persistence_store_root: Optional[Path] = None
+        self._weighted_representation_cache: Optional[Tuple[str, Dict[str, set]]] = None
         # Firing/eligibility is a small epoch-scoped overlay. Learned record
         # fields remain byte-identical across a fresh-attention boundary; an
         # empty overlay makes their prior values logically inactive without
@@ -885,7 +924,7 @@ class NeuralSubstrate:
             paged.import_state(metadata, tensors)
             for identifier in identifiers:
                 if (
-                    paged.packed_row(identifier) != source.packed_row(identifier)
+                    paged.row_payload(identifier) != source.row_payload(identifier)
                     or paged.update_count(identifier) != source.update_count(identifier)
                 ):
                     raise ValueError("paged vector migration changed a learned row")
@@ -1423,25 +1462,26 @@ class NeuralSubstrate:
             return F.normalize(
                 self.space.symbol("empty-assembly").reshape(1, -1), dim=-1
             )[0]
-        vectors = []
-        for index, label in enumerate(labels):
-            neuron_id = hashlib.sha256(
-                ("semantic:%s" % label).encode("utf-8")
-            ).hexdigest()[:24]
-            neuron = self.neuron_vectors.get(
-                neuron_id, self.space.symbol("semantic-neuron:" + label)
-            )
-            role = self.space.symbol("position:%d" % index)
-            vectors.append(
-                self.space.permute(self.space.bind(neuron, role), steps=index + 1)
-            )
+        from .streamed_vsa_activity import streamed_activity_mean
+
+        def vectors():
+            for index, label in enumerate(labels):
+                neuron_id = hashlib.sha256(
+                    ("semantic:%s" % label).encode("utf-8")
+                ).hexdigest()[:24]
+                neuron = self.neuron_vectors.get(neuron_id)
+                if neuron is None:
+                    neuron = self.space.symbol("semantic-neuron:" + label)
+                role = self.space.symbol("position:%d" % index)
+                yield self.space.permute(self.space.bind(neuron, role), steps=index + 1)
         # The cue is transient activity, not a synaptic weight. Keep its
         # continuous superposition at unit norm to match the normalized
         # read view of packed neuron and assembly rows, including sensory
         # assemblies, without persisting a second learned scale.
-        activity = torch.stack(vectors).mean(dim=0)
+        activity = streamed_activity_mean(vectors(), self.space.dimensions)
         if float(activity.norm()) <= 1e-8:
-            activity = self.space.bundle(vectors)
+            activity = torch.sign(activity)
+            activity[activity == 0] = 1.0
         return F.normalize(activity.reshape(1, -1), dim=-1)[0]
 
     def vector_for_text(self, text: str) -> torch.Tensor:
@@ -1452,14 +1492,14 @@ class NeuralSubstrate:
     ) -> torch.Tensor:
         """Compose the *current* distributed activity without sign quantization."""
 
-        pieces = []
-        for index, neuron_id in enumerate(neuron_ids):
-            neuron = self.neuron_vectors[neuron_id]
-            role = self.space.symbol("position:%d" % index)
-            pieces.append(
-                self.space.permute(self.space.bind(neuron, role), steps=index + 1)
-            )
-        return torch.stack(pieces).mean(dim=0)
+        from .streamed_vsa_activity import streamed_activity_mean
+
+        def pieces():
+            for index, neuron_id in enumerate(neuron_ids):
+                neuron = self.neuron_vectors[neuron_id]
+                role = self.space.symbol("position:%d" % index)
+                yield self.space.permute(self.space.bind(neuron, role), steps=index + 1)
+        return streamed_activity_mean(pieces(), self.space.dimensions)
 
     def _adapt_coactive_vectors(
         self, neuron_ids: Sequence[str], importance: float
@@ -1496,18 +1536,16 @@ class NeuralSubstrate:
                 )
                 if synapse is None:
                     continue
-                effective = self.exact_effective_weight(
-                    synapse.get("effective_weight", 0)
-                )
-                eligibility = self.effective_eligibility(synapse)
-                if effective == 0 or eligibility <= 0.0:
+                effective = sum(synapse_contribution(contact) * self.effective_eligibility(contact)
+                    for contact in self._parallel_synapse_records(synapse))
+                if effective == 0:
                     continue
                 contexts.append(
                     self.space.permute(
                         prior[neighbor_id], steps=neighbor_index - index
                     )
                 )
-                strengths.append(effective * eligibility)
+                strengths.append(effective)
             magnitude = sum(abs(value) for value in strengths)
             if not contexts or magnitude <= 1e-8:
                 continue
@@ -1531,68 +1569,73 @@ class NeuralSubstrate:
         self._mark_state_changed()
         return integrated
 
+    def _parallel_synapse_records(self, root):
+        yield root
+        count = root.get("parallel_count", 0)
+        if type(count) is not int or count < 0:
+            raise ValueError("memory parallel connection count is invalid")
+        for ordinal in range(1, count + 1):
+            identifier = str(root["id"]) + "#contact=" + str(ordinal)
+            record = self.synapses.get(identifier)
+            if record is None:
+                raise ValueError("memory parallel connection is missing")
+            yield record
+
     def _strengthen_synapse(
-        self,
-        source: str,
-        target: str,
-        timestamp: float,
-        *,
-        kind: str,
-        amount: float,
+        self, source: str, target: str, timestamp: float, *, kind: str, amount: float,
     ) -> None:
         if source == target:
             return
-        synapse_id = "%s>%s:%s" % (source, target, kind)
-        synapse = self.synapses.get(synapse_id)
-        if synapse is None:
-            # A first exposure creates an immediately usable, exact ternary
-            # pathway. No duplicate floating-point synaptic weight is kept.
-            synapse = {
-                "id": synapse_id,
-                "source_id": source,
-                "target_id": target,
-                "kind": kind,
-                "effective_weight": (1 if amount > 0 else (-1 if amount < 0 else 0)),
-                "eligibility": 0.0,
-                "plasticity": 1.0,
-                "uses": 0,
-                "stability": 0.0,
-                "last_updated_at": timestamp,
+        base_id = "%s>%s:%s" % (source, target, kind)
+        base = self.synapses.get(base_id)
+        if base is None:
+            self._check_growth(1024 + 4 * len(base_id))
+            self.synapses[base_id] = {
+                "id": base_id, "source_id": source, "target_id": target, "kind": kind,
+                "effective_weight": 1 if amount > 0 else -1 if amount < 0 else 0,
+                "connection_strength": 1, "parallel_count": 0,
+                "eligibility": 0.0, "plasticity": 1.0, "uses": 0,
+                "stability": 0.0, "last_updated_at": timestamp,
             }
-            self.synapses[synapse_id] = synapse
-            synapse = self.synapses[synapse_id]
+            base = self.synapses[base_id]
             self.growth_events += 1
             created = True
         else:
             created = False
+        count = base.get("parallel_count", 0)
+        if type(count) is not int or count < 0:
+            raise ValueError("memory parallel connection count is invalid")
+        synapse_id = base_id if count == 0 else base_id + "#contact=" + str(count)
+        synapse = base if count == 0 else self.synapses.get(synapse_id)
+        if synapse is None:
+            raise ValueError("memory parallel connection is missing")
         synapse["uses"] += 1
-        synapse["stability"] = min(
-            20.0, float(synapse.get("stability", 0.0)) + 0.01
-        )
-        local_rate = float(synapse.get("plasticity", 1.0)) / (
-            1.0 + float(synapse["stability"])
-        )
-        # Signed eligibility is a decaying spike-timing trace, not a second
-        # synaptic weight. Subthreshold events accumulate in this short-lived
-        # state until they cause an exact {-1,0,+1} transition. The trace can
-        # be cleared with attention without erasing the learned pathway.
-        timing = max(
-            -1.0,
-            min(
-                1.0,
-                self._signed_eligibility(synapse) * 0.8
-                + amount * local_rate,
-            ),
-        )
-        weight = self.exact_effective_weight(synapse["effective_weight"])
-        if not created and timing >= 0.25 and weight < 1:
-            weight += 1
-            timing -= 0.25
-        elif not created and timing <= -0.25 and weight > -1:
-            weight -= 1
-            timing += 0.25
+        synapse["stability"] = min(20.0, float(synapse.get("stability", 0.0)) + 0.01)
+        local_rate = float(synapse.get("plasticity", 1.0)) / (1.0 + float(synapse["stability"]))
+        timing = max(-1.0, min(1.0, self._signed_eligibility(synapse) * 0.8 + amount * local_rate))
+        value = synapse_contribution(synapse)
+        direction = 1 if timing >= 0.25 else -1 if timing <= -0.25 else 0
+        if not created and direction:
+            desired = value + direction
+            if abs(desired) <= 16:
+                synapse["effective_weight"] = 1 if desired > 0 else -1 if desired < 0 else 0
+                synapse["connection_strength"] = max(1, abs(desired))
+            else:
+                next_id = base_id + "#contact=" + str(count + 1)
+                self._check_growth(1024 + 4 * len(next_id))
+                if next_id in self.synapses:
+                    raise ValueError("memory parallel connection identity is already allocated")
+                self.synapses[next_id] = {
+                    "id": next_id, "source_id": source, "target_id": target, "kind": kind,
+                    "effective_weight": direction, "connection_strength": 1,
+                    "eligibility": 0.0, "plasticity": 1.0, "uses": 1,
+                    "stability": 0.0, "last_updated_at": timestamp,
+                }
+                base["parallel_count"] = count + 1
+                self.growth_events += 1
+                self.mark_attention_synapse(next_id)
+            timing -= direction * 0.25
         synapse["eligibility"] = timing
-        synapse["effective_weight"] = weight
         synapse["last_updated_at"] = timestamp
         self.mark_attention_synapse(synapse_id)
         self._mark_state_changed()
@@ -1703,7 +1746,7 @@ class NeuralSubstrate:
         )
         if not labels:
             labels = ["empty-experience"]
-        packed_vector_bytes = (self.space.dimensions + 3) // 4 + 8
+        packed_vector_bytes = (self.space.dimensions + 3) // 4 + self.space.dimensions + 8 + 12
         estimated = (
             len(labels) * (packed_vector_bytes + 640)
             + len(labels) * 20 * 320
@@ -2111,7 +2154,7 @@ class NeuralSubstrate:
         # This estimate is deliberately conservative and is checked before any
         # mutation. It covers new atoms, local/membership pathways, an indexed
         # seed field when novel, and newly observed source provenance.
-        packed_vector_bytes = (self.space.dimensions + 3) // 4 + 8
+        packed_vector_bytes = (self.space.dimensions + 3) // 4 + self.space.dimensions + 8 + 12
         estimated = (
             new_neurons * (packed_vector_bytes + 640)
             + len(labels) * 18 * 320
@@ -2393,15 +2436,13 @@ class NeuralSubstrate:
         inhibitory_edges = 0
         eligible_edges = 0
         persisted_edges = (
-            self.synapses.iter_effective_edges()
+            self.synapses.iter_weighted_edges()
             if isinstance(self.synapses, LazyPersistedSynapses)
             else (
                 (
                     str(synapse["source_id"]),
                     str(synapse["target_id"]),
-                    self.exact_effective_weight(
-                        synapse.get("effective_weight", 0)
-                    ),
+                    synapse_contribution(synapse),
                 )
                 for synapse in self.synapses.values()
             )
@@ -2414,7 +2455,7 @@ class NeuralSubstrate:
             eligible_edges += 1
             inhibitory_edges += int(effective < 0)
             adjacency[source].append((target, effective))
-            incoming[target] += 1
+            incoming[target] += abs(effective)
 
         cacheable = revision is not None
         if cacheable:
@@ -2449,6 +2490,24 @@ class NeuralSubstrate:
         *,
         workspace_slots: Optional[int] = None,
         record_activity: bool = True,
+        cancelled=None,
+    ) -> Tuple[torch.Tensor, Sequence[Dict[str, Any]]]:
+        if record_activity:
+            return self._recall_vector_impl(cue, workspace_slots=workspace_slots, record_activity=True,
+                cancelled=cancelled)
+        from .paged_read_session import ReadSession, keeper_eligible_stores
+        stores = (self.neurons, self.neuron_vectors, getattr(self.assemblies, 'index', None))
+        with ReadSession(keeper_eligible_stores(stores), cancelled=cancelled):
+            return self._recall_vector_impl(cue, workspace_slots=workspace_slots, record_activity=False,
+                cancelled=cancelled)
+
+    def _recall_vector_impl(
+        self,
+        cue: torch.Tensor,
+        *,
+        workspace_slots: Optional[int] = None,
+        record_activity: bool = True,
+        cancelled=None,
     ) -> Tuple[torch.Tensor, Sequence[Dict[str, Any]]]:
         """Recall by similarity followed by recurrent spreading activation.
 
@@ -2464,7 +2523,8 @@ class NeuralSubstrate:
             isinstance(self.assemblies, PagedAssemblyView)
             and isinstance(self.neuron_vectors, PagedPackedVectors)
         ):
-            return self._recall_vector_paged(cue, workspace_slots=workspace_slots, record_activity=record_activity)
+            return self._recall_vector_paged(cue, workspace_slots=workspace_slots, record_activity=record_activity,
+                cancelled=cancelled)
         # The metadata and packed-neuron stores are separate SQLite files in
         # paged mode. Score only assembly IDs through a paired generation
         # provider: an all-neuron scan would mistake ordinary neurons for
@@ -2668,6 +2728,7 @@ class NeuralSubstrate:
 
     def _recall_vector_paged(
         self, cue: torch.Tensor, *, workspace_slots: Optional[int], record_activity: bool,
+        cancelled=None,
     ):
         from .paged_recurrent_spreading import PagedRecurrentState
         from .paged_recall_graph import PagedRecallGraph
@@ -2685,6 +2746,8 @@ class NeuralSubstrate:
             # Corpus/frontier bytes live on disk, not in an equally large
             # resident mirror. Charge the actual SQLite write envelope and
             # only the bounded per-connection RAM window.
+            if cancelled is not None and cancelled():
+                raise InterruptedError("native paged recurrent recall cancelled at a resource boundary")
             source = source_reference()
             if source is None:
                 raise RuntimeError("paged recurrent execution source is closed")
@@ -2706,13 +2769,19 @@ class NeuralSubstrate:
                 graph = PagedRecallGraph(self.assemblies.index.path.parent / "recall", reserve=reserve)
                 try:
                     edges = (
-                        self.synapses.iter_effective_edge_records() if isinstance(self.synapses, LazyPersistedSynapses)
+                        self.synapses.iter_weighted_edge_records() if isinstance(self.synapses, LazyPersistedSynapses)
                         else ((str(identifier), str(value["source_id"]), str(value["target_id"]),
-                               self.exact_effective_weight(value.get("effective_weight", 0)))
+                               synapse_contribution(value))
                               for identifier, value in self.synapses.items())
                     )
                     graph.load(edges, node_exists=lambda identifier: identifier in self.neurons,
-                               synapse_revision=initial_graph_revision, neuron_revision=initial_neuron_revision)
+                               synapse_revision=initial_graph_revision, neuron_revision=initial_neuron_revision,
+                               read_stores=(self.neurons,), cancelled=cancelled,
+                               node_exists_many=(
+                                   (lambda identifiers: self.neurons.contains_many(
+                                       identifiers, expected_graph_revision=initial_neuron_revision))
+                                   if isinstance(self.neurons, PagedNeuronMetadata) else None
+                               ))
                 except BaseException:
                     graph.close()
                     raise
@@ -2894,10 +2963,19 @@ class NeuralSubstrate:
 
         def identifiers(field: str, available: Mapping[str, Any]) -> set[str]:
             values = overlay.get(field, [])
-            if not isinstance(values, list) or not all(
-                isinstance(value, str) and value in available
-                for value in values
-            ):
+            if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                raise ValueError("substrate attention overlay ids are invalid")
+            contains_many = getattr(available, "contains_many", None)
+            if callable(contains_many) and isinstance(available, LazyPersistedSynapses):
+                index = getattr(self.assemblies, "index", None)
+                reserve = getattr(index, "_reserve_memory", None)
+                if not callable(reserve):
+                    reserve = lambda amount, _operation: self._check_growth(amount)
+                found = contains_many(values, memory_reserve=reserve)
+                if any(value not in found for value in values):
+                    raise ValueError("substrate attention overlay ids are invalid")
+                return found
+            if not all(value in available for value in values):
                 raise ValueError("substrate attention overlay ids are invalid")
             return set(values)
 
@@ -2999,7 +3077,10 @@ class NeuralSubstrate:
                 timing -= weight * pressure
                 if weight * timing <= -0.25:
                     timing += weight * 0.25
-                    weight = 0
+                    magnitude = synapse_strength(synapse) - 1
+                    synapse["connection_strength"] = max(1, magnitude)
+                    if magnitude == 0:
+                        weight = 0
             synapse["eligibility"] = max(-1.0, min(1.0, timing))
             synapse["stability"] = max(0.0, stability - amount * 0.05)
             synapse["effective_weight"] = weight
@@ -3123,6 +3204,38 @@ class NeuralSubstrate:
                 }
             )
         return metadata
+
+    def _weighted_migration_groups(self) -> Dict[str, set]:
+        """Derive representation work from the current committed pointer.
+
+        A failed save can restore that pointer. The cached result is keyed to
+        the immutable generation rather than an irreversible runtime flag.
+        """
+        if self.persistence_manifest is None:
+            return {"neurons": set(), "synapses": set()}
+        root = getattr(self, "_persistence_store_root", None)
+        if root is None:
+            raise ValueError("native memory generation has no verified store root")
+        identity = str(self.persistence_manifest.get("generationManifestSha256", ""))
+        cached = getattr(self, "_weighted_representation_cache", None)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        from .weighted_substrate_migration import missing_weighted_groups
+        groups = missing_weighted_groups(root, self.persistence_manifest)
+        self._weighted_representation_cache = (identity, groups)
+        return groups
+
+    @property
+    def native_weighted_migration_required(self) -> bool:
+        return any(self._weighted_migration_groups().values())
+
+    @classmethod
+    def verify_saved_weighted_generation(cls, root: Path, pointer: Mapping[str, Any], *,
+                                         source_pointer: Mapping[str, Any], memory_reserve=None,
+                                         disk_reserve=None) -> Dict[str, Any]:
+        from .weighted_substrate_migration import verify_saved_weighted_generation
+        return verify_saved_weighted_generation(root, pointer, source_pointer=source_pointer,
+            memory_reserve=memory_reserve, disk_reserve=disk_reserve)
 
     @staticmethod
     def _canonical_json(value: Any) -> bytes:
@@ -3351,6 +3464,7 @@ class NeuralSubstrate:
                 self.exact_effective_weight(synapse.get("effective_weight", 0))
         self._validate_packed_vector_identity()
         store = Path(root).resolve()
+        self._persistence_store_root = store
         (store / "blobs").mkdir(parents=True, exist_ok=True)
         (store / "generations").mkdir(parents=True, exist_ok=True)
         shards: List[Dict[str, Any]] = []
@@ -3470,15 +3584,15 @@ class NeuralSubstrate:
             reused, lazy_changed_groups = lazy_synapses.save_plan(
                 records_per_shard
             )
-            migrating_legacy_synapses = (
-                lazy_synapses.store_version < _SUBSTRATE_STORE_VERSION
-            )
+            weighted_groups = self._weighted_migration_groups()["synapses"]
+            migrating_legacy_synapses = lazy_synapses.store_version < _SUBSTRATE_STORE_VERSION
             migration_keys = [
                 (str(item["bucket"]), int(item["part"]))
                 for item in reused
-            ] if migrating_legacy_synapses else []
-            if not migrating_legacy_synapses:
-                shards.extend(reused)
+                if migrating_legacy_synapses or (str(item["bucket"]), int(item["part"])) in weighted_groups
+            ]
+            migrating_keys = set(migration_keys)
+            shards.extend(item for item in reused if (str(item["bucket"]), int(item["part"])) not in migrating_keys)
             synapse_groups: Iterable[
                 Tuple[str, int, List[Tuple[str, Dict[str, Any]]]]
             ] = (
@@ -3539,6 +3653,8 @@ class NeuralSubstrate:
                 },
             )
             tensors = {
+                "packed_connection_strength": torch.tensor(list(pack_strengths(
+                    synapse_strength(record) for _record_id, record in group)), dtype=torch.uint8),
                 "packed_effective_weight": torch.tensor(
                     list(_pack_ternary_levels(
                         self.exact_effective_weight(
@@ -3617,6 +3733,7 @@ class NeuralSubstrate:
         generation_body = {
             "format": _SUBSTRATE_STORE_FORMAT,
             "formatVersion": _SUBSTRATE_STORE_VERSION,
+            "nativeWeightedRepresentation": 2,
             "schema": self.SCHEMA,
             "dimensions": self.space.dimensions,
             "seed": self.space.seed,
@@ -4159,9 +4276,7 @@ class NeuralSubstrate:
                 vector_ids = [
                     str(item) for item in payload.get("vectorIds", [])
                 ]
-                if vector_ids != ids or set(tensor_values) != {
-                    "packed_rows", "update_counters_le"
-                }:
+                if vector_ids != ids or set(tensor_values) != PackedTernaryVectors.tensor_names(payload.get("packedVectorState")):
                     raise ValueError("neuron shard lacks exact packed vector state")
                 vector_metadata = payload.get("packedVectorState")
                 if (
@@ -4215,6 +4330,7 @@ class NeuralSubstrate:
                             "effective_weight": int(
                                 tensor_values["effective_weight"][index].item()
                             ),
+                            "connection_strength": int(tensor_values["connection_strength"][index].item()),
                             "eligibility": float(
                                 tensor_values["eligibility"][index].item()
                             ),
@@ -4302,6 +4418,7 @@ class NeuralSubstrate:
                         hot_node_ids=hot_node_ids,
                         entries=entries,
                         growth_guard=growth_guard,
+                        verified_rebuild=True,
                     )
                     substrate.synapses.install_forward_index_manifest(
                         published_forward_index
@@ -4334,6 +4451,7 @@ class NeuralSubstrate:
                 substrate.assembly_vectors.link(str(item.get("id", "")))
             substrate._validate_packed_vector_identity()
         substrate.persistence_manifest = dict(pointer)
+        substrate._persistence_store_root = store
         substrate._persistence_records_per_shard = int(
             generation.get("recordsPerShard", 0)
         )
@@ -4617,7 +4735,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     or _pack_ternary_levels(levels) != packed
                 ):
                     raise ValueError("substrate forward index weights are invalid")
-                self._forward_by_shard[key] = (forward, packed)
+                self._forward_by_shard[key] = (forward, _weighted_forward_signs(entry, forward, packed))
                 shard_uses = entry.get("synapticUses")
                 if not _is_nonnegative_int(shard_uses):
                     raise ValueError(
@@ -4695,7 +4813,9 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     forward.append((index, record_id, source_id, target_id))
                     forward_levels.append(weight)
             self._forward_by_shard[key] = (
-                forward, _pack_ternary_levels(forward_levels)
+                forward, WeightedForwardSigns(_pack_ternary_levels(forward_levels), pack_strengths(
+                    int(value) for value in tensors["connection_strength"].tolist()), len(records),
+                    positions=tuple(row[0] for row in forward))
             )
             self._uses_by_shard[key] = shard_uses
         if observed != self._base_count:
@@ -4890,6 +5010,50 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     connection.close()
         return TernaryPackedSource((source_count,), pages), source_count, digest.hexdigest(), _DYNAMIC_ORDER_BASIS
 
+    def stream_dynamic_connection_state(self, *, disk_reserve=None, memory_reserve=None):
+        """Stream gain companions in exactly the native sign export order.
+
+        Each real graph contact is already one logical synapse, including
+        repeats. High resistance bits are zero here because this graph's
+        existing eligibility/plasticity/stability fields remain their sole
+        authoritative control state in its substrate shards.
+        """
+        from .ternary_packing import ConnectionStateSource
+        if self._new_ids or self._deleted_locations:
+            raise RuntimeError("lazy substrate must checkpoint structural changes before packing")
+        revision = self.graph_revision, self.persistence_revision
+        count = self._base_count
+        digest = hashlib.sha256(b"[")
+        for ordinal, key in enumerate(self._ordered_keys):
+            descriptor = self._descriptors[key]
+            if ordinal:
+                digest.update(b",")
+            digest.update(NeuralSubstrate._canonical_json({"bucket": key[0], "part": key[1],
+                "count": descriptor["count"], "recordsSha256": descriptor["records"]["sha256"]}))
+        digest.update(b"]")
+
+        def pages():
+            seen = 0
+            for key in self._ordered_keys:
+                if revision != (self.graph_revision, self.persistence_revision):
+                    raise ValueError("dynamic source changed during connection-state export")
+                descriptor = self._descriptors[key]
+                estimate = 8 * (descriptor["records"]["bytes"] + descriptor["tensors"]["bytes"]) + 65536
+                if memory_reserve is not None and memory_reserve(estimate, "dynamic strength group") is False:
+                    raise SubstrateResourcePause("dynamic strength export paused at memory reserve")
+                records, tensors = self._read_shard(key, validate=True)
+                values = tensors["connection_strength"].clone().to(torch.uint8).sub_(1)
+                for position, record in enumerate(records):
+                    replacement = self._dirty.get(record["id"])
+                    if replacement is not None:
+                        values[position] = synapse_strength(replacement) - 1
+                seen += len(records)
+                yield values
+            if seen != count or revision != (self.graph_revision, self.persistence_revision):
+                raise ValueError("dynamic connection-state coverage/source revision differs")
+
+        return ConnectionStateSource((1, count), pages), count, digest.hexdigest(), _DYNAMIC_ORDER_BASIS
+
     def paging_status(self) -> Dict[str, Any]:
         return {
             "mode": "generation-indexed-content-addressed-lazy-synapses",
@@ -4956,6 +5120,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             "synapticUses": self._uses_by_shard[key],
             "forwardRecords": [list(value) for value in structures],
             "packedEffectiveWeights": base64.b64encode(packed).decode("ascii"),
+            "packedConnectionStrengths": base64.b64encode(getattr(packed, "strengths", bytes((int(descriptor["count"]) + 1) // 2))).decode("ascii"),
             "hotLocations": hot_locations,
         }
 
@@ -5003,6 +5168,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                             "effective_weight": tensors["effective_weight"][
                                 index
                             ].item(),
+                            "connection_strength": int(tensors["connection_strength"][index].item()),
                             "uses": int(tensors["uses"][index].item()),
                         },
                     )
@@ -5010,7 +5176,12 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             expected = _forward_index_entry(
                 self._descriptors[key], group, self._hot_node_ids
             )
-            if expected != self._persisted_index_entry(key):
+            persisted_entry = self._persisted_index_entry(key)
+            if "packedConnectionStrengths" not in persisted_entry:
+                if bool(tensors["connection_strength"].ne(1).any()):
+                    raise ValueError("substrate forward index omitted learned strengths")
+                expected.pop("packedConnectionStrengths", None)
+            if expected != persisted_entry:
                 raise ValueError(
                     "substrate forward index diverges from persisted shards"
                 )
@@ -5173,6 +5344,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                 "effective_weight": NeuralSubstrate.exact_effective_weight(
                     tensors["effective_weight"][index].item()
                 ),
+                "connection_strength": int(tensors["connection_strength"][index].item()),
                 "eligibility": float(tensors["eligibility"][index].item()),
                 "plasticity": float(tensors["plasticity"][index].item()),
                 "uses": int(tensors["uses"][index].item()),
@@ -5227,7 +5399,61 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             return False
         return value in self._dirty_locations or self._locate(value) is not None
 
+    def contains_many(self, values: Sequence[str], *, memory_reserve=None) -> set[str]:
+        """Exact membership with one validated read per candidate shard.
+
+        Attention IDs are lexically sorted, but shards use a hash bucket. A
+        per-ID loop thrashes the bounded shard cache. Group only the requested
+        locations; retain all existing checksum and structural verification.
+        """
+        candidate_slots = 0
+        largest_payload = 0
+        for value in values:
+            if (not isinstance(value, str) or value in self._new_ids
+                    or value in self._deleted_locations or value in self._dirty_locations
+                    or value in self._locations):
+                continue
+            bucket = NeuralSubstrate._bucket("synapses", value)
+            for minimum, maximum, key in self._ranges.get(bucket, ()):
+                if minimum <= value <= maximum:
+                    candidate_slots += 1
+                    descriptor = self._descriptors[key]
+                    largest_payload = max(largest_payload, int(descriptor["records"]["bytes"])
+                                          + int(descriptor["tensors"]["bytes"]))
+        # Account requested-ID/set/group metadata plus bounded decoded cache
+        # before constructing it. No count cap or source records are dropped.
+        scratch = 8192 + len(values) * 96 + candidate_slots * 512
+        scratch += largest_payload * (self.CACHE_SHARDS + 1) * 4
+        if memory_reserve is not None and memory_reserve(scratch, "attention membership groups and decoded shards") is False:
+            raise SubstrateResourcePause("attention membership paused at resource reserve")
+        found: set[str] = set()
+        groups: Dict[Tuple[str, int], set[str]] = defaultdict(set)
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            if value in self._new_ids:
+                if value in self._dirty:
+                    found.add(value)
+                continue
+            if value in self._deleted_locations:
+                continue
+            if value in self._dirty_locations or value in self._locations:
+                found.add(value)
+                continue
+            bucket = NeuralSubstrate._bucket("synapses", value)
+            for minimum, maximum, key in self._ranges.get(bucket, ()):
+                if minimum <= value <= maximum:
+                    groups[key].add(value)
+        for key, requested in groups.items():
+            records, _tensors = self._read_shard(key)
+            for row in records:
+                value = str(row.get("id", ""))
+                if value in requested:
+                    found.add(value)
+        return found
+
     def __getitem__(self, record_id: str) -> Dict[str, Any]:
+        from .connected_transaction import observe_synapse_access
         if record_id in self._dirty:
             return self._dirty[record_id]
         if record_id in self._deleted_locations:
@@ -5241,6 +5467,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
             self._restore_record(records[index], tensors, index),
             lambda: self._graph_changed(record_id),
             self._persistence_changed,
+            lambda: observe_synapse_access(self, record_id),
         )
         self._dirty[record_id] = restored
         self._dirty_locations[record_id] = location
@@ -5250,11 +5477,14 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         return restored
 
     def __setitem__(self, record_id: str, value: Dict[str, Any]) -> None:
+        from .connected_transaction import observe_synapse_access
+        observe_synapse_access(self, record_id)
         record_id = str(record_id)
         record = dict(value)
         if str(record.get("id", "")) != record_id:
             raise ValueError("synapse mapping key does not match record id")
         NeuralSubstrate.exact_effective_weight(record.get("effective_weight", 0))
+        synapse_strength(record)
         if record_id in self._deleted_locations:
             location = self._deleted_locations.pop(record_id)
             self._dirty_locations[record_id] = location
@@ -5270,11 +5500,14 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                 )
         self._exact_uses(record.get("uses", 0))
         self._dirty[record_id] = _TrackedSynapseRecord(
-            record, lambda: self._graph_changed(record_id), self._persistence_changed
+            record, lambda: self._graph_changed(record_id), self._persistence_changed,
+            lambda: observe_synapse_access(self, record_id),
         )
         self._graph_changed(record_id)
 
     def __delitem__(self, record_id: str) -> None:
+        from .connected_transaction import observe_synapse_access
+        observe_synapse_access(self, record_id)
         if record_id in self._new_ids:
             self._new_ids.remove(record_id)
             self._dirty.pop(record_id, None)
@@ -5309,7 +5542,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         for _identifier, source, target, level in self.iter_effective_edge_records():
             yield source, target, level
 
-    def iter_effective_edge_records(self) -> Iterator[Tuple[str, str, str, int]]:
+    def iter_effective_edge_records(self, *, weighted=False) -> Iterator[Tuple[str, str, str, int]]:
         """Include actual edge IDs for exact incremental execution indexing."""
 
         replacements_by_shard: Dict[
@@ -5330,14 +5563,14 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                 for offset, (_index, record_id, source, target) in enumerate(
                     structures
                 ):
-                    yield record_id, source, target, _unpack_ternary_level(packed, offset)
+                    yield record_id, source, target, (forward_contribution(packed, offset) if weighted else _unpack_ternary_level(packed, offset))
                 continue
             base = {
                 index: (
                     record_id,
                     source,
                     target,
-                    _unpack_ternary_level(packed, offset),
+                    forward_contribution(packed, offset) if weighted else _unpack_ternary_level(packed, offset),
                 )
                 for offset, (index, record_id, source, target) in enumerate(
                     structures
@@ -5348,9 +5581,8 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     continue
                 replacement = replacements.get(index)
                 if replacement is not None:
-                    weight = NeuralSubstrate.exact_effective_weight(
-                        replacement.get("effective_weight", 0)
-                    )
+                    weight = (synapse_contribution(replacement) if weighted else NeuralSubstrate.exact_effective_weight(
+                        replacement.get("effective_weight", 0)))
                     if weight:
                         yield (
                             str(replacement["id"]),
@@ -5364,15 +5596,24 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
         for record_id, record in self._dirty.items():
             if record_id not in self._new_ids:
                 continue
-            weight = NeuralSubstrate.exact_effective_weight(
-                record.get("effective_weight", 0)
-            )
+            weight = (synapse_contribution(record) if weighted else NeuralSubstrate.exact_effective_weight(
+                record.get("effective_weight", 0)))
             if weight:
                 yield record_id, str(record["source_id"]), str(record["target_id"]), weight
 
+    def iter_weighted_edge_records(self):
+        yield from self.iter_effective_edge_records(weighted=True)
+
+    def iter_weighted_edges(self):
+        for _identifier, source, target, value in self.iter_weighted_edge_records():
+            yield source, target, value
+
     def observed_effective_levels(self) -> set[int]:
-        levels = {weight for _source, _target, weight in self.iter_effective_edges()}
-        if len(levels) < len(self):
+        levels, count = set(), 0
+        for _source, _target, weight in self.iter_effective_edges():
+            levels.add(weight)
+            count += 1
+        if count < len(self):
             levels.add(0)
         return levels
 
@@ -5496,6 +5737,8 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                 for descriptor in descriptors:
                     key = str(descriptor["bucket"]), int(descriptor["part"])
                     changed = changed_groups.get(key)
+                    if changed is None and descriptor.get("tensors") != self._descriptors[key].get("tensors"):
+                        changed = self._group_records(key)
                     if changed is not None:
                         yield _forward_index_entry(descriptor, changed, hot_ids)
                     elif same_membership:
@@ -5556,6 +5799,7 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     "packedEffectiveWeights": base64.b64encode(packed).decode(
                         "ascii"
                     ),
+                    "packedConnectionStrengths": base64.b64encode(getattr(packed, "strengths", bytes((int(descriptor["count"]) + 1) // 2))).decode("ascii"),
                     "hotLocations": hot_locations,
                 }
             )
@@ -5657,7 +5901,9 @@ class LazyPersistedSynapses(MutableMapping[str, Dict[str, Any]]):
                     levels.append(weight)
                 next_forward[key] = (
                     structures,
-                    _pack_ternary_levels(levels),
+                    WeightedForwardSigns(_pack_ternary_levels(levels), pack_strengths(
+                        synapse_strength(record) for _identifier, record in changed), len(changed),
+                        positions=tuple(row[0] for row in structures)),
                 )
             if identifiers:
                 self._range_by_key[key] = (identifiers[0], identifiers[-1])

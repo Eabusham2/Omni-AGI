@@ -2,6 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, realpathSync, statSync } from "node:fs";
 import {
   open,
+  lstat,
+  readFile,
+  readdir,
   rm,
   rmdir,
   stat
@@ -13,6 +16,9 @@ import type {
   ModalityPreview
 } from "../shared/types";
 import { INLINE_MEDIA_DATA_URL_CHARACTER_LIMIT } from "../shared/mediaTransport";
+import type { ImaginationCaptureOrigin } from "../shared/imaginationCapture";
+import type { DeliveredImaginationFragment } from "./imaginationCapture";
+import { nativeMediaTimeline } from "../shared/nativeMediaTimeline";
 import {
   ArtifactIndexStore,
   type PersistedGeneratedArtifact
@@ -243,6 +249,26 @@ async function verifiedMagic(path: string, mimeType: string): Promise<boolean> {
  * content-addressed custom-scheme URL whose bytes are verified on first use.
  */
 export class MediaArtifactRegistry {
+  private readonly captureOrigins = new Map<string, ImaginationCaptureOrigin>();
+  private readonly spontaneousLeases = new Map<string, string>();
+  noteSpontaneousOutputLease(brainId: string, jobId: string, leaseId: string): void {
+    if (!/^[a-f0-9]{64}$/.test(leaseId) || this.captureOrigin(`job:${brainId}:${jobId}`).kind !== "spontaneous") throw new Error("Spontaneous output has no trusted main job provenance.");
+    const key = `job:${brainId}:${jobId}`, prior = this.spontaneousLeases.get(key); if (prior && prior !== leaseId) throw new Error("Spontaneous output owner changed."); this.spontaneousLeases.set(key, leaseId);
+  }
+  private captureSink?: (fragment: DeliveredImaginationFragment) => Promise<void>;
+  setCaptureSink(sink: NonNullable<MediaArtifactRegistry["captureSink"]>): void { this.captureSink = sink; }
+  noteCaptureOrigin(streamId: string, origin: ImaginationCaptureOrigin): void {
+    const prior = this.captureOrigins.get(streamId);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(origin)) throw new Error("Imagination stream provenance cannot be replaced.");
+    this.captureOrigins.set(streamId, structuredClone(origin));
+  }
+  captureOrigin(streamId: string): ImaginationCaptureOrigin { return this.captureOrigins.get(streamId) ?? { kind: "unclassified", authority: "missing-main-provenance" }; }
+  releaseCaptureOrigins(brainId: string): void { for (const id of this.captureOrigins.keys()) if (id.startsWith(`job:${brainId}:`) || id.startsWith(`action:${brainId}:`)) this.captureOrigins.delete(id); }
+  private offerCapture(lease: MediaLease, origin: ImaginationCaptureOrigin, kind: DeliveredImaginationFragment["kind"], modality: DeliveredImaginationFragment["modality"], metadata: Partial<DeliveredImaginationFragment> = {}): void {
+    if (origin.kind !== "spontaneous" || !this.captureSink) return;
+    void this.captureSink({ brainId: lease.brainId, streamId: lease.streamKey, origin, kind, modality, ...metadata,
+      resolve: async () => { await this.verify(lease); return { path: lease.path, sha256: lease.sha256, mimeType: lease.mimeType, size: lease.size }; } }).catch(() => undefined);
+  }
   private readonly leases = new Map<string, MediaLease>();
   private readonly streamTokens = new Map<string, string>();
   private readonly latestRevisions = new Map<string, number>();
@@ -257,7 +283,7 @@ export class MediaArtifactRegistry {
     this.cleanupTimer.unref?.();
   }
 
-  private allowedPath(brainId: string, rawPath: string): {
+  private allowedPath(brainId: string, rawPath: string, captureArchive = false, replayArchive = false): {
     path: string;
     ephemeral: boolean;
   } {
@@ -273,14 +299,17 @@ export class MediaArtifactRegistry {
     const brainRoot = realpathSync.native(this.brainDirectory(brainId));
     const engineRoot = realpathSync.native(join(brainRoot, "engine"));
     const actual = realpathSync.native(resolve(rawPath));
+    if (captureArchive && inside(actual, resolve(brainRoot, "imagination", "blobs")) && /^[a-f0-9]{64}\.data$/.test(basename(actual))) return { path: actual, ephemeral: false };
+    if (replayArchive && inside(actual, resolve(brainRoot, "imagination-assemblies", "blobs")) && /^[a-f0-9]{64}\.data$/.test(basename(actual))) return { path: actual, ephemeral: false };
     if (!inside(actual, engineRoot)) {
       throw new Error("Media artifact escaped the selected brain.");
     }
     const finalRoot = resolve(engineRoot, "artifacts");
     const previewRoot = resolve(engineRoot, ".preview-cache");
     const inlineRoot = resolve(engineRoot, ".inline-imagination");
+    const spontaneousRoot = resolve(engineRoot, ".spontaneous-imagination");
     if (inside(actual, finalRoot)) return { path: actual, ephemeral: false };
-    if (inside(actual, previewRoot) || inside(actual, inlineRoot)) {
+    if (inside(actual, previewRoot) || inside(actual, inlineRoot) || inside(actual, spontaneousRoot)) {
       return { path: actual, ephemeral: true };
     }
     throw new Error("Media artifact is outside an approved neural output directory.");
@@ -293,8 +322,10 @@ export class MediaArtifactRegistry {
     sha256: string;
     mimeType: string;
     ephemeral: boolean;
+    captureArchive?: boolean;
+    replayArchive?: boolean;
   }): MediaLease {
-    const resolved = this.allowedPath(input.brainId, input.path);
+    const resolved = this.allowedPath(input.brainId, input.path, input.captureArchive, input.replayArchive);
     const mimeType = safeMimeType(input.mimeType);
     if (!mimeType) throw new Error("Media artifact MIME type is invalid.");
     if (resolved.ephemeral !== input.ephemeral) {
@@ -351,8 +382,18 @@ export class MediaArtifactRegistry {
         if ([...this.leases.values()].some((candidate) => candidate.path === path)) {
           return;
         }
-        void rm(path, { force: true })
-          .then(() => rmdir(dirname(path)))
+        void (async () => {
+          const current = await stat(path, { bigint: true }); if (current.dev !== lease.device || current.ino !== lease.inode || current.size !== BigInt(lease.size)) return;
+          await rm(path, { force: true });
+          const parent = dirname(path);
+          if (basename(dirname(parent)) === ".spontaneous-imagination" && /^[a-f0-9]{64}$/.test(basename(parent))) {
+            const entries = await readdir(parent); if (entries.length !== 1 || entries[0] !== "owner.json") return;
+            const marker = join(parent, "owner.json"), info = await lstat(marker); if (!info.isFile() || info.isSymbolicLink() || info.size > 65536) return;
+            const owner = JSON.parse(await readFile(marker, "utf8")); if (owner.format !== "omni-spontaneous-output-owner" || owner.brainId !== lease.brainId || owner.leaseId !== basename(parent)) return;
+            await rm(marker, { force: true });
+          }
+          await rmdir(parent);
+        })()
           .catch(() => undefined);
       }, 30_000).unref?.();
     }
@@ -403,6 +444,14 @@ export class MediaArtifactRegistry {
         return undefined;
       }
       mediaUrl = this.url(lease);
+      if (preview.producer === "same-brain-decoder") {
+        const modality = ["image", "audio", "video"].includes(String(preview.modality)) ? preview.modality as DeliveredImaginationFragment["modality"] : mimeType.split("/")[0] as DeliveredImaginationFragment["modality"];
+        this.offerCapture(lease, this.captureOrigin(streamKey), "preview-fragment", modality, { revision: preview.revision,
+          ...(preview.width === undefined ? {} : { width: preview.width }), ...(preview.height === undefined ? {} : { height: preview.height }),
+          ...(preview.durationMs === undefined ? {} : { durationMs: preview.durationMs }), ...(preview.fps === undefined ? {} : { fps: preview.fps }),
+          ...(preview.frameCount === undefined ? {} : { frameCount: preview.frameCount }),
+          ...(nativeMediaTimeline(preview.mediaTimeline) ? { mediaTimeline: nativeMediaTimeline(preview.mediaTimeline) } : {}) });
+      }
       if (previous && previous !== lease.token) this.revokeToken(previous);
     }
     this.latestRevisions.set(streamKey, preview.revision);
@@ -462,14 +511,21 @@ export class MediaArtifactRegistry {
         ? output.artifactPath
         : undefined;
     let mediaUrl: string | undefined;
+    const streamKey = `job:${brainId}:${jobId}`, origin = this.captureOrigin(streamKey), spontaneous = origin.kind === "spontaneous";
     if (mimeType && sha256 && rawPath) {
+      if (spontaneous) {
+        const expected = this.spontaneousLeases.get(streamKey), parent = dirname(rawPath), marker = join(parent, "owner.json"), info = await lstat(marker);
+        if (!expected || basename(parent) !== expected || !info.isFile() || info.isSymbolicLink() || info.size > 65536) throw new Error("Spontaneous final has no fresh native output owner.");
+        const owner = JSON.parse(await readFile(marker, "utf8"));
+        if (owner.format !== "omni-spontaneous-output-owner" || owner.version !== 1 || owner.brainId !== brainId || owner.jobId !== jobId || owner.leaseId !== expected) throw new Error("Spontaneous final belongs to another native job.");
+      }
       const lease = this.createLease({
         brainId,
         streamKey: `final:${brainId}:${jobId}`,
         path: rawPath,
         sha256,
         mimeType,
-        ephemeral: false
+        ephemeral: spontaneous
       });
       mediaUrl = this.url(lease);
       await this.verify(lease);
@@ -477,7 +533,11 @@ export class MediaArtifactRegistry {
       if (!["image", "audio", "video"].includes(String(modality))) {
         throw new Error("Generated artifact modality is invalid.");
       }
-      await this.persistArtifact(brainId, {
+      this.offerCapture(lease, origin, "final-artifact", modality as DeliveredImaginationFragment["modality"], {
+        streamId: streamKey,
+        ...(nativeMediaTimeline(output.mediaTimeline) ? { mediaTimeline: nativeMediaTimeline(output.mediaTimeline) } : {})
+      });
+      if (!spontaneous) await this.persistArtifact(brainId, {
         id: createHash("sha256").update(`${brainId}:${jobId}`).digest("hex"),
         modality: modality as PersistedGeneratedArtifact["modality"],
         mimeType,
@@ -497,6 +557,8 @@ export class MediaArtifactRegistry {
       });
     }
     this.revokeStream(`job:${brainId}:${jobId}`);
+    this.captureOrigins.delete(streamKey);
+    this.spontaneousLeases.delete(streamKey);
     const neuralActionId = typeof output.neuralActionId === "string"
       ? output.neuralActionId
       : "";
@@ -507,7 +569,8 @@ export class MediaArtifactRegistry {
     return {
       ...rest,
       ...(mimeType ? { mimeType } : {}),
-      ...(safeDataUrl(dataUrl, mimeType, sha256) ? { dataUrl } : {}),
+      ...(!spontaneous && safeDataUrl(dataUrl, mimeType, sha256) ? { dataUrl } : {}),
+      ...(spontaneous ? { artifactRetention: "ephemeral-spontaneous" } : {}),
       ...(mediaUrl ? { mediaUrl } : {})
     };
   }
@@ -582,6 +645,19 @@ export class MediaArtifactRegistry {
 
   cancelJob(brainId: string, jobId: string): void {
     this.revokeStream(`job:${brainId}:${jobId}`);
+    this.captureOrigins.delete(`job:${brainId}:${jobId}`);
+    this.spontaneousLeases.delete(`job:${brainId}:${jobId}`);
+  }
+
+  async leaseCapture(brainId: string, sha256: string, mimeType: string): Promise<string> {
+    if (!safeSha256(sha256)) throw new Error("Invalid retained fragment hash.");
+    const lease = this.createLease({ brainId, streamKey: `capture:${brainId}:${sha256}`, path: join(this.brainDirectory(brainId), "imagination", "blobs", `${sha256}.data`), sha256, mimeType, ephemeral: false, captureArchive: true });
+    await this.verify(lease); return this.url(lease);
+  }
+  async leaseReplay(brainId: string, sha256: string, mimeType: string): Promise<string> {
+    if (!safeSha256(sha256)) throw new Error("Invalid replay artifact hash.");
+    const lease = this.createLease({ brainId, streamKey: `replay:${brainId}:${sha256}`, path: join(this.brainDirectory(brainId), "imagination-assemblies", "blobs", `${sha256}.data`), sha256, mimeType, ephemeral: false, replayArchive: true });
+    await this.verify(lease); return this.url(lease);
   }
 
   private async verify(lease: MediaLease): Promise<void> {
@@ -661,5 +737,7 @@ export class MediaArtifactRegistry {
     this.leases.clear();
     this.streamTokens.clear();
     this.latestRevisions.clear();
+    this.captureOrigins.clear();
+    this.spontaneousLeases.clear();
   }
 }

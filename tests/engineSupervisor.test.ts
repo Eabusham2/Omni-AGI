@@ -80,6 +80,28 @@ function inspectionSupervisorWith(worker: FakeWorker): EngineSupervisor {
 }
 
 describe("EngineSupervisor interruption", () => {
+  it("uses flags-only lifecycle controls beside an active chat without releasing or cancelling that turn", async () => {
+    const worker = new FakeWorker(), supervisor = supervisorWith(worker);
+    const consume = (result: unknown, index: number) => {
+      const request = JSON.parse(String(worker.stdin.write.mock.calls[index]?.[0])) as { id: string };
+      (supervisor as unknown as { consumeLine(line: string): void }).consumeLine(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+    };
+    let chatSettled = false;
+    const chat = supervisor.request("chat", { brainId: "lifecycle-brain", streamId: "same-turn" }, ENGINE_REQUEST_NO_DEADLINE)
+      .then((result) => { chatSettled = true; return result; });
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledOnce());
+    const suspend = supervisor.suspendChat("lifecycle-brain", "same-turn");
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledTimes(2));
+    consume({ requested: true, waitingFor: { kind: "native-boundary", label: "Waiting for token" } }, 1);
+    await expect(suspend).resolves.toMatchObject({ requested: true });
+    const status = supervisor.instanceStatus("lifecycle-brain", "/fixture/lifecycle-brain");
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledTimes(3));
+    consume({ brainId: "lifecycle-brain", learnedRuntimeResident: true, minimumContextTokens: 8, reconnect: [] }, 2);
+    await expect(status).resolves.toMatchObject({ learnedRuntimeResident: true });
+    expect(chatSettled).toBe(false); expect(worker.kill).not.toHaveBeenCalled();
+    expect(worker.stdin.write.mock.calls.map(([line]) => JSON.parse(String(line)).method)).toEqual(["chat", "suspend_chat", "instance_status"]);
+    consume({ suspended: true, turnCommitted: false }, 0); await chat;
+  });
   it("routes substrate inspection to a separate cancellable worker without blocking chat", async () => {
     const neuralWorker = new FakeWorker();
     const inspectionWorker = new FakeWorker();
@@ -488,6 +510,7 @@ describe("EngineSupervisor interruption", () => {
         params: {
           type: "chat-token",
           streamId: "long-chat",
+          brainId: "large-online-brain",
           sequence: 0,
           data: { delta: "hi" }
         }
@@ -720,6 +743,23 @@ describe("EngineSupervisor interruption", () => {
 
     await expect(request).resolves.toEqual({ done: true });
     expect(received).toEqual([0, 2]);
+    await supervisor.stop();
+  });
+
+  it("keeps copied stream IDs brain-scoped and contains observer failures until the owned receipt", async () => {
+    const worker = new FakeWorker(), supervisor = supervisorWith(worker), observed: number[] = [];
+    const request = supervisor.requestStream("chat", { brainId: "copy" }, event => {
+      observed.push(event.sequence!); throw new Error("Invalid owned presentation");
+    }, 60_000, undefined, "shared-native-turn");
+    const rejected = request.catch(error => error);
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledOnce());
+    supervisor.emit("event", { type: "chat-token", brainId: "original", streamId: "shared-native-turn", sequence: 100, data: { delta: "foreign" } });
+    expect(() => supervisor.emit("event", { type: "chat-token", brainId: "copy", streamId: "shared-native-turn", sequence: 0, data: { delta: "owned" } })).not.toThrow();
+    supervisor.emit("event", { type: "chat-token", brainId: "copy", streamId: "shared-native-turn", sequence: 1, data: { delta: "later" } });
+    expect(observed).toEqual([0]); expect(worker.kill).not.toHaveBeenCalled();
+    const sent = JSON.parse(String(worker.stdin.write.mock.calls[0]![0]));
+    (supervisor as unknown as { consumeLine(line: string): void }).consumeLine(JSON.stringify({ jsonrpc: "2.0", id: sent.id, result: { committed: true } }));
+    expect(await rejected).toMatchObject({ message: "Invalid owned presentation" });
     await supervisor.stop();
   });
 

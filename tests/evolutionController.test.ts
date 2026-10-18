@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,14 +207,14 @@ describe("EvolutionController", () => {
   async function setEvolutionPermission(
     level: "off" | "ask" | "auto" | "full"
   ): Promise<void> {
-    const current = await repository.get(brain.id);
-    current.toolPermissions = (current.toolPermissions ?? []).map((permission) =>
-      permission.toolId === "source.self-modify"
-        ? { ...permission, level, updatedAt: new Date().toISOString() }
-        : permission
+    await repository.updateToolPermission(
+      brain.id,
+      "source.self-modify",
+      "Source Self-modify",
+      level,
+      { requestId: randomUUID() }
     );
-    await repository.save(current);
-    brain = current;
+    brain = await repository.get(brain.id);
   }
 
   it("archives an all-green source change without promoting an unproved improvement", async () => {

@@ -57,6 +57,9 @@ class PackedVSAIntegrationTests(unittest.TestCase):
         self.assertEqual(set(tensors), {
             "substrate.vectors.packed_rows",
             "substrate.vectors.update_counters_le",
+            "substrate.vectors.connection_state",
+            "substrate.vectors.parallel_offsets_le",
+            "substrate.vectors.parallel_records",
         })
         self.assertTrue(all(value.dtype == torch.uint8 for value in tensors.values()))
         restored = NeuralSubstrate.from_state(metadata, tensors)
@@ -101,7 +104,7 @@ class PackedVSAIntegrationTests(unittest.TestCase):
                         payload["packedVectorState"]["ids"], payload["ids"]
                     )
                     values = load_tensors(store / shard["tensors"]["path"])
-                    self.assertEqual(set(values), {"packed_rows", "update_counters_le"})
+                    self.assertEqual(set(values), {"packed_rows", "update_counters_le", "connection_state", "parallel_offsets_le", "parallel_records"})
                     self.assertTrue(all(value.dtype == torch.uint8 for value in values.values()))
                 elif shard["kind"] == "assemblies":
                     self.assertIsNone(shard["tensors"])

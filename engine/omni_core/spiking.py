@@ -2,7 +2,7 @@
 
 import hashlib
 import math
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -22,6 +22,10 @@ from .router_state_paging import (
     tile_ranges, unpack_tile, update_historical_tensor_checksum,
 )
 from .sparse_router_state import SparseRouterState
+from .packed_native_kernel import packed_forward_float
+from .router_spike_capture import retire_population_spike_capture
+from .operation_transfer_observation import observed_cpu_recurrence
+from .whole_path_scheduler import owned_memory_effect
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,8 @@ class STDPUpdateSummary:
     changed_signed_sum: int = 0
     changed_pairs: int = 0
     active_pairs: int = 0
+    contact_updates: int = 0
+    new_contacts: int = 0
 
 
 class LIFPopulation(nn.Module):
@@ -51,6 +57,7 @@ class LIFPopulation(nn.Module):
         self.register_buffer("spike_count", torch.zeros(neurons))
 
     def reset(self) -> None:
+        retire_population_spike_capture(self, "LIF-activity-reset")
         self.membrane.zero_()
         self.spike_count.zero_()
 
@@ -68,6 +75,9 @@ class LIFPopulation(nn.Module):
         spikes = (self.membrane >= threshold).to(current.dtype)
         self.membrane.sub_(spikes * threshold)
         self.spike_count.add_(spikes)
+        observer = getattr(self, "_native_spike_observer", None)
+        if observer is not None:
+            observer.record_hard_spikes(spikes)
         # Preserve a differentiable surrogate around the hard threshold.
         soft_spike = torch.sigmoid((current - threshold) * 8.0)
         surrogate = spikes + (soft_spike - soft_spike.detach())
@@ -77,10 +87,10 @@ class LIFPopulation(nn.Module):
 class STDPSynapses(nn.Module):
     """Pair-based causal/anti-causal STDP with metaplastic stability.
 
-    The durable connection strength is a packed exact ternary code, never a
-    floating shadow weight. Spike timing accumulates only bounded int16
-    eligibility before moving a connection by one ternary level. The decoded
-    ``weights`` property is an inspection copy, not mutable neural storage.
+    The learned sign is a packed ternary code; a separate byte encodes integer
+    strength and resistance. Spike timing accumulates bounded int16 eligibility
+    before a strength/polarity step or an independently stored repeated contact.
+    ``weights`` is an inspection copy, never mutable learned storage.
     """
 
     def __init__(
@@ -132,7 +142,7 @@ class STDPSynapses(nn.Module):
             return super()._apply(fn, recurse=recurse)
         if getattr(self, "_router_state_pager", None) is None:
             return super()._apply(fn, recurse=recurse)
-        matrices = {name: self._buffers[name] for name in MATRIX_FIELDS}
+        matrices = {name: self._buffers[name] for name in MATRIX_FIELDS if name in self._buffers}
         try:
             self._buffers.update({name: None for name in matrices})
             return super()._apply(fn, recurse=recurse)
@@ -358,10 +368,10 @@ class STDPSynapses(nn.Module):
         with self._operation(), self._ram(needed * 8, "explicit router inspection"):
             self._validate_packed()
             if hasattr(self, "_sparse_state"):
-                result = torch.zeros((self.post_neurons, self.pre_neurons), dtype=torch.int8)
+                result = torch.zeros((self.post_neurons, self.pre_neurons), dtype=torch.int64)
                 for region, levels in self._sparse_state.iter_effective_tiles():
                     r0, r1, c0, c1 = region
-                    result[r0:r1, c0:c1].copy_(levels)
+                    result[r0:r1, c0:c1].add_(levels)
                 return result
             return unpack_ternary_weight_rows(self._packed_weights, self.pre_neurons)
 
@@ -386,6 +396,25 @@ class STDPSynapses(nn.Module):
                 yield from self._sparse_state.dense_field_chunks("weights")
             return
         yield from iter_row_major_ternary_chunks(self)
+
+    def iter_packed_tiles(self, *, include_identity=False):
+        """Native recurrent payloads, never an expanded learned weight tile."""
+        with self._operation():
+            if hasattr(self, "_sparse_state"):
+                yield from self._sparse_state.iter_packed_tiles(
+                    include_identity=include_identity)
+                return
+            for region in tile_ranges(self.post_neurons, self.pre_neurons, self._tile_budget()):
+                self._check()
+                r0, r1, c0, c1 = region
+                try:
+                    with self._ram((r1-r0)*(c1-c0)*3 + (c1-c0)*8 + (r1-r0)*16 + 1024,
+                                   "dense-compatible router packed sign tile"):
+                        signs = self._packed_weights[r0:r1, c0//4:(c1+3)//4].detach().to(device="cpu").contiguous()
+                        value = (region, signs, None)
+                        yield (*value, (None, None)) if include_identity else value
+                finally:
+                    self._release_tile(*region)
 
     def _historical_checksum(self, *, controls: bool) -> str:
         with self._operation():
@@ -425,16 +454,79 @@ class STDPSynapses(nn.Module):
         return self._historical_checksum(controls=False)
 
     @torch.no_grad()
+    @observed_cpu_recurrence
     def recurrent(self, inputs: torch.Tensor) -> torch.Tensor:
-        """All allocated edges participate; absent blocks are exact zero."""
-        if inputs.numel() != self.pre_neurons or not bool(torch.isfinite(inputs).all()):
+        """Direct packed floating-activity recurrence; absent blocks are zero.
+
+        The existing CPU-backed router placement is preserved. Only raw uint8
+        signs/gains and live activity/output vectors are materialized, including
+        for callers whose small live vectors reside on an accelerator.
+        """
+        if inputs.numel() != self.pre_neurons or inputs.dtype not in {
+                torch.float16, torch.bfloat16, torch.float32, torch.float64}:
             raise ValueError("router recurrence vector is invalid")
         with self._operation(), self._ram((self.pre_neurons + self.post_neurons) * inputs.element_size() * 3, "router recurrent live vectors"):
-            vector = inputs.detach().reshape(-1).to(device="cpu")
+            if not bool(torch.isfinite(inputs).all()):
+                raise ValueError("router recurrence vector is invalid")
+            vector = inputs.detach().reshape(-1).to(device="cpu").contiguous()
             output = torch.zeros(self.post_neurons, dtype=vector.dtype)
-            for region, levels in self.iter_effective_tiles():
-                r0, r1, c0, c1 = region
-                output[r0:r1].add_(torch.mv(levels.to(vector.dtype), vector[c0:c1]))
+            observer = getattr(self, "_native_transmission_observer", None)
+            contact_observer = getattr(observer, "contact_snapshot", None)
+            if contact_observer is None:
+                observer = None
+            operation = None
+            if observer is not None:
+                try:
+                    operation = contact_observer.begin_recurrence(self)
+                    if operation is None:
+                        observer = None
+                except Exception as error:
+                    if getattr(self, "_native_transmission_observer", None) is observer:
+                        self._native_transmission_observer = None
+                    try:
+                        contact_observer.retire_transmissions(
+                            "transmission-observer-retired: " + str(error))
+                    except Exception:
+                        pass
+                    observer = None
+            identity_mode = observer is not None
+            with closing(self.iter_packed_tiles(include_identity=identity_mode)) as tiles:
+                for value in tiles:
+                    if identity_mode:
+                        region, signs, states, identity = value
+                    else:
+                        region, signs, states = value
+                    r0, r1, c0, c1 = region
+                    input_slice = vector[c0:c1]
+                    contribution = packed_forward_float(input_slice.reshape(1, -1),
+                        signs, states, c1-c0, r1-r0)
+                    if observer is not None:
+                        try:
+                            contact_observer.record_packed_tile(
+                                operation, self, identity, region, input_slice,
+                                signs, states)
+                        except Exception as error:
+                            if getattr(self, "_native_transmission_observer", None) is observer:
+                                self._native_transmission_observer = None
+                            try:
+                                contact_observer.retire_transmissions(
+                                    "transmission-observer-retired: " + str(error))
+                            except Exception:
+                                pass
+                            observer = None
+                            operation = None
+                    output[r0:r1].add_(contribution[0])
+            if observer is not None:
+                try:
+                    contact_observer.finish_recurrence(operation)
+                except Exception as error:
+                    if getattr(self, "_native_transmission_observer", None) is observer:
+                        self._native_transmission_observer = None
+                    try:
+                        contact_observer.retire_transmissions(
+                            "transmission-observer-retired: " + str(error))
+                    except Exception:
+                        pass
             return output.to(inputs.device)
 
     @torch.no_grad()
@@ -644,8 +736,10 @@ class AssociativeSpikingRouter(nn.Module):
             for old, new in ((self.input_projection, incoming), (self.output_projection, outgoing)):
                 copy_packed_prefix(old._packed_forward_weight, new._packed_forward_weight, old.in_features, new.in_features)
                 copy_packed_prefix(old._packed_forward_bias, new._packed_forward_bias, old.out_features, new.out_features)
-                for name in ("_packed_forward_scale", "_online_learning_rate", "_row_stability", "_bias_row_stability"):
+                for name in ("_packed_forward_scale", "_online_learning_rate", "_row_stability", "_bias_row_stability",
+                             "_connection_state", "_bias_connection_state"):
                     copy_tensor_prefix(getattr(old, name), getattr(new, name))
+                new.copy_parallel_connections_from_(old)
                 new._packed_stability_strength = old._packed_stability_strength
                 new._pending_stability_events = old._pending_stability_events
             population = LIFPopulation(new_neurons, leak=self.population.leak, threshold=self.population.threshold).to(device)
@@ -671,6 +765,7 @@ class AssociativeSpikingRouter(nn.Module):
             running += size
             ends.append(running)
         self.input_projection, self.output_projection = incoming, outgoing
+        retire_population_spike_capture(self.population, "LIF-population-grown")
         self.population, self.synapses = population, synapses
         self.neurons = new_neurons
         self.region_ends = torch.tensor(ends, dtype=torch.long, device=device)
@@ -732,6 +827,7 @@ class AssociativeSpikingRouter(nn.Module):
         self.population.reset()
         self.synapses.reset_activity()
 
+    @owned_memory_effect("router-LIF-STDP")
     def route(
         self,
         idea: torch.Tensor,
@@ -783,6 +879,7 @@ class AssociativeSpikingRouter(nn.Module):
         return routed, metrics
 
     @torch.no_grad()
+    @owned_memory_effect("router-feedback-STDP")
     def apply_feedback(
         self, idea: torch.Tensor, direction: int
     ) -> Dict[str, float]:

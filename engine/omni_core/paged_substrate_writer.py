@@ -525,9 +525,7 @@ def _emit_record_group(
     tensors = None
     if kind == "neurons":
         vector_metadata, tensors = substrate.neuron_vectors.export_state(keys=ids)
-        if vector_metadata.get("ids") != ids or set(tensors) != {
-            "packed_rows", "update_counters_le"
-        }:
+        if vector_metadata.get("ids") != ids or set(tensors) != PackedTernaryVectors.tensor_names(vector_metadata):
             raise ValueError("paged vector shard export differs from neuron IDs")
         PackedTernaryVectors.from_state(vector_metadata, tensors)
         payload["packedVectorState"] = vector_metadata
@@ -705,6 +703,7 @@ def _write_paged_substrate_generation(
         _fsync_directory(store.parent)
     _fsync_directory(store)
     prior_pointer = substrate.persistence_manifest
+    substrate._persistence_store_root = store
     prior = _prior_generation(store, prior_pointer) if prior_pointer else None
     shared_path = _shared_paged_path(substrate)
     initial_stamp = None
@@ -712,7 +711,7 @@ def _write_paged_substrate_generation(
     if shared_path is not None:
         with closing(sqlite3.connect(shared_path)) as connection:
             initial_stamp = source_stamp(connection)
-        if prior_pointer is not None:
+        if prior_pointer is not None and not substrate.native_weighted_migration_required:
             try:
                 candidate = DirtyShardPlan(
                     shared_path, prior_pointer,
@@ -808,9 +807,7 @@ def _write_paged_substrate_generation(
             tensors = None
             if kind == "neurons":
                 vector_metadata, tensors = substrate.neuron_vectors.export_state(keys=ids)
-                if vector_metadata.get("ids") != ids or set(tensors) != {
-                    "packed_rows", "update_counters_le"
-                }:
+                if vector_metadata.get("ids") != ids or set(tensors) != PackedTernaryVectors.tensor_names(vector_metadata):
                     raise ValueError("paged vector shard export differs from neuron IDs")
                 PackedTernaryVectors.from_state(vector_metadata, tensors)
                 payload["packedVectorState"] = vector_metadata
@@ -909,6 +906,7 @@ def _write_paged_substrate_generation(
     body = {
         "format": _SUBSTRATE_STORE_FORMAT,
         "formatVersion": _SUBSTRATE_STORE_VERSION,
+        "nativeWeightedRepresentation": 2,
         "schema": substrate.SCHEMA,
         "dimensions": substrate.space.dimensions,
         "seed": substrate.space.seed,

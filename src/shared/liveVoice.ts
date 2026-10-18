@@ -44,13 +44,15 @@ export interface LiveVoiceCapabilities {
   microphoneCapture: boolean;
   speechRecognition: boolean;
   speechSynthesis: boolean;
-  /** Recognition remains active while a reply is being spoken. */
+  /** Selected real input capture remains active while a reply is spoken. */
   fullDuplex: boolean;
   /** A speech-start event can synchronously stop the local speech queue. */
   bargeIn: boolean;
   /** Direct same-brain paths; never aliases for platform STT/TTS. */
   neuralListening: boolean;
   neuralVoice: boolean;
+  nativeAudioChatInput?: boolean;
+  nativeAudioChatInputDetail?: string;
   neuralVoiceQuality?: "needs-speech-training" | "unverified";
   recognitionDetail?: string;
   neuralDetail?: string;
@@ -70,6 +72,7 @@ export interface LiveVoiceUtterance {
   id: string;
   turnId: string;
   transcript: string;
+  nativeAudio?: Omit<import("./nativeAudioChat").NativeAudioChatRequest, "dataBase64"> & { bytes: number };
   confidence?: number;
   sequence: number;
   createdAt: string;
@@ -131,6 +134,8 @@ export interface LiveVoiceRecognitionHandlers {
 
 export interface LiveVoiceCaptureSession {
   stop(): void;
+  /** Renderer-private real microphone handle; never sent through preload. */
+  stream?: MediaStream;
 }
 
 export interface LiveVoiceCaptureAdapter {
@@ -142,6 +147,8 @@ export interface LiveVoiceCaptureAdapter {
 export interface LiveVoiceNeuralCapabilityStatus {
   /** Raw microphone audio can enter trained assemblies/STDP in this brain. */
   listening: boolean;
+  nativeAudioChatInput?: boolean;
+  nativeAudioChatInputDetail?: string;
   /** Same-brain waveform rendering is connected; intelligibility is separate. */
   voice: boolean;
   voiceQuality?: "needs-speech-training" | "unverified";
@@ -156,8 +163,14 @@ export interface LiveVoiceNeuralCapabilityStatus {
  */
 export interface LiveVoiceNeuralAdapter {
   inspect(brainId: string): Promise<LiveVoiceNeuralCapabilityStatus>;
-  startListening(brainId: string): Promise<LiveVoiceCaptureSession>;
+  startListening(brainId: string, handlers?: LiveVoiceNativeAudioHandlers, signal?: AbortSignal): Promise<LiveVoiceCaptureSession>;
   synthesis?: LiveVoiceSynthesisAdapter;
+}
+
+export interface LiveVoiceNativeAudioHandlers {
+  onSpeechStart(): void;
+  onFinalAudio(input: import("./nativeAudioChat").NativeAudioChatRequest): void;
+  onError(error: unknown): void;
 }
 
 export interface LiveVoiceRecognitionSession {
@@ -196,6 +209,7 @@ export interface LiveVoiceSynthesisAdapter {
 
 export interface LiveVoiceChatAdapter {
   send(brainId: string, transcript: string, turnId: string): Promise<ChatResult>;
+  sendAudio?(brainId: string, input: import("./nativeAudioChat").NativeAudioChatRequest, turnId: string): Promise<ChatResult>;
   cancel(brainId: string, turnId: string): Promise<number>;
   subscribe?(listener: (event: ChatStreamEvent) => void): () => void;
 }

@@ -28,6 +28,7 @@ import torch
 
 from .bounded_tensor_io import TRANSFER_BYTES, BoundedTensorFile, atomic_save_tensors_bounded
 from .packed_collective_hooks import packed_row_owner
+from .regional_execution import canonical_device, regional_group_admission, transient_regional_limits
 
 
 _CONSTRUCTION = contextvars.ContextVar("omni_native_core_construction", default=None)
@@ -85,6 +86,11 @@ class _Owner:
     heat: int = 0
     name: str = "<unbound>"
     loaded: bool = False
+    # Logical learned versions exclude disposable sort/cache buffers. Known
+    # exact representation moves rebind these tokens without changing epoch.
+    learned_tokens: dict[str, tuple[int, int]] = field(default_factory=dict)
+    scoped_learning_revision: int = 0
+    scoped_learning_observers: int = 0
 
 
 def current_native_core_pager() -> Optional["NativeCorePager"]:
@@ -188,7 +194,8 @@ class NativePackedModuleMixin:
             else:
                 result.__dict__[name] = copy.deepcopy(value, memo)
         for name in ("_packed_validated_version", "_bias_validated_version", "_scale_validated_version",
-                     "_row_stability_validated_version", "_bias_row_stability_validated_version"):
+                     "_row_stability_validated_version", "_bias_row_stability_validated_version",
+                     "_connection_state_validated_version", "_bias_connection_state_validated_version"):
             if hasattr(result, name):
                 setattr(result, name, -1)
         result._validated_device = None
@@ -202,7 +209,7 @@ class NativePackedModuleMixin:
         # Keep persistent owners cold; move derived trigger/index state only.
         pager.evict(self)
         saved = {name: value for name, value in self._buffers.items()
-                 if name not in self._non_persistent_buffers_set}
+                 if name not in self._non_persistent_buffers_set or name in getattr(self, "_native_cached_buffers", ())}
         try:
             for name in saved:
                 self._buffers[name] = None
@@ -244,6 +251,10 @@ class NativeCorePager:
         self.resource_pause = resource_pause
         self.budget_provider = budget_provider
         self.shared_resource_policy = resource_policy
+        # Process-local manual regional consumer; never checkpointed or armed
+        # from saved/imported hardware preferences alone.
+        self.regional_device_budget_provider = None
+        self._regional_device_limits = None
         self._quota_leases: dict[Path, Any] = {}
         self.chunk_bytes = max(8, int(chunk_bytes))
         self._owners: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -251,6 +262,12 @@ class NativeCorePager:
         self._lock = threading.RLock()
         self._clock = 0
         self._revision = 0
+        self._learning_revision = 0
+        self._learning_revision_active = False
+        self._learning_tracking_lease = None
+        self._logical_read_bytes = 0
+        self._logical_write_bytes = 0
+        self._transfer_bytes = 0
         self._peak_transfer_bytes = 0
         self._page_ins = 0
         self._page_outs = 0
@@ -265,6 +282,7 @@ class NativeCorePager:
         self._closed = False
         self._close_status: dict[str, Any] = {}
         self._observation_requests: dict[str, tuple[int, int]] = {}
+        self._observation_scopes: dict[str, Optional[str]] = {}
         self._observations: dict[str, dict[str, Any]] = {}
         if self.budget_provider is not None:
             self.refresh_budget(force=True)
@@ -318,9 +336,24 @@ class NativeCorePager:
                    for owner in self._owners.values()
                    for name, value in owner.cold.items() if name not in owner.maps)
 
-    def _accelerator_bytes(self) -> int:
+    def _accelerator_bytes(self, device=None) -> int:
         return sum(self._owner_bytes(owner) for owner in self._owners.values()
-                   if owner.device is not None)
+                   if owner.device is not None and (device is None or canonical_device(owner.device) == canonical_device(device)))
+
+    def _accelerator_usage(self):
+        result = {}
+        for owner in self._owners.values():
+            if owner.device is not None:
+                name = canonical_device(owner.device)
+                result[name] = result.get(name, 0) + self._owner_bytes(owner)
+        return result
+
+    def _regional_limits(self):
+        transient = transient_regional_limits(self.shared_resource_policy)
+        provider = self.regional_device_budget_provider
+        limits = transient if transient is not None else provider(self.status()) if callable(provider) else None
+        self._regional_device_limits = limits
+        return limits
 
     @staticmethod
     def _owner_bytes(owner: _Owner) -> int:
@@ -345,16 +378,21 @@ class NativeCorePager:
         # blocks. This is conservative while a load is still filling maps.
         promised = sum(max(0, page.byte_count - self._page_allocated_bytes(page)[0])
                        for entry in self._owners.values() for page in entry.maps.values())
-        if self.reserve_disk is not None:
-            self.reserve_disk(byte_count + promised, "native packed model spill")
-        self.directory.mkdir(parents=True, exist_ok=True)
-        path = self.directory / (uuid.uuid4().hex + ".packed-page")
-        reserve = getattr(self.shared_resource_policy, "reserve_spill", None)
-        quota = reserve(((byte_count + 65535) // 65536) * 65536, "native packed model spill") if callable(reserve) else None
+        place = getattr(self.shared_resource_policy, "allocate_spill_file", None)
+        quota = place(byte_count, "native packed model spill", ".packed-page") if callable(place) else None
+        if quota is not None:
+            path = quota.path
+        else:
+            if self.reserve_disk is not None:
+                self.reserve_disk(byte_count + promised, "native packed model spill")
+            self.directory.mkdir(parents=True, exist_ok=True)
+            path = self.directory / (uuid.uuid4().hex + ".packed-page")
+            reserve = getattr(self.shared_resource_policy, "reserve_spill", None)
+            quota = reserve(((byte_count + 65535) // 65536) * 65536, "native packed model spill") if callable(reserve) else None
         if quota is not None:
             quota.bind_path(path)
         try:
-            descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            descriptor = quota.open() if callable(getattr(quota, "open", None)) else os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         except BaseException:
             if quota is not None:
                 quota.release()
@@ -421,8 +459,11 @@ class NativeCorePager:
             owner = self._owners.setdefault(module, _Owner())
             owner.cold = {name: value for name, value in module._buffers.items()
                           if isinstance(value, torch.Tensor)
-                          and name not in module._non_persistent_buffers_set}
+                          and (name not in module._non_persistent_buffers_set or name in getattr(module, "_native_cached_buffers", ())) }
             owner.versions = {name: int(value._version) for name, value in owner.cold.items()}
+            if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0): self._rebind_learned_tokens(module, owner)
+            if getattr(owner, "scoped_learning_observers", 0): owner.scoped_learning_revision += 1
+            self._learning_revision += 1
             owner.loaded = bool(loaded)
             self._clock += 1
             owner.heat = self._clock
@@ -439,22 +480,40 @@ class NativeCorePager:
                 if owner is not None:
                     owner.name = prefix + name
 
-    def observation(self, module_name: str, *, enabled: bool, start: int = 0, count: int = 64) -> dict[str, Any]:
+    def observation(self, module_name: str, *, enabled: bool, start: int = 0, count: int = 64,
+                    capture_id: Optional[str] = None) -> dict[str, Any]:
         """Retarget one bounded viewer viewport; never represent all rows as seen."""
         with self._lock:
             if start < 0 or count < 1:
                 raise ValueError("invalid observed activation viewport")
+            if capture_id is not None and (not isinstance(capture_id, str) or not capture_id or len(capture_id) > 128):
+                raise ValueError("invalid observed activation capture identity")
+            from .cortical_activity_descriptor import describe_forward_output
+            module = next((module for module, owner in self._owners.items() if owner.name == module_name), None)
+            descriptor = describe_forward_output(module) if module is not None else None
+            if descriptor is None:
+                return {"available": False, "enabled": False, "module": module_name,
+                        "observed": False, "observation": None,
+                        "reason": "selected-storage-owner-has-no-observable-forward-output"}
+            if start >= descriptor["outputSize"]:
+                return {"available": False, "enabled": False, "module": module_name,
+                        "observed": False, "observation": None, **descriptor,
+                        "reason": "requested-viewport-exceeds-actual-forward-output"}
             # Transfer envelope is resource-derived and can be retargeted to
             # any row; it is not a model/neuron cardinality restriction.
-            limit = max(1, min(count, max(1, self.chunk_bytes // 32)))
+            limit = max(1, min(count, descriptor["outputSize"] - start, max(1, self.chunk_bytes // 32)))
             if enabled:
-                if self._observation_requests.get(module_name) != (int(start), int(limit)):
+                if (self._observation_requests.get(module_name) != (int(start), int(limit))
+                        or self._observation_scopes.get(module_name) != capture_id):
                     self._observations.clear()
                 self._observation_requests = {module_name: (int(start), int(limit))}
-            else:
-                self._observation_requests.clear()
+                self._observation_scopes = {module_name: capture_id}
+            elif module_name in self._observation_requests and self._observation_scopes.get(module_name) == capture_id:
+                self._observation_requests.pop(module_name)
+                self._observation_scopes.pop(module_name, None)
             value = self._observations.get(module_name)
             return {"available": True, "enabled": enabled, "module": module_name,
+                    **descriptor,
                     "requestedStart": start, "requestedCount": count, "admittedCount": limit,
                     "observation": value, "observed": value is not None,
                     "evidence": "actual-forward-output-viewport-not-confidence-or-all-neuron-firing"}
@@ -495,20 +554,38 @@ class NativeCorePager:
                 owner.loaded = True
                 module._native_loading_checkpoint = False
                 owner.versions = {name: int(value._version) for name, value in owner.cold.items()}
+                if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0): self._rebind_learned_tokens(module, owner)
+                if getattr(owner, "scoped_learning_observers", 0): owner.scoped_learning_revision += 1
                 for page in owner.maps.values():
                     page.dirty = True
                     self._release_page(page)
+            self._learning_revision += 1
             self.refresh_budget(force=True)
 
     def _invalidate_validation(self, module) -> None:
         for name in ("_packed_validated_version", "_bias_validated_version", "_scale_validated_version",
-                     "_row_stability_validated_version", "_bias_row_stability_validated_version"):
+                     "_row_stability_validated_version", "_bias_row_stability_validated_version",
+                     "_connection_state_validated_version", "_bias_connection_state_validated_version"):
             if hasattr(module, name):
                 setattr(module, name, -1)
         if hasattr(module, "_validated_device"):
             module._validated_device = None
 
+    @staticmethod
+    def _rebind_learned_tokens(module, owner: _Owner) -> None:
+        owner.learned_tokens = {name: (id(value), int(value._version))
+            for name, value in module._buffers.items() if name in owner.cold
+            and isinstance(value, torch.Tensor) and name not in module._non_persistent_buffers_set}
+
     def _observe_mutations(self, module, owner: _Owner) -> None:
+        if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0):
+            learned = {name: (id(value), int(value._version))
+                for name, value in module._buffers.items() if name in owner.cold
+                and isinstance(value, torch.Tensor) and name not in module._non_persistent_buffers_set}
+            if learned != owner.learned_tokens:
+                if self._learning_revision_active: self._learning_revision += 1
+                owner.scoped_learning_revision = getattr(owner, "scoped_learning_revision", 0) + 1
+                owner.learned_tokens = learned
         changed = False
         for name in owner.cold:
             value = module._buffers.get(name)
@@ -532,6 +609,56 @@ class NativeCorePager:
                 self._observe_mutations(module, owner)
             return self._revision
 
+    @property
+    def learning_revision(self) -> int:
+        """Same-owner live learned epoch, not a device/cache identity.
+
+        Persistent signs, strengths, stability and repeated-contact metadata
+        participate. Disposable sort indices and our exact moves do not.
+        This is process-local evidence, never a checkpoint content hash.
+        """
+        with self._lock:
+            if not self._learning_revision_active:
+                size = sum(256 + len(owner.cold) * 192 for owner in self._owners.values())
+                reserve = getattr(self.shared_resource_policy, "reserve_ram", None)
+                lease = reserve(size, "opt-in live packed-owner version metadata") if callable(reserve) else None
+                try:
+                    for module, owner in self._owners.items():
+                        if getattr(owner, "scoped_learning_observers", 0): self._observe_mutations(module, owner)
+                        else: self._rebind_learned_tokens(module, owner)
+                    if lease is not None: lease.mark_allocated(size)
+                except BaseException:
+                    if lease is not None: lease.release()
+                    raise
+                self._learning_tracking_lease = lease
+                self._learning_revision_active = True
+                self._learning_revision += 1
+            for module, owner in self._owners.items():
+                self._observe_mutations(module, owner)
+            return self._learning_revision
+
+    def retire_learning_observation(self):
+        """Serialized Auto retirement; default forwards retain their old loop."""
+        with self._lock:
+            self._learning_revision_active = False
+            for owner in self._owners.values():
+                if not getattr(owner, "scoped_learning_observers", 0): owner.learned_tokens.clear()
+            if self._learning_tracking_lease is not None:
+                self._learning_tracking_lease.release()
+                self._learning_tracking_lease = None
+
+    def observe_learning_owners(self, modules):
+        """Admitted independent epoch scope; global observers cannot retire it."""
+        from .scoped_owner_observation import ScopedLearningOwners
+        return ScopedLearningOwners(self, modules)
+
+    def execution_counters(self) -> dict[str, int]:
+        with self._lock:
+            return {"coreReadBytes": self._logical_read_bytes,
+                    "coreWriteBytes": self._logical_write_bytes,
+                    "coreTransferBytes": self._transfer_bytes,
+                    "corePageIns": self._page_ins, "corePageOuts": self._page_outs}
+
     @contextmanager
     def use(self, module: torch.nn.Module, device: torch.device) -> Iterator[None]:
         device = torch.device(device)
@@ -545,6 +672,9 @@ class NativeCorePager:
             if owner.pins and owner.device != (None if device.type == "cpu" else device):
                 raise RuntimeError("cannot change a pinned packed owner's device")
             self._observe_mutations(module, owner)
+            # Logical mapped-owner visits, NOT measured physical disk reads.
+            if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0):
+                self._logical_read_bytes += sum(page.byte_count for page in owner.maps.values())
             self._clock += 1
             owner.heat = self._clock
             if device.type == "cpu":
@@ -553,14 +683,25 @@ class NativeCorePager:
             elif owner.device != device:
                 self.evict(module)
                 required = self._owner_bytes(owner)
-                if required > self.accelerator_hot_bytes:
+                regional_limits = self._regional_limits()
+                target_name = canonical_device(device)
+                if regional_limits is not None and target_name not in regional_limits:
+                    self._pause("regional packed target is not a current enabled execution interface")
+                maximum = (regional_limits.get(target_name, {}).get("hotBytes", 0)
+                           if regional_limits is not None else self.accelerator_hot_bytes)
+                if required > maximum:
                     self._pause("one packed projection exceeds the accelerator residency budget; use CPU or a larger safe budget")
+                def fits():
+                    return (regional_group_admission(self._accelerator_usage(), regional_limits, target_name, required)
+                            if regional_limits is not None else self._accelerator_bytes() + required <= self.accelerator_hot_bytes)
                 for other, cold in sorted(list(self._owners.items()), key=lambda pair: pair[1].heat):
-                    if self._accelerator_bytes() + required <= self.accelerator_hot_bytes:
+                    if fits():
                         break
-                    if other is not module and cold.device is not None and not cold.pins:
+                    same_group = (regional_limits is None or canonical_device(cold.device) not in regional_limits
+                                  or regional_limits[canonical_device(cold.device)]["memoryGroupId"] == regional_limits[target_name]["memoryGroupId"])
+                    if other is not module and cold.device is not None and not cold.pins and same_group:
                         self.evict(other)
-                if self._accelerator_bytes() + required > self.accelerator_hot_bytes:
+                if not fits():
                     self._pause("pinned packed projections exhaust the accelerator residency budget")
                 if self.reserve_admission is not None:
                     self.reserve_admission(required, device)
@@ -580,6 +721,7 @@ class NativeCorePager:
                 module._buffers.update(admitted)
                 owner.device = device
                 owner.versions = {name: int(value._version) for name, value in admitted.items()}
+                if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0): self._rebind_learned_tokens(module, owner)
                 owner.dirty_names.clear()
                 self._invalidate_validation(module)
                 self._page_ins += 1
@@ -606,6 +748,7 @@ class NativeCorePager:
             target_flat[start:end].copy_(source_flat[start:end], non_blocking=False)
             count = (end - start) * source.element_size()
             copied += count
+            self._transfer_bytes += count
             self._peak_transfer_bytes = max(self._peak_transfer_bytes, count)
         return copied
 
@@ -616,6 +759,7 @@ class NativeCorePager:
                 return
             if owner.pins:
                 raise RuntimeError("cannot evict a pinned packed projection")
+            self._observe_mutations(module, owner)
             for name, target in owner.cold.items():
                 source = module._buffers[name]
                 if name in owner.dirty_names or int(source._version) != owner.versions.get(name):
@@ -629,6 +773,7 @@ class NativeCorePager:
             owner.device = None
             owner.dirty_names.clear()
             owner.versions = {name: int(value._version) for name, value in owner.cold.items()}
+            if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0): self._rebind_learned_tokens(module, owner)
             self._invalidate_validation(module)
             self._page_outs += 1
             self._event("accelerator-evict", owner, self._owner_bytes(owner))
@@ -636,6 +781,10 @@ class NativeCorePager:
     def _release_page(self, page: _Map) -> None:
         if page.dirty:
             page.mapping.flush()
+            self._logical_write_bytes += page.byte_count
+            refresh = getattr(self._quota_leases.get(page.path), "refresh_physical", None)
+            if callable(refresh):
+                refresh()
             page.dirty = False
         if hasattr(page.mapping, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
             page.mapping.madvise(mmap.MADV_DONTNEED)
@@ -666,6 +815,7 @@ class NativeCorePager:
             for module, owner in sorted(list(self._owners.items()), key=lambda pair: pair[1].heat):
                 if owner.pins or not owner.loaded:
                     continue
+                self._observe_mutations(module, owner)
                 if self._heap_bytes() > self.cpu_hot_bytes:
                     if owner.device is not None:
                         self.evict(module)
@@ -684,6 +834,7 @@ class NativeCorePager:
                         if owner.device is None:
                             module._buffers[name] = target
                             owner.versions[name] = int(target._version)
+                            if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0): self._rebind_learned_tokens(module, owner)
                             self._invalidate_validation(module)
                         self._event("cpu-cold-spill", owner, target.numel() * target.element_size())
                 for page in owner.maps.values():
@@ -702,17 +853,30 @@ class NativeCorePager:
             self._budget_status = budget
             self.cpu_hot_bytes = max(0, int(budget["liveCoreHotBytes"]))
             self.accelerator_hot_bytes = max(0, int(budget.get("acceleratorCoreHotBytes", self.accelerator_hot_bytes)))
+            regional_limits = self._regional_limits()
             for module, owner in sorted(list(self._owners.items()), key=lambda pair: pair[1].heat):
-                if self._accelerator_bytes() <= self.accelerator_hot_bytes:
-                    break
+                if regional_limits is None:
+                    if self._accelerator_bytes() <= self.accelerator_hot_bytes:
+                        break
+                elif owner.device is None or (canonical_device(owner.device) in regional_limits
+                        and regional_group_admission(self._accelerator_usage(), regional_limits, canonical_device(owner.device), 0)):
+                    continue
                 if owner.device is not None and not owner.pins:
                     self.evict(module)
             self.cool_to_budget()
             self.promote_hot_to_budget()
 
     def _unlink_owned_page(self, path: Path) -> bool:
-        if path not in self._owned_files or path.parent.resolve() != self.directory.resolve():
+        quota = self._quota_leases.get(path)
+        placed = getattr(quota, "owns_path", None)
+        if path not in self._owned_files:
             raise ValueError("refusing cleanup of a non-session native spill file")
+        if path.parent.resolve() != self.directory.resolve():
+            try:
+                if not (callable(placed) and placed(path)):
+                    raise ValueError("refusing cleanup of an unverified native spill file")
+            except (OSError, ValueError):
+                return False  # Detached/replaced drive: report and retain its charge.
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -739,6 +903,7 @@ class NativeCorePager:
             for module, owner in sorted(list(self._owners.items()), key=lambda pair: -pair[1].heat):
                 if owner.pins or owner.device is not None or not owner.loaded:
                     continue
+                self._observe_mutations(module, owner)
                 for name, page in list(owner.maps.items()):
                     source = owner.cold[name]
                     byte_count = source.numel() * source.element_size()
@@ -757,6 +922,7 @@ class NativeCorePager:
                     module._buffers[name] = target
                     del owner.maps[name]
                     owner.versions[name] = int(target._version)
+                    if self._learning_revision_active or getattr(owner, "scoped_learning_observers", 0): self._rebind_learned_tokens(module, owner)
                     self._invalidate_validation(module)
                     self._unlink_owned_page(page.path)
                     self._event("cpu-hot-promote", owner, byte_count)
@@ -771,6 +937,29 @@ class NativeCorePager:
                 self.evict(module)
                 for page in owner.maps.values():
                     self._release_page(page)
+
+    def retire(self, module: torch.nn.Module) -> None:
+        """Drop an explicit removed owner and its session-owned spill files.
+
+        Existing tensor views keep their mappings valid. Only this pager's
+        temporary backing files are unlinked; checkpoint files are untouched.
+        """
+        with self._lock:
+            owner = self._owners.get(module)
+            if owner is None:
+                return
+            if owner.pins:
+                raise RuntimeError("cannot retire a pinned packed projection")
+            self.evict(module)
+            pages = tuple(owner.maps.values())
+            owner.maps.clear()
+            owner.cold.clear()
+            del self._owners[module]
+            module._native_core_pager = None
+            for page in pages:
+                self._unlink_owned_page(page.path)
+            self._revision += 1
+            self._learning_revision += 1
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -789,6 +978,8 @@ class NativeCorePager:
                 "cpuReclamation": "os-madvise-hint" if hasattr(mmap.mmap, "madvise") else "os-file-backed-reclamation",
                 "hardCpuRssBound": False,
                 "acceleratorAdmittedBytes": self._accelerator_bytes(),
+                "acceleratorAdmittedByDevice": self._accelerator_usage(),
+                "regionalDevicePackedLimits": copy.deepcopy(self._regional_device_limits),
                 "acceleratorPackedBudgetBytes": self.accelerator_hot_bytes,
                 "acceleratorPageIns": self._page_ins,
                 "acceleratorPageOuts": self._page_outs,
@@ -821,6 +1012,7 @@ class NativeCorePager:
                 return dict(self._close_status)
             if any(owner.pins for owner in self._owners.values()):
                 raise RuntimeError("native spill cleanup requires all packed jobs to finish")
+            self.retire_learning_observation()
             self.flush()
             # Drop only the pager's packed owners after all scoped jobs ended.
             # Exported tensor/storage views retain their own raw mmap objects.
@@ -873,16 +1065,22 @@ class BoundedPackedRollback:
     dirty-row journal; their I/O cost is reported by ``byte_count``.
     """
 
-    def __init__(self, directory: Path, path: Path, entries, byte_count: int):
+    def __init__(self, directory: Path, path: Path, entries, byte_count: int, *, chunk_bytes: int = TRANSFER_BYTES, placed_lease=None):
         self.directory = directory
         self.path = path
         self.entries = entries
         self.byte_count = int(byte_count)
+        self.chunk_bytes = max(8, int(chunk_bytes))
+        self._placed_lease = placed_lease
+        self._topology_boundaries = tuple(module.capture_packed_topology_boundary()
+            for module, _names, _pending in entries
+            if callable(getattr(module, "capture_packed_topology_boundary", None)))
         from .parameter_diagnostics import active_diagnostic_scopes
         self._diagnostic_scopes = active_diagnostic_scopes()
 
     @classmethod
-    def capture(cls, roots, *, directory: Path, reserve_disk=None):
+    def capture(cls, roots, *, directory: Path, reserve_disk=None, chunk_bytes: int = TRANSFER_BYTES,
+                include_all_uint8: bool = False, allocate_spill=None):
         roots = tuple(roots)
         pagers = {getattr(module, "_native_core_pager", None)
                   for root in roots for module in root.modules()}
@@ -897,12 +1095,12 @@ class BoundedPackedRollback:
                     continue
                 seen.add(id(module))
                 getter = getattr(module, "authoritative_packed_tensors", None)
-                if not callable(getter):
+                if not callable(getter) and not include_all_uint8:
                     continue
-                identities = {id(value) for value in getter()}
+                identities = {id(value) for value in getter()} if callable(getter) else set()
                 names = []
                 for name, value in module.named_buffers(recurse=False):
-                    if id(value) in identities or name in {"_row_stability", "_bias_row_stability"}:
+                    if id(value) in identities or name in {"_row_stability", "_bias_row_stability"} or (include_all_uint8 and value.dtype == torch.uint8 and name not in getattr(module, "_non_persistent_buffers_set", ())):
                         if value.dtype != torch.uint8:
                             raise ValueError("packed rollback contains non-uint8 state")
                         key = "%d.%s" % (len(entries), name)
@@ -910,27 +1108,45 @@ class BoundedPackedRollback:
                         tensors[key] = value
                 if len(identities) > len(names):
                     raise ValueError("packed rollback owner is not a registered buffer")
-                entries.append((module, names, int(getattr(module, "_pending_stability_events", 0))))
+                if names or callable(getter):
+                    entries.append((module, names, int(getattr(module, "_pending_stability_events", 0))))
         byte_count = sum(value.numel() for value in tensors.values()) + 4096 + len(tensors) * 256
-        if reserve_disk is not None:
-            reserve_disk(byte_count, "native packed rollback snapshot")
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        private = Path(tempfile.mkdtemp(prefix="packed-rollback-", dir=str(directory)))
-        path = private / "packed.safetensors"
+        # New local picker grants select the actual volume, not merely a
+        # global quota on the instance's primary cache drive. With no selected
+        # volumes the allocator returns None and preserves the prior path.
+        placed = allocate_spill(byte_count, "native packed rollback snapshot", ".packed-rollback") if callable(allocate_spill) else None
+        private = None
+        if placed is not None:
+            path = placed.path
+        else:
+            if reserve_disk is not None:
+                reserve_disk(byte_count, "native packed rollback snapshot")
+            directory = Path(directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            private = Path(tempfile.mkdtemp(prefix="packed-rollback-", dir=str(directory)))
+            path = private / "packed.safetensors"
         try:
-            atomic_save_tensors_bounded(path, tensors, metadata={"format": "omni-packed-rollback"})
+            if placed is not None:
+                placed.bind_path(path)  # Revalidate the exact authorized root.
+            atomic_save_tensors_bounded(path, tensors, metadata={"format": "omni-packed-rollback"}, chunk_bytes=chunk_bytes)
+            if placed is not None:
+                placed.commit(path=path)
+            return cls(path.parent, path, entries, byte_count, chunk_bytes=chunk_bytes, placed_lease=placed)
         except BaseException:
             path.unlink(missing_ok=True)
-            private.rmdir()
+            if private is not None:
+                private.rmdir()
+            if placed is not None:
+                placed.release()
             raise
-        return cls(private, path, entries, byte_count)
 
     def restore(self) -> None:
+        for owner, keys in self._topology_boundaries:
+            owner.restore_topology_boundary(keys)
         pagers = {getattr(module, "_native_core_pager", None) for module, _, _ in self.entries}
         for pager in pagers - {None}:
             pager.flush()
-        reader = BoundedTensorFile(self.path)
+        reader = BoundedTensorFile(self.path, chunk_bytes=self.chunk_bytes)
         for module, names, pending in self.entries:
             for name, key in names:
                 target = module._buffers.get(name)
@@ -957,5 +1173,7 @@ class BoundedPackedRollback:
 
     def close(self) -> None:
         self.path.unlink(missing_ok=True)
-        if self.directory.exists():
+        if self._placed_lease is not None:
+            self._placed_lease.release()
+        elif self.directory.exists():
             self.directory.rmdir()

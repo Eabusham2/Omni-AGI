@@ -1,0 +1,35 @@
+{
+  "format": "omni-selected-learning-comparison-1",
+  "backend": "cpu",
+  "sourceSha256": "96baa34a70bdd2e3eadd4d1194a505ffff3f8bbda68b3d3f146f95a0dfd3e91a",
+  "codes": 8193,
+  "dimensions": 65,
+  "selectedOccurrences": 5,
+  "trials": 5,
+  "milliseconds": {
+    "fullWidth": [30.533875, 23.583667, 22.943584, 27.803833, 29.738334],
+    "twoAxisNormal": [6.539208, 7.262709, 8.374041, 10.114292, 8.036667],
+    "twoAxisPressure": [31.764792, 28.248125, 34.96425, 32.400792, 27.506917]
+  },
+  "medianMilliseconds": {
+    "fullWidth": 27.803833,
+    "twoAxisNormal": 8.036667,
+    "twoAxisPressure": 31.764792
+  },
+  "oldDerivativeFloatBytes": 2097408,
+  "newDerivativeFloatBytes": {
+    "twoAxisNormal": 16384,
+    "twoAxisPressure": 1024
+  },
+  "newAdmittedLearningPeakBytes": {
+    "twoAxisNormal": 400032,
+    "twoAxisPressure": 27072
+  },
+  "twoAxisTile": {
+    "twoAxisNormal": {"dimensions": 64, "codes": 64, "samples": 5},
+    "twoAxisPressure": {"dimensions": 4, "codes": 64, "samples": 5}
+  },
+  "nativeStateMatched": true,
+  "sourceUnchanged": true,
+  "scope": "selected-code CPU update only; not whole-model throughput or resident memory"
+}

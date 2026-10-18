@@ -26,6 +26,12 @@ import {
 } from "node:path";
 import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
+import type { WebLearningPolicy, WebSourceProvenance } from "../shared/learning";
+import { validateWebLearningPolicy } from "./webLearningPolicy";
+import { openLearningRelocations } from "./learningSourceRelocation";
+import { observeLocalSourceMediaType, datasetFormatForMediaType, normalizeSourceMediaType, validSourceMediaType } from "./sourceMediaType";
+import type { SourceMediaType } from "../shared/sourceMediaType";
+import { PLUGIN_RUNTIME_MEDIA_TYPES, validPluginTrainingFormatSelection, type PluginTrainingFormatSelection } from "../shared/plugins";
 import type {
   DatasetCursor,
   DatasetEntryReceipt,
@@ -35,6 +41,7 @@ import type {
   DatasetProgressGeneration,
   DatasetResumeCandidate,
   PersistedDatasetCoverageSummary,
+  PluginTrainingFormatBinding,
   TrainingCoverage,
   TrainingCoverageError,
 } from "../shared/types";
@@ -48,6 +55,10 @@ const PROGRESS_SCHEMA_VERSION = 1;
 const MAX_RECEIPT_WARNINGS = 64;
 const MAX_RECEIPT_TEXT = 4_096;
 const SQLITE_SNAPSHOT_RESERVE_BYTES = 1024 * 1024 * 1024;
+const PLUGIN_STREAM_FORMATS = new Set<DatasetFormat>([
+  "text", "pdf", "csv", "tsv", "json", "jsonl", "parquet", "arrow",
+  "sqlite", "archive", "huggingface", "image", "audio", "video"
+]);
 const INTERNAL_DATASET_DIRECTORIES = new Set([
   ".git",
   ".hg",
@@ -100,6 +111,60 @@ export interface DatasetManifestStoreOptions {
   compatibilityMaterializationHook?: (
     phase: "after-authoritative" | "after-cursor" | "after-coverage",
   ) => void | Promise<void>;
+  /** Observed MIME is a routing hint; explicit selection is still revalidated. */
+  resolvePluginTrainingFormat?: (
+    brainId: string,
+    path: string,
+    mediaType?: string,
+    selection?: PluginTrainingFormatSelection,
+  ) => Promise<PluginTrainingFormatBinding | undefined>;
+}
+
+function validPluginTrainingFormatBinding(
+  value: PluginTrainingFormatBinding | undefined,
+  format: DatasetFormat,
+): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = [
+    "catalogRevision", "contentSha256", "formatId", "instanceRevision",
+    "parserFormat", "pluginId"
+  ];
+  if (value.executable !== undefined) keys.push("executable");
+  if (value.inputMediaType !== undefined) keys.push("inputMediaType");
+  if (Object.keys(value).sort().join("\0") !== keys.sort().join("\0")) return false;
+  if (value.executable !== undefined) {
+    if (!value.executable || typeof value.executable !== "object" || Array.isArray(value.executable)) return false;
+    const outputMediaTypes = "outputMediaTypes" in value.executable ? value.executable.outputMediaTypes : undefined;
+    const executableKeys = ["abi", "kind", "moduleId", "moduleSha256", "outputFormat",
+      ...(outputMediaTypes === undefined ? [] : ["outputMediaTypes"])];
+    if (Object.keys(value.executable).sort().join("\0") !== executableKeys.sort().join("\0") ||
+        typeof value.executable.moduleId !== "string" || !SAFE_ID.test(value.executable.moduleId) ||
+        typeof value.executable.moduleSha256 !== "string" || !validSha256(value.executable.moduleSha256) ||
+        !["wasm-stream", "runtime-stream"].includes(value.executable.kind)) return false;
+    const mediaTypes = value.executable.kind === "runtime-stream" ? outputMediaTypes : undefined;
+    const validMediaTypes = Array.isArray(mediaTypes) && mediaTypes.length > 0 && new Set(mediaTypes).size === mediaTypes.length &&
+      mediaTypes.every(mediaType => (PLUGIN_RUNTIME_MEDIA_TYPES as readonly string[]).includes(mediaType));
+    if (value.executable.kind === "wasm-stream") {
+      if (value.executable.abi !== "omni-wasm-record-stream-1" || value.executable.outputFormat !== "jsonl" ||
+          value.parserFormat !== "jsonl" || mediaTypes !== undefined) return false;
+    } else if (value.executable.abi !== "omni-runtime-record-stream-1" || !(
+      value.executable.outputFormat === "jsonl" && value.parserFormat === "jsonl" && mediaTypes === undefined ||
+      value.executable.outputFormat === "media-assets" && value.parserFormat === "archive" && validMediaTypes
+    )) return false;
+  }
+  return (
+    typeof value.pluginId === "string" && SAFE_ID.test(value.pluginId) &&
+    /^[a-f0-9]{64}$/.test(value.contentSha256) &&
+    typeof value.formatId === "string" && SAFE_ID.test(value.formatId) &&
+    value.parserFormat === format &&
+    (value.inputMediaType === undefined || normalizeSourceMediaType(value.inputMediaType) === value.inputMediaType) &&
+    PLUGIN_STREAM_FORMATS.has(format) &&
+    Number.isSafeInteger(value.catalogRevision) &&
+    value.catalogRevision >= 1 &&
+    Number.isSafeInteger(value.instanceRevision) &&
+    value.instanceRevision >= 1
+  );
 }
 
 function canonicalJson(value: unknown): string {
@@ -127,7 +192,7 @@ function datasetEntryTransactionKey(receipt: DatasetEntryReceipt): string {
       [
         receipt.runId ? "omni-dataset-entry-v2" : "omni-dataset-entry-v1",
         ...(receipt.runId ? [receipt.runId] : []),
-        receipt.manifestId,
+        receipt.continuationManifestId ?? receipt.manifestId,
         receipt.entryIndex,
         receipt.epoch,
         receipt.contentHash,
@@ -166,6 +231,33 @@ function safeProduct(left: number, right: number, label: string): number {
 
 function validSha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function validParserExecution(value: DatasetEntryReceipt["parserExecution"]): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const media = value.outputKind === "media-assets";
+  const keys = ["abi", "complete", "format", "formatId", "moduleId", "moduleSha256", "outputBytes", "outputRecords",
+    "outputSha256", "packageSha256", "pluginId", "sourceBytes", "sourceSha256", "version",
+    ...(value.inputMediaType === undefined ? [] : ["inputMediaType"]),
+    ...(media ? ["assetManifestSha256", "outputAssets", "outputKind", "outputModalityCounts"] : [])];
+  const counts = media && value.outputModalityCounts && typeof value.outputModalityCounts === "object" && !Array.isArray(value.outputModalityCounts)
+    ? value.outputModalityCounts : undefined;
+  const validCounts = counts !== undefined && Object.keys(counts).sort().join("\0") === ["audio", "image", "video"].join("\0") &&
+    [counts.image, counts.audio, counts.video].every(count => Number.isSafeInteger(count) && count >= 0);
+  return Boolean(value && Object.keys(value).sort().join("\0") === keys.sort().join("\0") &&
+    value.format === "omni-plugin-parser-execution" && value.version === 1 &&
+    (value.inputMediaType === undefined || normalizeSourceMediaType(value.inputMediaType) === value.inputMediaType) &&
+    typeof value.pluginId === "string" && SAFE_ID.test(value.pluginId) && validSha256(value.packageSha256) &&
+    typeof value.formatId === "string" && SAFE_ID.test(value.formatId) &&
+    typeof value.moduleId === "string" && SAFE_ID.test(value.moduleId) && validSha256(value.moduleSha256) &&
+    ["omni-wasm-record-stream-1", "omni-runtime-record-stream-1"].includes(value.abi) &&
+    validSha256(value.sourceSha256) && Number.isSafeInteger(value.sourceBytes) && value.sourceBytes >= 0 &&
+    validSha256(value.outputSha256) && Number.isSafeInteger(value.outputBytes) && value.outputBytes >= 0 &&
+    Number.isSafeInteger(value.outputRecords) && value.outputRecords >= 0 && value.complete === true &&
+    (media ? validSha256(value.assetManifestSha256) && Number.isSafeInteger(value.outputAssets) && value.outputAssets! >= 0 &&
+      value.outputAssets === value.outputRecords && validCounts && counts!.image + counts!.audio + counts!.video === value.outputAssets :
+      value.outputKind === undefined && value.outputAssets === undefined && value.assetManifestSha256 === undefined && value.outputModalityCounts === undefined));
 }
 
 function comparePathNames(left: string, right: string): number {
@@ -609,6 +701,28 @@ export async function assertManifestEntryStable(
   }
 }
 
+/** Plugin parser authority is re-bound to the actual bytes and observed MIME at every start/resume. */
+export async function assertPluginManifestSourceStable(
+  entry: DatasetManifestEntry,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!entry.pluginFormat) return;
+  if (!entry.contentSha256) throw new Error("Plugin parser source has no committed content checksum.");
+  const actualHash = await hashFileWithProgress(entry.path, { signal });
+  if (actualHash !== entry.contentSha256) {
+    throw new Error("Plugin parser source bytes changed after the manifest was committed.");
+  }
+  if (entry.sourceMediaType?.source === "file-signature") {
+    const observed = await observeLocalSourceMediaType(entry.path, signal);
+    if (observed?.value !== entry.sourceMediaType.value) {
+      throw new Error("Plugin parser source MIME signature changed after the manifest was committed.");
+    }
+  }
+  if (entry.pluginFormat.inputMediaType !== entry.sourceMediaType?.value) {
+    throw new Error("Plugin parser source MIME differs from its committed immutable binding.");
+  }
+}
+
 export async function* streamUtf8Text(path: string): AsyncGenerator<string> {
   const decoder = new TextDecoder("utf-8", { fatal: false });
   let pending = "";
@@ -644,6 +758,11 @@ export interface DatasetManifestCreateProgress {
 export interface DatasetManifestCreateOptions {
   signal?: AbortSignal;
   onProgress?: (progress: DatasetManifestCreateProgress) => void;
+  parserSelection?: PluginTrainingFormatSelection;
+  /** Trusted host observation, not accepted from arbitrary renderer operands. */
+  sourceMediaType?: SourceMediaType;
+  /** Trusted actual remote source name; generated spool extensions are not selectors. */
+  parserSourceName?: string;
 }
 
 export class DatasetManifestStore {
@@ -795,12 +914,14 @@ export class DatasetManifestStore {
       receipt.manifestHash !== manifest.manifestHash ||
       !validSha256(receipt.transactionKey) ||
       !validSha256(receipt.contentHash) ||
+      (receipt.parserBindingSha256 !== undefined && !validSha256(receipt.parserBindingSha256)) ||
+      !validParserExecution(receipt.parserExecution) ||
       (receipt.runId !== undefined &&
         (typeof receipt.runId !== "string" || !SAFE_ID.test(receipt.runId))) ||
       !["encode", "consolidate", "pretrain", "archive"].includes(
         receipt.policy,
       ) ||
-      !["learned", "rejected"].includes(receipt.outcome) ||
+      !["learned", "rejected", "no-assets"].includes(receipt.outcome) ||
       typeof receipt.completedAt !== "string" ||
       receipt.completedAt.length > 128
     ) {
@@ -813,6 +934,7 @@ export class DatasetManifestStore {
       manifest.discoveredFiles - 1,
     );
     safeInteger(receipt.epoch, "receipt.epoch", 0, requestedEpochs - 1);
+    if (receipt.continuationManifestId !== manifest.continuationIdentity?.manifestId) throw new Error("Dataset receipt lost its original native transaction owner.");
     if (receipt.transactionKey !== datasetEntryTransactionKey(receipt)) {
       throw new Error("Dataset entry receipt transaction checksum is invalid.");
     }
@@ -863,7 +985,7 @@ export class DatasetManifestStore {
       throw new Error("receipt.parametersChanged is invalid.");
     }
     if (
-      receipt.outcome === "learned" &&
+      ["learned", "no-assets"].includes(receipt.outcome) &&
       (!receipt.sourceId ||
         !receipt.sourceKind ||
         receipt.sourceBytes === undefined ||
@@ -874,6 +996,12 @@ export class DatasetManifestStore {
       throw new Error(
         "Learned dataset receipt is missing repository metadata.",
       );
+    }
+    if (receipt.outcome === "no-assets" &&
+        (receipt.parserExecution?.outputKind !== "media-assets" || receipt.parserExecution.outputAssets !== 0 ||
+          receipt.learnedIdeas !== 0 || receipt.learnedConcepts !== 0 || receipt.learnedSynapses !== 0 ||
+          receipt.learnedParameterSteps !== 0 || receipt.parametersChanged !== false)) {
+      throw new Error("No-assets dataset receipt claims neural or modality updates.");
     }
     if (receipt.coverage) {
       if (
@@ -1134,6 +1262,9 @@ export class DatasetManifestStore {
     if (inputPaths.length === 0)
       throw new Error("Choose at least one dataset path.");
     throwIfCancelled(options.signal);
+    if (options.sourceMediaType !== undefined && !validSourceMediaType(options.sourceMediaType)) throw new Error("Dataset source MIME observation is invalid.");
+    if (options.parserSourceName !== undefined && (typeof options.parserSourceName !== "string" || !options.parserSourceName || options.parserSourceName.length > 32_768 || options.parserSourceName.includes("\0"))) throw new Error("Dataset original parser source name is invalid.");
+    if (options.parserSelection !== undefined && !validPluginTrainingFormatSelection(options.parserSelection)) throw new Error("Explicit dataset parser selection is invalid.");
     const roots = [...new Set(inputPaths.map((value) => resolve(value)))].sort(
       comparePathNames,
     );
@@ -1185,8 +1316,22 @@ export class DatasetManifestStore {
         const relativePath = entry.rootIsFile
           ? basename(entry.path)
           : relative(entry.root, entry.path).split(sep).join("/");
-        const format = detectDatasetFormat(entry.path);
         let rejection = entry.rejection;
+        let sourceMediaType: SourceMediaType | undefined;
+        if (!rejection) {
+          try { sourceMediaType = options.sourceMediaType ?? await observeLocalSourceMediaType(entry.path, options.signal); }
+          catch (error) { throwIfCancelled(options.signal); rejection = `Could not observe selected source MIME: ${error instanceof Error ? error.message : String(error)}`; }
+        }
+        const extensionFormat = detectDatasetFormat(entry.path);
+        const detectedFormat = extensionFormat !== "unknown" ? extensionFormat : datasetFormatForMediaType(sourceMediaType?.value);
+        const pluginFormat = !rejection && (options.parserSelection !== undefined || extensionFormat === "unknown")
+          ? await this.options.resolvePluginTrainingFormat?.(brainId, options.parserSourceName ?? entry.path, sourceMediaType?.value, options.parserSelection)
+          : undefined;
+        if (!rejection && options.parserSelection && !pluginFormat) throw new Error(`The explicitly selected parser is not available for ${relativePath || basename(entry.path)}.`);
+        const format = pluginFormat?.parserFormat ?? detectedFormat;
+        if (!validPluginTrainingFormatBinding(pluginFormat, format)) {
+          throw new Error("Plugin training-format resolution returned an invalid immutable binding.");
+        }
         let contentSha256: string | undefined;
         let committedPath = entry.path;
         let committedBytes = entry.bytes;
@@ -1267,6 +1412,10 @@ export class DatasetManifestStore {
           bytes: committedBytes,
           lastModifiedMs: committedLastModifiedMs,
           ...(contentSha256 ? { contentSha256 } : {}),
+          ...(pluginFormat ? { pluginFormat } : {}),
+          ...(sourceMediaType ? { sourceMediaType } : {}),
+          ...(pluginFormat && options.parserSelection ? { parserSelection: structuredClone(options.parserSelection) } : {}),
+          ...(pluginFormat && options.parserSourceName ? { parserSourceName: options.parserSourceName } : {}),
           ...(rejection ? { rejection } : {}),
         };
         const line = `${JSON.stringify(record)}\n`;
@@ -1389,6 +1538,7 @@ export class DatasetManifestStore {
     }
     safeInteger(parsed.discoveredFiles, "manifest.discoveredFiles");
     safeInteger(parsed.discoveredBytes, "manifest.discoveredBytes");
+    if (parsed.continuationIdentity && (!SAFE_ID.test(parsed.continuationIdentity.manifestId) || !SAFE_ID.test(parsed.continuationIdentity.sourceBrainId))) throw new Error("Dataset continuation identity is invalid.");
     return parsed;
   }
 
@@ -1518,6 +1668,8 @@ export class DatasetManifestStore {
     brainId: string,
     manifestId: string,
     startIndex = 0,
+    /** Metadata-only archival reads never grant access to a canonical path. */
+    resolveSources = true,
   ): AsyncGenerator<DatasetManifestEntry> {
     const manifest = await this.manifest(brainId, manifestId);
     safeInteger(
@@ -1539,6 +1691,8 @@ export class DatasetManifestStore {
       crlfDelay: Infinity,
     });
     let expectedIndex = 0;
+    const relocations = resolveSources ? await openLearningRelocations(this.brainDirectory(brainId), brainId) : undefined;
+    try {
     for await (const line of lines) {
       if (!line.trim()) continue;
       const entry = JSON.parse(line) as DatasetManifestEntry;
@@ -1556,11 +1710,24 @@ export class DatasetManifestStore {
         entry.path.length > 32_768 ||
         typeof entry.relativePath !== "string" ||
         entry.relativePath.length > 32_768 ||
-        (entry.contentSha256 !== undefined && !validSha256(entry.contentSha256))
+        (entry.contentSha256 !== undefined && !validSha256(entry.contentSha256)) ||
+        !validPluginTrainingFormatBinding(entry.pluginFormat, entry.format) ||
+        (entry.sourceMediaType !== undefined && !validSourceMediaType(entry.sourceMediaType)) ||
+        (entry.parserSourceName !== undefined && (typeof entry.parserSourceName !== "string" || !entry.parserSourceName || entry.parserSourceName.length > 32_768 || entry.parserSourceName.includes("\0"))) ||
+        (entry.pluginFormat !== undefined && entry.pluginFormat.inputMediaType !== entry.sourceMediaType?.value) ||
+        (entry.parserSourceName !== undefined && !entry.pluginFormat) ||
+        (entry.parserSelection !== undefined && (!entry.pluginFormat ||
+          !validPluginTrainingFormatSelection(entry.parserSelection) ||
+          entry.parserSelection.pluginId !== entry.pluginFormat.pluginId || entry.parserSelection.contentSha256 !== entry.pluginFormat.contentSha256 || entry.parserSelection.formatId !== entry.pluginFormat.formatId)) ||
+        Object.hasOwn(entry, "sourceRelocation")
       ) {
         throw new Error("Dataset manifest entry contract is invalid.");
       }
-      if (entry.snapshotKind === "sqlite") {
+      expectedIndex += 1;
+      if (entry.index < startIndex) continue;
+      if (resolveSources && manifest.portableSources && !entry.rejection && !relocations?.source(manifestId, entry.index)) throw new Error("This retained source needs its owned portable bytes or an explicit source selection.");
+      const resolved = relocations ? await relocations.resolve(manifestId, entry) : entry;
+      if (resolveSources && entry.snapshotKind === "sqlite" && !resolved.sourceRelocation) {
         const snapshots = resolve(
           this.manifestDirectory(brainId, manifestId),
           "snapshots",
@@ -1578,15 +1745,14 @@ export class DatasetManifestStore {
           throw new Error("Dataset SQLite snapshot identity is invalid.");
         }
       }
-      expectedIndex += 1;
-      if (entry.index < startIndex) continue;
-      yield entry;
+      yield resolved;
     }
     if (expectedIndex !== manifest.discoveredFiles) {
       throw new Error(
         "Dataset manifest entry count does not match its declaration.",
       );
     }
+    } finally { relocations?.close(); lines.close(); }
   }
 
   async saveCursor(brainId: string, cursor: DatasetCursor): Promise<void> {
@@ -1831,6 +1997,9 @@ export class CrawlFrontierStore {
         warnings_json TEXT NOT NULL DEFAULT '[]',
         recorded_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS policy_revisions(revision INTEGER PRIMARY KEY,sha256 TEXT UNIQUE NOT NULL,body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS source_provenance(sequence INTEGER PRIMARY KEY AUTOINCREMENT,url TEXT NOT NULL,body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS scope_exclusions(url TEXT PRIMARY KEY,depth INTEGER NOT NULL);
     `);
     const visitedColumns = this.database
       .prepare("PRAGMA table_info(visited)")
@@ -1848,7 +2017,7 @@ export class CrawlFrontierStore {
     }
     if (!resume) {
       this.database.exec(
-        "DELETE FROM frontier; DELETE FROM visited; DELETE FROM warnings; DELETE FROM result_receipts;",
+        "DELETE FROM frontier; DELETE FROM visited; DELETE FROM warnings; DELETE FROM result_receipts; DELETE FROM policy_revisions; DELETE FROM source_provenance; DELETE FROM scope_exclusions;",
       );
     }
     const insertMeta = this.database.prepare(
@@ -1909,6 +2078,42 @@ export class CrawlFrontierStore {
           entry.url,
         );
       }
+    });
+  }
+
+  recordPolicy(value: WebLearningPolicy): void {
+    const policy = validateWebLearningPolicy(value);
+    const latest = this.database.prepare("SELECT revision,sha256 FROM policy_revisions ORDER BY revision DESC LIMIT 1").get() as { revision: number; sha256: string } | undefined;
+    if (latest?.sha256 === policy.sha256) return;
+    if (latest && policy.revision <= latest.revision) throw new Error("Crawl scope revision is stale.");
+    this.transact(() => {
+      this.database.prepare("INSERT INTO policy_revisions VALUES(?,?,?)").run(policy.revision, policy.sha256, JSON.stringify(policy));
+      // Previously excluded, never-committed pages may become eligible under
+      // explicit user steering. Already learned pages/receipts never replay.
+      for (const row of this.database.prepare("SELECT url,depth FROM scope_exclusions WHERE url NOT IN (SELECT url FROM result_receipts)").all() as unknown as CrawlFrontierEntry[]) {
+        this.database.prepare("DELETE FROM visited WHERE url=?").run(row.url);
+        this.database.prepare("INSERT OR IGNORE INTO frontier(url,depth,state,added_at) VALUES(?,?,'queued',?)").run(row.url, row.depth, policy.changedAt);
+      }
+      this.database.prepare("DELETE FROM scope_exclusions").run();
+    });
+  }
+
+  policy(): WebLearningPolicy | undefined {
+    const row = this.database.prepare("SELECT body FROM policy_revisions ORDER BY revision DESC LIMIT 1").get() as { body: string } | undefined;
+    return row ? validateWebLearningPolicy(JSON.parse(row.body)) : undefined;
+  }
+
+  provenance(record: WebSourceProvenance): void {
+    this.database.prepare("INSERT INTO source_provenance(url,body) VALUES(?,?)").run(record.requestedUrl, JSON.stringify(record));
+  }
+
+  excluded(entry: CrawlFrontierEntry, record: WebSourceProvenance): void {
+    this.transact(() => {
+      this.provenance(record);
+      this.database.prepare("DELETE FROM frontier WHERE url=?").run(entry.url);
+      this.database.prepare("INSERT OR REPLACE INTO visited(url,status,visited_at,error,bytes) VALUES(?,'skipped',?,?,0)")
+        .run(entry.url, record.checkedAt, `Scope: ${record.decision}`);
+      this.database.prepare("INSERT OR REPLACE INTO scope_exclusions VALUES(?,?)").run(entry.url, entry.depth);
     });
   }
 

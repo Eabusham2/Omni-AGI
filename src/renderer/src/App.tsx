@@ -42,6 +42,7 @@ import {
   type RuntimeJob,
   type InstalledModalityPack,
   type ToolInvocation,
+  type ToolExecutionResult,
   type ToolPermissionRecord,
   type AgentMergePreview,
   type ActionEvent,
@@ -55,10 +56,10 @@ import {
   type SystemRamMode,
   type WorkingMemoryMode,
   type WorkingMemoryResourcePlan,
-  type ApiTeacherProvider,
-  type ApiTeacherProviderStatus,
   type McpTransport,
-  type McpServerSummary
+  type McpServerSummary,
+  type McpRegistrySummary,
+  type McpRegistryUpdateRequest
 } from "@shared/types";
 import type {
   BrainActiveModeResult,
@@ -66,6 +67,8 @@ import type {
 } from "@shared/types";
 import { BRAIN_EXPORT_DISCLOSURE } from "@shared/brainExportDisclosure";
 import { chatInputCapacity } from "@shared/chatInput";
+import { chatHostSuspensionStatus } from "@shared/chatSuspension";
+import { pausedOutputLabel, savedChatSuspension } from "./chatSuspensionPresentation";
 import {
   EXPERIENCE_UPLOADS,
   type ExperienceUploadKind
@@ -83,6 +86,72 @@ import type {
 import { demoSummaries, makeDemoBrain } from "./demo";
 import { EvolutionWorkspace } from "./EvolutionWorkspace";
 import { BrainMapCortex } from "./BrainMapCortex";
+import { BrainMapSubstrateGraph, type BrainMapGraphEdge } from "./BrainMapSubstrateGraph";
+import { projectBrainMapContact, uniqueRegionLayoutNodes } from "./brainMapGraphProjection";
+import { ComposerSubmitControl } from "./ComposerSubmitControl";
+import { ChatAttachmentMenu } from "./ChatAttachmentMenu";
+import { ChatQueueStack } from "./ChatQueueStack";
+import { ChatDirectionStrip } from "./ChatDirectionStrip";
+import { useChatDirections } from "./useChatDirections";
+import { chatDirectionStripItem, isSteerDirectionMessage } from "./chatDirectionPresentation";
+import { chatMessageAttribution } from "./chatMessageAttribution";
+import { BestWorkSettings } from "./BestWorkSettings";
+import { McpAuthenticationPanel } from "./McpAuthenticationPanel";
+import { McpCredentialPanel } from "./McpCredentialPanel";
+import { McpPresetPicker } from "./McpPresetPicker";
+import { MapConnectionPanel } from "./MapConnectionPanel";
+import { MapBasemapPanel } from "./MapBasemapPanel";
+import { MapRasterView } from "./MapRasterView";
+import { mapRasterFromAction } from "./mapRasterPresentation";
+import { MapResultView } from "./MapResultView";
+import { mapDisplayFromAction } from "./mapPresentation";
+import { McpInteractionPanel } from "./McpInteractionPanel";
+import { McpAppView } from "./McpAppView";
+import { HtmlArtifactView } from "./HtmlArtifactView";
+import { chatHtmlArtifactRequest } from "./htmlArtifactPresentation";
+import { TimeWorkspace } from "./TimeWorkspace";
+import { PluginManager } from "./PluginManager";
+import { PluginApprovalReviewView, PluginToolApprovalReviewView } from "./PluginApprovalReview";
+import { LearningWorkspace } from "./LearningWorkspace";
+import { ExternalAdvicePanel } from "./ExternalAdvicePanel";
+import { ActionReviewDetails } from "./ActionReviewDetails";
+import { BuildProgressStatus, StorageOperationTiming } from "./BuildProgressStatus";
+import { PluginThemeHost, loadPluginThemeSelection, savePluginThemeSelection, clearPluginThemeSelection } from "./PluginThemes";
+import { PortableWorkspaceControls } from "./PortableWorkspaceControls";
+import { applyPortablePresentationOnce } from "./portablePresentation";
+import { DatasetParserPicker, useDatasetParserPicker } from "./DatasetParserPicker";
+import { PluginRuntimeContributionsProvider, PluginRuntimeSlot } from "./PluginRuntimeContributions";
+import { PluginRuntimeApprovalQueue } from "./PluginRuntimeApprovals";
+import { SparseSubstrateJobsProvider, SparseSubstrateJobsPanel, SparseSubstrateJobCard, useSparseSubstrateActionJob } from "./SparseSubstrateJobs";
+import { sparseJobLabel } from "./sparseSubstratePresentation";
+import { ResponseOutputCounter } from "./ResponseOutputCounter";
+import { FullMergePanel } from "./FullMergePanel";
+import { DeviceAllocationSelector, synchronizeDeviceRam } from "./DeviceAllocationSelector";
+import { RegionalExecutionControls } from "./RegionalExecutionControls";
+import { DecoderExecutionControls } from "./DecoderExecutionControls";
+import { CachedDecoderExecutionControls } from "./CachedDecoderExecutionControls";
+import { NativeOperationAutoControls } from "./NativeOperationAutoControls";
+import { PonderPresentationLedger, reconcilePonderPresentation, type PonderPresentation } from "./ponderSelfReportPresentation";
+import { PonderSelfReportView } from "./PonderSelfReportView";
+import { McpHostServicesPanel } from "./McpHostServicesPanel";
+import { McpTasksPanel } from "./McpTasksPanel";
+import { McpTaskActionView } from "./McpTaskActionView";
+import { mcpTaskActionLabel } from "./mcpTaskPresentation";
+import { WholeBrainMap } from "./WholeBrainMap";
+import { InstanceLifecycleControls } from "./InstanceLifecycleControls";
+import { InheritedTaskFilesReview } from "./InheritedTaskFilesReview";
+import { ImaginationCaptureControls } from "./ImaginationCaptureControls";
+import { RouterSpikeView } from "./RouterSpikeView";
+import { ProcessMemorySettings } from "./ProcessMemorySettings";
+import { ToastNotice } from "./ToastNotice";
+import { ApiTeacherPanel } from "./ApiTeacherPanel";
+import { libraryRuntimePresentation } from "./libraryRuntimePresentation";
+import { ChatImaginationMedia } from "./ChatImaginationMedia";
+import { ToolActionPicker, defaultToolAction } from "./ToolActionPicker";
+import type { ToolDescription } from "../../shared/toolDescriptions";
+import type { InheritedTaskFileReview } from "../../shared/inheritedTaskFiles";
+import type { InstanceLifecycleState } from "../../shared/instanceLifecycle";
+import type { DeviceResourceSettings } from "@shared/deviceResources";
 import {
   presentJournalKind,
   presentTraceEvidence,
@@ -96,7 +165,6 @@ import {
   type TextFrameBatcher
 } from "./chatStreaming";
 import {
-  actionImaginationMedia,
   imaginationRevisionCopy,
   imaginationSeedCopy,
   jobImaginationMedia,
@@ -152,13 +220,25 @@ import {
 import { LiveVoiceController, LIVE_VOICE_PACE_RATES } from "./liveVoiceController";
 import { liveVoiceStatusCopy } from "./liveVoicePresentation";
 import {
-  LIVE_VOICE_DELIVERY_MODES,
-  LIVE_VOICE_PACES,
-  loadLiveVoicePreferences,
-  saveLiveVoicePreferences
+  DEFAULT_LIVE_VOICE_PREFERENCES
 } from "./liveVoicePreferences";
+import { useInstanceVoice } from "./useInstanceVoice";
+import { VoiceRoutingControls } from "./VoiceRoutingControls";
+import { useTaskAttachmentDraft } from "./useTaskAttachmentDraft";
+import { TaskAttachmentStrip } from "./TaskAttachmentStrip";
+import { MessageTaskAttachments } from "./MessageTaskAttachments";
+import { NativeAudioInputSummary } from "./NativeAudioInputSummary";
+import type { ChatTaskAttachmentHandle } from "@shared/taskAttachments";
+import type { TouchBarState } from "@shared/touchBar";
+import {
+  conversationTouchBarState,
+  matchTouchBarAction,
+  touchBarActionRemainsReady,
+  type ConversationTouchBarInput
+} from "./touchBarPresentation";
 import { studioUiDestination } from "./studioUiActions";
 import { LivePerceptionPanel } from "./LivePerceptionPanel";
+import { CallLayout } from "./CallLayout";
 import {
   clearSubmittedChatDraft,
   chatMessageDeliveryState,
@@ -179,6 +259,7 @@ import {
 import {
   chatActionCancellationTarget,
   chatActionSearchActivity,
+  chatActionMcpAppViewId,
   chatActionStateLabel,
   chatActionTitle,
   cleanChatActionStatus
@@ -212,11 +293,14 @@ import {
 } from "./resourceEnvelope";
 import {
   compactParameterCount,
+  nativeConnectionLabel,
   neuralParameterAccounting,
   neuralResourceRuntimeRows,
   type NeuralParameterAccountingPresentation
 } from "./neuralRuntimePresentation";
 import { brainProvenancePresentation } from "./brainProvenancePresentation";
+import { CognitionProgressView } from "./CognitionProgressView";
+import type { CognitionProgress } from "../../shared/cognition";
 import {
   connectionCountPresentation,
   conciseUiMessage,
@@ -271,6 +355,9 @@ const WORKSPACE_TELEMETRY_REFRESH_MS = 1_250;
 type WorkspaceView =
   | "chat"
   | "data"
+  | "learn"
+  | "fact-check"
+  | "schedule"
   | "map"
   | "trace"
   | "imagine"
@@ -283,6 +370,7 @@ type PermissionLevel = "off" | "ask" | "auto" | "full";
 type ModalityId = "vision" | "image" | "audio" | "video";
 
 interface BuilderExtras {
+  spillPoolSelectionId?: string;
   hardware: HardwareChoice;
   initialTraining: boolean;
   initialResources: BuilderResource[];
@@ -361,6 +449,9 @@ const recipeMeta: Array<{
 const navItems: Array<{ id: WorkspaceView; label: string; icon: IconName }> = [
   { id: "chat", label: "Conversation", icon: "chat" },
   { id: "data", label: "Data & training", icon: "database" },
+  { id: "learn", label: "Learn", icon: "memory" },
+  { id: "fact-check", label: "Fact Check", icon: "search" },
+  { id: "schedule", label: "Time & schedules", icon: "activity" },
   { id: "map", label: "Brain map", icon: "brain" },
   { id: "trace", label: "Trace & journal", icon: "trace" },
   { id: "imagine", label: "Imagination", icon: "sparkles" },
@@ -975,19 +1066,24 @@ function LibraryPage({
   onDelete,
   onBuild,
   onImport,
-  demo
+  onMerged,
+  demo,
+  portableControls
 }: {
   summaries: BrainSummary[];
   loading: boolean;
-  onOpen: (summary: BrainSummary) => void;
+  onOpen: (summary: BrainSummary | string) => void;
   onDuplicate: (summary: BrainSummary) => void;
   onDelete: (summary: BrainSummary) => void;
   onBuild: () => void;
   onImport: () => void;
+  onMerged: () => void;
   demo: boolean;
+  portableControls?: import("react").ReactNode;
 }) {
   const [query, setQuery] = useState("");
   const visible = summaries.filter((brain) => brain.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+  const runtimeNotice = libraryRuntimePresentation(demo);
 
   return (
     <main className="library-page">
@@ -1026,6 +1122,8 @@ function LibraryPage({
       </section>
 
       <section className="library-content">
+        <FullMergePanel summaries={summaries} api={window.omni} onPublished={onMerged} onOpen={onOpen} />
+        {portableControls}
         <div className="section-heading">
           <div>
             <h2>Your instances</h2>
@@ -1177,12 +1275,12 @@ function LibraryPage({
               <Icon name="pulse" size={20} />
             </div>
             <div>
-              <strong>Compute is ready</strong>
-              <span>Local runtime · Cross-platform · Hardware scaling enabled</span>
+              <strong>{runtimeNotice.title}</strong>
+              <span>{runtimeNotice.detail}</span>
             </div>
-            <span className={cx("system-card__pill", demo && "system-card__pill--demo")}>
-              {demo ? "DEMO · no trained brain" : "Engine online"}
-            </span>
+            {runtimeNotice.badge ? <span className="system-card__pill system-card__pill--demo">
+              {runtimeNotice.badge}
+            </span> : null}
           </div>
           <div className="tip-card">
             <Icon name="sparkles" size={18} />
@@ -1421,6 +1519,9 @@ function SimpleBuildWizard({
   const [manualStoragePoolGiB, setManualStoragePoolGiB] = useState(
     "20"
   );
+  const [deviceResources, setDeviceResources] = useState<DeviceResourceSettings>();
+  const effectiveDeviceResources = useMemo(() => synchronizeDeviceRam(deviceResources, systemRamMode, systemRamSharePercent),
+    [deviceResources, systemRamMode, systemRamSharePercent]);
   const [memoryPlan, setMemoryPlan] = useState<WorkingMemoryResourcePlan | null>(null);
   const [memoryPlanPending, setMemoryPlanPending] = useState(false);
   const builderMainContentRef = useRef<HTMLDivElement>(null);
@@ -1468,6 +1569,8 @@ function SimpleBuildWizard({
       setMemoryPlanPending(true);
       void window.omni!.catalog.resourcePlan({
         mode: workingMemoryMode,
+        ...(effectiveDeviceResources ? { deviceResources: effectiveDeviceResources } : {}),
+        ...(extras.spillPoolSelectionId ? { spillPoolSelectionId: extras.spillPoolSelectionId } : {}),
         hardwareTier: extras.hardware === "auto" ? detectedHardware.recommendedTier : extras.hardware,
         systemRamMode,
         acceleratorAvailable: detectedHardware.gpu.available,
@@ -1501,7 +1604,9 @@ function SimpleBuildWizard({
     systemRamMode,
     systemRamSharePercent,
     workingMemoryMode,
-    extras.hardware
+    extras.hardware,
+    extras.spillPoolSelectionId,
+    effectiveDeviceResources
   ]);
 
   useEffect(() => {
@@ -1595,6 +1700,7 @@ function SimpleBuildWizard({
   const submit = async () => {
     const extendedConfig = {
       ...config,
+      ...(effectiveDeviceResources ? { deviceResources: effectiveDeviceResources } : {}),
       name: name.trim(),
       preset: config.preset,
       runtime: "adaptive-core" as const,
@@ -1754,7 +1860,7 @@ function SimpleBuildWizard({
           </strong>
           <span>
             {memoryPlan?.architecture
-              ? `All initial learned weights use 2-bit packed ternary codes · ${formatBytes(memoryPlan.architecture.packedTernaryWeightBytes)} weights; non-weight runtime state is budgeted separately`
+              ? `Packed ternary signs · ${formatBytes(memoryPlan.architecture.packedTernaryWeightBytes)}; strength and plasticity · ${memoryPlan.architecture.connectionStateBytes === undefined ? "not reported" : formatBytes(memoryPlan.architecture.connectionStateBytes)}. Runtime state is budgeted separately.`
               : "Versioned OmniCortex architecture profile"}
           </span>
         </div>
@@ -1963,6 +2069,15 @@ function SimpleBuildWizard({
                 </span>
               </div>
             ) : null}
+            <DeviceAllocationSelector catalog={window.omni?.catalog} settings={effectiveDeviceResources}
+              ramMode={systemRamMode} ramPercent={systemRamSharePercent} disabled={building}
+              plan={memoryPlan?.deviceResources} planPending={memoryPlanPending}
+              onChange={(settings, selectionId) => {
+                setDeviceResources(settings); setMemoryPlanPending(Boolean(window.omni));
+                const ram = settings.allocations.find((entry) => entry.deviceId === "ram:system");
+                if (ram) { setSystemRamMode(ram.mode); setSystemRamSharePercent(ram.percent); }
+                if (selectionId) setExtras((current) => ({ ...current, spillPoolSelectionId: selectionId }));
+              }} />
             <details className="system-ram-budget">
               <summary>
                 <span>
@@ -2434,7 +2549,6 @@ function WorkspaceShell({
   onView,
   onLibrary,
   onDuplicate,
-  onDelete,
   onActiveModeChange,
   onBrainChange,
   onToast
@@ -2444,19 +2558,23 @@ function WorkspaceShell({
   onView: (view: WorkspaceView) => void;
   onLibrary: () => void;
   onDuplicate: () => void;
-  onDelete: () => void;
   onActiveModeChange: (result: BrainActiveModeResult) => Promise<void>;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
 }) {
-  const [health, setHealth] = useState("Adaptive core ready");
-  const [learningSwitchBusy, setLearningSwitchBusy] = useState(false);
+  const [health, setHealth] = useState("Checking runtime…");
   const [compactInspectorOpen, setCompactInspectorOpen] = useState(false);
+  const [adviceOpen, setAdviceOpen] = useState(false);
+  const [adviceVisited, setAdviceVisited] = useState(false);
+  const [instanceState, setInstanceState] = useState<InstanceLifecycleState>();
+  const [loadReviewRequest, setLoadReviewRequest] = useState(0);
+  const runtimeLoaded = !window.omni?.brain.lifecycle || instanceState?.brainId === brain.id && instanceState.phase === "loaded";
   const [chatActivity, setChatActivity] = useState<ChatWorkspaceActivitySnapshot>(
     EMPTY_CHAT_WORKSPACE_ACTIVITY
   );
   const chatActivityStatus = workspaceChatActivityPresentation(chatActivity);
-  const viewWaitsForTurn = workspaceViewWaitsForForegroundTurn(view, chatActivity);
+  const offlineSettings = view === "settings" && instanceState && !instanceState.learnedRuntimeResident && ["unloaded", "suspended", "error"].includes(instanceState.phase);
+  const viewWaitsForTurn = !offlineSettings && workspaceViewWaitsForForegroundTurn(view, chatActivity);
   const explainForegroundWait = (): void => {
     onToast(
       chatActivityStatus?.waitingLabel ??
@@ -2469,28 +2587,6 @@ function WorkspaceShell({
       return;
     }
     action();
-  };
-  const toggleLearning = async () => {
-    if (learningSwitchBusy) return;
-    if (chatActivity.turnActive) {
-      explainForegroundWait();
-      return;
-    }
-    const enabled = !brain.config.onlineLearning;
-    setLearningSwitchBusy(true);
-    try {
-      const updated = window.omni
-        ? await window.omni.brain.setOnlineLearning(brain.id, enabled)
-        : { ...brain, config: { ...brain.config, onlineLearning: enabled }, updatedAt: new Date().toISOString() };
-      onBrainChange(updated);
-      onToast(enabled
-        ? "Background parameter training resumed; queued updates are retained."
-        : "Background parameter training paused or stopping. Fast conversation learning remains active.");
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Background training state could not be changed.");
-    } finally {
-      setLearningSwitchBusy(false);
-    }
   };
 
   useEffect(() => {
@@ -2545,6 +2641,8 @@ function WorkspaceShell({
   }, [compactInspectorOpen]);
 
   return (
+    <PluginRuntimeContributionsProvider brainId={brain.id} onNotice={onToast}>
+    <SparseSubstrateJobsProvider brainId={brain.id}>
     <main className="workspace">
       <aside className="workspace-rail">
         <button
@@ -2593,9 +2691,6 @@ function WorkspaceShell({
             <span className="workspace-header__view">{navItems.find((item) => item.id === view)?.label}</span>
             <span className="workspace-header__slash">/</span>
             <strong>{brain.name}</strong>
-            <span className="live-chip">
-              <i /> Fast conversation learning active
-            </span>
           </div>
           {view !== "chat" && chatActivityStatus ? (
             <button
@@ -2616,6 +2711,12 @@ function WorkspaceShell({
             </span>
           </div>
           <div className="workspace-header__actions">
+            {view === "chat" ? <PluginRuntimeSlot slot="chat.toolbar" /> : null}
+            <button type="button" className="button button--ghost" aria-controls="external-advice-panel" aria-expanded={adviceOpen}
+              title="Separate optional assistant and pre-action reviewer" onClick={() => { setAdviceVisited(true); setAdviceOpen(open => !open); }}>Assistant</button>
+            <InstanceLifecycleControls key={brain.id} brainId={brain.id} name={brain.name}
+              api={window.omni?.brain.lifecycle ? window.omni.brain : undefined} onState={setInstanceState}
+              reviewRequest={loadReviewRequest} onEditSettings={() => onView("settings")} />
             {view === "chat" ? (
               <button
                 className="icon-button workspace-inspector-toggle"
@@ -2640,33 +2741,10 @@ function WorkspaceShell({
             >
               <Icon name="copy" size={14} /> <span>Duplicate instance</span>
             </button>
-            <button
-              className="workspace-delete"
-              aria-label={chatActivity.turnActive
-                ? `Delete instance ${brain.name}; waiting for current reply`
-                : `Delete instance ${brain.name}`}
-              title={chatActivity.turnActive
-                ? "Waiting for the current reply; return to Conversation to Queue or Steer"
-                : "Permanently delete this exact instance"}
-              onClick={() => runOutsideForegroundTurn(onDelete)}
-            >
-              <Icon name="close" size={14} />
-            </button>
-            <button
-              className="icon-button"
-              aria-label={brain.config.onlineLearning ? "Pause background training" : "Resume background training"}
-              title={chatActivity.turnActive
-                ? "Waiting for the current reply; return to Conversation to Queue or Steer"
-                : brain.config.onlineLearning
-                  ? "Pause slow parameter replay; fast conversation learning remains active"
-                  : "Resume queued slow parameter replay"}
-              disabled={learningSwitchBusy}
-              onClick={() => void toggleLearning()}
-            >
-              <Icon name={brain.config.onlineLearning ? "pause" : "play"} size={16} />
-            </button>
           </div>
         </header>
+        <McpInteractionPanel brainId={brain.id} />
+        {adviceVisited ? <ExternalAdvicePanel brainId={brain.id} api={window.omni?.advice} hidden={!adviceOpen} onClose={() => setAdviceOpen(false)} /> : null}
         <button
           className="workspace-inspector-backdrop"
           aria-label="Close cortex inspector"
@@ -2675,6 +2753,9 @@ function WorkspaceShell({
         />
         <ChatWorkspace
           brain={brain}
+          runtimeLoaded={Boolean(runtimeLoaded)}
+          resumeCheckpointId={instanceState?.resume?.checkpointId}
+          inheritedExecutionId={instanceState?.inheritedExecutions?.entries.find(entry => entry.status === "queued" || entry.status === "suspended")?.id}
           hidden={view !== "chat"}
           onBrainChange={onBrainChange}
           onToast={onToast}
@@ -2685,7 +2766,7 @@ function WorkspaceShell({
           <div className={cx("workspace-view-host", viewWaitsForTurn && "is-waiting")}>
             <div
               className="workspace-view-host__content"
-              inert={viewWaitsForTurn || undefined}
+              inert={viewWaitsForTurn || (!runtimeLoaded && view !== "settings" && view !== "tools" && view !== "trace" && view !== "schedule") || undefined}
               aria-busy={viewWaitsForTurn || undefined}
             >
               {view === "data" ? (
@@ -2696,6 +2777,11 @@ function WorkspaceShell({
                   onBrainChange={onBrainChange}
                   onToast={onToast}
                 />
+              ) : view === "learn" || view === "fact-check" ? (
+                <LearningWorkspace brainId={brain.id} mode={view === "learn" ? "specific-learn" : "fact-check"}
+                  api={window.omni?.learning} questions={window.omni?.questions} data={window.omni?.data} localTeacher={window.omni?.localTeacher} />
+              ) : view === "schedule" ? (
+                <TimeWorkspace key={brain.id} brainId={brain.id} onToast={onToast} onActiveMode={() => onView("settings")} />
               ) : view === "map" ? (
                 <BrainMapWorkspace brain={brain} onBack={() => onView("chat")} />
               ) : view === "trace" ? (
@@ -2703,10 +2789,13 @@ function WorkspaceShell({
               ) : view === "imagine" ? (
                 <ImaginationWorkspace brain={brain} onToast={onToast} />
               ) : view === "tools" ? (
-                <ToolsWorkspace brain={brain} onBrainChange={onBrainChange} onToast={onToast} />
+                <ToolsWorkspace key={brain.id} brain={brain} onBrainChange={onBrainChange} onToast={onToast} />
               ) : view === "settings" ? (
                 <DeviceRuntimeWorkspace
+                  key={brain.id}
                   brain={brain}
+                  foregroundTurnActive={chatActivity.turnActive && chatActivity.phase !== "reply-complete-learning" && chatActivity.phase !== "action-result-learning"}
+                  instanceState={instanceState} onReviewLoad={() => setLoadReviewRequest((value) => value + 1)}
                   onActiveModeChange={onActiveModeChange}
                   onBrainChange={onBrainChange}
                   onToast={onToast}
@@ -2734,6 +2823,8 @@ function WorkspaceShell({
         ) : null}
       </section>
     </main>
+    </SparseSubstrateJobsProvider>
+    </PluginRuntimeContributionsProvider>
   );
 }
 
@@ -2768,6 +2859,7 @@ interface QueuedChatTurn {
   id: string;
   text: string;
   createdAt: string;
+  attachments?: ChatTaskAttachmentHandle[];
 }
 
 interface AttachmentLearningReceipt {
@@ -2788,12 +2880,16 @@ function valueRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function ChatActionCard({ event, onCancel, onApprove }: {
+function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, readablePonder = false, onReadablePonder, flushPonder }: {
   event: ActionEvent;
   onCancel?: () => Promise<void>;
   onApprove?: () => Promise<void>;
+  onDecline?: (instruction?: string) => Promise<void>;
+  ponderReports?: PonderPresentation[];
+  readablePonder?: boolean;
+  onReadablePonder?: (value: boolean) => void;
+  flushPonder?: boolean;
 }) {
-  const [mediaPlaybackFailed, setMediaPlaybackFailed] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [approving, setApproving] = useState(false);
   const iconByKind: Record<ActionEvent["action"]["kind"], IconName> = {
@@ -2806,21 +2902,23 @@ function ChatActionCard({ event, onCancel, onApprove }: {
     evolve: "pulse",
     stop: "close"
   };
-  const preview = event.preview;
-  const imaginationMedia = actionImaginationMedia(event);
-  const { sourceUrl, mimeType } = imaginationMedia;
-  useEffect(() => setMediaPlaybackFailed(false), [sourceUrl]);
   const title = chatActionTitle(event.action);
-  const stateLabel = event.cancellationRequested ? "Cancelling" : chatActionStateLabel(event.state);
+  const sparseJob = useSparseSubstrateActionJob(event);
+  const stateLabel = sparseJob ? sparseJobLabel(sparseJob.state) : mcpTaskActionLabel(event) ?? (event.cancellationRequested ? "Cancelling" : chatActionStateLabel(event.state));
   const searchActivity = chatActionSearchActivity(event.action, event.state);
-  const argumentsText = Object.keys(event.action.arguments).length
-    ? JSON.stringify(event.action.arguments)
+  const mcpAppViewId = chatActionMcpAppViewId(event);
+  const mapResult = useMemo(() => mapDisplayFromAction(event), [event.id, event.state, event.action, event.execution]);
+  const mapRaster = useMemo(() => mapRasterFromAction(event), [event.id, event.state, event.action, event.execution]);
+  const visibleArguments = event.action.kind === "ponder"
+    ? Object.fromEntries(Object.entries(event.action.arguments).filter(([key]) => key !== "ponderSelfReport")) : event.action.arguments;
+  const argumentsText = Object.keys(visibleArguments).length
+    ? JSON.stringify(visibleArguments)
     : "";
-  const artifactPath = imaginationMedia.finalArtifactPath ||
-    imaginationMedia.artifactPath;
 
   return (
-    <details className={cx("chat-action-card", `chat-action-card--${event.state}`)}>
+    <>
+      <ChatImaginationMedia event={event} />
+      <details className={cx("chat-action-card", `chat-action-card--${event.state}`)}>
       <summary aria-label={`${title}: ${stateLabel}. Expand action details`}>
         <span className="chat-action-card__icon"><Icon name={iconByKind[event.action.kind]} size={15} /></span>
         <span className="chat-action-card__summary-copy">
@@ -2844,6 +2942,8 @@ function ChatActionCard({ event, onCancel, onApprove }: {
         ) : null}
         {argumentsText ? <code>{argumentsText.length > 360 ? `${argumentsText.slice(0, 357)}…` : argumentsText}</code> : null}
         {event.error ? <p>{cleanChatActionStatus(event.error, event.action)}</p> : null}
+        {event.action.kind === "ponder" && onReadablePonder ? ponderReports?.map(row => <PonderSelfReportView key={row.report.id}
+          row={row} readable={readablePonder} onReadableChange={onReadablePonder} flush={flushPonder} />) : null}
         {event.state === "running" && event.progress !== undefined ? (
           <span
             className="chat-action-card__progress"
@@ -2862,6 +2962,9 @@ function ChatActionCard({ event, onCancel, onApprove }: {
             {cancelling || event.cancellationRequested ? "Cancelling this action…" : "Cancel this action"}
           </Button>
         ) : null}
+        <PluginApprovalReviewView event={event} />
+        <ActionReviewDetails execution={event.execution} onDecline={onDecline} />
+        {sparseJob ? <SparseSubstrateJobCard key={`${sparseJob.brainId}/${sparseJob.id}`} job={sparseJob} /> : null}
         {onApprove && pendingChatToolFromAction(event) ? (
           <Button kind="primary" icon={approving ? "pulse" : "check"}
             disabled={approving || event.cancellationRequested}
@@ -2872,44 +2975,24 @@ function ChatActionCard({ event, onCancel, onApprove }: {
             {approving ? "Approving this action…" : "Approve exact action"}
           </Button>
         ) : null}
-        {preview ? (
-          <small
-            className="chat-action-card__preview-label"
-            role="status"
-            aria-live="polite"
-          >
-            {imaginationRevisionCopy(imaginationMedia)}
-          </small>
-        ) : null}
-        {sourceUrl && mimeType.startsWith("image/") ? (
-          <img src={sourceUrl} alt="Artifact created by the local imagination action" />
-        ) : sourceUrl && mimeType.startsWith("audio/") && !mediaPlaybackFailed ? (
-          <audio src={sourceUrl} controls onError={() => setMediaPlaybackFailed(true)} />
-        ) : sourceUrl && mimeType.startsWith("video/") && !mediaPlaybackFailed ? (
-          <video src={sourceUrl} controls onError={() => setMediaPlaybackFailed(true)} />
-        ) : mediaPlaybackFailed && imaginationMedia.downloadUrl ? (
-          <span className="chat-action-card__artifact">
-            <Icon name="warning" size={14} /> Inline playback is unavailable for this larger artifact. It remains saved in Imagination for download.
-          </span>
-        ) : artifactPath ? (
-          <span className="chat-action-card__artifact"><Icon name="file" size={14} /> {artifactPath}</span>
-        ) : null}
-        {sourceUrl && imaginationMedia.finalArtifactPath ? (
-          <span className="chat-action-card__artifact">
-            <Icon name="file" size={14} /> Final artifact · {imaginationMedia.finalArtifactPath}
-          </span>
-        ) : null}
+        <ChatImaginationMedia event={event} placement="audit" />
         {studioUiDestination(event) ? (
           <span className="chat-action-card__artifact">
             <Icon name={studioUiDestination(event) === "imagine" ? "sparkles" : "settings"} size={14} /> {studioUiDestination(event) === "imagine" ? "Creativity workspace" : "Permissions workspace"} opened locally · reversible
           </span>
         ) : null}
+        {mcpAppViewId ? <McpAppView brainId={event.brainId} viewId={mcpAppViewId} /> : null}
+        <McpTaskActionView event={event} />
+        {chatHtmlArtifactRequest(event) ? <HtmlArtifactView event={event} /> : null}
+        {mapResult ? <MapResultView result={mapResult} /> : null}
+        {mapRaster ? <MapRasterView result={mapRaster} /> : null}
         <span className="chat-action-card__meta">
           {event.action.confidence !== undefined ? `${Math.round(event.action.confidence * 100)}% action confidence · ` : ""}
           {new Date(event.updatedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
         </span>
       </div>
-    </details>
+      </details>
+    </>
   );
 }
 
@@ -3082,6 +3165,9 @@ function DatasetActivityCard({
 
 function ChatWorkspace({
   brain,
+  runtimeLoaded = true,
+  resumeCheckpointId,
+  inheritedExecutionId,
   hidden,
   onBrainChange,
   onToast,
@@ -3089,6 +3175,9 @@ function ChatWorkspace({
   onActivityChange
 }: {
   brain: BrainDocument;
+  runtimeLoaded?: boolean;
+  resumeCheckpointId?: string;
+  inheritedExecutionId?: string;
   hidden?: boolean;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
@@ -3099,6 +3188,8 @@ function ChatWorkspace({
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
+  const [callOpen, setCallOpen] = useState(false);
+  const [captureOpen, setCaptureOpen] = useState(false);
   const [attachmentReceipts, setAttachmentReceipts] = useState<
     AttachmentLearningReceipt[]
   >([]);
@@ -3110,6 +3201,13 @@ function ChatWorkspace({
   const [toolStatus, setToolStatus] = useState("");
   const [toolRunning, setToolRunning] = useState(false);
   const [actionEvents, setActionEvents] = useState<ActionEvent[]>([]);
+  const ponderLedger = useMemo(() => new PonderPresentationLedger(brain.id), [brain.id]);
+  const [ponderRevision, setPonderRevision] = useState(0);
+  const [readablePonder, setReadablePonder] = useState(false);
+  const [ponderError, setPonderError] = useState("");
+  const finishPonder = useCallback((turnId: string) => {
+    if (ponderLedger.finish(turnId)) setPonderRevision(value => value + 1);
+  }, [ponderLedger]);
   const [persistedConversation, setPersistedConversation] = useState<ConversationLedgerEntry[]>([]);
   const [conversationTotal, setConversationTotal] = useState(0);
   const [conversationHasOlder, setConversationHasOlder] = useState(false);
@@ -3123,8 +3221,22 @@ function ChatWorkspace({
   }>>([]);
   const [activeTurnStartedAtMs, setActiveTurnStartedAtMs] = useState<number | null>(null);
   const [chatOutputClockMs, setChatOutputClockMs] = useState<number | null>(null);
+  const [outputRateClockMs, setOutputRateClockMs] = useState<number | null>(null);
+  const [measuredOutput, setMeasuredOutput] = useState<{ tokens: number; rate?: number } | null>(null);
+  const [cognitionProgress, setCognitionProgress] = useState<CognitionProgress | null>(null);
+  const cognitionProgressRef = useRef<CognitionProgress | null>(null);
+  const measuredOutputRef = useRef<{ tokens: number; rate?: number } | null>(null);
+  const outputRateStartRef = useRef<{ at: number; count: number } | null>(null);
   const [chatQueue, setChatQueue] = useState<ChatQueueState | null>(null);
   const [chatDeliveryStatus, setChatDeliveryStatus] = useState("");
+  const [inheritedFileReview, setInheritedFileReview] = useState<{
+    brainId: string; executionId: string; review: InheritedTaskFileReview; input: string;
+    busy: boolean; paused: boolean; error?: string;
+  }>();
+  const [inheritedReviewAttempt, setInheritedReviewAttempt] = useState(0);
+  const waitingInheritedFileReview = Boolean(runtimeLoaded && inheritedFileReview?.brainId === brain.id &&
+    inheritedFileReview.executionId === inheritedExecutionId);
+  const inheritedFilePolicyKey = JSON.stringify(brain.toolPermissions?.find(permission => permission.toolId === "task.attachments") ?? null);
   const [cancellingTurn, setCancellingTurn] = useState(false);
   const [optimisticHumans, setOptimisticHumans] = useState<ChatMessage[]>([]);
   const [sessionCommittedMessages, setSessionCommittedMessages] =
@@ -3139,21 +3251,9 @@ function ChatWorkspace({
     useState<WorkspaceTelemetryDelta | undefined>();
   const [inspectorTab, setInspectorTab] = useState<"state" | "runtime">("state");
   const [liveVoiceState, setLiveVoiceState] = useState<LiveVoiceState | null>(null);
+  const [preparingVoiceCall, setPreparingVoiceCall] = useState(false);
   const [savedReplyVoice, setSavedReplyVoice] = useState<{ messageId: string; phase: "preparing" | "playing" } | null>(null);
-  const [liveVoicePreferences, setLiveVoicePreferences] =
-    useState<LiveVoicePreferences>(() => {
-      try {
-        return loadLiveVoicePreferences(window.localStorage);
-      } catch {
-        return {
-          schemaVersion: 1,
-          deliveryMode: "live",
-          pace: "normal",
-          neuralListening: false,
-          neuralVoice: false
-        };
-      }
-    });
+  const liveVoicePreferences: LiveVoicePreferences = liveVoiceState?.preferences ?? DEFAULT_LIVE_VOICE_PREFERENCES;
 
   useEffect(() => {
     if (!pendingTool?.approvalExpiresAt) return;
@@ -3173,15 +3273,21 @@ function ChatWorkspace({
   }, [pendingTool?.approvalExpiresAt, pendingTool?.approvalToken]);
 
   useEffect(() => {
-    if (!activeTurnId || partialText) {
+    if (!activeTurnId) {
       setChatOutputClockMs(null);
+      setOutputRateClockMs(null);
       return;
     }
-    const tick = (): void => setChatOutputClockMs(Date.now());
+    const tick = (): void => {
+      setChatOutputClockMs(Date.now());
+      setOutputRateClockMs(performance.now());
+      setMeasuredOutput(measuredOutputRef.current);
+      setCognitionProgress(cognitionProgressRef.current);
+    };
     tick();
-    const timer = window.setInterval(tick, 1_000);
+    const timer = window.setInterval(tick, 250);
     return () => window.clearInterval(timer);
-  }, [activeTurnId, partialText]);
+  }, [activeTurnId]);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const messageStreamRef = useRef<HTMLDivElement>(null);
   const pendingTimelineAnchorRef = useRef<{
@@ -3194,28 +3300,47 @@ function ChatWorkspace({
   const followOutputRef = useRef(true);
   const userTimelineScrollRef = useRef(false);
   const activeTurnIdRef = useRef<string | null>(null);
+  const touchBarRevisionRef = useRef(0);
+  const touchBarScopeRef = useRef(0);
+  const touchBarAcceptedStateRef = useRef<TouchBarState | null>(null);
+  const touchBarActionContextRef = useRef<{
+    input: ConversationTouchBarInput;
+    submit(): void;
+    stop(): void;
+    call(): void;
+  } | null>(null);
   const partialTextRef = useRef("");
   const generationPhasesRef = useRef(new Map<string, ChatGenerationPhase>());
   const committedTurnIdsRef = useRef(new Set<string>());
   const receivedInputTurnIdsRef = useRef(new Set<string>());
   const cancelledTurnIdsRef = useRef(new Set<string>());
   const steeredTurnIdsRef = useRef(new Set<string>());
+  const suspendedTurnIdsRef = useRef(new Set<string>());
   const actionTurnIdsRef = useRef(new Map<string, string>());
   const currentBrainIdRef = useRef(brain.id);
   currentBrainIdRef.current = brain.id;
+  const inheritedReviewScopeRef = useRef("");
+  inheritedReviewScopeRef.current = `${brain.id}:${inheritedExecutionId ?? ""}:${runtimeLoaded}`;
+  useLayoutEffect(() => {
+    inheritedReviewScopeRef.current = `${brain.id}:${inheritedExecutionId ?? ""}:${runtimeLoaded}`;
+    return () => { inheritedReviewScopeRef.current = "unmounted"; };
+  }, [brain.id, inheritedExecutionId, runtimeLoaded]);
   const chatQueueRef = useRef<ChatQueueState | null>(null);
   const streamSequenceRef = useRef(new Map<string, number>());
   const tokenBatcherRef = useRef<TextFrameBatcher | null>(null);
   const textTurnGenerationRef = useRef(0);
   const activeHumanTurnsRef = useRef(new Map<
     string,
-    { content: string; createdAt: string }
+    { content: string; createdAt: string; attachmentIds?: string[] }
   >());
   const activePreviewIdRef = useRef<string | null>(null);
   const attachmentOperationGateRef = useRef(
     new ChatAttachmentOperationGate()
   );
   const liveVoiceControllerRef = useRef<LiveVoiceController | null>(null);
+  const preparingVoiceRef = useRef<LiveVoiceController | null>(null);
+  const instanceVoice = useInstanceVoice(brain.id, runtimeLoaded, callOpen, liveVoiceControllerRef, window.omni?.voice);
+  const taskAttachmentDraft = useTaskAttachmentDraft(brain.id, window.omni?.chat.attachments);
   const savedReplySynthesisRef = useRef<LiveVoiceSynthesisAdapter | null>(null);
   const savedReplySessionRef = useRef<LiveVoiceSynthesisSession | null>(null);
   const savedReplyVoiceGenerationRef = useRef(0);
@@ -3255,7 +3380,7 @@ function ChatWorkspace({
   const persistDeliveryReceipt = (
     turnId: string,
     state: ChatDeliveryReceiptState,
-    fallback?: { content: string; createdAt: string }
+    fallback?: { content: string; createdAt: string; attachmentIds?: string[] }
   ): Promise<void> => {
     const turn = activeHumanTurnsRef.current.get(turnId) ?? fallback;
     const recorder = window.omni?.chat.recordDeliveryReceipt;
@@ -3265,6 +3390,7 @@ function ChatWorkspace({
       turnId,
       content: turn.content,
       createdAt: turn.createdAt,
+      ...(turn.attachmentIds?.length ? { attachmentIds: turn.attachmentIds } : {}),
       state
     }).catch((error: unknown) => {
       onToast(
@@ -3367,7 +3493,7 @@ function ChatWorkspace({
     const controller = new LiveVoiceController({
       brainId: brain.id,
       ...adapters,
-      preferences: liveVoicePreferences,
+      preferences: { ...DEFAULT_LIVE_VOICE_PREFERENCES },
       chat: createOmniLiveVoiceChatAdapter(window.omni.chat),
       onAcceptedReply: (reply) => {
         generationPhasesRef.current.delete(reply.turnId);
@@ -3404,6 +3530,11 @@ function ChatWorkspace({
           : Date.now();
         setActiveTurnStartedAtMs(measuredStart);
         setChatOutputClockMs(measuredStart);
+        measuredOutputRef.current = null;
+        setMeasuredOutput(null);
+        cognitionProgressRef.current = null;
+        setCognitionProgress(null);
+        outputRateStartRef.current = null;
         tokenBatcherRef.current?.reset();
         partialTextRef.current = "";
         setPartialText("");
@@ -3450,6 +3581,7 @@ function ChatWorkspace({
       if (liveVoiceControllerRef.current === controller) {
         liveVoiceControllerRef.current = null;
       }
+      if (preparingVoiceRef.current === controller) { preparingVoiceRef.current = null; setPreparingVoiceCall(false); }
       liveVoiceUtteranceRef.current = null;
       void controller.dispose();
     };
@@ -3519,6 +3651,7 @@ function ChatWorkspace({
     receivedInputTurnIdsRef.current.clear();
     cancelledTurnIdsRef.current.clear();
     steeredTurnIdsRef.current.clear();
+    suspendedTurnIdsRef.current.clear();
     actionTurnIdsRef.current.clear();
     activeTurnIdRef.current = null;
     setActiveTurnId(null);
@@ -3527,6 +3660,11 @@ function ChatWorkspace({
     setPartialText("");
     setActiveTurnStartedAtMs(null);
     setChatOutputClockMs(null);
+    measuredOutputRef.current = null;
+    setMeasuredOutput(null);
+    cognitionProgressRef.current = null;
+    setCognitionProgress(null);
+    outputRateStartRef.current = null;
     setChatQueue(null);
     chatQueueRef.current = null;
     setChatDeliveryStatus("");
@@ -3642,12 +3780,14 @@ function ChatWorkspace({
       (delta) => {
         partialTextRef.current += delta;
         setPartialText(partialTextRef.current);
+        setMeasuredOutput(measuredOutputRef.current);
       },
       (callback) => window.requestAnimationFrame(callback),
       (handle) => window.cancelAnimationFrame(handle)
     );
     tokenBatcherRef.current = batcher;
     const finishGeneration = (turnId: string, createdAt: string, provisional: boolean): void => {
+      finishPonder(turnId);
       if (activeTurnIdRef.current !== turnId) return;
       batcher.flush();
       if (provisional) {
@@ -3659,6 +3799,8 @@ function ChatWorkspace({
       batcher.reset();
       partialTextRef.current = "";
       activeTurnIdRef.current = null;
+      cognitionProgressRef.current = null;
+      setCognitionProgress(null);
       chatQueueRef.current = null;
       setActiveTurnId(null);
       setActiveTurnStartedAtMs(null);
@@ -3688,6 +3830,7 @@ function ChatWorkspace({
         return;
       }
       if (event.type === "chat-action") {
+        ponderLedger.recognize(event.actionEvent, event.turnId);
         actionTurnIdsRef.current.set(event.actionEvent.id, event.turnId);
         setActionEvents((current) => mergeChatActionEvent(current, event.actionEvent));
         routeStudioAction(event.actionEvent);
@@ -3703,6 +3846,11 @@ function ChatWorkspace({
             ? `${chatActionTitle(event.actionEvent.action)} failed: ${cleanChatActionStatus(event.actionEvent.error, event.actionEvent.action)}`
             : `${chatActionTitle(event.actionEvent.action)}: ${chatActionStateLabel(event.actionEvent.state)}.`
         );
+        return;
+      }
+      if (event.type === "chat-ponder-self-report") {
+        try { if (ponderLedger.receive(event.turnId, event.report)) setPonderRevision(value => value + 1); }
+        catch (error) { setPonderError(error instanceof Error ? error.message : "Ponder publication could not be displayed."); }
         return;
       }
       if (event.type === "modality-preview") {
@@ -3742,12 +3890,24 @@ function ChatWorkspace({
         return;
       }
       if (event.type === "chat-state" &&
-          ["complete", "steered", "stopped", "no-reply", "failed", "cancelled"].includes(event.state)) {
+          ["complete", "steered", "stopped", "no-reply", "failed", "cancelled", "suspended", "detached"].includes(event.state)) {
         const priorQueue = event.turnId === activeTurnIdRef.current ? chatQueueRef.current : null;
         const committed = committedTurnIdsRef.current.has(event.turnId);
         const received = receivedInputTurnIdsRef.current.has(event.turnId);
         finishGeneration(event.turnId, event.createdAt, !committed && event.state !== "complete");
         setPostReplyWork((current) => current.filter((work) => work.turnId !== event.turnId));
+        if (event.state === "suspended" || event.state === "detached") {
+          const suspendedState = event.state;
+          suspendedTurnIdsRef.current.add(event.turnId);
+          // Main alone certifies/persists this disposition. The renderer must
+          // not turn its RPC unwind into a failed send or a fabricated Stop.
+          setOptimisticHumans(current => settleOptimisticChatTurn(current, event.turnId, suspendedState));
+          setUncommittedOutputs(current => settleUncommittedChatOutput(current, event.turnId, suspendedState));
+          if (!activeTurnIdRef.current) setChatDeliveryStatus(event.suspension &&
+            event.suspension.brainId === brain.id && event.suspension.turnId === event.turnId && event.suspension.state === event.state
+            ? chatHostSuspensionStatus(event.suspension) : "Host attachment ended; the input is not resubmitted automatically.");
+          void loadLatestConversation().catch(() => undefined);
+        }
         if (event.state === "no-reply" && committed && !activeTurnIdRef.current) {
           setChatDeliveryStatus("Input saved · generation produced no printable reply.");
         }
@@ -3785,6 +3945,14 @@ function ChatWorkspace({
         return;
       }
       if (event.turnId !== activeTurnIdRef.current || previousPhase !== "responding") return;
+      if (event.type === "chat-cognition") {
+        const prior = cognitionProgressRef.current;
+        cognitionProgressRef.current = event.progress;
+        if (!prior || prior.phase !== event.progress.phase || prior.active !== event.progress.active) {
+          setCognitionProgress(event.progress);
+        }
+        return;
+      }
       if (event.type === "chat-state" && event.state === "queued") {
         if (!event.queue) return;
         chatQueueRef.current = event.queue;
@@ -3799,9 +3967,23 @@ function ChatWorkspace({
         const startedAt = Date.now();
         setActiveTurnStartedAtMs(startedAt);
         setChatOutputClockMs(startedAt);
+        measuredOutputRef.current = null;
+        setMeasuredOutput(null);
+        cognitionProgressRef.current = null;
+        setCognitionProgress(null);
+        outputRateStartRef.current = null;
       } else if (event.type === "chat-token") {
         chatQueueRef.current = null;
         setChatQueue(null);
+        // Keep frequent neural measurements out of React's update queue. Text
+        // frames (or the 250ms clock for a non-printing token) publish the latest.
+        const current = measuredOutputRef.current;
+        if (event.outputTokens !== undefined && (!current || event.outputTokens >= current.tokens)) {
+          measuredOutputRef.current = { tokens: event.outputTokens, rate: event.tokensPerSecond };
+          if (!outputRateStartRef.current) {
+            outputRateStartRef.current = { at: performance.now(), count: event.outputTokens };
+          }
+        }
         batcher.push(event.delta);
       }
     });
@@ -3811,7 +3993,59 @@ function ChatWorkspace({
       if (tokenBatcherRef.current === batcher) tokenBatcherRef.current = null;
       streamSequenceRef.current.clear();
     };
-  }, [brain.id, refreshWorkspaceSnapshot]);
+  }, [brain.id, refreshWorkspaceSnapshot, ponderLedger, finishPonder]);
+
+  useEffect(() => {
+    if (!runtimeLoaded || (!resumeCheckpointId && !inheritedExecutionId) || !window.omni?.brain.resumePresentation) {
+      setInheritedFileReview(undefined);
+      return;
+    }
+    if (activeTurnIdRef.current && generationPhasesRef.current.has(activeTurnIdRef.current)) return;
+    let active = true;
+    const presentation = inheritedExecutionId
+      ? window.omni.brain.inheritedResumePresentation(brain.id, inheritedExecutionId)
+      : window.omni.brain.resumePresentation(brain.id);
+    void presentation.then(async (attachment) => {
+      if (!active || !attachment || (inheritedExecutionId ? attachment.inheritedExecutionId !== inheritedExecutionId : attachment.frontier.checkpointId !== resumeCheckpointId) ||
+          generationPhasesRef.current.has(attachment.frontier.turnId)) return;
+      if (inheritedExecutionId && !attachment.hostAttached) {
+        // Authenticate and review BEFORE claiming active output/turn ownership.
+        // An already-attached writer must not be re-entered by a review RPC.
+        const review = await window.omni!.brain.prepareInheritedTaskFiles({ brainId: brain.id, executionId: inheritedExecutionId });
+        if (!active) return;
+        if (review?.state === "review-required") {
+          setInheritedFileReview({ brainId: brain.id, executionId: inheritedExecutionId, review,
+            input: attachment.input, busy: false, paused: false });
+          return;
+        }
+      }
+      setInheritedFileReview(undefined);
+      const turnId = attachment.frontier.turnId;
+      generationPhasesRef.current.set(turnId, "responding");
+      streamSequenceRef.current.set(turnId, attachment.frontier.lastStreamSequence);
+      receivedInputTurnIdsRef.current.add(turnId);
+      activeHumanTurnsRef.current.set(turnId, { content: attachment.input, createdAt: new Date().toISOString() });
+      activeTurnIdRef.current = turnId; setActiveTurnId(turnId);
+      partialTextRef.current = attachment.publishedText; setPartialText(attachment.publishedText);
+      setSending(true); setCancellingTurn(false); setActiveTurnStartedAtMs(Date.now());
+      setChatDeliveryStatus(attachment.priorActions.length
+        ? "Continuing the saved turn. Earlier action proposals are retained but are not replayed. External sessions require explicit reconnection."
+        : "Continuing the exact saved turn; the accepted input is not submitted again.");
+      if (!attachment.hostAttached) {
+        const result = inheritedExecutionId
+          ? await window.omni!.brain.resumeInheritedTurn({ brainId: brain.id, executionId: inheritedExecutionId })
+          : await window.omni!.brain.resumeTurn({ brainId: brain.id, checkpointId: resumeCheckpointId! });
+        if (active) onBrainChangeRef.current(result.brain);
+      }
+    }).catch((reason: unknown) => {
+      if (!active) return;
+      const error = reason instanceof Error ? reason.message : "Saved-turn reattachment is unavailable; the checkpoint is retained.";
+      setChatDeliveryStatus(error);
+      setInheritedFileReview(current => current?.brainId === brain.id && current.executionId === inheritedExecutionId
+        ? { ...current, busy: false, error } : current);
+    });
+    return () => { active = false; }; // Navigation does not Cancel the main-owned continuation.
+  }, [brain.id, runtimeLoaded, resumeCheckpointId, inheritedExecutionId, inheritedReviewAttempt, inheritedFilePolicyKey]);
 
   useEffect(() => {
     void refreshWorkspaceSnapshot();
@@ -3835,6 +4069,9 @@ function ChatWorkspace({
     turnMetadata?: ChatTurnMetadata,
     queuedTurn?: QueuedChatTurn
   ) => {
+    if (waitingInheritedFileReview) { onToast("Review the saved task's files first, or leave that task paused. Your draft is retained."); return; }
+    if (taskAttachmentDraft.busy && !queuedTurn) { onToast("Wait for attachment preparation, or stop it before sending."); return; }
+    if (!runtimeLoaded) { onToast("Load this instance to send or continue neural work. Its saved turn is retained."); return; }
     const text = (queuedTurn?.text ?? input).trim();
     const capacity = chatInputCapacity(text, brain.config.contextWindowTokens);
     if (text && !capacity.fits) {
@@ -3843,7 +4080,7 @@ function ChatWorkspace({
       return;
     }
     const steering = turnMetadata?.kind === "steer";
-    if (!text || (!steering && sending) ||
+    if (!text || (!steering && (sending || activeTurnIdRef.current)) ||
         (!steering && liveVoiceGenerationActive && liveVoiceState?.phase === "pondering")) return;
     if (!window.omni) {
       if (queuedTurn) {
@@ -3855,15 +4092,23 @@ function ChatWorkspace({
     const submissionGeneration = ++textTurnGenerationRef.current;
     const turnId = queuedTurn?.id ?? globalThis.crypto?.randomUUID?.() ??
       `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const createdAt = queuedTurn?.createdAt ?? new Date().toISOString();
+    const createdAt = queuedTurn?.createdAt ?? turnMetadata?.createdAt ?? new Date().toISOString();
+    const attachments = queuedTurn?.attachments ?? taskAttachmentDraft.take();
+    const attachmentIds = attachments.map(value => value.id);
+    const metadata: ChatTurnMetadata | undefined = attachmentIds.length
+      ? turnMetadata?.kind === "steer" ? { ...turnMetadata, attachmentIds }
+        : { kind: "task", source: "human", createdAt, attachmentIds }
+      : turnMetadata;
     generationPhasesRef.current.set(turnId, "responding");
     const optimisticHuman: ChatMessage = {
       id: queuedTurn ? `queued-${turnId}` : `pending-${turnId}`,
       role: "human",
       content: text,
-      createdAt
+      createdAt,
+      turnId,
+      ...(attachmentIds.length ? { taskAttachmentIds: attachmentIds } : {})
     };
-    activeHumanTurnsRef.current.set(turnId, { content: text, createdAt });
+    activeHumanTurnsRef.current.set(turnId, { content: text, createdAt, attachmentIds });
     setSending(true);
     setCancellingTurn(false);
     chatQueueRef.current = null;
@@ -3874,7 +4119,7 @@ function ChatWorkspace({
     }
     if (window.omni && !queuedTurn) {
       setOptimisticHumans((current) => [
-        ...(turnMetadata
+        ...(turnMetadata?.kind === "steer"
           ? preserveSteeredChatMessage(current, turnMetadata.replacesTurnId)
           : current),
         optimisticHuman
@@ -3887,6 +4132,12 @@ function ChatWorkspace({
     const turnStartedAtMs = Date.now();
     setActiveTurnStartedAtMs(turnStartedAtMs);
     setChatOutputClockMs(turnStartedAtMs);
+    outputRateStartRef.current = null;
+    measuredOutputRef.current = null;
+    setMeasuredOutput(null);
+    cognitionProgressRef.current = null;
+    setCognitionProgress(null);
+    setOutputRateClockMs(null);
     partialTextRef.current = "";
     setPartialText("");
     try {
@@ -3906,7 +4157,7 @@ function ChatWorkspace({
           brain.id,
           text,
           turnId,
-          turnMetadata
+          metadata
         );
         if (currentBrainIdRef.current !== brain.id) return;
         // The chat result is authoritative. The separate ledger page can lag
@@ -3976,7 +4227,25 @@ function ChatWorkspace({
       }
     } catch (error) {
       if (currentBrainIdRef.current !== brain.id) return;
-      if (steeredTurnIdsRef.current.has(turnId)) return;
+      if (steeredTurnIdsRef.current.has(turnId) || suspendedTurnIdsRef.current.has(turnId)) return;
+      if (!committedTurnIdsRef.current.has(turnId)) {
+        const saved = savedChatSuspension(await loadLatestConversation().catch(() => []), brain.id, turnId);
+        if (currentBrainIdRef.current !== brain.id) return;
+        if (saved) {
+          suspendedTurnIdsRef.current.add(turnId);
+          setOptimisticHumans(current => settleOptimisticChatTurn(current, turnId, saved.state));
+          if (activeTurnIdRef.current === turnId) {
+            tokenBatcherRef.current?.flush();
+            const publishedPrefix = partialTextRef.current;
+            setUncommittedOutputs(current => settleUncommittedChatOutput(retainUncommittedChatOutput(
+              current, turnId, publishedPrefix, saved.createdAt), turnId, saved.state));
+          } else {
+            setUncommittedOutputs(current => settleUncommittedChatOutput(current, turnId, saved.state));
+          }
+          if (!activeTurnIdRef.current || activeTurnIdRef.current === turnId) setChatDeliveryStatus(chatHostSuspensionStatus(saved));
+          return;
+        }
+      }
       if (committedTurnIdsRef.current.has(turnId)) {
         setToolStatus(`Reply remains saved; later action work did not finish: ${conciseUiMessage(error)}`);
         return;
@@ -4020,10 +4289,12 @@ function ChatWorkspace({
       }
       if (terminalState === "failed" &&
           isCurrentChatSubmission(submissionGeneration, textTurnGenerationRef.current)) {
+        void taskAttachmentDraft.restore(attachmentIds).catch(() => undefined);
         onToast(error instanceof Error ? error.message : "The local brain could not respond.");
       }
     } finally {
       if (currentBrainIdRef.current !== brain.id) return;
+      finishPonder(turnId);
       setPostReplyWork((current) => current.filter((work) => work.turnId !== turnId));
       // Late frames for retired turns are ignored by the stream's known-turn
       // guard; retain metadata only while its real work/result is outstanding.
@@ -4032,6 +4303,7 @@ function ChatWorkspace({
       receivedInputTurnIdsRef.current.delete(turnId);
       cancelledTurnIdsRef.current.delete(turnId);
       steeredTurnIdsRef.current.delete(turnId);
+      suspendedTurnIdsRef.current.delete(turnId);
       streamSequenceRef.current.delete(turnId);
       activeHumanTurnsRef.current.delete(turnId);
       // Only the matching generation may clear the live composer. Every older
@@ -4109,13 +4381,27 @@ function ChatWorkspace({
     }
   };
 
-  const steerCurrentTurn = async (): Promise<void> => {
+  const declinePendingTool = async (event: ActionEvent, instruction?: string): Promise<void> => {
+    const pending = pendingChatToolFromAction(event);
+    if (!pending || !window.omni) return;
+    const result = await window.omni.chat.declineAction({ brainId: brain.id,
+      actionEventId: event.id, approvalToken: pending.approvalToken });
+    setActionEvents(current => mergeChatActionEvent(current, result));
+    setPendingTool(current => current?.actionEventId === event.id ? null : current);
+    if (instruction) setInput(current => recoverFailedChatDraft(current, instruction));
+  };
+
+  const steerCurrentTurn = async (queuedTurn?: QueuedChatTurn): Promise<void> => {
     if (cancellingTurn) return;
-    const capacity = chatInputCapacity(input, brain.config.contextWindowTokens);
+    if (!runtimeLoaded) { onToast("Load this instance before steering; the saved task is retained."); return; }
+    if (taskAttachmentDraft.busy && !queuedTurn) { onToast("Wait for attachment preparation, or stop it before steering."); return; }
+    const text = queuedTurn?.text ?? input;
+    if (!text.trim()) return;
+    const capacity = chatInputCapacity(text, brain.config.contextWindowTokens);
     if (!capacity.fits) { onToast(capacity.reason!); return; }
     const replacesTurnId = activeTurnIdRef.current;
     if (!replacesTurnId) {
-      await send();
+      await send(undefined, queuedTurn);
       return;
     }
     await persistDeliveryReceipt(replacesTurnId, "steered");
@@ -4130,11 +4416,12 @@ function ChatWorkspace({
       kind: "steer",
       replacesTurnId,
       source: "human",
-      createdAt: new Date().toISOString()
-    });
+      createdAt: queuedTurn?.createdAt ?? new Date().toISOString()
+    }, queuedTurn);
   };
 
   const queueCurrentTurn = (): void => {
+    if (taskAttachmentDraft.busy) { onToast("Wait for attachment preparation, or stop it before queuing."); return; }
     const text = input.trim();
     if (!text) return;
     const capacity = chatInputCapacity(text, brain.config.contextWindowTokens);
@@ -4142,16 +4429,18 @@ function ChatWorkspace({
     const id = globalThis.crypto?.randomUUID?.() ??
       `queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const createdAt = new Date().toISOString();
-    const turn: QueuedChatTurn = { id, text, createdAt };
+    const turn: QueuedChatTurn = { id, text, createdAt, attachments: taskAttachmentDraft.take() };
     setInput((current) => clearSubmittedChatDraft(current, text));
     void persistDeliveryReceipt(id, "queued", {
       content: text,
-      createdAt
+      createdAt,
+      attachmentIds: turn.attachments?.map(value => value.id)
     });
     setQueuedTurns((current) => [...current, turn]);
     setOptimisticHumans((current) => [
       ...current,
-      { id: `queued-${id}`, role: "human", content: text, createdAt }
+      { id: `queued-${id}`, role: "human", content: text, createdAt, turnId: id,
+        taskAttachmentIds: turn.attachments?.map(value => value.id) }
     ]);
   };
 
@@ -4166,10 +4455,12 @@ function ChatWorkspace({
   };
 
   const discardQueuedTurns = (): void => {
+    void taskAttachmentDraft.restore(queuedTurns.flatMap(turn => turn.attachments?.map(value => value.id) ?? [])).catch(() => undefined);
     queuedTurns.forEach((turn) => {
       void persistDeliveryReceipt(turn.id, "cancelled", {
         content: turn.text,
-        createdAt: turn.createdAt
+        createdAt: turn.createdAt,
+        attachmentIds: turn.attachments?.map(value => value.id)
       });
     });
     const ids = new Set(queuedTurns.map((turn) => `queued-${turn.id}`));
@@ -4179,8 +4470,46 @@ function ChatWorkspace({
     setQueuedTurns([]);
   };
 
+  const editQueuedTurn = (id: string, text: string): void => {
+    const turn = queuedTurns.find(item => item.id === id);
+    if (!turn) return;
+    setQueuedTurns(current => current.map(item => item.id === id ? { ...item, text } : item));
+    setOptimisticHumans(current => current.map(item => item.id === `queued-${id}` ? { ...item, content: text } : item));
+    void persistDeliveryReceipt(id, "queued", { content: text, createdAt: turn.createdAt, attachmentIds: turn.attachments?.map(value => value.id) });
+  };
+  const removeQueuedTurn = (id: string): void => {
+    const turn = queuedTurns.find(item => item.id === id);
+    if (!turn) return;
+    void taskAttachmentDraft.restore(turn.attachments?.map(value => value.id) ?? []).catch(() => undefined);
+    setQueuedTurns(current => current.filter(item => item.id !== id));
+    setOptimisticHumans(current => current.filter(item => item.id !== `queued-${id}`));
+    void persistDeliveryReceipt(id, "cancelled", { content: turn.text, createdAt: turn.createdAt, attachmentIds: turn.attachments?.map(value => value.id) });
+  };
+  const moveQueuedTurn = (id: string, direction: -1 | 1): void => {
+    setQueuedTurns(current => {
+      const index = current.findIndex(item => item.id === id);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return current;
+      const next = [...current];
+      [next[index], next[nextIndex]] = [next[nextIndex]!, next[index]!];
+      return next;
+    });
+  };
+  const sendQueuedNow = (id: string): void => {
+    const turn = queuedTurns.find(item => item.id === id);
+    if (!turn || cancellingTurn) return;
+    if (waitingInheritedFileReview) { onToast("The queued message is retained while the saved task's files await review."); return; }
+    if (!runtimeLoaded) { onToast("Load this instance to send a queued message. The queue is retained."); return; }
+    const capacity = chatInputCapacity(turn.text, brain.config.contextWindowTokens);
+    if (!capacity.fits) { onToast(capacity.reason!); return; }
+    const active = activeTurnIdRef.current;
+    if (sending && !active) return;
+    setQueuedTurns(current => current.filter(item => item.id !== id));
+    void (active ? steerCurrentTurn(turn) : send(undefined, turn));
+  };
+
   useEffect(() => {
-    if (sending || liveVoiceGenerationActive || !queuedTurns.length) return;
+    if (waitingInheritedFileReview || sending || activeTurnIdRef.current || liveVoiceGenerationActive || !queuedTurns.length) return;
     const next = queuedTurns[0]!;
     setQueuedTurns((current) =>
       current[0]?.id === next.id
@@ -4188,7 +4517,7 @@ function ChatWorkspace({
         : current.filter((turn) => turn.id !== next.id)
     );
     void send(undefined, next);
-  }, [sending, liveVoiceGenerationActive, queuedTurns]);
+  }, [sending, activeTurnId, liveVoiceGenerationActive, queuedTurns, waitingInheritedFileReview]);
 
   const cancelChatTool = async () => {
     if (!window.omni) return;
@@ -4308,35 +4637,28 @@ function ChatWorkspace({
     if (controller.getState().enabled) {
       await controller.stop();
     } else {
+      if (preparingVoiceRef.current === controller) return;
+      if (!runtimeLoaded) { onToast("Load the instance before starting a new voice session."); return; }
       // Saved-reply waveform output is an independent job, not a voice turn.
       // Stop that selected output before opening a microphone/recognizer.
       savedReplyVoiceGenerationRef.current += 1;
       savedReplySessionRef.current?.cancel();
       savedReplySessionRef.current = null;
       setSavedReplyVoice(null);
-      await controller.start();
+      preparingVoiceRef.current = controller; setPreparingVoiceCall(true);
+      try {
+        await instanceVoice.prepareCall();
+        if (liveVoiceControllerRef.current === controller) await controller.start();
+      } catch (failure) {
+        if (liveVoiceControllerRef.current === controller) onToast(conciseUiMessage(failure, "This voice call could not start."));
+      } finally {
+        if (preparingVoiceRef.current === controller) { preparingVoiceRef.current = null; setPreparingVoiceCall(false); }
+      }
     }
   };
 
   const bargeInLiveVoice = (): void => {
     liveVoiceControllerRef.current?.interrupt();
-  };
-
-  const updateLiveVoicePreferences = (
-    patch: Partial<Omit<LiveVoicePreferences, "schemaVersion">>
-  ): void => {
-    const next: LiveVoicePreferences = {
-      ...liveVoicePreferences,
-      ...patch,
-      schemaVersion: 1
-    };
-    setLiveVoicePreferences(next);
-    liveVoiceControllerRef.current?.setPreferences(next);
-    try {
-      saveLiveVoicePreferences(window.localStorage, next);
-    } catch {
-      // Ephemeral or hardened renderers can still use the choice this session.
-    }
   };
 
   const recordAttachmentResults = (
@@ -4387,7 +4709,6 @@ function ChatWorkspace({
       onNavigate("data");
       return;
     }
-    if (sending) return;
     const operationLease = attachmentOperationGateRef.current.begin();
     if (!operationLease) return;
     setAttaching(true);
@@ -4605,6 +4926,18 @@ function ChatWorkspace({
     ),
     [persistedConversation]
   );
+  useEffect(() => {
+    // Drop derived live copies only after exact saved message/action custody
+    // exists. Historical reports remain in the paged conversation ledger.
+    if (ponderLedger.retirePersisted([...persistedMessages, ...sessionCommittedMessages], persistedActions))
+      setPonderRevision(value => value + 1);
+  }, [ponderLedger, ponderRevision, persistedMessages, sessionCommittedMessages, persistedActions]);
+  const directionTurnIds = useMemo(() => [...new Set(
+    [...persistedMessages, ...sessionCommittedMessages, ...optimisticHumans]
+      .filter(message => message.role === "human")
+      .flatMap(message => message.turnId ?? message.deliveryReceipt?.turnId ?? [])
+  )], [persistedMessages, sessionCommittedMessages, optimisticHumans]);
+  const directions = useChatDirections(brain.id, directionTurnIds, window.omni?.chat.directions);
   const displayedMessages = useMemo(() => {
     const authoritative = window.omni
       ? mergeCommittedChatMessages(persistedMessages, sessionCommittedMessages)
@@ -4613,7 +4946,9 @@ function ChatWorkspace({
       authoritative,
       optimisticHumans
     );
-    const visible = [...combined, ...uncommittedOutputs.map((output) => output.message)];
+    const queuedIds = new Set(queuedTurns.map(turn => `queued-${turn.id}`));
+    const visible = [...combined.filter(message => !queuedIds.has(message.id) &&
+      !isSteerDirectionMessage(message, directions.records)), ...uncommittedOutputs.map((output) => output.message)];
     if (visible.length) return visible;
     return window.omni
       ? []
@@ -4625,12 +4960,15 @@ function ChatWorkspace({
           createdAt: brain.createdAt,
           runtime: brain.config.runtime
         }];
-  }, [brain.createdAt, brain.messages, brain.config.runtime, optimisticHumans, persistedMessages, sessionCommittedMessages, uncommittedOutputs]);
+  }, [brain.createdAt, brain.messages, brain.config.runtime, optimisticHumans, persistedMessages, sessionCommittedMessages, uncommittedOutputs, queuedTurns, directions.records]);
   const displayedActions = useMemo(() => {
     const merged = new Map(persistedActions.map((event) => [event.id, event]));
     actionEvents.forEach((event) => merged.set(event.id, event));
     return [...merged.values()];
   }, [actionEvents, persistedActions]);
+  const ponderPresentation = useMemo(() => reconcilePonderPresentation(ponderLedger.snapshot(), displayedMessages, displayedActions),
+    [ponderLedger, ponderRevision, displayedMessages, displayedActions]);
+  const displayedActionIds = useMemo(() => new Set(displayedActions.map(event => event.neuralActionId).filter(Boolean)), [displayedActions]);
   const timelineEntries = useMemo(() => [
       ...displayedMessages.map((message, order) => ({
         kind: "message" as const,
@@ -4832,7 +5170,6 @@ function ChatWorkspace({
       liveVoiceState.phase === "unavailable" ||
       liveVoiceState.phase === "starting")
   );
-  const voiceSettingsLocked = Boolean(liveVoiceState?.activeUtterance);
   const turnActive = sending || textTurnVisiblyActive || liveVoiceGenerationActive;
   const composerResponsePhase = !turnActive
     ? "idle"
@@ -4868,12 +5205,122 @@ function ChatWorkspace({
   ]);
   const draftTokenCount = utf8DraftTokenCount(input);
   const draftCapacity = chatInputCapacity(input, brain.config.contextWindowTokens);
-  const responseTokenCount = utf8DraftTokenCount(partialText);
+  const touchBarDraftHasContent = Boolean(input.trim());
+  const touchBarInput: ConversationTouchBarInput = {
+    revision: Math.max(1, touchBarRevisionRef.current),
+    brainId: brain.id,
+    instanceName: brain.name,
+    visible: !hidden,
+    runtimeLoaded,
+    draftHasContent: touchBarDraftHasContent,
+    draftFits: draftCapacity.fits,
+    draftBusy: taskAttachmentDraft.busy,
+    inheritedReviewPending: waitingInheritedFileReview,
+    turnActive,
+    activeTurnId: activeTurnIdRef.current ?? activeTurnId,
+    cancellingTurn,
+    callAvailable: Boolean(liveVoiceControllerRef.current),
+    callActive: Boolean(liveVoiceState?.enabled),
+    callBusy: preparingVoiceCall
+  };
+  touchBarActionContextRef.current = {
+    input: touchBarInput,
+    submit: submitOrdinaryTurn,
+    stop: () => { void cancelChatTool(); },
+    call: () => { void toggleLiveVoice(); }
+  };
+
+  useEffect(() => {
+    const touchBar = window.omni?.window.touchBar;
+    if (!touchBar) return;
+    return touchBar.onAction((event) => {
+      const accepted = touchBarAcceptedStateRef.current;
+      const current = touchBarActionContextRef.current;
+      const matched = matchTouchBarAction(event, accepted);
+      if (!accepted || !current || accepted.brainId !== current.input.brainId || !matched) return;
+      const liveVoiceController = liveVoiceControllerRef.current;
+      const activeTurn = activeTurnIdRef.current;
+      const latestInput: ConversationTouchBarInput = {
+        ...current.input,
+        turnActive: current.input.turnActive || Boolean(activeTurn),
+        activeTurnId: activeTurn,
+        callAvailable: Boolean(liveVoiceController),
+        callActive: Boolean(liveVoiceController?.getState().enabled),
+        callBusy: current.input.callBusy || Boolean(preparingVoiceRef.current)
+      };
+      if (!touchBarActionRemainsReady(matched, latestInput)) return;
+      if (matched.action === "stop" && activeTurn !== matched.turnId) return;
+      // Consume this exact accepted revision before dispatch so repeated native
+      // callbacks cannot operate while React publishes the next semantic state.
+      touchBarAcceptedStateRef.current = null;
+      if (matched.action === "submit") current.submit();
+      else if (matched.action === "stop") current.stop();
+      else current.call();
+    });
+  }, [brain.id]);
+
+  useEffect(() => {
+    const touchBar = window.omni?.window.touchBar;
+    const scope = ++touchBarScopeRef.current;
+    if (!touchBar) {
+      touchBarAcceptedStateRef.current = null;
+      return;
+    }
+    const current = touchBarActionContextRef.current;
+    if (!current || current.input.brainId !== brain.id) return;
+    const revision = ++touchBarRevisionRef.current;
+    const proposed = conversationTouchBarState({ ...current.input, revision });
+    if (!proposed) {
+      touchBarAcceptedStateRef.current = null;
+      void touchBar.update(null).catch(() => undefined);
+      return;
+    }
+    void touchBar.update(proposed).then((result) => {
+      const latest = touchBarActionContextRef.current;
+      if (
+        scope !== touchBarScopeRef.current ||
+        revision !== touchBarRevisionRef.current ||
+        latest?.input.brainId !== proposed.brainId
+      ) return;
+      if (result.accepted && result.revision === proposed.revision) {
+        touchBarAcceptedStateRef.current = proposed;
+      }
+    }).catch(() => undefined);
+  }, [
+    activeTurnId,
+    brain.id,
+    brain.name,
+    cancellingTurn,
+    draftCapacity.fits,
+    hidden,
+    liveVoiceState?.enabled,
+    preparingVoiceCall,
+    runtimeLoaded,
+    taskAttachmentDraft.busy,
+    touchBarDraftHasContent,
+    turnActive,
+    waitingInheritedFileReview
+  ]);
+
+  useEffect(() => {
+    const touchBar = window.omni?.window.touchBar;
+    return () => {
+      ++touchBarScopeRef.current;
+      touchBarAcceptedStateRef.current = null;
+      void touchBar?.update(null).catch(() => undefined);
+    };
+  }, [brain.id]);
+
+  const responseTokenCount = measuredOutput?.tokens ?? 0;
   const responseOutputPresentation = pendingChatOutputPresentation({
     outputTokens: responseTokenCount,
     startedAtMs: activeTurnStartedAtMs,
     nowMs: chatOutputClockMs,
-    queue: chatQueue
+    queue: chatQueue,
+    streamStartedAtMs: outputRateStartRef.current?.at,
+    streamNowMs: outputRateClockMs,
+    initialOutputTokens: outputRateStartRef.current?.count,
+    measuredTokensPerSecond: measuredOutput?.rate
   });
   const workspaceTelemetry = workspaceSnapshot
     ? workspaceTelemetryPresentation({
@@ -4934,16 +5381,78 @@ function ChatWorkspace({
         }}
         onDrop={(event) => {
           event.preventDefault();
-          void attachDroppedExperience(Array.from(event.dataTransfer.files));
+          setAttachmentDragActive(false);
+          void taskAttachmentDraft.stage("files", Array.from(event.dataTransfer.files));
         }}
       >
         {attachmentDragActive ? (
           <div className="chat-attachment-drop" role="status">
             <span><Icon name="upload" size={24} /></span>
-            <strong>Drop files, folders, images, audio, or video</strong>
-            <small>They will be encoded into this brain’s parameters and synapses.</small>
+            <strong>Attach files, images, audio, or video</strong>
+            <small>Available for the task, without automatic training. Use Learn for folders.</small>
           </div>
         ) : null}
+        <div className="chat-call-toolbar">
+          <button type="button" aria-expanded={callOpen} aria-controls="chat-call-panel"
+            onClick={() => setCallOpen(current => !current)} title="Voice, camera and screen sharing">
+            <Icon name="microphone" size={15} /> Call
+            {liveVoiceState?.enabled ? <i aria-label="Call active" /> : null}
+          </button>
+          <button type="button" aria-expanded={captureOpen} aria-controls="chat-capture-panel"
+            onClick={() => setCaptureOpen(current => !current)} title="Record recent and ongoing spontaneous imagination">
+            <Icon name="video" size={15} /> Record
+          </button>
+        </div>
+        <div id="chat-capture-panel" className="chat-capture-panel" hidden={!captureOpen}>
+          {captureOpen && !hidden ? <ImaginationCaptureControls brainId={brain.id} api={window.omni?.modality.capture} /> : null}
+        </div>
+        <CallLayout open={callOpen} controls={<section id="chat-call-panel" className="chat-call-panel" hidden={!callOpen} aria-label="Call controls">
+          <button type="button" className="chat-call-start" onClick={() => void toggleLiveVoice()}
+            disabled={preparingVoiceCall || !runtimeLoaded && !liveVoiceState?.enabled}
+            aria-label={liveVoiceState?.enabled ? "Stop live voice" : "Start live voice"}>
+            <Icon name="microphone" size={15} /> {preparingVoiceCall ? "Preparing call…" : liveVoiceState?.enabled ? "End voice call" : "Start voice call"}
+          </button>
+          {showVoiceStatus && liveVoiceState && voiceStatus ? (
+            <div
+              className={cx(
+                "live-voice-status",
+                `live-voice-status--${voiceStatus.tone}`
+              )}
+              role={voiceStatus.tone === "warning" ? "alert" : "status"}
+              aria-live="polite"
+            >
+              <span className="live-voice-status__icon">
+                <Icon name="microphone" size={16} />
+                {liveVoiceState.enabled ? <i aria-hidden="true" /> : null}
+              </span>
+              <p>
+                <strong>{voiceStatus.title}</strong>
+                <small>{voiceStatus.detail}</small>
+              </p>
+              {(liveVoiceState.phase === "pondering" ||
+                liveVoiceState.phase === "speaking") &&
+                liveVoicePreferences.deliveryMode === "live" ? (
+                <Button kind="ghost" icon="pause" onClick={bargeInLiveVoice}>
+                  Barge in
+                </Button>
+              ) : null}
+              {liveVoiceState.enabled ? (
+                <Button kind="ghost" icon="close" onClick={() => void toggleLiveVoice()}>
+                  Stop
+                </Button>
+              ) : liveVoiceState.error?.recoverable ? (
+                <Button kind="ghost" icon="microphone" onClick={() => void toggleLiveVoice()}>
+                  Try again
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+          {instanceVoice.error ? <p role="alert">{instanceVoice.error}</p> : null}
+          {!instanceVoice.error || instanceVoice.snapshot ? <VoiceRoutingControls key={brain.id} snapshot={instanceVoice.snapshot}
+            capabilities={liveVoiceState?.capabilities} callActive={Boolean(liveVoiceState?.enabled) || preparingVoiceCall}
+            utteranceActive={Boolean(liveVoiceState?.activeUtterance)} onSave={instanceVoice.save} /> : null}
+          <LivePerceptionPanel brain={brain} runtimeLoaded={runtimeLoaded} />
+        </section>}>
         <div className="conversation__date">
           <span />
           <time>Continuous conversation · started with this identity</time>
@@ -4984,6 +5493,7 @@ function ChatWorkspace({
               setFollowingOutput((current) => current === next ? current : next);
             }}
           >
+          <PluginRuntimeSlot slot="chat.before" />
           {!displayedMessages.length ? (
             <div className="chat-empty">
               <span><BrandMark size={42} /></span>
@@ -5024,8 +5534,13 @@ function ChatWorkspace({
             >
             {
             entry.kind === "message" ? (
+              <>
+              {entry.message.ponderSelfReports?.filter(report => !displayedActionIds.has(report.actionId)).map(report => <details key={report.id}
+                className="chat-action-card"><summary>Ponder</summary><PonderSelfReportView row={{ report, live: false }}
+                  readable={readablePonder} onReadableChange={setReadablePonder} flush /></details>)}
               <MessageBubble
                 message={entry.message}
+                brainId={brain.id}
                 brainName={brain.name}
                 onToast={onToast}
                 onTrace={() => onNavigate("trace")}
@@ -5036,9 +5551,13 @@ function ChatWorkspace({
                 uncommittedOutputState={uncommittedOutputs.find((output) =>
                   output.message.id === entry.message.id)?.state}
               />
+              </>
             ) : entry.kind === "action" ? (
               <div className="chat-action-stream" aria-label="Visible chat action">
                 <ChatActionCard event={entry.event}
+                  ponderReports={ponderPresentation.byAction.get(entry.event.id)} readablePonder={readablePonder}
+                  onReadablePonder={setReadablePonder} flushPonder={Boolean(hidden)}
+                  onDecline={pendingChatToolFromAction(entry.event) ? instruction => declinePendingTool(entry.event, instruction) : undefined}
                   onCancel={chatActionCancellationTarget(entry.event,
                     actionTurnIdsRef.current.get(entry.event.id))
                     ? () => cancelActionJob(entry.event) : undefined}
@@ -5066,6 +5585,7 @@ function ChatWorkspace({
             }
             </div>
           ))}
+          {ponderError || ponderPresentation.error ? <p role="alert">{ponderError || ponderPresentation.error}</p> : null}
           {showTurnActivity && timelineAtLatest ? (
             <div className="message message--brain">
               <div className="message__avatar">
@@ -5082,6 +5602,8 @@ function ChatWorkspace({
                         ? "Stopping"
                         : chatQueue
                           ? "Queued"
+                          : cognitionProgress?.active
+                            ? cognitionProgress.phase === "ponder" ? "Pondering" : "Best Work"
                           : pondering
                             ? "Pondering"
                             : actionRunning
@@ -5089,15 +5611,7 @@ function ChatWorkspace({
                               : "Responding"
                     }
                   </span>
-                  <span
-                    className={cx(
-                      "response-token-counter",
-                      `response-token-counter--${responseOutputPresentation.phase}`
-                    )}
-                    aria-label={responseOutputPresentation.ariaLabel}
-                  >
-                    {responseOutputPresentation.label}
-                  </span>
+                  <ResponseOutputCounter presentation={responseOutputPresentation} cognitionWithoutOutput={cognitionProgress?.active} />
                 </div>
                 {partialText ? (
                   <p
@@ -5124,9 +5638,11 @@ function ChatWorkspace({
                     </em>
                   </div>
                 )}
+                {cognitionProgress ? <CognitionProgressView progress={cognitionProgress} /> : null}
               </div>
             </div>
           ) : null}
+            <PluginRuntimeSlot slot="chat.after" />
             <div ref={messagesEnd} />
           </div>
           {!followingOutput || !timelineAtLatest ? (
@@ -5136,139 +5652,60 @@ function ChatWorkspace({
           ) : null}
         </div>
         <div className="composer-wrap">
-          {showVoiceStatus && liveVoiceState && voiceStatus ? (
-            <div
-              className={cx(
-                "live-voice-status",
-                `live-voice-status--${voiceStatus.tone}`
-              )}
-              role={voiceStatus.tone === "warning" ? "alert" : "status"}
-              aria-live="polite"
-            >
-              <span className="live-voice-status__icon">
-                <Icon name="microphone" size={16} />
-                {liveVoiceState.enabled ? <i aria-hidden="true" /> : null}
-              </span>
-              <p>
-                <strong>{voiceStatus.title}</strong>
-                <small>{voiceStatus.detail}</small>
-              </p>
-              {(liveVoiceState.phase === "pondering" ||
-                liveVoiceState.phase === "speaking") &&
-                liveVoicePreferences.deliveryMode === "live" ? (
-                <Button kind="ghost" icon="pause" onClick={bargeInLiveVoice}>
-                  Barge in
-                </Button>
-              ) : null}
-              {liveVoiceState.enabled ? (
-                <Button kind="ghost" icon="close" onClick={() => void toggleLiveVoice()}>
-                  Stop
-                </Button>
-              ) : liveVoiceState.error?.recoverable ? (
-                <Button kind="ghost" icon="microphone" onClick={() => void toggleLiveVoice()}>
-                  Try again
-                </Button>
-              ) : null}
-            </div>
-          ) : null}
-          {liveVoiceState?.enabled ? (
-            <>
-              <div className="live-voice-settings" aria-label="Live voice settings">
-                <span className="live-voice-settings__title">
-                  <Icon name="microphone" size={13} /> Voice options
-                </span>
-                <fieldset>
-                  <legend>Delivery</legend>
-                  {LIVE_VOICE_DELIVERY_MODES.map((mode) => (
-                    <button
-                      key={mode}
-                      aria-pressed={liveVoicePreferences.deliveryMode === mode}
-                      disabled={voiceSettingsLocked}
-                      onClick={() => updateLiveVoicePreferences({ deliveryMode: mode })}
-                    >
-                      {mode === "live" ? "Live" : "Buffered"}
-                    </button>
-                  ))}
-                </fieldset>
-                <fieldset>
-                  <legend>Pace</legend>
-                  {LIVE_VOICE_PACES.map((pace) => (
-                    <button
-                      key={pace}
-                      aria-pressed={liveVoicePreferences.pace === pace}
-                      disabled={voiceSettingsLocked}
-                      onClick={() => updateLiveVoicePreferences({ pace })}
-                    >
-                      {pace[0]!.toLocaleUpperCase() + pace.slice(1)}
-                    </button>
-                  ))}
-                </fieldset>
-                <label
-                  title={
-                    liveVoiceState.capabilities.neuralListening
-                      ? "Route microphone audio directly through a trained neural audio-input pack"
-                      : "Requires a compatible trained neural audio-input pack"
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={liveVoicePreferences.neuralListening}
-                    disabled={
-                      voiceSettingsLocked ||
-                      (!liveVoiceState.capabilities.neuralListening &&
-                        !liveVoicePreferences.neuralListening)
-                    }
-                    onChange={(event) =>
-                      updateLiveVoicePreferences({ neuralListening: event.target.checked })
-                    }
-                  />
-                  Neural listening
-                </label>
-                <label
-                  title={
-                    liveVoiceState.capabilities.neuralVoice
-                      ? "Play waveform output from this brain's audio region; intelligible speech is not verified"
-                      : "Requires this brain's audio region and local WAV playback"
-                  }
-                >
-                  <input
-                    type="checkbox"
-                    checked={liveVoicePreferences.neuralVoice}
-                    disabled={
-                      voiceSettingsLocked ||
-                      (!liveVoiceState.capabilities.neuralVoice &&
-                        !liveVoicePreferences.neuralVoice)
-                    }
-                    onChange={(event) =>
-                      updateLiveVoicePreferences({ neuralVoice: event.target.checked })
-                    }
-                  />
-                  Own neural voice
-                </label>
-                <small>
-                  Default uses platform STT + TTS. Own neural voice needs speech training; speech quality is not verified. No silent fallback.
-                </small>
-              </div>
-            </>
-          ) : null}
-          <LivePerceptionPanel brain={brain} />
-          {queuedTurns.length || queuedLearningJobCount ? (
-            <div className="chat-queue-status" role="status" aria-live="polite">
-              <span><Icon name="chat" size={14} /></span>
-              <p>
-                <strong>
-                  {queuedTurns.length
-                    ? `${queuedTurns.length} message${queuedTurns.length === 1 ? "" : "s"} queued`
-                    : "Shared work queue"}
-                  {queuedLearningJobCount
-                    ? ` · ${queuedLearningJobCount} learning task${queuedLearningJobCount === 1 ? "" : "s"} waiting`
-                    : ""}
-                </strong>
-                <small>Messages and long learning work run in visible order without replacing the active turn.</small>
-              </p>
-              {queuedTurns.length ? <button onClick={discardQueuedTurns}>Clear messages</button> : null}
-            </div>
-          ) : null}
+          {waitingInheritedFileReview && inheritedFileReview ? <InheritedTaskFilesReview
+            review={inheritedFileReview.review} input={inheritedFileReview.input}
+            busy={inheritedFileReview.busy} paused={inheritedFileReview.paused} error={inheritedFileReview.error}
+            onPause={() => setInheritedFileReview(current => current ? { ...current, paused: true } : current)}
+            onReviewAgain={() => {
+              setInheritedFileReview(current => current ? { ...current, busy: true, error: undefined } : current);
+              setInheritedReviewAttempt(current => current + 1);
+            }}
+            onApprove={() => {
+              const pending = inheritedFileReview;
+              const owner = inheritedReviewScopeRef.current;
+              if (!window.omni || pending.busy || pending.paused) return;
+              setInheritedFileReview(current => current === pending ? { ...current, busy: true, error: undefined } : current);
+              void window.omni.brain.approveInheritedTaskFiles({ brainId: brain.id,
+                reviewId: pending.review.reviewId, reviewSha256: pending.review.reviewSha256 }).then(receipt => {
+                if (inheritedReviewScopeRef.current !== owner) return;
+                if (receipt.brainId !== pending.brainId || receipt.executionId !== pending.executionId ||
+                    receipt.reviewSha256 !== pending.review.reviewSha256) throw new Error("The file adoption receipt does not match this exact review.");
+                setInheritedFileReview(current => current?.review.reviewSha256 === pending.review.reviewSha256 ? undefined : current);
+                setInheritedReviewAttempt(current => current + 1);
+              }).catch(failure => {
+                if (inheritedReviewScopeRef.current !== owner) return;
+                setInheritedFileReview(current => current?.review.reviewSha256 === pending.review.reviewSha256
+                  ? { ...current, busy: false, error: failure instanceof Error ? failure.message : String(failure) } : current);
+              });
+            }} /> : null}
+          <ChatDirectionStrip key={brain.id} items={directions.records.map(chatDirectionStripItem)} total={directions.total}
+            canSteer={runtimeLoaded && composerTurn.steerAvailable && !cancellingTurn}
+            busy={directions.busy} hasOlder={directions.hasOlder}
+            onOlder={() => void directions.older()} onDismiss={directions.dismiss}
+            onRevise={async text => {
+              const content = text.trim();
+              const capacity = chatInputCapacity(content, brain.config.contextWindowTokens);
+              if (!capacity.fits) throw new Error(capacity.reason!);
+              if (runtimeLoaded && composerTurn.steerAvailable && !cancellingTurn && activeTurnIdRef.current) {
+                // A revision is a fresh direction, never an edit to accepted neural input.
+                // Empty attachment selection preserves the current unsent draft's files.
+                await steerCurrentTurn({ id: globalThis.crypto.randomUUID(), text: content,
+                  createdAt: new Date().toISOString(), attachments: [] });
+              } else {
+                setInput(current => recoverFailedChatDraft(current, content));
+              }
+            }} />
+          {directions.error ? <p role="alert" className="task-attachment-status">{directions.error}</p> : null}
+          <TaskAttachmentStrip entries={taskAttachmentDraft.entries} onRemove={id => void taskAttachmentDraft.remove(id)} />
+          {taskAttachmentDraft.status ? <div className="task-attachment-status" role="status" aria-live="polite">
+            <span>{taskAttachmentDraft.status}</span>{taskAttachmentDraft.busy ? <button type="button" className="button button--ghost" onClick={taskAttachmentDraft.cancel}>Stop preparing</button> : null}
+          </div> : null}
+          <ChatQueueStack items={queuedTurns} busy={turnActive}
+            onEdit={editQueuedTurn} onRemove={removeQueuedTurn}
+            onMove={moveQueuedTurn} onSendNow={sendQueuedNow} />
+          {queuedLearningJobCount ? <div className="chat-queue-learning" role="status">
+            {queuedLearningJobCount} learning task{queuedLearningJobCount === 1 ? "" : "s"} queued
+          </div> : null}
           {chatDeliveryStatus ? (
             <div
               className="chat-tool-status chat-tool-status--delivery"
@@ -5314,6 +5751,7 @@ function ChatWorkspace({
           ) : null}
           <div className="composer">
             <textarea
+              readOnly={!runtimeLoaded}
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={onComposerKeyDown}
@@ -5336,147 +5774,42 @@ function ChatWorkspace({
               </div>
             ) : null}
             <div className="composer__bottom">
-              <div>
-                <button
-                  aria-label="Upload files and datasets to learn"
-                  title="Upload documents, code, datasets, or any supported file"
-                  disabled={attaching || sending}
-                  onClick={() => void attachExperience("files")}
-                >
-                  <Icon name={attaching ? "pulse" : "file"} size={18} />
-                </button>
-                <button
-                  aria-label="Upload images to learn"
-                  title="Upload one or more images into neural memory"
-                  disabled={attaching || sending}
-                  onClick={() => void attachExperience("images")}
-                >
-                  <Icon name="image" size={18} />
-                </button>
-                <button
-                  aria-label="Upload audio to learn"
-                  title="Upload one or more audio files into neural memory"
-                  disabled={attaching || sending}
-                  onClick={() => void attachExperience("audio")}
-                >
-                  <Icon name="volume" size={18} />
-                </button>
-                <button
-                  aria-label="Upload video to learn"
-                  title="Upload one or more videos into neural memory"
-                  disabled={attaching || sending}
-                  onClick={() => void attachExperience("video")}
-                >
-                  <Icon name="video" size={18} />
-                </button>
-                <button
-                  aria-label="Upload a folder to learn"
-                  title="Upload every supported file in a folder"
-                  disabled={attaching || sending}
-                  onClick={() => void attachExperience("folder")}
-                >
-                  <Icon name="archive" size={18} />
-                </button>
-                <button
-                  className={cx(
-                    "composer__voice-toggle",
-                    liveVoiceState?.enabled && "is-active"
-                  )}
-                  aria-label={liveVoiceState?.enabled ? "Stop live voice" : "Start live voice"}
-                  aria-pressed={liveVoiceState?.enabled ?? false}
-                  title={
-                    liveVoiceState?.enabled
-                      ? "Stop continuous live voice"
-                      : "Start continuous live voice (requests microphone permission)"
-                  }
-                  disabled={sending}
-                  onClick={() => void toggleLiveVoice()}
-                >
-                  <Icon name="microphone" size={18} />
-                  <span>Voice</span>
-                </button>
-              </div>
-              <span className="composer__status-copy">
-                <span className="composer__key-hint">
-                  {turnActive
-                    ? "Enter queues · Ctrl/Cmd Enter steers · empty input keeps Stop"
-                    : "Enter to send · Shift Enter for a line break"}
-                </span>
-                <span
-                  className="composer__token-counter"
-                  aria-label={`Token counter and neural learning status. ${composerTelemetryAriaLabel}`}
-                  title={composerTelemetryAriaLabel}
-                >
-                  {draftTokenCount.toLocaleString()} draft · {contextTokenCopy} · {composerTelemetryCopy}
-                </span>
+              <ChatAttachmentMenu key={brain.id} active={!hidden}>
+                  {([
+                    ["files", "file", "Attach files"], ["images", "image", "Attach images"],
+                    ["audio", "volume", "Attach audio"], ["video", "video", "Attach video"]
+                  ] as const).map(([kind, icon, label]) => <button type="button" key={`task-${kind}`} disabled={taskAttachmentDraft.busy}
+                    onClick={() => { void taskAttachmentDraft.stage(kind); }}>
+                    <Icon name={icon} size={16} /> {label}</button>)}
+                  {([
+                    ["files", "file", "Learn from files"],
+                    ["images", "image", "Learn from images"],
+                    ["audio", "volume", "Learn from audio"],
+                    ["video", "video", "Learn from video"],
+                    ["folder", "archive", "Learn from a folder"]
+                  ] as const).map(([kind, icon, label]) => (
+                    <button type="button" key={kind} disabled={attaching || !runtimeLoaded} onClick={() => {
+                      void attachExperience(kind);
+                    }}><Icon name={icon} size={16} /> {label}</button>
+                  ))}
+              </ChatAttachmentMenu>
+              <span className="composer__input-count" title={composerTelemetryAriaLabel}
+                aria-label={`${draftTokenCount.toLocaleString()} input tokens. ${composerTelemetryAriaLabel}`}>
+                {draftTokenCount ? compactNumber(draftTokenCount) : ""}
               </span>
-              {turnActive ? (
-                <div
-                  className="composer__turn-choices"
-                  role="group"
-                  aria-label={composerTurn.queueAvailable && input.trim()
-                    ? "Message choices and current turn controls"
-                    : "Current turn controls"}
-                >
-                  {input.trim() && !cancellingTurn && composerTurn.queueAvailable ? (
-                    <>
-                      {composerTurn.steerAvailable ? (
-                        <button
-                          className="composer__steer-choice"
-                          aria-label="Steer current turn"
-                          title="Apply this direction at the next safe neural boundary; the prior request remains visible and the loaded mind stays warm"
-                          disabled={!draftCapacity.fits}
-                          onClick={() => void steerCurrentTurn()}
-                        >
-                          <Icon name="arrow" size={13} /> <span>Steer now</span>
-                        </button>
-                      ) : null}
-                      <button
-                        className="send-button composer__queue-choice"
-                        aria-label="Queue message"
-                        title="Run this message next without interrupting the active reply"
-                        disabled={!draftCapacity.fits}
-                        onClick={submitOrdinaryTurn}
-                      >
-                        <Icon name="chat" size={13} /> <span>Queue</span>
-                      </button>
-                    </>
-                  ) : null}
-                  <button
-                    className="composer__stop-choice"
-                    onClick={() => void cancelChatTool()}
-                    disabled={cancellingTurn}
-                    aria-label={cancellingTurn ? "Stopping current turn" : "Stop current turn"}
-                  >
-                    <Icon name={cancellingTurn ? "pulse" : "close"} size={13} />
-                    <span>{cancellingTurn ? "Stopping" : "Stop"}</span>
-                  </button>
-                </div>
-              ) : (
-                <button
-                  className="send-button"
-                  onClick={() => void send()}
-                  disabled={!input.trim() || !window.omni || !draftCapacity.fits}
-                  aria-label="Send message"
-                  title={!window.omni ? "Neural engine unavailable in design preview" : undefined}
-                >
-                  <Icon name="send" size={17} />
-                </button>
-              )}
-            </div>
-            <div className="composer__suggestions" aria-label="Natural chat examples">
-              <button onClick={() => setInput("Search the web for ")}><Icon name="search" size={13} /> Search the web</button>
-              <button onClick={() => setInput("Imagine an image of ")}><Icon name="image" size={13} /> Imagine</button>
-              <button onClick={() => setInput("Fork an agent to ")}><Icon name="agents" size={13} /> Create an agent</button>
-              <button onClick={() => setInput("Improve your own implementation by ")}><Icon name="pulse" size={13} /> Evolve</button>
+              <ComposerSubmitControl active={turnActive} stopping={cancellingTurn}
+                canSend={Boolean(runtimeLoaded && input.trim() && window.omni && draftCapacity.fits && !taskAttachmentDraft.busy && !waitingInheritedFileReview)}
+                canSteer={runtimeLoaded && composerTurn.steerAvailable}
+                onSend={submitOrdinaryTurn} onSteer={() => void steerCurrentTurn()}
+                onStop={() => void cancelChatTool()} />
             </div>
           </div>
-          <p className="composer-disclaimer" role={!window.omni ? "status" : undefined}>
-            {window.omni
-              ? "Learned parameters, active state, and structured tool schemas drive each turn. Tool actions stay permissioned and visible."
-              : "Neural engine unavailable in this design preview. Drafts stay in the composer; no chat or learning runs."}
-          </p>
+          {!window.omni ? <p className="composer-disclaimer" role="status">
+            Neural engine unavailable in this design preview. Drafts stay in the composer; no chat or learning runs.
+          </p> : null}
+          {window.omni && !runtimeLoaded ? <p className="composer-disclaimer" role="status">Load is required. Unload retains the supported turn; Stop is a separate action.</p> : null}
         </div>
+        </CallLayout>
       </section>
 
       <aside id="chat-cortex-panel" className="cortex-panel" aria-label="Cortex and runtime inspector">
@@ -5496,17 +5829,6 @@ function ChatWorkspace({
                 <i className="dot-violet" />
                 <small>Current state</small>
                 <strong>{cortexState}</strong>
-              </span>
-              <span>
-                <small>Liquid τ</small>
-                <strong>
-                  {brain.liquidState.timeConstants.length
-                    ? `${(
-                        brain.liquidState.timeConstants.reduce((sum, value) => sum + value, 0) /
-                        brain.liquidState.timeConstants.length
-                      ).toFixed(2)}×`
-                    : "—"}
-                </strong>
               </span>
             </div>
             {chatParameterAccounting ? (
@@ -5560,6 +5882,7 @@ function ChatWorkspace({
 
 function MessageBubble({
   message,
+  brainId,
   brainName,
   onToast,
   onTrace,
@@ -5570,6 +5893,7 @@ function MessageBubble({
   uncommittedOutputState
 }: {
   message: ChatMessage;
+  brainId: string;
   brainName: string;
   onToast: (message: string) => void;
   onTrace: () => void;
@@ -5580,6 +5904,7 @@ function MessageBubble({
   uncommittedOutputState?: UncommittedChatOutput["state"];
 }) {
   const isBrain = message.role === "brain";
+  const attribution = chatMessageAttribution(message, brainName);
   const deliveryState = chatMessageDeliveryState(message);
   const durableReceipt = message.deliveryReceipt?.presentationOnly === true;
   const queued = deliveryState === "queued";
@@ -5589,6 +5914,7 @@ function MessageBubble({
   const noReplyPresentation = chatNoReplyPresentation(message);
   const failed = deliveryState === "failed";
   const cancelled = deliveryState === "cancelled";
+  const paused = pausedOutputLabel(deliveryState);
   const pending = deliveryState === "pending" ||
     (queued && !durableReceipt);
   return (
@@ -5603,7 +5929,7 @@ function MessageBubble({
         cancelled && "message--cancelled"
       )}
       data-turn-state={
-        noReply ? "no-reply" : stopped ? "stopped" : !isBrain && message.inputReceipt?.committed ? "received" : uncommittedOutputState
+        noReply ? "no-reply" : stopped ? "stopped" : paused ? deliveryState : !isBrain && message.inputReceipt?.committed ? "received" : uncommittedOutputState
           ? `output-uncommitted-${uncommittedOutputState}`
           : failed
           ? "failed"
@@ -5619,26 +5945,27 @@ function MessageBubble({
       }
       aria-busy={pending || undefined}
       aria-invalid={failed || undefined}
+      data-input-source={attribution.connectedApp ? "mcp-app" : message.role}
     >
       <div className="message__avatar">
-        {isBrain ? <BrandMark size={28} /> : <span className="human-avatar">E</span>}
+        {isBrain ? <BrandMark size={28} /> : <span className="human-avatar">{attribution.connectedApp ? <Icon name="terminal" size={16} /> : "E"}</span>}
       </div>
       <div className="message__body">
         <div className="message__meta">
-          <strong>{isBrain ? brainName : "You"}</strong>
+          <strong><bdi>{attribution.name}</bdi>{attribution.connectedApp ? " · App" : ""}</strong>
           <time>
             {new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
           </time>
           {!isBrain && message.inputReceipt?.committed ? <span className="message-queue-label">Received</span> : null}
           {uncommittedOutputState ? (
             <span className="message-queue-label">
-              {uncommittedOutputState === "saving"
+              {pausedOutputLabel(uncommittedOutputState) ?? (uncommittedOutputState === "saving"
                 ? "Reply complete · save pending, not committed"
                 : uncommittedOutputState === "steering"
                   ? "Steering · emitted prefix awaiting safe save"
                 : uncommittedOutputState === "cancelled"
                   ? "Stopped output · not committed"
-                  : "Save failed · output not committed"}
+                  : "Save failed · output not committed")}
             </span>
           ) : null}
           {queued ? (
@@ -5664,9 +5991,13 @@ function MessageBubble({
           {cancelled ? (
             <span className="message-queue-label message-cancelled-label">Cancelled</span>
           ) : null}
+          {paused ? <span className="message-queue-label">{paused}</span> : null}
           {isBrain && message.runtime ? <span className="runtime-label">{message.runtime.replace("-", " ")}</span> : null}
         </div>
         {noReply ? null : <div className="message__content">{message.content}</div>}
+        {!isBrain && message.nativeAudioInput ? <NativeAudioInputSummary input={message.nativeAudioInput} /> : null}
+        {!isBrain && message.turnId && message.taskAttachmentIds?.length ? <MessageTaskAttachments
+          brainId={brainId} turnId={message.turnId} attachmentIds={message.taskAttachmentIds} received={message.inputReceipt?.committed === true} /> : null}
         {isBrain ? (
           <div className="message__actions">
             {message.content ? <button aria-label="Copy response" onClick={() => void navigator.clipboard?.writeText(message.content)}>
@@ -5811,10 +6142,12 @@ function NeuralParameterCount({
 
 function BrainSnapshotsPanel({
   brain,
+  foregroundTurnActive = false,
   onBrainChange,
   onToast
 }: {
   brain: BrainDocument;
+  foregroundTurnActive?: boolean;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
 }) {
@@ -5882,7 +6215,7 @@ function BrainSnapshotsPanel({
   }, [brain.id]);
 
   const createSnapshot = async (): Promise<void> => {
-    if (!window.omni || busy) return;
+    if (!window.omni || busy || foregroundTurnActive) return;
     setBusy("creating");
     setStatus("Saving the current document and neural state…");
     try {
@@ -5905,7 +6238,7 @@ function BrainSnapshotsPanel({
   };
 
   const restoreSnapshot = async (snapshot: BrainSnapshotSummary): Promise<void> => {
-    if (!window.omni || busy) return;
+    if (!window.omni || busy || foregroundTurnActive) return;
     const confirmed = window.confirm(
       `Restore “${snapshot.label}” from ${new Date(snapshot.createdAt).toLocaleString()}?\n\n` +
       "This replaces the current document and neural state for this identity. Changes made after that recovery point are not kept. Create a new recovery point first if you may need them."
@@ -5960,7 +6293,7 @@ function BrainSnapshotsPanel({
         <Button
           kind="primary"
           icon={busy === "creating" ? "pulse" : "archive"}
-          disabled={Boolean(busy) || !window.omni}
+          disabled={Boolean(busy) || !window.omni || foregroundTurnActive}
           onClick={() => void createSnapshot()}
         >
           {busy === "creating" ? "Saving…" : "Create recovery point"}
@@ -5974,6 +6307,7 @@ function BrainSnapshotsPanel({
         </Button>
       </div>
       <p className="brain-snapshots__status" role="status" aria-live="polite">{status}</p>
+      {foregroundTurnActive ? <p role="status">Recovery points stay readable. Create or restore after the current reply finishes, or use Unload to preserve its exact frontier.</p> : null}
       <div className="brain-snapshots__list">
         {snapshots.map((snapshot) => {
           const restoring = busy === `restore:${snapshot.id}`;
@@ -5988,7 +6322,7 @@ function BrainSnapshotsPanel({
               <Button
                 kind="ghost"
                 icon={restoring ? "pulse" : "arrow"}
-                disabled={Boolean(busy)}
+                disabled={Boolean(busy) || foregroundTurnActive}
                 onClick={() => void restoreSnapshot(snapshot)}
               >
                 {restoring ? "Restoring…" : "Restore"}
@@ -6118,11 +6452,17 @@ function RuntimeCard({
 
 function DeviceRuntimeWorkspace({
   brain,
+  foregroundTurnActive = false,
+  instanceState,
+  onReviewLoad,
   onActiveModeChange,
   onBrainChange,
   onToast
 }: {
   brain: BrainDocument;
+  foregroundTurnActive?: boolean;
+  instanceState?: InstanceLifecycleState;
+  onReviewLoad?: () => void;
   onActiveModeChange: (result: BrainActiveModeResult) => Promise<void>;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
@@ -6151,6 +6491,13 @@ function DeviceRuntimeWorkspace({
   const [manualStoragePoolGiB, setManualStoragePoolGiB] = useState(
     String(Math.max(1, Math.ceil(persistedStoragePoolBytes / GIB_BYTES)))
   );
+  const persistedDeviceResourcesKey = JSON.stringify(brain.config.deviceResources ?? null);
+  const [deviceResources, setDeviceResources] = useState<DeviceResourceSettings | undefined>(brain.config.deviceResources);
+  const effectiveDeviceResources = useMemo(() => synchronizeDeviceRam(deviceResources, systemRamMode, systemRamSharePercent),
+    [deviceResources, systemRamMode, systemRamSharePercent]);
+  useEffect(() => {
+    setDeviceResources((JSON.parse(persistedDeviceResourcesKey) as DeviceResourceSettings | null) ?? undefined);
+  }, [brain.id, persistedDeviceResourcesKey]);
   const [detectedHardware, setDetectedHardware] = useState<SystemHardwareProfile | null>(null);
   const [resourcePlan, setResourcePlan] = useState<WorkingMemoryResourcePlan | null>(null);
   const [resourcePlanPending, setResourcePlanPending] = useState(Boolean(window.omni));
@@ -6230,6 +6577,7 @@ function DeviceRuntimeWorkspace({
       void window.omni!.catalog.resourcePlan({
         mode: workingMemoryMode,
         brainId: brain.id,
+        ...(effectiveDeviceResources ? { deviceResources: effectiveDeviceResources } : {}),
         acceleratorAvailable: detectedHardware.gpu.available,
         systemRamMode,
         ...(systemRamMode === "manual" ? { systemRamSharePercent } : {}),
@@ -6268,10 +6616,12 @@ function DeviceRuntimeWorkspace({
     storagePoolMode,
     systemRamMode,
     systemRamSharePercent,
-    workingMemoryMode
+    workingMemoryMode,
+    effectiveDeviceResources
   ]);
 
   const dirty =
+    JSON.stringify(effectiveDeviceResources ?? null) !== persistedDeviceResourcesKey ||
     systemRamMode !== persistedMode ||
     (systemRamMode === "manual" && systemRamSharePercent !== persistedShare) ||
     workingMemoryMode !== persistedMemoryMode ||
@@ -6333,12 +6683,12 @@ function DeviceRuntimeWorkspace({
   };
 
   const saveResourceEnvelope = async (): Promise<void> => {
-    if (!resourcePlan?.allowed || resourcePlanPending || saving) return;
+    if (!resourcePlan?.allowed || resourcePlanPending || saving || foregroundTurnActive) return;
     setSaving(true);
     setResourceError("");
     try {
       const nextConfig = configWithResourceEnvelope(
-        brain.config,
+        { ...brain.config, ...(effectiveDeviceResources ? { deviceResources: effectiveDeviceResources } : {}) },
         resourcePlan,
         systemRamMode,
         systemRamSharePercent
@@ -6362,6 +6712,7 @@ function DeviceRuntimeWorkspace({
   };
 
   const resetResourceEnvelope = (): void => {
+    setDeviceResources((JSON.parse(persistedDeviceResourcesKey) as DeviceResourceSettings | null) ?? undefined);
     setSystemRamMode(persistedMode);
     setSystemRamSharePercent(initialManualSystemRamSharePercent(brain.config));
     setWorkingMemoryMode(persistedMemoryMode);
@@ -6373,7 +6724,7 @@ function DeviceRuntimeWorkspace({
   };
 
   const startFreshAttention = async (): Promise<void> => {
-    if (!window.omni || freshAttentionBusy) return;
+    if (!window.omni || freshAttentionBusy || foregroundTurnActive) return;
     const confirmed = window.confirm(
       "Start fresh attention?\n\n" +
       "This clears only temporary prompt and active neural state: recent context, working thoughts, fading scratch, and firing/spike/liquid activity. " +
@@ -6501,6 +6852,24 @@ function DeviceRuntimeWorkspace({
       </div>
 
       <div className="resource-settings-layout">
+        {onReviewLoad ? <section className="surface resource-settings-residency"><h2>Instance residency</h2>
+          <p>{instanceState?.phase === "loaded" ? "Learned runtime loaded." : "Offline settings can be edited without loading neural state."}
+            {instanceState?.resume ? ` The saved turn retains ${instanceState.resume.publishedTokens.toLocaleString()} published tokens.` : ""}</p>
+          <Button onClick={onReviewLoad}>Review Load and current fit</Button>
+        </section> : null}
+        <BestWorkSettings
+          key={`${brain.id}:${brain.config.bestWorkEnabled}:${brain.config.bestWorkExplorationBranches}`}
+          preferences={{ bestWorkEnabled: brain.config.bestWorkEnabled ?? false, bestWorkExplorationBranches: brain.config.bestWorkExplorationBranches ?? 16 }}
+          applyBlockedReason={foregroundTurnActive ? "Edit now; apply after the current reply finishes." : undefined}
+          onSave={async (preferences) => {
+            const config = { ...brain.config, ...preferences };
+            const updated = window.omni
+              ? await window.omni.brain.update(brain.id, config)
+              : { ...brain, config, updatedAt: new Date().toISOString() };
+            onBrainChange(updated);
+            onToast(window.omni ? "Best Work preference saved." : "Preview only; no model is connected.");
+          }}
+        />
         <section className="surface active-mode-card" aria-labelledby="active-mode-heading">
           <div className="resource-settings-section-heading">
             <span className="resource-settings-section-icon"><Icon name="pulse" size={18} /></span>
@@ -6511,13 +6880,13 @@ function DeviceRuntimeWorkspace({
           </div>
           <Toggle
             checked={brain.config.idleCognition}
-            disabled={activeModeBusy}
+            disabled={activeModeBusy || foregroundTurnActive}
             onChange={(enabled) => void setActiveModeEnabled(enabled)}
             label={brain.config.idleCognition ? "Active for this identity" : "Inactive for this identity"}
             description="Enabling this identity atomically switches Active Mode off for every other brain. It does not change Ponder, personality, or foreground replies."
           />
           <p className="active-mode-card__status" role="status" aria-live="polite">
-            {activeModeStatus || (brain.config.idleCognition
+            {foregroundTurnActive ? "The current reply continues normally. Switch the background identity after it finishes." : activeModeStatus || (brain.config.idleCognition
               ? "Selected · bounded idle cognition may run when no foreground work is active."
               : "Off · this identity remains stored and responds normally when you open it.")}
           </p>
@@ -6612,7 +6981,7 @@ function DeviceRuntimeWorkspace({
               <span className="resource-settings-section-icon"><Icon name="brain" size={18} /></span>
               <span>
                 <h2>Active context</h2>
-                <p>This is the live token window used during a turn. It remains in RAM; older neural activity can move through recurrent memory and storage-backed cold state.</p>
+                <p>The current token window and hottest activity stay in RAM. Cold attention can use the designated storage pool while experience moves through neural memory.</p>
               </span>
             </div>
             <fieldset className="resource-settings-mode-picker resource-settings-mode-picker--three">
@@ -6764,6 +7133,32 @@ function DeviceRuntimeWorkspace({
             ) : null}
           </div>
 
+          <DeviceAllocationSelector catalog={window.omni?.catalog} brainId={brain.id} settings={effectiveDeviceResources}
+            ramMode={systemRamMode} ramPercent={systemRamSharePercent} disabled={saving}
+            plan={resourcePlan?.deviceResources} planPending={resourcePlanPending}
+            onChange={(settings) => {
+              setDeviceResources(settings); setResourcePlanPending(Boolean(window.omni));
+              const ram = settings.allocations.find((entry) => entry.deviceId === "ram:system");
+              if (ram) { setSystemRamMode(ram.mode); setSystemRamSharePercent(ram.percent); }
+            }} />
+          <DecoderExecutionControls api={window.omni?.decoderExecution} brainId={brain.id}
+            loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
+            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} />
+          <CachedDecoderExecutionControls api={window.omni?.cachedDecoderExecution} brainId={brain.id}
+            loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
+            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} />
+          <NativeOperationAutoControls api={window.omni?.nativeOperationAuto} brainId={brain.id}
+            loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
+            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} />
+          <RegionalExecutionControls api={window.omni?.regionalExecution} brainId={brain.id}
+            loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
+            foregroundTurnActive={foregroundTurnActive} settings={effectiveDeviceResources} dirty={dirty} disabled={saving}
+            onChange={settings => {
+              // Selecting a regional target must not silently replace the
+              // separately selected global RAM policy or raise its ceiling.
+              setDeviceResources(synchronizeDeviceRam(settings, systemRamMode, systemRamSharePercent));
+              setResourcePlanPending(Boolean(window.omni));
+            }} />
           <div
             className={cx(
               "resource-settings-preflight",
@@ -6819,7 +7214,7 @@ function DeviceRuntimeWorkspace({
             <Button
               kind="primary"
               icon={saving ? "pulse" : "check"}
-              disabled={!dirty || saving || resourcePlanPending || !resourcePlan?.allowed}
+              disabled={!dirty || saving || resourcePlanPending || !resourcePlan?.allowed || foregroundTurnActive}
               onClick={() => void saveResourceEnvelope()}
             >
               {saving ? "Saving resources…" : "Save memory & storage"}
@@ -6828,6 +7223,7 @@ function DeviceRuntimeWorkspace({
               Discard change
             </Button>
           </div>
+          {dirty && foregroundTurnActive ? <p className="resource-settings-note" role="status">You can review and edit this allocation now. Apply it after the current reply finishes; the running reply keeps its admitted memory envelope.</p> : null}
         </section>
 
         <aside className="resource-settings-sidebar">
@@ -6974,7 +7370,7 @@ function DeviceRuntimeWorkspace({
           <div className="resource-settings-actions">
             <Button
               icon="pulse"
-              disabled={freshAttentionBusy || saving}
+              disabled={freshAttentionBusy || saving || foregroundTurnActive || Boolean(window.omni?.brain.lifecycle && (instanceState?.phase !== "loaded" || instanceState.resume))}
               onClick={() => void startFreshAttention()}
             >
               {freshAttentionBusy ? "Starting fresh attention…" : "Start fresh attention"}
@@ -6984,6 +7380,7 @@ function DeviceRuntimeWorkspace({
 
         <BrainSnapshotsPanel
           brain={brain}
+          foregroundTurnActive={foregroundTurnActive}
           onBrainChange={onBrainChange}
           onToast={onToast}
         />
@@ -6993,7 +7390,7 @@ function DeviceRuntimeWorkspace({
             <span className="resource-settings-section-icon"><Icon name="agents" size={18} /></span>
             <span>
               <h2 id="mobile-companion-heading">Phone companion</h2>
-              <p>The Android app opens this same persistent identity, conversation, neural state, tools, and action audit. It does not create a mobile model copy.</p>
+              <p>The Android and iOS companion apps open this same persistent identity, conversation, neural state, tools, and action audit. They do not create a mobile model copy.</p>
             </span>
           </div>
 
@@ -7017,7 +7414,7 @@ function DeviceRuntimeWorkspace({
                 disabled={mobileBusy}
                 onClick={() => void startMobilePairing()}
               >
-                {mobileBusy ? "Updating…" : mobileStatus?.state === "listening" ? "New pairing code" : "Pair Android app"}
+                {mobileBusy ? "Updating…" : mobileStatus?.state === "listening" ? "New pairing code" : "Pair a phone"}
               </Button>
               {mobileStatus?.state === "listening" ? (
                 <Button disabled={mobileBusy} onClick={() => void stopMobileGateway()}>
@@ -7170,6 +7567,7 @@ function DataWorkspace({
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const announcedJobs = useRef(new Set<string>());
   const previewRequestId = useRef<string | null>(null);
+  const parserPicker = useDatasetParserPicker(brain.id);
 
   const loadSourcePage = useCallback(async (cursor?: string, depth = 0) => {
     if (!window.omni) {
@@ -7363,7 +7761,8 @@ function DataWorkspace({
           brainId: brain.id,
           policy: learningPolicy,
           requestId,
-          selection: kind === "folder" ? "folder" : selection
+          selection: kind === "folder" ? "folder" : selection,
+          ...(parserPicker.selection ? { parserSelection: parserPicker.selection } : {})
         });
         if (!manifest) {
           previewRequestId.current = null;
@@ -7585,7 +7984,7 @@ function DataWorkspace({
     brain.trainingSources.reduce((sum, source) => sum + source.learnedSynapses, 0);
 
   return (
-    <div className="content-page data-page">
+    <div className="content-page data-page" data-training-active={Boolean(activeJob && activeJob.state !== "complete" && activeJob.state !== "cancelled")}>
       <div className="content-page__title">
         <div>
           <button
@@ -7704,6 +8103,7 @@ function DataWorkspace({
                     Whole folder
                   </Button>
                 </div>
+                <DatasetParserPicker model={parserPicker} disabled={busy} />
               </div>
             ) : mode === "catalog" ? (
               <div className="catalog-list">
@@ -8057,16 +8457,7 @@ interface SubstrateMapNode {
   lastActivatedAt?: string;
 }
 
-interface SubstrateMapEdge {
-  id: string;
-  sourceId: string;
-  targetId: string;
-  effectiveWeight: -1 | 0 | 1;
-  /** Aggregate of displayed ternary connections, not a second learned weight. */
-  signedStrength: number;
-  stability: number;
-  pathways: number;
-}
+type SubstrateMapEdge = BrainMapGraphEdge;
 
 function stableMapHash(value: string) {
   let hash = 2_166_136_261;
@@ -8078,15 +8469,7 @@ function stableMapHash(value: string) {
 }
 
 function BrainMapWorkspace({ brain, onBack }: { brain: BrainDocument; onBack: () => void }) {
-  const [domain, setDomain] = useState<"substrate" | "cortex">("substrate");
-  return <div>
-    <div className="segmented" role="tablist" aria-label="Brain map domain" style={{ margin: "18px 28px 0" }}>
-      <button role="tab" aria-selected={domain === "substrate"} className={domain === "substrate" ? "is-active" : ""} onClick={() => setDomain("substrate")}>Sparse neural substrate</button>
-      <button role="tab" aria-selected={domain === "cortex"} className={domain === "cortex" ? "is-active" : ""} onClick={() => setDomain("cortex")}>Packed cortical model</button>
-    </div>
-    {domain === "cortex" ? <BrainMapCortex brainId={brain.id} updatedAt={brain.updatedAt} onBack={onBack} />
-      : <SubstrateBrainMapWorkspace brain={brain} onBack={onBack} />}
-  </div>;
+  return <WholeBrainMap brainId={brain.id} api={window.omni?.wholeBrainInspection} observeActivity={window.omni?.brain.routerActivity} onBack={onBack} />;
 }
 
 function SubstrateBrainMapWorkspace({
@@ -8219,6 +8602,7 @@ function SubstrateBrainMapWorkspace({
             label: cluster.label,
             region: cluster.region,
             activation: cluster.meanActivation,
+            activationObserved: Number.isFinite(cluster.meanActivation),
             importance: cluster.maxActivation,
             uncertainty: 1 - cluster.meanActivation,
             exposures: cluster.activeCount,
@@ -8258,6 +8642,7 @@ function SubstrateBrainMapWorkspace({
             label: neuron.label,
             region: neuron.region,
             activation: neuron.activation,
+            activationObserved: Number.isFinite(neuron.activation),
             importance: neuron.importance,
             uncertainty: neuron.uncertainty,
             exposures: neuron.exposures,
@@ -8277,6 +8662,7 @@ function SubstrateBrainMapWorkspace({
             id,
             label: mirror?.label ?? `Neuron ${id.slice(0, 8)}`,
             activation: mirror?.activation ?? 0,
+            activationObserved: Boolean(mirror && Number.isFinite(mirror.activation)),
             importance: mirror?.importance ?? 0.35,
             uncertainty: mirror?.uncertainty ?? 0.5,
             exposures: mirror?.exposures ?? 0,
@@ -8326,6 +8712,7 @@ function SubstrateBrainMapWorkspace({
           id: concept.id,
           label: concept.label,
           activation: concept.activation,
+          activationObserved: Number.isFinite(concept.activation),
           importance: concept.importance,
           uncertainty: concept.uncertainty,
           exposures: concept.exposures,
@@ -8348,6 +8735,7 @@ function SubstrateBrainMapWorkspace({
         id: `cluster-${bucket}`,
         label: members.length === 1 ? strongest.label : `${strongest.label} + ${members.length - 1}`,
         activation: members.reduce((sum, concept) => sum + concept.activation, 0) / divisor,
+        activationObserved: members.every(concept => Number.isFinite(concept.activation)),
         importance: members.reduce((sum, concept) => sum + concept.importance, 0) / divisor,
         uncertainty: members.reduce((sum, concept) => sum + concept.uncertainty, 0) / divisor,
         exposures: members.reduce((sum, concept) => sum + concept.exposures, 0),
@@ -8384,6 +8772,7 @@ function SubstrateBrainMapWorkspace({
           label: mirror?.label ?? id,
           region: "connected pathway",
           activation: mirror?.activation ?? 0,
+          activationObserved: Boolean(mirror && Number.isFinite(mirror.activation)),
           importance: mirror?.importance ?? 0.35,
           uncertainty: mirror?.uncertainty ?? 0.5,
           exposures: mirror?.exposures ?? 0,
@@ -8408,28 +8797,16 @@ function SubstrateBrainMapWorkspace({
           .map((synapse) => [synapse.id, synapse] as const)
       );
       const directEdges = [...authoritative.values()].flatMap((synapse) => {
-        const sourceId = realToView.get(synapse.sourceId);
-        const targetId = realToView.get(synapse.targetId);
-        if (!sourceId || !targetId || sourceId === targetId) return [];
-        return [{
-          id: synapse.id,
-          sourceId,
-          targetId,
-          effectiveWeight: synapse.effectiveWeight,
-          signedStrength: synapse.effectiveWeight,
-          stability: synapse.stability,
-          pathways: 1
-        }];
+        const edge = projectBrainMapContact(synapse, realToView);
+        return edge ? [edge] : [];
       });
       if (directEdges.length) return directEdges;
-      const regionNodes = new Map(
-        mapNodes.flatMap((node) => node.region ? [[node.region, node.id] as const] : [])
-      );
+      const regionNodes = uniqueRegionLayoutNodes(mapNodes, substratePage.clusters);
       const clusteredEdges = substratePage.clusters.flatMap((cluster) => {
         if (cluster.kind !== "pathway" || !cluster.sourceRegion || !cluster.targetRegion) return [];
         const sourceId = regionNodes.get(cluster.sourceRegion);
         const targetId = regionNodes.get(cluster.targetRegion);
-        if (!sourceId || !targetId || sourceId === targetId) return [];
+        if (!sourceId || !targetId) return [];
         const signed = cluster.effectiveWeights.positive - cluster.effectiveWeights.negative;
         const total = Math.max(1, cluster.effectiveWeights.negative + cluster.effectiveWeights.zero + cluster.effectiveWeights.positive);
         const signedStrength = signed / total;
@@ -8440,11 +8817,16 @@ function SubstrateBrainMapWorkspace({
           effectiveWeight: signedStrength > 0.15 ? 1 as const : signedStrength < -0.15 ? -1 as const : 0 as const,
           signedStrength,
           stability: cluster.activeCount / Math.max(1, cluster.count),
-          pathways: cluster.count
+          pathways: cluster.count,
+          aggregate: true, aggregateSignCounts: cluster.effectiveWeights
         }];
       });
       if (clusteredEdges.length || clustered) return clusteredEdges;
     }
+    if (!clustered) return Object.values(brain.synapses).flatMap(synapse => {
+      const edge = projectBrainMapContact(synapse, realToView);
+      return edge ? [edge] : [];
+    });
     const aggregated = new Map<string, {
       sourceId: string;
       targetId: string;
@@ -8455,7 +8837,7 @@ function SubstrateBrainMapWorkspace({
     Object.values(brain.synapses).forEach((synapse) => {
       const sourceId = realToView.get(synapse.sourceId);
       const targetId = realToView.get(synapse.targetId);
-      if (!sourceId || !targetId || sourceId === targetId) return;
+      if (!sourceId || !targetId) return;
       const key = `${sourceId}\u0000${targetId}`;
       const current = aggregated.get(key) ?? {
         sourceId,
@@ -8478,23 +8860,11 @@ function SubstrateBrainMapWorkspace({
         effectiveWeight: signedStrength > 0.15 ? 1 : signedStrength < -0.15 ? -1 : 0,
         signedStrength,
         stability: edge.stability / edge.pathways,
-        pathways: edge.pathways
+        pathways: edge.pathways,
+        aggregate: true
       };
     });
   }, [brain.synapses, clustered, mapNodes, pathwayPage, realToView, substratePage]);
-  const positions = useMemo(() => {
-    const values = new Map<string, { x: number; y: number }>();
-    const total = Math.max(1, visibleGraphNodes.length);
-    visibleGraphNodes.forEach((node, index) => {
-      const angle = index * 2.399963229728653;
-      const radial = Math.sqrt((index + 0.65) / total);
-      values.set(node.id, {
-        x: 500 + Math.cos(angle) * radial * 420,
-        y: 325 + Math.sin(angle) * radial * 265
-      });
-    });
-    return values;
-  }, [visibleGraphNodes]);
   const selectedMapNode =
     visibleGraphNodes.find((node) => node.id === selected || node.members.includes(selected)) ??
     visibleGraphNodes[0];
@@ -8694,90 +9064,11 @@ function SubstrateBrainMapWorkspace({
                 <span>Clear the filter or begin a conversation to form connected assemblies.</span>
               </div>
             ) : null}
-            <svg viewBox="0 0 1000 650" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Virtualized multiresolution neural substrate">
-              <defs>
-                <radialGradient id="scalableMapBackground">
-                  <stop offset="0" stopColor="#7259d2" stopOpacity=".13" />
-                  <stop offset="1" stopColor="#0e0d16" stopOpacity="0" />
-                </radialGradient>
-                <filter id="scalableMapGlow">
-                  <feGaussianBlur stdDeviation="5" result="blur" />
-                  <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
-                </filter>
-              </defs>
-              <ellipse cx="500" cy="325" rx="430" ry="295" fill="url(#scalableMapBackground)" />
-              {graphEdges.map((edge) => {
-                const start = positions.get(edge.sourceId);
-                const end = positions.get(edge.targetId);
-                if (!start || !end) return null;
-                return (
-                  <line
-                    key={edge.id}
-                    className={cx(
-                      "graph-edge",
-                      edge.effectiveWeight < 0
-                        ? "graph-edge--negative"
-                        : edge.effectiveWeight === 0
-                          ? "graph-edge--neutral"
-                          : "graph-edge--positive"
-                    )}
-                    x1={start.x}
-                    y1={start.y}
-                    x2={end.x}
-                    y2={end.y}
-                    strokeOpacity={0.1 + Math.min(0.55, Math.abs(edge.signedStrength) * 0.42)}
-                    strokeWidth={0.5 + Math.min(3, edge.stability * 1.4 + Math.log2(edge.pathways + 1) * 0.25)}
-                    strokeDasharray={edge.effectiveWeight < 0 ? "5 5" : edge.effectiveWeight === 0 ? "2 7" : undefined}
-                  />
-                );
-              })}
-              {visibleGraphNodes.map((node, index) => {
-                const position = positions.get(node.id)!;
-                const isSelected = selected === node.id || node.members.includes(selectedConcept?.id ?? "");
-                const representedCount = node.clusterCount ?? node.members.length;
-                const clusterBoost = clustered ? Math.min(15, Math.log2(representedCount + 1) * 4) : 0;
-                const radius = Math.max(7, 10 + node.importance * 10 + clusterBoost - Math.max(0, visibleGraphNodes.length - 90) * 0.025);
-                return (
-                  <g
-                    key={node.id}
-                    className="graph-node"
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => openNode(node)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") openNode(node);
-                    }}
-                    transform={`translate(${position.x} ${position.y})`}
-                  >
-                    <circle className="graph-node__hit-area" r="18" />
-                    <circle
-                      r={radius + (isSelected ? 9 : 3)}
-                      fill={isSelected ? "#8f74ff" : index % 5 === 0 ? "#55d8cf" : "#8e76ef"}
-                      opacity={isSelected ? ".16" : ".065"}
-                    />
-                    <circle
-                      r={radius}
-                      fill={isSelected ? "#a790ff" : index % 5 === 0 ? "#5bd8d0" : "#8069d5"}
-                      opacity={0.45 + node.activation * 0.45}
-                      stroke={isSelected ? "var(--graph-node-stroke-selected)" : "var(--graph-node-stroke)"}
-                      strokeOpacity={isSelected ? ".9" : ".32"}
-                      strokeWidth={isSelected ? "2.2" : "1"}
-                      filter={isSelected ? "url(#scalableMapGlow)" : undefined}
-                    />
-                    {clustered && representedCount > 1 ? (
-                      <text y="4" textAnchor="middle" fill="var(--graph-node-ink)" fontSize="11" fontWeight="700">
-                        {compactNumber(representedCount)}
-                      </text>
-                    ) : <circle r={Math.max(2.5, radius * 0.22)} fill="var(--graph-node-ink)" opacity=".9" />}
-                    {(clustered || visibleGraphNodes.length <= 90 || isSelected) ? (
-                      <text y={radius + 17} textAnchor="middle" fill="var(--graph-label)" fontSize={clustered ? "11" : "10.5"} fontWeight={isSelected ? "650" : "500"}>
-                        {node.label.length > 20 ? `${node.label.slice(0, 19)}…` : node.label}
-                      </text>
-                    ) : null}
-                  </g>
-                );
-              })}
-            </svg>
+            <BrainMapSubstrateGraph nodes={visibleGraphNodes} edges={graphEdges} selectedId={selected}
+              clustered={clustered} onSelect={node => {
+                const actual = visibleGraphNodes.find(value => value.id === node.id);
+                if (actual) openNode(actual);
+              }} />
             <div className="map-viewport-controls">
               <button aria-label="Zoom out" onClick={() => setZoom((value) => Math.max(0.45, Number((value - 0.25).toFixed(2))))}>−</button>
               <span>{Math.round(zoom * 100)}% · {clustered ? "cluster view" : "assembly detail"}</span>
@@ -8855,7 +9146,7 @@ function SubstrateBrainMapWorkspace({
                     return (
                       <div key={synapse.id}>
                         <span><i /> {brain.concepts[otherId]?.label ?? otherId}</span>
-                        <em>{synapse.effectiveWeight > 0 ? "+1" : synapse.effectiveWeight < 0 ? "−1" : "0"}</em>
+                        <em>{nativeConnectionLabel(synapse)}</em>
                       </div>
                     );
                   })}
@@ -8914,7 +9205,7 @@ function SubstrateBrainMapWorkspace({
                     <Icon name="pulse" size={16} />
                     <span>
                       Latest connected synapse changed with <strong>{brain.concepts[recentSynapse.sourceId === selectedConcept.id ? recentSynapse.targetId : recentSynapse.sourceId]?.label ?? "another assembly"}</strong>.
-                      <small>{recentSynapse.lastUpdatedAt ? relativeTime(recentSynapse.lastUpdatedAt) : "Time unavailable"} · ternary {recentSynapse.effectiveWeight > 0 ? "+1" : recentSynapse.effectiveWeight < 0 ? "−1" : "0"}</small>
+                      <small>{recentSynapse.lastUpdatedAt ? relativeTime(recentSynapse.lastUpdatedAt) : "Time unavailable"} · {nativeConnectionLabel(recentSynapse)}</small>
                     </span>
                   </div>
                 ) : <span className="pathway-empty">No connection change has been recorded for this assembly.</span>}
@@ -8975,7 +9266,7 @@ function SubstrateBrainMapWorkspace({
                       return (
                         <div key={edge.id}>
                           <span><i /> {brain.concepts[otherId]?.label ?? mapNodes.find((node) => node.id === otherId)?.label ?? otherId}</span>
-                          <em>{edge.effectiveWeight > 0 ? "+1" : edge.effectiveWeight < 0 ? "−1" : "0"}</em>
+                          <em>{"pathways" in edge && edge.pathways > 1 ? `${compactNumber(edge.pathways)} pathways` : nativeConnectionLabel(edge)}</em>
                         </div>
                       );
                     })}
@@ -9867,6 +10158,7 @@ function ImaginationWorkspace({ brain, onToast }: { brain: BrainDocument; onToas
           </div>
         </section>
         <aside className="surface imagination-controls">
+          <ImaginationCaptureControls brainId={brain.id} api={window.omni?.modality.capture} />
           <div className="modality-switcher">
             {(
               [
@@ -10174,6 +10466,8 @@ function ToolsWorkspace({
     mergeToolPermissionDefaults(brain.toolPermissions, brain.createdAt)
   );
   const [selectedTool, setSelectedTool] = useState("web.fetch");
+  const [toolDescriptions, setToolDescriptions] = useState<ToolDescription[]>([]);
+  const [toolDescriptionRevision, setToolDescriptionRevision] = useState(0);
   const selectedMeta = protocolMeta[selectedTool] ?? {
     label: permissions.find((item) => item.toolId === selectedTool)?.label ?? selectedTool,
     icon: "terminal" as const,
@@ -10184,14 +10478,11 @@ function ToolsWorkspace({
   const [argumentsText, setArgumentsText] = useState(JSON.stringify(selectedMeta.args, null, 2));
   const [resultText, setResultText] = useState("");
   const [approvalToken, setApprovalToken] = useState("");
+  const [executionReview, setExecutionReview] = useState<ToolExecutionResult>();
   const [running, setRunning] = useState(false);
-  const [teacherProvider, setTeacherProvider] = useState<ApiTeacherProvider>("openai");
-  const [teacherStatuses, setTeacherStatuses] = useState<ApiTeacherProviderStatus[]>([]);
-  const [teacherKey, setTeacherKey] = useState("");
-  const [teacherModel, setTeacherModel] = useState("gpt-5");
-  const [teacherPrompts, setTeacherPrompts] = useState("");
-  const [teacherJob, setTeacherJob] = useState<RuntimeJob | null>(null);
   const [mcpServers, setMcpServers] = useState<McpServerSummary[]>([]);
+  const [mcpRegistry, setMcpRegistry] = useState<McpRegistrySummary>({ enabled: true, instanceEnabled: true, servers: [] });
+  const [mcpForAll, setMcpForAll] = useState(true);
   const [mcpId, setMcpId] = useState("");
   const [mcpLabel, setMcpLabel] = useState("");
   const [mcpTransport, setMcpTransport] = useState<McpTransport>("http");
@@ -10199,6 +10490,7 @@ function ToolsWorkspace({
   const [mcpCommand, setMcpCommand] = useState("");
   const [mcpArgs, setMcpArgs] = useState("");
   const [mcpToken, setMcpToken] = useState("");
+  const [mcpEnvironmentText, setMcpEnvironmentText] = useState("");
   const [integrationBusy, setIntegrationBusy] = useState(false);
   const [approvalTimeout, setApprovalTimeout] = useState("30");
 
@@ -10210,33 +10502,41 @@ function ToolsWorkspace({
     };
     void window.omni.tool.listPermissions(brain.id).then((records) => {
       if (active) setPermissions(mergeToolPermissionDefaults(records, brain.createdAt));
+    }).catch((error: unknown) => {
+      if (active) onToast(error instanceof Error ? error.message : "Tool permissions could not load.");
     });
     return () => {
       active = false;
     };
-  }, [brain.createdAt, brain.id, brain.toolPermissions]);
+  }, [brain.createdAt, brain.id, brain.toolPermissions, onToast]);
+
+  useEffect(() => {
+    let active = true;
+    if (window.omni) void window.omni.tool.descriptions(brain.id).then(page => {
+      if (active && page.brainId === brain.id) setToolDescriptions(page.tools);
+    }).catch(reason => { if (active) onToast(reason instanceof Error ? reason.message : "Tool action descriptions could not load."); });
+    return () => { active = false; };
+  }, [brain.id, brain.toolPermissions, toolDescriptionRevision, onToast]);
+
+  const selectedDescription = toolDescriptions.find(value => value.id === selectedTool);
+  useEffect(() => {
+    if (!action.trim() && selectedDescription) setAction(defaultToolAction(selectedDescription));
+  }, [action, selectedDescription]);
 
   useEffect(() => {
     if (!window.omni) return;
     let active = true;
     void Promise.all([
-      window.omni.teacher.status(),
-      window.omni.teacher.list(brain.id),
-      window.omni.mcp.list(brain.id),
+      window.omni.mcp.registry(brain.id),
       window.omni.tool.preferences()
-    ]).then(([statuses, jobs, servers, preferences]) => {
+    ]).then(([registry, preferences]) => {
       if (!active) return;
-      setTeacherStatuses(statuses);
-      setTeacherJob(jobs.find(runtimeJobIsActive) ?? jobs[0] ?? null);
-      setMcpServers(servers);
+      setMcpRegistry(registry);
+      setMcpServers(registry.servers);
       setApprovalTimeout(String(preferences.approvalTimeoutSeconds));
     }).catch((error) => onToast(error instanceof Error ? error.message : "Integration settings could not load."));
-    const unsubscribe = window.omni.teacher.onEvent(({ job }) => {
-      if (active && job.brainId === brain.id) setTeacherJob(job);
-    });
     return () => {
       active = false;
-      unsubscribe();
     };
   }, [brain.id, onToast]);
 
@@ -10244,7 +10544,7 @@ function ToolsWorkspace({
     const meta = protocolMeta[toolId] ?? {
       label: permissions.find((item) => item.toolId === toolId)?.label ?? toolId,
       icon: "terminal" as const,
-      action: toolId.startsWith("mcp.") ? "call" : "",
+      action: defaultToolAction(toolDescriptions.find(value => value.id === toolId)) || (toolId.startsWith("mcp.") ? "call" : ""),
       args: {}
     };
     setSelectedTool(toolId);
@@ -10252,6 +10552,7 @@ function ToolsWorkspace({
     setArgumentsText(JSON.stringify(meta.args, null, 2));
     setResultText("");
     setApprovalToken("");
+    setExecutionReview(undefined);
   };
 
   const setPermission = async (toolId: string, level: PermissionLevel) => {
@@ -10261,10 +10562,21 @@ function ToolsWorkspace({
       return;
     }
     try {
-      const next = await window.omni.tool.setPermission(brain.id, toolId, level);
+      const next = await window.omni.tool.setPermission(
+        brain.id,
+        toolId,
+        level,
+        globalThis.crypto.randomUUID(),
+        Math.max(1, ...permissions.map((permission) => permission.revision ?? 1))
+      );
       setPermissions(mergeToolPermissionDefaults(next, brain.createdAt));
+      if (toolId === selectedTool) { setApprovalToken(""); setExecutionReview(undefined); }
       onBrainChange(await window.omni.brain.get(brain.id));
     } catch (error) {
+      // A rejected stale-revision write is not retried as a new grant. Refresh
+      // current host authority so the next deliberate click starts from it.
+      const current = await window.omni.tool.listPermissions(brain.id).catch(() => undefined);
+      if (current) setPermissions(mergeToolPermissionDefaults(current, brain.createdAt));
       onToast(error instanceof Error ? error.message : "Permission could not be changed.");
     }
   };
@@ -10289,11 +10601,13 @@ function ToolsWorkspace({
       });
       if (result.state === "approval-required" && result.approvalToken) {
         setApprovalToken(result.approvalToken);
+        setExecutionReview(result);
         setResultText(
           `Approval required${result.approvalExpiresAt ? ` until ${new Date(result.approvalExpiresAt).toLocaleTimeString()}` : ""}. Inspect the action above, then click Approve & run.`
         );
       } else {
         setApprovalToken("");
+        setExecutionReview(undefined);
         setResultText(
           result.state === "complete"
             ? JSON.stringify(result.output ?? { state: "complete" }, null, 2)
@@ -10318,125 +10632,55 @@ function ToolsWorkspace({
     );
   };
 
-  const saveTeacherCredential = async () => {
-    if (!window.omni || !teacherKey.trim()) return;
-    setIntegrationBusy(true);
-    try {
-      setTeacherStatuses(await window.omni.teacher.saveCredential({
-        provider: teacherProvider,
-        apiKey: teacherKey
-      }));
-      setTeacherKey("");
-      onToast(`${teacherProvider} credential stored outside every brain and export.`);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Credential could not be stored.");
-    } finally {
-      setIntegrationBusy(false);
-    }
-  };
-
-  const removeTeacherCredential = async (): Promise<void> => {
-    if (!window.omni || integrationBusy) return;
-    const configured = teacherStatuses.find((item) => item.provider === teacherProvider)?.configured;
-    if (!configured) return;
-    if (!window.confirm(
-      `Remove the saved ${teacherProvider} API credential?\n\nAPI teacher jobs for this provider cannot start again until a new key is stored. Existing learned neural state is not changed.`
-    )) return;
-    setIntegrationBusy(true);
-    try {
-      setTeacherStatuses(await window.omni.teacher.removeCredential(teacherProvider));
-      setTeacherKey("");
-      onToast(`${teacherProvider} credential removed from secure device storage.`);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Credential could not be removed.");
-    } finally {
-      setIntegrationBusy(false);
-    }
-  };
-
-  const startTeacherTraining = async () => {
-    if (!window.omni) return;
-    const prompts = teacherPrompts.split(/\n+/).map((value) => value.trim()).filter(Boolean);
-    setIntegrationBusy(true);
-    try {
-      const job = await window.omni.teacher.start({
-        brainId: brain.id,
-        provider: teacherProvider,
-        model: teacherModel.trim(),
-        prompts
-      });
-      setTeacherJob(job);
-      onToast("API teacher learning started; each response will mutate this brain's neural state.");
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "API teacher learning could not start.");
-    } finally {
-      setIntegrationBusy(false);
-    }
-  };
-
-  const cancelTeacherTraining = async () => {
-    if (!window.omni || !teacherJob) return;
-    const stop = runtimeJobStopPresentation(teacherJob);
-    if (!stop.requestAllowed) return;
-    const requestedJob = teacherJob;
-    setIntegrationBusy(true);
-    setTeacherJob({
-      ...requestedJob,
-      state: "cancelling",
-      label: "Cancelling API teacher learning · waiting for acknowledgement",
-      error: undefined,
-      updatedAt: new Date().toISOString()
-    });
-    try {
-      const cancelled = await window.omni.teacher.cancel(requestedJob.id);
-      setTeacherJob(cancelled);
-      onToast("API teacher learning stopped after worker acknowledgement.");
-    } catch (error) {
-      const reason = conciseUiMessage(
-        error instanceof Error ? error.message : String(error),
-        "API teacher learning is still awaiting stop acknowledgement."
-      );
-      const current = await window.omni.teacher
-        .list(brain.id)
-        .then((jobs) => jobs.find((candidate) => candidate.id === requestedJob.id))
-        .catch(() => undefined);
-      setTeacherJob(current ?? {
-        ...requestedJob,
-        state: "cancelling",
-        label: "API teacher stop needs acknowledgement",
-        error: reason,
-        updatedAt: new Date().toISOString()
-      });
-      onToast(`${reason} Retry stop when ready.`);
-    } finally {
-      setIntegrationBusy(false);
-    }
-  };
-
   const addMcpServer = async () => {
     if (!window.omni) return;
     setIntegrationBusy(true);
     try {
+      let environment: Record<string, string> | undefined;
+      if (mcpTransport === "stdio" && mcpEnvironmentText.trim()) {
+        try { environment = JSON.parse(mcpEnvironmentText) as Record<string, string>; }
+        catch { throw new Error("Local server variables must be a valid JSON name/value object."); }
+      }
       const added = await window.omni.mcp.add({
         brainId: brain.id,
         id: mcpId.trim(),
         label: mcpLabel.trim() || mcpId.trim(),
         transport: mcpTransport,
+        scope: mcpForAll ? "all" : "instance",
         ...(mcpTransport === "http"
           ? { url: mcpUrl.trim(), bearerToken: mcpToken.trim() || undefined }
           : {
               command: mcpCommand.trim(),
-              args: mcpArgs.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
+              args: mcpArgs.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+              ...(environment ? { environment } : {})
             })
       });
       setMcpServers((current) => [...current.filter((item) => item.id !== added.id), added]);
       setMcpToken("");
+      setMcpEnvironmentText("");
       const next = await window.omni.tool.listPermissions(brain.id);
       setPermissions(mergeToolPermissionDefaults(next, brain.createdAt));
       onBrainChange(await window.omni.brain.get(brain.id));
-      onToast(`Connected ${added.label}; ${added.tools.length} typed tools entered neural learning.`);
+      onToast(added.connected ? `Connected ${added.label} · ${added.tools.length} tools · ${added.schemaLearning === "complete" ? "capabilities learned" : "capability learning pending"}`
+        : `Added ${added.label} · ${added.authentication?.state === "required" ? "sign-in needed" : "connection pending"}`);
     } catch (error) {
       onToast(error instanceof Error ? error.message : "MCP server could not connect.");
+    } finally {
+      setIntegrationBusy(false);
+    }
+  };
+
+  const configureMcp = async (request: McpRegistryUpdateRequest): Promise<void> => {
+    if (!window.omni || integrationBusy) return;
+    setIntegrationBusy(true);
+    try {
+      await window.omni.mcp.configure(request);
+      const registry = await window.omni.mcp.registry(brain.id);
+      setMcpRegistry(registry);
+      setMcpServers(registry.servers);
+      setPermissions(mergeToolPermissionDefaults(await window.omni.tool.listPermissions(brain.id), brain.createdAt));
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "MCP access could not be changed.");
     } finally {
       setIntegrationBusy(false);
     }
@@ -10497,7 +10741,13 @@ function ToolsWorkspace({
     }
   };
 
-  const teacherStop = runtimeJobStopPresentation(teacherJob);
+  const onPluginNotice = (message: string): void => {
+    onToast(message);
+    setToolDescriptionRevision(value => value + 1);
+    if (window.omni) void window.omni.tool.listPermissions(brain.id).then(records => {
+      setPermissions(mergeToolPermissionDefaults(records, brain.createdAt));
+    }).catch(error => onToast(error instanceof Error ? error.message : "Current tool permissions could not refresh."));
+  };
 
   return (
     <div className="content-page tools-page">
@@ -10520,7 +10770,7 @@ function ToolsWorkspace({
               const meta = protocolMeta[permission.toolId] ?? { label: permission.label, icon: "terminal" as const };
               return (
                 <div key={permission.toolId} className={cx("permission-row", selectedTool === permission.toolId && "is-selected")}>
-                  <button className="permission-row__identity" onClick={() => chooseTool(permission.toolId)}>
+                  <button className="permission-row__identity" disabled={running} onClick={() => chooseTool(permission.toolId)}>
                     <span><Icon name={meta.icon} size={17} /></span>
                     <span><strong>{meta.label}</strong><small>{permission.toolId}</small></span>
                   </button>
@@ -10541,26 +10791,33 @@ function ToolsWorkspace({
             })}
           </div>
           {!permissions.length ? <div className="table-empty">No tool protocols are registered for this brain.</div> : null}
+          <ProcessMemorySettings brainId={brain.id} api={window.omni?.processMemory} />
         </section>
         <aside className="surface tool-console">
           <div className="tool-console__head">
             <span><Icon name={selectedMeta.icon} size={18} /></span>
             <div><small>TEST PROTOCOL</small><strong>{selectedMeta.label}</strong></div>
           </div>
-          <label>
-            <span>Action</span>
-            <input value={action} onChange={(event) => setAction(event.target.value)} />
-          </label>
+          <ToolActionPicker description={selectedDescription} action={action} disabled={running}
+            onChange={value => { setAction(value); setApprovalToken(""); setExecutionReview(undefined); }} />
           <label>
             <span>Arguments · JSON</span>
-            <textarea value={argumentsText} onChange={(event) => setArgumentsText(event.target.value)} rows={10} spellCheck={false} />
+            <textarea value={argumentsText} disabled={running} onChange={(event) => { setArgumentsText(event.target.value); setApprovalToken(""); setExecutionReview(undefined); }} rows={10} spellCheck={false} />
           </label>
+          <PluginToolApprovalReviewView execution={executionReview} toolId={selectedTool} action={action} />
+          <ActionReviewDetails execution={executionReview} />
+          {approvalToken ? <Button kind="ghost" icon="close" onClick={() => void (async () => {
+            if (!window.omni) return;
+            await window.omni.tool.declineApproval(brain.id, approvalToken);
+            setApprovalToken(""); setExecutionReview(undefined); setResultText("This exact approval was discarded; no action dispatched.");
+          })().catch(error => onToast(conciseUiMessage(error, "The approval could not be discarded.")))}>Discard approval</Button> : null}
           <Button
             kind="primary"
             icon={running ? "close" : approvalToken ? "check" : "play"}
+            disabled={!running && (!action.trim() || selectedDescription?.source === "unregistered")}
             onClick={() => void (running ? cancelExecution() : execute())}
           >
-            {running ? "Cancel execution" : approvalToken ? "Approve & run" : "Run test"}
+            {running ? "Cancel execution" : approvalToken ? "Approve & run" : "Run action"}
           </Button>
           <div className="tool-output">
             <span>OUTPUT</span>
@@ -10568,10 +10825,24 @@ function ToolsWorkspace({
           </div>
           <div className="builder-note">
             <Icon name="info" size={15} />
-            <span>Full authority skips confirmation. Audit entries remain mandatory at every level.</span>
+            <span>Full authority permits broad host actions. Uncertain effects and special reviews still ask; every action is recorded.</span>
           </div>
         </aside>
       </div>
+      <section className="surface integration-surface">
+        <PluginRuntimeSlot slot="tools" showProviderError />
+        <SparseSubstrateJobsPanel />
+        <PluginManager key={brain.id} brainId={brain.id} onNotice={onPluginNotice}
+          onCapabilitiesChanged={pluginId => {
+            setToolDescriptionRevision(value => value + 1);
+            if (selectedTool.startsWith(`plugin.${pluginId}.`)) {
+              if (approvalToken) setResultText("Plugin access or version changed. Submit a new exact action for review.");
+              setApprovalToken(""); setExecutionReview(undefined);
+            }
+          }} />
+      </section>
+      {window.omni?.maps ? <section className="surface integration-surface"><MapConnectionPanel /></section> : null}
+      {window.omni?.maps?.basemaps ? <section className="surface integration-surface"><MapBasemapPanel api={window.omni.maps.basemaps} /></section> : null}
       <section className="surface integration-surface">
         <div className="surface-title">
           <div>
@@ -10584,66 +10855,24 @@ function ToolsWorkspace({
           </label>
         </div>
         <div className="integration-grid">
-          <div className="integration-card">
-            <div className="integration-card__head">
-              <span><Icon name="brain" size={18} /></span>
-              <div><strong>API teacher learning</strong><small>No RLHF · no system prompt · same neural substrate</small></div>
-            </div>
-            <div className="integration-fields integration-fields--three">
-              <label>
-                <span>Provider</span>
-                <select value={teacherProvider} onChange={(event) => {
-                  const provider = event.target.value as ApiTeacherProvider;
-                  setTeacherProvider(provider);
-                  setTeacherModel(provider === "openai" ? "gpt-5" : provider === "anthropic" ? "claude-sonnet-4-5" : "gemini-2.5-pro");
-                }}>
-                  <option value="openai">OpenAI</option>
-                  <option value="anthropic">Claude</option>
-                  <option value="gemini">Gemini</option>
-                </select>
-              </label>
-              <label><span>Model</span><input value={teacherModel} onChange={(event) => setTeacherModel(event.target.value)} /></label>
-              <label><span>API key · never returned</span><input type="password" autoComplete="off" value={teacherKey} onChange={(event) => setTeacherKey(event.target.value)} placeholder={teacherStatuses.find((item) => item.provider === teacherProvider)?.keyHint ?? "Paste key"} /></label>
-            </div>
-            <div className="integration-actions">
-              <Button icon="check" disabled={integrationBusy || !teacherKey.trim()} onClick={() => void saveTeacherCredential()}>Store key</Button>
-              <Button
-                kind="danger"
-                icon="close"
-                disabled={integrationBusy || !teacherStatuses.find((item) => item.provider === teacherProvider)?.configured}
-                onClick={() => void removeTeacherCredential()}
-              >
-                Remove key
-              </Button>
-              <small>{teacherStatuses.find((item) => item.provider === teacherProvider)?.configured ? `${teacherProvider} configured · ${teacherStatuses.find((item) => item.provider === teacherProvider)?.persistence}` : "Not configured"}</small>
-            </div>
-            <label>
-              <span>Learning questions · one per line</span>
-              <textarea rows={5} value={teacherPrompts} onChange={(event) => setTeacherPrompts(event.target.value)} placeholder="Explain a concept with evidence…&#10;Show a correct tool trajectory for…" />
-            </label>
-            <div className="integration-actions">
-              <Button
-                kind="primary"
-                icon={teacherStop.active ? (teacherStop.waitingForAcknowledgement ? "pulse" : "close") : "play"}
-                disabled={integrationBusy || (teacherStop.active && !teacherStop.requestAllowed)}
-                onClick={() => void (teacherStop.active ? cancelTeacherTraining() : startTeacherTraining())}
-              >
-                {teacherStop.retryAvailable
-                  ? "Retry stop"
-                  : teacherStop.waitingForAcknowledgement
-                    ? "Stopping learning…"
-                    : teacherStop.active
-                      ? "Stop learning"
-                      : "Learn from API"}
-              </Button>
-              <small>{teacherJob ? `${teacherJob.label} · ${Math.round(teacherJob.progress * 100)}%` : "Responses become parameters and synapses, not chat context."}</small>
-            </div>
-          </div>
+          <ApiTeacherPanel brainId={brain.id} api={window.omni?.teacher} onNotice={onToast} />
           <div className="integration-card">
             <div className="integration-card__head">
               <span><Icon name="terminal" size={18} /></span>
               <div><strong>MCP tools</strong><small>Connect remote Streamable HTTP or an installed local stdio server</small></div>
             </div>
+            <div className="mcp-access-controls">
+              <label><input type="checkbox" checked={mcpRegistry.enabled} disabled={integrationBusy}
+                onChange={event => void configureMcp({ enabled: event.target.checked })} /> MCP enabled on this device</label>
+              <label><input type="checkbox" checked={mcpRegistry.instanceEnabled} disabled={integrationBusy || !mcpRegistry.enabled}
+                onChange={event => void configureMcp({ brainId: brain.id, enabled: event.target.checked })} /> Allow MCP for {brain.name}</label>
+            </div>
+            <McpPresetPicker disabled={integrationBusy} onChoose={(draft) => {
+                setMcpId(draft.id); setMcpLabel(draft.label); setMcpTransport(draft.transport);
+                setMcpUrl(draft.url ?? ""); setMcpCommand(draft.command); setMcpArgs(draft.args.join("\n"));
+                setMcpToken(""); setMcpEnvironmentText("");
+                onToast("Connection draft prepared. No installation, sign-in, connection or access grant has run.");
+              }} />
             <div className="integration-fields integration-fields--three">
               <label><span>Server id</span><input value={mcpId} onChange={(event) => setMcpId(event.target.value)} placeholder="coding" /></label>
               <label><span>Label</span><input value={mcpLabel} onChange={(event) => setMcpLabel(event.target.value)} placeholder="Coding tools" /></label>
@@ -10664,31 +10893,54 @@ function ToolsWorkspace({
               <div className="integration-fields integration-fields--endpoint">
                 <label><span>Absolute executable path</span><input value={mcpCommand} onChange={(event) => setMcpCommand(event.target.value)} placeholder={navigator.platform.startsWith("Win") ? "C:\\Program Files\\MCP\\server.exe" : "/usr/local/bin/mcp-server"} /></label>
                 <label><span>Arguments · one per line</span><textarea rows={3} value={mcpArgs} onChange={(event) => setMcpArgs(event.target.value)} placeholder="--workspace&#10;/absolute/project/path" /></label>
+                <details className="mcp-environment-editor"><summary>Credential environment · optional</summary>
+                  <label><span>Variables · JSON name/value object</span><textarea rows={3} autoComplete="off" spellCheck={false}
+                    value={mcpEnvironmentText} onChange={event => setMcpEnvironmentText(event.target.value)} placeholder={'{"SERVICE_API_KEY":"…"}'} /></label>
+                </details>
               </div>
             )}
             <div className="integration-actions">
+              <label className="mcp-add-scope"><input type="checkbox" checked={mcpForAll} onChange={event => setMcpForAll(event.target.checked)} /> Add for all instances</label>
               <Button
                 kind="primary"
                 icon="plus"
                 disabled={integrationBusy || !mcpId.trim() || (mcpTransport === "http" ? !mcpUrl.trim() : !mcpCommand.trim())}
                 onClick={() => void addMcpServer()}
               >
-                Connect & learn tools
+                Connect server
               </Button>
-              <small>Descriptions are untrusted; only typed names and schemas enter neural learning.</small>
+              <small>Each tool follows this instance’s permissions.</small>
             </div>
             <div className="mcp-server-list">
               {mcpServers.map((server) => (
-                <div key={server.id}>
-                  <span><i className={server.connected ? "is-connected" : ""} /><strong>{server.label}</strong><small>{server.tools.length} tools · {server.transport}{server.error ? ` · ${server.error}` : ""}</small></span>
+                <div key={server.id} className={server.effectiveEnabled ? "" : "mcp-server--disabled"}>
+                  <span><i className={server.connected && server.effectiveEnabled ? "is-connected" : ""} /><strong>{server.label}</strong><small>{server.tools.length} tools · {server.transport}{server.disabledReason ? ` · ${server.disabledReason}` : server.error ? ` · ${server.error}` : ""}</small></span>
                   <span className="mcp-server-list__actions">
+                    <label><input type="checkbox" checked={server.globallyEnabled} disabled={integrationBusy || !mcpRegistry.enabled}
+                      onChange={event => void configureMcp({ registryId: server.registryId, enabled: event.target.checked })} /> Server enabled</label>
+                    <select aria-label={`${server.label} access for ${brain.name}`} value={server.accessOverride}
+                      disabled={integrationBusy || !mcpRegistry.enabled || !mcpRegistry.instanceEnabled || !server.globallyEnabled}
+                      onChange={event => void configureMcp({ brainId: brain.id, registryId: server.registryId, accessOverride: event.target.value as "inherit" | "on" | "off" })}>
+                      <option value="inherit">Default ({server.defaultEnabled ? "on" : "off"})</option>
+                      <option value="on">On for this instance</option>
+                      <option value="off">Off for this instance</option>
+                    </select>
                     <Button icon="pulse" disabled={integrationBusy} onClick={() => void refreshMcpServer(server.id)}>Refresh</Button>
-                    <Button kind="danger" disabled={integrationBusy} onClick={() => void removeMcpServer(server.id)}>Remove</Button>
+                    <Button kind="danger" disabled={integrationBusy} onClick={() => void removeMcpServer(server.id)}>Remove server</Button>
                   </span>
+                  {server.transport === "http" ? <McpAuthenticationPanel key={`${brain.id}:${server.id}:${server.authentication?.state}:${server.credentialConfigured}`} brainId={brain.id} server={server}
+                    onChanged={() => { const api = window.omni?.mcp; if (api) void api.registry(brain.id).then(registry => { setMcpRegistry(registry); setMcpServers(registry.servers); }).catch(error => onToast(error instanceof Error ? error.message : "MCP status could not refresh.")); }} /> : null}
+                  <McpCredentialPanel key={`${brain.id}:${server.id}:credentials`} brainId={brain.id} server={server} onSaved={updated => {
+                    setMcpServers(current => current.map(item => item.id === updated.id ? updated : item));
+                    setMcpRegistry(current => ({ ...current, servers: current.servers.map(item => item.id === updated.id ? updated : item) }));
+                  }} />
+                  <McpHostServicesPanel brainId={brain.id} serverId={server.id} connected={server.connected} enabled={server.effectiveEnabled}
+                    roots={window.omni?.mcp.roots} diagnostics={window.omni?.mcp.diagnostics} />
                 </div>
               ))}
               {!mcpServers.length ? <small>No MCP servers connected to this mind.</small> : null}
             </div>
+            <McpTasksPanel key={brain.id} brainId={brain.id} api={window.omni?.mcp.tasks} tools={window.omni?.tool} servers={mcpServers} />
           </div>
         </div>
       </section>
@@ -11156,7 +11408,8 @@ export function App() {
   const [initializationStopIntent, setInitializationStopIntent] =
     useState<InitializationStopIntent | null>(null);
   const [confirmingInitializationCancel, setConfirmingInitializationCancel] = useState(false);
-  const [toast, setToast] = useState("");
+  const [toast, setToast] = useState<{ id: number; text: string } | null>(null);
+  const toastSequence = useRef(0);
   const [deleteTarget, setDeleteTarget] = useState<
     Pick<BrainSummary, "id" | "name" | "rootId"> | null
   >(null);
@@ -11201,7 +11454,7 @@ export function App() {
     buildMetrics?.recordsVisited !== undefined ||
     buildMetrics?.neuronDelta !== undefined ||
     buildMetrics?.synapseDelta !== undefined ||
-    buildMetrics?.parameterChecksumChanged !== undefined;
+    buildMetrics?.diskSpace !== undefined;
 
   useLayoutEffect(() => {
     const platform = `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`;
@@ -11321,11 +11574,7 @@ export function App() {
 
   const showToast = (message: string) => {
     const presentedMessage = conciseUiMessage(message);
-    setToast(presentedMessage);
-    window.setTimeout(
-      () => setToast((current) => (current === presentedMessage ? "" : current)),
-      3_600
-    );
+    setToast({ id: ++toastSequence.current, text: presentedMessage });
     dispatchLocalNotification({
       enabled: appearanceWorkspace.notificationsEnabled,
       visible: document.visibilityState === "visible",
@@ -11335,6 +11584,20 @@ export function App() {
       environment: browserNotificationEnvironment()
     });
   };
+
+  useEffect(() => {
+    const api = window.omni?.portable; if (!api) return;
+    let current = true;
+    void api.status().then(status => {
+      if (!current) return;
+      applyPortablePresentationOnce(status, window.localStorage, value => {
+        setAppearance(value.appearance); setAppearanceWorkspace(value.workspace);
+        if (value.theme) savePluginThemeSelection(window.localStorage, value.theme);
+        else clearPluginThemeSelection(window.localStorage);
+      });
+    }).catch(error => { if (current) showToast(error instanceof Error ? error.message : "Portable appearance could not be restored."); });
+    return () => { current = false; };
+  }, []);
 
   useEffect(() => {
     if (!window.omni) return;
@@ -11429,14 +11692,16 @@ export function App() {
     };
   }, [missingLibrarySubstrateIds, page]);
 
-  const openBrain = async (summary: BrainSummary) => {
+  const openBrain = async (summary: BrainSummary | string, nextView: WorkspaceView = "chat") => {
     setLoading(true);
     try {
+      if (typeof summary === "string" && !window.omni) throw new Error("The native instance is unavailable in this design preview.");
       const document = window.omni
-        ? await window.omni.brain.get(summary.id)
-        : makeDemoBrain(summary.id, summary.name, createPresetConfig(summary.preset, summary.name));
+        ? await window.omni.brain.get(typeof summary === "string" ? summary : summary.id)
+        : typeof summary !== "string" ? makeDemoBrain(summary.id, summary.name, createPresetConfig(summary.preset, summary.name)) : null;
+      if (!document) throw new Error("The native instance could not be opened.");
       setActiveBrain(document);
-      setWorkspaceView("chat");
+      setWorkspaceView(nextView);
       setPage("workspace");
     } catch (error) {
       showToast(error instanceof Error ? error.message : "This brain could not be opened.");
@@ -11482,9 +11747,12 @@ export function App() {
       const document = window.omni
         ? await window.omni.brain.create({
           config,
+          ...(extras.spillPoolSelectionId ? { spillPoolSelectionId: extras.spillPoolSelectionId } : {}),
           hardwareTier,
           workingMemory: {
             mode: config.workingMemoryMode,
+            ...(config.deviceResources ? { deviceResources: config.deviceResources } : {}),
+            ...(extras.spillPoolSelectionId ? { spillPoolSelectionId: extras.spillPoolSelectionId } : {}),
             hardwareTier,
             ...(acceleratorAvailable !== undefined
               ? { acceleratorAvailable }
@@ -11826,8 +12094,14 @@ export function App() {
     }
   };
 
+  const portableControls = <PortableWorkspaceControls api={window.omni?.portable} summaries={summaries}
+    presentation={() => ({ appearance, workspace: appearanceWorkspace, theme: loadPluginThemeSelection(window.localStorage) })}
+    onCreated={result => showToast(`Portable Windows folder created: ${result.destination}`)}
+    onEditSettings={id => { void openBrain(id, "settings"); }} />;
+
   return (
     <div className="app-shell">
+      <PluginThemeHost />
       <div className="mica-glow mica-glow--one" />
       <div className="mica-glow mica-glow--two" />
       <Titlebar
@@ -11851,7 +12125,9 @@ export function App() {
           onDelete={setDeleteTarget}
           onBuild={() => setPage("build")}
           onImport={() => void importBrain()}
+          onMerged={() => { if (window.omni) void window.omni.brain.list().then(setSummaries).catch((error: unknown) => showToast(error instanceof Error ? error.message : "Library refresh failed.")); }}
           demo={demo}
+          portableControls={portableControls}
         />
       ) : page === "build" ? (
         <SimpleBuildWizard
@@ -11866,6 +12142,7 @@ export function App() {
             </span>
             <h3>{initializationRunning!.title}</h3>
             <p>{initializationRunning!.detail}</p>
+            {initializationControlBrainId ? <PluginRuntimeApprovalQueue key={initializationControlBrainId} brainId={initializationControlBrainId} /> : null}
             {initializationRunning!.percent !== undefined ? (
               <div
                 className="training-progress initialization-recovery-card__progress"
@@ -11975,13 +12252,6 @@ export function App() {
             const summary = summaries.find((item) => item.id === activeBrain.id);
             if (summary) void duplicateBrain(summary);
           }}
-          onDelete={() => setDeleteTarget(
-            summaries.find((summary) => summary.id === activeBrain.id) ?? {
-              id: activeBrain.id,
-              name: activeBrain.name,
-              rootId: activeBrain.lineage.rootId
-            }
-          )}
           onActiveModeChange={applyActiveModeResult}
           onBrainChange={updateActiveBrain}
           onToast={showToast}
@@ -11996,6 +12266,8 @@ export function App() {
           onBuild={() => setPage("build")}
           onImport={() => void importBrain()}
           demo={demo}
+          portableControls={portableControls}
+          onMerged={() => { if (window.omni) void window.omni.brain.list().then(setSummaries).catch((error: unknown) => showToast(error instanceof Error ? error.message : "Library refresh failed.")); }}
         />
       )}
       {loading && page !== "library" ? (
@@ -12004,14 +12276,14 @@ export function App() {
           <span>Opening neural state…</span>
         </div>
       ) : null}
-       {buildProgress && !initializationRunningActive ? (
+       {buildProgress && (!initializationRunningActive || page === "library") ? (
         <div className="loading-overlay build-readiness-overlay" role="status" aria-live="polite">
           <BrandMark size={52} />
           <strong>{buildProgress.label}</strong>
-          <span>{Math.round(buildProgress.progress * 100)}% · Core checks gate chat; fluency depends on training</span>
-          <i className="build-readiness-overlay__meter">
-            <b style={{ width: `${Math.round(buildProgress.progress * 100)}%` }} />
-          </i>
+          <BuildProgressStatus progress={buildProgress} />
+          {initializationControlBrainId ?? initialMaterialsBrainId ? <PluginRuntimeApprovalQueue
+            key={initializationControlBrainId ?? initialMaterialsBrainId}
+            brainId={(initializationControlBrainId ?? initialMaterialsBrainId)!} /> : null}
           {initialMaterialsPresentation ? (
             <span>{initialMaterialsPresentation.detail}</span>
           ) : hasBuildMetrics ? (
@@ -12033,12 +12305,6 @@ export function App() {
               {buildMetrics?.synapseDelta !== undefined ? (
                 <div><dt>Connections</dt><dd>{buildMetrics.synapseDelta.toLocaleString()}</dd></div>
               ) : null}
-               {buildMetrics?.parameterChecksumChanged !== undefined ? (
-                <div>
-                  <dt title="Includes associative neural state; does not independently prove dense model weights changed">Composite neural checksum</dt>
-                  <dd>{buildMetrics.parameterChecksumChanged ? "Changed" : "Unchanged"}</dd>
-                 </div>
-               ) : null}
                {buildMetrics?.diskSpace ? (
                  <div>
                    <dt>Disk space left</dt>
@@ -12149,7 +12415,7 @@ export function App() {
             <div><dt>Shared</dt><dd>{formatBytes(storageOperation.sharedBytes)}</dd></div>
             <div><dt>Physical added</dt><dd>{formatBytes(storageOperation.physicalBytesAdded)}</dd></div>
             <div><dt>Rate</dt><dd>{formatBytes(storageOperation.bytesPerSecond)}/s</dd></div>
-            <div><dt>ETA</dt><dd>{storageOperation.etaMs === undefined ? "—" : `${Math.max(0, Math.ceil(storageOperation.etaMs / 1_000))}s`}</dd></div>
+            <StorageOperationTiming operation={storageOperation} />
             {storageOperation.diskSpace ? (
               <div>
                 <dt>Disk after operation</dt>
@@ -12187,11 +12453,7 @@ export function App() {
         </aside>
       ) : null}
       {toast ? (
-        <div className="toast" role="status">
-          <span><Icon name="check" size={15} /></span>
-          <p className="toast__message">{toast}</p>
-          <button onClick={() => setToast("")} aria-label="Dismiss"><Icon name="close" size={14} /></button>
-        </div>
+        <ToastNotice key={toast.id} text={toast.text} onDismiss={() => setToast(current => current?.id === toast.id ? null : current)} />
       ) : null}
     </div>
   );

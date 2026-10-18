@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
@@ -340,6 +341,12 @@ def snapshot_required_bytes(
         (source / filename).stat().st_size
         for filename in ("brain.json", "core.safetensors", "plasticity.safetensors")
     )
+    from .app_observation_audit import app_observation_audit_snapshot_files
+    total += sum(path.stat().st_size for path in app_observation_audit_snapshot_files(source, metadata).values())
+    from .whole_brain_catalog import iter_catalog_files, iter_catalog_lineage_files
+    for iterator in (iter_catalog_files, iter_catalog_lineage_files):
+        total += sum(size for _relative, size, _sha in iterator(
+            source, metadata, admit=lambda _size, _label: None))
     substrate = metadata.get("substrate")
     pointer = (
         substrate.get("persistence")
@@ -414,6 +421,28 @@ def snapshot_required_bytes(
         total += conversation.stat().st_size
     from .registered_geometry_holdouts import registered_geometry_snapshot_files
     total += sum(path.stat().st_size for path in registered_geometry_snapshot_files(source).values())
+    from .connected_execution import execution_checkpoint_snapshot_entries, connected_execution_snapshot_entries
+    total += sum(path.stat().st_size for _name, path, _sha in execution_checkpoint_snapshot_entries(source))
+    total += sum(path.stat().st_size for _name, path, _sha in connected_execution_snapshot_entries(source))
+    if metadata.get("connected_regions") is not None:
+        from .full_merge import connected_graph_snapshot_entries, connected_input_snapshot_required_bytes
+        total += connected_input_snapshot_required_bytes(source)
+        for _relative, value, _expected in connected_graph_snapshot_entries(source, metadata.get("connected_graph_states")):
+            total += len(value) if isinstance(value, bytes) else value.stat().st_size
+        runtime = source / "connected-runtime.sqlite3"
+        if runtime.is_symlink() or not runtime.is_file():
+            raise ValueError("connected snapshot runtime provenance is missing or unsafe")
+        total += runtime.stat().st_size
+        wal = source / "connected-runtime.sqlite3-wal"
+        if wal.exists():
+            if wal.is_symlink() or not wal.is_file():
+                raise ValueError("connected runtime journal is unsafe")
+            total += wal.stat().st_size
+        marker = source / "connected-origin.json"
+        if marker.exists():
+            if marker.is_symlink() or not marker.is_file():
+                raise ValueError("connected origin marker is unsafe")
+            total += marker.stat().st_size
     return max(0, int(total))
 
 
@@ -467,6 +496,59 @@ def snapshot_files(source: Path, destination: Path, *, resource_policy=None) -> 
     conversation = source / "conversation.sqlite3"
     if conversation.is_file() and not conversation.is_symlink():
         shutil.copy2(str(conversation), str(destination / "conversation.sqlite3"))
+    metadata = read_json(source / "brain.json")
+    from .app_observation_audit import copy_app_observation_audit_snapshot
+    copy_app_observation_audit_snapshot(source, destination, metadata, policy=resource_policy)
+    from .whole_brain_catalog import iter_catalog_files, iter_catalog_lineage_files
+    for iterator in (iter_catalog_files, iter_catalog_lineage_files):
+        for relative, size, expected in iterator(
+                source, metadata, admit=lambda _size, _label: None):
+            source_path = _safe_relative(source, relative)
+            target = _safe_relative(destination, relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if resource_policy is not None:
+                resource_policy.require_disk(size + 65536, "whole-brain inspection catalog snapshot closure")
+            shutil.copy2(source_path, target)
+            if target.stat().st_size != size or _file_sha256(target) != expected:
+                raise ValueError("whole-brain catalog snapshot closure changed while copying")
+    from .connected_execution import execution_checkpoint_snapshot_entries, connected_execution_snapshot_entries
+    from .execution_state_codec import file_digest
+    from itertools import chain
+    for name, path, expected in chain(execution_checkpoint_snapshot_entries(source), connected_execution_snapshot_entries(source)):
+        target = _safe_relative(destination, name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if resource_policy is not None:
+            resource_policy.require_disk(path.stat().st_size + 65536, "exact native execution snapshot closure")
+        shutil.copy2(path, target)
+        if file_digest(target) != expected:
+            raise ValueError("native execution snapshot closure lost an authenticated file")
+    if metadata.get("connected_regions") is not None:
+        from .full_merge import copy_connected_graph_snapshot, copy_connected_inputs
+        copy_connected_inputs(source, destination, resource_policy=resource_policy)
+        reserve = resource_policy.require_disk if resource_policy is not None else None
+        copy_connected_graph_snapshot(source.parent, metadata.get("connected_graph_states"), destination,
+            source_engine=source, reserve=reserve)
+        runtime = source / "connected-runtime.sqlite3"
+        if runtime.is_symlink() or not runtime.is_file():
+            raise ValueError("connected snapshot runtime provenance is missing or unsafe")
+        target = destination / runtime.name
+        with closing(sqlite3.connect(runtime.resolve().as_uri() + "?mode=ro", uri=True)) as reader, \
+             closing(sqlite3.connect(target)) as writer:
+            if reader.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("connected runtime provenance is corrupt")
+            page_size = int(reader.execute("PRAGMA page_size").fetchone()[0])
+            def progress(_status, remaining, _pages):
+                if reserve is not None:
+                    reserve(remaining * page_size + 65536, "connected runtime snapshot")
+            reader.backup(writer, pages=128, progress=progress)
+            writer.execute("PRAGMA journal_mode=DELETE")
+            if writer.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("connected runtime snapshot is corrupt")
+        marker = source / "connected-origin.json"
+        if marker.exists():
+            if marker.is_symlink() or not marker.is_file():
+                raise ValueError("connected origin marker is unsafe")
+            shutil.copy2(marker, destination / marker.name)
 
 
 class EventLog:

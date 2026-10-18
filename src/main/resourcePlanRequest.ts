@@ -1,4 +1,5 @@
 import type { WorkingMemoryPlanRequest } from "../shared/types";
+import { validateDeviceResourceSettings } from "./deviceResourcePlan";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -13,6 +14,7 @@ export function requireWorkingMemoryPlanRequest(
 ): WorkingMemoryPlanRequest {
   if (
     !isRecord(value) ||
+    (value.spillPoolSelectionId !== undefined && (typeof value.spillPoolSelectionId !== "string" || !/^[a-zA-Z0-9-]{1,128}$/.test(value.spillPoolSelectionId))) ||
     (value.brainId !== undefined && (typeof value.brainId !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value.brainId))) ||
     !["auto", "extended", "manual"].includes(String(value.mode)) ||
     (value.hardwareTier !== undefined &&
@@ -43,6 +45,8 @@ export function requireWorkingMemoryPlanRequest(
   }
 
   return {
+    ...(value.spillPoolSelectionId !== undefined ? { spillPoolSelectionId: value.spillPoolSelectionId as string } : {}),
+    ...(value.deviceResources !== undefined ? { deviceResources: validateDeviceResourceSettings(value.deviceResources) } : {}),
     mode: value.mode as WorkingMemoryPlanRequest["mode"],
     ...(value.brainId !== undefined ? { brainId: value.brainId as string } : {}),
     hardwareTier:

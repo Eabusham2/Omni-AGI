@@ -24,7 +24,7 @@ import uuid
 import wave
 import zipfile
 import zlib
-from contextlib import nullcontext, ExitStack
+from contextlib import contextmanager, nullcontext, ExitStack
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -47,12 +47,23 @@ from .committed_paged_cache import (
     prepare_committed_paged_cache,
 )
 from .config import OmniConfig, safe_rounded_storage_bytes_per_second
-from .router_state_paging import RouterStatePager
+from .connected_capabilities import preserve_connected_feature_activity
+from .whole_path_scheduler import owned_memory_effect
+from .outer_learning_pipeline import outer_learning_phase, note_learning_commit
+from .reply_execution_planner import owned_reply, reply_stage
+from .router_state_paging import RouterStatePager, MIN_ROUTER_TILE_BYTES
 from .native_action_protocol import (
     NativeActionEmissionLedger,
     observed_argument_schema,
     structural_schema,
     validate_structural_value,
+)
+from .ponder_self_report import (
+    PRIVATE_CANDIDATE as PONDER_REPORT_CANDIDATE,
+    PUBLIC_REPORT as PONDER_PUBLIC_REPORT,
+    decode_ponder_self_report,
+    emit_registered_action,
+    finalize_registered_action,
 )
 from .architecture_migration import normalize_architecture_change
 from .chat_steering import generation_completion, mark_interrupted_turn, mark_no_reply_turn, validate_no_reply_turn
@@ -111,6 +122,7 @@ from .joint_generation import (
 )
 from .distributed_seal import validate_distributed_training_seal
 from .liquid import LiquidController
+from .generation_cursor import NativeGenerationSuspended
 from .memory_lifecycle import OrganicMemoryLifecycle
 from .recent_token_activity import RecentTokenActivity
 from .modalities import (
@@ -118,6 +130,12 @@ from .modalities import (
     ModalityGenerationCancelled,
     ModalityHub,
 )
+from .media_canvas import MediaCanvasView, create_media_canvas, media_storage_lifetime
+from .media_randomness import media_transfer
+from .media_streaming_codec import (EncodedMediaFile, encode_png_file, encode_wav_file, encode_mp4_file,
+    payload_sha256, write_media_payload)
+from .media_artifact_operation import (measured_media_artifact, media_artifact_directory, media_resource_pause,
+    observe_media_preview, observe_media_output)
 from .media_planning import (
     MediaGenerationMeasurements,
     MediaOutputRequest,
@@ -169,7 +187,7 @@ from .persistence import (
     snapshot_files,
     tensor_checksum,
 )
-from .spiking import AssociativeSpikingRouter
+from .spiking import AssociativeSpikingRouter, STDPSynapses
 from .sparse_router_state import canonical_module_walk
 from .ternary_packing import (
     collect_module_ternary_tensors,
@@ -352,6 +370,9 @@ class AdaptiveBrain:
         config: OmniConfig,
         *,
         _loading_checkpoint: bool = False,
+        _connected_descriptor: Optional[Mapping[str, Any]] = None,
+        _connected_graph_states: Optional[Mapping[str, Any]] = None,
+        _connected_cancelled: Optional[Callable[[], bool]] = None,
     ):
         # Native OmniCortex keeps eligible learned synapses in packed ternary
         # storage while higher-precision activity and control state remain
@@ -373,6 +394,18 @@ class AdaptiveBrain:
             self.engine_path / "state" / "live-substrate-cache" / uuid.uuid4().hex
         )
         self.config = config
+        self._connected_regions = None
+        self._regional_execution = None  # Process-local only; never restored/auto-armed.
+        self._decoder_execution = None
+        self._decoder_execution_session = uuid.uuid4().hex
+        self._cached_decoder_execution = None
+        self._cached_decoder_execution_session = uuid.uuid4().hex
+        self._native_operation_auto = None
+        self._native_operation_auto_session = uuid.uuid4().hex
+        self._connected_graph_states = copy.deepcopy(_connected_graph_states)
+        self.connected_runtime_adoption = None
+        self.connected_pending_ingestions = []
+        self.connected_executions = None
         self.resource_policy = ResourcePolicy(
             self.engine_path,
             ram_reserve_bytes=config.ram_reserve_bytes,
@@ -382,6 +415,7 @@ class AdaptiveBrain:
             hardware_tier=config.hardware_tier,
             shared_resource_owner_id=self.brain_id,
             shared_storage_pool_bytes=config.storage_pool_bytes,
+            device_resource_settings=config.device_resource_settings,
         )
         self.state_store = MutableStateStore(
             self.engine_path / "state", self.brain_id, self.resource_policy
@@ -429,6 +463,7 @@ class AdaptiveBrain:
             self.device_backend = "mps"
         else:
             self.device = torch.device("cpu")
+        self.resource_policy.execution_device = str(self.device)
         self._native_preferred_device = self.device
         self._native_preferred_backend = self.device_backend
         self._native_backend_last_changed = 0.0
@@ -465,6 +500,7 @@ class AdaptiveBrain:
                 or isinstance(free, int) and known["routerNonweightTensorBytes"] + known["maximumProjectionBytes"] > free // 2):
                 self.device = torch.device("cpu")
                 self.device_backend = "cpu"
+                self.resource_policy.execution_device = "cpu"
                 self._native_backend_residency.update({
                     "actualBackend": "cpu", "cpuFallback": True,
                     "reason": "bounded-checkpoint-cpu-staging" if _loading_checkpoint else "initial-accelerator-packed-admission",
@@ -473,6 +509,8 @@ class AdaptiveBrain:
                 initial_core_budget = core_budget_provider({})
 
         def reserve_core_admission(byte_count: int, device: torch.device) -> None:
+            if device.type != "cpu":
+                self.resource_policy.require_device(device, byte_count, "native packed device allocation")
             # CUDA has separate physical storage; MPS and DirectML must also
             # stay inside the process-wide host envelope. Activation/KV owners
             # reserve their own working set separately from packed synapses.
@@ -485,7 +523,8 @@ class AdaptiveBrain:
                 ))
             estimated_host = int(byte_count) if device.type != "cuda" else 0
             status = self.resource_policy.status(estimated_ram_bytes=estimated_host)
-            free = status.get("acceleratorFreeMemoryBytes")
+            from .regional_execution import current_regional_target
+            free = None if current_regional_target(self.resource_policy) is not None else status.get("acceleratorFreeMemoryBytes")
             if status["memoryPressure"] or (
                 device.type != "cpu" and isinstance(free, int) and byte_count > max(0, free // 2)
             ):
@@ -519,7 +558,20 @@ class AdaptiveBrain:
             budget_provider=self._router_state_budget,
         )
         with self.core_pager.construction(from_checkpoint=_loading_checkpoint):
-            self.decoder = OmniDecoder(config).to(self.device)
+            if _connected_descriptor is not None:
+                from .full_merge import load_connected_regions
+                self._connected_regions = load_connected_regions(
+                    self.storage_path, _connected_descriptor, config,
+                    core_pager=self.core_pager, router_pager=self.router_state_pager,
+                    resource_policy=self.resource_policy,
+                    growth_guard=self._allow_substrate_growth,
+                    graph_states=_connected_graph_states,
+                    cancelled=_connected_cancelled,
+                    restoring_checkpoint=_loading_checkpoint,
+                )
+                self.decoder = self._connected_regions.decoder.to(self.device)
+            else:
+                self.decoder = OmniDecoder(config).to(self.device)
             self.memory_bridge = BitLinear(config.vsa_dim, config.idea_dim, bias=True).to(
                 self.device
             )
@@ -555,12 +607,17 @@ class AdaptiveBrain:
                 mode=config.liquid_mode,
                 solver_steps=config.liquid_steps,
             ).to(self.device)
-            self.modalities = ModalityHub(config).to(self.device)
+            self.modalities = (
+                self._connected_regions.modalities if self._connected_regions is not None
+                else ModalityHub(config)
+            ).to(self.device)
         self.core_pager.bind_names((
             ("decoder.", self.decoder), ("memory_bridge.", self.memory_bridge),
             ("idea_adapter.", self.idea_adapter), ("router.", self.router),
             ("liquid.", self.liquid), ("modalities.", self.modalities),
         ))
+        if self._connected_regions is not None and not _loading_checkpoint:
+            self.core_pager.finish_load()
         self._configure_working_attention_resources()
         for root_module in (
             self.decoder,
@@ -640,6 +697,12 @@ class AdaptiveBrain:
         self.distributed_training_seal: Optional[Dict[str, Any]] = None
         self.completed_chat_turns: List[Dict[str, Any]] = []
         self.accepted_chat_inputs: List[Dict[str, Any]] = []
+        # Only one native reviewed-App head; immutable review history is host
+        # owned. This frontier publishes atomically with its neural state.
+        self.app_observation_frontier: Optional[Dict[str, Any]] = None
+        # Exact reviewed sparse import ACK, published with the normal atomic
+        # neural generation. Host history archives older heads separately.
+        self.sparse_transfer_head: Optional[Dict[str, Any]] = None
         # Every accepted turn enters fast episodic neural state. Slow replay
         # jobs are checkpointed beside that state so cortical consolidation
         # can be preempted/retried without loss or duplicate optimizer steps.
@@ -673,6 +736,7 @@ class AdaptiveBrain:
             "video": 0,
         }
         self.installed_modality_packs: List[Dict[str, Any]] = []
+        self.supplementary_capability_receipts: Dict[str, Any] = {}
         # Every build uses the native, randomly initialized core.
         self.ground_up_training_manifest: Optional[Dict[str, Any]] = None
         self.geometry_holdout_registration: Optional[Dict[str, Any]] = None
@@ -684,7 +748,13 @@ class AdaptiveBrain:
         self._ground_up_action_origin_verified = False
         self.novelty_streak = 0
         self.growth_pause: Optional[Dict[str, Any]] = None
-        self.last_activity_decay = time.time()
+        from .activity_clock import ActivityClock
+        self.activity_clock = ActivityClock()
+        if not _loading_checkpoint:
+            from .working_activity import checkpoint_wall_time
+            self.paged_working_memory.bind_activity_clock(lambda: self._owned_activity_clock().now(),
+                checkpoint_wall_at=checkpoint_wall_time(self.updated_at))
+        self.last_activity_decay = self.activity_clock.now()
         self.last_idle_cycle_at = 0.0
         # Prompt-free recurrent activity may run frequently, but surfacing an
         # unsolicited message or external action every cycle is not organic
@@ -708,7 +778,10 @@ class AdaptiveBrain:
         device = self.device if device is None else device
         readings = self.resource_policy.status()
         heap = max(0, int(paging.get("cpuHeapBytes") or 0))
-        admitted = max(0, int(paging.get("acceleratorAdmittedBytes") or 0))
+        from .regional_execution import canonical_device
+        by_device = paging.get("acceleratorAdmittedByDevice")
+        admitted = (max(0, int(by_device.get(canonical_device(device), 0))) if isinstance(by_device, dict)
+                    else max(0, int(paging.get("acceleratorAdmittedBytes") or 0)))
         budget = shared_native_residency_budget(
             readings, baseline_bytes=self._native_residency_baseline_bytes,
             current_core_heap_bytes=heap,
@@ -725,6 +798,9 @@ class AdaptiveBrain:
         budget["sharedCorePartitionBytes"] = budget["corePartitionBytes"]
         budget["corePartitionBytes"] -= router_reserve
         budget["liveCoreHotBytes"] = min(budget["liveCoreHotBytes"], budget["corePartitionBytes"])
+        if getattr(getattr(self, "_regional_execution", None), "active", False) and isinstance(by_device, dict):
+            unified = sum(int(value) for name, value in by_device.items() if not name.startswith("cuda:"))
+            budget["liveCoreHotBytes"] = min(budget["liveCoreHotBytes"], max(0, budget["corePartitionBytes"] - unified))
         free = readings.get("acceleratorFreeMemoryBytes")
         total = readings.get("acceleratorTotalMemoryBytes")
         if device.type == "cuda" and isinstance(free, int):
@@ -740,17 +816,263 @@ class AdaptiveBrain:
                 hot = min(hot, int(self.config.training_accelerator_budget_bytes) * 55 // 100)
         else:
             hot = 0
+        select_budget = getattr(self.resource_policy, "device_budget", None)
+        selected_device = select_budget(device, readings) if callable(select_budget) else None
+        if selected_device is not None:
+            if device.type == "cpu" and not selected_device["enabled"]:
+                budget["liveCoreHotBytes"] = 0
+            elif device.type != "cpu":
+                hot = min(max(0, int(selected_device["liveCeilingBytes"]) * 55 // 100),
+                          max(0, int(selected_device["remainingBytes"])) + admitted)
+            budget["selectedDeviceBudget"] = selected_device
         budget["acceleratorCoreHotBytes"] = max(0, int(hot))
         return budget
+
+    def _regional_quiescent(self) -> None:
+        from .connected_execution import require_joint_mutation_allowed
+        require_joint_mutation_allowed(self, operation="regional device reconfiguration")
+        status = self.core_pager.status()
+        activity = getattr(self, "working_attention_pager", None)
+        if (status["pinnedOwners"] or any(getattr(module, "_online_transaction", None) is not None
+                for root in self._trainable_modules() for module in root.modules())
+                or activity is not None and (activity.status().get("livePages", 0) or activity.status().get("ownedSpillBytes", 0))):
+            raise NeuralStateResourcePause("regional review/device change awaits live cache, pins or training transaction; context was not cleared",
+                                           {"paused": True, "regionalExecutionBoundaryRequired": True})
+
+    def _regional_policy_sha(self) -> str:
+        from .regional_execution import canonical_sha
+        return canonical_sha({"ownerId": self.brain_id, "resourcePolicyInstance": str(id(self.resource_policy)),
+            "deviceSettings": self.config.device_resource_settings,
+            "systemRamBudgetBytes": self.resource_policy.status().get("systemRamBudgetBytes"),
+            "trainingAcceleratorBudgetBytes": self.config.training_accelerator_budget_bytes})
+
+    def _regional_topology(self):
+        manager = self.resource_policy.device_resources
+        if manager is not None:
+            return manager.topology()
+        from .device_topology import collect_device_topology
+        return collect_device_topology(policy=self.resource_policy, torch_module=torch)
+
+    def _regional_describe(self, module):
+        from .packed_connections import PackedContactPage
+        owners = [(child, self.core_pager._owners.get(child)) for child in module.modules()]
+        owners = [(child, owner) for child, owner in owners if owner is not None]
+        sizes = [(child, self.core_pager._owner_bytes(owner)) for child, owner in owners]
+        return {"dimensions": int(module.attention.n_heads * module.attention.head_dim),
+            "heads": int(module.attention.n_heads), "feedForward": int(module.feed_forward.down.in_features),
+            "packedOwners": len(sizes), "packedOwnerBytes": sum(size for _child, size in sizes),
+            "maximumPackedOwnerBytes": max((size for _child, size in sizes), default=0),
+            "maximumDevicePackedOwnerBytes": max((size for child, size in sizes if not isinstance(child, PackedContactPage)), default=0)}
+
+    def _regional_packed_limits(self, paging):
+        consumer = getattr(self, "_regional_execution", None)
+        if consumer is None or not consumer.active:
+            return None
+        from .regional_execution import canonical_device
+        devices = consumer.devices()
+        current = canonical_device(self.device)
+        if current != "cpu" and current not in devices:
+            entry = next((item for item in self._regional_topology()["devices"]
+                          if canonical_device(item.get("executionDevice", "")) == current), None)
+            if entry is None:
+                raise NeuralStateResourcePause("current native device disappeared", {"paused": True})
+            devices[current] = entry["memoryGroupId"]
+        return {name: {"memoryGroupId": group, "hotBytes": int(self._native_core_budget_for_device(paging, torch.device(name))["acceleratorCoreHotBytes"])}
+                for name, group in devices.items() if name != "cpu"}
+
+    @contextmanager
+    def _regional_transfer_reservation(self, destination, size, label):
+        device = torch.device(destination)
+        self.resource_policy.require_device(device, int(size), label)
+        reservation = (self.resource_policy.reserve_ram(int(size), label) if device.type != "cuda" else nullcontext())
+        with reservation as held:
+            yield held
+
+    def _regional_admit_compute(self, module, hidden, target, _route):
+        from .native_compute_profile import native_projection_tensor_budget
+        from .regional_execution import canonical_device
+        descriptor = self._regional_describe(module)
+        width, ff = descriptor["dimensions"], descriptor["feedForward"]
+        samples = max(1, int(hidden.numel()) // width)
+        needed = max(native_projection_tensor_budget(samples, first, second)["forwardTensorReserveBytes"]
+                     for first, second in ((width, width * 3), (width, ff * 2), (ff, width)))
+        needed += int(hidden.numel() * hidden.element_size()) * 4 + 16  # residuals +derived gain indices
+        limits = self._regional_packed_limits(self.core_pager.status())
+        if canonical_device(target) != "cpu" and (limits is None or canonical_device(target) not in limits
+                or descriptor["maximumDevicePackedOwnerBytes"] > limits[canonical_device(target)]["hotBytes"]):
+            raise NeuralStateResourcePause("regional packed owner exceeds its selected device hot budget", {"paused": True, "region": descriptor})
+        self.working_attention_pager.admit_compute(needed, "regional decoder forward working tensors", device=torch.device(target))
+
+    def _regional_validate_route(self, route):
+        budget = self.resource_policy.device_budget(torch.device(route["executionDevice"]), fresh=True)
+        if budget is None or not budget["enabled"] or not budget["capacityMeasured"]:
+            raise NeuralStateResourcePause("regional route awaits its measured enabled allocation", {"paused": True, "deviceBudget": budget})
+
+    def _regional_consumer(self):
+        from .regional_execution import RegionalExecutionConsumer, bind_regional_blocks
+        from .model import DecoderBlock
+        consumer = getattr(self, "_regional_execution", None)
+        if consumer is None:
+            consumer = RegionalExecutionConsumer(owner_id=self.brain_id,
+                settings=lambda: copy.deepcopy((self.config.device_resource_settings or {}).get("regionalExecution",
+                    {"version": 1, "enabled": False, "mode": "manual", "routes": []})),
+                policy_identity=lambda: self.resource_policy, policy_sha=self._regional_policy_sha,
+                topology=self._regional_topology, quiescent=self._regional_quiescent, describe=self._regional_describe,
+                tensor_bytes=lambda value: int(value.numel() * value.element_size()), tensor_device=lambda value: str(value.device),
+                transfer=lambda value, destination: value.to(device=torch.device(destination), non_blocking=False),
+                reserve_transfer=self._regional_transfer_reservation, admit_compute=self._regional_admit_compute,
+                training=lambda module: module.training or torch.is_grad_enabled(),
+                cancelled=lambda: bool(callable(getattr(self.working_attention_pager, "_cancelled", None)) and self.working_attention_pager._cancelled()),
+                validate_route=self._regional_validate_route)
+            self._regional_execution = consumer
+            self.core_pager.regional_device_budget_provider = self._regional_packed_limits
+        if self.resource_policy.device_resources is not None:
+            self.resource_policy.device_resources.regional_execution_provider = consumer.status
+        bind_regional_blocks(consumer, (("decoder." + name, module) for name, module in self.decoder.named_modules() if isinstance(module, DecoderBlock)))
+        self.core_pager.regional_execution_epoch = consumer.status()["epoch"]
+        return consumer
+
+    def regional_execution_prepare(self, *, start=0, count=64, topology=None):
+        return self._regional_consumer().prepare(start=start, count=count, topology=topology)
+
+    def regional_execution_status(self):
+        return self._regional_consumer().status()
+
+    def regional_execution_activate(self, reviewed):
+        operation_auto = getattr(self, "_native_operation_auto", None)
+        if operation_auto is not None and operation_auto.status()["phase"] in {"prepared", "awaiting-operation", "qualifying", "active"}:
+            raise RuntimeError("Stop the distinct perception Auto policy before manual regional activation")
+        consumer = self._regional_consumer()
+        result = consumer.activate(reviewed)
+        self.core_pager.regional_execution_epoch = result["epoch"]
+        try:
+            self.core_pager.refresh_budget(force=True)
+        except BaseException:
+            consumer.retire("activation-device-budget-refused")
+            self.core_pager.regional_execution_epoch = None
+            raise
+        return result
+
+    def regional_execution_deactivate(self, *, epoch=None, reason="explicitly-deactivated"):
+        consumer = self._regional_consumer()
+        result = consumer.retire(reason, expected_epoch=epoch)
+        self.core_pager.regional_execution_epoch = None
+        self.core_pager.flush()
+        self.core_pager.refresh_budget(force=True)
+        return result
+
+    def _decoder_execution_controller(self):
+        value = getattr(self, "_decoder_execution", None)
+        if value is None:
+            from .decoder_execution_native import create_decoder_execution
+            value = self._decoder_execution = create_decoder_execution(self)
+        return value
+
+    def decoder_execution_capture_next(self, *, acknowledge_cuda=False):
+        self._require_no_perception_auto_policy()
+        cached = getattr(self, "_cached_decoder_execution", None)
+        if cached is not None and cached.status()["phase"] in {"prepared", "awaiting-retained-frontier", "calibrating"}:
+            raise RuntimeError("finish or stop the separate cached-step review before isolated-prefill capture")
+        return self._decoder_execution_controller().capture_next(acknowledge_cuda=acknowledge_cuda)
+
+    def decoder_execution_prepare(self, *, topology=None):
+        return self._decoder_execution_controller().prepare(topology=topology)
+
+    def decoder_execution_calibrate(self, *, operation_id, reviewed, samples_per_candidate=3):
+        return self._decoder_execution_controller().calibrate(operation_id=operation_id, reviewed=reviewed,
+            samples_per_candidate=samples_per_candidate)
+
+    def decoder_execution_apply(self, *, proposal_id, proposal_sha256):
+        return self._decoder_execution_controller().apply(proposal_id=proposal_id, proposal_sha256=proposal_sha256)
+
+    def decoder_execution_status(self):
+        value = getattr(self, "_decoder_execution", None)
+        if value is not None:
+            return value.status()
+        # Metadata only, also safe on the control lane before capture is armed.
+        from .decoder_path_execution import DecoderPathExecution
+        return DecoderPathExecution(self.brain_id, None,
+            owner_session=self._decoder_execution_session).status()
+
+    def decoder_execution_stop(self, *, operation_id=None):
+        value = getattr(self, "_decoder_execution", None)
+        return self.decoder_execution_status() if value is None else value.stop(operation_id=operation_id)
+
+    def decoder_execution_release_stopped(self, *, operation_id=None):
+        value = getattr(self, "_decoder_execution", None)
+        return self.decoder_execution_status() if value is None else value.release_stopped(operation_id=operation_id)
+
+    def _cached_execution_controller(self):
+        value = getattr(self, "_cached_decoder_execution", None)
+        if value is None:
+            from .cached_decoder_native import create_cached_decoder_execution
+            value = self._cached_decoder_execution = create_cached_decoder_execution(self)
+        return value
+
+    def cached_decoder_execution_prepare(self, *, topology=None, acknowledge_cuda=False):
+        self._require_no_perception_auto_policy()
+        return self._cached_execution_controller().prepare(topology=topology, acknowledge_cuda=acknowledge_cuda)
+
+    def cached_decoder_execution_arm(self, *, operation_id, reviewed, samples=3):
+        return self._cached_execution_controller().arm(operation_id=operation_id, reviewed=reviewed, samples=samples)
+
+    def cached_decoder_execution_status(self):
+        value = getattr(self, "_cached_decoder_execution", None)
+        if value is not None: return value.status()
+        from .cached_decoder_execution import CachedDecoderExecution
+        return CachedDecoderExecution(self.brain_id, None, owner_session=self._cached_decoder_execution_session).status()
+
+    def cached_decoder_execution_stop(self, *, operation_id=None):
+        value = getattr(self, "_cached_decoder_execution", None)
+        return self.cached_decoder_execution_status() if value is None else value.stop(operation_id=operation_id)
+
+    def _require_no_perception_auto_policy(self):
+        value = getattr(self, "_native_operation_auto", None)
+        if value is not None and value.status()["phase"] in {"prepared", "awaiting-operation", "qualifying", "active"}:
+            raise RuntimeError("Stop the separate perception Auto policy before reviewing another placement")
+
+    def _native_operation_auto_controller(self):
+        value = getattr(self, "_native_operation_auto", None)
+        if value is None:
+            from .operation_auto_native import create_native_operation_auto
+            value = self._native_operation_auto = create_native_operation_auto(self)
+        return value
+
+    def native_operation_auto_prepare(self, *, topology=None, acknowledge_cuda=False):
+        return self._native_operation_auto_controller().prepare(topology=topology, acknowledge_cuda=acknowledge_cuda)
+
+    def native_operation_auto_arm(self, *, operation_id, reviewed, samples=3):
+        return self._native_operation_auto_controller().arm(operation_id=operation_id, reviewed=reviewed, samples=samples)
+
+    def native_operation_auto_status(self):
+        value = getattr(self, "_native_operation_auto", None)
+        if value is not None: return value.status()
+        from .operation_auto_policy import OperationAutoPolicy
+        return OperationAutoPolicy(self.brain_id, None, owner_session=self._native_operation_auto_session).status()
+
+    def native_operation_auto_stop(self, *, operation_id=None):
+        value = getattr(self, "_native_operation_auto", None)
+        return self.native_operation_auto_status() if value is None else value.stop(operation_id=operation_id)
+
+    def native_operation_auto_plans(self, *, after=None, limit=32):
+        value = getattr(self, "_native_operation_auto", None)
+        if value is None:
+            from .operation_auto_policy import OperationAutoPolicy
+            value = OperationAutoPolicy(self.brain_id, None, owner_session=self._native_operation_auto_session)
+        return value.plans(after=after, limit=limit)
+
+    def native_operation_auto_release_stopped(self, *, operation_id=None):
+        value = getattr(self, "_native_operation_auto", None)
+        return self.native_operation_auto_status() if value is None else value.release_stopped(operation_id=operation_id)
 
     def _router_state_budget(self, paging: Mapping[str, Any]) -> Dict[str, int]:
         budget = self._native_core_budget_for_device(self.core_pager.status())
         available = max(0, int(self.resource_policy.status().get("availableSafeRamBytes") or 0))
         owned = int(paging.get("cpuHeapBytes", 0)) + int(paging.get("mappedHotRetainedBytesEstimate", 0))
         transfer = max(0, int(budget["trainingTransferPartitionBytes"]))
-        if transfer < 1408:
-            raise NeuralStateResourcePause("one exact recurrent tile requires physical scratch RAM", {"requiredBytes": 1408})
-        tile = min(4 * 1024 * 1024, transfer // 2 if transfer >= 2816 else transfer)
+        if transfer < MIN_ROUTER_TILE_BYTES:
+            raise NeuralStateResourcePause("one exact recurrent tile requires physical scratch RAM", {"requiredBytes": MIN_ROUTER_TILE_BYTES})
+        tile = min(4 * 1024 * 1024, transfer // 2 if transfer >= 2*MIN_ROUTER_TILE_BYTES else transfer)
         return {"hotBytes": min(budget["routerCoreReservationBytes"], available + owned),
                 "tileBytes": tile, "journalRamBytes": max(0, transfer - tile)}
 
@@ -782,13 +1104,16 @@ class AdaptiveBrain:
             return value if all(updated[key] is item for key, item in value.items()) else updated
         return value
 
-    def prepare_native_execution(self, *, operation: str, quiescent: bool = False) -> Dict[str, Any]:
+    def prepare_native_execution(self, *, operation: str, quiescent: bool = False,
+                                 reviewed_target=None, acknowledge_packed_cpu_fallback=False) -> Dict[str, Any]:
         """Switch the SAME packed brain only before a top-level operation.
 
         Worker dispatch/creation supplies the quiescent boundary; no layer,
         token, active saved graph or online transaction can invoke this switch.
         CPU exact packed bytes and immutable checkpoint identity are preserved.
         """
+        if getattr(self, "_native_execution_restore_required", False):
+            raise NeuralStateResourcePause("native placement restore failed; explicit Unload is required before more neural work", {"paused": True})
         status = self.core_pager.status()
         if not quiescent or status["pinnedOwners"] or any(
             getattr(module, "_online_transaction", None) is not None
@@ -812,20 +1137,47 @@ class AdaptiveBrain:
         if activity is not None and activity.status().get("livePages", 0):
             # A retained inference cache/graph has its own job lifetime. The
             # caller must release it; moving its model beneath it is unsafe.
+            if reviewed_target is not None:
+                raise NeuralStateResourcePause("reviewed placement cannot move beneath live activity handles", {"paused": True})
             return {**self._native_backend_residency, "migrationDeferred": "live-working-activity-handles"}
+        if getattr(getattr(self, "_regional_execution", None), "active", False):
+            self._regional_consumer()  # Revalidate exact registry after permitted growth.
+            if self._regional_execution.active:
+                if reviewed_target is not None:
+                    raise NeuralStateResourcePause("reviewed whole-decoder placement cannot replace a manual regional lease", {"paused": True})
+                self.core_pager.refresh_budget(force=True)
+                return {**self._native_backend_residency, "operation": operation,
+                        "migrationDeferred": "explicit-manual-regional-lease", "regionalExecution": self._regional_execution.status()}
         preferred = self._native_preferred_device
         preferred_backend = self._native_preferred_backend
+        if reviewed_target is not None:
+            from .regional_execution import canonical_device
+            name = canonical_device(reviewed_target)
+            if name != "cpu" and name != "mps" and not (name.startswith("cuda:") and name[5:].isdigit()):
+                raise ValueError("reviewed native target is unavailable/unsupported")
+            if name.startswith("cuda:") and acknowledge_packed_cpu_fallback is not True:
+                raise ValueError("CUDA route requires explicit packed-CPU-tile fallback acknowledgment")
+            preferred = torch.device(name)
+            preferred_backend = preferred.type
+            admitted = self.resource_policy.device_budget(preferred, fresh=True)
+            if admitted is None or not admitted["enabled"] or not admitted["capacityMeasured"]:
+                raise NeuralStateResourcePause("reviewed target lacks its current measured enabled allocation", {"paused": True})
         budget = self._native_core_budget_for_device(status, preferred)
         largest = int(status["maximumPackedOwnerBytes"])
         limit = int(budget["acceleratorCoreHotBytes"])
         target, backend = self.device, self.device_backend
         reason = "current-backend-admitted"
-        if preferred.type != "cpu" and largest > limit:
+        if reviewed_target is not None:
+            if preferred.type != "cpu" and largest > limit:
+                raise NeuralStateResourcePause("reviewed exact target cannot admit its largest packed owner", {"paused": True})
+            target, backend, reason = preferred, preferred_backend, "exact-reviewed-operation-local-placement"
+        elif preferred.type != "cpu" and largest > limit:
             target, backend, reason = torch.device("cpu"), "cpu", "packed-owner-exceeds-accelerator-admission"
         elif self.device.type == "cpu" and preferred.type != "cpu":
             if largest <= int(limit * 0.85) and time.monotonic() - self._native_backend_last_changed >= 30.0:
                 target, backend, reason = preferred, preferred_backend, "safe-accelerator-residency-restored"
         if target == self.device:
+            self.resource_policy.execution_device = str(self.device)
             self.core_pager.refresh_budget(force=True)
             return {**self._native_backend_residency, "operation": operation, "maximumPackedOwnerBytes": largest,
                     "acceleratorCoreBudgetBytes": limit, "migrationDeferred": None}
@@ -863,6 +1215,12 @@ class AdaptiveBrain:
             if reading.get("memoryPressure"):
                 raise NeuralStateResourcePause("exact CPU packed fallback cannot fit its physical transfer/row working set", {**reading, "paused": True})
         free = reading.get("acceleratorFreeMemoryBytes")
+        if reviewed_target is not None:
+            # The SAME current per-device/physical-group gate used by real
+            # execution, not a root accelerator's unrelated free-memory field.
+            self.resource_policy.require_device(target, transfer + (largest if target.type != "cpu" else 0),
+                                                "reviewed exact native control/packed transfer")
+            free = None
         if target.type != "cpu" and (isinstance(free, int) and transfer + largest > free // 2):
             return {**self._native_backend_residency, "migrationDeferred": "accelerator-control-transfer-headroom"}
         old_device, old_backend = self.device, self.device_backend
@@ -893,6 +1251,7 @@ class AdaptiveBrain:
                 activity.compute_device = old_device
             raise
         self._native_backend_last_changed = time.monotonic()
+        self.resource_policy.execution_device = str(self.device)
         self._native_backend_residency = {
             "requestedDevice": self.config.device, "actualBackend": backend,
             "operation": operation, "reason": reason, "cpuFallback": target.type == "cpu" and preferred.type != "cpu",
@@ -905,6 +1264,21 @@ class AdaptiveBrain:
         return dict(self._native_backend_residency)
 
     def close(self) -> None:
+        operation_auto = getattr(self, "_native_operation_auto", None)
+        if operation_auto is not None: operation_auto.close()
+        cached_execution = getattr(self, "_cached_decoder_execution", None)
+        if cached_execution is not None: cached_execution.close()
+        decoder_execution = getattr(self, "_decoder_execution", None)
+        if decoder_execution is not None:
+            decoder_execution.close()
+        regional = getattr(self, "_regional_execution", None)
+        if regional is not None:
+            regional.close()
+        from .router_spike_capture import retire_router_spike_capture
+        retire_router_spike_capture(self, "brain-closed-or-unloaded")
+        connected = getattr(self, "_connected_regions", None)
+        if connected is not None:
+            connected.close()
         router_pager = getattr(self, "router_state_pager", None)
         if router_pager is not None: router_pager.close()
         working_pager = getattr(self, "working_attention_pager", None)
@@ -916,8 +1290,10 @@ class AdaptiveBrain:
         release_recall = getattr(getattr(self, "memory", None), "release_paged_recall_scratch", None)
         if callable(release_recall):
             release_recall()
-        self.conversation.close()
-        self.events.close()
+        for name in ("conversation", "events"):
+            owner = getattr(self, name, None)
+            if owner is not None:
+                owner.close()
 
     def _working_attention_status(self) -> Dict[str, Any]:
         status = getattr(self.decoder, "working_attention_status", None)
@@ -965,6 +1341,15 @@ class AdaptiveBrain:
         scratch_capacity = max(0, disk_headroom - model_promises)
         designated_pool = max(0, int(self.config.storage_pool_bytes or 0))
         context_allowance = self.config.working_attention_scratch_budget_bytes
+        device_manager = getattr(self.resource_policy, "device_resources", None)
+        drive_settings = device_manager.settings if device_manager is not None else None
+        selected_drives = bool(drive_settings and drive_settings.get("storageDirectories"))
+        if selected_drives:
+            # Real placed leases recheck each authorized volume and the shared
+            # pool atomically. Free bytes on the checkpoint volume cannot cap
+            # attention pages which are backed on a different selected drive.
+            designated_pool = max(designated_pool, int((readings.get("sharedQuota") or {}).get("largestConfiguredPoolBytes", 0)))
+            scratch_capacity = designated_pool
         if designated_pool:
             scratch_capacity = min(scratch_capacity, designated_pool)
         if context_allowance is not None:
@@ -972,7 +1357,7 @@ class AdaptiveBrain:
         configured_scratch = int(self.config.training_scratch_budget_bytes or 0)
         if configured_scratch:
             scratch_capacity = min(scratch_capacity, configured_scratch)
-        if not self.config.disk_state_offload:
+        if not self.config.disk_state_offload or (drive_settings and not drive_settings.get("allowStorageSpill", True)):
             scratch_capacity = 0
         if old is None:
             self.working_attention_pager = WorkingAttentionPager(
@@ -999,6 +1384,7 @@ class AdaptiveBrain:
             "scratchCapacityBytes": scratch_capacity,
             "designatedStoragePoolBytes": designated_pool,
             "designatedContextAllowanceBytes": context_allowance,
+            "scratchPlacement": "selected-drives" if selected_drives else "primary-volume",
             "sharedPartition": {"corePercent": 55, "activityPercent": 30, "transferPercent": 15},
             "capacityShrunk": False,
         }
@@ -1565,7 +1951,8 @@ class AdaptiveBrain:
         allowed = None if parameters is None else {id(item) for item in parameters}
         terms: List[torch.Tensor] = []
         if not self.config.metaplasticity or self.config.slow_stability_strength <= 0:
-            return torch.zeros((), device=self.device)
+            from .training_randomness import training_execution_device
+            return torch.zeros((), device=training_execution_device(self.device))
         self._sync_stability_state()
         for name, parameter in named.items():
             if allowed is not None and id(parameter) not in allowed:
@@ -1578,7 +1965,8 @@ class AdaptiveBrain:
             )
             terms.append((importance * (parameter - anchor).pow(2)).mean())
         if not terms:
-            return torch.zeros((), device=self.device)
+            from .training_randomness import training_execution_device
+            return torch.zeros((), device=training_execution_device(self.device))
         return torch.stack(terms).mean() * self.config.slow_stability_strength
 
     def _accumulate_slow_importance(
@@ -1773,6 +2161,8 @@ class AdaptiveBrain:
                 if hasattr(child, "_pending_stability_events")
             },
             "expert_count": int(self.decoder.expert_count),
+            **({"connected_layout": self.decoder.layout()}
+               if getattr(self, "_connected_regions", None) is not None else {}),
             "counters": dict(self.counters),
             **self._recent_dialogue_snapshot(),
             "novelty_streak": int(self.novelty_streak),
@@ -1792,6 +2182,8 @@ class AdaptiveBrain:
         """Restore a chat slow mutation, including dynamic expert topology."""
 
         expected_experts = int(snapshot["expert_count"])
+        if getattr(self, "_connected_regions", None) is not None:
+            self.decoder.restore_layout(snapshot["connected_layout"])
         while self.decoder.expert_count < expected_experts:
             self.decoder.grow_expert()
         if self.decoder.expert_count > expected_experts:
@@ -1899,6 +2291,26 @@ class AdaptiveBrain:
                 "OmniCortex v3 training manifest is invalid"
             ) from error
         accounting = self.parameter_accounting()
+        initialized_core_parameters = int(accounting["mutableDenseParameters"]) - int(
+            accounting.get("nativeRepeatedConnections", 0)
+        )
+        # A fresh sparse router has zero allocated recurrent contacts. The
+        # curriculum may allocate blocks (and repeat layers) before this
+        # receipt is sealed. They are real learned connections, but were not
+        # part of the seeded initial core. Subtract the actual allocated
+        # contacts here only; their signs/strengths remain in the exact live
+        # checksum and named-tensor checks below. Do not count potential N²
+        # connectivity or exempt any learned tensor from those checks.
+        seen_recurrent_owners: set[int] = set()
+        for root in self._trainable_modules():
+            for module in root.modules():
+                if (isinstance(module, STDPSynapses)
+                        and hasattr(module, "_sparse_state")
+                        and id(module) not in seen_recurrent_owners):
+                    seen_recurrent_owners.add(id(module))
+                    initialized_core_parameters -= int(
+                        module.logical_ternary_parameter_count
+                    )
         initialization = validated.get("randomInitialization")
         architecture = validated.get("architectureScale")
         if self.config.native_architecture is not None and (
@@ -1934,7 +2346,7 @@ class AdaptiveBrain:
             != "torch-seeded-module-initialization-v1"
             or initialization.get("seed") != int(self.config.seed)
             or initialization.get("exactParameterCount")
-            != int(accounting["mutableDenseParameters"])
+            != initialized_core_parameters
             or initialization.get("parameterChecksum")
             != receipt.get("parameterChecksumBefore")
             or not isinstance(architecture, Mapping)
@@ -1946,7 +2358,7 @@ class AdaptiveBrain:
             or architecture.get("routerNeurons")
             != self.config.router_neurons
             or architecture.get("denseParameterCount")
-            != int(accounting["mutableDenseParameters"])
+            != initialized_core_parameters
             or architecture.get("growthCardinalityLimit") is not None
             or architecture.get("growthBoundary")
             != "live-resource-watermark"
@@ -2078,6 +2490,24 @@ class AdaptiveBrain:
             path.unlink()
 
     def _ground_up_origin_is_complete(self, origin: Path) -> bool:
+        connected = getattr(self, "_connected_regions", None)
+        if connected is not None:
+            from .full_merge import verify_connected_origin
+            try:
+                proof_files = ("connected-origin.json", "brain.json", "core.safetensors",
+                               "plasticity.safetensors", "packed-ternary/manifest.json")
+                signature = (str(origin.resolve()), connected.descriptor["sha256"], tuple(
+                    (name, (origin / name).stat().st_ino, (origin / name).stat().st_size,
+                     (origin / name).stat().st_mtime_ns) for name in proof_files))
+                if getattr(self, "_connected_origin_verified_signature", None) == signature:
+                    return True
+                verify_connected_origin(origin, brain_id=self.brain_id,
+                                        descriptor_sha256=connected.descriptor["sha256"],
+                                        allow_ancestor_owner=True)
+                self._connected_origin_verified_signature = signature
+                return True
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
         required = (
             origin / "brain.json",
             origin / "core.safetensors",
@@ -2761,6 +3191,12 @@ class AdaptiveBrain:
             "generalizationVerified": False,
         }
 
+    def learn_supplementary_capabilities(self, pack, *, steps=2, cancel_check=None):
+        """Commit declared native teaching separately from the immutable origin."""
+        from .supplementary_capabilities import teach_supplementary_capabilities
+        return teach_supplementary_capabilities(self, pack, steps=steps,
+            cancel_check=cancel_check, commit=lambda _receipt: self.save())
+
     def learn_tool_route_experience(
         self, *, utterance: str, tool_id: str, action: str,
         outcome: str, source: str, event_id: str = "",
@@ -3121,6 +3557,15 @@ class AdaptiveBrain:
 
         if self.config.origin_kind != "ground-up":
             return False
+        connected = getattr(self, "_connected_regions", None)
+        if connected is not None:
+            from .full_merge import connected_parent_action_curriculum
+            self._inherited_capability_curriculum = None
+            if not self._ground_up_origin_is_complete(self.engine_path / "origin"):
+                return False
+            self._inherited_capability_curriculum = connected_parent_action_curriculum(
+                self.storage_path, connected.descriptor, self._public_capability_origin_receipt_valid)
+            return self._inherited_capability_curriculum is not None
         origin = self.engine_path / "origin"
         required = (
             origin / "brain.json",
@@ -3183,8 +3628,10 @@ class AdaptiveBrain:
             device=self.device,
         )
 
+    @preserve_connected_feature_activity
     def _starter_action_features(
         self,
+        *, indices: Optional[Sequence[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Materialize current neural features in one mask-correct batch.
 
@@ -3195,12 +3642,19 @@ class AdaptiveBrain:
         as an individual public-chat forward, without sixteen serial passes.
         """
 
+        examples = GROUND_UP_ACTION_EXAMPLES
+        if indices is not None:
+            chosen = tuple(indices)
+            if (not chosen or any(type(index) is not int or not 0 <= index < len(examples) for index in chosen)
+                    or len(set(chosen)) != len(chosen)):
+                raise ValueError("native action feature selection is invalid")
+            examples = tuple(examples[index] for index in chosen)
         self.decoder.eval()
         assembly_features: List[torch.Tensor] = []
         token_rows: List[torch.Tensor] = []
         targets: List[int] = []
         with torch.no_grad():
-            for text, kind in GROUND_UP_ACTION_EXAMPLES:
+            for text, kind in examples:
                 # This is the real public chat boundary, not a bare-text or
                 # synthetic instruction representation: bos, human, text,
                 # brain. The same helper is used by runtime action selection.
@@ -3346,6 +3800,7 @@ class AdaptiveBrain:
         max_steps: int,
         minimum_steps: int = 0,
         strict: bool = True,
+        _feature_batch: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Dict[str, Any]:
         """Rehearse typed trajectories after shared representations learn.
 
@@ -3395,15 +3850,21 @@ class AdaptiveBrain:
         internal_head_was_training = self.decoder.internal_action_policy.training
         try:
             language_batch, assembly_batch, target_batch = (
-                self._starter_action_features()
+                self._starter_action_features() if _feature_batch is None else _feature_batch
             )
+            if (language_batch.ndim != 2 or assembly_batch.ndim != 2 or target_batch.ndim != 1
+                    or language_batch.shape != (target_batch.numel(), self.config.d_model)
+                    or assembly_batch.shape != (target_batch.numel(), self.config.idea_dim)
+                    or target_batch.numel() < 1 or target_batch.dtype != torch.long
+                    or not torch.isfinite(language_batch).all() or not torch.isfinite(assembly_batch).all()):
+                raise ValueError("native action feature batch does not match the current geometry")
             # Feature extraction puts the decoder in eval mode. Packed
             # synapses update directly during backward only while their head
             # is training; without restoring these modes, this loop silently
-            # trains only the remaining floating normalization scales.
+            # skips the packed sign/strength transitions entirely.
             self.decoder.action_policy.train()
             self.decoder.internal_action_policy.train()
-            if self._starter_action_language_cache is None:
+            if self._starter_action_language_cache is None and getattr(self, "_connected_regions", None) is None:
                 self._starter_action_language_cache = (
                     language_batch.detach().cpu().clone()
                 )
@@ -3553,7 +4014,7 @@ class AdaptiveBrain:
             readings["languageAccuracy"] + readings["internalAccuracy"]
         )
         return {
-            "examples": len(GROUND_UP_ACTION_EXAMPLES),
+            "examples": int(target_batch.numel()),
             "trainingVectors": int(target_batch.numel()) * 2,
             "neuralChannels": ["language-decoder", "internal-assembly"],
             "languageChatFraming": ["bos", "human", "text", "brain"],
@@ -3586,10 +4047,17 @@ class AdaptiveBrain:
     def _can_retain_native_action_policy(self) -> bool:
         """Retain learned routes only for an authenticated native origin."""
 
+        if getattr(self, "_connected_regions", None) is not None:
+            # The actual parent origins authenticate eligibility. Computing a
+            # curriculum forward batch is training work, not a cold-load gate.
+            return bool(self.config.origin_kind == "ground-up"
+                and self._ground_up_action_origin_verified
+                and isinstance(getattr(self, "_inherited_capability_curriculum", None), Mapping))
         return bool(
             self.config.origin_kind == "ground-up"
             and self._ground_up_action_origin_verified
-            and isinstance(self.ground_up_training_manifest, Mapping)
+            and (isinstance(self.ground_up_training_manifest, Mapping)
+                 or isinstance(getattr(self, "_inherited_capability_curriculum", None), Mapping))
             and self._starter_action_language_cache is not None
             and self._starter_action_internal_cache is not None
             and self._starter_action_target_cache is not None
@@ -3618,9 +4086,10 @@ class AdaptiveBrain:
 
         if not self._can_retain_native_action_policy():
             return None
-        assert self._starter_action_language_cache is not None
-        assert self._starter_action_internal_cache is not None
-        assert self._starter_action_target_cache is not None
+        if getattr(self, "_connected_regions", None) is None:
+            assert self._starter_action_language_cache is not None
+            assert self._starter_action_internal_cache is not None
+            assert self._starter_action_target_cache is not None
         parameters = [
             *self.decoder.action_policy.parameters(),
             *self.decoder.internal_action_policy.parameters(),
@@ -4232,7 +4701,7 @@ class AdaptiveBrain:
 
     @classmethod
     def load(
-        cls, storage_path: Path, expected_brain_id: Optional[str] = None
+        cls, storage_path: Path, expected_brain_id: Optional[str] = None, *, runtime_config: Optional[Mapping[str, Any]] = None
     ) -> "AdaptiveBrain":
         constructed: List["AdaptiveBrain"] = []
         try:
@@ -4240,6 +4709,7 @@ class AdaptiveBrain:
                 storage_path,
                 expected_brain_id=expected_brain_id,
                 constructed=constructed,
+                runtime_config=runtime_config,
             )
         except BaseException:
             # A failed integrity or compatibility check must not leave the
@@ -4327,6 +4797,7 @@ class AdaptiveBrain:
         storage_path: Path,
         expected_brain_id: Optional[str] = None,
         constructed: Optional[List["AdaptiveBrain"]] = None,
+        runtime_config: Optional[Mapping[str, Any]] = None,
     ) -> "AdaptiveBrain":
         engine_path = Path(storage_path).resolve() / "engine"
         def require_native_metadata(candidate: Mapping[str, Any]) -> None:
@@ -4365,10 +4836,42 @@ class AdaptiveBrain:
         brain_id = str(metadata["brain_id"])
         if expected_brain_id is not None and str(expected_brain_id) != brain_id:
             raise ValueError("brain id does not match the requested storage path")
+        from .app_observation_audit import app_observation_audit_snapshot_files
+        app_observation_audit_snapshot_files(engine_path, metadata)
         config = OmniConfig.from_dict(metadata["config"])
+        if runtime_config is not None:
+            from .runtime_load_config import apply_runtime_load_config
+            from .execution_checkpoint import ExecutionCheckpointStore
+            from .connected_execution import validated_connected_executions
+            execution = ExecutionCheckpointStore(engine_path, brain_id).current()
+            inherited = validated_connected_executions(metadata.get("connected_executions"))
+            minimum = max(int((metadata.get("current_context") or {}).get("tokenCount", 0)),
+                len(metadata.get("recent_token_context", [])),
+                max((entry.get("minimumContextTokens", 0) for entry in inherited["entries"] if entry["status"] in {"queued", "suspended"}), default=0),
+                int(execution["minimumContextTokens"]) if execution is not None and execution["status"] == "suspended" else 0)
+            config = apply_runtime_load_config(config, runtime_config, minimum_context_tokens=minimum)
+        if (engine_path / ".connected-working-publication.json").exists():
+            from .connected_working_publication import recover_inherited_working_publication
+            recovery_policy = ResourcePolicy(engine_path, ram_reserve_bytes=config.ram_reserve_bytes,
+                disk_reserve_bytes=config.disk_reserve_bytes, system_ram_share_percent=config.system_ram_share_percent,
+                storage_bytes_per_second=config.storage_bytes_per_second, hardware_tier=config.hardware_tier,
+                shared_resource_owner_id=brain_id, shared_storage_pool_bytes=config.storage_pool_bytes,
+                device_resource_settings=config.device_resource_settings)
+            recover_inherited_working_publication(engine_path, metadata, policy=recovery_policy)
         # Deferred packed allocation avoids initialized-full-model + loaded
         # full-core duplication. The loader fills the real owners in chunks.
-        brain = cls(brain_id, storage_path, config, _loading_checkpoint=True)
+        brain = cls(brain_id, storage_path, config, _loading_checkpoint=True,
+            _connected_descriptor=metadata.get("connected_regions"),
+            _connected_graph_states=metadata.get("connected_graph_states"))
+        # Preserve exact inherited inspection provenance; it is not a current
+        # registry, a learned memory, or an executable/device grant.
+        brain._whole_brain_catalog_lineage = copy.deepcopy(metadata.get("whole_brain_catalog_lineage"))
+        if brain._connected_regions is not None:
+            from .connected_runtime import validate_runtime_adoption, validate_pending_ingestions
+            brain.connected_runtime_adoption = validate_runtime_adoption(metadata.get("connected_runtime_adoption"))
+            brain.connected_pending_ingestions = validate_pending_ingestions(metadata.get("connected_pending_ingestions"))
+            from .connected_execution import validated_connected_executions
+            brain.connected_executions = validated_connected_executions(metadata.get("connected_executions"))
         if constructed is not None:
             constructed.append(brain)
         stored_working_pages = metadata.get("paged_working_memory")
@@ -4378,8 +4881,11 @@ class AdaptiveBrain:
                     stored_working_pages
                 )
             )
-        for _ in range(int(metadata.get("expert_count", 0))):
-            brain.decoder.grow_expert()
+        if brain._connected_regions is None:
+            for _ in range(int(metadata.get("expert_count", 0))):
+                brain.decoder.grow_expert()
+        else:
+            brain.decoder.restore_layout(metadata["connected_layout"])
         brain._configure_packed_stability()
         recovered_mutable: Optional[Dict[str, Any]] = None
         mutable_pointer = metadata.get("mutable_state")
@@ -4486,7 +4992,12 @@ class AdaptiveBrain:
             (brain.idea_adapter, "idea_adapter."), (brain.liquid, "liquid."),
             (brain.modalities, "modalities."),
         ):
-            load_module_bounded(module, core_reader, prefix, overrides=repaired_controls)
+            if prefix == "decoder." and brain._connected_regions is not None:
+                from .full_merge import load_connected_decoder_bounded
+                load_connected_decoder_bounded(brain.decoder, core_reader, prefix,
+                    overrides=repaired_controls)
+            else:
+                load_module_bounded(module, core_reader, prefix, overrides=repaired_controls)
         router_migration = brain.router.synapses.load_recurrent_state_bounded(plastic_reader, "router.synapses.")
         load_module_bounded(brain.router, plastic_reader, "router.", excluded_prefixes=("synapses.",))
         brain.core_pager.finish_load()
@@ -4629,6 +5140,13 @@ class AdaptiveBrain:
                     growth_guard=brain._allow_substrate_growth,
                     lazy_synapses=True,
                 )
+        substrate_source_binding = brain._verify_loaded_substrate_binding(
+            substrate_metadata["persistence"], recovered_mutable,
+        )
+        substrate_migration_required = brain.memory.native_weighted_migration_required
+        if type(substrate_migration_required) is not bool:
+            raise ValueError("native weighted substrate migration requirement is invalid")
+        brain._native_core_load_status["substrateSourceBinding"] = substrate_source_binding
         replay = plastic.get("state.replay") if len(brain.replay) == 0 else None
         if replay is not None:
             # One-way migration for early internal stable-v1 checkpoints. New
@@ -4724,6 +5242,10 @@ class AdaptiveBrain:
         brain.completed_chat_turns = cls._validated_completed_chat_turns(
             metadata.get("completed_chat_turns")
         )
+        from .app_observation import validate_frontier_head
+        brain.app_observation_frontier = validate_frontier_head(metadata.get("app_observation_frontier"))
+        from .sparse_substrate_transfer import validate_sparse_transfer_head
+        brain.sparse_transfer_head = validate_sparse_transfer_head(metadata.get("sparse_transfer_head"))
         accepted = metadata.get("accepted_chat_inputs", [])
         if not isinstance(accepted, list):
             raise ValueError("accepted chat input references are invalid")
@@ -4739,6 +5261,12 @@ class AdaptiveBrain:
                 or ("slowJobId" in value and not cls._sha256_identifier(value["slowJobId"]))):
                 raise ValueError("accepted chat input receipt is invalid")
             brain.accepted_chat_inputs.append(dict(value))
+            if value.get("nativeAudioInput") is not None:
+                from .native_audio_chat import validate_native_audio_receipt
+                validate_native_audio_receipt(value["nativeAudioInput"], input_sha256=value["inputSha256"])
+            if value.get("inputProvenance") is not None:
+                from .app_chat_input import validate_app_input_provenance
+                validate_app_input_provenance(value["inputProvenance"], input_sha256=value["inputSha256"])
         raw_completed_chat_slow = metadata.get(
             "completed_chat_slow_learning", []
         )
@@ -4763,8 +5291,11 @@ class AdaptiveBrain:
         ]
         for record in brain.pending_chat_slow_learning:
             record["replayCursor"] = validate_replay_cursor(record.get("replayCursor"))
-            if record.get("evidenceRole", "human") not in {"human", "brain"}:
+            if record.get("evidenceRole", "human") not in {"human", "brain", "mcp-app"}:
                 raise ValueError("pending replay evidence role is invalid")
+            if record.get("evidenceRole") == "mcp-app":
+                from .app_chat_input import validate_app_input_provenance
+                validate_app_input_provenance(record.get("inputProvenance"), input_sha256=record["inputSha256"])
             passes = record.get("completedReplayPasses", 0)
             if type(passes) is not int or passes < 0:
                 raise ValueError("pending replay pass count is invalid")
@@ -4830,6 +5361,8 @@ class AdaptiveBrain:
             for item in metadata.get("installed_modality_packs", [])
             if isinstance(item, Mapping)
         ]
+        from .supplementary_capabilities import validated_capability_receipts
+        brain.supplementary_capability_receipts = validated_capability_receipts(metadata.get("supplementary_capability_receipts"))
         stored_ground_up_manifest = metadata.get("ground_up_training_manifest")
         brain.ground_up_training_manifest = (
             dict(stored_ground_up_manifest)
@@ -4857,10 +5390,26 @@ class AdaptiveBrain:
         brain.last_idle_visible_action_at = float(
             metadata.get("last_idle_visible_action_at", 0.0)
         )
+        from .activity_clock import ActivityClock
+        brain.activity_clock = ActivityClock.from_state(metadata.get("activity_clock"), legacy_markers=(
+            brain.last_activity_decay, brain.last_idle_cycle_at, brain.last_idle_visible_action_at))
+        # Loading bytes is not elapsed cognition. Explicit runtime activation
+        # or the first actual native operation resumes this per-owner clock.
+        brain.activity_clock.pause()
+        from .working_activity import checkpoint_wall_time
+        brain.paged_working_memory.bind_activity_clock(lambda: brain._owned_activity_clock().now(),
+            checkpoint_wall_at=checkpoint_wall_time(brain.updated_at))
         brain._ground_up_action_origin_verified = (
             brain._verify_ground_up_action_origin()
         )
-        if brain._ground_up_action_origin_verified:
+        if brain._ground_up_action_origin_verified and brain._connected_regions is not None:
+            # Never use stale parent-width activation caches or turn startup
+            # into a training-only forward pass. Connected rehearsal derives
+            # current features once inside its own admitted transaction.
+            brain._starter_action_language_cache = None
+            brain._starter_action_internal_cache = None
+            brain._starter_action_target_cache = None
+        elif brain._ground_up_action_origin_verified:
             origin_plastic_reader = BoundedTensorFile(engine_path / "origin" / "plasticity.safetensors")
             origin_plastic = AdmittedTensorMapping(
                 origin_plastic_reader,
@@ -4909,9 +5458,43 @@ class AdaptiveBrain:
             repaired_core_masks
         )
         current_loaded_parameter_checksum = brain.parameter_checksum()
-        dense_router_migrated = bool(router_migration.get("legacyDenseMigration"))
-        loaded_parameter_checksum = (brain._legacy_router_parameter_checksum(plastic_reader)
-            if dense_router_migrated else current_loaded_parameter_checksum)
+        generation = (recovered_mutable or {}).get("generation", {})
+        generation_metadata = generation.get("metadata", {}) if isinstance(generation, Mapping) else {}
+        saved_parameter_checksum = generation_metadata.get("parameterChecksum") if isinstance(generation_metadata, Mapping) else None
+        if (saved_parameter_checksum == current_loaded_parameter_checksum
+                and not router_migration.get("legacyDenseMigration")
+                and not router_migration.get("unitStrengthMigration")):
+            # The source blobs were verified by state-store recovery and copied
+            # by the strict bounded loader. Matching the full learned hash is
+            # sufficient for an unchanged v2 load; do not scan it a second time.
+            representation_migration = {
+                "required": False,
+                "sourceParameterChecksum": current_loaded_parameter_checksum,
+                "destinationParameterChecksum": current_loaded_parameter_checksum,
+                "validation": "verified-generation-and-loaded-learned-checksum",
+            }
+        else:
+            representation_migration = brain._verify_native_representation_migration(
+                core_reader, plastic_reader, router_migration,
+                current_checksum=current_loaded_parameter_checksum,
+            )
+        loaded_parameter_checksum = representation_migration["sourceParameterChecksum"]
+        representation_migration["substrateSourceBinding"] = substrate_source_binding
+        if substrate_migration_required:
+            # The six module-root checksum need not change for a memory-only
+            # representation update. The substrate/joint generation still must
+            # be verified and rebound atomically before the converted data is used.
+            representation_migration.update({
+                "format": "omni-native-representation-migration-v2", "required": True,
+                "originalLearnedBytesPreserved": True,
+                "substrateMigrationRequired": True,
+                "sourceCursorAdvanced": False, "immutableOriginChanged": False,
+            })
+        if cls._sha256_identifier(saved_parameter_checksum) and saved_parameter_checksum != loaded_parameter_checksum:
+            raise ValueError("loaded native source checksum differs from its verified saved generation")
+        if representation_migration["required"]:
+            cls._bind_native_migration_source_generation(representation_migration, recovered_mutable)
+            brain._native_core_load_status["nativeRepresentationMigration"] = representation_migration
         for active_checkpoint in brain.ingestion_checkpoints.values():
             if active_checkpoint.get("formatVersion") == 3:
                 if core_recovery_records:
@@ -4943,7 +5526,7 @@ class AdaptiveBrain:
                         "v3 cursor diverges from its committed joint generation"
                     )
                 continue
-            if core_recovery_records:
+            if core_recovery_records and not representation_migration["required"]:
                 # The record cursor and every finite neural value remain
                 # authoritative. The repaired generation is committed below
                 # and receives a fresh exact transactional binding.
@@ -4994,13 +5577,11 @@ class AdaptiveBrain:
                 raise ValueError(
                     "ingestion checkpoint does not match its committed generation"
                 )
-        if dense_router_migrated:
-            # Verify old cursor bindings against the byte-exact original
-            # layout, then publish only its storage representation change.
-            # Record/window positions and immutable origin remain unchanged.
-            for active_checkpoint in brain.ingestion_checkpoints.values():
-                active_checkpoint["neuralStateChecksum"] = current_loaded_parameter_checksum
-            brain.save()
+        # Keep source-backed readers valid until the last auxiliary/RNG read.
+        # Publishing a migrated compatibility file here would invalidate their
+        # old byte offsets and could save constructor RNG instead of saved RNG.
+        packed_refresh_required = False
+        checked_packed_manifest = None
         packed_path = engine_path / "packed-ternary"
         if (
             not core_recovery_records
@@ -5013,12 +5594,16 @@ class AdaptiveBrain:
                 dynamic_order_basis,
             ) = brain._dynamic_synapse_pack_state()
             dynamic_name = "substrate.dynamic_synapses.weights"
-            dynamic_tensors = brain._dynamic_ternary_tensors(dynamic_values)
+            expected_memory_owners: Dict[str, Any] = {}
+            dynamic_tensors = brain._dynamic_ternary_tensors(dynamic_values,
+                substrate_order=(dynamic_synapse_count, expected_synapse_order_hash, dynamic_order_basis),
+                memory_bindings=expected_memory_owners)
             expected_layout = inspect_module_ternary_layout(
                 brain._ternary_export_roots(),
                 dynamic_synapses=dynamic_tensors,
             )
             verified_packed = verify_ternary_shards(packed_path, retain_names=())
+            checked_packed_manifest = verified_packed.manifest
             packed_layout = {
                 str(entry.get("name", "")): (
                     tuple(int(value) for value in entry.get("shape", [])),
@@ -5084,7 +5669,8 @@ class AdaptiveBrain:
             ):
                 raise ValueError("packed checkpoint contains obsolete answer-key state")
             dynamic_pack_is_stale = (
-                packed_total_dynamic != dynamic_synapse_count
+                packed_metadata.get("neuralMemoryOwners") != expected_memory_owners
+                or packed_total_dynamic != dynamic_synapse_count
                 or packed_metadata.get("dynamicSynapseCountingBasis")
                 != "substrate-records-v1"
                 or isinstance(packed_dynamic_count, bool)
@@ -5108,11 +5694,17 @@ class AdaptiveBrain:
                 or packed_dynamic_entry.get("tensorSha256") != expected_tensor_sha
             )
             if (
-                packed_parameter_checksum != brain.parameter_checksum()
+                # This object is still unpublished and no learned module was
+                # mutated since the full loaded checksum above. Keep the
+                # already measured value within this one read-only Load phase
+                # instead of rescanning every packed byte a second time.
+                packed_parameter_checksum != current_loaded_parameter_checksum
                 or dynamic_pack_is_stale
                 or packed_layout_is_stale
+                or not isinstance(brain.packed_ternary_manifest, Mapping)
+                or brain.packed_ternary_manifest.get("contentSha256") != verified_packed.manifest.get("contentSha256")
             ):
-                brain.export_packed_ternary()
+                packed_refresh_required = True
         stored_cpu_rng = plastic.get("state.rng_cpu")
         if stored_cpu_rng is not None:
             torch.set_rng_state(stored_cpu_rng.detach().cpu().to(torch.uint8))
@@ -5159,7 +5751,10 @@ class AdaptiveBrain:
                         retained_recovery_generation
                     )
                 )
-            brain.save()
+            if representation_migration["required"]:
+                brain._commit_native_representation_migration(representation_migration)
+            else:
+                brain.save()
             brain.export_packed_ternary()
             recovery_event = {
                 "reason": "non-finite checkpoint control state",
@@ -5189,6 +5784,25 @@ class AdaptiveBrain:
                 "previousActiveGeneration": previous_generation,
             }
             brain.events.append("checkpoint-tensor-recovered", recovery_event)
+        elif representation_migration["required"]:
+            brain._commit_native_representation_migration(representation_migration)
+            brain.export_packed_ternary()
+        elif packed_refresh_required:
+            # This is a derived export, not the native packed runtime. Its
+            # existing bytes were fully checked above; rebuilding all shards
+            # belongs to explicit Export/checkpoint, not cold Load. Do not
+            # write paused metadata or claim these stale copies are current.
+            from .derived_inference_sidecar import record_sidecar_validation
+            record_sidecar_validation(brain, manifest_sha256=checked_packed_manifest["contentSha256"],
+                parameter_checksum=current_loaded_parameter_checksum, refresh_required=True,
+                reason="verified-derived-sidecar-does-not-match-current-committed-layout-or-order")
+        else:
+            from .derived_inference_sidecar import record_sidecar_validation
+            record_sidecar_validation(brain,
+                manifest_sha256=checked_packed_manifest["contentSha256"] if checked_packed_manifest is not None else None,
+                parameter_checksum=current_loaded_parameter_checksum,
+                refresh_required=checked_packed_manifest is None,
+                reason="verified-during-load" if checked_packed_manifest is not None else "no-derived-sidecar-present")
         for recovered in recovered_candidates:
             brain.events.append("candidate-recovered", recovered)
         brain._native_core_load_status.update({
@@ -5288,15 +5902,68 @@ class AdaptiveBrain:
             self._trainable_modules()
         )
         mutable_dense_parameters = mutable_parameters + packed_parameters
-        substrate_dynamic_synapses = len(self.memory.synapses)
-        substrate_vector_parameters = (
-            len(self.memory.neuron_vectors) * int(self.memory.space.dimensions)
-        )
+        substrate_dynamic_synapses = 0
+        substrate_vector_parameters = 0
+        substrate_vector_counts = {key: 0 for key in ("baseContacts", "repeatedContacts", "learnedBytes", "structuralBytes", "allocatedStateBytes", "connectionStateBytes", "rowEnvelopeBytes")}
+        memories = [self.memory]
+        connected = getattr(self, "_connected_regions", None)
+        if connected is not None:
+            memories.extend(regional_memory for _region_id, regional_memory in connected.iter_memories())
+        seen_vectors, seen_synapses = set(), set()
+        for memory in memories:
+            if id(memory.synapses) not in seen_synapses:
+                seen_synapses.add(id(memory.synapses))
+                substrate_dynamic_synapses += len(memory.synapses)
+            vectors = memory.neuron_vectors
+            if id(vectors) in seen_vectors:
+                continue
+            seen_vectors.add(id(vectors))
+            inspect = getattr(vectors, "parameter_accounting", None)
+            if not callable(inspect):
+                if len(vectors):
+                    raise ValueError("native memory vectors lack exact incremental accounting")
+                continue
+            counts = inspect()
+            substrate_vector_parameters += counts["logicalParameters"]
+            for key in substrate_vector_counts:
+                substrate_vector_counts[key] += counts[key]
         total_parameters = (
             mutable_dense_parameters
             + substrate_vector_parameters
             + substrate_dynamic_synapses
         )
+        packed_state_bytes = 0
+        packed_structural_bytes = 0
+        connection_state_bytes = 0
+        repeated_connections = 0
+        seen_modules: set[int] = set()
+        seen_packed_tensors: set[int] = set()
+        seen_connection_tensors: set[int] = set()
+        for root in self._trainable_modules():
+            for module in root.modules():
+                if id(module) in seen_modules:
+                    continue
+                seen_modules.add(id(module))
+                parallel = getattr(module, "parallel_connections", None)
+                if isinstance(parallel, nn.Module):
+                    repeated_connections += len(parallel)
+                getter = getattr(module, "authoritative_packed_tensors", None)
+                structural = {id(getattr(module, name)) for name in
+                    getattr(module, "_packed_structural_fields", ())
+                    if isinstance(getattr(module, name, None), torch.Tensor)}
+                for tensor in getter() if callable(getter) else ():
+                    if id(tensor) not in seen_packed_tensors:
+                        seen_packed_tensors.add(id(tensor))
+                        size = int(tensor.numel()) * int(tensor.element_size())
+                        if id(tensor) in structural:
+                            packed_structural_bytes += size
+                        else:
+                            packed_state_bytes += size
+                for name in ("_connection_state", "_bias_connection_state"):
+                    tensor = getattr(module, name, None)
+                    if isinstance(tensor, torch.Tensor) and id(tensor) not in seen_connection_tensors:
+                        seen_connection_tensors.add(id(tensor))
+                        connection_state_bytes += int(tensor.numel()) * int(tensor.element_size())
         return {
             "mutableDenseParameters": mutable_dense_parameters,
             "floatingTrainableParameters": mutable_parameters,
@@ -5305,11 +5972,26 @@ class AdaptiveBrain:
             "substrateDynamicSparseSynapses": substrate_dynamic_synapses,
             "dynamicSparseSynapses": substrate_dynamic_synapses,
             "totalNeuralParameters": total_parameters,
+            "nativeRepeatedConnections": repeated_connections,
+            "substrateBaseVectorParameters": substrate_vector_counts["baseContacts"],
+            "substrateRepeatedVectorContacts": substrate_vector_counts["repeatedContacts"],
+            "corePackedLearnedStateBytes": packed_state_bytes,
+            "corePackedStructuralStateBytes": packed_structural_bytes,
+            "substrateVectorLearnedStateBytes": substrate_vector_counts["learnedBytes"],
+            "substrateVectorStructuralStateBytes": substrate_vector_counts["structuralBytes"],
+            "substrateVectorAllocatedStateBytes": substrate_vector_counts["allocatedStateBytes"],
+            "substrateVectorRowEnvelopeBytes": substrate_vector_counts["rowEnvelopeBytes"],
+            "packedLearnedStateBytes": packed_state_bytes + substrate_vector_counts["learnedBytes"],
+            "packedStructuralStateBytes": packed_structural_bytes + substrate_vector_counts["structuralBytes"],
+            "packedAllocatedStateBytes": packed_state_bytes + packed_structural_bytes + substrate_vector_counts["allocatedStateBytes"],
+            "connectionStateBytes": connection_state_bytes + substrate_vector_counts["connectionStateBytes"],
+            "packedByteAccountingScope": "core-native-buffers-and-substrate-vector-payloads-excluding-graph-database-and-host-overhead",
             "countingRule": (
                 "unique floating trainable parameters plus logical packed "
                 "ternary synapses, shared packed substrate vector elements, "
-                "and authoritative sparse substrate synapses; "
-                "excludes packing bytes, scales, optimizer state, and activity"
+                "and authoritative sparse substrate synapses including repeated contacts; "
+                "strength/plasticity bytes are reported separately, not counted as extra synapses; "
+                "excludes scales, optimizer state, and activity"
             ),
         }
 
@@ -6104,6 +6786,7 @@ class AdaptiveBrain:
         human_message_id: str,
         experience: Mapping[str, Any],
         evidence_role: str = "human",
+        input_provenance: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Queue one idempotent cortical replay after fast chat admission."""
 
@@ -6171,8 +6854,13 @@ class AdaptiveBrain:
         interference = max(
             0.0, min(1.0, float(signals.get("interference", 0.0)))
         )
-        if evidence_role not in {"human", "brain"}:
+        if evidence_role not in {"human", "brain", "mcp-app"}:
             raise ValueError("chat replay must name an observed message role")
+        if evidence_role == "mcp-app":
+            from .app_chat_input import validate_app_input_provenance
+            input_provenance = validate_app_input_provenance(input_provenance, input_sha256=input_sha256)
+        elif input_provenance is not None:
+            raise ValueError("non-App replay cannot claim App source attribution")
         record = {
             "format": "omni-chat-slow-learning-job",
             "formatVersion": 1,
@@ -6181,6 +6869,7 @@ class AdaptiveBrain:
             "inputSha256": input_sha256,
             "humanMessageId": human_message_id,
             "evidenceRole": evidence_role,
+            **({"inputProvenance": input_provenance} if input_provenance is not None else {}),
             "afterimageId": str(settling.get("afterimageId", "")),
             "replayCursor": initial_replay_cursor(),
             "completedReplayPasses": 0,
@@ -6204,6 +6893,7 @@ class AdaptiveBrain:
         self.pending_chat_slow_learning.append(record)
         return record
 
+    @outer_learning_phase("queued-replay")
     @slow_snapshot_lifetime
     def consolidate_pending_chat_learning(
         self,
@@ -6240,9 +6930,15 @@ class AdaptiveBrain:
         message = self.conversation.payload_by_id(
             "message", str(record["humanMessageId"])
         )
+        evidence_role = record.get("evidenceRole", "human")
+        if evidence_role == "mcp-app":
+            from .app_chat_input import validate_app_input_provenance
+            provenance = validate_app_input_provenance(record.get("inputProvenance"), input_sha256=record["inputSha256"])
+            if not isinstance(message, Mapping) or message.get("input_provenance") != provenance:
+                raise RuntimeError("queued App replay lost its original observed attribution")
         if (
             not isinstance(message, Mapping)
-            or message.get("role") != record.get("evidenceRole", "human")
+            or message.get("role") != ("human" if evidence_role == "mcp-app" else evidence_role)
             or hashlib.sha256(
                 str(message.get("content", "")).encode("utf-8")
             ).hexdigest()
@@ -6450,7 +7146,7 @@ class AdaptiveBrain:
             turn_id = receipt.get("turnId")
             if (
                 not required.issubset(receipt)
-                or bool(set(receipt) - (required | {"generationEnd"}))
+                or bool(set(receipt) - (required | {"generationEnd", "inputProvenance", "nativeAudioInput"}))
                 or receipt.get("generationEnd", "complete") not in {"complete", "steered", "native-stop", "no-reply"}
                 or receipt.get("format") != CHAT_TURN_RECEIPT_FORMAT
                 or receipt.get("formatVersion") != 1
@@ -6479,6 +7175,12 @@ class AdaptiveBrain:
                 or not receipt["committedAt"]
             ):
                 raise ValueError("completed chat turn receipt contract is invalid")
+            if receipt.get("inputProvenance") is not None:
+                from .app_chat_input import validate_app_input_provenance
+                validate_app_input_provenance(receipt["inputProvenance"], input_sha256=receipt["inputSha256"])
+            if receipt.get("nativeAudioInput") is not None:
+                from .native_audio_chat import validate_native_audio_receipt
+                validate_native_audio_receipt(receipt["nativeAudioInput"], input_sha256=receipt["inputSha256"])
             receipt_key = (turn_id, str(receipt["inputSha256"]))
             if receipt_key in seen:
                 raise ValueError("completed chat turn receipt is duplicated")
@@ -6859,6 +7561,12 @@ class AdaptiveBrain:
         *,
         runtime_card_override: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if getattr(self, "_connected_regions", None) is not None:
+            from .connected_runtime import refresh_pending_ingestions
+            refresh_pending_ingestions(self)
+        from .app_observation import validate_frontier_head
+        from .sparse_substrate_transfer import validate_sparse_transfer_head
+        from .derived_inference_sidecar import current_sidecar_descriptor, sidecar_status
         return {
             "schema_version": ENGINE_SCHEMA_VERSION,
             "release_format": "stable-1.0",
@@ -6868,6 +7576,13 @@ class AdaptiveBrain:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "config": self.config.to_dict(),
+            **({"connected_regions": self._connected_regions.descriptor,
+                "connected_graph_states": self._connected_graph_states,
+                "connected_layout": self.decoder.layout(),
+                "connected_runtime_adoption": self.connected_runtime_adoption,
+                "connected_pending_ingestions": self.connected_pending_ingestions,
+                "connected_executions": self.connected_executions}
+               if getattr(self, "_connected_regions", None) is not None else {}),
             "expert_count": self.decoder.expert_count,
             "novelty_streak": self.novelty_streak,
             "growth_pause": self.growth_pause,
@@ -6875,6 +7590,7 @@ class AdaptiveBrain:
             "last_activity_decay": self.last_activity_decay,
             "last_idle_cycle_at": self.last_idle_cycle_at,
             "last_idle_visible_action_at": self.last_idle_visible_action_at,
+            "activity_clock": self._owned_activity_clock().snapshot(),
             "conversation": self.conversation.summary(),
             "training_sources": [
                 self._source_without_inline_text(value)
@@ -6892,6 +7608,8 @@ class AdaptiveBrain:
                 -COMPLETED_CHAT_TURN_RECEIPTS:
             ],
             "accepted_chat_inputs": self.accepted_chat_inputs,
+            "app_observation_frontier": validate_frontier_head(getattr(self, "app_observation_frontier", None)),
+            "sparse_transfer_head": validate_sparse_transfer_head(getattr(self, "sparse_transfer_head", None)),
             "completed_chat_slow_learning": self.completed_chat_slow_learning[
                 -COMPLETED_CHAT_SLOW_LEARNING:
             ],
@@ -6909,11 +7627,14 @@ class AdaptiveBrain:
             "packed_metaplasticity": self._packed_stability_accounting(),
             "modality_training": self.modality_training,
             "installed_modality_packs": self.installed_modality_packs,
+            "supplementary_capability_receipts": self.supplementary_capability_receipts,
             "ground_up_training_manifest": self.ground_up_training_manifest,
             "geometry_holdout_registration": self.geometry_holdout_registration,
-            "packed_ternary_manifest": self.packed_ternary_manifest,
+            "packed_ternary_manifest": current_sidecar_descriptor(self),
+            "packed_inference_sidecar": sidecar_status(self),
             "substrate": self.memory.metadata(include_records=False),
             "mutable_state": self.mutable_state_manifest,
+            "whole_brain_catalog_lineage": getattr(self, "_whole_brain_catalog_lineage", None),
             "paged_working_memory": (
                 PagedWorkingMemory.empty_checkpoint()
                 if self._fresh_attention_paged_clear_pending
@@ -6946,17 +7667,24 @@ class AdaptiveBrain:
         self._distributed_seal_stage_previous = (copy.deepcopy(self.distributed_training_seal),)
         self.distributed_training_seal = clean
 
+    @outer_learning_phase("checkpoint-publication")
     def save(self, *, reuse_substrate_generation: bool = False) -> None:
         """Keep staged convenience pointers distinct from a durable commit."""
 
+        if getattr(self, "_connected_recovery_required", False):
+            raise RuntimeError("cannot publish a failed regional admission; reload the last atomic checkpoint")
         previous_substrate = copy.deepcopy(self.memory.persistence_manifest)
         previous_mutable = copy.deepcopy(self.mutable_state_manifest)
         previous_seal_stage = getattr(self, "_distributed_seal_stage_previous", None)
+        connected = getattr(self, "_connected_regions", None)
+        previous_connected_states = copy.deepcopy(getattr(self, "_connected_graph_states", None))
+        previous_connected_pointers = connected.pointer_snapshot() if connected is not None else {}
         committed = False
 
         def mark_committed() -> None:
             nonlocal committed
             committed = True
+            note_learning_commit(self)
 
         try:
             self._save_checkpoint_impl(
@@ -6969,6 +7697,9 @@ class AdaptiveBrain:
                 self.mutable_state_manifest = previous_mutable
                 if previous_seal_stage is not None:
                     self.distributed_training_seal = previous_seal_stage[0]
+                self._connected_graph_states = previous_connected_states
+                if connected is not None:
+                    connected.restore_pointers(previous_connected_pointers)
             raise
         finally:
             self._distributed_seal_stage_previous = None
@@ -6979,9 +7710,17 @@ class AdaptiveBrain:
     ) -> None:
         self.updated_at = _iso_now()
         self.engine_path.mkdir(parents=True, exist_ok=True)
+        persist_working_clock = getattr(self.paged_working_memory, "persist_activity_baseline", None)
+        if callable(persist_working_clock):
+            persist_working_clock()
         self.router_state_pager.flush()
         self._drain_packed_stability_events()
         self._ensure_optimizer_resident()
+        if getattr(self, "_connected_regions", None) is not None:
+            self._connected_graph_states = self._connected_regions.stage_graphs(
+                self.storage_path, reserve=self.resource_policy.require_disk,
+                reuse=reuse_substrate_generation,
+            )
         if not reuse_substrate_generation and not isinstance(self.memory.assemblies, PagedAssemblyView):
             for assembly in self.memory.assemblies:
                 if isinstance(assembly, dict):
@@ -7026,6 +7765,8 @@ class AdaptiveBrain:
                 self.engine_path / "substrate",
                 disk_reserve=self.resource_policy.require_disk,
             )
+        if getattr(self, "_native_substrate_migration_source", None) is not None:
+            self._verify_staged_substrate_migration()
         core = self._core_tensors()
         plasticity = self._plastic_tensors()
         try:
@@ -7058,10 +7799,15 @@ class AdaptiveBrain:
             # presentation projection plus host action lifecycle; it never
             # invents or renumbers these rows.
             self.conversation.backfill(self.messages, self.traces)
-            atomic_write_json(
-                self.engine_path / "brain.json",
-                self._metadata(runtime_card_override=runtime_card_override),
-            )
+            metadata = self._metadata(runtime_card_override=runtime_card_override)
+            from .whole_brain_catalog import InspectionScratch, publish_whole_brain_catalog
+            with InspectionScratch(self.resource_policy.reserve_ram) as inspection_scratch:
+                metadata["whole_brain_catalog"] = publish_whole_brain_catalog(
+                    self, metadata, self.engine_path, admit=inspection_scratch.admit,
+                    reserve_disk=self.resource_policy.require_disk,
+                    tensor_registry={"core": core, "plasticity": plasticity},
+                )
+                atomic_write_json(self.engine_path / "brain.json", metadata)
             if commit_callback is not None:
                 commit_callback()
             if not reuse_substrate_generation:
@@ -7197,7 +7943,7 @@ class AdaptiveBrain:
             and not embedding_blockers
             and not floating_parameter_blockers
             and not master_blockers,
-            "weightFormat": "two-bit-packed-ternary",
+            "weightFormat": "two-bit-ternary-signs-with-discrete-connection-strengths",
             "activationFormat": "signed-int8-dynamic-scale",
             "packedBitLinearModules": packed_linear_modules,
             "packedConvolutionModules": packed_convolution_modules,
@@ -7229,14 +7975,15 @@ class AdaptiveBrain:
             )
         return status
 
-    def _dynamic_synapse_export(self) -> Tuple[List[str], torch.Tensor]:
-        if isinstance(self.memory.synapses, LazyPersistedSynapses):
-            return self.memory.synapses.dynamic_export()
-        synapse_ids = sorted(self.memory.synapses)
+    def _dynamic_synapse_export(self, memory=None) -> Tuple[List[str], torch.Tensor]:
+        memory = self.memory if memory is None else memory
+        if isinstance(memory.synapses, LazyPersistedSynapses):
+            return memory.synapses.dynamic_export()
+        synapse_ids = sorted(memory.synapses)
         values = torch.tensor(
             [
-                self.memory.exact_effective_weight(
-                    self.memory.synapses[synapse_id]["effective_weight"]
+                memory.exact_effective_weight(
+                    memory.synapses[synapse_id]["effective_weight"]
                 )
                 for synapse_id in synapse_ids
             ],
@@ -7245,16 +7992,17 @@ class AdaptiveBrain:
         return synapse_ids, values
 
     def _dynamic_synapse_pack_state(
-        self,
+        self, memory=None,
     ) -> Tuple[Any, int, str, str]:
         """Return exact packed state without paging indexed cold records."""
 
-        if isinstance(self.memory.synapses, LazyPersistedSynapses):
-            return self.memory.synapses.stream_dynamic_pack_state(
+        memory = self.memory if memory is None else memory
+        if isinstance(memory.synapses, LazyPersistedSynapses):
+            return memory.synapses.stream_dynamic_pack_state(
                 disk_reserve=self.resource_policy.require_disk,
                 memory_reserve=lambda size, _operation: self._allow_substrate_growth(size),
             )
-        synapse_ids, values = self._dynamic_synapse_export()
+        synapse_ids, values = self._dynamic_synapse_export(memory)
         return (
             values,
             len(synapse_ids),
@@ -7265,12 +8013,65 @@ class AdaptiveBrain:
     def _dynamic_ternary_tensors(
         self,
         substrate_values: Optional[Any] = None,
+        *,
+        substrate_order: Optional[Tuple[int, str, str]] = None,
+        memory_bindings: Optional[Dict[str, Any]] = None,
+        _memory=None,
+        _prefix: str = "substrate",
     ) -> Dict[str, Any]:
         """All non-module synapses eligible for packed forward inference."""
+        from .ternary_packing import ConnectionStateSource, TernaryTensorSpec
+        from .weighted_substrate_state import synapse_strength
+        from .memory_inference_export import vector_tensor_spec
+        memory = self.memory if _memory is None else _memory
 
-        if substrate_values is None:
-            substrate_values = self._dynamic_synapse_pack_state()[0]
-        return {"substrate.dynamic_synapses.weights": substrate_values}
+        if substrate_values is None or substrate_order is None:
+            values, count, order_hash, order_basis = self._dynamic_synapse_pack_state(memory)
+            if substrate_values is None:
+                substrate_values = values
+            substrate_order = (count, order_hash, order_basis)
+        if isinstance(memory.synapses, LazyPersistedSynapses):
+            companion, count, order_hash, order_basis = memory.synapses.stream_dynamic_connection_state(
+                disk_reserve=self.resource_policy.require_disk,
+                memory_reserve=lambda size, _operation: self._allow_substrate_growth(size),
+            )
+            if (count, order_hash, order_basis) != substrate_order:
+                raise ValueError("dynamic sign and strength streams describe different generations or ordering")
+        else:
+            identifiers = tuple(sorted(memory.synapses))
+            count = len(identifiers)
+            order_hash = hashlib.sha256("\0".join(identifiers).encode("utf-8")).hexdigest()
+            if (count, order_hash, "record-id-lexicographic-v1") != substrate_order:
+                raise ValueError("dynamic sign and strength streams describe different ordering")
+            synapses = memory.synapses
+            revision = getattr(synapses, "graph_revision", None)
+            def pages():
+                for start in range(0, count, 65536):
+                    if memory.synapses is not synapses or getattr(synapses, "graph_revision", None) != revision:
+                        raise ValueError("dynamic source changed during connection-state export")
+                    yield torch.tensor([synapse_strength(memory.synapses[key]) - 1
+                                        for key in identifiers[start:start + 65536]], dtype=torch.uint8)
+                if memory.synapses is not synapses or getattr(synapses, "graph_revision", None) != revision:
+                    raise ValueError("dynamic source changed during connection-state export")
+            companion = ConnectionStateSource((1, count), pages)
+        name = _prefix + ".dynamic_synapses.weights"
+        result = {name: TernaryTensorSpec(name=name, values=substrate_values, kind="dynamic-synapse",
+            source_dtype="packed-2bit", connection_state=companion)}
+        vector_spec, vector_binding = vector_tensor_spec(memory.neuron_vectors,
+            name=_prefix + ".neuron_vectors.weight",
+            reserve=lambda size, _operation: self._allow_substrate_growth(size))
+        result[vector_spec.name] = vector_spec
+        if memory_bindings is not None:
+            memory_bindings[_prefix] = {"substrateContentSha256": str(
+                (memory.persistence_manifest or {}).get("contentSha256", "")),
+                "dynamicCount": substrate_order[0], "dynamicOrderSha256": substrate_order[1],
+                "dynamicOrderBasis": substrate_order[2], "vectors": vector_binding}
+        connected = getattr(self, "_connected_regions", None)
+        if _memory is None and connected is not None:
+            for region_id, regional_memory in connected.iter_memories():
+                result.update(self._dynamic_ternary_tensors(_memory=regional_memory,
+                    _prefix="substrate.connected." + region_id, memory_bindings=memory_bindings))
+        return result
 
     def export_packed_ternary(
         self, destination: Optional[Path] = None
@@ -7318,7 +8119,10 @@ class AdaptiveBrain:
             synapse_order_hash,
             dynamic_order_basis,
         ) = self._dynamic_synapse_pack_state()
-        dynamic = self._dynamic_ternary_tensors(dynamic_values)
+        memory_bindings: Dict[str, Any] = {}
+        dynamic = self._dynamic_ternary_tensors(dynamic_values,
+            substrate_order=(dynamic_synapse_count, synapse_order_hash, dynamic_order_basis),
+            memory_bindings=memory_bindings)
         specs = collect_module_ternary_tensors(
             roots,
             dynamic_synapses=dynamic,
@@ -7326,6 +8130,9 @@ class AdaptiveBrain:
         expected_names = [spec.name for spec in specs]
         packed_write_bytes = sum(
             (int(spec.values.numel()) + 3) // 4
+            + (int(spec.connection_state.numel()) if spec.connection_state is not None else 0)
+            + 26 * (spec.parallel_connections.count if hasattr(spec.parallel_connections, "records")
+                    else len(spec.parallel_connections))
             for spec in specs
         ) + max(64 * 1024, len(specs) * 1024)
         self.resource_policy.require_disk(
@@ -7355,6 +8162,7 @@ class AdaptiveBrain:
                 expected_names=expected_names,
                 metadata={
                     "brainId": self.brain_id,
+                    "neuralMemoryOwners": memory_bindings,
                     "engineSchemaVersion": ENGINE_SCHEMA_VERSION,
                     "parameterChecksum": self.parameter_checksum(),
                     "originKind": self.config.origin_kind,
@@ -7464,9 +8272,26 @@ class AdaptiveBrain:
             "pretrainedTextCortex": None,
             "relativePath": "packed-ternary/",
         }
-        self.packed_ternary_manifest = summary
-        self.updated_at = _iso_now()
-        atomic_write_json(self.engine_path / "brain.json", self._metadata())
+        # An external directory is an explicit export result, not proof that
+        # the managed sidecar was replaced. Only its managed publication may
+        # advertise/persist a current committed inference copy.
+        if target == (self.engine_path / "packed-ternary").resolve():
+            from .derived_inference_sidecar import record_sidecar_validation
+            previous_manifest = self.packed_ternary_manifest
+            previous_status = getattr(self, "_packed_inference_sidecar_status", None)
+            previous_updated = self.updated_at
+            try:
+                self.packed_ternary_manifest = summary
+                record_sidecar_validation(self, manifest_sha256=manifest["contentSha256"],
+                    parameter_checksum=summary["parameterChecksum"], refresh_required=False,
+                    reason="explicit-managed-export-verified-and-published")
+                self.updated_at = _iso_now()
+                atomic_write_json(self.engine_path / "brain.json", self._metadata())
+            except BaseException:
+                self.packed_ternary_manifest = previous_manifest
+                self._packed_inference_sidecar_status = previous_status
+                self.updated_at = previous_updated
+                raise
         return {
             "brainId": self.brain_id,
             "path": str(target),
@@ -7510,7 +8335,7 @@ class AdaptiveBrain:
             for module_name, module in root.named_modules():
                 if not (
                     isinstance(module, TERNARY_PROJECTION_TYPES)
-                    or module is self.router.synapses
+                    or isinstance(module, STDPSynapses)
                 ):
                     continue
                 name = "%s.%s" % (root_name, module_name or "<root>")
@@ -7518,7 +8343,21 @@ class AdaptiveBrain:
                 if getattr(module, "ternary", False) is not True:
                     violations.append(name)
                 try:
+                    if isinstance(module, STDPSynapses) and hasattr(module, "_sparse_state"):
+                        # Sparse recurrence has no dense `_packed_weights`
+                        # owner. Validate its allocated contacts; absent blocks
+                        # are exact zero and must not be materialized to audit.
+                        module._sparse_state.validate()
+                        from .streamed_ternary import packed_rows_source
+                        for block in module.blocks.values():
+                            source = packed_rows_source(block._packed_weights, (block.rows, block.columns))
+                            for page in source.pages():
+                                audit_tensor(name, page)
+                        continue
                     from .ternary_packing import _module_spec
+                    pool = getattr(module, "parallel_connections", None)
+                    if pool is not None:
+                        pool.validate_bounded_state_load()
                     spec = _module_spec(root_name, module_name, module)
                     from .streamed_ternary import TernaryPackedSource
                     if isinstance(spec.values, TernaryPackedSource):
@@ -7564,6 +8403,8 @@ class AdaptiveBrain:
             "observedLevels": sorted(observed_levels),
             "authoritativeWeightStorage": "packed-ternary-synapses",
             "forwardPrecision": "exact ternary {-1,0,+1}",
+            "connectionStrengthEncoding": "uint4-strength-minus-one-high4-resistance",
+            "effectiveContribution": "ternary sign times integer strength plus independent repeated contacts",
             "packedExecution": self.packed_runtime_audit(),
         }
 
@@ -7661,7 +8502,11 @@ class AdaptiveBrain:
             "curiosity": curiosity,
         }
 
-    def runtime_card(self) -> Dict[str, Any]:
+    def runtime_card(self, *, parameter_accounting: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        # A summary may supply its own synchronous measurement. Never retain
+        # this inventory across calls/generations or expose the caller's dict.
+        accounting = dict(self.parameter_accounting() if parameter_accounting is None else parameter_accounting)
+        from .derived_inference_sidecar import current_sidecar_descriptor, sidecar_status
         card: Dict[str, Any] = {
             "architecture": "OmniCortex",
             "pretrained": False,
@@ -7673,7 +8518,8 @@ class AdaptiveBrain:
             "origin_kind": self.config.origin_kind,
             "baseFrozen": False,
             "ground_up_training_manifest": self.ground_up_training_manifest,
-            "packed_ternary_manifest": self.packed_ternary_manifest,
+            "packed_ternary_manifest": current_sidecar_descriptor(self),
+            "packedInferenceSidecar": sidecar_status(self),
             "hidden_behavioral_prompt": False,
             "reward_model": False,
             "rlhf": False,
@@ -7699,7 +8545,7 @@ class AdaptiveBrain:
             ),
             "tokenizer_boundary": "UTF-8 bytes",
             "weight_forward": "scaled ternary {-1,0,+1}",
-            "parameterAccounting": self.parameter_accounting(),
+            "parameterAccounting": accounting,
             "ternary_audit": self._ternary_audit(),
             "device": str(self.device),
             "device_backend": self.device_backend,
@@ -7817,7 +8663,7 @@ class AdaptiveBrain:
                 "parameterChecksum": initialization.get("parameterChecksum"),
                 "exactParameterCount": initialization.get(
                     "exactParameterCount",
-                    self.parameter_accounting()["totalNeuralParameters"],
+                    accounting["totalNeuralParameters"],
                 ),
             }
         return card
@@ -7828,30 +8674,293 @@ class AdaptiveBrain:
             reserve=self._reserve_core_diagnostic_state,
         )
 
-    def _legacy_router_parameter_checksum(self, reader: BoundedTensorFile) -> str:
-        """Verify a native dense checkpoint without expanding sparse zeros."""
-        name = "router.synapses._packed_weights"
-        spec = reader.specs[name]
+    def _verify_loaded_substrate_binding(
+        self, source_pointer: Mapping[str, Any], recovered: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Keep root memory at its original committed generation during load.
+
+        Additive in-memory representation defaults are not permission to publish
+        a new source pointer before the original cursor/joint checks run.
+        """
+        loaded = self.memory.persistence_manifest
+        if not isinstance(loaded, Mapping) or dict(loaded) != dict(source_pointer):
+            raise ValueError("substrate load changed its committed generation before cursor verification")
+        content = source_pointer.get("contentSha256")
+        counts = source_pointer.get("counts")
+        if (not self._sha256_identifier(content) or source_pointer.get("activeGeneration") != content
+                or not self._sha256_identifier(source_pointer.get("generationManifestSha256"))
+                or not isinstance(counts, Mapping) or set(counts) != {"neurons", "assemblies", "synapses"}
+                or any(type(count) is not int or count < 0 for count in counts.values())):
+            raise ValueError("native substrate source binding is invalid")
+        linked = False
+        revision = getattr(self.memory, "state_revision", None)
+        if revision is not None and (type(revision) is not int or revision < 0):
+            raise ValueError("loaded native substrate revision is invalid")
+        if recovered is not None:
+            generation = recovered.get("generation", {})
+            metadata = generation.get("metadata", {}) if isinstance(generation, Mapping) else {}
+            if not isinstance(metadata, Mapping) or metadata.get("substrateContentSha256") != content:
+                raise ValueError("saved neural and substrate generations do not match")
+            linked = True
+        return {"format": "omni-native-substrate-source-binding-v1",
+                "sourceGenerationSha256": content,
+                "sourceManifestSha256": source_pointer["generationManifestSha256"],
+                "sourceCounts": dict(counts), "mutableSourceLinked": linked,
+                "sourcePointerUnchanged": True, "loadedStateRevision": revision}
+
+    def _verify_native_representation_migration(
+        self, core_reader: BoundedTensorFile, plastic_reader: BoundedTensorFile,
+        router_migration: Mapping[str, Any], *, current_checksum: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Reconstruct the original learned stream, proving each retained byte.
+
+        The order is the native parameter-checksum order: parameters first for
+        each root, then canonical module getters in their declared tensor order.
+        Safe-tensor lexical/header order is never used as the learned ordering.
+        Only verified additive unit strengths and an empty contact-pool counter
+        may be absent. Original learned source bytes must equal the loaded owner.
+        """
+        from .packed_connections import PooledParallelConnections
+        from .sparse_router_state import SparseRouterBlock
+        from .native_core_paging import release_native_tensor_chunk
+        from .router_state_paging import release_router_tensor_chunk
+
+        roots = tuple(self._ternary_export_roots().items())
+        if tuple(id(root) for _, root in roots) != tuple(id(root) for root in self._trainable_modules()):
+            raise ValueError("native checkpoint roots do not match learned checksum ordering")
+        dense_router = bool(router_migration.get("legacyDenseMigration"))
         owner = self.router.synapses
-        descendants = {id(child) for child in owner.modules() if child is not owner}
+        additions: List[str] = []
+        compared = 0
+        readers = (core_reader, plastic_reader)
+        identities = tuple((reader.path.stat().st_dev, reader.path.stat().st_ino,
+                            reader.path.stat().st_size, reader.path.stat().st_mtime_ns) for reader in readers)
+
+        def release(value, start, count):
+            release_native_tensor_chunk(value, start, count)
+            release_router_tensor_chunk(value, start, count)
+
+        def require_zero(value, label):
+            if value.dtype != torch.uint8 or not value.is_contiguous():
+                raise ValueError("native additive state must be contiguous uint8: " + label)
+            flat = value.detach().reshape(-1)
+            for start in range(0, flat.numel(), min(core_reader.chunk_bytes, plastic_reader.chunk_bytes)):
+                count = min(core_reader.chunk_bytes, plastic_reader.chunk_bytes, flat.numel()-start)
+                self._reserve_core_diagnostic_state(count*3 + 4096)
+                try:
+                    if bool(flat[start:start+count].ne(0).any()):
+                        raise ValueError("native additive state is not unit strength or empty metadata: " + label)
+                finally:
+                    release(value, start, count)
+
+        def source_for(reader, full_name, value):
+            nonlocal compared
+            spec = reader.specs.get(full_name)
+            if spec is None:
+                raise ValueError("saved native learned tensor is missing: " + full_name)
+            if spec.shape != tuple(value.shape) or spec.dtype != value.dtype or not value.is_contiguous():
+                raise ValueError("native migration learned shape/dtype differs: " + full_name)
+            compared += 1
+
+            def checked_chunks():
+                self._reserve_core_diagnostic_state(min(reader.chunk_bytes, spec.byte_count)*5 + 4096)
+                flat = value.detach().reshape(-1)
+                position = 0
+                for saved in reader.chunks(full_name):
+                    count = saved.numel()
+                    try:
+                        live = flat[position:position+count].to(device="cpu")
+                        if not torch.equal(saved.reshape(-1), live):
+                            raise ValueError("native migration changed original learned bytes: " + full_name)
+                        yield saved
+                    finally:
+                        release(value, position*value.element_size(), count*value.element_size())
+                    position += count
+                if position != value.numel():
+                    raise ValueError("native migration did not visit the complete saved learned tensor")
+
+            return BoundedChecksumSource(spec.shape, spec.dtype, checked_chunks)
+
+        def saved_chunks(reader, full_name):
+            spec = reader.specs[full_name]
+            self._reserve_core_diagnostic_state(min(reader.chunk_bytes, spec.byte_count)*3 + 4096)
+            yield from reader.chunks(full_name)
+
         def sources():
             seen = set()
-            for root in self._trainable_modules():
-                for parameter in root.parameters():
+            for root_name, root in roots:
+                reader = plastic_reader if root_name == "router" else core_reader
+                for name, parameter in root.named_parameters():
                     if id(parameter) not in seen:
-                        seen.add(id(parameter)); yield parameter
-                for _path, child in canonical_module_walk(root):
-                    if child is owner:
-                        yield BoundedChecksumSource(spec.shape, spec.dtype, lambda: reader.chunks(name))
+                        seen.add(id(parameter))
+                        yield source_for(reader, root_name + "." + name, parameter)
+                for path, child in canonical_module_walk(root):
+                    if dense_router and child is owner:
+                        # This proof scans only bounded rectangles and confirms
+                        # original signs AND timing/control fields, including
+                        # implicit zero pairs in the new sparse representation.
+                        proof = owner._sparse_state._dense_equivalence_proof(plastic_reader, "router.synapses.")
+                        if proof.get("exactNativeFieldsPreserved") is not True:
+                            raise ValueError("native dense router migration has no exact field proof")
+                        if "router.synapses._connection_state" not in plastic_reader.specs:
+                            from .sparse_router_state import block_layer
+                            for key, block in owner.blocks.items():
+                                if block_layer(key):
+                                    raise ValueError("dense native migration unexpectedly created repeated contacts")
+                                label = "router.synapses.blocks." + key + "._connection_state"
+                                require_zero(block._connection_state, label)
+                                additions.append(label)
+                        for field in ("_packed_weights", "_connection_state"):
+                            name = "router.synapses." + field
+                            spec = plastic_reader.specs.get(name)
+                            if spec is not None:
+                                yield BoundedChecksumSource(spec.shape, spec.dtype, lambda name=name: saved_chunks(plastic_reader, name))
                         continue
-                    if id(child) in descendants:
+                    if dense_router and root_name == "router" and path.startswith("synapses."):
                         continue
                     getter = getattr(child, "authoritative_packed_tensors", None)
-                    if callable(getter):
-                        for value in getter():
-                            if id(value) not in seen:
-                                seen.add(id(value)); yield value
-        return tensor_checksum(sources(), reserve=self._reserve_core_diagnostic_state)
+                    if not callable(getter):
+                        continue
+                    for value in getter():
+                        if id(value) in seen:
+                            continue
+                        seen.add(id(value))
+                        # A getter may expose a child-owned buffer. Resolve its
+                        # real registered path rather than inventing its owner.
+                        binding = next(((name, candidate) for name, candidate in child.named_buffers()
+                                        if candidate is value), None)
+                        if binding is None:
+                            raise ValueError("native learned checksum tensor has no registered source name")
+                        name = binding[0]
+                        registered_path, separator, field = name.rpartition(".")
+                        registered_owner = child.get_submodule(registered_path) if separator else child
+                        field = field if separator else name
+                        full_name = ".".join(part for part in (root_name, path, name) if part)
+                        if full_name not in reader.specs:
+                            additive_strength = (field in {"_connection_state", "_bias_connection_state"}
+                                and isinstance(registered_owner, (*TERNARY_PROJECTION_TYPES, SparseRouterBlock)))
+                            additive_pool = (field == "_next_page" and isinstance(registered_owner, PooledParallelConnections)
+                                             and len(registered_owner.pages) == 0)
+                            if not (additive_strength or additive_pool):
+                                raise ValueError("native learned source field cannot be defaulted: " + full_name)
+                            require_zero(value, full_name)
+                            additions.append(full_name)
+                            continue
+                        yield source_for(reader, full_name, value)
+
+        original_checksum = tensor_checksum(sources(), reserve=self._reserve_core_diagnostic_state)
+        for reader, before in zip(readers, identities):
+            after = reader.path.stat()
+            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != before:
+                raise ValueError("native checkpoint source changed while verifying representation migration")
+        live_checksum = current_checksum or self.parameter_checksum()
+        required = bool(additions or dense_router or router_migration.get("unitStrengthMigration"))
+        if not required and original_checksum != live_checksum:
+            raise ValueError("saved native learned checksum differs without a declared representation migration")
+        return {"format": "omni-native-representation-migration-v2", "required": required,
+                "sourceParameterChecksum": original_checksum, "destinationParameterChecksum": live_checksum,
+                "comparedLearnedTensors": compared, "verifiedAdditiveFields": additions,
+                "originalLearnedBytesPreserved": True, "additiveStrengthsAreUnit": True,
+                "newContactPoolsAreEmpty": True, "denseRouterMigrated": dense_router,
+                "sourceCursorAdvanced": False, "immutableOriginChanged": False}
+
+    def _verify_staged_substrate_migration(self) -> Optional[Dict[str, Any]]:
+        """Prove staged weighted memory before its root checkpoint can publish."""
+        source = getattr(self, "_native_substrate_migration_source", None)
+        if source is None:
+            return None
+        target = self.memory.persistence_manifest
+        if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+            raise ValueError("native memory migration has no complete generation pointers")
+        verified = NeuralSubstrate.verify_saved_weighted_generation(
+            self.engine_path / "substrate", target, source_pointer=source,
+            memory_reserve=self._reserve_core_diagnostic_state,
+            disk_reserve=self.resource_policy.require_disk,
+        )
+        if (not isinstance(verified, Mapping) or verified.get("verified") is not True
+                or verified.get("unitDefaultsVerified") is not True
+                or verified.get("sourceRecordsAndSignsPreserved") is not True
+                or verified.get("sourceGeneration") != source.get("activeGeneration")
+                or verified.get("targetGeneration") != target.get("activeGeneration")
+                or target.get("counts") != source.get("counts")
+                or type(verified.get("preservedNeuronCount")) is not int
+                or type(verified.get("preservedSynapseCount")) is not int
+                or verified.get("preservedNeuronCount") != source.get("counts", {}).get("neurons")
+                or verified.get("preservedSynapseCount") != source.get("counts", {}).get("synapses")):
+            raise ValueError("native memory migration did not preserve its complete original generation")
+        proof = dict(verified)
+        if hasattr(self, "_native_core_load_status"):
+            self._native_core_load_status["substrateRepresentationMigration"] = proof
+        return proof
+
+    @staticmethod
+    def _bind_native_migration_source_generation(proof: Dict[str, Any], recovered: Optional[Mapping[str, Any]]) -> None:
+        """Anchor reconstructed bytes to the already verified immutable store."""
+        generation = (recovered or {}).get("generation", {})
+        metadata = generation.get("metadata", {}) if isinstance(generation, Mapping) else {}
+        checksum = metadata.get("parameterChecksum") if isinstance(metadata, Mapping) else None
+        if (not AdaptiveBrain._sha256_identifier(checksum) or checksum != proof.get("sourceParameterChecksum")
+                or not AdaptiveBrain._sha256_identifier(generation.get("contentSha256"))):
+            raise ValueError("native representation migration does not match its verified saved generation checksum")
+        proof["sourceGenerationVerified"] = True
+        proof["sourceGenerationSha256"] = generation.get("contentSha256")
+
+    def _commit_native_representation_migration(self, proof: Mapping[str, Any]) -> None:
+        """Publish the verified format change through the normal atomic save."""
+        before = str(proof.get("sourceParameterChecksum", ""))
+        after = str(proof.get("destinationParameterChecksum", ""))
+        if (proof.get("format") != "omni-native-representation-migration-v2" or proof.get("required") is not True
+                or proof.get("originalLearnedBytesPreserved") is not True
+                or proof.get("sourceGenerationVerified") is not True
+                or not self._sha256_identifier(before) or not self._sha256_identifier(after)
+                or self.parameter_checksum() != after):
+            raise ValueError("native representation migration proof no longer describes the loaded brain")
+        substrate_binding = proof.get("substrateSourceBinding")
+        if substrate_binding is not None:
+            pointer = self.memory.persistence_manifest or {}
+            if (not isinstance(substrate_binding, Mapping)
+                    or substrate_binding.get("format") != "omni-native-substrate-source-binding-v1"
+                    or substrate_binding.get("sourcePointerUnchanged") is not True
+                    or pointer.get("contentSha256") != substrate_binding.get("sourceGenerationSha256")
+                    or pointer.get("activeGeneration") != substrate_binding.get("sourceGenerationSha256")
+                    or pointer.get("generationManifestSha256") != substrate_binding.get("sourceManifestSha256")
+                    or pointer.get("counts") != substrate_binding.get("sourceCounts")
+                    or (substrate_binding.get("loadedStateRevision") is not None and
+                        getattr(self.memory, "state_revision", None) != substrate_binding["loadedStateRevision"])):
+                raise ValueError("native representation migration began after its verified substrate changed")
+        previous = copy.deepcopy(self.ingestion_checkpoints)
+        previous_joint = copy.deepcopy(self.ingestion_joint_generation)
+        for checkpoint in self.ingestion_checkpoints.values():
+            if checkpoint.get("neuralStateChecksum") != before:
+                raise ValueError("native representation migration cannot rebind a stale source cursor")
+        memory_migration = proof.get("substrateMigrationRequired") is True
+        if getattr(self, "_native_substrate_migration_source", None) is not None:
+            raise RuntimeError("a native substrate migration is already in progress")
+        if memory_migration:
+            if not isinstance(substrate_binding, Mapping) or substrate_binding.get("mutableSourceLinked") is not True:
+                raise ValueError("native memory migration requires the verified original substrate binding")
+            self._native_substrate_migration_source = copy.deepcopy(self.memory.persistence_manifest)
+        for checkpoint in self.ingestion_checkpoints.values():
+            checkpoint["neuralStateChecksum"] = after
+        try:
+            # This stages neural/substrate/joint generations before brain.json
+            # commits them. Source record/window positions and schedules remain.
+            self.save()
+        except BaseException:
+            try:
+                committed = read_json(self.engine_path / "brain.json")
+                durable = (committed.get("ingestion_checkpoints") == self.ingestion_checkpoints
+                           and committed.get("ingestion_joint_generation") == self.ingestion_joint_generation
+                           and committed.get("mutable_state") == self.mutable_state_manifest)
+            except (OSError, ValueError, TypeError):
+                durable = False
+            if not durable:
+                self.ingestion_checkpoints = previous
+                self.ingestion_joint_generation = previous_joint
+            raise
+        finally:
+            if memory_migration:
+                self._native_substrate_migration_source = None
 
     def _reserve_core_diagnostic_state(self, byte_count):
         status = self.resource_policy.status(estimated_ram_bytes=int(byte_count))
@@ -7866,49 +8975,20 @@ class AdaptiveBrain:
             reserve_ram=self._reserve_core_diagnostic_state, reserve_disk=self.resource_policy.require_disk,
             resource_policy=self.resource_policy)
 
-    def _parameter_delta_norm(self, before: Sequence[torch.Tensor]) -> float:
-        if isinstance(before, ParameterDeltaJournal):
-            try:
-                return before.delta_norm()
-            finally:
-                before.close()
-        total = 0.0
-        modules: List[nn.Module] = [
-            self.decoder,
-            self.memory_bridge,
-            self.idea_adapter,
-            self.liquid,
-        ]
-        current = self._learned_parameter_tensors(modules)
-        for index, parameter in enumerate(current):
-            if (
-                index < len(before)
-                and parameter.shape == before[index].shape
-                and parameter.dtype == torch.uint8
-                and before[index].dtype == torch.uint8
-            ):
-                # Four signed ternary codes live in each byte. Decode only a
-                # bounded byte block for an exact mutation norm; never create
-                # a full dense copy of a packed cortical matrix.
-                current_bytes = parameter.reshape(-1)
-                previous_bytes = before[index].reshape(-1)
-                for offset in range(0, current_bytes.numel(), 65_536):
-                    now = current_bytes[offset : offset + 65_536].to(device="cpu", dtype=torch.int16)
-                    prior = previous_bytes[offset : offset + 65_536].to(device="cpu", dtype=torch.int16)
-                    for shift in (0, 2, 4, 6):
-                        delta = ((now >> shift) & 3) - ((prior >> shift) & 3)
-                        total += float(delta.float().pow(2).sum().item())
-                continue
-            flat = parameter.detach().reshape(-1)
-            prior = before[index].detach().reshape(-1) if index < len(before) and parameter.shape == before[index].shape else None
-            for offset in range(0, flat.numel(), 65536):
-                block = flat[offset:offset + 65536].to(device="cpu", dtype=torch.float32)
-                difference = block - prior[offset:offset + block.numel()].to(device="cpu", dtype=torch.float32) if prior is not None else block
-                total += float(difference.square().sum().item())
-        return math.sqrt(total)
+    def _parameter_delta_norm(self, before: ParameterDeltaJournal) -> float:
+        # A raw uint8 tensor list cannot distinguish packed signs from learned
+        # strength/resistance or connectivity records. Only the owner-aware
+        # journal can report the actual change in this native representation.
+        if not isinstance(before, ParameterDeltaJournal):
+            raise TypeError("native parameter deltas require an owner-aware mutation journal")
+        try:
+            return before.delta_norm()
+        finally:
+            before.close()
 
     def _idea_model_vector(self, vsa_vector: torch.Tensor) -> torch.Tensor:
-        raw = vsa_vector.to(self.device, dtype=torch.float32).reshape(1, -1)
+        from .training_randomness import training_execution_device, learning_transfer
+        raw = learning_transfer(vsa_vector, training_execution_device(self.device), dtype=torch.float32).reshape(1, -1)
         return torch.tanh(self.memory_bridge(raw))
 
     @staticmethod
@@ -7988,6 +9068,7 @@ class AdaptiveBrain:
         )
         return float(assessment["slowReplayPriority"])
 
+    @owned_memory_effect("replay-admission")
     def _append_replay(
         self,
         idea: torch.Tensor,
@@ -8052,6 +9133,7 @@ class AdaptiveBrain:
             }
             raise
 
+    @owned_memory_effect("working-memory-admission")
     def _append_working_memory(
         self,
         idea: torch.Tensor,
@@ -8202,6 +9284,7 @@ class AdaptiveBrain:
             return 1.0
         return loss / (1.0 + loss)
 
+    @owned_memory_effect("organic-memory-settling")
     def _settle_memory_automatically(
         self,
         vector: torch.Tensor,
@@ -8396,6 +9479,7 @@ class AdaptiveBrain:
         self.recent_token_activity = RecentTokenActivity()
         self._sync_recent_dialogue_counts()
 
+    @owned_memory_effect("recent-dialogue-decay")
     def _cool_recent_dialogue(self) -> Dict[str, Any]:
         """Release weak raw spans from live episode signals, never history."""
 
@@ -8416,6 +9500,7 @@ class AdaptiveBrain:
         self._sync_recent_dialogue_counts()
         return {**activity.summary(), "cooledTokens": removed}
 
+    @owned_memory_effect("recent-dialogue-admission")
     def _append_recent_dialogue(
         self, human: str, brain: str, *, afterimage_id: str = ""
     ) -> None:
@@ -8637,11 +9722,13 @@ class AdaptiveBrain:
         self.workspace_items = []
         self.liquid_state.zero_()
         self.router.reset_activity()
+        if getattr(self, "_connected_regions", None) is not None:
+            cleared["connectedRegions"] = self._connected_regions.clear_attention(prior_epoch + 1)
         self.novelty_streak = 0
         for module in self._trainable_modules():
             for parameter in module.parameters():
                 parameter.grad = None
-        reset_clock = time.time()
+        reset_clock = self._activity_now()
         self.last_activity_decay = reset_clock
         self.last_idle_cycle_at = reset_clock
         self.last_idle_visible_action_at = reset_clock
@@ -8979,6 +10066,7 @@ class AdaptiveBrain:
         }
 
     def _inspect_synapse(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        from .weighted_substrate_state import synapse_inspection_fields
         effective = NeuralSubstrate.exact_effective_weight(
             record.get("effective_weight", 0)
         )
@@ -8991,6 +10079,7 @@ class AdaptiveBrain:
             "targetId": str(record.get("target_id", "")),
             "kind": str(record.get("kind", "associates")),
             "effectiveWeight": effective,
+            **synapse_inspection_fields(record),
             "eligibility": self._inspection_number(
                 (
                     effective_eligibility(record)
@@ -9447,6 +10536,7 @@ class AdaptiveBrain:
             )
         return response
 
+    @outer_learning_phase("replay-objectives")
     def _optimize_experience(
         self,
         text: str,
@@ -10173,24 +11263,26 @@ class AdaptiveBrain:
 
         if not encoded or len(encoded) != len(vsa_vectors):
             raise ValueError("token windows and idea vectors must align")
+        from .training_randomness import training_execution_device, learning_randn_like, learning_transfer
+        execution_device = training_execution_device(self.device)
         width = max(int(ids.shape[0]) for ids in encoded)
         ids = torch.full(
             (len(encoded), width),
             self.tokenizer.pad_id,
             dtype=torch.long,
-            device=self.device,
+            device=execution_device,
         )
         for index, values in enumerate(encoded):
-            ids[index, : values.shape[0]] = values
+            ids[index, : values.shape[0]] = learning_transfer(values, execution_device)
         idea = torch.cat(
             [self._idea_model_vector(vector) for vector in vsa_vectors],
             dim=0,
         )
         reconstructed = self.idea_adapter(
-            idea + torch.randn_like(idea) * 0.06
+            idea + learning_randn_like(idea) * 0.06
         )
         idea_loss = F.mse_loss(reconstructed, idea.detach())
-        liquid_state = self.liquid_state.detach().expand(
+        liquid_state = learning_transfer(self.liquid_state.detach(), execution_device).expand(
             idea.shape[0], -1
         )
         temporal, _ = self.liquid(
@@ -10592,6 +11684,16 @@ class AdaptiveBrain:
                 "records": 0.0,
                 "optimizer_steps": 0.0,
             }
+        from .training_randomness import training_private, training_wave_active, training_prepared_batches, PrivateWaveSnapshot
+        if not training_wave_active():
+            from .training_whole_operation import consume_streaming_training_wave
+            automatic = consume_streaming_training_wave(self, experiences, learning_schedule, schedule_locked)
+            if automatic is not None:
+                # Real resource maintenance is outside the privately compared
+                # learner wave and still runs exactly once after its update.
+                self._clear_allocator_recovery_pause()
+                self._maintain_neural_state_resources()
+                return automatic
         training_plan = self._training_resource_plan()
         if bool(training_plan["pauseBeforeStep"]):
             status = {
@@ -10670,7 +11772,7 @@ class AdaptiveBrain:
                 )
 
         try:
-            packed_snapshot = PackedMutationSnapshot.capture(
+            packed_snapshot = PrivateWaveSnapshot() if training_private() else PackedMutationSnapshot.capture(
                 self._slow_transaction_modules().values(),
                 reserve=reserve_packed_rollback,
                 disk_directory=self._live_paging_cache_directory / "packed-logical-batch-rollback",
@@ -10705,15 +11807,16 @@ class AdaptiveBrain:
                 accelerator_rng_state = torch.mps.get_rng_state().clone()
             self._optimizer.zero_grad(set_to_none=True)
             try:
-                for encoded, vectors in self._streaming_experience_window_batches(
+                prepared_batches = training_prepared_batches()
+                for encoded, vectors in (prepared_batches() if prepared_batches is not None else self._streaming_experience_window_batches(
                     experiences,
                     physical_batch=physical,
                     sequence_tokens=sequence_tokens,
-                ):
+                )):
                     loss, measured = self._experience_ids_batch_loss(
                         encoded, vectors
                     )
-                    if self.device_backend == "mps":
+                    if self.device_backend == "mps" and not training_wave_active():
                         # Checkpointed workspace chunks leave only inactive
                         # allocator blocks after forward. Release those blocks
                         # before backward recomputes each exact slot chunk.
@@ -10723,7 +11826,7 @@ class AdaptiveBrain:
                     # the same objective as any other physical partition.
                     window_count = len(encoded)
                     (loss * float(window_count)).backward()
-                    if self.device_backend == "mps":
+                    if self.device_backend == "mps" and not training_wave_active():
                         # The next microbatch must not inherit disposable MPS
                         # cache from checkpoint recomputation.
                         self._release_training_allocator_cache()
@@ -10811,6 +11914,10 @@ class AdaptiveBrain:
                 )
                 break
             except BaseException as error:
+                if training_private():
+                    # The current module/control/database namespace is wholly
+                    # private. Discard it; never restore/reset original state.
+                    raise
                 if is_allocator_oom_error(error):
                     self._release_training_allocator_cache()
                 try:
@@ -10875,8 +11982,9 @@ class AdaptiveBrain:
         packed_snapshot.close() # final validated logical batch, never a retry boundary
         self._optimizer.zero_grad(set_to_none=True)
         self.counters["training_steps"] += 1
-        self._clear_allocator_recovery_pause()
-        self._maintain_neural_state_resources()
+        if not training_wave_active():
+            self._clear_allocator_recovery_pause()
+            self._maintain_neural_state_resources()
         keys = (
             "loss",
             "language_loss",
@@ -11000,6 +12108,8 @@ class AdaptiveBrain:
     def _training_resource_plan(self) -> Dict[str, Any]:
         """Measure the RAM-first envelope for the next exhaustive update."""
 
+        from .native_architecture import packed_learning_scratch_bytes
+
         parameters = {
             id(parameter): parameter
             for module in self._trainable_modules()
@@ -11022,14 +12132,18 @@ class AdaptiveBrain:
                 if not weights or weights[0].ndim != 2:
                     continue
                 rows, packed_columns = weights[0].shape
-                # One row block is decoded/graded at a time. Four logical
-                # levels share each byte; 16 bytes per active level covers
-                # local float gradient, probability, draw, and code scratch.
-                # This is a maximum transient block, not a full FP32 mirror.
+                # Weighted rows require probability/gradient, discrete strength
+                # and packing intermediates, plus saturated-contact index
+                # lists. Match main-process transient admission. Authoritative
+                # packed state itself is already counted by the live pager.
                 packed_update_scratch_bytes = max(
                     packed_update_scratch_bytes,
-                    min(64, int(rows)) * int(packed_columns) * 4 * 16,
+                    packed_learning_scratch_bytes(int(rows), int(packed_columns) * 4),
                 )
+                bias = getattr(module, "_packed_forward_bias", None)
+                if isinstance(bias, torch.Tensor) and bias.ndim == 2:
+                    packed_update_scratch_bytes = max(packed_update_scratch_bytes,
+                        packed_learning_scratch_bytes(int(bias.shape[0]), int(bias.shape[1]) * 4))
         activation_multiplier = (
             24 if self.config.gradient_checkpointing else 48
         )
@@ -11304,6 +12418,7 @@ class AdaptiveBrain:
             result.update(assemblyIdView=descriptor, sourceTurnId=turn)
         return result
 
+    @owned_memory_effect("current-memory-preview")
     def _preview_chat_experience(
         self,
         text: str,
@@ -11407,6 +12522,20 @@ class AdaptiveBrain:
             "preview": True,
         }
 
+    def _owned_activity_clock(self):
+        clock = getattr(self, "activity_clock", None)
+        if clock is None:
+            from .activity_clock import ActivityClock
+            clock = self.activity_clock = ActivityClock.from_state(None, legacy_markers=(
+                getattr(self, "last_activity_decay", 0.0), getattr(self, "last_idle_cycle_at", 0.0),
+                getattr(self, "last_idle_visible_action_at", 0.0)))
+        return clock
+
+    def _activity_now(self):
+        clock = self._owned_activity_clock()
+        clock.resume()
+        return clock.now()
+
     def learn_experience(
         self,
         text: str,
@@ -11418,17 +12547,22 @@ class AdaptiveBrain:
         structural_detail: bool = True,
     ) -> Dict[str, Any]:
         """Learn a whole experience through shared activity, synapses and cortex."""
+        connected = getattr(self, "_connected_regions", None)
+        if getattr(self, "_connected_recovery_required", False):
+            raise RuntimeError("regional admission recovery requires reloading the last atomic checkpoint")
+        from .connected_transaction import ConnectedExperienceTransaction
+        with ConnectedExperienceTransaction(self) if connected is not None else nullcontext():
+            return self._learn_experience_impl(
+                text,
+                kind=kind,
+                source=source,
+                source_label=source_label,
+                steps=steps,
+                importance=importance,
+                structural_detail=structural_detail,
+            )
 
-        return self._learn_experience_impl(
-            text,
-            kind=kind,
-            source=source,
-            source_label=source_label,
-            steps=steps,
-            importance=importance,
-            structural_detail=structural_detail,
-        )
-
+    @owned_memory_effect("experience-learning")
     def _learn_experience_impl(
         self,
         text: str,
@@ -11440,7 +12574,7 @@ class AdaptiveBrain:
         importance: float,
         structural_detail: bool,
     ) -> Dict[str, Any]:
-        now = time.time()
+        now = self._activity_now()
         elapsed = max(0.0, now - self.last_activity_decay)
         half_life = self.config.short_term_half_life_minutes * 60.0
         if elapsed > 0 and self.config.vector_symbolic_memory:
@@ -11527,6 +12661,13 @@ class AdaptiveBrain:
                 "active_synapses": 0.0,
             }
         requested_steps = self.config.online_steps if steps is None else steps
+        connected_observation = None
+        if getattr(self, "_connected_regions", None) is not None:
+            event_key = hashlib.sha256((self.brain_id + "\0" + str(self.counters["experiences"])
+                + "\0" + source + "\0" + str(learned["idea_id"])).encode("utf-8")).hexdigest()
+            regional = self.decoder.observe_experience(routed.detach(), event_key=event_key, importance=importance)
+            connected_observation = [{key: value for key, value in row.items() if key != "activity" and key != "memory"}
+                                     for row in regional]
         slow_learning_applied = bool(
             self.config.online_learning and int(requested_steps) > 0
         )
@@ -11615,9 +12756,11 @@ class AdaptiveBrain:
             "memory_settling": memory_settling,
             "grew_expert": grew,
             "state_offload": offload,
+            **({"connected_regions": connected_observation} if connected_observation is not None else {}),
         }
         return result
 
+    @outer_learning_phase("latent-rehearsal")
     def _latent_rehearsal_step(
         self, substrate_vector: torch.Tensor, seed: int
     ) -> Dict[str, float]:
@@ -11789,7 +12932,7 @@ class AdaptiveBrain:
     ) -> Dict[str, Any]:
         """Run one organic, prompt-free recurrent cognition cycle."""
 
-        now = time.time()
+        now = self._activity_now()
         minimum_idle_seconds = max(0.0, float(minimum_idle_seconds))
         since_activity = now - max(
             self.last_activity_decay, self.last_idle_cycle_at
@@ -12837,6 +13980,8 @@ class AdaptiveBrain:
             if not {"entryPath", "language"}.issubset(arguments):
                 return None
         elif tool_id in {"web.fetch", "browser.automation"}:
+            if tool_id == "web.fetch" and action == "inspect-image":
+                return arguments if isinstance(arguments.get("referenceId"), str) and re.fullmatch(r"[a-f0-9]{64}", arguments["referenceId"]) else None
             if len(urls) == 1:
                 arguments.setdefault("url", urls[0])
             if "url" not in arguments:
@@ -13478,13 +14623,27 @@ class AdaptiveBrain:
             try:
                 for observation in observations:
                     text = observation["payloadJson"]
+                    image_receipt = None
                     try:
                         # Every byte enters one bounded window. CfC keeps the
                         # accumulated world state across windows; one huge
                         # result never creates a whole-value label/tensor list.
                         recurrent = self.liquid_state.detach() if self.config.liquid_dynamics else None
                         candidate = refined
-                        for offset in range(0, len(text), 16_384):
+                        from .web_image_observation import selected_tool_output, encode_web_image
+                        selected_image = selected_tool_output(observation)
+                        if selected_image is not None:
+                            with encode_web_image(self, selected_image, turn_id=observation["turnId"],
+                                cancelled=lambda: bool(getattr(provider, "cancelled", lambda: False)())) as (sensory, image_receipt):
+                                cue = self._idea_model_vector(sensory)
+                                if self.config.liquid_dynamics:
+                                    recurrent, controls = self.liquid(cue, state=recurrent, elapsed=1.0)
+                                    retention = controls["retention"].reshape(-1, 1).clamp(0, 1)
+                                    merged = recurrent if candidate is None else (1 - retention) * candidate + retention * recurrent
+                                else:
+                                    merged = cue if candidate is None else F.normalize(candidate + cue, dim=-1)
+                                candidate = self.idea_adapter(merged).detach()
+                        for offset in range(0, len(text) if selected_image is None else 0, 16_384):
                             part = text[offset:offset + 16_384]
                             with self.resource_policy.reserve_ram(len(part) * 128 + 131072,
                                                                   "native tool observation encoding"):
@@ -13503,6 +14662,8 @@ class AdaptiveBrain:
                     refined = candidate
                     bindings.append({key: observation[key] for key in ("observationId", "payloadSha256", "neuralActionId",
                         "actionEventId", "executionId", "toolId", "action", "completedAt")})
+                    if image_receipt is not None:
+                        bindings[-1]["webImagePerception"] = image_receipt
             finally:
                 for observation in observations:
                     release = getattr(observation, "release", None)
@@ -13527,7 +14688,10 @@ class AdaptiveBrain:
         seed: int,
         emit: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        steer_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         self_activity_observer: Optional[Callable[[torch.Tensor, Mapping[str, Any]], None]] = None,
+        continuation_state: Optional[Mapping[str, Any]] = None,
     ) -> Callable[[torch.Tensor, int, float], Dict[str, Any]]:
         """Reevaluate native action heads from every actual prefix state.
 
@@ -13535,7 +14699,9 @@ class AdaptiveBrain:
         the selected visible replay can publish host-executable actions. The
         ledger suppresses repeated effects, not language/model activations.
         """
-        cue = action_cue.detach()
+        cue = action_cue.detach() if continuation_state is None else continuation_state["cue"]
+        if not isinstance(cue, torch.Tensor) or cue.shape != action_cue.shape or cue.device != action_cue.device:
+            raise ValueError("native action continuation has a different neural cue")
 
         def callback(hidden: torch.Tensor, step: int, entropy: float) -> Dict[str, Any]:
             nonlocal cue
@@ -13564,23 +14730,34 @@ class AdaptiveBrain:
                         cue, ponder_trace = self._native_pre_speech_ponder(
                             state, state, seed=int(seed) + int(step),
                             confidence=float(action.get("confidence", 0.0)),
-                            pass_budget=1, resource_budget_ms=10_000,
                             noise=float(live_organic.get("organicNoise", 0.0)),
-                            cancel_check=cancel_check,
+                            cancel_check=cancel_check, steer_check=steer_check,
+                            progress_callback=progress_callback or ((lambda progress: emit("cognition-progress", progress)) if emit is not None else None),
                         )
                         ponder_trace["phase"] = "mid-generation" if step else "pre-speech"
                         registered["arguments"] = {
                             **dict(registered.get("arguments", {})),
-                            "completedInTurn": True, "ponderTrace": ponder_trace,
+                            "handledInTurn": True, "completedInTurn": ponder_trace["completed"], "ponderTrace": ponder_trace,
                         }
+                        if ponder_trace["completed"] and int(ponder_trace["passes"]) > 0:
+                            report = decode_ponder_self_report(
+                                self.decoder, cue, phase=ponder_trace["phase"],
+                                max_output_bytes=max(1, int(self.config.max_seq_len)),
+                                cancelled=cancel_check,
+                            )
+                            if report is not None:
+                                registered["arguments"][PONDER_REPORT_CANDIDATE] = report
                         refined_memory = cue
                         if self_activity_observer is not None:
                             self_activity_observer(cue, ponder_trace)
+                        if ponder_trace["stop_reason"] == "steered":
+                            return {"yield": "steered"}
                     if emit is not None:
-                        emit("action", {"actionId": registered["actionId"], "action": registered})
+                        emit_registered_action(emit, registered)
                     stop = stop or action.get("kind") == "stop"
                 return {"stop": stop, **({"memoryBias": refined_memory} if refined_memory is not None else {})}
 
+        callback.suspension_state = lambda: {"cue": cue.detach()}
         return callback
 
     @torch.no_grad()
@@ -13591,10 +14768,10 @@ class AdaptiveBrain:
         *,
         seed: int,
         confidence: float,
-        pass_budget: int,
-        resource_budget_ms: int,
         noise: float,
         cancel_check: Optional[Callable[[], bool]] = None,
+        steer_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Refine this turn's latent memory after a learned Ponder proposal.
 
@@ -13621,19 +14798,27 @@ class AdaptiveBrain:
         router_steps = 0
         final_delta = 0.0
         converged = False
-        stop_reason = "neural-budget"
+        stop_reason = "not-started"
+        last_kind = "ponder"
+        last_scores: Dict[str, float] = {}
+        scheduler_yields = 0
+        last_yield = started
+
+        def boundary() -> bool:
+            if cancel_check is not None and cancel_check():
+                raise ChatGenerationCancelled("chat generation was cancelled")
+            return bool(steer_check is not None and steer_check())
+
         try:
-            while passes < max(1, int(pass_budget)):
-                if cancel_check is not None and cancel_check():
-                    raise ChatGenerationCancelled("chat generation was cancelled")
+            if progress_callback is not None:
+                progress_callback({"phase": "ponder", "active": True, "passes": 0, "elapsedMs": 0.})
+            while True:
+                if boundary():
+                    stop_reason = "steered"
+                    break
                 readings = self.resource_policy.status()
                 if readings.get("diskPressure") or readings.get("memoryPressure"):
                     stop_reason = "resource-pressure"
-                    break
-                if (time.perf_counter() - started) * 1000.0 >= max(
-                    1, int(resource_budget_ms)
-                ):
-                    stop_reason = "resource-budget"
                     break
                 if self.config.liquid_dynamics:
                     liquid_state, controls = self.liquid(
@@ -13644,6 +14829,9 @@ class AdaptiveBrain:
                 else:
                     driven = 0.65 * anchor + 0.35 * current
                     threshold = 0.0
+                if boundary():
+                    stop_reason = "steered"
+                    break
                 if self.config.spiking_dynamics:
                     updated, _metrics = self.router.route(
                         driven, steps=2, learn=False, threshold_offset=threshold
@@ -13651,6 +14839,9 @@ class AdaptiveBrain:
                     router_steps += 2
                 else:
                     updated = driven
+                if boundary():
+                    stop_reason = "steered"
+                    break
                 next_refined = self.idea_adapter(updated)
                 if not bool(torch.isfinite(next_refined).all()):
                     raise RuntimeError("non-finite native pre-speech Ponder state")
@@ -13661,22 +14852,55 @@ class AdaptiveBrain:
                 current = updated
                 refined = next_refined
                 passes += 1
-                if cancel_check is not None and cancel_check():
-                    raise ChatGenerationCancelled("chat generation was cancelled")
+                if boundary():
+                    stop_reason = "steered"
+                    break
+                probabilities = F.softmax(self.decoder.internal_action_policy(refined).detach().float(), dim=-1).reshape(-1, len(ACTION_KINDS)).mean(dim=0)
+                last_kind = ACTION_KINDS[int(probabilities.argmax().item())]
+                last_scores = {kind: float(probabilities[index]) for index, kind in enumerate(ACTION_KINDS)}
+                if last_kind != "ponder":
+                    stop_reason = "learned-action-transition"
+                    break
                 scale = float(refined.float().square().mean().sqrt().item())
                 if final_delta <= 1e-4 * (1.0 + scale):
                     converged = True
                     stop_reason = "converged"
                     break
+                now = time.perf_counter()
+                if now - last_yield >= .032:
+                    if progress_callback is not None:
+                        progress_callback({"phase": "ponder", "active": True, "passes": passes, "elapsedMs": (now - started) * 1000.,
+                            "delta": final_delta, "selectedAction": last_kind, "schedulerYield": True})
+                    # Release the interpreter between safe operations, not a
+                    # terminal duration cap or model-facing instruction.
+                    time.sleep(0)
+                    scheduler_yields += 1
+                    last_yield = now
+        except ChatGenerationCancelled:
+            stop_reason = "cancelled"
+            raise
+        except BaseException:
+            stop_reason = "failed"
+            raise
         finally:
             self.router.population.membrane.copy_(membrane)
             self.router.population.spike_count.copy_(spike_count)
+            if progress_callback is not None:
+                progress_callback({"phase": "ponder", "active": False, "passes": passes,
+                    "elapsedMs": (time.perf_counter() - started) * 1000., "delta": final_delta,
+                    "selectedAction": last_kind, "stopReason": stop_reason})
         return refined, {
             "activated": True,
             "activated_by": "learned-action-head",
             "passes": passes,
             "converged": converged,
+            "completed": stop_reason in {"converged", "learned-action-transition"},
             "stop_reason": stop_reason,
+            "continuationAction": last_kind,
+            "continuationScores": last_scores,
+            "schedulerYields": scheduler_yields,
+            "fixedPassLimit": None,
+            "fixedTimeLimitMs": None,
             "initial_score": float(confidence),
             "final_delta": final_delta,
             "elapsed_ms": (time.perf_counter() - started) * 1000.0,
@@ -13928,9 +15152,12 @@ class AdaptiveBrain:
             or receipt.get("inputSha256") != input_sha256 or receipt.get("committed") is not True):
             raise ValueError("accepted input identity conflicts with this retry")
         message = self.conversation.payload_by_id("message", str(receipt.get("humanMessageId", "")))
+        from .native_audio_chat import observed_input_sha256
         if (not isinstance(message, Mapping) or message.get("role") != "human"
             or message.get("turn_id") != turn_id
-            or hashlib.sha256(str(message.get("content", "")).encode()).hexdigest() != input_sha256):
+            or observed_input_sha256(message) != input_sha256
+            or message.get("input_provenance") != receipt.get("inputProvenance")
+            or message.get("native_audio_input") != receipt.get("nativeAudioInput")):
             raise RuntimeError("accepted input has no matching observed human message")
         return dict(receipt)
 
@@ -13961,6 +15188,7 @@ class AdaptiveBrain:
     def learn_action_result(
         self, evidence_id: str, execution_id: str, evidence_path: str,
         evidence_sha256: str, provenance: Mapping[str, Any], progress: Optional[Any] = None,
+        merge_continuation: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Learn completed observed effects with the existing atomic cursor.
 
@@ -13988,10 +15216,35 @@ class AdaptiveBrain:
                 raise ValueError("completed action evidence directory is unsafe")
         if expected.is_symlink() or not expected.is_file() or expected.stat().st_size < 1:
             raise ValueError("completed action evidence is unavailable")
+        if provenance.get("toolId") == "web.fetch" and provenance.get("action") == "inspect-image" and provenance.get("executionState") == "complete":
+            from .web_image_observation import learn_selected_web_image_result
+            return learn_selected_web_image_result(self, evidence_id=evidence_id, execution_id=execution_id,
+                evidence_path=expected, evidence_sha256=evidence_sha256, progress=progress, merge_continuation=merge_continuation)
+        source_name, epoch, transaction_key = "action-result-" + evidence_id, 0, evidence_id
+        if merge_continuation is not None:
+            from .connected_runtime import action_result_continuation, activate_pending_ingestion
+            selected, source_name = action_result_continuation(self, merge_continuation, evidence_sha256)
+            if selected["status"] == "complete":
+                if self._file_sha256(expected) != evidence_sha256:
+                    raise ValueError("completed imported action evidence bytes changed")
+                receipt = selected.get("completionReceipt")
+                if not isinstance(receipt, Mapping) or receipt.get("contentHash") != evidence_sha256:
+                    raise ValueError("completed imported action has no exact source receipt")
+                return {"brainId": self.brain_id, "evidenceId": evidence_id, "executionId": execution_id,
+                    "evidenceSha256": evidence_sha256, "processed": False, "duplicate": True,
+                    "committed": True, "sourceIdentity": receipt["sourceIdentity"],
+                    "commitSequence": int(receipt.get("commitSequence", 0)),
+                    "source": {"completionReceipt": dict(receipt), "importedLearning": True},
+                    "mergeContinuation": dict(merge_continuation), "metrics": self.metrics()}
+            activate_pending_ingestion(self, selected["id"], expected, source_name)
+            epoch = int(selected["checkpoint"]["epoch"])
+            transaction_key = selected["checkpoint"]["transactionId"]
         result = self.ingest(
-            path=str(expected), name="action-result-" + evidence_id, kind="jsonl",
+            path=str(expected), name=source_name, kind="jsonl",
             policy="pretrain", expected_hash=evidence_sha256, allow_replay=False,
-            transaction_key=evidence_id, progress=progress,
+            epoch=epoch, transaction_key=transaction_key, progress=progress,
+            _record_source_basename=(merge_continuation["originalEvidenceId"] + ".jsonl"
+                                     if merge_continuation is not None else None),
         )
         source = result.get("source", {})
         receipt = source.get("completionReceipt", {}) if isinstance(source, Mapping) else {}
@@ -14003,7 +15256,8 @@ class AdaptiveBrain:
                 "duplicate": bool(result.get("duplicate")), "committed": True,
                 "sourceIdentity": receipt.get("sourceIdentity"),
                 "commitSequence": source.get("record_batch_commits", result.get("recordRecovery", {}).get("batchCommits", 0)),
-                "source": source, "metrics": result["metrics"] if "metrics" in result else self.metrics()}
+                "source": source, "metrics": result["metrics"] if "metrics" in result else self.metrics(),
+                **({"mergeContinuation": dict(merge_continuation)} if merge_continuation is not None else {})}
 
     def _completed_chat_result(
         self, receipt: Mapping[str, Any]
@@ -14037,19 +15291,19 @@ class AdaptiveBrain:
         if human_message is None or brain_message is None or trace is None:
             raise RuntimeError("committed chat receipt references missing state")
         validate_no_reply_turn(human_message, brain_message, trace, receipt)
+        from .native_audio_chat import observed_input_sha256
         if (
             human_message.get("turn_id") != receipt["turnId"]
             or brain_message.get("turn_id") != receipt["turnId"]
             or trace.get("turn_id") != receipt["turnId"]
-            or hashlib.sha256(
-                str(human_message.get("content", "")).encode("utf-8")
-            ).hexdigest()
-            != receipt["inputSha256"]
+            or observed_input_sha256(human_message) != receipt["inputSha256"]
             or trace.get("input_sha256") != receipt["inputSha256"]
             or trace.get("parameter_checksum_after")
             != receipt["parameterChecksumAfter"]
             or int(receipt["inferenceCount"])
             > int(self.counters.get("inference_count", 0))
+            or human_message.get("input_provenance") != receipt.get("inputProvenance")
+            or human_message.get("native_audio_input") != receipt.get("nativeAudioInput")
         ):
             raise RuntimeError("committed chat receipt binding diverged")
         runtime_card = self.runtime_card()
@@ -14080,6 +15334,7 @@ class AdaptiveBrain:
 
     @diagnostic_call
     @slow_snapshot_lifetime
+    @owned_reply
     def chat(
         self,
         text: str,
@@ -14096,10 +15351,17 @@ class AdaptiveBrain:
         temporary_steering_context: Optional[Mapping[str, Any]] = None,
         tool_observation_provider: Optional[Callable[[], Sequence[Mapping[str, Any]]]] = None,
         chat_control_callback: Optional[Callable[[], None]] = None,
+        suspension_check: Optional[Callable[[], bool]] = None,
+        suspend_callback: Optional[Callable[..., Any]] = None,
+        app_input: Optional[Mapping[str, Any]] = None,
+        native_audio_input: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
+        self._activity_now()
         clean = text.replace("\x00", "").strip()
-        if not clean:
+        if not clean and native_audio_input is None:
             raise ValueError("chat input cannot be empty")
+        if native_audio_input is not None and (clean or app_input is not None):
+            raise ValueError("native audio input cannot contain a transcript or App prompt substitute")
         # Current input is never silently suffix-cropped. Older prompt words
         # may yield space while their previously admitted neural/scratch state
         # remains; a message itself larger than the selected window is blocked
@@ -14129,7 +15391,13 @@ class AdaptiveBrain:
 
         cancellation_boundary()
         turn_id = self._validated_chat_turn_id(turn_id)
-        input_sha256 = ""
+        audio_identity = None
+        if native_audio_input is not None:
+            from .native_audio_chat import validate_native_audio_input
+            if not turn_id or cancel_check is None:
+                raise ValueError("native audio requires an owned ordinary transactional turn")
+            audio_identity = validate_native_audio_input(native_audio_input, brain_id=self.brain_id, turn_id=turn_id)
+        input_sha256 = audio_identity["inputSha256"] if audio_identity is not None else ""
         if turn_id:
             candidates = [receipt for receipt in reversed(self.completed_chat_turns)
                           if receipt.get("turnId") == turn_id]
@@ -14137,13 +15405,23 @@ class AdaptiveBrain:
                 # A completed receipt remains idempotent even if the user
                 # reduced context since that turn. Hash in bounded chunks;
                 # this is identity verification, not another neural input.
-                digest = hashlib.sha256()
-                for offset in range(0, len(clean), 16_384):
-                    digest.update(clean[offset:offset + 16_384].encode("utf-8"))
-                input_sha256 = digest.hexdigest()
+                if audio_identity is None:
+                    digest = hashlib.sha256()
+                    for offset in range(0, len(clean), 16_384):
+                        digest.update(clean[offset:offset + 16_384].encode("utf-8"))
+                    input_sha256 = digest.hexdigest()
                 existing_receipt = next((receipt for receipt in candidates
                                          if receipt.get("inputSha256") == input_sha256), None)
                 if existing_receipt is not None:
+                    prior_audio = existing_receipt.get("nativeAudioInput")
+                    if (audio_identity is None) != (prior_audio is None) or prior_audio is not None and prior_audio["input"] != audio_identity:
+                        raise ValueError("completed chat retry has a different audio source")
+                    prior_provenance = existing_receipt.get("inputProvenance")
+                    if (app_input is None) != (prior_provenance is None):
+                        raise ValueError("completed chat retry has a different task source")
+                    if app_input is not None:
+                        from .app_chat_input import validate_native_app_chat_input
+                        validate_native_app_chat_input(self, app_input, clean, prior_provenance=prior_provenance)
                     return self._completed_chat_result(existing_receipt)
         if current_input_tokens + 3 > int(self.config.max_seq_len):
             raise NeuralStateResourcePause(
@@ -14156,12 +15434,30 @@ class AdaptiveBrain:
         if not input_sha256:
             input_sha256 = hashlib.sha256(clean.encode("utf-8")).hexdigest()
         if steer_check is not None and steer_check():
-            # A control admitted before neural work never hashes/copies the
-            # whole substrate or creates a private candidate merely to yield.
+            # Preserve the pre-work yield before parsing any App proof or
+            # consulting its receipt. Nothing was admitted at this boundary.
             return {"brainId": self.brain_id, "turnId": turn_id,
                     "inputSha256": input_sha256, "steered": True,
                     "nativeStopped": False, "zeroTokenYield": True,
                     "turnCommitted": False, "text": "", "response": "", "actions": []}
+        transactional_generation = cancel_check is not None
+        source_admitted_input = self._accepted_input_receipt(turn_id, input_sha256) if transactional_generation and turn_id else None
+        native_audio_receipt = None
+        if source_admitted_input is not None:
+            native_audio_receipt = source_admitted_input.get("nativeAudioInput")
+            if (audio_identity is None) != (native_audio_receipt is None) or native_audio_receipt is not None and native_audio_receipt["input"] != audio_identity:
+                raise ValueError("accepted native audio input differs from this retry")
+        input_provenance = None
+        if app_input is not None:
+            if not transactional_generation or not turn_id:
+                raise ValueError("App follow-up requires an owned ordinary transactional turn")
+            prior_provenance = source_admitted_input.get("inputProvenance") if source_admitted_input is not None else None
+            if source_admitted_input is not None and prior_provenance is None:
+                raise ValueError("App follow-up cannot replace a previously accepted human source")
+            from .app_chat_input import validate_native_app_chat_input
+            input_provenance = validate_native_app_chat_input(self, app_input, clean, prior_provenance=prior_provenance)
+        elif source_admitted_input is not None and source_admitted_input.get("inputProvenance") is not None:
+            raise ValueError("App retry requires its original internal source proof")
         # One exact, checkpointed window gives existing experience a fair
         # cortical turn even during a continuous stream of foreground chats.
         # Resource pressure preserves its cursor; it never fabricates learning
@@ -14198,7 +15494,46 @@ class AdaptiveBrain:
                 ponder_activity_vector = F.normalize(ponder_activity_vector + current, dim=-1).detach()
             ponder_activity_passes += int(observation.get("passes", 0))
 
-        cue = self.memory.vector_for_text(clean)
+        decoded_audio = None
+        if audio_identity is not None:
+            from .native_audio_chat import accepted_audio_cue, encode_native_audio
+            if source_admitted_input is not None:
+                cue, native_audio_receipt = accepted_audio_cue(self, source_admitted_input)
+            else:
+                try:
+                    with encode_native_audio(self, audio_identity, cancelled=lambda: bool(original_cancel_check is not None and original_cancel_check()) or bool(steer_check is not None and steer_check())) as (encoded_cue, decoded_audio):
+                        cue = encoded_cue.detach().clone()
+                except InterruptedError as error:
+                    if original_cancel_check is not None and original_cancel_check():
+                        raise ChatGenerationCancelled("native audio chat input was cancelled before neural admission") from error
+                    if steer_check is not None and steer_check():
+                        return {"brainId": self.brain_id, "turnId": turn_id, "inputSha256": input_sha256,
+                            "steered": True, "nativeStopped": False, "zeroTokenYield": True,
+                            "turnCommitted": False, "text": "", "response": "", "actions": []}
+                    raise
+        else:
+            cue = self.memory.vector_for_text(clean)
+        if (source_admitted_input is None and temporary_input_audit is not None
+                and not temporary_input_audit["freshAttentionDiscarded"] and temporary_steering_context.get("audioInputs")):
+            from .native_audio_chat import encode_native_audio
+            mixed = cue.detach().cpu().float().clone()
+            correction = torch.zeros_like(mixed)
+            for pending_audio in temporary_steering_context["audioInputs"]:
+                try:
+                    with encode_native_audio(self, pending_audio, cancelled=lambda: bool(original_cancel_check is not None and original_cancel_check()) or bool(steer_check is not None and steer_check())) as (pending_cue, _pending_receipt):
+                        increment = pending_cue - correction
+                        updated = mixed + increment
+                        correction = (updated - mixed) - increment
+                        mixed = updated
+                except InterruptedError as error:
+                    if original_cancel_check is not None and original_cancel_check():
+                        raise ChatGenerationCancelled("temporary native audio handoff was cancelled before admission") from error
+                    if steer_check is not None and steer_check():
+                        return {"brainId": self.brain_id, "turnId": turn_id, "inputSha256": input_sha256,
+                            "steered": True, "nativeStopped": False, "zeroTokenYield": True,
+                            "turnCommitted": False, "text": "", "response": "", "actions": []}
+                    raise
+            cue = F.normalize(mixed.reshape(1, -1), dim=-1)[0]
         # Default speech is conditioned by the shared neural substrate and
         # transient working activity. Exact episode keys and the separate
         # sequence-statistical field must not act as an answer database.
@@ -14211,9 +15546,15 @@ class AdaptiveBrain:
         else:
             recalled_vector, recalled = cue, []
         recall_audit = dict(self.memory._last_recall_audit)
-        transactional_generation = cancel_check is not None
-
         def commit_fast_experience() -> Dict[str, Any]:
+            nonlocal native_audio_receipt
+            if audio_identity is not None:
+                from .native_audio_chat import admit_native_audio_experience
+                experience, native_audio_receipt = admit_native_audio_experience(self, audio_identity, cue, decoded_audio, recalled)
+                return experience
+            if input_provenance is not None:
+                from .app_chat_input import admitted_app_chat_experience
+                return admitted_app_chat_experience(self, clean, cue, recalled)
             self.memory.record_recall_activity(recalled)
             return self.learn_experience(
                 clean,
@@ -14224,30 +15565,47 @@ class AdaptiveBrain:
                 importance=0.7,
             )
 
-        admitted_input = self._accepted_input_receipt(turn_id, input_sha256) if transactional_generation and turn_id else None
+        admitted_input = source_admitted_input
         admitted_human_message = None
         if transactional_generation and turn_id:
             if admitted_input is None:
-                experience = commit_fast_experience()
-                admitted_human_message = {"id": uuid.uuid4().hex, "role": "human", "content": clean,
-                    "created_at": _iso_now(), "attention_epoch": self._attention_epoch(), "turn_id": turn_id,
-                    "input_accepted_before_reply": True}
-                self.messages.append(admitted_human_message)
-                job = self._enqueue_chat_slow_learning(turn_id=turn_id, input_sha256=input_sha256,
-                    human_message_id=admitted_human_message["id"], experience=experience) if defer_slow_learning else None
-                admitted_input = {"turnId": turn_id, "inputSha256": input_sha256,
-                    "humanMessageId": admitted_human_message["id"],
-                    "afterimageId": str(experience["memory_settling"].get("afterimageId", "")),
-                    "createdAt": admitted_human_message["created_at"], "attentionEpoch": self._attention_epoch(),
-                    "committed": True, **({"slowJobId": job["jobId"]} if job else {})}
-                self.accepted_chat_inputs = [admitted_input]
-                receipt_key = hashlib.sha256((self.brain_id + "\0" + turn_id + "\0accepted-input-v1").encode()).hexdigest()
-                self.traces.append({"id": receipt_key, "created_at": admitted_human_message["created_at"],
-                    "attention_epoch": self._attention_epoch(), "kind": "chat-input-accepted", "inputAccepted": admitted_input})
-                self._save_observed_neural_boundary(before_checksum, receipt_key)
+                from .connected_transaction import ConnectedExperienceTransaction
+                audio_transaction = ConnectedExperienceTransaction(self) if audio_identity is not None and getattr(self, "_connected_regions", None) is not None else None
+                with audio_transaction if audio_transaction is not None else nullcontext():
+                    experience = commit_fast_experience()
+                    admitted_human_message = {"id": uuid.uuid4().hex, "role": "human", "content": clean,
+                        "created_at": _iso_now(), "attention_epoch": self._attention_epoch(), "turn_id": turn_id,
+                        "input_accepted_before_reply": True,
+                        **({"input_provenance": input_provenance} if input_provenance is not None else {}),
+                        **({"native_audio_input": native_audio_receipt} if native_audio_receipt is not None else {})}
+                    self.messages.append(admitted_human_message)
+                    job = self._enqueue_chat_slow_learning(turn_id=turn_id, input_sha256=input_sha256,
+                        human_message_id=admitted_human_message["id"], experience=experience,
+                        evidence_role="mcp-app" if input_provenance is not None else "human",
+                        input_provenance=input_provenance) if defer_slow_learning and native_audio_receipt is None else None
+                    admitted_input = {"turnId": turn_id, "inputSha256": input_sha256,
+                        "humanMessageId": admitted_human_message["id"],
+                        "afterimageId": str(experience["memory_settling"].get("afterimageId", "")),
+                        "createdAt": admitted_human_message["created_at"], "attentionEpoch": self._attention_epoch(),
+                        "committed": True, **({"slowJobId": job["jobId"]} if job else {}),
+                        **({"inputProvenance": input_provenance} if input_provenance is not None else {}),
+                        **({"nativeAudioInput": native_audio_receipt} if native_audio_receipt is not None else {})}
+                    self.accepted_chat_inputs = [admitted_input]
+                    receipt_key = hashlib.sha256((self.brain_id + "\0" + turn_id + "\0accepted-input-v1").encode()).hexdigest()
+                    self.traces.append({"id": receipt_key, "created_at": admitted_human_message["created_at"],
+                        "attention_epoch": self._attention_epoch(), "kind": "chat-input-accepted", "inputAccepted": admitted_input})
+                    if audio_transaction is not None:
+                        audio_transaction.prepare_publication()
+                    self._save_observed_neural_boundary(before_checksum, receipt_key)
             else:
                 admitted_human_message = self.conversation.payload_by_id("message", admitted_input["humanMessageId"])
-                experience = self._preview_chat_experience(clean, cue, recalled)
+                if native_audio_receipt is not None:
+                    from .native_audio_chat import audio_preview_experience
+                    experience = audio_preview_experience(self, cue, recalled, assembly_id=native_audio_receipt["assemblyId"])
+                else:
+                    experience = self._preview_chat_experience(clean, cue, recalled)
+                experience["memory_settling"] = {"afterimageId": str(admitted_input.get("afterimageId", "")),
+                    "previouslyAdmittedInput": True}
             if stream_callback is not None:
                 stream_callback("input-accepted", dict(admitted_input))
         elif transactional_generation:
@@ -14280,7 +15638,7 @@ class AdaptiveBrain:
         if seed is None:
             seed_material = (
                 "%s:%d:%s"
-                % (self.brain_id, self.counters["inference_count"], clean)
+                % (self.brain_id, self.counters["inference_count"], input_sha256 if native_audio_receipt is not None else clean)
             ).encode("utf-8")
             seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little")
             seed &= 0x7FFFFFFF
@@ -14302,7 +15660,7 @@ class AdaptiveBrain:
             "recentTokenHash": self._token_sequence_hash(
                 self.recent_token_context
             ),
-            "sensorySlots": 0,
+            "sensorySlots": 1 if native_audio_receipt is not None else 0,
             "updatedAt": _iso_now(),
         }
         if not transactional_generation:
@@ -14313,11 +15671,12 @@ class AdaptiveBrain:
             # This is the exact deployed action route: the complete bounded
             # runtime prompt plus the same recalled, working, sensory, and
             # capability-conditioned memory used by generation.
-            routing_output = self.decoder(
-                prompt_ids,
-                memory_bias=internal_memory,
-                use_global_workspace=True,
-            )
+            with reply_stage(self, "routing-forward", pinned=False):
+                routing_output = self.decoder(
+                    prompt_ids,
+                    memory_bias=internal_memory,
+                    use_global_workspace=True,
+                )
             if prompt_ids.shape[1] > 1:
                 routed_ids = prompt_ids[
                     :, -routing_output["logits"].shape[1] :
@@ -14336,12 +15695,13 @@ class AdaptiveBrain:
             language_action_feature = (
                 routing_output["hidden"][:, -1] + 0.5 * action_cue
             )
-            language_action_logits = self.decoder.action_policy(
-                language_action_feature
-            )
-            internal_action_logits = self.decoder.internal_action_policy(
-                action_cue
-            )
+            with reply_stage(self, "action-readout"):
+                language_action_logits = self.decoder.action_policy(
+                    language_action_feature
+                )
+                internal_action_logits = self.decoder.internal_action_policy(
+                    action_cue
+                )
         uncertainties = [
             float(self.memory.concepts[concept_id]["uncertainty"])
             for concept_id in experience["concept_ids"]
@@ -14389,16 +15749,6 @@ class AdaptiveBrain:
             "learningProgress": learning_progress,
             "curiosity": curiosity,
         }
-        ponder_pass_budget = max(
-            1,
-            int(
-                round(
-                    ponder_factors["liquid"]
-                    + 3.0 * compute_demand
-                    + 1.5 * ponder_factors["uncertainty"]
-                )
-            ),
-        )
         organic_noise = max(
             0.005,
             min(
@@ -14429,22 +15779,22 @@ class AdaptiveBrain:
             from .recall_views import RecalledIdSequence
             active_assemblies = RecalledIdSequence(recalled, prefix=str(experience.get("assembly_id", experience["idea_id"])))
             active_assemblies.source_turn_id = turn_id
-            action_scores, proposed_actions = self._select_structured_actions(
-                0.35 * language_action_logits
-                + 0.65 * internal_action_logits,
-                schemas=normalized_tools,
-                input_text=clean,
-                assembly_ids=active_assemblies,
-                organic_state=action_state,
-                supporting_action_logits=(
-                    language_action_logits,
-                    internal_action_logits,
-                ),
-                neural_state=action_cue,
-            )
+            with reply_stage(self, "structured-action-arguments"):
+                action_scores, proposed_actions = self._select_structured_actions(
+                    0.35 * language_action_logits
+                    + 0.65 * internal_action_logits,
+                    schemas=normalized_tools,
+                    input_text=clean,
+                    assembly_ids=active_assemblies,
+                    organic_state=action_state,
+                    supporting_action_logits=(
+                        language_action_logits,
+                        internal_action_logits,
+                    ),
+                    neural_state=action_cue,
+                )
 
-        # Measure only neural selection/decoding (including deterministic
-        # visible-stream replay), not learning committed after the response.
+        # Measure neural selection/decoding, not learning after the response.
         # The measurement is operational state and never model-facing text.
         generation_started_at = time.perf_counter()
         private_generation_steered = False
@@ -14454,6 +15804,7 @@ class AdaptiveBrain:
             "activated_by": "inactive",
             "passes": 0,
             "converged": False,
+            "completed": False,
             "stop_reason": "not-selected",
             "initial_score": float(action_scores.get("ponder", 0.0)),
             "final_delta": 0.0,
@@ -14477,150 +15828,246 @@ class AdaptiveBrain:
             action.get("kind") == "stop" for action in proposed_actions
         ):
             try:
-                internal_memory, native_ponder_trace = self._native_pre_speech_ponder(
-                    combined_memory,
-                    internal_memory,
-                    seed=int(seed),
-                    confidence=float(native_ponder_action.get("confidence", 0.0)),
-                    pass_budget=ponder_pass_budget,
-                    resource_budget_ms=max(
-                        250, min(10_000, int(500 + 3500 * compute_demand))
-                    ),
-                    noise=organic_noise,
-                    cancel_check=cancel_check,
-                )
+                with reply_stage(self, "voluntary-ponder"):
+                    internal_memory, native_ponder_trace = self._native_pre_speech_ponder(
+                        combined_memory,
+                        internal_memory,
+                        seed=int(seed),
+                        confidence=float(native_ponder_action.get("confidence", 0.0)),
+                        noise=organic_noise,
+                        cancel_check=cancel_check, steer_check=steer_check,
+                        progress_callback=(lambda progress: stream_callback("cognition-progress", progress)) if stream_callback is not None else None,
+                    )
                 observe_self_activity(internal_memory, native_ponder_trace)
             except Exception:
                 self.decoder.train(decoder_training_before_generation)
                 raise
             ponder_steps = int(native_ponder_trace["passes"])
             arguments = native_ponder_action.setdefault("arguments", {})
-            arguments["completedInTurn"] = True
+            arguments["handledInTurn"] = True
+            arguments["completedInTurn"] = native_ponder_trace["completed"]
             arguments["ponderTrace"] = dict(native_ponder_trace)
-        # Candidate computation has no fixed "parallel thoughts" or
-        # hardware branch ceiling. Neural energy is derived from the
-        # current organic state and working workspace, then spent until
-        # activity converges or the host reserve reports pressure.
-        remaining_neural_energy = max(
-            1.0,
-            1.0
-            + compute_demand
-            * (1.0 + math.log2(max(2, self.config.working_memory_slots))),
-        )
-        branch = 0
-        best_score = -float("inf")
-        score_change = float("inf")
-        while remaining_neural_energy > 0.0:
+            if native_ponder_trace["completed"] and ponder_steps > 0:
+                with reply_stage(self, "ponder-self-report"):
+                    report = decode_ponder_self_report(
+                        self.decoder, internal_memory, phase="pre-speech",
+                        max_output_bytes=max(1, int(self.config.max_seq_len)),
+                        cancelled=cancel_check,
+                    )
+                if report is not None:
+                    arguments[PONDER_REPORT_CANDIDATE] = report
+        # Voluntary latent Ponder is independent from optional multi-candidate
+        # search. With Best Work off, the first ordinary decode always streams.
+        initial_search_entropy = 0.
+        search_wanted = self.config.best_work_enabled
+        if search_wanted:
+            from .best_work import exploration_target
+            probabilities = F.softmax(routing_output["logits"][:, -1].detach().float(), dim=-1)
+            initial_search_entropy = float((-(probabilities * probabilities.clamp_min(1e-45).log()).sum(dim=-1)).mean()) / math.log(probabilities.shape[-1])
+            search_wanted = exploration_target(initial_search_entropy, self.config.best_work_exploration_branches) > 0
+        single_pass_generation = not search_wanted
+        best_work_trace: Dict[str, Any] = {"enabled": self.config.best_work_enabled, "searchActivated": search_wanted,
+            "normalizedRoutingEntropy": initial_search_entropy if self.config.best_work_enabled else None}
+        best_work_selected = 0
+        live_generation_ledger: Optional[NativeActionEmissionLedger] = None
+        streamed_token_count = 0
+        first_stream_sample: Optional[Tuple[float, int]] = None
+
+        def stream_token(token: torch.Tensor, step: int, entropy: float) -> None:
+            nonlocal streamed_token_count, first_stream_sample
+            if stream_callback is None:
+                return
+            token_ids = token.reshape(-1).tolist()
+            streamed_token_count += len(token_ids)
+            now = time.perf_counter()
+            if first_stream_sample is None:
+                first_stream_sample = (now, streamed_token_count)
+            elapsed = max(0.0, now - first_stream_sample[0])
+            stream_callback("token", {
+                "delta": self.tokenizer.decode(token_ids),
+                "step": int(step), "entropy": float(entropy),
+                "outputTokens": streamed_token_count,
+                "outputElapsedMs": elapsed * 1000.0,
+                "tokensPerSecond": ((streamed_token_count - first_stream_sample[1]) / elapsed
+                    if elapsed > 0.0 else None),
+            })
+
+        def suspend_visible_generation(cursor, values, *, ledger, activity, organic, initial, phase):
+            from .chat_continuation import final_context
+            if suspend_callback is None:
+                cursor.close()
+                raise RuntimeError("native suspension has no durable checkpoint owner")
+            context = final_context(values)
+            # A monotonic timestamp is process-local. Persist elapsed active
+            # computation, excluding the subsequent unloaded interval.
+            elapsed = max(0., time.perf_counter() - generation_started_at)
+            stream_elapsed = max(0., time.perf_counter() - first_stream_sample[0]) if first_stream_sample is not None else 0.
+            continuation = {"format": "omni-visible-chat-continuation", "version": 1,
+                "phase": phase, "ledger": ledger.suspension_state(), "activity": activity.suspension_state(),
+                "organic": organic, "initialActions": initial, "actionCue": action_cue,
+                "generationElapsedSeconds": elapsed, "streamedTokens": streamed_token_count,
+                "streamElapsedSeconds": stream_elapsed,
+                "firstStreamTokens": first_stream_sample[1] if first_stream_sample is not None else 0}
+            try:
+                return suspend_callback(context, cursor, continuation)
+            finally:
+                cursor.close()
+                self.decoder.train(decoder_training_before_generation)
+
+        if single_pass_generation:
             cancellation_boundary()
-            branch_seed = int(seed) + branch * 7919
+            branch_seed = int(seed)
             branch_ledger = NativeActionEmissionLedger(turn_id)
             initial_actions = copy.deepcopy(proposed_actions)
             branch_organic = dict(action_state)
             for action in initial_actions:
-                branch_ledger.register(action, step=-1, phase="pre-speech")
+                registered = branch_ledger.register(action, step=-1, phase="pre-speech")
+                if stream_callback is not None and registered is not None:
+                    emit_registered_action(stream_callback, registered)
             branch_activity = self._generation_activity_callback(
                 schemas=normalized_tools, input_text=clean,
                 assembly_ids=active_assemblies, organic_state=branch_organic,
                 action_cue=action_cue, ledger=branch_ledger,
-                seed=branch_seed, cancel_check=cancel_check,
+                seed=branch_seed, cancel_check=cancel_check, steer_check=steer_check,
+                emit=stream_callback, self_activity_observer=observe_self_activity,
             )
-            candidate, branch_entropies = self.decoder.generate(
-                prompt_ids,
-                memory_bias=internal_memory,
-                max_new_tokens=generation_tokens,
-                temperature=self.config.temperature,
-                top_k=self.config.top_k,
-                noise=organic_noise * (1.0 + 0.04 * ponder_steps),
-                seed=branch_seed,
-                printable_only=True,
-                cancelled=cancel_check,
-                steer_check=steer_check,
-                activity_callback=branch_activity,
-            )
+            try:
+                candidate, branch_entropies = self.decoder.generate(
+                    prompt_ids,
+                    memory_bias=internal_memory,
+                    max_new_tokens=generation_tokens,
+                    temperature=self.config.temperature,
+                    top_k=self.config.top_k,
+                    noise=organic_noise * (1.0 + 0.04 * ponder_steps),
+                    seed=branch_seed,
+                    printable_only=True,
+                    cancelled=cancel_check,
+                    steer_check=steer_check,
+                    activity_callback=branch_activity,
+                    token_callback=stream_token if stream_callback is not None else None,
+                    conditioning_callback=self._generation_observation_callback(tool_observation_provider)
+                        if tool_observation_provider is not None else None,
+                    suspension_check=suspension_check,
+                    allow_cached_execution=True,
+                    cached_cancelled=lambda: bool(original_cancel_check is not None and original_cancel_check())
+                        or bool(steer_check is not None and steer_check()) or bool(suspension_check is not None and suspension_check()),
+                )
+            except NativeGenerationSuspended as suspended:
+                return suspend_visible_generation(suspended.cursor, locals(), ledger=branch_ledger, activity=branch_activity,
+                    organic=branch_organic, initial=initial_actions, phase="single-pass")
             cancellation_boundary()
-            if getattr(self.decoder, "last_generation_stop_reason", "") == "steered":
-                # Candidate tokens were private computation, never delivered.
-                # Hand an exact zero-visible-token outcome to the receipt path.
-                private_generation_steered = True
-                candidates.append({
-                    "tensor": prompt_ids, "entropies": [], "seed": branch_seed,
-                    "selfNll": 0.0, "entropy": 0.0, "score": 0.0,
-                    "backend": "mutable-omni-decoder", "privateSteered": True,
-                    "initialActions": [], "activityActions": [],
-                    "activityOrganic": branch_organic,
-                })
-                break
-            nll = self._candidate_nll(
-                prompt_ids, candidate, internal_memory
-            )
             entropy = (
                 sum(branch_entropies) / len(branch_entropies)
                 if branch_entropies
                 else 0.0
-            )
-            intrinsic_score = (
-                -(1.0 + 0.35 * (1.0 - uncertainty)) * nll
-                + curiosity * entropy * 0.08
-                + novelty
-                * min(candidate.shape[1] - prompt_ids.shape[1], 32)
-                / 320.0
             )
             candidates.append(
                 {
                     "tensor": candidate,
                     "entropies": branch_entropies,
                     "seed": branch_seed,
-                    "selfNll": nll,
+                    "selfNll": None,
                     "entropy": entropy,
-                    "score": intrinsic_score,
+                    "score": None,
+                    "temperature": self.config.temperature,
                     "backend": "mutable-omni-decoder",
                     "initialActions": initial_actions,
                     "activityActions": list(branch_ledger.actions.values()),
                     "activityOrganic": branch_organic,
                 }
             )
-            improvement = intrinsic_score - best_score
-            score_change = (
-                abs(improvement) if math.isfinite(best_score) else float("inf")
-            )
-            best_score = max(best_score, intrinsic_score)
-            normalized_entropy = max(0.0, min(4.0, entropy)) / 4.0
-            remaining_neural_energy -= (
-                1.0
-                + 0.35 * normalized_entropy
-                + 0.20 * max(0.0, 1.0 - compute_demand)
-            )
-            branch += 1
-            convergence_floor = 0.0025 * (1.0 + abs(best_score))
-            if len(candidates) > 1 and score_change <= convergence_floor:
-                break
-            readings = self._resource_readings()
-            disk_free = readings.get("diskFreeBytes")
-            memory_free = readings.get("availableMemoryBytes")
-            if (
-                isinstance(disk_free, int)
-                and disk_free <= 512 * 1024 * 1024
-            ) or (
-                isinstance(memory_free, int)
-                and memory_free <= 384 * 1024 * 1024
-            ):
-                break
+            live_generation_ledger = branch_ledger
+        else:
+            from .best_work import run_best_work
+            from .cooperative_generation import CooperativeNativeGeneration
+
+            def start_branch(specification):
+                # Shared weights are not copied. This lease covers candidate
+                # tokens/ledgers; each private native cache separately uses the
+                # existing working-state pager's real allocation admission.
+                charge = 65536 + 4 * (prompt_ids.numel() + generation_tokens) * prompt_ids.element_size() + internal_memory.numel() * 16
+                try:
+                    lease = self.resource_policy.reserve_ram(charge, "Best Work branch state")
+                except NeuralStateResourcePause:
+                    if specification.ordinary:
+                        raise
+                    return None
+                try:
+                    ledger = NativeActionEmissionLedger(turn_id)
+                    initial = copy.deepcopy(proposed_actions)
+                    organic = dict(action_state)
+                    for action in initial:
+                        ledger.register(action, step=-1, phase="pre-speech")
+                    activity = self._generation_activity_callback(
+                        schemas=normalized_tools, input_text=clean, assembly_ids=active_assemblies,
+                        organic_state=organic, action_cue=action_cue, ledger=ledger,
+                        seed=specification.seed, cancel_check=cancel_check, steer_check=steer_check,
+                        progress_callback=(lambda progress: stream_callback("cognition-progress", {
+                            "phase": "best-work", "active": True, "branch": specification.index,
+                            "ordinary": specification.ordinary, "passes": progress.get("passes", 0),
+                            "elapsedMs": progress.get("elapsedMs", 0.), "concurrency": "cooperative-interleaved",
+                        })) if stream_callback is not None else None,
+                    )
+                    session = CooperativeNativeGeneration(self.decoder, prompt_ids,
+                        memory_bias=internal_memory, max_new_tokens=generation_tokens,
+                        temperature=specification.temperature, top_k=self.config.top_k,
+                        noise=organic_noise * (1.0 + .04 * ponder_steps), seed=specification.seed,
+                        printable_only=True, cancelled=cancel_check, steer_check=steer_check,
+                        activity_callback=activity)
+                    return session, {"ledger": ledger, "initial": initial, "organic": organic}, lease.release
+                except BaseException:
+                    lease.release()
+                    raise
+
+            def finish_branch(specification, session, metadata):
+                tensor, entropies = session.result
+                return {"tensor": tensor, "entropies": entropies, "seed": specification.seed,
+                    "selfNll": -session.mean_log_probability if session.mean_log_probability is not None else None,
+                    "entropy": sum(entropies) / len(entropies) if entropies else 0.,
+                    "backend": "mutable-omni-decoder", "initialActions": metadata["initial"],
+                    "activityActions": list(metadata["ledger"].actions.values()), "activityOrganic": metadata["organic"],
+                    "text": self.tokenizer.decode(tensor[0, prompt_ids.shape[1]:].detach().cpu().tolist()),
+                    "structuralChecks": [{"kind": "tool-argument-schema", "toolId": action.get("toolId"),
+                        "passed": self._materialized_tool_action_matches_schema(normalized_tools, action)}
+                        for action in metadata["ledger"].actions.values() if action.get("kind") == "tool"],
+                    "nativeStopReason": session.stop_reason}
+
+            searched = run_best_work(seed=int(seed), ordinary_temperature=self.config.temperature,
+                normalized_entropy=initial_search_entropy, exploration_budget=self.config.best_work_exploration_branches,
+                start=start_branch, finish=finish_branch,
+                cancelled=cancel_check or (lambda: False), steered=steer_check or (lambda: False),
+                progress=(lambda progress: stream_callback("cognition-progress", progress)) if stream_callback is not None else None)
+            cancellation_boundary()
+            best_work_trace.update({key: value for key, value in searched.items() if key != "candidates"})
+            if searched["interrupted"] == "steered":
+                private_generation_steered = True
+                self.decoder.last_generation_stop_reason = "steered"
+                candidates = [{"tensor": prompt_ids, "entropies": [], "seed": int(seed),
+                    "selfNll": None, "entropy": 0., "score": None, "temperature": self.config.temperature,
+                    "backend": "mutable-omni-decoder", "initialActions": [], "activityActions": [],
+                    "activityOrganic": dict(action_state), "privateSteered": True}]
+            else:
+                candidates = searched["candidates"]
+                best_work_selected = searched["selected"]
+                for candidate in candidates:
+                    candidate["score"] = candidate["uncalibratedSupport"]
         branch_count = len(candidates)
         action_state["branches"] = branch_count
-        with torch.no_grad():
-            action_scores, proposed_actions = self._select_structured_actions(
-                0.35 * language_action_logits
-                + 0.65 * internal_action_logits,
-                schemas=normalized_tools,
-                input_text=clean,
-                assembly_ids=active_assemblies,
-                organic_state=action_state,
-                supporting_action_logits=(
-                    language_action_logits,
-                    internal_action_logits,
-                ),
-                neural_state=action_cue,
-            )
+        if not single_pass_generation:
+            with torch.no_grad(), reply_stage(self, "branch-action-arguments"):
+                action_scores, proposed_actions = self._select_structured_actions(
+                    0.35 * language_action_logits
+                    + 0.65 * internal_action_logits,
+                    schemas=normalized_tools,
+                    input_text=clean,
+                    assembly_ids=active_assemblies,
+                    organic_state=action_state,
+                    supporting_action_logits=(
+                        language_action_logits,
+                        internal_action_logits,
+                    ),
+                    neural_state=action_cue,
+                )
         if native_ponder_action is not None and native_ponder_trace["activated"]:
             # The final branch-aware materialization must preserve the
             # already completed action, not schedule post-response idle
@@ -14630,17 +16077,16 @@ class AdaptiveBrain:
                 if action.get("kind") != "ponder"
             ]
             proposed_actions.append(native_ponder_action)
-        selected_branch = len(candidates) - 1 if private_generation_steered else max(
-            range(len(candidates)),
-            key=lambda index: candidates[index]["score"],
-        )
+        selected_branch = 0 if single_pass_generation or private_generation_steered else best_work_selected
         selected = candidates[selected_branch]
         generated = selected["tensor"]
         entropies = selected["entropies"]
-        emission_ledger = NativeActionEmissionLedger(turn_id)
+        if not single_pass_generation and not private_generation_steered:
+            self.decoder.last_generation_stop_reason = selected.get("nativeStopReason", "unknown")
+        emission_ledger = live_generation_ledger or NativeActionEmissionLedger(turn_id)
         proposed_actions = [] if private_generation_steered else list(selected["activityActions"])
 
-        if stream_callback is not None and not private_generation_steered:
+        if stream_callback is not None and not private_generation_steered and not single_pass_generation:
             for action in selected["initialActions"]:
                 if steer_check is not None and steer_check():
                     private_generation_steered = True
@@ -14650,28 +16096,7 @@ class AdaptiveBrain:
                 registered = emission_ledger.register(action, step=-1, phase="pre-speech")
                 if registered is None:
                     continue
-                stream_callback(
-                    "action",
-                    {
-                        "actionId": registered["actionId"],
-                        "action": registered,
-                    },
-                )
-
-            def stream_token(
-                token: torch.Tensor, step: int, entropy: float
-            ) -> None:
-                token_ids = token.reshape(-1).tolist()
-                delta = self.tokenizer.decode(token_ids)
-                if delta:
-                    stream_callback(
-                        "token",
-                        {
-                            "delta": delta,
-                            "step": int(step),
-                            "entropy": float(entropy),
-                        },
-                    )
+                emit_registered_action(stream_callback, registered)
 
             # Candidate selection remains private neural computation.
             # Replay the chosen deterministic branch once so the visible
@@ -14682,25 +16107,30 @@ class AdaptiveBrain:
                 organic_state=selected["activityOrganic"],
                 action_cue=action_cue, ledger=emission_ledger,
                 seed=int(selected["seed"]), emit=stream_callback,
-                cancel_check=cancel_check,
+                cancel_check=cancel_check, steer_check=steer_check,
                 self_activity_observer=observe_self_activity,
             )
-            replayed, replay_entropies = (prompt_ids, []) if private_generation_steered else self.decoder.generate(
-                prompt_ids,
-                memory_bias=internal_memory,
-                max_new_tokens=generation_tokens,
-                temperature=self.config.temperature,
-                top_k=self.config.top_k,
-                noise=organic_noise * (1.0 + 0.04 * ponder_steps),
-                seed=int(selected["seed"]),
-                printable_only=True,
-                token_callback=stream_token,
-                cancelled=cancel_check,
-                activity_callback=replay_activity,
-                steer_check=steer_check,
-                conditioning_callback=self._generation_observation_callback(tool_observation_provider)
-                    if tool_observation_provider is not None else None,
-            )
+            try:
+                replayed, replay_entropies = (prompt_ids, []) if private_generation_steered else self.decoder.generate(
+                    prompt_ids,
+                    memory_bias=internal_memory,
+                    max_new_tokens=generation_tokens,
+                    temperature=selected["temperature"],
+                    top_k=self.config.top_k,
+                    noise=organic_noise * (1.0 + 0.04 * ponder_steps),
+                    seed=int(selected["seed"]),
+                    printable_only=True,
+                    token_callback=stream_token,
+                    cancelled=cancel_check,
+                    activity_callback=replay_activity,
+                    steer_check=steer_check,
+                    conditioning_callback=self._generation_observation_callback(tool_observation_provider)
+                        if tool_observation_provider is not None else None,
+                    suspension_check=suspension_check,
+                )
+            except NativeGenerationSuspended as suspended:
+                return suspend_visible_generation(suspended.cursor, locals(), ledger=emission_ledger, activity=replay_activity,
+                    organic=selected["activityOrganic"], initial=selected["initialActions"], phase="selected-replay")
             cancellation_boundary()
             observation_uses = list(getattr(self.decoder, "last_generation_tool_observations", []))
             comparison_end = prompt_ids.shape[1] + min((int(item["generationStep"]) for item in observation_uses),
@@ -14714,6 +16144,175 @@ class AdaptiveBrain:
             generated = replayed
             entropies = replay_entropies
             proposed_actions = list(emission_ledger.actions.values())
+
+        from .chat_continuation import final_context
+        with reply_stage(self, "reply-finalization"):
+            return self._finish_chat_continuation(final_context(locals()), stream_callback=stream_callback, cancel_check=cancel_check)
+
+    @diagnostic_call
+    @slow_snapshot_lifetime
+    def resume_chat(self, payload, *, stream_callback=None, cancel_check=None, steer_check=None,
+                    tool_observation_provider=None, chat_control_callback=None,
+                    suspension_check=None, suspend_callback=None):
+        """Continue a verified token frontier, never readmit/replay its input."""
+        from .generation_cursor import NativeGenerationSuspended, NativeGenerationCursor
+        from .recall_views import RecalledIdSequence
+        context, cursor, continuation = payload["context"], payload["cursor"], payload["continuation"]
+        if (not isinstance(cursor, NativeGenerationCursor) or not isinstance(context, dict)
+                or continuation.get("format") != "omni-visible-chat-continuation" or continuation.get("version") != 1
+                or continuation.get("phase") not in {"single-pass", "selected-replay"}):
+            raise ValueError("unsupported native chat continuation")
+        turn_id = self._validated_chat_turn_id(context["turn_id"])
+        from .native_audio_chat import observed_input_sha256
+        source_message = context.get("admitted_human_message") or {"content": context["clean"]}
+        if observed_input_sha256(source_message) != context["input_sha256"]:
+            raise ValueError("native continuation lost its admitted input identity")
+        from .execution_rng import restore_execution_rng
+        restore_execution_rng(payload["globalRng"], self.device)
+        self._activity_now()
+        ledger = NativeActionEmissionLedger.from_suspension_state(continuation["ledger"], turn_id)
+        assemblies = RecalledIdSequence(context["recalled"], prefix=str(context["experience"].get("assembly_id", context["experience"]["idea_id"])))
+        assemblies.source_turn_id = turn_id
+        original_cancel = cancel_check
+        def checked_cancel():
+            if chat_control_callback is not None:
+                chat_control_callback()
+            pressure = getattr(self.resource_policy, "check_active_pressure", None)
+            if callable(pressure):
+                pressure("chat", reclaim=self._release_training_allocator_cache)
+            return bool(original_cancel is not None and original_cancel())
+        cancel_check = checked_cancel
+        def observe(vector, observation):
+            prior = context["ponder_activity_vector"]
+            current = vector.detach()
+            context["ponder_activity_vector"] = current.clone() if prior is None else F.normalize(prior + current, dim=-1).detach()
+            context["ponder_activity_passes"] += int(observation.get("passes", 0))
+        activity = self._generation_activity_callback(schemas=context["normalized_tools"], input_text=context["clean"],
+            assembly_ids=assemblies, organic_state=continuation["organic"], action_cue=continuation["actionCue"], ledger=ledger,
+            seed=cursor.options["seed"], cancel_check=cancel_check, steer_check=steer_check,
+            emit=stream_callback, self_activity_observer=observe, continuation_state=continuation["activity"])
+        started = time.perf_counter()
+        context["generation_started_at"] = started - continuation["generationElapsedSeconds"]
+        streamed = continuation["streamedTokens"]
+        first_tokens = continuation["firstStreamTokens"]
+        def stream_token(token, step, entropy):
+            nonlocal streamed, first_tokens
+            if stream_callback is None:
+                return
+            ids = token.reshape(-1).tolist()
+            streamed += len(ids)
+            elapsed = continuation["streamElapsedSeconds"] + max(0., time.perf_counter() - started)
+            if first_tokens == 0:
+                first_tokens = streamed
+            stream_callback("token", {"delta": self.tokenizer.decode(ids), "step": int(step), "entropy": float(entropy),
+                "outputTokens": streamed, "outputElapsedMs": elapsed * 1000.,
+                "tokensPerSecond": (streamed - first_tokens) / elapsed if elapsed > 0 else None})
+        try:
+            generated, entropies = self.decoder.generate(context["prompt_ids"],
+                memory_bias=cursor.memory_bias, max_new_tokens=cursor.token_budget,
+                temperature=cursor.options["temperature"], top_k=cursor.options["top_k"], noise=cursor.options["noise"],
+                seed=cursor.options["seed"], printable_only=cursor.options["printable_only"], use_cache=cursor.options["use_cache"],
+                cancelled=cancel_check, steer_check=steer_check, activity_callback=activity,
+                token_callback=stream_token if stream_callback is not None else None,
+                conditioning_callback=self._generation_observation_callback(tool_observation_provider) if tool_observation_provider is not None else None,
+                suspension_check=suspension_check, resume_cursor=cursor)
+        except NativeGenerationSuspended as suspended:
+            if suspend_callback is None:
+                suspended.cursor.close()
+                raise RuntimeError("native re-suspension has no durable checkpoint owner")
+            continuation = {**continuation, "ledger": ledger.suspension_state(), "activity": activity.suspension_state(),
+                "generationElapsedSeconds": max(0., time.perf_counter() - context["generation_started_at"]),
+                "streamedTokens": streamed, "firstStreamTokens": first_tokens,
+                "streamElapsedSeconds": continuation["streamElapsedSeconds"] + max(0., time.perf_counter() - started)}
+            try:
+                return suspend_callback(context, suspended.cursor, continuation)
+            finally:
+                suspended.cursor.close()
+                self.decoder.train(context["decoder_training_before_generation"])
+        context["generated"], context["entropies"] = generated, entropies
+        context["proposed_actions"] = list(ledger.actions.values())
+        if continuation["phase"] == "single-pass":
+            context["action_state"]["branches"] = 1
+            context["selected_branch"] = 0
+            context["candidates"] = [{"tensor": generated, "entropies": entropies, "seed": cursor.options["seed"],
+                "selfNll": None, "entropy": sum(entropies) / len(entropies) if entropies else 0., "score": None,
+                "temperature": cursor.options["temperature"], "backend": "mutable-omni-decoder",
+                "initialActions": continuation["initialActions"], "activityActions": list(ledger.actions.values()),
+                "activityOrganic": continuation["organic"]}]
+        else:
+            selected = context["candidates"][context["selected_branch"]]
+            observations = list(getattr(self.decoder, "last_generation_tool_observations", []))
+            end = context["prompt_ids"].shape[1] + min((int(item["generationStep"]) for item in observations),
+                default=max(generated.shape[1], selected["tensor"].shape[1]))
+            matches = torch.equal(generated[:, :end], selected["tensor"][:, :end]) if observations else torch.equal(generated, selected["tensor"])
+            if self.decoder.last_generation_stop_reason != "steered" and not matches:
+                raise RuntimeError("deterministic selected-branch resume diverged")
+        return self._finish_chat_continuation(context, stream_callback=stream_callback, cancel_check=cancel_check)
+
+    def _finish_chat_continuation(self, context, *, stream_callback=None, cancel_check=None):
+        """One finalization implementation for uninterrupted and restored turns."""
+        action_scores = context['action_scores']
+        action_state = context['action_state']
+        admitted_human_message = context['admitted_human_message']
+        admitted_input = context['admitted_input']
+        before_checksum = context['before_checksum']
+        before_parameters = context['before_parameters']
+        best_work_trace = context['best_work_trace']
+        candidates = context['candidates']
+        clean = context['clean']
+        cue = context['cue']
+        decision_prediction_loss = context['decision_prediction_loss']
+        decoder_training_before_generation = context['decoder_training_before_generation']
+        defer_slow_learning = context['defer_slow_learning']
+        entropies = context['entropies']
+        experience = context['experience']
+        expert_route = context['expert_route']
+        generated = context['generated']
+        generation_budget = context['generation_budget']
+        generation_started_at = context['generation_started_at']
+        generation_tokens = context['generation_tokens']
+        input_sha256 = context['input_sha256']
+        input_provenance = admitted_human_message.get("input_provenance") if isinstance(admitted_human_message, Mapping) else None
+        native_audio_receipt = admitted_human_message.get("native_audio_input") if isinstance(admitted_human_message, Mapping) else None
+        internal_action_logits = context['internal_action_logits']
+        language_action_logits = context['language_action_logits']
+        native_ponder_trace = context['native_ponder_trace']
+        normalized_tools = context['normalized_tools']
+        pending_current_context = context['pending_current_context']
+        ponder_activity_passes = context['ponder_activity_passes']
+        ponder_activity_vector = context['ponder_activity_vector']
+        ponder_factors = context['ponder_factors']
+        ponder_steps = context['ponder_steps']
+        prior_replay = context['prior_replay']
+        private_generation_steered = context['private_generation_steered']
+        prompt_ids = context['prompt_ids']
+        prompt_token_hash = context['prompt_token_hash']
+        proposed_actions = context['proposed_actions']
+        recall_audit = context['recall_audit']
+        recalled = context['recalled']
+        recalled_vector = context['recalled_vector']
+        recent_prompt_tokens = context['recent_prompt_tokens']
+        response_boundary_checksum = context['response_boundary_checksum']
+        seed = context['seed']
+        selected_branch = context['selected_branch']
+        single_pass_generation = context['single_pass_generation']
+        temporary_input_audit = context['temporary_input_audit']
+        tool_model = context['tool_model']
+        transactional_generation = context['transactional_generation']
+        turn_id = context['turn_id']
+        working_memory_used = context['working_memory_used']
+        working_model = context['working_model']
+
+        def cancellation_boundary():
+            pressure = getattr(getattr(self, "resource_policy", None), "check_active_pressure", None)
+            if callable(pressure):
+                pressure("chat", reclaim=self._release_training_allocator_cache)
+            if cancel_check is not None and cancel_check():
+                raise ChatGenerationCancelled("chat generation was cancelled")
+
+        def commit_fast_experience():
+            self.memory.record_recall_activity(recalled)
+            return self.learn_experience(clean, kind="experience", source="conversation", source_label="chat", steps=0, importance=0.7)
 
         new_ids = generated[
             0, prompt_ids.shape[1] :
@@ -14826,6 +16425,7 @@ class AdaptiveBrain:
         action_calibration = None
         slow_mutation_requested = bool(
             not defer_slow_learning
+            and native_audio_receipt is None
             and self.config.online_learning
             and int(self.config.online_steps) > 0
         )
@@ -14985,6 +16585,15 @@ class AdaptiveBrain:
         after_checksum = self.parameter_checksum()
         delta_norm = self._parameter_delta_norm(before_parameters)
         self.counters["inference_count"] += 1
+        ponder_self_reports: List[Dict[str, Any]] = []
+        seen_ponder_reports = set()
+        for action in proposed_actions:
+            if not isinstance(action, dict) or action.get("kind") != "ponder":
+                continue
+            report = finalize_registered_action(action)
+            if report is not None and report["id"] not in seen_ponder_reports:
+                seen_ponder_reports.add(report["id"])
+                ponder_self_reports.append(report)
         now = _iso_now()
         user_message = admitted_human_message or {
             "id": uuid.uuid4().hex,
@@ -15001,6 +16610,7 @@ class AdaptiveBrain:
             "created_at": _iso_now(),
             "attention_epoch": self._attention_epoch(),
             **({"turn_id": turn_id} if turn_id else {}),
+            **({"ponder_self_reports": copy.deepcopy(ponder_self_reports)} if ponder_self_reports else {}),
         }
         if disposition:
             if admitted_human_message is None:
@@ -15016,7 +16626,9 @@ class AdaptiveBrain:
                 input_sha256=input_sha256,
                 human_message_id=str(user_message["id"]),
                 experience=experience,
-            )
+                evidence_role="mcp-app" if input_provenance is not None else "human",
+                input_provenance=input_provenance,
+            ) if native_audio_receipt is None else None
             if queued_slow_learning is not None:
                 slow_mutation_requested = True
                 slow_mutation_stage = "queued-background"
@@ -15152,8 +16764,8 @@ class AdaptiveBrain:
                 {
                     "stage": "slow-adaptation",
                     "detail": (
-                        "Updated ternary decoder and idea-adapter master "
-                        "parameters and committed the validated transaction."
+                        "Updated native ternary decoder and idea-adapter "
+                        "connections and committed the validated transaction."
                         if slow_mutation_applied
                         else (
                             "Queued this fast episode for priority-driven "
@@ -15389,6 +17001,7 @@ class AdaptiveBrain:
                 getattr(self.decoder, "last_generation_cache_mode", "unknown")
             ),
             "ponder": dict(native_ponder_trace),
+            "ponder_self_reports": copy.deepcopy(ponder_self_reports),
             "ponder_steps": ponder_steps,
             "ponder_factors": ponder_factors,
             "organic_state": action_state,
@@ -15425,13 +17038,19 @@ class AdaptiveBrain:
                     "seed": candidate["seed"],
                     "selfNll": candidate["selfNll"],
                     "entropy": candidate["entropy"],
-                    "intrinsicScore": candidate["score"],
+                    "selectionSupport": candidate["score"],
+                    "temperature": candidate.get("temperature"),
+                    "ordinary": candidate.get("ordinary", single_pass_generation),
+                    "agreement": candidate.get("agreement"),
+                    "verification": candidate.get("verification"),
                     "backend": candidate.get("backend"),
                     "quality": candidate.get("quality"),
                 }
                 for index, candidate in enumerate(candidates)
             ],
             "selected_branch": selected_branch,
+            "single_pass_generation": single_pass_generation,
+            "best_work": best_work_trace,
             "mechanism_order": "event-derived-unordered",
             "steps": measured_mechanisms,
             "note": (
@@ -15469,6 +17088,8 @@ class AdaptiveBrain:
                     trace["parameter_checksum_after"]
                 ),
                 "committedAt": _iso_now(),
+                **({"inputProvenance": input_provenance} if input_provenance is not None else {}),
+                **({"nativeAudioInput": native_audio_receipt} if native_audio_receipt is not None else {}),
             }
             self.completed_chat_turns.append(turn_receipt)
             if no_reply:
@@ -15572,6 +17193,7 @@ class AdaptiveBrain:
                 if hasattr(module, "_pending_stability_events"):
                     module._pending_stability_events = 0
 
+    @outer_learning_phase("slow-candidate")
     def train(
         self,
         texts: Optional[Sequence[str]] = None,
@@ -15713,6 +17335,7 @@ class AdaptiveBrain:
                     group = list(itertools.islice(units, effective_batch))
                     if not group:
                         break
+                    self._check_neural_learning_boundary("slow-training-wave")
                     next_checkpoint_bytes = int(
                         training_plan.get("scratch", {}).get(
                             "estimatedCheckpointBytes", 0
@@ -15730,6 +17353,7 @@ class AdaptiveBrain:
                         self._ensure_optimizer_resident()
                     optimizer.zero_grad(set_to_none=True)
                     for micro_batch in micro_batches:
+                        self._check_neural_learning_boundary("slow-training-microbatch")
                         token_windows = [
                             item[0] for item in micro_batch
                         ]
@@ -15871,6 +17495,7 @@ class AdaptiveBrain:
             "metrics": self.metrics(),
         }
 
+    @outer_learning_phase("evolution-replay")
     def _train_evolution_replay_candidate(
         self, steps: int = 4, progress: Optional[Any] = None
     ) -> Dict[str, Any]:
@@ -15926,6 +17551,7 @@ class AdaptiveBrain:
         )
         try:
             for index in range(steps):
+                self._check_neural_learning_boundary("evolution-replay-step")
                 self.resource_policy.require_disk(0, "evolution replay")
                 target = self.replay[index % len(self.replay)].to(self.device).reshape(1, -1)
                 optimizer.zero_grad(set_to_none=True)
@@ -16795,10 +18421,7 @@ class AdaptiveBrain:
             value = value.unsqueeze(0)
         if value.shape[-1] != self.config.idea_dim:
             raise ValueError("sensory embedding dimensions do not match idea space")
-        ternary = self.memory_bridge.effective_weight().to(
-            self.device, dtype=torch.float32
-        )
-        lifted = value.mean(dim=0, keepdim=True) @ ternary
+        lifted = self.memory_bridge.transpose_projection(value.mean(dim=0, keepdim=True))
         lifted = lifted[0].detach().cpu()
         if not bool(torch.isfinite(lifted).all()) or float(lifted.norm()) <= 1e-8:
             raise RuntimeError(
@@ -16807,6 +18430,7 @@ class AdaptiveBrain:
             )
         return F.normalize(lifted.reshape(1, -1), dim=-1)[0]
 
+    @owned_memory_effect("sensory-experience-learning")
     def _admit_sensory_embedding(
         self,
         embedding: torch.Tensor,
@@ -16933,7 +18557,7 @@ class AdaptiveBrain:
     def _effective_media_kind(path: str, requested_kind: str) -> str:
         """Route animated GIF experiences through temporal video learning."""
 
-        if requested_kind != "image" or Path(path).suffix.lower() != ".gif":
+        if requested_kind != "image":
             return requested_kind
         try:
             from PIL import Image
@@ -17192,7 +18816,8 @@ class AdaptiveBrain:
 
         pending: List[Any] = []
         suffix = Path(path).suffix.lower()
-        if suffix in {".gif", ".webp"}:
+        from .web_image_observation import is_pillow_image_source
+        if suffix in {".gif", ".webp"} or is_pillow_image_source(path):
             try:
                 with Image.open(path) as opened:
                     for frame in ImageSequence.Iterator(opened):
@@ -17348,6 +18973,7 @@ class AdaptiveBrain:
         finally:
             source_windows.close()
 
+    @outer_learning_phase("media-objectives")
     def _train_media(
         self,
         path: str,
@@ -17357,6 +18983,7 @@ class AdaptiveBrain:
         progress: Optional[Any] = None,
         content_sha256: str = "",
         speech_text: str = "",
+        conditioning_text: str = "",
         _include_embedded_audio: bool = True,
         _embedded_audio: bool = False,
     ) -> Dict[str, Any]:
@@ -17364,7 +18991,11 @@ class AdaptiveBrain:
         paired_speech = kind == "audio" and bool(speech_text)
         if paired_speech and (not isinstance(speech_text, str) or not speech_text.strip() or "\x00" in speech_text):
             raise ValueError("paired speech text must be the literal recorded utterance")
-        idea = self._modality_idea(speech_text).detach() if paired_speech else self._media_idea(source_name)
+        if conditioning_text and (not isinstance(conditioning_text, str) or not conditioning_text.strip() or "\x00" in conditioning_text):
+            raise ValueError("teacher media conditioning must be literal verified lesson text")
+        # Teacher descriptions condition actual native media losses; they do
+        # not claim to be an audio transcript or replace the sensory target.
+        idea = self._modality_idea(speech_text or conditioning_text).detach() if paired_speech or conditioning_text else self._media_idea(source_name)
         window_size = 1
         unit = "images"
         if kind == "image":
@@ -17427,11 +19058,13 @@ class AdaptiveBrain:
             ("%s:%s:%s" % (kind, source_name, Path(path).name)).encode("utf-8")
         ).hexdigest()
         for target, actual_units in window_stream:
+            self._check_neural_learning_boundary("media-learning-window")
             windows += 1
             processed_units += int(actual_units)
             if int(actual_units) < window_size:
                 tail_units = int(actual_units)
             for index in range(steps_per_window):
+                self._check_neural_learning_boundary("media-learning-step")
                 optimizer.zero_grad(set_to_none=True)
                 window_embedding: Optional[torch.Tensor] = None
                 if kind == "image":
@@ -17603,6 +19236,7 @@ class AdaptiveBrain:
                     steps=steps_per_window,
                     progress=progress,
                     content_sha256=fingerprint_base + ":embedded-audio",
+                    conditioning_text=conditioning_text,
                     _include_embedded_audio=False,
                     _embedded_audio=True,
                 )
@@ -18149,6 +19783,7 @@ class AdaptiveBrain:
         epoch: int = 0,
         transaction_key: str = "",
         progress: Optional[Any] = None,
+        _record_source_basename: Optional[str] = None,
     ) -> Dict[str, Any]:
         if policy not in {"encode", "consolidate", "pretrain", "archive"}:
             raise ValueError("unsupported ingestion policy")
@@ -18156,6 +19791,12 @@ class AdaptiveBrain:
             transaction_key and not re.fullmatch(r"[a-f0-9]{64}", transaction_key)
         ):
             raise ValueError("ingestion transaction key must be a lowercase sha256")
+        if _record_source_basename is not None and (
+            not isinstance(_record_source_basename, str)
+            or not re.fullmatch(r"[a-f0-9]{64}\.jsonl", _record_source_basename)
+            or kind != "jsonl" or name != "action-result-" + _record_source_basename[:-6]
+        ):
+            raise ValueError("logical action-result record identity is invalid")
 
         def admit_dataset_parser(stage: str, ram_bytes: int, disk_bytes: int) -> None:
             status = self.resource_policy.status(
@@ -19316,6 +20957,17 @@ class AdaptiveBrain:
                 record_stream = []
 
             for record in record_stream:
+                if _record_source_basename is not None:
+                    # The host gives a merged result a new spool filename,
+                    # but the already-committed parser prefix used its original
+                    # filename. Preserve that structural record identity only;
+                    # do not rewrite payload text, provenance, bytes or hash.
+                    raw_name = str(record.name)
+                    prefix = source_path.name + "#line-"
+                    if not raw_name.startswith(prefix) or not raw_name[len(prefix):].isdecimal():
+                        raise ValueError("action-result JSONL record identity is unsupported")
+                    record = copy.copy(record)
+                    record.name = _record_source_basename + raw_name[len(source_path.name):]
                 if resolved_kind == "sqlite":
                     record_snapshot_hash = str(
                         dict(getattr(record, "provenance", {})).get(
@@ -19525,6 +21177,7 @@ class AdaptiveBrain:
                                 getattr(record, "content_sha256", "")
                             ),
                             speech_text=str((getattr(record, "provenance", {}) or {}).get("speech_text", "")),
+                            conditioning_text=str((getattr(record, "provenance", {}) or {}).get("conditioning_text", "")),
                         )
                     except MediaDecodeError as error:
                         if int(self.counters["training_steps"]) != media_training_steps_before:
@@ -20156,7 +21809,7 @@ class AdaptiveBrain:
 
     @classmethod
     def _png_bytes(cls, image: torch.Tensor) -> bytes:
-        value = image.detach().cpu().float()
+        value = media_transfer(image.detach(), "cpu").float()
         if value.ndim == 4:
             value = value[0]
         value = ((value.clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
@@ -20180,7 +21833,7 @@ class AdaptiveBrain:
         if isinstance(fps, bool) or not 1 <= int(fps) <= 65_535:
             raise ValueError("APNG FPS must fit its positive 16-bit timebase")
         fps = int(fps)
-        value = video.detach().cpu().float()
+        value = media_transfer(video.detach(), "cpu").float()
         if value.ndim == 5:
             value = value[0]
         value = ((value.clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8)
@@ -20240,7 +21893,7 @@ class AdaptiveBrain:
     ) -> bytes:
         """Encode H.264 MP4 and, when supplied, mux same-idea audio as AAC."""
 
-        value = video.detach().cpu().float()
+        value = media_transfer(video.detach(), "cpu").float()
         if value.ndim == 5:
             value = value[0]
         if value.ndim != 4 or value.shape[0] != 3:
@@ -20327,7 +21980,7 @@ class AdaptiveBrain:
         if isinstance(sample_rate, bool) or not 1 <= int(sample_rate) <= 0xFFFFFFFF:
             raise ValueError("WAV sample rate must fit its positive 32-bit field")
         sample_rate = int(sample_rate)
-        value = waveform.detach().cpu().float().reshape(-1).clamp(-1, 1)
+        value = media_transfer(waveform.detach(), "cpu").float().reshape(-1).clamp(-1, 1)
         samples = array.array("h", (value * 32767.0).to(torch.int16).tolist())
         if os.sys.byteorder != "little":
             samples.byteswap()
@@ -20450,6 +22103,51 @@ class AdaptiveBrain:
         )
         return max(1, min(total, tier_budget))
 
+    def _media_codec_directory(self):
+        directory = self._live_paging_cache_directory / "media-codec"
+        self.resource_policy.require_disk(65536, "native media codec ownership")
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _media_png_payload(self, value, *, fps=None, cancel_check=None):
+        if isinstance(value, MediaCanvasView):
+            return encode_png_file(value, directory=self._media_codec_directory(), policy=self.resource_policy,
+                cancelled=cancel_check or (lambda: False), fps=fps)
+        return self._png_bytes(value) if fps is None else self._apng_bytes(value, fps=fps)
+
+    def _media_wav_payload(self, value, *, sample_rate=16000, cancel_check=None):
+        if isinstance(value, MediaCanvasView):
+            return encode_wav_file(value, directory=self._media_codec_directory(), policy=self.resource_policy,
+                cancelled=cancel_check or (lambda: False), sample_rate=sample_rate)
+        return self._wav_bytes(value, sample_rate=sample_rate)
+
+    def _media_mp4_payload(self, value, *, fps=8, audio=None, sample_rate=16000, cancel_check=None):
+        # Keep small native neural output in RAM, but stream the host codec
+        # for both sizes: Stop/new-work must not wait on an uncancellable
+        # communicate(input=whole_movie) or an arbitrary 120-second timeout.
+        with self._video_runtime_executable("encode-video") as executable:
+            return encode_mp4_file(value, directory=self._media_codec_directory(), policy=self.resource_policy,
+                executable=executable, fps=fps, audio=audio, sample_rate=sample_rate, cancelled=cancel_check or (lambda: False))
+
+    def _media_canvas_spill_enabled(self):
+        manager = getattr(self.resource_policy, "device_resources", None)
+        return bool(self.config.disk_state_offload and (manager is None or manager.settings["allowStorageSpill"]))
+
+    def _prepare_media_output_plan(self, modality, idea, seed, raw_settings, request, *, benchmark_xor=0x4D454449, cancel_check=None):
+        started = time.perf_counter()
+        self.modalities.generate(modality, idea, seed=int(seed) ^ benchmark_xor, cancel_check=cancel_check, maximum_previews=1)
+        unit_ms = max(.001, (time.perf_counter()-started) * 1000.0)
+        available_memory, available_storage = media_resource_headroom(self._resource_readings())
+        target = _finite_number(raw_settings.get("targetLatencyMs"), 30000.0)
+        cadence = _finite_number(raw_settings.get("previewIntervalMs"), 500.0)
+        if target <= 0 or cadence <= 0: raise ValueError("media latency and preview intervals must be positive")
+        measurements = MediaGenerationMeasurements.for_modality(modality, available_memory_bytes=available_memory,
+            available_storage_bytes=available_storage, native_unit_ms=unit_ms, target_latency_ms=target,
+            preview_interval_ms=cadence, source="live-native-unit-benchmark")
+        return plan_media_output(modality, NeuralMediaWindows.from_config(self.config), measurements, request,
+            allow_canvas_spill=self._media_canvas_spill_enabled()), unit_ms
+
+    @media_storage_lifetime
     def generate_modality(
         self,
         modality: str,
@@ -20464,6 +22162,7 @@ class AdaptiveBrain:
         cancel_check: Optional[Callable[[], bool]] = None,
         concept_id_view: Optional[Dict[str, Any]] = None,
         source_turn_id: str = "",
+        owned_output_directory: Optional[Path] = None,
     ) -> Dict[str, Any]:
         created_artifact: Optional[Path] = None
 
@@ -20480,6 +22179,7 @@ class AdaptiveBrain:
             from .concept_id_views import IdView
             concept_ids = IdView(self.engine_path, concept_id_view, brain_id=self.brain_id, turn_id=source_turn_id)
         generation_started_at = time.perf_counter()
+        from media_timeline import encoded_media_timeline
         enabled = {
             "vision": self.config.vision_enabled,
             "image": self.config.image_enabled,
@@ -20705,519 +22405,505 @@ class AdaptiveBrain:
                 "trainingSteps": modality_steps,
             }
         else:
-            def encode_preview(
-                progress_value: float,
-                tensor: torch.Tensor,
-                scaled_details: Optional[Dict[str, Any]] = None,
-            ) -> None:
-                nonlocal actual_preview_count
-                nonlocal first_preview_ms
-                ensure_active()
-                if preview_callback is None:
-                    return
-                actual_preview_count += 1
-                if first_preview_ms is None:
-                    first_preview_ms = (
-                        time.perf_counter() - generation_started_at
-                    ) * 1_000.0
-                total_steps = (
-                    int(media_output_plan.work_units)
-                    if media_output_plan is not None
-                    else MODALITY_DECODER_STEPS[modality]
-                )
-                completed_step = max(
-                    1,
-                    min(total_steps, int(round(progress_value * total_steps))),
-                )
-                details: Dict[str, Any] = {
-                    "schemaVersion": 1,
-                    "modality": modality,
-                    "completedUnits": completed_step,
-                    "totalUnits": total_steps,
-                    "actualDecoderOutput": True,
-                    "spatialResolutionReduced": False,
-                    "cadence": "hardware-aware-bounded-synchronous",
-                    "hardwareTier": self.config.hardware_tier,
-                    "previewCount": (
-                        int(media_output_plan.estimated_previews)
+            if scaled_output:
+                request = MediaOutputRequest(width=output_width, height=output_height, duration_ms=output_duration_ms,
+                    sample_rate=output_sample_rate, fps=output_fps)
+                if output_mode == "exact" and not request.explicit_for(modality):
+                    raise ValueError("exact media output requires dimensions or duration")
+                media_output_plan, native_unit_ms = self._prepare_media_output_plan(
+                    modality, idea, seed, raw_settings, request, cancel_check=cancel_check)
+            companion_audio_plan = None
+            companion_audio_enabled = bool(modality == "video" and raw_settings.get("includeAudio", True)
+                and self.config.audio_enabled and (int(self.modality_training.get("audio", 0)) > 0 or any(
+                    "audio" in item.get("modalities", []) for item in self.installed_modality_packs if isinstance(item, Mapping))))
+            if scaled_output and companion_audio_enabled:
+                audio_seed = int.from_bytes(hashlib.sha256(("%d:same-brain-video-audio" % int(seed)).encode()).digest()[:8], "little") & 0x7fffffff
+                companion_audio_plan, _companion_unit_ms = self._prepare_media_output_plan("audio", idea, audio_seed, raw_settings,
+                    MediaOutputRequest(duration_ms=media_output_plan.total_frames / float(media_output_plan.fps) * 1000.0,
+                        sample_rate=output_sample_rate), benchmark_xor=0x41554449, cancel_check=cancel_check)
+
+            def produce_media(current_idea, emit_preview, owned_directory, cancelled, operation_started_at):
+                idea, preview_callback, owned_output_directory, cancel_check = current_idea, emit_preview, owned_directory, cancelled
+                created_artifact, media_output_metadata = None, None
+                actual_preview_count, first_preview_ms = 0, None
+                def ensure_active():
+                    if cancel_check is not None and bool(cancel_check()):
+                        if created_artifact is not None: created_artifact.unlink(missing_ok=True)
+                        raise ModalityGenerationCancelled("modality generation was cancelled")
+                def encode_preview(
+                    progress_value: float,
+                    tensor: torch.Tensor,
+                    scaled_details: Optional[Dict[str, Any]] = None,
+                ) -> None:
+                    nonlocal actual_preview_count
+                    nonlocal first_preview_ms
+                    ensure_active()
+                    if preview_callback is None:
+                        return
+                    actual_preview_count += 1
+                    if first_preview_ms is None:
+                        first_preview_ms = (
+                            time.perf_counter() - operation_started_at
+                        ) * 1_000.0
+                    total_steps = (
+                        int(media_output_plan.work_units)
                         if media_output_plan is not None
-                        else self._modality_preview_budget(modality)
-                    ),
-                    "ideaSource": idea_seed["source"],
-                    "activeAssemblyCount": idea_seed["activeAssemblyCount"],
-                    "promptProvided": idea_seed["promptProvided"],
-                    **(scaled_details or {}),
-                }
-                if modality == "image":
-                    details.update(
-                        {
-                            "stage": "diffusion-vq-decode",
-                            "width": int(tensor.shape[-1]),
-                            "height": int(tensor.shape[-2]),
-                        }
+                        else MODALITY_DECODER_STEPS[modality]
                     )
-                    preview_callback(
-                        progress_value,
-                        "image/png",
-                        self._png_bytes(tensor),
-                        details,
+                    completed_step = max(
+                        1,
+                        min(total_steps, int(round(progress_value * total_steps))),
+                    )
+                    details: Dict[str, Any] = {
+                        "schemaVersion": 1,
+                        "modality": modality,
+                        "completedUnits": completed_step,
+                        "totalUnits": total_steps,
+                        "actualDecoderOutput": True,
+                        "spatialResolutionReduced": False,
+                        "cadence": "hardware-aware-bounded-synchronous",
+                        "hardwareTier": self.config.hardware_tier,
+                        "previewCount": (
+                            int(media_output_plan.estimated_previews)
+                            if media_output_plan is not None
+                            else self._modality_preview_budget(modality)
+                        ),
+                        "ideaSource": idea_seed["source"],
+                        "activeAssemblyCount": idea_seed["activeAssemblyCount"],
+                        "promptProvided": idea_seed["promptProvided"],
+                        **(scaled_details or {}),
+                    }
+                    def publish_preview(mime_type, payload):
+                        try:
+                            preview_callback(progress_value, mime_type, payload, details)
+                            # Deliver the genuine preview before optional Auto
+                            # proof scans; private sinks preserve this order.
+                            observe_media_preview(self, progress_value, tensor, mime_type, payload, details)
+                        finally:
+                            if isinstance(payload, EncodedMediaFile): payload.close()
+                    if modality == "image":
+                        details.update(
+                            {
+                                "stage": "diffusion-vq-decode",
+                                "width": int(tensor.shape[-1]),
+                                "height": int(tensor.shape[-2]),
+                                "mediaTimeline": encoded_media_timeline("image"),
+                            }
+                        )
+                        publish_preview(
+                            "image/png",
+                            self._media_png_payload(tensor, cancel_check=cancel_check),
+                        )
+                    elif modality == "audio":
+                        sample_rate = int(
+                            media_output_plan.sample_rate
+                            if media_output_plan is not None
+                            and media_output_plan.sample_rate is not None
+                            else output_sample_rate
+                        )
+                        sample_count = int(tensor.numel())
+                        details.update(
+                            {
+                                "stage": "codec-waveform",
+                                "sampleCount": sample_count,
+                                "sampleRate": sample_rate,
+                                "mediaTimeline": encoded_media_timeline(
+                                    "samples", sample_count, sample_rate,
+                                    stable_count=(scaled_details or {}).get("stablePrefixSamples"),
+                                ),
+                                "totalSamples": int(
+                                    media_output_plan.total_samples
+                                    if media_output_plan is not None
+                                    and media_output_plan.total_samples is not None
+                                    else self.config.audio_samples
+                                ),
+                                "durationMs": sample_count / float(sample_rate) * 1_000.0,
+                            }
+                        )
+                        publish_preview(
+                            "audio/wav",
+                            self._media_wav_payload(
+                                tensor,
+                                sample_rate=sample_rate,
+                                cancel_check=cancel_check,
+                            ),
+                        )
+                    elif modality == "video":
+                        frame_count = int(
+                            tensor.shape[2] if tensor.ndim == 5 else tensor.shape[1]
+                        )
+                        details.update(
+                            {
+                                "stage": "temporal-frame-timeline",
+                                "frameCount": frame_count,
+                                "totalFrames": int(
+                                    media_output_plan.total_frames
+                                    if media_output_plan is not None
+                                    and media_output_plan.total_frames is not None
+                                    else self.config.video_frames
+                                ),
+                                "width": int(tensor.shape[-1]),
+                                "height": int(tensor.shape[-2]),
+                                "mediaTimeline": encoded_media_timeline(
+                                    "frames", frame_count,
+                                    int(_finite_number(output_fps, 8)),
+                                    stable_count=(
+                                        (scaled_details or {}).get("stableFramePrefix")
+                                        if (scaled_details or {}).get("partialCoverage") is False
+                                        else None
+                                    ),
+                                ),
+                            }
+                        )
+                        publish_preview(
+                            "image/apng",
+                            self._media_png_payload(
+                                tensor,
+                                fps=int(
+                                    _finite_number(
+                                        output_fps, 8
+                                    )
+                                ),
+                                cancel_check=cancel_check,
+                            ),
+                        )
+                    ensure_active()
+
+                if scaled_output:
+                    def media_watermark(demand: MediaResourceDemand) -> bool:
+                        status = self.resource_policy.status(
+                            estimated_write_bytes=demand.output_bytes,
+                            estimated_ram_bytes=demand.working_bytes,
+                        )
+                        admitted = not bool(
+                            status.get("memoryPressure")
+                            or status.get("diskPressure")
+                        )
+                        if not admitted:
+                            media_resource_pause(self, {
+                                "reason": "media generation reached the live resource watermark",
+                                "readings": status,
+                                "mediaDemand": {
+                                    "stage": demand.stage,
+                                    "workingBytes": demand.working_bytes,
+                                    "outputBytes": demand.output_bytes,
+                                    "completedUnits": demand.completed_units,
+                                    "totalUnits": demand.total_units,
+                                },
+                                "at": _iso_now(),
+                            })
+                        return admitted
+
+                    scaled = self.modalities.generate_scaled(
+                        media_output_plan,
+                        idea,
+                        seed=int(seed),
+                        training_steps=modality_steps,
+                        installed_pack_id=(
+                            str(installed_pack.get("id"))
+                            if isinstance(installed_pack, Mapping)
+                            else None
+                        ),
+                        preview_callback=(
+                            encode_preview if preview_callback is not None else None
+                        ),
+                        cancel_check=cancel_check,
+                        resource_watermark=media_watermark,
+                        canvas_factory=lambda plan, current_idea, cancelled: create_media_canvas(self, plan, current_idea, cancelled),
+                    )
+                    output = scaled.tensor
+                    media_output_metadata = scaled.metadata
+                else:
+                    output = self.modalities.generate(
+                        modality,
+                        idea,
+                        seed=seed,
+                        preview_callback=(
+                            encode_preview if preview_callback is not None else None
+                        ),
+                        cancel_check=cancel_check,
+                        maximum_previews=self._modality_preview_budget(modality),
+                    )
+                ensure_active()
+                from spontaneous_output import checked_output_directory
+                artifact_dir = media_artifact_directory(self, owned_output_directory)
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                observe_media_output(self, "primary", output)
+                artifact_id = uuid.uuid4().hex
+                if modality == "image":
+                    artifact = artifact_dir / (artifact_id + ".png")
+                    created_artifact = artifact
+                    artifact_bytes = self._media_png_payload(output, cancel_check=cancel_check)
+                    write_media_payload(artifact, artifact_bytes)
+                    mime_type = "image/png"
+                    ensure_active()
+                elif modality == "audio":
+                    artifact = artifact_dir / (artifact_id + ".wav")
+                    created_artifact = artifact
+                    artifact_bytes = self._media_wav_payload(
+                        output,
+                        sample_rate=int(
+                            media_output_plan.sample_rate
+                            if media_output_plan is not None
+                            and media_output_plan.sample_rate is not None
+                            else output_sample_rate
+                        ),
+                        cancel_check=cancel_check,
+                    )
+                    write_media_payload(artifact, artifact_bytes)
+                    mime_type = "audio/wav"
+                    ensure_active()
+                elif modality == "video":
+                    fps = int(
+                        media_output_plan.fps
+                        if media_output_plan is not None
+                        and media_output_plan.fps is not None
+                        else output_fps
+                    )
+                    sample_rate = int(
+                        output_sample_rate
+                    )
+                    include_audio_value = raw_settings.get("includeAudio", True)
+                    audio_requested = (
+                        include_audio_value
+                        if isinstance(include_audio_value, bool)
+                        else True
+                    )
+                    audio_installed = any(
+                        isinstance(item, Mapping)
+                        and "audio" in item.get("modalities", [])
+                        for item in self.installed_modality_packs
+                    )
+                    audio_supported = bool(
+                        self.config.audio_enabled
+                        and (
+                            int(self.modality_training.get("audio", 0)) > 0
+                            or audio_installed
+                        )
+                    )
+                    synchronized_audio: Dict[str, Any] = {
+                        "requested": audio_requested,
+                        "supported": audio_supported,
+                        "decoded": False,
+                        "generated": False,
+                        "sameBrainIdea": False,
+                        "lengthAlignedToVideo": False,
+                        "speechSynthesis": False,
+                        "hiddenBehavioralPrompt": False,
+                    }
+                    audio_output: Optional[torch.Tensor] = None
+                    if not audio_requested:
+                        synchronized_audio["reason"] = (
+                            "Synchronized neural sound was disabled for this generation."
+                        )
+                    elif not audio_supported:
+                        synchronized_audio["reason"] = (
+                            "No trained same-brain audio pack is available; the video remains silent."
+                        )
+                    else:
+                        audio_seed_material = (
+                            "%d:same-brain-video-audio" % int(seed)
+                        ).encode("utf-8")
+                        audio_seed = int.from_bytes(
+                            hashlib.sha256(audio_seed_material).digest()[:8],
+                            "little",
+                        ) & 0x7FFFFFFF
+                        if output.ndim == 5:
+                            frame_count = int(output.shape[2])
+                        elif output.ndim == 4:
+                            frame_count = int(output.shape[1])
+                        else:
+                            raise ValueError(
+                                "video output must have shape [3, frames, height, width]"
+                            )
+                        duration_ms = frame_count / float(fps) * 1_000.0
+                        if scaled_output:
+                            audio_plan = companion_audio_plan
+                            if audio_plan is None: raise RuntimeError("companion audio lost its frozen actual output plan")
+                            audio_pack = next(
+                                (
+                                    item
+                                    for item in reversed(
+                                        self.installed_modality_packs
+                                    )
+                                    if "audio" in item.get("modalities", [])
+                                ),
+                                None,
+                            )
+                            audio_scaled = self.modalities.generate_scaled(
+                                audio_plan,
+                                idea,
+                                seed=audio_seed,
+                                training_steps=int(
+                                    self.modality_training.get("audio", 0)
+                                ),
+                                installed_pack_id=(
+                                    str(audio_pack.get("id"))
+                                    if isinstance(audio_pack, Mapping)
+                                    else None
+                                ),
+                                cancel_check=cancel_check,
+                                resource_watermark=media_watermark,
+                                canvas_factory=lambda plan, current_idea, cancelled: create_media_canvas(self, plan, current_idea, cancelled),
+                            )
+                            audio_output = audio_scaled.tensor if isinstance(audio_scaled.tensor, MediaCanvasView) else audio_scaled.tensor.reshape(-1)
+                        else:
+                            audio_native = self.modalities.generate(
+                                "audio",
+                                idea,
+                                seed=audio_seed,
+                                cancel_check=cancel_check,
+                            )
+                            duration_samples = max(
+                                1,
+                                int(round(frame_count * sample_rate / float(fps))),
+                            )
+                            audio_output = F.interpolate(
+                                audio_native.detach().reshape(1, 1, -1),
+                                size=duration_samples,
+                                mode="linear",
+                                align_corners=False,
+                            ).reshape(-1)
+                        ensure_active()
+                        synchronized_audio.update(
+                            {
+                                "decoded": True,
+                                "sameBrainIdea": True,
+                                "audioSeed": audio_seed,
+                                "sampleRate": sample_rate,
+                                "durationMs": duration_ms,
+                                "lengthAlignedToVideo": True,
+                                **(
+                                    {
+                                        "mediaOutputPlan": audio_plan.as_dict(),
+                                        "mediaOutput": audio_scaled.metadata,
+                                    }
+                                    if scaled_output
+                                    else {}
+                                ),
+                            }
+                        )
+                    if audio_output is not None: observe_media_output(self, "companion-audio", audio_output)
+                    container_fallback = ""
+                    try:
+                        artifact_bytes = self._media_mp4_payload(
+                            output,
+                            fps=fps,
+                            audio=audio_output,
+                            sample_rate=sample_rate,
+                            cancel_check=cancel_check,
+                        )
+                        artifact = artifact_dir / (artifact_id + ".mp4")
+                        mime_type = "video/mp4"
+                        if audio_output is not None:
+                            synchronized_audio["generated"] = True
+                            synchronized_audio.pop("reason", None)
+                    except (
+                        ImportError,
+                        OSError,
+                        RuntimeError,
+                        subprocess.SubprocessError,
+                    ) as error:
+                        ensure_active()
+                        artifact_bytes = self._media_png_payload(output, fps=fps, cancel_check=cancel_check)
+                        artifact = artifact_dir / (artifact_id + ".png")
+                        mime_type = "image/apng"
+                        container_fallback = str(error)
+                        if audio_output is not None:
+                            synchronized_audio["generated"] = False
+                            synchronized_audio["reason"] = (
+                                "The MP4/AAC encoder was unavailable, so the honest "
+                                "APNG fallback cannot carry the generated neural sound: %s"
+                                % error
+                            )
+                    created_artifact = artifact
+                    write_media_payload(artifact, artifact_bytes)
+                    ensure_active()
+                else:
+                    raise ValueError("modality must be image, audio, video, or vision")
+                artifact_sha256 = payload_sha256(artifact_bytes)
+                content_artifact = artifact_dir / (
+                    artifact_sha256 + artifact.suffix.lower()
+                )
+                if artifact != content_artifact:
+                    if content_artifact.exists():
+                        from .media_streaming_codec import existing_media_sha256
+                        if existing_media_sha256(content_artifact) != artifact_sha256:
+                            raise RuntimeError(
+                                "content-addressed modality artifact checksum collision"
+                            )
+                        artifact.unlink(missing_ok=True)
+                        created_artifact = None
+                    else:
+                        os.replace(str(artifact), str(content_artifact))
+                        created_artifact = content_artifact
+                    artifact = content_artifact
+                ensure_active()
+                result = {
+                    "brainId": self.brain_id,
+                    "modality": modality,
+                    "path": str(artifact),
+                    "mimeType": mime_type,
+                    "shape": list(output.shape),
+                    "seed": int(seed),
+                    "artifactSha256": artifact_sha256,
+                    "randomlyInitialized": randomly_initialized,
+                    "initialization": initialization,
+                    "trainingSteps": modality_steps,
+                    "ideaSeed": idea_seed,
+                    "qualityNote": (
+                        "Hardware-scaled output assembled from actual same-brain "
+                        "neural patches/windows; size and training evidence do not "
+                        "claim semantic quality."
+                        if media_output_metadata is not None
+                        else (
+                            "Generated by a tiny research baseline; output quality depends "
+                            "on the disclosed pack and local modality training."
+                        )
+                    ),
+                    **(
+                        {
+                            "mediaOutputPlan": media_output_plan.as_dict(),
+                            "mediaOutput": media_output_metadata,
+                        }
+                        if media_output_plan is not None
+                        and media_output_metadata is not None
+                        else {}
+                    ),
+                }
+                if modality == "video":
+                    result["containerFallback"] = container_fallback
+                    result["synchronizedAudio"] = synchronized_audio
+                    result["mediaTimeline"] = encoded_media_timeline(
+                        "frames", int(output.shape[2] if output.ndim == 5 else output.shape[1]), fps,
+                        complete=True,
+                        container_audio=(
+                            {"sampleRate": sample_rate, "sampleCount": int(audio_output.numel()), "startSample": 0}
+                            if mime_type == "video/mp4" and audio_output is not None
+                            and synchronized_audio.get("generated") else None
+                        ),
                     )
                 elif modality == "audio":
-                    sample_rate = int(
-                        media_output_plan.sample_rate
-                        if media_output_plan is not None
-                        and media_output_plan.sample_rate is not None
-                        else output_sample_rate
-                    )
-                    sample_count = int(tensor.shape[-1])
-                    details.update(
-                        {
-                            "stage": "codec-waveform",
-                            "sampleCount": sample_count,
-                            "totalSamples": int(
-                                media_output_plan.total_samples
-                                if media_output_plan is not None
-                                and media_output_plan.total_samples is not None
-                                else self.config.audio_samples
-                            ),
-                            "durationMs": sample_count / float(sample_rate) * 1_000.0,
-                        }
-                    )
-                    preview_callback(
-                        progress_value,
-                        "audio/wav",
-                        self._wav_bytes(
-                            tensor,
-                            sample_rate=sample_rate,
-                        ),
-                        details,
-                    )
-                elif modality == "video":
-                    frame_count = int(
-                        tensor.shape[2] if tensor.ndim == 5 else tensor.shape[1]
-                    )
-                    details.update(
-                        {
-                            "stage": "temporal-frame-timeline",
-                            "frameCount": frame_count,
-                            "totalFrames": int(
-                                media_output_plan.total_frames
-                                if media_output_plan is not None
-                                and media_output_plan.total_frames is not None
-                                else self.config.video_frames
-                            ),
-                            "width": int(tensor.shape[-1]),
-                            "height": int(tensor.shape[-2]),
-                        }
-                    )
-                    preview_callback(
-                        progress_value,
-                        "image/apng",
-                        self._apng_bytes(
-                            tensor,
-                            fps=int(
-                                _finite_number(
-                                    output_fps, 8
-                                )
-                            ),
-                        ),
-                        details,
-                    )
-                ensure_active()
-
-            if scaled_output:
-                benchmark_started = time.perf_counter()
-                self.modalities.generate(
-                    modality,
-                    idea,
-                    seed=int(seed) ^ 0x4D454449,
-                    cancel_check=cancel_check,
-                    maximum_previews=1,
-                )
-                native_unit_ms = max(
-                    0.001,
-                    (time.perf_counter() - benchmark_started) * 1_000.0,
-                )
-                readings = self._resource_readings()
-                available_memory, available_storage = media_resource_headroom(
-                    readings
-                )
-                target_latency_ms = _finite_number(
-                    raw_settings.get("targetLatencyMs"), 30_000.0
-                )
-                preview_interval_ms = _finite_number(
-                    raw_settings.get("previewIntervalMs"), 500.0
-                )
-                if target_latency_ms <= 0.0 or preview_interval_ms <= 0.0:
-                    raise ValueError(
-                        "media latency and preview intervals must be positive"
-                    )
-                measurements = MediaGenerationMeasurements.for_modality(
-                    modality,
-                    available_memory_bytes=available_memory,
-                    available_storage_bytes=available_storage,
-                    native_unit_ms=native_unit_ms,
-                    target_latency_ms=target_latency_ms,
-                    preview_interval_ms=preview_interval_ms,
-                    source="live-native-unit-benchmark",
-                )
-                request = MediaOutputRequest(
-                    width=output_width,
-                    height=output_height,
-                    duration_ms=output_duration_ms,
-                    sample_rate=output_sample_rate,
-                    fps=output_fps,
-                )
-                if output_mode == "exact" and not request.explicit_for(modality):
-                    raise ValueError(
-                        "exact media output requires dimensions or duration"
-                    )
-                media_output_plan = plan_media_output(
-                    modality,
-                    NeuralMediaWindows.from_config(self.config),
-                    measurements,
-                    request,
-                )
-
-                def media_watermark(demand: MediaResourceDemand) -> bool:
-                    status = self.resource_policy.status(
-                        estimated_write_bytes=demand.output_bytes,
-                        estimated_ram_bytes=demand.working_bytes,
-                    )
-                    admitted = not bool(
-                        status.get("memoryPressure")
-                        or status.get("diskPressure")
-                    )
-                    if not admitted:
-                        self.resource_pause = {
-                            "reason": "media generation reached the live resource watermark",
-                            "readings": status,
-                            "mediaDemand": {
-                                "stage": demand.stage,
-                                "workingBytes": demand.working_bytes,
-                                "outputBytes": demand.output_bytes,
-                                "completedUnits": demand.completed_units,
-                                "totalUnits": demand.total_units,
-                            },
-                            "at": _iso_now(),
-                        }
-                    return admitted
-
-                scaled = self.modalities.generate_scaled(
-                    media_output_plan,
-                    idea,
-                    seed=int(seed),
-                    training_steps=modality_steps,
-                    installed_pack_id=(
-                        str(installed_pack.get("id"))
-                        if isinstance(installed_pack, Mapping)
-                        else None
-                    ),
-                    preview_callback=(
-                        encode_preview if preview_callback is not None else None
-                    ),
-                    cancel_check=cancel_check,
-                    resource_watermark=media_watermark,
-                )
-                output = scaled.tensor
-                media_output_metadata = scaled.metadata
-            else:
-                output = self.modalities.generate(
-                    modality,
-                    idea,
-                    seed=seed,
-                    preview_callback=(
-                        encode_preview if preview_callback is not None else None
-                    ),
-                    cancel_check=cancel_check,
-                    maximum_previews=self._modality_preview_budget(modality),
-                )
-            ensure_active()
-            artifact_dir = self.engine_path / "artifacts"
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            artifact_id = uuid.uuid4().hex
-            if modality == "image":
-                artifact = artifact_dir / (artifact_id + ".png")
-                created_artifact = artifact
-                artifact_bytes = self._png_bytes(output)
-                artifact.write_bytes(artifact_bytes)
-                mime_type = "image/png"
-                ensure_active()
-            elif modality == "audio":
-                artifact = artifact_dir / (artifact_id + ".wav")
-                created_artifact = artifact
-                artifact_bytes = self._wav_bytes(
-                    output,
-                    sample_rate=int(
-                        media_output_plan.sample_rate
-                        if media_output_plan is not None
-                        and media_output_plan.sample_rate is not None
-                        else output_sample_rate
-                    ),
-                )
-                artifact.write_bytes(artifact_bytes)
-                mime_type = "audio/wav"
-                ensure_active()
-            elif modality == "video":
-                fps = int(
-                    media_output_plan.fps
-                    if media_output_plan is not None
-                    and media_output_plan.fps is not None
-                    else output_fps
-                )
-                sample_rate = int(
-                    output_sample_rate
-                )
-                include_audio_value = raw_settings.get("includeAudio", True)
-                audio_requested = (
-                    include_audio_value
-                    if isinstance(include_audio_value, bool)
-                    else True
-                )
-                audio_installed = any(
-                    isinstance(item, Mapping)
-                    and "audio" in item.get("modalities", [])
-                    for item in self.installed_modality_packs
-                )
-                audio_supported = bool(
-                    self.config.audio_enabled
-                    and (
-                        int(self.modality_training.get("audio", 0)) > 0
-                        or audio_installed
-                    )
-                )
-                synchronized_audio: Dict[str, Any] = {
-                    "requested": audio_requested,
-                    "supported": audio_supported,
-                    "decoded": False,
-                    "generated": False,
-                    "sameBrainIdea": False,
-                    "lengthAlignedToVideo": False,
-                    "speechSynthesis": False,
-                    "hiddenBehavioralPrompt": False,
-                }
-                audio_output: Optional[torch.Tensor] = None
-                if not audio_requested:
-                    synchronized_audio["reason"] = (
-                        "Synchronized neural sound was disabled for this generation."
-                    )
-                elif not audio_supported:
-                    synchronized_audio["reason"] = (
-                        "No trained same-brain audio pack is available; the video remains silent."
+                    result["mediaTimeline"] = encoded_media_timeline(
+                        "samples", int(output.numel()),
+                        int(media_output_plan.sample_rate if media_output_plan is not None and media_output_plan.sample_rate is not None else output_sample_rate),
+                        complete=True,
                     )
                 else:
-                    audio_seed_material = (
-                        "%d:same-brain-video-audio" % int(seed)
-                    ).encode("utf-8")
-                    audio_seed = int.from_bytes(
-                        hashlib.sha256(audio_seed_material).digest()[:8],
-                        "little",
-                    ) & 0x7FFFFFFF
-                    if output.ndim == 5:
-                        frame_count = int(output.shape[2])
-                    elif output.ndim == 4:
-                        frame_count = int(output.shape[1])
-                    else:
-                        raise ValueError(
-                            "video output must have shape [3, frames, height, width]"
-                        )
-                    duration_ms = frame_count / float(fps) * 1_000.0
-                    if scaled_output:
-                        audio_benchmark_started = time.perf_counter()
-                        self.modalities.generate(
-                            "audio",
-                            idea,
-                            seed=audio_seed ^ 0x41554449,
-                            cancel_check=cancel_check,
-                            maximum_previews=1,
-                        )
-                        audio_native_ms = max(
-                            0.001,
-                            (time.perf_counter() - audio_benchmark_started)
-                            * 1_000.0,
-                        )
-                        readings = self._resource_readings()
-                        audio_memory, audio_storage = media_resource_headroom(
-                            readings
-                        )
-                        audio_measurements = (
-                            MediaGenerationMeasurements.for_modality(
-                                "audio",
-                                available_memory_bytes=audio_memory,
-                                available_storage_bytes=audio_storage,
-                                native_unit_ms=audio_native_ms,
-                                target_latency_ms=_finite_number(
-                                    raw_settings.get("targetLatencyMs"),
-                                    30_000.0,
-                                ),
-                                preview_interval_ms=_finite_number(
-                                    raw_settings.get("previewIntervalMs"),
-                                    500.0,
-                                ),
-                                source="live-native-unit-benchmark",
-                            )
-                        )
-                        audio_plan = plan_media_output(
-                            "audio",
-                            NeuralMediaWindows.from_config(self.config),
-                            audio_measurements,
-                            MediaOutputRequest(
-                                duration_ms=duration_ms,
-                                sample_rate=sample_rate,
-                            ),
-                        )
-                        audio_pack = next(
-                            (
-                                item
-                                for item in reversed(
-                                    self.installed_modality_packs
-                                )
-                                if "audio" in item.get("modalities", [])
-                            ),
-                            None,
-                        )
-                        audio_scaled = self.modalities.generate_scaled(
-                            audio_plan,
-                            idea,
-                            seed=audio_seed,
-                            training_steps=int(
-                                self.modality_training.get("audio", 0)
-                            ),
-                            installed_pack_id=(
-                                str(audio_pack.get("id"))
-                                if isinstance(audio_pack, Mapping)
-                                else None
-                            ),
-                            cancel_check=cancel_check,
-                            resource_watermark=media_watermark,
-                        )
-                        audio_output = audio_scaled.tensor.reshape(-1)
-                    else:
-                        audio_native = self.modalities.generate(
-                            "audio",
-                            idea,
-                            seed=audio_seed,
-                            cancel_check=cancel_check,
-                        )
-                        duration_samples = max(
-                            1,
-                            int(round(frame_count * sample_rate / float(fps))),
-                        )
-                        audio_output = F.interpolate(
-                            audio_native.detach().reshape(1, 1, -1),
-                            size=duration_samples,
-                            mode="linear",
-                            align_corners=False,
-                        ).reshape(-1)
-                    ensure_active()
-                    synchronized_audio.update(
-                        {
-                            "decoded": True,
-                            "sameBrainIdea": True,
-                            "audioSeed": audio_seed,
-                            "sampleRate": sample_rate,
-                            "durationMs": duration_ms,
-                            "lengthAlignedToVideo": True,
-                            **(
-                                {
-                                    "mediaOutputPlan": audio_plan.as_dict(),
-                                    "mediaOutput": audio_scaled.metadata,
-                                }
-                                if scaled_output
-                                else {}
-                            ),
-                        }
-                    )
-                container_fallback = ""
-                try:
-                    artifact_bytes = self._mp4_bytes(
-                        output,
-                        fps=fps,
-                        audio=audio_output,
-                        sample_rate=sample_rate,
-                    )
-                    artifact = artifact_dir / (artifact_id + ".mp4")
-                    mime_type = "video/mp4"
-                    if audio_output is not None:
-                        synchronized_audio["generated"] = True
-                        synchronized_audio.pop("reason", None)
-                except (
-                    ImportError,
-                    OSError,
-                    RuntimeError,
-                    subprocess.SubprocessError,
-                ) as error:
-                    artifact_bytes = self._apng_bytes(output, fps=fps)
-                    artifact = artifact_dir / (artifact_id + ".png")
-                    mime_type = "image/apng"
-                    container_fallback = str(error)
-                    if audio_output is not None:
-                        synchronized_audio["generated"] = False
-                        synchronized_audio["reason"] = (
-                            "The MP4/AAC encoder was unavailable, so the honest "
-                            "APNG fallback cannot carry the generated neural sound: %s"
-                            % error
-                        )
-                created_artifact = artifact
-                artifact.write_bytes(artifact_bytes)
-                ensure_active()
-            else:
-                raise ValueError("modality must be image, audio, video, or vision")
-            artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
-            content_artifact = artifact_dir / (
-                artifact_sha256 + artifact.suffix.lower()
-            )
-            if artifact != content_artifact:
-                if content_artifact.exists():
-                    if hashlib.sha256(content_artifact.read_bytes()).hexdigest() != artifact_sha256:
-                        raise RuntimeError(
-                            "content-addressed modality artifact checksum collision"
-                        )
-                    artifact.unlink(missing_ok=True)
-                    created_artifact = None
-                else:
-                    os.replace(str(artifact), str(content_artifact))
-                    created_artifact = content_artifact
-                artifact = content_artifact
-            ensure_active()
-            result = {
-                "brainId": self.brain_id,
-                "modality": modality,
-                "path": str(artifact),
-                "mimeType": mime_type,
-                "shape": list(output.shape),
-                "seed": int(seed),
-                "artifactSha256": artifact_sha256,
-                "randomlyInitialized": randomly_initialized,
-                "initialization": initialization,
-                "trainingSteps": modality_steps,
-                "ideaSeed": idea_seed,
-                "qualityNote": (
-                    "Hardware-scaled output assembled from actual same-brain "
-                    "neural patches/windows; size and training evidence do not "
-                    "claim semantic quality."
-                    if media_output_metadata is not None
-                    else (
-                        "Generated by a tiny research baseline; output quality depends "
-                        "on the disclosed pack and local modality training."
-                    )
-                ),
-                **(
-                    {
-                        "mediaOutputPlan": media_output_plan.as_dict(),
-                        "mediaOutput": media_output_metadata,
-                    }
-                    if media_output_plan is not None
-                    and media_output_metadata is not None
-                    else {}
-                ),
-            }
-            if modality == "video":
-                result["containerFallback"] = container_fallback
-                result["synchronizedAudio"] = synchronized_audio
-            embedded_media = inline_media_data_url(mime_type, artifact_bytes)
-            if embedded_media is not None:
-                result["dataUrl"] = embedded_media
+                    result["mediaTimeline"] = encoded_media_timeline("image")
+                embedded_media = inline_media_data_url(mime_type, artifact_bytes)
+                if embedded_media is not None:
+                    result["dataUrl"] = embedded_media
+                return {"result": result, "previewCount": actual_preview_count, "firstPreviewMs": first_preview_ms,
+                    "mediaOutputMetadata": media_output_metadata}
+
+            prepared = {"modality": modality, "idea": idea, "seed": int(seed), "settings": dict(raw_settings),
+                "primaryPlan": media_output_plan, "audioPlan": companion_audio_plan,
+                "companionAudio": companion_audio_enabled, "ideaEvidence": idea_seed}
+            produced = measured_media_artifact(self, prepared, produce_media, preview_callback, owned_output_directory,
+                cancel_check, generation_started_at)
+            result, actual_preview_count = produced["result"], produced["previewCount"]
+            first_preview_ms, media_output_metadata = produced["firstPreviewMs"], produced["mediaOutputMetadata"]
         generation_elapsed_seconds = max(
             1e-9, time.perf_counter() - generation_started_at
         )
@@ -21233,12 +22919,16 @@ class AdaptiveBrain:
                 * MODALITY_DECODER_STEPS[modality]
                 + MODALITY_DECODER_STEPS[modality]
             )
+        if modality == "video" and companion_audio_plan is not None:
+            decoder_steps += MODALITY_DECODER_STEPS["audio"]
         if (
             modality == "video"
             and isinstance(result.get("synchronizedAudio"), Mapping)
             and bool(result["synchronizedAudio"].get("decoded", False))
         ):
-            decoder_steps += 3
+            audio_plan_info = result["synchronizedAudio"].get("mediaOutputPlan")
+            audio_units = int(audio_plan_info["workUnits"]) if isinstance(audio_plan_info, Mapping) else 1
+            decoder_steps += audio_units * MODALITY_DECODER_STEPS["audio"]
         result["generationPerformance"] = {
             "elapsedMs": generation_elapsed_seconds * 1000.0,
             "decoderSteps": decoder_steps,
@@ -21534,8 +23224,8 @@ class AdaptiveBrain:
         self.events.append("snapshot", result)
         return result
 
-    def metrics(self) -> Dict[str, Any]:
-        parameter_accounting = self.parameter_accounting()
+    def metrics(self, *, parameter_accounting: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        parameter_accounting = dict(self.parameter_accounting() if parameter_accounting is None else parameter_accounting)
         trainable_parameters = int(
             parameter_accounting["mutableDenseParameters"]
         )
@@ -21582,6 +23272,8 @@ class AdaptiveBrain:
         }
 
     def summary(self) -> Dict[str, Any]:
+        checksum = self.parameter_checksum()
+        accounting = self.parameter_accounting()
         return {
             "brainId": self.brain_id,
             "name": self.config.name,
@@ -21589,9 +23281,9 @@ class AdaptiveBrain:
             "enginePath": str(self.engine_path),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "parameterChecksum": self.parameter_checksum(),
-            "metrics": self.metrics(),
-            "runtimeCard": self.runtime_card(),
+            "parameterChecksum": checksum,
+            "metrics": self.metrics(parameter_accounting=accounting),
+            "runtimeCard": self.runtime_card(parameter_accounting=accounting),
         }
 
     def state(self, include_events: int = 20) -> Dict[str, Any]:
@@ -21611,7 +23303,7 @@ class AdaptiveBrain:
         result["events"] = self.events.recent(include_events)
         return result
 
-    def update_config(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+    def update_config(self, raw: Dict[str, Any], *, persist_if_unchanged: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         """Apply runtime context/RAM/storage without altering learned shape.
 
         Device Auto/Extended item estimates are advisory; the persisted latent
@@ -21619,6 +23311,29 @@ class AdaptiveBrain:
         Learned growth must use an isolated validated architecture operation.
         """
 
+        # A source/capacity change cannot keep a lease bound to the old policy
+        # or clear a running cache. Portable preferences themselves never arm it.
+        operation_auto = getattr(self, "_native_operation_auto", None)
+        if operation_auto is not None:
+            operation_auto.close()
+            self._native_operation_auto = None
+            self._native_operation_auto_session = uuid.uuid4().hex
+        cached_execution = getattr(self, "_cached_decoder_execution", None)
+        if cached_execution is not None:
+            cached_execution.close()
+            self._cached_decoder_execution = None
+            self._cached_decoder_execution_session = uuid.uuid4().hex
+        decoder_execution = getattr(self, "_decoder_execution", None)
+        if decoder_execution is not None and set(raw).intersection({
+            "deviceResources", "systemRamMode", "systemRamSharePercent", "storageBytesPerSecond",
+            "memoryOffloadBytes", "storagePoolBytes", "contextOffloadBudgetBytes", "memoryResidentItems", "contextWindowTokens"}):
+            decoder_execution.close()
+            self._decoder_execution = None
+            self._decoder_execution_session = uuid.uuid4().hex
+        if getattr(getattr(self, "_regional_execution", None), "active", False) and set(raw).intersection({
+            "deviceResources", "systemRamMode", "systemRamSharePercent", "storageBytesPerSecond",
+            "memoryOffloadBytes", "storagePoolBytes", "contextOffloadBudgetBytes", "memoryResidentItems", "contextWindowTokens"}):
+            self.regional_execution_deactivate(reason="resource-policy-or-context-review-required")
         ignored_shape_fields: List[str] = []
         if "workingMemorySlots" in raw:
             slots = raw["workingMemorySlots"]
@@ -21729,6 +23444,8 @@ class AdaptiveBrain:
             assign(attribute, key, transform)
         assign("working_memory_mode", "workingMemoryMode", str)
         assign("extended_working_memory", "extendedWorkingMemory", bool)
+        assign("best_work_enabled", "bestWorkEnabled", lambda value: value)
+        assign("best_work_exploration_branches", "bestWorkExplorationBranches", lambda value: value)
         if "systemRamMode" in raw or "systemRamSharePercent" in raw:
             system_ram_mode = str(
                 raw.get(
@@ -21758,6 +23475,18 @@ class AdaptiveBrain:
             if self.config.system_ram_share_percent != system_ram_share:
                 self.config.system_ram_share_percent = system_ram_share
                 changed.append("system_ram_share_percent")
+        if "deviceResources" in raw:
+            from .device_resources import validate_device_resource_settings
+            selected_resources = validate_device_resource_settings(raw["deviceResources"])
+            if self.config.device_resource_settings != selected_resources:
+                self.config.device_resource_settings = selected_resources
+                changed.append("device_resource_settings")
+            selected_ram = next((entry for entry in selected_resources["allocations"] if entry["deviceId"] == "ram:system"), None)
+            if selected_ram is not None:
+                share = float(selected_ram["percent"]) if selected_ram["mode"] == "manual" else 0.0
+                if self.config.system_ram_share_percent != share:
+                    self.config.system_ram_share_percent = share
+                    changed.append("system_ram_share_percent")
         if "learningRate" in raw:
             neural_rate = max(
                 1e-5, min(0.02, float(raw["learningRate"]) * 0.02)
@@ -21790,6 +23519,7 @@ class AdaptiveBrain:
                 "memory_resident_items",
                 "storage_pool_bytes",
                 "working_attention_scratch_budget_bytes",
+                "device_resource_settings",
             }
         ):
             self.resource_policy = ResourcePolicy(
@@ -21801,6 +23531,8 @@ class AdaptiveBrain:
                 hardware_tier=self.config.hardware_tier,
                 shared_resource_owner_id=self.brain_id,
                 shared_storage_pool_bytes=self.config.storage_pool_bytes,
+                device_resource_settings=self.config.device_resource_settings,
+                execution_device=str(self.device),
             )
             self.state_store.policy = self.resource_policy
             self.replay.policy = self.resource_policy
@@ -21812,6 +23544,7 @@ class AdaptiveBrain:
             "max_seq_len", "system_ram_share_percent", "storage_bytes_per_second",
             "memory_offload_bytes", "memory_resident_items", "storage_pool_bytes",
             "working_attention_scratch_budget_bytes",
+            "device_resource_settings",
         }):
             self._configure_working_attention_resources()
             self.core_pager.refresh_budget(force=True)
@@ -21820,11 +23553,15 @@ class AdaptiveBrain:
         # optimizer is rebuilt only when its configured learning rate changes.
         if "learning_rate" in changed:
             self._replace_optimizer()
-        self.save()
-        self.events.append(
-            "config-updated", {"changed": changed, "runtimeCard": self.runtime_card()}
-        )
-        result = self.summary()
+        if changed or persist_if_unchanged:
+            self.save()
+            self.events.append(
+                "config-updated", {"changed": changed, "runtimeCard": self.runtime_card()}
+            )
+        # Internal Load already returns its final full summary after all
+        # compatibility checks. Validation/save/audit above are unchanged;
+        # this only avoids constructing a discarded presentation beforehand.
+        result = self.summary() if include_summary else {}
         result["changed"] = changed
         result["ignoredLearnedShapeFields"] = ignored_shape_fields
         return result

@@ -1,6 +1,6 @@
 # Omni AGI Studio
 
-Omni AGI Studio v1 is a Windows, macOS, and Linux desktop research environment for building persistent, continuously adapting **OmniCortex** models. Every new Build initializes its native core locally, learns a transparent local capability curriculum, and can then train on user-selected data before its first conversation. Import accepts only a verified native, ground-up OmniCortex `.omni`; it never converts or selects a Falcon, bundled Starter, Blank, foundation-adapter, or other legacy checkpoint.
+Omni AGI Studio v2 is a Windows, macOS, and Linux desktop research environment for building persistent, continuously adapting **OmniCortex** models. Every new Build initializes its native core locally, learns a transparent local capability curriculum, and can then train on user-selected data before its first conversation. Import accepts only a verified native, ground-up OmniCortex `.omni`; it never converts or selects a Falcon, bundled Starter, Blank, foundation-adapter, or other legacy checkpoint.
 
 The project combines a tiny trainable ternary language cortex, spiking/STDP associative plasticity, liquid temporal state, a unified growable neural substrate, hardware-sized working memory, multimodal research packs, one continuous chat, traceable mutations, and portable forks.
 
@@ -68,16 +68,24 @@ Long-term substrate decay can reduce activation and plastic strength but never c
 
 Prerequisites:
 
-- Node.js 22+
+- Node.js 22 LTS, selected by `.nvmrc`; the bundled Electron runtime uses Node.js 24
 - Python 3.10–3.12
 - PyTorch matching the machine's CPU or CUDA runtime
+- A C++17 compiler for the packed CPU library; Windows builds use Visual Studio C++ Build Tools
 
 ```powershell
-npm install
+npm ci
 python -m pip install -r engine/requirements.txt
-npm run test:python:portable
+python scripts/build-native-kernels.py
 npm run dev
 ```
+
+Use the selected LTS Node runtime for source checks. Homebrew Node 26.7.0 on
+macOS can leave `node:sqlite` backup completion waiting for another event-loop
+wakeup; increasing a test timeout does not fix it. The application's bundled
+Node 24.18.0 completes the affected merge checks normally. See
+[the SQLite runtime note](docs/v2/sqlite-runtime-completion.md) for the measured
+boundary and a command that uses the actual bundled runtime.
 
 Release worker packaging specifically uses CPython 3.11. The platform build
 scripts install the matching binary-only SHA-256 lock from `engine/locks`
@@ -104,7 +112,7 @@ npm run package:linux:x64
 npm run package:linux:arm64
 ```
 
-Windows produces NSIS and ZIP files, macOS produces DMG and ZIP files, and Linux produces AppImage, DEB, and tar.gz files. Each package embeds a self-contained PyInstaller worker built on the matching OS and architecture. The Windows ARM64 shell intentionally carries an x64 worker for Windows 11 emulation because stable PyTorch Windows ARM64 wheels are not available.
+Windows produces NSIS and ZIP files, macOS produces DMG and ZIP files, and Linux produces AppImage, DEB, and tar.gz files. Each package embeds a self-contained PyInstaller worker built on the matching OS and worker architecture. The Windows ARM64 shell intentionally carries an x64 worker for Windows 11 emulation until the complete reviewed dependency set, including PyArrow and the media wrapper, is available and verified as native ARM64 binary wheels.
 
 The app uses Windows 11 Mica where supported and the same Fluent-inspired surfaces on other systems. Native-host CI checks source, UI contracts, package structure, worker health, and packaged desktop startup without creating or training a brain. A trained ground-up brain and its capabilities require separate live acceptance. See [docs/RELEASE.md](docs/RELEASE.md) for the release contract.
 
@@ -135,7 +143,7 @@ See [`mobile/android/README.md`](mobile/android/README.md) and [`mobile/ios/READ
 - `docs/GROUND_UP_OMNICORTEX.md` — new-Build origin, training, no-fallback, scale, and readiness contract.
 - `docs/DISK_SPACE_CONTRACT.md` — one measured space-left and device-adaptive reserve contract for Build, training, and storage operations.
 - `docs/COMPLETION_AUDIT.md` — requirement-to-code map and verified release gates.
-- `docs/OMNI_FORMAT.md` — strict version-1 `.omni` container contract and privacy boundary.
+- `docs/OMNI_FORMAT.md` — strict format2 `.omni` container contract and privacy boundary.
 - `docs/SUBSTRATE_PERSISTENCE.md` — content-addressed substrate generations, bounded shards, and exact signed recurrent activation.
 - `docs/CATALOG_FORMATS.md` — non-executable recipe and `.omnipack` contracts.
 - `docs/TRAINING.md` — native initial curriculum, continual learning, and recovery limits.
@@ -154,11 +162,78 @@ Brains live below `%LOCALAPPDATA%\OmniAGI\brains` on Windows and the Electron ap
 
 Tools & permissions also connects MCP servers over Streamable HTTP or an explicitly installed local stdio executable. Discovered tool names and structural schemas are learned into the brain and can be selected naturally in chat; untrusted server descriptions never become prompt text. Web search has a credential-free public RSS fallback, while an optional SearXNG endpoint can still be configured. Completed organic research evidence is learned without creating a hidden prompt.
 
+Plain chat attachment is separate from Learn. Studio streams selected
+files/media into main-owned content-addressed handles, binds the exact set to
+one turn, and exposes only a turn-scoped paged read tool. Staging reports no
+ingestion and no parameter change; ordinary learning can occur later only when
+the brain actually reads visible tool evidence. Bound attachments and private
+source provenance follow unsanitized snapshot/fork/export/import custody, while
+full merge keeps parent attachments dormant. Direct raw-audio chat reuses this
+registry and never manufactures a transcript.
+
+The declarative plugin SDK stores immutable content-addressed packages outside
+brains, renders static panels through a dedicated deny-all iframe protocol,
+binds custom filename extensions to existing streaming parsers or an explicitly
+enabled import-free WASM-to-JSONL module, and delegates
+custom tools through the same nested permission executor. Packages may also
+declare a scripted controls/canvas panel. Each Open gets a fresh
+brain/hash/revision-bound handle in an opaque no-same-origin iframe with
+hash-only script CSP, no network/preload/Node access, main-side replay checks,
+and a host-owned Ask card before any declared tool effect. This is a browser-UI
+extension boundary, not permission for package code to run in Studio/main or
+install executable parser/native hooks. Supported `.omni` exports retain exact
+package/documentation/provenance and semantic-receipt
+records. Trusted local duplicates preserve their reviewed selection under an
+independent policy revision; external imports and full merges keep selections
+dormant and transfer no credentials, sessions, approvals, or callable grant.
+
+Completed `studio.artifact.create` actions can also retain a local HTML/SVG/
+canvas mini-app directly in chat. Raw markup stays in a content-addressed
+main-owned store and is served only through a fresh, opaque sandbox frame. An
+artifact script has no Node/preload/network/credential access and may request
+only its saved exact tool/action allowlist; every effect still passes through
+the current ToolExecutor permission and host-owned Ask review. Recovery keeps
+saved content but no live handles. New-owner copies, external imports, and full
+merges keep exact bytes and provenance with interaction dormant until explicit
+review. See [the saved HTML artifact contract](docs/v2/html-artifacts.md).
+
 API teacher learning supports OpenAI, Anthropic, and Gemini. A user supplies explicit learning questions; the provider response is encoded into the same fast synapses, assemblies, replay, and slow weights as other data. No provider request includes a system prompt, and the trajectory records no RLHF or reward model. Keys are stored outside all brains and exports through the OS encryption service, or held only for the current session if secure storage is unavailable. Ask approvals default to a visible 30-second countdown and can be changed from Tools & permissions.
 
 The browser tool uses a sandboxed persistent per-brain session. It validates public-network destinations, can navigate, click, type, press keys, wait, extract, and capture screenshots, and denies browser permission requests, downloads, popups, private-network targets, and non-web navigation. A user-approved visible session can retain its sign-in cookies. Source evolution uses an authorized Git clone and a separate worktree for typed hash-bound authoring, diff, allowlisted build/test, exact-diff validation, and optional promotion; it never executes generated prose or overwrites the running binary mid-execution. Full Authority may stage a passing native runtime in a separately hashed app-data slot and schedule a delayed packaged-app relaunch; Ask/Auto never activate it, and development/test hosts keep the slot deferred.
 
-`.omni` exports support current-portable, origin-portable, confirmed private-archive, and referenced-local modes. Export and import stream ZIP/ZIP64 entries and substrate shards instead of buffering a complete brain; there is no product-defined archive-size or entry-count cutoff, but operations pause before crossing the configured disk reserve. Import additionally requires current native ground-up OmniCortex provenance and the exact supported schema; legacy compatibility is not a selectable mode. Portable modes omit retained source content, sanitize metadata, and downgrade shared tool grants. Recursive pattern-based secret redaction applies to JSON; private archives refuse detected credentials in retained text-like blobs. No detector can guarantee discovery of every user-authored secret, so inspect an archive before sharing it. Referenced-local exports are deliberately non-portable because their real tensor bytes remain in the originating installation's content-addressed store.
+`runtime.sandbox` and `runtime.vm` provide durable create/list/status/Load/Run/
+Stop receipts directly through chat. The sandbox route fails closed when its
+OS adapter is absent. Supported Windows 11 hosts can use an already-enabled,
+signature-validated Windows Sandbox CLI with no network, mapped host folder,
+clipboard, or redirected device; Stop/cancellation deletes the exact owned
+guest, and its receipt explicitly says guest stdout/stderr are unavailable.
+No actual Windows guest boot is claimed by the source fixtures. The VM route accepts only an exact reviewed local image
+and never downloads a template, runs user provisioning scripts, mounts host files, forwards
+credentials, or adopts an existing user VM. Copies keep environment evidence
+dormant rather than transferring live processes or grants. See the
+[managed environment contract](docs/v2/managed-environments.md) for adapter and
+platform limits; a real VM boot is not yet claimed.
+
+`studio.clipboard` provides each brain a complete versioned portable text
+clipboard without touching the OS. The separate `system.clipboard` tool is Off
+by default and uses bounded monitored host adapters with nonreplayable effect
+receipts. Non-text formats and actual packaged desktop acceptance remain open;
+see the [clipboard contract](docs/v2/clipboard.md).
+
+`.omni` exports support current-portable, origin-portable, confirmed
+private-archive, and referenced-local modes. Export and import stream ZIP/ZIP64
+entries and substrate shards instead of buffering a complete brain; there is no
+product-defined archive-size or entry-count cutoff, but operations pause before
+crossing the configured disk reserve. Import additionally requires current
+native ground-up OmniCortex provenance and the exact supported schema; legacy
+compatibility is not a selectable mode. Saved-instance exports preserve their
+declared content instead of silently sanitizing the brain. User-authored source,
+conversation, paths, evidence, or credentials can therefore remain in an
+archive; inspect it before sharing. Installation credential stores, live
+sessions, approval tokens, Auto-load authority, and local drive grants are not
+portable, and imported tool/plugin authority starts from reviewed local policy.
+Referenced-local exports are deliberately non-portable because their real
+tensor bytes remain in the originating installation's content-addressed store.
 
 ## License
 

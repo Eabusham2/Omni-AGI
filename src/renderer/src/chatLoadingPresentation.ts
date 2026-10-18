@@ -1,4 +1,5 @@
 import type { ChatQueueState } from "../../shared/types";
+import { compactParameterCount } from "./neuralRuntimePresentation";
 
 export interface PendingChatOutputPresentation {
   phase: "queued" | "loading" | "streaming";
@@ -6,6 +7,7 @@ export interface PendingChatOutputPresentation {
   ariaLabel: string;
   outputTokens: number;
   elapsedMs?: number;
+  tokensPerSecond?: number;
 }
 
 function safeCount(value: unknown): number | undefined {
@@ -39,6 +41,10 @@ export function pendingChatOutputPresentation(input: {
   startedAtMs?: number | null;
   nowMs?: number | null;
   queue?: ChatQueueState | null;
+  streamStartedAtMs?: number | null;
+  streamNowMs?: number | null;
+  initialOutputTokens?: number;
+  measuredTokensPerSecond?: number;
 }): PendingChatOutputPresentation {
   const outputTokens = safeCount(input.outputTokens) ?? 0;
   if (input.queue) {
@@ -55,12 +61,23 @@ export function pendingChatOutputPresentation(input: {
   }
   if (outputTokens > 0) {
     const tokenNoun = outputTokens === 1 ? "token" : "tokens";
-    const label = `${outputTokens.toLocaleString("en-US")} output ${tokenNoun} used`;
+    const start = safeTimestamp(input.streamStartedAtMs);
+    const now = safeTimestamp(input.streamNowMs);
+    const initial = safeCount(input.initialOutputTokens) ?? outputTokens;
+    const duration = start !== undefined && now !== undefined ? now - start : 0;
+    const measured = typeof input.measuredTokensPerSecond === "number" && Number.isFinite(input.measuredTokensPerSecond) && input.measuredTokensPerSecond >= 0
+      ? input.measuredTokensPerSecond : undefined;
+    const tokensPerSecond = measured ?? (duration >= 250 && outputTokens > initial
+      ? (outputTokens - initial) / (duration / 1_000) : undefined);
+    const label = `${compactParameterCount(outputTokens)} ${tokenNoun}` +
+      (tokensPerSecond !== undefined ? ` · ${tokensPerSecond.toLocaleString("en-US", { maximumFractionDigits: 1 })} tok/s` : "");
     return {
       phase: "streaming",
       label,
-      ariaLabel: `Live response output: ${label}`,
-      outputTokens
+      ariaLabel: `Live response output: ${outputTokens.toLocaleString("en-US")} output ${tokenNoun} used` +
+        (tokensPerSecond !== undefined ? `. Average delivered speed since first output: ${tokensPerSecond.toFixed(2)} tokens per second.` : ""),
+      outputTokens,
+      ...(tokensPerSecond !== undefined ? { tokensPerSecond } : {})
     };
   }
 

@@ -16,6 +16,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -89,6 +90,46 @@ class AuthenticatedCacheSession:
         return hmac.new(self._secret,
                         domain.encode("ascii") + b"\0" + self.store_id.encode("utf-8")
                         + b"\0" + canonical(value), hashlib.sha256).hexdigest()
+
+    @contextmanager
+    def proof_io_window(self) -> Iterator[None]:
+        """Keep WAL open during a bounded verification operation.
+
+        Individual proof transactions still commit independently. This idle
+        read connection holds no read snapshot, so it does not prevent writer
+        checkpoints or acquire authority over unverified source bytes. Close
+        it before staging publication/retargeting, including exceptions.
+        """
+        connection = None
+        try:
+            self.owner._reserve_memory(self.sqlite_window_bytes + 4096, "verification WAL connection window")
+            self.reserve_disk(4 * 1024 * 1024 + 65536, "verification WAL transient headroom")
+            # An RW handle is needed for SQLite's last-close checkpoint.
+            # mode=rw cannot create a missing file; we issue only read queries.
+            connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=rw", uri=True,
+                                         timeout=30., isolation_level=None)
+            connection.execute("PRAGMA cache_size=-%d" % max(4, self.sqlite_window_bytes // 1024))
+            connection.execute("PRAGMA mmap_size=0")
+            cursor = connection.execute("SELECT value FROM index_metadata WHERE key='store_id'")
+            try:
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+            if row is None or row[0] != self.store_id or connection.in_transaction:
+                raise ValueError("verification WAL window has invalid owner or held snapshot")
+        except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+            if connection is not None:
+                connection.close()
+                connection = None
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            raise
+        try:
+            yield
+        finally:
+            if connection is not None:
+                connection.close()
 
     def authentic(self, domain: str, value: Any, observed: Any) -> bool:
         return isinstance(observed, str) and hmac.compare_digest(self.sign(domain, value), observed)
@@ -210,3 +251,15 @@ def cache_session(owner: Any, *, disk_reserve: Optional[Callable[[int, str], Any
 
 def active_blob_session() -> Optional[AuthenticatedCacheSession]:
     return _ACTIVE_SESSION.get()
+
+
+def bounded_proof_io_window(method):
+    """Speed a verified read phase without extending a staging-file lifetime."""
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        session = active_blob_session()
+        if session is None:
+            return method(*args, **kwargs)
+        with session.proof_io_window():
+            return method(*args, **kwargs)
+    return wrapped

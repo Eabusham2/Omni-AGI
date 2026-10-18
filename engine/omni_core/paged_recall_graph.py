@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .paged_merkle_kv import SqliteMerkleMap
+from .weighted_substrate_state import validate_contribution, synapse_contribution
 
 
 class PagedRecallGraph:
@@ -33,7 +34,7 @@ class PagedRecallGraph:
         self.connection.execute("PRAGMA mmap_size=0")
         self.connection.execute(
             "CREATE TABLE raw_edges(edge_id TEXT PRIMARY KEY,ordinal INTEGER NOT NULL UNIQUE,"
-            "source_id TEXT NOT NULL,target_id TEXT NOT NULL,level INTEGER NOT NULL CHECK(level IN (-1,1)),"
+            "source_id TEXT NOT NULL,target_id TEXT NOT NULL,level INTEGER NOT NULL CHECK(level BETWEEN -16 AND 16 AND level!=0),"
             "eligible INTEGER NOT NULL CHECK(eligible IN (0,1))) WITHOUT ROWID"
         )
         self.connection.execute("CREATE INDEX graph_edge_source ON raw_edges(source_id,ordinal)")
@@ -49,13 +50,13 @@ class PagedRecallGraph:
             statements = []
             if old:
                 statements.extend((
-                    "UPDATE incoming SET count=count-1 WHERE node_id=OLD.target_id AND OLD.eligible=1;",
+                    "UPDATE incoming SET count=count-ABS(OLD.level) WHERE node_id=OLD.target_id AND OLD.eligible=1;",
                     "DELETE FROM incoming WHERE node_id=OLD.target_id AND count=0;",
                 ))
             if new:
                 statements.append(
-                    "INSERT INTO incoming SELECT NEW.target_id,1 WHERE NEW.eligible=1 "
-                    "ON CONFLICT(node_id) DO UPDATE SET count=count+1;"
+                    "INSERT INTO incoming SELECT NEW.target_id,ABS(NEW.level) WHERE NEW.eligible=1 "
+                    "ON CONFLICT(node_id) DO UPDATE SET count=count+excluded.count;"
                 )
             self.connection.execute(
                 "CREATE TRIGGER graph_degree_%s AFTER %s ON raw_edges BEGIN %s END"
@@ -76,7 +77,8 @@ class PagedRecallGraph:
             raise RuntimeError("%s paused at resource reserve" % operation)
 
     def _replace(self, identifier: str, source: str, target: str, level: int, *, node_exists) -> None:
-        if not isinstance(identifier, str) or not identifier or type(level) is not int or level not in {-1, 0, 1}:
+        validate_contribution(level)
+        if not isinstance(identifier, str) or not identifier:
             raise ValueError("recall graph edge identity/sign is invalid")
         old = self.connection.execute(
             "SELECT ordinal,level,eligible FROM raw_edges WHERE edge_id=?", (identifier,),
@@ -101,9 +103,62 @@ class PagedRecallGraph:
         self.inhibitory_edges += int(eligible and level < 0)
 
     def load(self, edges: Iterable[tuple[str, str, str, int]], *, node_exists,
-             synapse_revision, neuron_revision) -> None:
-        for identifier, source, target, level in edges:
-            self._replace(identifier, source, target, level, node_exists=node_exists)
+             synapse_revision, neuron_revision, read_stores=(), cancelled=None,
+             node_exists_many=None) -> None:
+        from .paged_read_session import ReadSession, keeper_eligible_stores
+        with ReadSession(keeper_eligible_stores(read_stores), cancelled=cancelled):
+            def verify_nodes():
+                for store in read_stores:
+                    revision = getattr(store, 'graph_revision', None)
+                    if revision is not None and neuron_revision is not None and revision != neuron_revision:
+                        raise ValueError('native recall node generation changed during graph load')
+            verify_nodes()
+            if node_exists_many is None:
+                for identifier, source, target, level in edges:
+                    if cancelled is not None and cancelled():
+                        raise InterruptedError('native recall graph load cancelled')
+                    self._replace(identifier, source, target, level, node_exists=node_exists)
+            else:
+                # The keeper above already removes repeated connection setup.
+                # This independent bounded window removes the remaining 2E
+                # membership SQL queries, without retaining a node-ID mirror.
+                iterator = iter(edges)
+                exhausted = False
+                while not exhausted:
+                    self._require(32 * 1024, 'recall graph endpoint page')
+                    page = []
+                    for _position in range(64):
+                        if cancelled is not None and cancelled():
+                            raise InterruptedError('native recall graph load cancelled')
+                        try:
+                            page.append(next(iterator))
+                        except StopIteration:
+                            exhausted = True
+                            break
+                    if not page:
+                        break
+                    verify_nodes()
+                    endpoints = {}
+                    for _identifier, source, target, level in page:
+                        validate_contribution(level)
+                        if level:
+                            endpoints[source] = None
+                            endpoints[target] = None
+                    requested = tuple(endpoints)
+                    present = node_exists_many(requested)
+                    if (
+                        not isinstance(present, frozenset)
+                        or not present <= endpoints.keys()
+                    ):
+                        raise ValueError('native recall membership page returned invalid IDs')
+                    verify_nodes()
+                    for identifier, source, target, level in page:
+                        if cancelled is not None and cancelled():
+                            raise InterruptedError('native recall graph load cancelled')
+                        self._replace(identifier, source, target, level,
+                                      node_exists=present.__contains__)
+                    verify_nodes()
+            verify_nodes()
         self.connection.commit()
         self.applied_synapse_revision = synapse_revision
         self.queued_synapse_revision = synapse_revision
@@ -162,7 +217,7 @@ class PagedRecallGraph:
                     else:
                         from .vsa import NeuralSubstrate
                         self._replace(identifier, str(record["source_id"]), str(record["target_id"]),
-                                      NeuralSubstrate.exact_effective_weight(record.get("effective_weight", 0)),
+                                      synapse_contribution(record),
                                       node_exists=lambda value: value in neurons)
                 elif kind == "node":
                     for edge_id, source, target, level in self.connection.execute(

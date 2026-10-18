@@ -10,11 +10,10 @@ import type {
 import type { NeuralModalityCapabilities, OmniApi } from "../../shared/types";
 import {
   createBrowserLivePerceptionCapture,
-  LivePerceptionController,
-  planLivePerception,
   type LivePerceptionCaptureAdapter
 } from "./livePerceptionController";
 import { createNeuralSpeechSynthesisAdapter, type NeuralWavePlayerConstructor } from "./neuralSpeechPlayback";
+import { createNativeAudioCaptureAdapter, type NativeAudioCaptureAdapter } from "./nativeAudioCapture";
 
 interface RecognitionAlternativeLike {
   transcript: string;
@@ -64,6 +63,7 @@ export interface BrowserVoiceEnvironment {
   speechSynthesis?: Pick<SpeechSynthesis, "speak" | "cancel">;
   utteranceConstructor?: typeof SpeechSynthesisUtterance;
   audioConstructor?: NeuralWavePlayerConstructor;
+  audioContextConstructor?: typeof AudioContext;
 }
 
 export const LIVE_VOICE_CAPTURE_REQUEST_TIMEOUT_MS = 15_000;
@@ -72,6 +72,7 @@ function runtimeEnvironment(): BrowserVoiceEnvironment {
   const scope = globalThis as typeof globalThis & {
     SpeechRecognition?: RecognitionConstructor;
     webkitSpeechRecognition?: RecognitionConstructor;
+    webkitAudioContext?: typeof AudioContext;
   };
   return {
     mediaDevices: globalThis.navigator?.mediaDevices,
@@ -80,7 +81,8 @@ function runtimeEnvironment(): BrowserVoiceEnvironment {
     speechSynthesis: globalThis.speechSynthesis,
     utteranceConstructor: globalThis.SpeechSynthesisUtterance,
     audioConstructor: typeof globalThis.Audio === "function"
-      ? globalThis.Audio as unknown as NeuralWavePlayerConstructor : undefined
+      ? globalThis.Audio as unknown as NeuralWavePlayerConstructor : undefined,
+    audioContextConstructor: globalThis.AudioContext ?? scope.webkitAudioContext
   };
 }
 
@@ -155,6 +157,7 @@ export function createBrowserCaptureAdapter(
         if (timeoutId !== undefined) globalThis.clearTimeout(timeoutId);
       }
       return {
+        stream,
         stop: () => stream.getTracks().forEach((track) => track.stop())
       };
     }
@@ -241,6 +244,7 @@ export function createOmniLiveVoiceChatAdapter(
   return {
     send: (brainId, transcript, turnId) =>
       chat.send(brainId, transcript, turnId),
+    ...(typeof chat.sendAudio === "function" ? { sendAudio: (brainId: string, input: import("../../shared/nativeAudioChat").NativeAudioChatRequest, turnId: string) => chat.sendAudio(brainId, input, turnId) } : {}),
     cancel: (brainId, turnId) => chat.cancel(brainId, turnId),
     subscribe: (listener) => chat.onStream(listener)
   };
@@ -253,18 +257,25 @@ function runtimeOmniModality(): OmniApi["modality"] | undefined {
   return scope.window?.omni?.modality;
 }
 
+function runtimeOmniChat(): OmniApi["chat"] | undefined {
+  return (globalThis as typeof globalThis & { window?: { omni?: OmniApi } }).window?.omni?.chat;
+}
+
 /**
  * Feeds raw microphone audio into this brain's trained sensory substrate. It
- * deliberately does not transcribe or synthesize speech: Web Speech remains
- * the language-boundary transcript. Output quality is separate from connectivity.
+ * never invokes a platform recognizer. Actual audio conditions the same brain's
+ * ordinary chat route. Output quality is separate from connectivity.
  */
 export function createOmniNeuralAudioAdapter(
   modality: OmniApi["modality"] | undefined = runtimeOmniModality(),
-  capture: LivePerceptionCaptureAdapter = createBrowserLivePerceptionCapture(),
-  options: { brainId?: string; audioConstructor?: NeuralWavePlayerConstructor } = {}
+  _capture: LivePerceptionCaptureAdapter = createBrowserLivePerceptionCapture(),
+  options: { brainId?: string; audioConstructor?: NeuralWavePlayerConstructor; chat?: OmniApi["chat"]; nativeCapture?: NativeAudioCaptureAdapter } = {}
 ): LiveVoiceNeuralAdapter {
   const measured = new Map<string, NeuralModalityCapabilities>();
   let selectedBrainId = options.brainId;
+  const chat = options.chat ?? runtimeOmniChat();
+  const rawCapture = options.nativeCapture ?? createNativeAudioCaptureAdapter(createBrowserCaptureAdapter());
+  let nativeInputAvailable = false;
   const synthesis = createNeuralSpeechSynthesisAdapter(() => selectedBrainId, modality,
     options.audioConstructor ?? runtimeEnvironment().audioConstructor);
 
@@ -290,11 +301,16 @@ export function createOmniNeuralAudioAdapter(
         };
       }
       const capabilities = await inspect(brainId);
-      const listening = capabilities?.audioPerception === true && capture.capabilities.microphone;
+      const native = chat?.audioInputCapabilities ? await chat.audioInputCapabilities(brainId) : undefined;
+      nativeInputAvailable = native?.brainId === brainId && native.loaded === true && native.available === true &&
+        native.transcriptRequired === false && rawCapture.available && typeof chat?.sendAudio === "function";
+      const listening = nativeInputAvailable;
       const voice = capabilities?.audioRegionAvailable === true && synthesis.available;
       const quality = capabilities?.speechQuality ?? "needs-speech-training";
       return {
         listening,
+        nativeAudioChatInput: nativeInputAvailable,
+        nativeAudioChatInputDetail: native?.detail ?? "Direct raw-audio chat input is unavailable; no platform transcript was substituted.",
         voice,
         voiceQuality: quality,
         detail: voice
@@ -304,38 +320,19 @@ export function createOmniNeuralAudioAdapter(
           : "Same-brain waveform output or local playback is unavailable. Platform STT/TTS remain separate."
       };
     },
-    async startListening(brainId) {
+    async startListening(brainId, handlers, signal) {
       if (!modality) {
         throw new Error("The trusted neural-media preload API is unavailable.");
       }
+      if (!nativeInputAvailable || !handlers || !chat?.sendAudio) throw new Error("Direct native audio conversation is unavailable; STT was not substituted.");
       const capabilities = measured.get(brainId) ?? (await inspect(brainId));
-      if (!capabilities?.audioPerception) {
-        throw new Error("This brain has no verified trained neural audio-input path.");
-      }
-      if (!capture.capabilities.microphone) {
-        throw new Error("Direct neural microphone packet encoding is unavailable.");
-      }
-      const controller = new LivePerceptionController({
-        brainId,
-        modality,
-        capture
-      });
-      await controller.start(
-        "microphone",
-        planLivePerception({ hardwareTier: capabilities.hardwareTier }),
-        "neural"
-      );
-      const state = controller.getState();
-      if (!state.enabled) {
-        const message = state.error ?? "Direct neural listening could not start.";
-        await controller.dispose();
-        throw new Error(message);
-      }
-      return {
-        stop: () => {
-          void controller.dispose();
-        }
-      };
+      if (!capabilities?.audioRegionAvailable) throw new Error("This brain's own audio region is disabled.");
+      return rawCapture.start(async (sampleRate) => {
+        const lease = await modality.startObservation({ brainId, modalities: ["audio"], retention: "working",
+          permission: { granted: true, scope: "session", source: "microphone", grantedAt: new Date().toISOString() },
+          capture: { mode: "auto", audioSampleRate: sampleRate, benchmarkClass: "balanced" } });
+        return { sessionId: lease.id, maxBytes: lease.maxPacketBytes, stop: () => modality.stopObservation(lease.id) };
+      }, handlers, signal);
     },
     ...(synthesis.available ? { synthesis } : {})
   };
@@ -350,12 +347,14 @@ export function createBrowserLiveVoiceAdapters(
   synthesis: LiveVoiceSynthesisAdapter;
   neural: LiveVoiceNeuralAdapter;
 } {
+  const voiceCapture = createBrowserCaptureAdapter(environment);
   return {
-    capture: createBrowserCaptureAdapter(environment),
+    capture: voiceCapture,
     recognition: createBrowserRecognitionAdapter(environment),
     synthesis: createBrowserSynthesisAdapter(environment),
     neural: createOmniNeuralAudioAdapter(runtimeOmniModality(), createBrowserLivePerceptionCapture(), {
-      brainId, audioConstructor: environment.audioConstructor
+      brainId, audioConstructor: environment.audioConstructor,
+      nativeCapture: createNativeAudioCaptureAdapter(voiceCapture, environment.audioContextConstructor)
     })
   };
 }

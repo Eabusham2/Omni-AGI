@@ -44,12 +44,12 @@ class SpikingAndLiquidTests(unittest.TestCase):
         synapses.step(torch.tensor([1.0]), torch.tensor([0.0]))
         first = synapses.step(
             torch.tensor([0.0]), torch.tensor([1.0])
-        ).abs().item()
+        ).delta_absolute_sum
         synapses.reset_activity()
         synapses.step(torch.tensor([1.0]), torch.tensor([0.0]))
         second = synapses.step(
             torch.tensor([0.0]), torch.tensor([1.0])
-        ).abs().item()
+        ).delta_absolute_sum
         self.assertLess(second, first)
 
     def test_stdp_synapses_are_packed_authoritative_without_float_weight_mirror(self):

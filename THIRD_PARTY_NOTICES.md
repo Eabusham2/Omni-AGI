@@ -133,6 +133,34 @@ review and six native codec round-trip checks are not legal advice, patent
 clearance or proof of AI-generated media quality. See
 `docs/VIDEO_RUNTIME_PROVISIONING.md` for provenance and remaining live integration evidence.
 
+### Optional externally installed environment runtimes
+
+Omni AGI Studio can invoke an already installed Lima (`limactl`) or bubblewrap
+(`bwrap`) executable through its permissioned managed-environment adapter. The
+official Omni packages do not bundle, install or download either executable or
+a guest image. Lima is licensed under Apache-2.0; bubblewrap identifies its
+core under LGPL-2.0-or-later. Users or downstream distributors who install or
+bundle those separate programs must retain their upstream notices and terms.
+
+- Lima source and license: <https://github.com/lima-vm/lima>
+- bubblewrap source and license: <https://github.com/containers/bubblewrap>
+
+The optional Windows adapter invokes the operating-system-provided Microsoft
+Windows Sandbox CLI when it is already installed, signature-valid, enabled and
+supported by that Windows edition. Omni does not redistribute or enable
+Windows Sandbox. Its use remains governed by the user's Windows licence and
+Microsoft's platform terms and documentation.
+
+The optional clipboard adapter invokes operating-system-provided macOS
+JXA/AppKit pasteboard APIs or Windows PowerShell clipboard cmdlets. Omni does not
+redistribute those platform components. Their use remains governed by the
+host operating-system licence. Linux clipboard utilities are not bundled or
+automatically installed. When already installed, the optional adapter may
+invoke [xclip](https://github.com/astrand/xclip) (GNU GPL v2) or
+[wl-clipboard](https://github.com/bugaevc/wl-clipboard) (GNU GPL v3); those
+programs remain separate host executables under their upstream licences and
+are not copied into Omni.
+
 ## Research inspirations
 
 The architecture is informed by LLaMA-style decoder components, BitNet b1.58,
@@ -148,3 +176,15 @@ No third-party pretrained model weights are bundled or accepted as an
 OmniCortex brain. Imported datasets and modality-only packs require their own
 provenance and license manifests; whole-brain import requires verified native
 ground-up OmniCortex provenance and the exact supported schema.
+
+## DFlash2 and speculative-sampling research
+
+Omni's native auxiliary-drafting evaluation is independently written from
+published methods; it does not import or execute Z Lab model code or weights.
+The upstream method/implementation reference is
+<https://github.com/z-lab/dflash/tree/07ebd93db9f472af339b644bb70221ad8428328a>.
+Its MIT notice is preserved in `licenses/DFlash-MIT.txt`. The acceptance and
+positive-residual sampling method is attributed to Leviathan, Kalman and
+Matias, <https://arxiv.org/abs/2211.17192>. The current Omni evaluation is not
+enabled in normal inference and makes no upstream-equivalent speed claim.
+See `docs/v2/native-drafting.md` for the measured result and limits.

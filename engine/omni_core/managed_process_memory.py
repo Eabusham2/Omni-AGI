@@ -131,6 +131,14 @@ def _posix_table() -> ProcessTable:
             child.stdout.close()
 
 
+def _darwin_table(root_pid: int) -> ProcessTable:
+    from .darwin_process_memory import family_rows
+
+    return ProcessTable({pid: ProcessRow(pid, parent, rss)
+                         for pid, (parent, rss) in
+                         family_rows(root_pid, max_process_rows=MAX_PROCESS_ROWS).items()})
+
+
 def _windows_table() -> ProcessTable:
     # Primary Toolhelp parent inventory + PSAPI working sets, no new package.
     # https://learn.microsoft.com/windows/win32/api/tlhelp32/ns-tlhelp32-processentry32w
@@ -213,7 +221,14 @@ class ManagedProcessMemorySampler:
                 sample_started_ns = time.time_ns()
                 if self.invalid_owner:
                     raise ValueError("managed process memory owner is invalid")
-                table = self.provider() if self.provider is not None else (_windows_table() if os.name == "nt" else _posix_table())
+                if self.provider is not None:
+                    table = self.provider()
+                elif os.name == "nt":
+                    table = _windows_table()
+                elif sys.platform == "darwin":
+                    table = _darwin_table(self.root_pid)
+                else:
+                    table = _posix_table()
                 sample = managed_family_sample(table, self.root_pid, self.worker_pid, self.scope)
             except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
                 sample = ManagedMemorySample(None, None, self.root_pid, 0, False, self.scope,

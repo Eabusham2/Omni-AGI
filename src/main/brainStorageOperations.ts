@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { performance } from "node:perf_hooks";
 import type {
   BrainStorageOperationEvent,
   BrainStorageOperationKind,
@@ -39,7 +40,7 @@ function safeCount(value: number | undefined, fallback: number): number {
 
 export class BrainStorageOperationSession extends EventEmitter {
   readonly controller = new AbortController();
-  private readonly startedAtMs = Date.now();
+  private readonly startedAtMs: number;
   private pauseRequested = false;
   private resumeWaiters = new Set<() => void>();
   private terminal = false;
@@ -53,9 +54,11 @@ export class BrainStorageOperationSession extends EventEmitter {
       path: string,
       operationWriteBytes: number
     ) => Promise<DiskSpaceTelemetry> = (path, operationWriteBytes) =>
-      requireDiskWrite(path, { operationWriteBytes })
+      requireDiskWrite(path, { operationWriteBytes }),
+    private readonly monotonicNow: () => number = () => performance.now()
   ) {
     super();
+    this.startedAtMs = this.monotonicNow();
     const updatedAt = new Date().toISOString();
     this.snapshot = {
       schemaVersion: 1,
@@ -86,7 +89,7 @@ export class BrainStorageOperationSession extends EventEmitter {
     update: BrainStorageProgressUpdate = {},
     error?: string
   ): BrainStorageOperationEvent {
-    const elapsedMs = Math.max(0, Date.now() - this.startedAtMs);
+    const elapsedMs = Math.max(0, this.monotonicNow() - this.startedAtMs);
     const filesCompleted = safeCount(
       update.filesCompleted,
       this.snapshot.filesCompleted

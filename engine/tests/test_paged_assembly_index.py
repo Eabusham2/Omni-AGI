@@ -37,6 +37,19 @@ def _packed(levels):
 
 
 class PagedAssemblyIndexTests(unittest.TestCase):
+    def test_real_memory_lifecycle_scores_survive_paging_without_accepting_source_text(self):
+        from omni_core.paged_assembly_index import _record_payload
+        record = {"id": "assembly", "fingerprint": "fingerprint", "memory_strength": .4,
+            "retention_score": .4, "activity_score": .8, "plasticity_score": .6,
+            "reinforcement_drive": .7, "unfinished_score": .5, "unfinished": True,
+            "settling_signals": {"activation": .8, "recurrence": .6, "decayPressure": .1},
+            "last_settled_at": "2026-10-07T10:00:00Z"}
+        self.assertEqual(json.loads(_record_payload(record)[2]), record)
+        for update in ({"source_text": "not metadata"}, {"activity_score": float('nan')},
+                       {"settling_signals": {"answer": "arbitrary text"}}, {"unfinished": "true"}):
+            with self.assertRaises(ValueError):
+                _record_payload({**record, **update})
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="omni-assembly-index-")
         self.addCleanup(temporary.cleanup)

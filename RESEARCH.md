@@ -26,11 +26,60 @@ the new application packages are not yet published.
 | [Darwin Gödel Machine](https://arxiv.org/abs/2505.22954) and its [reference repository](https://github.com/jennyzzt/dgm) | Preserve an open-ended lineage of self-improvement experiments instead of greedily retaining only one candidate | `EvolutionController` forms isolated neural, data, architecture, or source candidates; binds them to immutable evaluation evidence; archives parentage and promising failures; promotes supported gains; and can recursively reassess the improved improvement process. Host permission, evaluator, origin, and rollback boundaries remain outside candidate-writable state. | Method-level inspiration only; DGM source is not copied, imported, or executed. Omni's controller and Git/safe-tensor isolation are independently implemented. |
 | [Model Context Protocol 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) | Discover and invoke external typed tools over negotiated Streamable HTTP or stdio JSON-RPC | Omni independently implements initialize, initialized notification, paged tool discovery, and calls. Only tool names and structural input schemas enter neural learning; descriptions, credentials, and transport metadata cannot become behavioral prompts. Host permission and audit enforcement remain outside candidate-writable state. | Protocol interoperability only; no MCP SDK or server code is copied or bundled. |
 | [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/methods/create), [Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create), and [Gemini Interactions](https://ai.google.dev/api/interactions-api) | Optional teacher-model response imitation from explicit user questions | Provider responses are converted into attributable corpus-prediction trajectories and learned through OmniCortex's existing synapse/assembly/slow-weight path. No provider model is used during normal chat inference; there is no hidden system prompt, preference optimization, or exported credential. | Wire-protocol integration only; provider SDKs, source, and weights are not copied or bundled. API use remains subject to each provider's terms and the user's account. |
+| [OpenAI List models](https://developers.openai.com/api/reference/resources/models/methods/list), [Anthropic List Models](https://platform.claude.com/docs/en/api/models/list), and [Gemini Models API](https://ai.google.dev/api/models) | Account-visible external-teacher model discovery | Main uses the providers' fixed HTTPS list routes and documented pagination to return bounded metadata candidates. Manual selection remains unchanged and every result says visibility is not generation compatibility. | Wire-level read only; no provider SDK/catalog copy, key creation, source, or weights are bundled. Fake HTTP/vault fixtures are not live-provider evidence. |
 | [Diffusion Transformers](https://arxiv.org/abs/2212.09748) | Transformer denoising in a compressed visual latent space | The VQ image pack uses a small ternary, idea/time-conditioned latent transformer with a latent noise-prediction loss and iterative denoising sampler. It is a trainable baseline, not a claim of Stable Diffusion quality. | Paper-level architecture; no DiT code or weights are bundled. |
 | [High Fidelity Neural Audio Compression](https://arxiv.org/abs/2210.13438) | Discrete residual-quantized audio latents | The audio pack provides a two-level RVQ codec and ternary latent-token generator without bundling AudioCraft weights. | Paper-level architecture; no EnCodec code or weights are bundled. |
 | [Latte](https://arxiv.org/abs/2401.03048) | Factorized spatial-temporal latent video processing | The video pack operates on tiny compressed clips with separate spatial/temporal paths, latent noise-prediction training, iterative denoising, liquid recurrent temporal gating, and local MP4 encoding. | Paper-level architecture; no Latte code or weights are bundled. |
+| [DFlash2](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/dflash2/), [authors' method](https://inco.ai/blog/dflash2/), and [speculative sampling](https://arxiv.org/abs/2211.17192) | Parallel local candidate features, predecessor-conditioned selection, and exact acceptance/positive-residual verification | A separate own packed auxiliary research region shares Omni's embedding/readout. Thirteen focused cases and eighteen paired native decoder comparisons passed their measurement/isolation contract; the serial-verified path was slower and a grown-expert fixture disproved naive one-long-forward verification. **Evaluated, not enabled**; no runtime switch or default change. See `docs/v2/native-drafting.md`. | Independently written method adaptation, not a complete DFlash2 reproduction. No upstream weights/module imported or executed. Pinned upstream MIT notice preserved in `licenses/DFlash-MIT.txt`; sampling equations attributed to Leviathan et al. |
 
 ## Reference-source boundary
+
+### v2 integration references (October 11, 2026)
+
+The reviewed MCP/provider templates and independently written private map
+adapter are documented in [maps-presets.md](docs/v2/maps-presets.md), including
+official GitHub, Microsoft, Adobe, Gmail and Resend endpoint/setup references.
+They do not vendor provider/server SDKs or silently install executable packages.
+[Photon's API](https://github.com/komoot/photon/blob/master/docs/api-v1.md) and
+[GeoJSON](https://www.rfc-editor.org/rfc/rfc7946) supply wire-format references,
+not copied source or model weights. Photon code's Apache-2.0 licence is distinct
+from [OSM data's attribution/ODbL](https://www.openstreetmap.org/copyright).
+No public geocoder or paid Mapbox request is run by default. Nominatim/public
+Photon service policies and the undecided Mapbox retention/export choice remain
+explicit; ordinary learning and complete unsanitized exports are not weakened
+to conceal a provider incompatibility.
+
+The managed environment adapter also interoperates with already installed
+[Lima](https://github.com/lima-vm/lima) and
+[bubblewrap](https://github.com/containers/bubblewrap). Studio independently
+builds its lifecycle, receipts, permissions, portable records and command
+operands; it does not vendor either source tree, install either executable, run
+remote templates, or bundle a guest image. Lima is Apache-2.0 and bubblewrap
+identifies its core as LGPL-2.0-or-later. Apple `sandbox-exec` is an OS command,
+and the current macOS manual marks it deprecated; the adapter reports that
+instead of claiming App Sandbox certification. On compatible Windows 11 hosts,
+the adapter uses Microsoft's built-in Windows Sandbox CLI according to the
+[official lifecycle](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-cli)
+and [configuration controls](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-configure-using-wsb-file).
+It does not bundle Windows Sandbox, enable its privileged optional feature, or
+claim guest process I/O that Microsoft's CLI does not provide. See
+`docs/v2/managed-environments.md` for the exact current boundary.
+
+Clipboard integration uses operating-system facilities already present on the
+host: fixed macOS JXA/AppKit `NSPasteboardTypeString` access and Windows PowerShell
+`Get-Clipboard`/`Set-Clipboard`, plus optional installed Wayland
+[`wl-clipboard`](https://github.com/bugaevc/wl-clipboard/blob/master/data/wl-clipboard.1)
+or X11 [`xclip`](https://github.com/astrand/xclip/blob/master/xclip.c). The Linux
+source references determine the nonforking foreground modes: wl-copy's
+`--foreground` and xclip's `-quiet` rather than forking `-silent`. Studio's
+paging, ownership, portability,
+permission checks and nonreplayable effect journal are independent code. It
+does not vendor those OS components, install Linux clipboard utilities, or
+claim that renderer clipboard APIs provide the model's host authority. Windows
+semantics follow Microsoft's [`Get-Clipboard`](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-clipboard?view=powershell-5.1)
+and [`Set-Clipboard`](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-clipboard?view=powershell-5.1)
+references. See
+`docs/v2/clipboard.md` for supported formats and actual-test limits.
 
 BitNet, snnTorch, NCPS, TorchHD, DGM, LLaMA, and the other entries above are
 research references, not selectable model families. Preserving a paper,

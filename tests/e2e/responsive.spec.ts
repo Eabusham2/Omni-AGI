@@ -10,6 +10,10 @@ const viewports = [
   { name: "design target", width: 1_480, height: 940 },
   { name: "ultrawide", width: 2_560, height: 1_080 }
 ] as const;
+const workspaceRoutes = [
+  "Conversation", "Data & training", "Learn", "Fact Check", "Time & schedules", "Brain map",
+  "Trace & journal", "Imagination", "Tools & permissions", "Device & runtime", "Forks & agents", "Evolution"
+] as const;
 
 test("workspace remains reachable, overflow-safe, and keyboard-accessible at supported viewports", async () => {
   const inheritedEnvironment = Object.fromEntries(
@@ -76,9 +80,19 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
         await expect(page.getByLabel("Workspace")).toBeVisible();
         await expect(page.getByLabel("Message Aster")).toBeVisible();
         await expect(page.getByLabel("Send message")).toBeVisible();
-        const liveVoice = page.getByLabel("Start live voice");
-        await expect(liveVoice).toBeVisible();
-        await expect(liveVoice).toHaveAttribute("aria-pressed", "false");
+        const call = page.getByRole("button", { name: "Call", exact: true });
+        await expect(call).toBeVisible();
+        await expect(call).toHaveAttribute("aria-expanded", "false");
+        const callControls = page.getByRole("region", { name: "Call controls", exact: true });
+        await expect(callControls).toBeHidden();
+        await call.click();
+        await expect(call).toHaveAttribute("aria-expanded", "true");
+        await expect(callControls).toBeVisible();
+        await expect(callControls.getByRole("button", { name: "Start live voice", exact: true })).toBeVisible();
+        await expect(callControls.getByRole("region", { name: "Camera and screen sharing", exact: true })).toBeVisible();
+        // Opening the real controls is not permission to start voice/camera.
+        await call.click();
+        await expect(callControls).toBeHidden();
         await expect(page.getByLabel("Live voice settings")).toHaveCount(0);
         await expect(page.getByRole("group", { name: "Delivery" })).toHaveCount(0);
 
@@ -96,22 +110,22 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
           shell: 0
         });
 
-        const liveVoiceBounds = await liveVoice.boundingBox();
-        expect(liveVoiceBounds, `${viewport.name} live voice must stay reachable`).not.toBeNull();
-        expect(liveVoiceBounds!.x).toBeGreaterThanOrEqual(0);
-        expect(liveVoiceBounds!.x + liveVoiceBounds!.width).toBeLessThanOrEqual(
+        const callBounds = await call.boundingBox();
+        expect(callBounds, `${viewport.name} Call must stay reachable`).not.toBeNull();
+        expect(callBounds!.x).toBeGreaterThanOrEqual(0);
+        expect(callBounds!.x + callBounds!.width).toBeLessThanOrEqual(
           viewport.width + 1
         );
 
         const workspaceButtons = page.getByLabel("Workspace").getByRole("button");
-        await expect(workspaceButtons).toHaveCount(9);
-        for (let index = 0; index < 9; index += 1) {
-          const button = workspaceButtons.nth(index);
+        await expect(workspaceButtons).toHaveCount(workspaceRoutes.length);
+        for (const label of workspaceRoutes) {
+          const button = page.getByLabel("Workspace").getByRole("button", { name: label, exact: true });
           await button.evaluate((element) =>
             element.scrollIntoView({ block: "nearest", inline: "nearest" })
           );
           const bounds = await button.boundingBox();
-          expect(bounds, `workspace action ${index + 1} must be reachable`).not.toBeNull();
+          expect(bounds, `workspace action ${label} must be reachable`).not.toBeNull();
           expect(bounds!.x).toBeGreaterThanOrEqual(0);
           expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width + 1);
           expect(bounds!.y).toBeGreaterThanOrEqual(0);

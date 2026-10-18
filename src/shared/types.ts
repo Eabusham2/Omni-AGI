@@ -1,5 +1,6 @@
 import type { TrainingTelemetry } from "./trainingTelemetry";
 import type { NativeArchitectureDescriptor } from "../main/nativeCoreInventory";
+import type { DeviceResourcePlan, DeviceResourceSettings, DeviceResourceTopology } from "./deviceResources";
 import type { CortexPage, CortexQuery, CortexActivityQuery, CortexActivity } from "./cortexInspection";
 export type { TrainingTelemetry } from "./trainingTelemetry";
 
@@ -59,6 +60,7 @@ export type StoragePoolMode = "auto" | "manual";
 export interface BrainConfig {
   /** Main-selected exact native shape; never accepted as a renderer shape override. */
   nativeArchitecture?: NativeArchitectureDescriptor;
+  deviceResources?: DeviceResourceSettings;
   name: string;
   preset: ArchitecturePreset;
   runtime: InferenceRuntime;
@@ -72,6 +74,10 @@ export interface BrainConfig {
    * It is an operational lease preference, not a Ponder capability or prompt.
    */
   idleCognition: boolean;
+  /** Optional same-brain inference search; independent from voluntary Ponder. */
+  bestWorkEnabled?: boolean;
+  /** Additional exploration branches; ordinary-response branch is always included. */
+  bestWorkExplorationBranches?: number;
 
   /** Hardware-resolved transient neural-workspace capacity. */
   workingMemorySlots: number;
@@ -111,6 +117,8 @@ export interface BrainConfig {
 
 export interface BrainLineage {
   parentId?: string;
+  /** Full merge has all parents; parentId remains the single-fork relation. */
+  parentIds?: string[];
   rootId: string;
   generation: number;
 }
@@ -178,6 +186,8 @@ export type ChatNoReplyReason = "no-generated-tokens" | "no-decoded-text" | "whi
 export type ChatDeliveryReceiptState =
   | "pending"
   | "queued"
+  | "suspended"
+  | "detached"
   | "steered"
   | "stopped"
   | "cancelled"
@@ -195,6 +205,9 @@ export interface ChatDeliveryReceipt {
   turnId: string;
   state: ChatDeliveryReceiptState;
   updatedAt: string;
+  attachmentIds?: string[];
+  /** Main-owned acknowledged detach evidence, never a renderer grant. */
+  suspension?: import("./chatSuspension").ChatHostSuspensionReceipt;
 }
 
 export interface ChatDeliveryReceiptRequest {
@@ -203,6 +216,7 @@ export interface ChatDeliveryReceiptRequest {
   content: string;
   createdAt: string;
   state: ChatDeliveryReceiptState;
+  attachmentIds?: string[];
 }
 
 export interface ChatMessage {
@@ -218,8 +232,15 @@ export interface ChatMessage {
   status?: "complete" | "error";
   attentionEpoch?: number;
   deliveryReceipt?: ChatDeliveryReceipt;
-  /** Actual received human experience, durable before any assistant reply. */
+  /** Actual received task experience, durable before any assistant reply. */
   inputReceipt?: ChatInputAcceptedReceipt;
+  /** Host-owned attribution; canonical task role does not imply human authorship. */
+  inputProvenance?: import("./chatInputProvenance").ChatInputProvenance;
+  nativeAudioInput?: import("./nativeAudioChat").NativeAudioMessageInfo;
+  /** Immutable handle identities; renderer resolves this turn only on demand. */
+  taskAttachmentIds?: string[];
+  /** Actual model-emitted Ponder self-reports; never inferred from reply text or operational progress. */
+  ponderSelfReports?: import("./ponderSelfReport").PonderSelfReport[];
 }
 
 export interface ChatInputAcceptedReceipt {
@@ -231,6 +252,9 @@ export interface ChatInputAcceptedReceipt {
   createdAt: string;
   attentionEpoch: number;
   slowJobId?: string;
+  inputProvenance?: import("./chatInputProvenance").ChatInputProvenance;
+  nativeAudioInput?: import("./nativeAudioChat").NativeAudioMessageInfo;
+  taskAttachmentIds?: string[];
 }
 
 export interface TraceStep {
@@ -271,6 +295,7 @@ export interface ThoughtTrace {
   selectedBranch: number;
   steps: TraceStep[];
   note: string;
+  ponderSelfReports?: import("./ponderSelfReport").PonderSelfReport[];
   attentionEpoch?: number;
   generation?: {
     disposition?: ChatGenerationEnd;
@@ -315,8 +340,14 @@ export interface TrainingSource {
   rawTextRetained: boolean;
   rawText?: string;
   contentHash?: string;
+  /** Immutable plugin/parser meaning applied to `contentHash`, when present. */
+  parserBindingSha256?: string;
+  /** Exact executable parser/source/output identity; never executable authority. */
+  parserExecution?: import("./plugins").PluginParserExecutionProvenance;
   blobHash?: string;
   policy?: PersistedDataIngestionPolicy;
+  /** Original requested web URL when provenanceUrl records a redirected final URL. */
+  requestedUrl?: string;
   provenanceUrl?: string;
   license?: string;
   licenseUrl?: string;
@@ -329,10 +360,24 @@ export interface NeuralParameterAccounting {
   substrateDynamicSparseSynapses: number;
   dynamicSparseSynapses: number;
   totalNeuralParameters: number;
+  nativeRepeatedConnections?: number;
+  substrateBaseVectorParameters?: number;
+  substrateRepeatedVectorContacts?: number;
+  substrateVectorLearnedStateBytes?: number;
+  substrateVectorStructuralStateBytes?: number;
+  substrateVectorAllocatedStateBytes?: number;
+  substrateVectorRowEnvelopeBytes?: number;
+  corePackedLearnedStateBytes?: number;
+  corePackedStructuralStateBytes?: number;
+  packedByteAccountingScope?: string;
+  packedLearnedStateBytes?: number;
+  packedStructuralStateBytes?: number;
+  packedAllocatedStateBytes?: number;
+  connectionStateBytes?: number;
   countingRule: string;
 }
 
-export type BrainOriginKind = "ground-up" | "legacy-hybrid" | "legacy";
+export type BrainOriginKind = "ground-up" | "merged-native" | "legacy-hybrid" | "legacy";
 
 /**
  * Compact origin metadata. Non-native variants exist only so stored old
@@ -340,6 +385,7 @@ export type BrainOriginKind = "ground-up" | "legacy-hybrid" | "legacy";
  */
 export interface BrainProvenance {
   originKind: BrainOriginKind;
+  merge?: { descriptorSha256: string; parentIds: string[]; initialCurriculumRerun: false };
   foundation?: {
     modelId: string;
     repository?: string;
@@ -563,6 +609,12 @@ export interface SubstrateQuery {
   cursor?: string;
   /** Exact neuron/assembly endpoint filter for cursor-paged synapse inspection. */
   connectedTo?: string;
+  /** Exact stored ordered pathway, not any-endpoint region matching. */
+  sourceRegion?: string;
+  targetRegion?: string;
+  /** Exact ordered neuron/child-assembly membership viewport. */
+  membersOf?: string;
+  activationBand?: "quiet" | "medium" | "high";
   /**
    * Preferred records per page. This is not a substrate cardinality limit;
    * the worker may return fewer only to stay inside the JSON-RPC byte envelope.
@@ -594,7 +646,7 @@ export interface SubstrateAssembly {
   childAssemblyIds: string[];
   neuronCount?: number;
   childAssemblyCount?: number;
-  /** True when relationships must be traversed with a connected synapse query. */
+  /** True when omitted relationships have an exact membersOf cursor traversal. */
   relationshipsPaged?: boolean;
   kind: string;
   source: string;
@@ -617,6 +669,12 @@ export interface SubstrateSynapse {
   targetId: string;
   kind: string;
   effectiveWeight: -1 | 0 | 1;
+  connectionStrength?: number;
+  effectiveContribution?: number;
+  isRepeatedContact?: boolean;
+  parallelRootId?: string;
+  parallelOrdinal?: number;
+  additionalContactCount?: number;
   eligibility: number;
   plasticity: number;
   stability: number;
@@ -631,6 +689,8 @@ export interface SubstrateCluster {
   region?: string;
   sourceRegion?: string;
   targetRegion?: string;
+  /** Actual source band field, never inferred from a display name. */
+  activationBand?: "quiet" | "medium" | "high";
   count: number;
   activeCount: number;
   meanActivation: number;
@@ -640,6 +700,14 @@ export interface SubstrateCluster {
     zero: number;
     positive: number;
   };
+}
+
+export interface SubstrateAssemblyMember {
+  assemblyId: string;
+  memberKind: "neuron" | "assembly";
+  memberId: string;
+  /** Original ordinal in the corresponding stored membership array. */
+  ordinal: number;
 }
 
 export interface SubstratePage {
@@ -663,6 +731,11 @@ export interface SubstratePage {
   hasMore: boolean;
   nextCursor?: string;
   clusters: SubstrateCluster[];
+  /** Actual source group totals for off-page aggregate pathway endpoints. */
+  clusterAnchors?: SubstrateCluster[];
+  pathwayFilter?: { sourceRegion: string; targetRegion: string };
+  activationBand?: "quiet" | "medium" | "high";
+  membershipPage?: { assemblyId: string; total: number; offset: number; returned: number; members: SubstrateAssemblyMember[] };
   neurons: SubstrateNeuron[];
   assemblies: SubstrateAssembly[];
   synapses: SubstrateSynapse[];
@@ -906,14 +979,22 @@ export interface ChatResult {
   /** Renderer-authored correlation metadata; never inserted into model input. */
   turnMetadata?: ChatTurnMetadata;
   generationEnd?: ChatGenerationEnd;
+  /** Host capability-learning diagnostics; never added to neural prompt text. */
+  capabilityWarnings?: string[];
 }
 
-export interface ChatTurnMetadata {
+export type ChatTurnMetadata = {
   kind: "steer";
   replacesTurnId: string;
   source: "human";
   createdAt: string;
-}
+  attachmentIds?: string[];
+} | {
+  kind: "task";
+  source: "human";
+  createdAt: string;
+  attachmentIds: string[];
+};
 
 export interface IngestResult {
   brain: BrainDocument;
@@ -931,6 +1012,8 @@ export interface RuntimeHealth {
 }
 
 export interface CreateBrainRequest {
+  /** One-use local native-picker receipt; never part of exported BrainConfig. */
+  spillPoolSelectionId?: string;
   config: BrainConfig;
   workingMemory?: WorkingMemoryPlanRequest;
   hardwareTier?: HardwareTier;
@@ -951,6 +1034,9 @@ export interface CreateBrainRequest {
 }
 
 export interface WorkingMemoryPlanRequest {
+  /** Local native-picker proof for a not-yet-created destination. */
+  spillPoolSelectionId?: string;
+  deviceResources?: DeviceResourceSettings;
   mode: WorkingMemoryMode;
   /** Existing identity: main resolves saved geometry, never a renderer shape. */
   brainId?: string;
@@ -978,6 +1064,8 @@ export interface WorkingMemoryPlanRequest {
 }
 
 export interface WorkingMemoryResourcePlan {
+  /** Measured per-device ceilings; additional placement consumers report their own admission. */
+  deviceResources?: DeviceResourcePlan;
   /** Versioned main-selected dimensions and exact symbolic packed inventory. */
   nativeArchitecture?: NativeArchitectureDescriptor;
   schemaVersion: 1;
@@ -1002,10 +1090,17 @@ export interface WorkingMemoryResourcePlan {
     exactPackedTableParameterCount: number;
     exactPackedTernaryParameterCount: number;
     packedTernaryWeightBytes: number;
+    connectionStateBytes?: number;
+    packedLearnedStateBytes?: number;
     packedWorkspaceTableBytes: number;
+    workspaceConnectionStateBytes?: number;
+    maximumProjectionBytes?: number;
+    pythonOwnerMetadataReserveBytes?: number;
     packedMetaplasticityReserveBytes: number;
     fixedControlBufferReserveBytes: number;
     packedUpdateScratchBytes: number;
+    /** Conservative transient buffers of the declared packed forward, not learned weights. */
+    packedForwardTensorReserveBytes?: number;
     residentInferenceStateBytes: number;
     minimumTrainingStateBytes: number;
     checkpointTensorBytes: number;
@@ -1060,6 +1155,8 @@ export interface WorkingMemoryResourcePlan {
       selectedContextResidentBytes: number;
       selectedContextSpillBytes?: number;
       contextOffloadBudgetBytes?: number;
+      selectedDriveCapacityBytes?: number;
+      selectedDriveAvailableBytes?: number;
       residentContextMaximumTokens?: number;
       contextSpillCapacityBytes?: number;
       residentTokenBytesPerToken?: number;
@@ -1084,11 +1181,13 @@ export interface WorkingMemoryResourcePlan {
     checkpointHeadroomBytes: number;
     usableDiskAfterReserveBytes: number;
     modelBytes: number;
-    /** Exact trainable master-element count for a new native build. */
+    /** Exact logical learned-connection count for a new native build. */
     modelParameterCount?: number;
     modelParameterCountBasis?: "architecture-logical-neural-elements";
     modelStorageBasis?: "packed-weights-plus-nonweight-state-reserve";
     modelWorkingSetBytes: number;
+    /** Estimated Python module/registry/cache RAM, excluded from saved tensor bytes. */
+    modelMetadataReserveBytes?: number;
     /** Estimated live learning state; raw checkpoint bytes are reported separately. */
     estimatedResidentModelBytes: number;
     /** Native model state plus Electron/worker/runtime overhead. */
@@ -1187,6 +1286,13 @@ export interface BuildProgressEvent {
     | "complete";
   progress: number;
   label: string;
+  /** Host-observed build lifetime; never inferred from weighted progress. */
+  startedAt?: string;
+  updatedAt?: string;
+  /** Monotonic producer duration; wall-clock timestamps are attribution only. */
+  elapsedMs?: number;
+  /** Present only when the active producer has an authoritative estimate. */
+  etaMs?: number;
   /** The authoritative first-learning job snapshot when this is initial-materials progress. */
   job?: RuntimeJob;
   data?: {
@@ -1343,6 +1449,44 @@ export type DatasetFormat =
   | "video"
   | "unknown";
 
+/** Existing exhaustive worker parsers or the verified output format of a pure
+ * executable plugin parser. */
+export type PluginTrainingParserFormat = Exclude<
+  DatasetFormat,
+  "epub" | "office" | "webdataset" | "unknown"
+> | "huggingface";
+
+/**
+ * Immutable parser authority captured in a dataset manifest. Built-in aliases
+ * retain their v1 shape; a pure executable parser additionally binds its exact
+ * module/ABI hash without embedding bytes in the manifest.
+ */
+export interface PluginTrainingFormatBinding {
+  pluginId: string;
+  contentSha256: string;
+  formatId: string;
+  parserFormat: PluginTrainingParserFormat;
+  catalogRevision: number;
+  instanceRevision: number;
+  /** Exact admitted source observation; omitted for old extension-only bindings. */
+  inputMediaType?: string;
+  executable?: {
+    kind: "wasm-stream";
+    moduleId: string;
+    moduleSha256: string;
+    abi: import("./plugins").PluginTrainingModuleDefinition["abi"];
+    outputFormat: "jsonl";
+  } | {
+    kind: "runtime-stream";
+    moduleId: string;
+    moduleSha256: string;
+    abi: typeof import("./plugins").PLUGIN_RUNTIME_PARSER_ABI;
+    outputFormat: "jsonl" | "media-assets";
+    /** Exact reviewed output MIME set; present only for media-assets. */
+    outputMediaTypes?: import("./plugins").PluginRuntimeMediaType[];
+  };
+}
+
 export interface DatasetManifestEntry {
   index: number;
   path: string;
@@ -1357,8 +1501,18 @@ export interface DatasetManifestEntry {
   contentSha256?: string;
   /** Explicit traversal rejection; these entries never reach neural training. */
   rejection?: string;
+  /** Reviewed custom extension mapped to a built-in or pure WASM parser. */
+  pluginFormat?: PluginTrainingFormatBinding;
+  sourceMediaType?: import("./sourceMediaType").SourceMediaType;
+  /** Explicit selection survives custody; it is not an imported execution grant. */
+  parserSelection?: import("./plugins").PluginTrainingFormatSelection;
+  /** Original selected source name for format matching, never a path to open. */
+  parserSourceName?: string;
   /** App-owned immutable snapshot kind used to prevent live-source drift. */
   snapshotKind?: "sqlite";
+  /** Host-owned exact source relocation; never accepted from a model path argument. */
+  sourceRelocation?: { originalPath: string; originalSourceIdentity: string; sourceName: string; contentSha256: string;
+    bytes: number; relativePath: string; identityPaths?: string[]; originalManifestId?: string; parentId?: string };
 }
 
 export interface DatasetManifest {
@@ -1372,6 +1526,10 @@ export interface DatasetManifest {
   discoveredFiles: number;
   discoveredBytes: number;
   manifestHash: string;
+  /** A namespaced merged manifest keeps its original native transaction identity. */
+  continuationIdentity?: { manifestId: string; sourceBrainId: string };
+  /** Imported/forked selected sources may only resolve through owned, hash-bound copies. */
+  portableSources?: true;
 }
 
 export type DatasetPreviewPhase =
@@ -1459,14 +1617,18 @@ export interface TrainingCoverage {
 export interface DatasetEntryReceipt {
   schemaVersion: 1;
   manifestId: string;
+  /** Native transaction owner retained when the host manifest is namespaced by merge. */
+  continuationManifestId?: string;
   runId?: string;
   manifestHash: string;
   transactionKey: string;
   entryIndex: number;
   epoch: number;
   contentHash: string;
+  parserBindingSha256?: string;
+  parserExecution?: import("./plugins").PluginParserExecutionProvenance;
   policy: PersistedDataIngestionPolicy;
-  outcome: "learned" | "rejected";
+  outcome: "learned" | "rejected" | "no-assets";
   sourceId?: string;
   journalId?: string;
   sourceKind?: TrainingSource["kind"];
@@ -1522,6 +1684,7 @@ export interface DatasetPreviewRequest
   extends Omit<IngestFilesRequest, "selection"> {
   /** Renderer-issued correlation used for progress and cooperative cancel. */
   requestId?: string;
+  parserSelection?: import("./plugins").PluginTrainingFormatSelection;
   selection?:
     | "folder"
     | import("./uploadSupport").ExperienceUploadKind;
@@ -1554,9 +1717,12 @@ export interface IngestWebRequest {
   url: string;
   policy?: DataIngestionPolicy;
   quarantine?: boolean;
+  parserSelection?: import("./plugins").PluginTrainingFormatSelection;
 }
 
 export interface WebCrawlRequest extends IngestWebRequest {
+  constraints?: import("./learning").WebLearningConstraints;
+  instructions?: string;
   crawlId?: string;
   maxPages?: number;
   maxDepth?: number;
@@ -1568,6 +1734,7 @@ export interface WebCrawlRequest extends IngestWebRequest {
 }
 
 export interface WebCrawlResult {
+  policy?: import("./learning").WebLearningPolicy;
   crawlId: string;
   startUrl: string;
   visited: number;
@@ -1592,6 +1759,8 @@ export interface ToolPermissionRecord {
   label: string;
   level: ToolPermissionLevel;
   updatedAt: string;
+  /** Monotonic main-owned policy revision for this record. */
+  revision?: number;
 }
 
 export interface JournalEntry {
@@ -1655,7 +1824,7 @@ export interface RuntimeJobEvent {
   job: RuntimeJob;
 }
 
-export type ApiTeacherProvider = "openai" | "anthropic" | "gemini";
+export type ApiTeacherProvider = "openai" | "anthropic" | "gemini" | "openrouter" | "ollama";
 
 export interface ApiTeacherCredentialRequest {
   provider: ApiTeacherProvider;
@@ -1667,15 +1836,68 @@ export interface ApiTeacherProviderStatus {
   configured: boolean;
   persistence: "encrypted" | "session" | "none";
   keyHint?: string;
+  /** False for explicit local Ollama; configured does not prove a server/model is available. */
+  required?: boolean;
+}
+
+export interface ApiTeacherModelDiscoveryRequest {
+  provider: ApiTeacherProvider;
+  requestId: string;
+  /** Optional explicit loopback Ollama base; other provider destinations remain fixed. */
+  endpoint?: string;
+}
+
+export interface ApiTeacherDiscoveredModel {
+  provider: ApiTeacherProvider;
+  /** Provider model identifier suitable for the manual model field. Discovery does not select it. */
+  id: string;
+  displayName?: string;
+  description?: string;
+  providerResourceName?: string;
+  version?: string;
+  owner?: string;
+  createdAt?: string;
+  lifecycle?: "active" | "deprecated" | "retired";
+  retirementAt?: string;
+  inputTokenLimit?: number;
+  outputTokenLimit?: number;
+  supportedMethods?: string[];
+}
+
+export interface ApiTeacherModelDiscoveryResult {
+  format: "omni-api-teacher-model-discovery";
+  version: 1;
+  provider: ApiTeacherProvider;
+  requestId: string;
+  sourceEndpoint: string;
+  discoveredAt: string;
+  pageCount: number;
+  complete: true;
+  generationCompatibilityVerified: false;
+  models: ApiTeacherDiscoveredModel[];
+  /** Known remote/cloud entries are inspectable but cannot authorize local-only dispatch. */
+  excludedModels?: Array<{ id: string; reason: string }>;
+  excludedModelCount?: number;
+  exclusionReason?: string;
+}
+
+export interface ApiTeacherModelDiscoveryCancellation {
+  provider: ApiTeacherProvider;
+  requestId: string;
+  cancelled: boolean;
 }
 
 export interface ApiTeacherTrainingRequest {
   brainId: string;
+  /** Stable per-submit identity retained for lost-ack recovery; never a provider request ID. */
+  requestId?: string;
   provider: ApiTeacherProvider;
   model: string;
   /** Explicit user-authored learning questions. They become training data, not a prompt at chat time. */
   prompts: string[];
   maxOutputTokens?: number;
+  /** Omission preserves text-only lessons. Media requires actual provider bytes and native coverage. */
+  responseModalities?: import("./apiTeacherMedia").ApiTeacherLessonModality[];
 }
 
 export interface ApiTeacherTrainingReport {
@@ -1684,13 +1906,84 @@ export interface ApiTeacherTrainingReport {
   requested: number;
   learned: number;
   failed: number;
+  skipped: number;
   requestHashes: string[];
   responseHashes: string[];
   rawCredentialsStoredInBrain: false;
   hiddenBehavioralPromptUsed: false;
+  durableState: ApiTeacherDurableJobState;
+  nextIndex: number;
+  uncertainItemIndexes: number[];
+  resumable: boolean;
+}
+
+export type ApiTeacherDurableJobState =
+  | "queued" | "running" | "paused" | "review-required" | "stopped" | "complete" | "failed" | "dormant";
+export type ApiTeacherDurableItemState =
+  | "pending" | "dispatching" | "response-staged" | "response-review" | "response-committed" | "learning" | "complete" | "failed" | "skipped"
+  | "uncertain-review" | "learning-uncertain-review" | "dormant";
+export interface ApiTeacherJobControlRequest { brainId: string; jobId: string }
+export interface ApiTeacherUncertainResolutionRequest extends ApiTeacherJobControlRequest {
+  itemIndex: number;
+  decision: "retry" | "skip";
+}
+export interface ApiTeacherDurableItemView {
+  index: number;
+  state: ApiTeacherDurableItemState;
+  prompt: string;
+  promptSha256: string;
+  deliveryId: string;
+  attemptId?: string;
+  requestSha256?: string;
+  rawResponseSha256?: string;
+  learnedResponseSha256?: string;
+  /** Credential-redacted response actually offered to native learning. */
+  response?: string;
+  experienceSha256?: string;
+  mediaLesson?: import("./apiTeacherMedia").ApiTeacherMediaLesson;
+  responseEnvelope?: import("./apiTeacherMedia").ApiTeacherResponseEnvelope;
+  receipt?: {
+    brainId: string;
+    sourceId: string;
+    contentHash: string;
+    learnedResponseSha256: string;
+    deliveryId: string;
+    learnedIdeas: number;
+    learnedConcepts: number;
+    learnedSynapses: number;
+    learnedParameterSteps: number;
+    parametersChanged: boolean;
+    mediaCoverage?: import("./apiTeacherMedia").ApiTeacherMediaCoverage;
+  };
+  error?: string;
+}
+export interface ApiTeacherDurableJobDetails {
+  format: "omni-api-teacher-job-details";
+  version: 1;
+  brainId: string;
+  jobId: string;
+  originalBrainId: string;
+  originalJobId: string;
+  requestId: string;
+  requestSha256: string;
+  provider: ApiTeacherProvider;
+  model: string;
+  state: ApiTeacherDurableJobState;
+  revision: number;
+  nextIndex: number;
+  promptCount: number;
+  learned: number;
+  failed: number;
+  skipped: number;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+  items: ApiTeacherDurableItemView[];
+  error?: string;
 }
 
 export type McpTransport = "http" | "stdio";
+export type McpAccessOverride = "inherit" | "on" | "off";
 
 export interface McpServerRegistrationRequest {
   brainId: string;
@@ -1701,6 +1994,12 @@ export interface McpServerRegistrationRequest {
   command?: string;
   args?: string[];
   bearerToken?: string;
+  /** Explicit stdio variables, stored outside brain files and exports. */
+  environment?: Record<string, string>;
+  /** New connections are available to all instances unless explicitly scoped. */
+  scope?: "all" | "instance";
+  defaultEnabled?: boolean;
+  disabledBrainIds?: string[];
 }
 
 export interface McpToolSummary {
@@ -1708,6 +2007,15 @@ export interface McpToolSummary {
   remoteName: string;
   actions: string[];
   inputSchema: Record<string, unknown>;
+  actionInputSchemas?: Record<string, Record<string, unknown>>;
+  taskSupport?: "required" | "optional" | "forbidden";
+  description?: string;
+  title?: string;
+  outputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  /** Generated by this client only; never accepted from remote tool metadata. */
+  clientOperation?: import("./mcpCapabilities").McpClientOperation;
 }
 
 export interface McpServerSummary {
@@ -1719,7 +2027,38 @@ export interface McpServerSummary {
   connected: boolean;
   tools: McpToolSummary[];
   credentialConfigured: boolean;
+  registryId: string;
+  scope: "all" | "instance";
+  ownerBrainId?: string;
+  globallyEnabled: boolean;
+  defaultEnabled: boolean;
+  accessOverride: McpAccessOverride;
+  effectiveEnabled: boolean;
+  disabledReason?: string;
+  protocolVersion?: string;
+  capabilities?: Record<string, unknown>;
+  capabilityRevision?: number;
+  resourceSubscriptions?: import("./mcpCapabilities").McpResourceSubscription[];
+  transportObservation?: import("./mcpCapabilities").McpTransportObservation;
+  schemaLearning?: "pending" | "complete";
+  authentication?: import("./mcpAuth").McpOAuthStatus;
+  environmentKeys?: string[];
   error?: string;
+}
+
+export interface McpRegistrySummary {
+  enabled: boolean;
+  instanceEnabled: boolean;
+  servers: McpServerSummary[];
+}
+
+/** No ids targets the global switch; registryId targets a server, brainId an instance. */
+export interface McpRegistryUpdateRequest {
+  brainId?: string;
+  registryId?: string;
+  enabled?: boolean;
+  defaultEnabled?: boolean;
+  accessOverride?: McpAccessOverride;
 }
 
 export interface ToolRuntimePreferences {
@@ -2224,6 +2563,8 @@ export interface ToolInvocation {
 }
 
 export interface ToolExecutionResult {
+  /** Separate advisory review; it can require Ask but never grant tool authority. */
+  actionReview?: import("./actionReviewer").ActionReviewerApprovalReview;
   /** Entered trusted dispatch after authorization; does not assert a failed attempt changed external state. */
   dispatchStarted?: true;
   id: string;
@@ -2236,6 +2577,10 @@ export interface ToolExecutionResult {
   error?: string;
   approvalToken?: string;
   approvalExpiresAt?: string;
+  /** A stored terminal outcome was delivered; no external dispatch ran again. */
+  recoveredEffectReceipt?: { evidenceId: string; originalActionEventId: string; originalBrainId: string };
+  /** Main-owned committed task custody on a failed/unknown wait; never means remote completion. */
+  mcpTaskReceipt?: import("./mcpTasks").McpTaskReceipt;
 }
 
 export type ActionKind =
@@ -2291,6 +2636,8 @@ export interface ActionEvent {
   cancellationRequested?: boolean;
   inlineGenerationOwned?: boolean;
   execution?: ToolExecutionResult;
+  /** Verified current-owner UI projection; original execution.output is immutable. */
+  mcpAppView?: import("./mcpAppArtifacts").McpAppViewProjection;
   evolutionRunId?: string;
   /** Latest safe progressive preview for an imagination action. */
   preview?: ModalityPreview;
@@ -2370,6 +2717,7 @@ export interface ModalityPreview {
   totalSamples?: number;
   durationMs?: number;
   sampleRate?: number;
+  mediaTimeline?: import("./nativeMediaTimeline").NativeMediaTimeline;
   fps?: number;
   frameCount?: number;
   totalFrames?: number;
@@ -2443,6 +2791,20 @@ export interface ChatCancellationState {
 export interface ChatTokenStreamEvent extends ChatStreamEventBase {
   type: "chat-token";
   delta: string;
+  /** Actual native output token count, including non-printing boundary tokens. */
+  outputTokens?: number;
+  outputElapsedMs?: number;
+  tokensPerSecond?: number;
+}
+
+export interface ChatCognitionStreamEvent extends ChatStreamEventBase {
+  type: "chat-cognition";
+  progress: import("./cognition").CognitionProgress;
+}
+
+export interface ChatPonderSelfReportStreamEvent extends ChatStreamEventBase {
+  type: "chat-ponder-self-report";
+  report: import("./ponderSelfReport").PonderSelfReportDelta;
 }
 
 export interface ChatActionStreamEvent extends ChatStreamEventBase {
@@ -2487,8 +2849,11 @@ export interface ChatInputAcceptedStreamEvent extends ChatStreamEventBase {
 
 export interface ChatStateStreamEvent extends ChatStreamEventBase {
   type: "chat-state";
-  state: "started" | "queued" | "complete" | "steered" | "stopped" | "no-reply" | "cancelled" | "failed";
+  state: "started" | "queued" | "complete" | "steered" | "stopped" | "no-reply" | "cancelled" | "failed" | "suspended" | "detached";
+  suspension?: import("./chatSuspension").ChatHostSuspensionReceipt;
   error?: string;
+  /** Nonblocking setup/learning diagnostics for this turn. */
+  notices?: string[];
   queue?: ChatQueueState;
   cancellation?: ChatCancellationState;
   /** Typed operational correlation only; it is not model-facing prose. */
@@ -2500,6 +2865,8 @@ export interface ChatStateStreamEvent extends ChatStreamEventBase {
  * instructions are parsed to manufacture an action.
  */
 export type ChatStreamEvent =
+  | ChatCognitionStreamEvent
+  | ChatPonderSelfReportStreamEvent
   | ChatInputAcceptedStreamEvent
   | ChatTokenStreamEvent
   | ChatActionStreamEvent
@@ -2543,6 +2910,7 @@ export interface IdleCycleResult {
   brainId: string;
   ran: boolean;
   reason?:
+    | "instance-unloaded"
     | "idle-cognition-disabled"
     | "initial-learning"
     | "foreground-work"
@@ -2746,6 +3114,20 @@ export interface MobileGatewayStartRequest {
 }
 
 export interface OmniApi {
+  nativeOperationAuto: import("./nativeOperationAuto").NativeOperationAutoApi;
+  wholeBrainInspection: import("./wholeBrainInspection").WholeBrainInspectionApi;
+  cachedDecoderExecution: import("./cachedDecoderExecution").CachedDecoderExecutionApi;
+  decoderExecution: import("./decoderExecution").DecoderExecutionApi;
+  portable: import("./portableWorkspace").PortableWorkspaceApi;
+  regionalExecution: import("./regionalExecution").RegionalExecutionApi;
+  advice: import("./externalAdvice").ExternalAdviceApi;
+  localTeacher: import("./localTeacher").LocalTeacherApi;
+  processMemory: import("./processMemory").ProcessMemoryApi;
+  voice: import("./voiceRouting").InstanceVoiceApi;
+  maps: import("./maps").MapConnectionsApi;
+  clock: import("./clock").ClockWorkspaceApi;
+  automation: import("./automation").AutomationWorkspaceApi;
+  substrate: import("./sparseSubstrateTransfer").SparseSubstrateUiApi;
   window: {
     minimize(): Promise<void>;
     maximize(): Promise<void>;
@@ -2754,9 +3136,11 @@ export interface OmniApi {
     openExternal(url: string): Promise<void>;
     revealDataFolder(): Promise<void>;
     platform(): Promise<string>;
+    workStatus(): Promise<import("./osWorkLease").OsWorkLeaseStatus>;
     setAppearance(request: NativeAppearanceRequest): Promise<NativeAppearanceState>;
+    touchBar: import("./touchBar").TouchBarApi;
   };
-  brain: {
+  brain: import("./instanceLifecycleApi").InstanceLifecycleApi & {
     list(): Promise<BrainSummary[]>;
     get(id: string): Promise<BrainDocument>;
     create(request: CreateBrainRequest): Promise<BrainDocument>;
@@ -2767,6 +3151,16 @@ export interface OmniApi {
     setActiveMode(id: string, enabled: boolean): Promise<BrainActiveModeResult>;
     duplicate(id: string, name?: string, operationId?: string): Promise<BrainDocument>;
     fork(id: string, name?: string, operationId?: string): Promise<BrainDocument>;
+    startFullMerge(request: import("./fullMerge").FullMergeStartRequest): Promise<import("./fullMerge").FullMergeProgress>;
+    listFullMerges(): Promise<import("./fullMerge").FullMergeProgress[]>;
+    fullMergeStatus(operationId: string): Promise<import("./fullMerge").FullMergeProgress>;
+    pauseFullMerge(operationId: string): Promise<import("./fullMerge").FullMergeProgress>;
+    resumeFullMerge(operationId: string): Promise<import("./fullMerge").FullMergeProgress>;
+    cancelFullMerge(operationId: string): Promise<import("./fullMerge").FullMergeProgress>;
+    fullMergeHistory(brainId: string, afterSequence?: number, limit?: number): Promise<import("./fullMerge").FullMergeHistoryPage>;
+    fullMergePendingIngestions(brainId: string): Promise<import("./fullMerge").FullMergePendingIngestion[]>;
+    resumeFullMergeIngestion(request: import("./fullMerge").FullMergeResumeIngestionRequest): Promise<RuntimeJob | null>;
+    onFullMerge(listener: (progress: import("./fullMerge").FullMergeProgress) => void): () => void;
     pauseStorageOperation(operationId: string): Promise<BrainStorageOperationEvent>;
     resumeStorageOperation(operationId: string): Promise<BrainStorageOperationEvent>;
     cancelStorageOperation(operationId: string): Promise<BrainStorageOperationEvent>;
@@ -2794,6 +3188,7 @@ export interface OmniApi {
     queryConceptIds(id: string, view: import("./conceptIdView").ConceptIdView, sourceTurnId: string, offset?: number): Promise<import("./conceptIdView").ConceptIdPage>;
     queryCortex(id: string, query?: CortexQuery): Promise<CortexPage>;
     cortexActivity(id: string, query: CortexActivityQuery): Promise<CortexActivity>;
+    routerActivity(id: string, query: import("./routerActivity").RouterSpikeQuery): Promise<import("./routerActivity").RouterSpikeActivity>;
     workspace(id: string): Promise<WorkspaceSnapshot>;
     freshAttention(id: string): Promise<FreshAttentionResult>;
     journalPage(
@@ -2803,6 +3198,9 @@ export interface OmniApi {
     ): Promise<JournalLedgerPage>;
   };
   chat: {
+    directions: import("./steerDirections").SteerDirectionsApi;
+    sendAudio(id: string, input: import("./nativeAudioChat").NativeAudioChatRequest, turnId?: string, turnMetadata?: ChatTurnMetadata): Promise<ChatResult>;
+    audioInputCapabilities(id: string): Promise<{ brainId: string; loaded: true; available: boolean; sameBrainSubstrate: true; transcriptRequired: false; detail: string }>;
     send(
       id: string,
       input: string,
@@ -2818,6 +3216,7 @@ export interface OmniApi {
       receipt: ChatDeliveryReceiptRequest
     ): Promise<void>;
     approveAction(request: ApprovedChatActionRequest): Promise<ApprovedChatActionResult>;
+    declineAction(request: ApprovedChatActionRequest): Promise<ActionEvent>;
     list(id: string): Promise<ChatMessage[]>;
     listPage(
       id: string,
@@ -2825,9 +3224,12 @@ export interface OmniApi {
       limit?: number
     ): Promise<ConversationLedgerPage>;
     feedback(request: FeedbackRequest): Promise<BrainDocument>;
+    attachments: import("./taskAttachments").ChatTaskAttachmentsApi;
     onAction(listener: (event: ActionEvent) => void): () => void;
     onStream(listener: (event: ChatStreamEvent) => void): () => void;
   };
+  questions: import("./userQuestions").UserQuestionsApi;
+  learning: import("./learning").LearningApi;
   mobile: {
     status(): Promise<MobileGatewayStatus>;
     startPairing(request: MobileGatewayStartRequest): Promise<MobilePairingSession>;
@@ -2843,16 +3245,38 @@ export interface OmniApi {
     status(): Promise<ApiTeacherProviderStatus[]>;
     saveCredential(request: ApiTeacherCredentialRequest): Promise<ApiTeacherProviderStatus[]>;
     removeCredential(provider: ApiTeacherProvider): Promise<ApiTeacherProviderStatus[]>;
+    discoverModels(request: ApiTeacherModelDiscoveryRequest): Promise<ApiTeacherModelDiscoveryResult>;
+    cancelModelDiscovery(request: ApiTeacherModelDiscoveryRequest): Promise<ApiTeacherModelDiscoveryCancellation>;
     start(request: ApiTeacherTrainingRequest): Promise<RuntimeJob>;
     cancel(jobId: string): Promise<RuntimeJob>;
+    pause(request: ApiTeacherJobControlRequest): Promise<RuntimeJob>;
+    resume(request: ApiTeacherJobControlRequest): Promise<RuntimeJob>;
+    stop(request: ApiTeacherJobControlRequest): Promise<RuntimeJob>;
+    details(request: ApiTeacherJobControlRequest): Promise<ApiTeacherDurableJobDetails>;
+    resolveUncertain(request: ApiTeacherUncertainResolutionRequest): Promise<RuntimeJob>;
     list(brainId?: string): Promise<RuntimeJob[]>;
     onEvent(listener: (event: RuntimeJobEvent) => void): () => void;
   };
   mcp: {
+    tasks?: import("./mcpTasks").McpTasksApi;
+    roots: import("./mcpHostServices").McpRootsApi;
+    diagnostics: import("./mcpHostServices").McpDiagnosticsApi;
     list(brainId: string): Promise<McpServerSummary[]>;
+    registry(brainId: string): Promise<McpRegistrySummary>;
+    configure(request: McpRegistryUpdateRequest): Promise<void>;
     add(request: McpServerRegistrationRequest): Promise<McpServerSummary>;
     remove(brainId: string, serverId: string): Promise<boolean>;
     refresh(brainId: string, serverId: string): Promise<McpServerSummary>;
+    authStatus(brainId: string, serverId: string): Promise<import("./mcpAuth").McpOAuthStatus>;
+    authorize(brainId: string, serverId: string, input: import("./mcpAuth").McpOAuthStart): Promise<import("./mcpAuth").McpOAuthStatus>;
+    cancelAuthorization(brainId: string, serverId: string): Promise<boolean>;
+    disconnectAuthorization(brainId: string, serverId: string): Promise<void>;
+    updateCredentials(brainId: string, serverId: string, input: import("./mcpAuth").McpCredentialUpdate): Promise<McpServerSummary>;
+    onCapabilityEvent(listener: (event: import("./mcpCapabilities").McpCapabilityEvent) => void): () => void;
+    interactions(brainId: string): Promise<import("./mcpInteractions").McpInteractionRecord[]>;
+    respondInteraction(response: import("./mcpInteractions").McpInteractionResponse): Promise<import("./mcpInteractions").McpInteractionRecord>;
+    onInteractionEvent(listener: (event: import("./mcpInteractions").McpInteractionEvent) => void): () => void;
+    apps: import("./mcpApps").McpAppsApi;
   };
   data: {
     selectBuildResources(
@@ -2883,6 +3307,7 @@ export interface OmniApi {
     ): Promise<TrainingSourceLedgerPage>;
   };
   modality: {
+    capture: import("./imaginationCapture").ImaginationCaptureApi;
     capabilities(brainId: string): Promise<NeuralModalityCapabilities>;
     artifacts(
       brainId: string,
@@ -2916,17 +3341,24 @@ export interface OmniApi {
     list(brainId: string, query?: TraceQuery): Promise<ThoughtTrace[]>;
   };
   tool: {
+    descriptions(brainId: string): Promise<import("./toolDescriptions").ToolDescriptionPage>;
     listPermissions(brainId: string): Promise<ToolPermissionRecord[]>;
     setPermission(
       brainId: string,
       toolId: string,
-      level: ToolPermissionLevel
+      level: ToolPermissionLevel,
+      requestId?: string,
+      expectedRevision?: number
     ): Promise<ToolPermissionRecord[]>;
     execute(request: ToolInvocation): Promise<ToolExecutionResult>;
+    declineApproval(brainId: string, approvalToken: string): Promise<boolean>;
     cancel(brainId: string, requestId?: string): Promise<number>;
     preferences(): Promise<ToolRuntimePreferences>;
     setPreferences(value: ToolRuntimePreferences): Promise<ToolRuntimePreferences>;
   };
+  plugins: import("./plugins").PluginsApi;
+  pluginRuntime: import("./pluginRuntime").PluginRuntimeApi;
+  artifacts: import("./htmlArtifacts").HtmlArtifactsApi;
   agent: {
     fork(brainId: string, name?: string): Promise<BrainDocument>;
     previewMerge(sourceBrainId: string, targetBrainId: string): Promise<AgentMergePreview>;
@@ -2955,6 +3387,8 @@ export interface OmniApi {
     installModalityPackFile(brainId: string): Promise<InstalledModalityPack | null>;
     listModalityPacks(brainId: string): Promise<InstalledModalityPack[]>;
     hardwareProfile(): Promise<HardwareProfile>;
+    deviceTopology(request?: { measure?: boolean; storageDirectories?: string[] }): Promise<DeviceResourceTopology>;
+    selectSpillPools(brainId?: string): Promise<{ selectionId: string; directories: string[] } | null>;
     resourcePlan(request: WorkingMemoryPlanRequest): Promise<WorkingMemoryResourcePlan>;
   };
 }
@@ -2969,6 +3403,8 @@ export const DEFAULT_CONFIG: BrainConfig = {
   extendedWorkingMemory: false,
   recursiveImprovement: true,
   idleCognition: true,
+  bestWorkEnabled: false,
+  bestWorkExplorationBranches: 16,
 
   workingMemorySlots: 256,
   contextWindowTokens: 1024,

@@ -44,6 +44,7 @@ else
 fi
 
 # These are fixed, repository-local build directories rather than user paths.
+"${PYTHON_BIN}" "${REPO_ROOT}/scripts/build-native-kernels.py"
 rm -rf -- "${DIST_ROOT}" "${WORK_ROOT}"
 
 "${PYTHON_BIN}" -m PyInstaller \
@@ -55,6 +56,8 @@ rm -rf -- "${DIST_ROOT}" "${WORK_ROOT}"
   --workpath "${WORK_ROOT}" \
   --specpath "${WORK_ROOT}" \
   --paths "${REPO_ROOT}/engine" \
+  --add-data "${REPO_ROOT}/engine/omni_core/native:omni_core/native" \
+  --add-data "${REPO_ROOT}/engine/omni_core/kernels:omni_core/kernels" \
   --collect-all torch \
   --collect-all safetensors \
   --collect-all imageio_ffmpeg \

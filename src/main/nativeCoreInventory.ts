@@ -10,7 +10,29 @@ export interface NativeArchitectureShape {
   liquidMode: "cfc" | "ltc";
 }
 
-export function nativeCoreInventory(shape: NativeArchitectureShape, routerStorageLayout?: "block-sparse-v1") {
+export const NATIVE_INVENTORY_VERSION = 2;
+export const PACKED_LEARNING_ROW_BLOCK = 64;
+/** Tensor temporaries plus worst-case saturated-coordinate host lists, not a learned mirror. */
+export const WEIGHTED_LEARNING_SCRATCH_BYTES_PER_ELEMENT = 256;
+export const PACKED_OWNER_METADATA_RESERVE_BYTES = 16 * 1024;
+
+export function packedOwnerMetadataReserve(owners: number): number {
+  const bytes = owners * PACKED_OWNER_METADATA_RESERVE_BYTES;
+  if (!Number.isSafeInteger(owners) || owners < 0 || !Number.isSafeInteger(bytes)) throw new Error("Packed owner metadata exceeds exact integer accounting.");
+  return bytes;
+}
+
+export function packedLearningScratchBytes(rows: number, width: number): number {
+  if (![rows, width].every((value) => Number.isSafeInteger(value) && value >= 0)) throw new Error("Packed scratch geometry must use nonnegative safe integers.");
+  const bytes = Math.min(PACKED_LEARNING_ROW_BLOCK, rows) * Math.ceil(width / 4) * 4 * WEIGHTED_LEARNING_SCRATCH_BYTES_PER_ELEMENT;
+  if (!Number.isSafeInteger(bytes)) throw new Error("Packed scratch geometry exceeds exact integer accounting.");
+  return bytes;
+}
+
+export function nativeCoreInventory(shape: NativeArchitectureShape, routerStorageLayout?: "block-sparse-v1", inventoryVersion: 1 | 2 = NATIVE_INVENTORY_VERSION,
+  observeProjection?: (layout: { inputFeatures: number; outputFeatures: number; biasColumns: number; table: boolean }) => void) {
+  if (inventoryVersion !== 1 && inventoryVersion !== 2) throw new Error("Unsupported native inventory version.");
+  const weighted = inventoryVersion === 2;
   if (routerStorageLayout !== undefined && routerStorageLayout !== "block-sparse-v1") throw new Error("Unsupported native router storage layout.");
   const sparse = routerStorageLayout === "block-sparse-v1";
   const { dModel: d, layers, feedForward: ff, vsaDimensions: vsa,
@@ -20,7 +42,11 @@ export function nativeCoreInventory(shape: NativeArchitectureShape, routerStorag
   const counts = { logicalParameters: 0, projectionParameters: 0, tableParameters: 0,
     routerSynapseParameters: sparse ? 0 : router * router, packedWeightBytes: 0,
     resistanceBytes: 0, packedOwners: 0, maximumProjectionBytes: 0 };
+  let maximumUpdateScratchBytes = 0;
   function matrix(width: number, rows: number, bias = 0, table = false, repeat = 1) {
+    // Trusted sizing consumer only. The optional observer does not add fields
+    // to immutable v1/v2 inventories or change their original hashes/arithmetic.
+    observeProjection?.({ inputFeatures: width, outputFeatures: rows, biasColumns: bias, table });
     const parameters = width * rows + bias;
     const packed = rows * Math.ceil(width / 4) + Math.ceil(bias / 4);
     counts.logicalParameters += repeat * parameters;
@@ -28,7 +54,10 @@ export function nativeCoreInventory(shape: NativeArchitectureShape, routerStorag
     counts.packedWeightBytes += repeat * packed;
     counts.resistanceBytes += repeat * (rows + Number(bias > 0));
     counts.packedOwners += repeat;
-    counts.maximumProjectionBytes = Math.max(counts.maximumProjectionBytes, packed + rows + Number(bias > 0) + 8);
+    counts.maximumProjectionBytes = Math.max(counts.maximumProjectionBytes,
+      packed + rows + Number(bias > 0) + 8 + (weighted ? parameters + 4 : 0));
+    if (weighted) maximumUpdateScratchBytes = Math.max(maximumUpdateScratchBytes,
+      packedLearningScratchBytes(rows, width), packedLearningScratchBytes(1, bias));
   }
   const linear = (width: number, rows: number, bias = false, repeat = 1, table = false) => matrix(width, rows, bias ? rows : 0, table, repeat);
   const norm = (width: number, repeat = 1) => matrix(width, 1, 0, true, repeat);
@@ -73,15 +102,18 @@ export function nativeCoreInventory(shape: NativeArchitectureShape, routerStorag
   const routerNonweightTensorBytes = (sparse ? 0 : 10 * router * router) + 16 * router + 32 + (sparse ? 40 : 0);
   const freshRouteControlBytes = 4096 + 24 + 16;
   const liquidStateBytes = 4 * d;
+  const parallelTopologyControlBytes = weighted ? 8 * counts.packedOwners : 0;
   return { ...counts, gainAndRateBytes, routerNonweightTensorBytes, freshRouteControlBytes,
-    liquidStateBytes, staticNonweightTensorBytes: counts.resistanceBytes + gainAndRateBytes + routerNonweightTensorBytes + freshRouteControlBytes + liquidStateBytes };
+    liquidStateBytes, staticNonweightTensorBytes: counts.resistanceBytes + gainAndRateBytes + routerNonweightTensorBytes + freshRouteControlBytes + liquidStateBytes + parallelTopologyControlBytes,
+    ...(weighted ? { maximumUpdateScratchBytes, connectionStateBytes: counts.logicalParameters,
+      packedLearnedStateBytes: counts.packedWeightBytes + counts.logicalParameters, parallelTopologyControlBytes } : {}) };
 }
 
 export type NativeCoreInventory = ReturnType<typeof nativeCoreInventory>;
 
 export interface NativeArchitectureDescriptor {
   format: "omni-main-selected-native-architecture";
-  formatVersion: 1;
+  formatVersion: 1 | 2;
   architecture: "OmniCortex";
   externalPretrainedWeights: false;
   hardwareTier: HardwareTier;
@@ -115,7 +147,7 @@ export function sealNativeArchitecture(descriptor: Omit<NativeArchitectureDescri
 export function validateNativeArchitectureDescriptor(value: unknown): NativeArchitectureDescriptor {
   const record = (candidate: unknown): candidate is Record<string, unknown> =>
     typeof candidate === "object" && candidate !== null && !Array.isArray(candidate);
-  if (!record(value) || value.format !== "omni-main-selected-native-architecture" || value.formatVersion !== 1
+  if (!record(value) || value.format !== "omni-main-selected-native-architecture" || ![1, 2].includes(Number(value.formatVersion)) || typeof value.formatVersion !== "number"
       || value.architecture !== "OmniCortex" || value.externalPretrainedWeights !== false
       || value.qualityEvidence !== "unmeasured-native-quality-deferred"
       || !["micro", "personal", "gpu", "workstation"].includes(String(value.hardwareTier))
@@ -143,7 +175,7 @@ export function validateNativeArchitectureDescriptor(value: unknown): NativeArch
   }
   const layout = value.sizing.routerStorageLayout;
   if (layout !== undefined && layout !== "block-sparse-v1") throw new Error("Unsupported native router storage layout.");
-  const exact = nativeCoreInventory(shape, layout as "block-sparse-v1" | undefined);
+  const exact = nativeCoreInventory(shape, layout as "block-sparse-v1" | undefined, value.formatVersion as 1 | 2);
   if (Object.keys(inventoryValue).length !== Object.keys(exact).length
       || Object.entries(exact).some(([key, count]) => !Number.isSafeInteger(count) || inventoryValue[key] !== count)) {
     throw new Error("Native architecture exact inventory does not match its shape.");

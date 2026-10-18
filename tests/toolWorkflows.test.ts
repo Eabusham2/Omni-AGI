@@ -98,12 +98,13 @@ describe("ToolExecutor complete workflows", () => {
     toolId: string,
     level: ToolPermissionLevel
   ): Promise<void> {
-    const current = await repository.get(brain.id);
-    const permission = current.toolPermissions?.find((entry) => entry.toolId === toolId);
-    if (!permission) throw new Error(`Missing fixture permission for ${toolId}.`);
-    permission.level = level;
-    permission.updatedAt = new Date().toISOString();
-    await repository.save(current);
+    await repository.updateToolPermission(
+      brain.id,
+      toolId,
+      toolId,
+      level,
+      { requestId: randomUUID() }
+    );
   }
 
   function executorFor(

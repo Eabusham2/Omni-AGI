@@ -10,6 +10,7 @@ import type {
   TrainingSource,
   TrainingSourceLedgerEntry
 } from "../shared/types";
+import { normalizeSourceMediaType } from "../shared/sourceMediaType";
 
 const FORMAT = "omni-brain-activity-ledger";
 const FORMAT_VERSION = 1;
@@ -87,7 +88,9 @@ interface CurrentSourceRow extends SourceRow {
 
 export function trainingSourceEvidenceFingerprint(source: TrainingSource): string {
   if (source.contentHash && /^[a-f0-9]{64}$/i.test(source.contentHash)) {
-    return `content:${source.contentHash.toLocaleLowerCase()}`;
+    return `content:${source.parserBindingSha256
+      ? sha256(`omni-parser-bound-source-v1\0${source.contentHash.toLocaleLowerCase()}\0${source.parserBindingSha256}`)
+      : source.contentHash.toLocaleLowerCase()}`;
   }
   if (source.blobHash && /^[a-f0-9]{64}$/i.test(source.blobHash)) {
     return `blob:${source.blobHash.toLocaleLowerCase()}`;
@@ -196,7 +199,53 @@ function normalizeSource(value: unknown): TrainingSource {
   const path = optionalString(source.path, "training source path");
   const rawText = optionalString(source.rawText, "training source raw text");
   const contentHash = optionalString(source.contentHash, "training source content hash");
+  const parserBindingSha256 = optionalString(source.parserBindingSha256, "training source parser binding");
+  if (parserBindingSha256 !== undefined && !/^[a-f0-9]{64}$/.test(parserBindingSha256)) {
+    throw new Error("Brain activity training source parser binding is invalid.");
+  }
+  let parserExecution: TrainingSource["parserExecution"];
+  if (source.parserExecution !== undefined) {
+    const execution = record(source.parserExecution);
+    const media = execution?.outputKind === "media-assets";
+    if (!execution || Object.keys(execution).sort().join("\0") !== ["abi", "complete", "format", "formatId", "moduleId",
+      "moduleSha256", "outputBytes", "outputRecords", "outputSha256", "packageSha256", "pluginId", "sourceBytes",
+      "sourceSha256", "version", ...(execution.inputMediaType === undefined ? [] : ["inputMediaType"]),
+      ...(media ? ["assetManifestSha256", "outputAssets", "outputKind", "outputModalityCounts"] : [])].sort().join("\0") || execution.format !== "omni-plugin-parser-execution" ||
+      execution.version !== 1 || !["omni-wasm-record-stream-1", "omni-runtime-record-stream-1"].includes(String(execution.abi)) || execution.complete !== true ||
+      (execution.inputMediaType !== undefined && normalizeSourceMediaType(execution.inputMediaType) !== execution.inputMediaType) ||
+      typeof execution.pluginId !== "string" || !SAFE_ENTRY_ID.test(execution.pluginId) ||
+      typeof execution.formatId !== "string" || !SAFE_ENTRY_ID.test(execution.formatId) ||
+      typeof execution.moduleId !== "string" || !SAFE_ENTRY_ID.test(execution.moduleId) ||
+      typeof execution.packageSha256 !== "string" || !/^[a-f0-9]{64}$/.test(execution.packageSha256) ||
+      typeof execution.moduleSha256 !== "string" || !/^[a-f0-9]{64}$/.test(execution.moduleSha256) ||
+      typeof execution.sourceSha256 !== "string" || !/^[a-f0-9]{64}$/.test(execution.sourceSha256) ||
+      typeof execution.outputSha256 !== "string" || !/^[a-f0-9]{64}$/.test(execution.outputSha256) ||
+      (media && (typeof execution.assetManifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(execution.assetManifestSha256) ||
+        safeInteger(execution.outputAssets, "parser output assets") !== safeInteger(execution.outputRecords, "parser output records") ||
+        !execution.outputModalityCounts || typeof execution.outputModalityCounts !== "object" || Array.isArray(execution.outputModalityCounts) ||
+        Object.keys(execution.outputModalityCounts).sort().join("\0") !== ["audio", "image", "video"].join("\0")))) {
+      throw new Error("Brain activity executable parser provenance is invalid.");
+    }
+    const outputModalityCounts = media ? execution.outputModalityCounts as Record<string, unknown> : undefined;
+    const image = media ? safeInteger(outputModalityCounts!.image, "parser image assets") : 0;
+    const audio = media ? safeInteger(outputModalityCounts!.audio, "parser audio assets") : 0;
+    const video = media ? safeInteger(outputModalityCounts!.video, "parser video assets") : 0;
+    if (media && image + audio + video !== safeInteger(execution.outputAssets, "parser output assets")) {
+      throw new Error("Brain activity parser modality counts do not close to its asset count.");
+    }
+    parserExecution = { format: "omni-plugin-parser-execution", version: 1,
+      pluginId: execution.pluginId, packageSha256: execution.packageSha256, formatId: execution.formatId,
+      moduleId: execution.moduleId, moduleSha256: execution.moduleSha256,
+      abi: execution.abi as "omni-wasm-record-stream-1" | "omni-runtime-record-stream-1",
+      sourceSha256: execution.sourceSha256, sourceBytes: safeInteger(execution.sourceBytes, "parser source bytes"),
+      ...(typeof execution.inputMediaType === "string" ? { inputMediaType: execution.inputMediaType } : {}),
+      outputSha256: execution.outputSha256, outputBytes: safeInteger(execution.outputBytes, "parser output bytes"),
+      outputRecords: safeInteger(execution.outputRecords, "parser output records"),
+      ...(media ? { outputKind: "media-assets" as const, outputAssets: safeInteger(execution.outputAssets, "parser output assets"),
+        assetManifestSha256: execution.assetManifestSha256 as string, outputModalityCounts: { image, audio, video } } : {}), complete: true };
+  }
   const blobHash = optionalString(source.blobHash, "training source blob hash");
+  const requestedUrl = optionalString(source.requestedUrl, "training source requested URL");
   const provenanceUrl = optionalString(
     source.provenanceUrl,
     "training source provenance URL"
@@ -230,10 +279,13 @@ function normalizeSource(value: unknown): TrainingSource {
     rawTextRetained: source.rawTextRetained,
     ...(rawText !== undefined ? { rawText } : {}),
     ...(contentHash !== undefined ? { contentHash } : {}),
+    ...(parserBindingSha256 !== undefined ? { parserBindingSha256 } : {}),
+    ...(parserExecution ? { parserExecution } : {}),
     ...(blobHash !== undefined ? { blobHash } : {}),
     ...(typeof source.policy === "string"
       ? { policy: source.policy as TrainingSource["policy"] }
       : {}),
+    ...(requestedUrl !== undefined ? { requestedUrl } : {}),
     ...(provenanceUrl !== undefined ? { provenanceUrl } : {}),
     ...(license !== undefined ? { license } : {}),
     ...(licenseUrl !== undefined ? { licenseUrl } : {})
@@ -1194,13 +1246,21 @@ export class BrainActivityLedger {
     return row ? presentSource(row).source : undefined;
   }
 
-  trainingSourceByContentHash(contentHash: string): TrainingSource | undefined {
+  trainingSourceByContentHash(
+    contentHash: string,
+    parserBindingSha256?: string
+  ): TrainingSource | undefined {
     if (!/^[a-f0-9]{64}$/i.test(contentHash)) return undefined;
-    const row = this.database.prepare(`
+    if (parserBindingSha256 !== undefined && !/^[a-f0-9]{64}$/.test(parserBindingSha256)) return undefined;
+    const rows = this.database.prepare(`
       SELECT * FROM training_source_current
-      WHERE content_hash=? ORDER BY sequence DESC LIMIT 1
-    `).get(contentHash.toLocaleLowerCase()) as CurrentSourceRow | undefined;
-    return row ? presentSource(row).source : undefined;
+      WHERE content_hash=? ORDER BY sequence DESC
+    `).all(contentHash.toLocaleLowerCase()) as unknown as CurrentSourceRow[];
+    for (const row of rows) {
+      const source = presentSource(row).source;
+      if (parserBindingSha256 === undefined || source.parserBindingSha256 === parserBindingSha256) return source;
+    }
+    return undefined;
   }
 
   trainingSourceByFingerprint(fingerprint: string): TrainingSource | undefined {

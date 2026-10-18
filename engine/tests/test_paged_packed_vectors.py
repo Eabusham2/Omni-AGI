@@ -203,7 +203,7 @@ class PagedPackedVectorTests(unittest.TestCase):
         for index in range(5):
             self.vectors["row-%d" % index] = torch.tensor([1, index % 2, 0, 0, -1])
         self.vectors.adapt("row-1", torch.tensor([-1, 0, 0, 0, 1]), 0.6)
-        self.assertEqual(self.vectors.storage_bytes, 5 * (self.vectors.row_bytes + 8))
+        self.assertEqual(self.vectors.storage_bytes, 5 * (self.vectors.row_bytes + self.vectors.dimensions + 8 + 12))
         metadata, tensors = self.vectors.export_state(
             prefix="neurons_", keys=["row-3", "row-1"]
         )

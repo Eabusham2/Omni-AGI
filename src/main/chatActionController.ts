@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type {
   ActionEvent,
@@ -27,14 +27,34 @@ import type {
   ToolRouteLearningResult
 } from "./brainService";
 import { normalizeCompatibleArchitectureMutation } from "../shared/architectureMutation";
+import { chatTurnKey } from "../shared/chatTurnKey";
 import { cleanGeometryHoldouts } from "./evolutionController";
 import { EngineRequestError } from "./engineSupervisor";
 import { inheritTemporarySteeringContext, type TemporarySteeringContext } from "./temporarySteeringContext";
 import type { ChatToolObservationReceipt } from "./chatToolObservation";
 import { actualTerminalToolOutcome, type CompletedActionEvidenceJob } from "./completedActionEvidence";
 import { receivedChatInput } from "./chatInputReceipt";
+import type { AdmittedExperienceLearningReceipt } from "./admittedExperienceLearning";
+import type { LearningTask } from "../shared/learning";
+import type { LearningExecutionContext, ToolExecutionContext } from "./learningExecutionContext";
+import type { NativeAppChatInput } from "../shared/chatInputProvenance";
+import type { NativeAudioInput } from "../shared/nativeAudioChat";
+import { expectedChatInputHash } from "./nativeAudioIdentity";
+import type { WarmTaskAttachmentTransfer } from "./taskContinuationScope";
+import type { SteerDirectionsService, SteerDirectionTracker } from "./steerDirections";
+import { cleanChatInput } from "../shared/chatInput";
+import { chatHostSuspensionForDetach, type ChatSuspensionSource } from "./chatSuspension";
+import type { ChatHostSuspensionReceipt } from "../shared/chatSuspension";
+import { validatePonderSelfReport, type PonderSelfReport, type PonderSelfReportDelta } from "../shared/ponderSelfReport";
 
 export interface ActionChatService {
+  prioritizeAdmittedExperience?(brainId: string, turnId: string): Promise<AdmittedExperienceLearningReceipt>;
+  onExperienceLearning?(listener: (receipt: AdmittedExperienceLearningReceipt) => void): () => void;
+  requireInstanceLoaded?(brainId: string, turnId?: string): void;
+  bindTaskAttachments?(brainId: string, turnId: string, attachmentIds: readonly string[]): Promise<unknown>;
+  waitUntilInstanceLoaded?(brainId: string, signal?: AbortSignal, turnId?: string): Promise<void>;
+  addInstanceSuspendBoundary?(boundary: (brainId: string, report: (waiting: import("../shared/instanceLifecycle").InstanceLifecycleState["waitingFor"]) => void) => Promise<void>): () => void;
+  addInstanceDetachBoundary?(boundary: (brainId: string) => Promise<void>): () => void;
   chat(
     brainId: string,
     input: string,
@@ -43,8 +63,16 @@ export interface ActionChatService {
     turnId?: string,
     responseTokenBudget?: number,
     temporarySteeringContext?: TemporarySteeringContext,
-    toolObservationWaitMs?: number
+    toolObservationWaitMs?: number,
+    resume?: import("../shared/instanceLifecycle").InstanceResumeFrontier,
+    inheritedExecutionId?: string,
+    appInput?: NativeAppChatInput,
+    nativeAudioInput?: NativeAudioInput
   ): Promise<ChatResult>;
+  instanceResumePresentation?(brainId: string): Promise<import("../shared/instanceLifecycleApi").InstanceResumeAttachment | null>;
+  instanceInheritedResumePresentation?(brainId: string, executionId: string): Promise<import("../shared/instanceLifecycleApi").InstanceResumeAttachment>;
+  resumeInheritedTurn?(brainId: string, executionId: string, signal?: AbortSignal,
+    onStream?: (event: NeuralChatStreamEvent) => void, toolObservationWaitMs?: number): Promise<ChatResult>;
   currentChatAttentionEpoch?(brainId: string): Promise<number>;
   observeChatActionResult?(brainId: string, turnId: string, event: ActionEvent,
     output: unknown): Promise<ChatToolObservationReceipt | undefined>;
@@ -73,12 +101,14 @@ export interface ActionChatService {
 }
 
 export interface ActionToolExecutor {
+  invalidateApproval?(brainId: string, token: string): boolean;
   preferences?(): ToolRuntimePreferences;
   execute(
     invocation: ToolInvocation,
     onProgress?: (job: RuntimeJob) => void,
     requestId?: string,
-    onCompleted?: (result: ToolExecutionResult) => Promise<void>
+    onCompleted?: (result: ToolExecutionResult) => Promise<void>,
+    context?: ToolExecutionContext
   ): Promise<ToolExecutionResult>;
   cancel(brainId: string, requestId?: string): number;
   hasPendingOrActive?(brainId: string): boolean;
@@ -197,6 +227,10 @@ function actionFingerprint(action: StructuredAction): string {
       action.arguments.settings ?? null
     ]);
   }
+  if (action.kind === "ponder") {
+    const { ponderSelfReport: _report, ...argumentsWithoutReport } = action.arguments;
+    return JSON.stringify([action.kind, action.toolId, action.action, argumentsWithoutReport]);
+  }
   return JSON.stringify([
     action.kind,
     canonicalSystemToolId(action.toolId),
@@ -283,6 +317,7 @@ interface ActiveTurn {
   earlySteeredYield?: boolean;
   neuralSteered?: boolean;
   input: string;
+  nativeAudioInput?: NativeAudioInput;
   attentionEpoch?: number;
   temporarySteeringContext?: TemporarySteeringContext;
   observationOffers: Set<string>;
@@ -294,6 +329,16 @@ interface ActiveTurn {
 interface ActionOutcome {
   event: ActionEvent;
   output?: unknown;
+}
+
+interface PonderReportAccumulator {
+  reportId: string;
+  actionId: string;
+  phase: PonderSelfReportDelta["phase"];
+  nextChunk: number;
+  bytes: number;
+  chunks: string[];
+  complete: boolean;
 }
 
 async function waitForTurnNeuralBoundary(
@@ -335,8 +380,36 @@ export function actionEventForTurnStream(event: ActionEvent): ActionEvent {
 }
 
 export class ChatActionController extends EventEmitter {
+  private warmTaskAttachmentTransfer?: (request: WarmTaskAttachmentTransfer, signal: AbortSignal) => Promise<void>;
+  /** Trusted composition only. Renderer metadata cannot create a file scope. */
+  setWarmTaskAttachmentTransfer(transfer: NonNullable<ChatActionController["warmTaskAttachmentTransfer"]>): void {
+    this.warmTaskAttachmentTransfer = transfer;
+  }
+  private steerDirections?: SteerDirectionsService;
+  setSteerDirections(service: SteerDirectionsService): void { this.steerDirections = service; }
+  private recordHostSuspension?: (receipt: ChatHostSuspensionReceipt, source: ChatSuspensionSource) => Promise<void>;
+  setChatSuspensionRecorder(record: NonNullable<ChatActionController["recordHostSuspension"]>): void { this.recordHostSuspension = record; }
+  private imaginationObserver?: (event: ActionEvent, job?: RuntimeJob) => void;
+  setImaginationObserver(observer: NonNullable<ChatActionController["imaginationObserver"]>): void { this.imaginationObserver = observer; }
+  private learningContextResolver?: (brainId: string, turnId: string) => Promise<LearningExecutionContext | undefined>;
+  setLearningContextResolver(resolver: NonNullable<ChatActionController["learningContextResolver"]>): void { this.learningContextResolver = resolver; }
+  private prepareCapabilities?: (brainId: string, signal: AbortSignal) => Promise<readonly string[]>;
   private readonly durableEvidence = new WeakMap<ActionEvent, Promise<CompletedActionEvidenceJob>>();
   private readonly actionChatTurns = new WeakMap<ActionEvent, string>();
+  private readonly experienceActions = new Map<string, ActionEvent[]>();
+  private readonly sourceLearningActions = new Map<string, ActionEvent[]>();
+
+  observeLearningTask(task: LearningTask): void {
+    const key = `${task.brainId}:${task.id}`;
+    for (const event of this.sourceLearningActions.get(key) ?? []) {
+      event.progress = task.progress; event.statusLabel = task.label; event.updatedAt = task.updatedAt;
+      event.state = task.state === "complete" ? "complete" : task.state === "failed" ? "failed" : task.state === "stopped" ? "stopped" : "running";
+      event.error = task.error;
+      this.publish(event);
+      void this.service.recordConversationActions?.(event.brainId, [event]);
+    }
+    if (["complete", "failed", "stopped"].includes(task.state)) this.sourceLearningActions.delete(key);
+  }
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly pendingApprovedActions = new Map<
     string,
@@ -354,13 +427,38 @@ export class ChatActionController extends EventEmitter {
     private readonly evolution: ActionEvolutionController
   ) {
     super();
+    service.onExperienceLearning?.(receipt => {
+      if (!receipt.jobId) return;
+      const key = `${receipt.brainId}:${receipt.jobId}`;
+      for (const event of this.experienceActions.get(key) ?? []) {
+        event.statusLabel = receipt.detail;
+        event.updatedAt = new Date().toISOString();
+        event.state = receipt.state === "complete" || receipt.state === "retained" ? "complete" :
+          receipt.state === "unresolved" || receipt.state === "failed" ? "failed" : "running";
+        this.publish(event);
+        void this.service.recordConversationActions?.(event.brainId, [event]);
+      }
+      if (["complete", "retained", "unresolved", "failed"].includes(receipt.state)) this.experienceActions.delete(key);
+    });
+    service.addInstanceSuspendBoundary?.(async (brainId, report) => {
+      while (this.tools.hasPendingOrActive?.(brainId) || [...this.activeTurns.values()].some((turn) => turn.brainId === brainId &&
+          [...turn.actions.values()].some((action) => action.state === "running" && !action.inlineGenerationOwned && action.action.kind !== "learn"))) {
+        report({ kind: "external-effect", label: "Waiting for the current external action or approval to settle; it will not be replayed" });
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      }
+    });
+    service.addInstanceDetachBoundary?.(async (brainId) => {
+      // The service already retired only unloaded native attachments. Finish
+      // actual receipt drains before recovery replaces their SQLite owners.
+      await Promise.all([...this.activeTurns.values()].filter((turn) => turn.brainId === brainId).map((turn) => turn.settled));
+    });
     service.onInlineImaginationCancelled?.((ack) => {
       const key = `${ack.brainId}:${ack.turnId}:${ack.actionId}`;
       const pending = this.inlineCancellations.get(key);
       if (pending) this.settleInlineCancellation(key, pending);
     });
     service.onCodecRuntimeSetup?.((setup) => {
-      const turn = this.activeTurns.get(setup.turnId);
+      const turn = this.activeTurns.get(chatTurnKey(setup.brainId, setup.turnId));
       if (!turn || turn.brainId !== setup.brainId) return;
       const action = [...turn.actions.values()].find((event) => event.neuralActionId === setup.actionId);
       if (!action || action.cancellationRequested || !["proposed", "running"].includes(action.state)) return;
@@ -368,6 +466,11 @@ export class ChatActionController extends EventEmitter {
       action.updatedAt = new Date().toISOString();
       this.publishAction(turn.neuralEnded ? undefined : turn, action);
     });
+  }
+
+  /** Runs before service.chat takes the neural writer, for desktop, mobile and child agents. */
+  setCapabilityPreparation(prepare: (brainId: string, signal: AbortSignal) => Promise<readonly string[]>): void {
+    this.prepareCapabilities = prepare;
   }
 
   private settleInlineCancellation(key: string, pending: { turn: ActiveTurn; event: ActionEvent }): void {
@@ -379,14 +482,14 @@ export class ChatActionController extends EventEmitter {
     event.statusLabel = "Artifact cancelled · decoder cleanup acknowledged";
     event.updatedAt = new Date().toISOString();
     event.error = undefined;
-    this.publishAction(this.activeTurns.has(turn.turnId) ? turn : undefined, event);
+    this.publishAction(this.activeTurns.has(chatTurnKey(turn.brainId, turn.turnId)) ? turn : undefined, event);
     void this.service.recordConversationActions?.(turn.brainId, [event]).catch(() => undefined);
   }
 
   async cancelInlineAction(brainId: string, turnId: string, actionEventId: string): Promise<{
     actionEvent: ActionEvent; acknowledged: boolean;
   }> {
-    const turn = this.activeTurns.get(turnId);
+    const turn = this.activeTurns.get(chatTurnKey(brainId, turnId));
     const event = turn?.actions.get(actionEventId);
     if (!turn || turn.brainId !== brainId || !event || !event.neuralActionId || !event.inlineGenerationOwned ||
         event.action.kind !== "imagine" || event.action.toolId !== "modality.imagine" ||
@@ -410,7 +513,7 @@ export class ChatActionController extends EventEmitter {
         this.inlineCancellations.delete(key);
         event.cancellationRequested = false;
         event.updatedAt = new Date().toISOString();
-        this.publishAction(this.activeTurns.has(turnId) ? turn : undefined, event);
+        this.publishAction(this.activeTurns.has(chatTurnKey(brainId, turnId)) ? turn : undefined, event);
       }
       throw error;
     }
@@ -444,6 +547,8 @@ export class ChatActionController extends EventEmitter {
     turn: ActiveTurn,
     event:
       | Omit<Extract<ChatStreamEvent, { type: "chat-token" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
+      | Omit<Extract<ChatStreamEvent, { type: "chat-cognition" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
+      | Omit<Extract<ChatStreamEvent, { type: "chat-ponder-self-report" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-action" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "modality-preview" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
       | Omit<Extract<ChatStreamEvent, { type: "chat-phase" }>, "id" | "brainId" | "turnId" | "sequence" | "createdAt">
@@ -587,6 +692,7 @@ export class ChatActionController extends EventEmitter {
     approvalToken?: string,
     userUtterance?: string
   ): Promise<unknown> {
+    if (this.service.waitUntilInstanceLoaded) await this.service.waitUntilInstanceLoaded(event.brainId, requestId ? this.activeTurns.get(chatTurnKey(event.brainId, requestId))?.controller.signal : undefined, requestId);
     event.state = "running";
     event.error = undefined;
     event.updatedAt = new Date().toISOString();
@@ -599,6 +705,23 @@ export class ChatActionController extends EventEmitter {
       return { stopped: true };
     }
     if (action.kind === "ponder") {
+      if (action.arguments.handledInTurn === true) {
+        const raw = action.arguments.ponderTrace;
+        const measured = raw && typeof raw === "object" && !Array.isArray(raw)
+          ? raw as Record<string, unknown> : undefined;
+        if (!measured || measured.activated !== true || measured.activated_by !== "learned-action-head" ||
+            measured.private !== true || measured.visibleMagicTags !== false || typeof measured.completed !== "boolean" ||
+            typeof measured.passes !== "number" || !Number.isSafeInteger(measured.passes) || measured.passes < 0 ||
+            [measured.elapsed_ms, measured.final_delta].some(value => typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+          throw new Error("The native Ponder activity receipt is invalid.");
+        }
+        event.state = measured.completed ? "complete" : "stopped";
+        event.statusLabel = measured.completed ? "Ponder finished" :
+          measured.stop_reason === "resource-pressure" ? "Ponder paused for resources" : "Ponder stopped";
+        event.updatedAt = new Date().toISOString();
+        return { internal: true, kind: action.kind, cognition: measured,
+          completed: measured.completed, handledInTurn: true, reused: false };
+      }
       if (action.arguments.completedInTurn === true) {
         // The active OmniCortex can finish Ponder privately before it emits
         // the first answer token. Consume that typed result exactly once;
@@ -625,7 +748,27 @@ export class ChatActionController extends EventEmitter {
       event.updatedAt = new Date().toISOString();
       return { internal: true, kind: action.kind, cognition };
     }
-    if (["talk", "learn"].includes(action.kind)) {
+    if (action.kind === "learn" && action.arguments.inputs === undefined) {
+      const turnId = this.actionChatTurns.get(event);
+      if (!turnId || !this.service.prioritizeAdmittedExperience) throw new Error("Learning needs an admitted current experience or explicit selected sources.");
+      if (Object.keys(action.arguments).some(key => !["currentExperience"].includes(key))) throw new Error("Use typed learning inputs for external sources; model strings cannot grant file access.");
+      const receipt = await this.service.prioritizeAdmittedExperience(event.brainId, turnId);
+      event.statusLabel = receipt.detail;
+      event.runtimeJobId = receipt.jobId;
+      event.updatedAt = new Date().toISOString();
+      event.state = receipt.state === "complete" || receipt.state === "retained" ? "complete" : receipt.state === "unresolved" ? "failed" : "running";
+      if (receipt.jobId && ["queued", "running", "paused"].includes(receipt.state)) {
+        const key = `${event.brainId}:${receipt.jobId}`;
+        this.experienceActions.set(key, [...(this.experienceActions.get(key) ?? []), event]);
+      }
+      return receipt;
+    }
+    if (action.kind === "learn") {
+      // The source remains a typed, permission-checked job. No path supplied
+      // by generated text becomes a filesystem capability.
+      action.toolId = "data.learn"; action.action = "start";
+    }
+    if (action.kind === "talk") {
       event.state = "complete";
       event.updatedAt = new Date().toISOString();
       return { internal: true, kind: action.kind };
@@ -735,6 +878,7 @@ export class ChatActionController extends EventEmitter {
     }
     const imagination =
       action.kind === "imagine" || action.toolId === "modality.imagine";
+    if (imagination) this.imaginationObserver?.(event);
     const invocation = {
       brainId: event.brainId,
       toolId: action.toolId,
@@ -756,9 +900,14 @@ export class ChatActionController extends EventEmitter {
       await this.offerLiveToolObservation(turn, event, actual.output);
       onUpdate(event);
     };
+    const chatTurnId = this.actionChatTurns.get(event);
+    const learning = chatTurnId ? await this.learningContextResolver?.(event.brainId, chatTurnId) : undefined;
+    const executionContext = learning || ["data.learn", "data.fact-check"].includes(invocation.toolId) || chatTurnId
+      ? { actionEventId: event.id, ...(chatTurnId ? { chatTurnId } : {}), ...(event.neuralActionId ? { nativeActionId: event.neuralActionId } : {}), ...(learning ? { learning } : {}) } : undefined;
     const execution =
       imagination
         ? await this.tools.execute(invocation, (job) => {
+            this.imaginationObserver?.(event, job);
             event.runtimeJobId = job.id;
             event.progress = Math.max(0, Math.min(1, job.progress));
             event.statusLabel = job.label;
@@ -770,15 +919,48 @@ export class ChatActionController extends EventEmitter {
             }
             event.updatedAt = job.updatedAt;
             onUpdate(event);
-          }, requestId, retainBeforeAudit)
-        : await this.tools.execute(invocation, undefined, requestId, retainBeforeAudit);
+          }, requestId, retainBeforeAudit, executionContext)
+        : executionContext
+          ? await this.tools.execute(invocation, undefined, requestId, retainBeforeAudit, executionContext)
+          : await this.tools.execute(invocation, undefined, requestId, retainBeforeAudit);
     event.execution = execution;
     if (event.cancellationRequested || (event as ActionEvent).state === "stopped") return execution.output;
     event.state = execution.state;
     event.error = execution.error;
+    if (execution.recoveredEffectReceipt) event.statusLabel = "Stored completed result · no external action repeated";
     event.updatedAt = execution.finishedAt ?? new Date().toISOString();
+    if (["data.learn", "data.fact-check"].includes(invocation.toolId) && execution.state === "complete" &&
+        execution.output && typeof execution.output === "object") {
+      const output = execution.output as { format?: string; task?: LearningTask };
+      const task = (output.format === "omni-learning-task" ? output : output.task) as LearningTask | undefined;
+      if (task?.format === "omni-learning-task" && task.brainId === event.brainId) {
+        event.runtimeJobId = task.id;
+        const key = `${task.brainId}:${task.id}`;
+        this.sourceLearningActions.set(key, [...(this.sourceLearningActions.get(key) ?? []), event]);
+        this.observeLearningTask(task);
+      }
+    }
     this.rememberPendingApprovedAction(event, userUtterance);
     return execution.output;
+  }
+
+  /** Explicit user denial consumes only this proposal's live one-use grant. */
+  async declineAction(request: ApprovedChatActionRequest): Promise<ActionEvent> {
+    this.prunePendingApprovedActions();
+    const pending = this.pendingApprovedActions.get(request.actionEventId);
+    if (!pending || pending.event.brainId !== request.brainId || pending.expiresAt < Date.now() ||
+        pending.event.state !== "approval-required" || pending.event.execution?.approvalToken !== request.approvalToken) {
+      throw new Error("This action's approval is unavailable or expired.");
+    }
+    this.pendingApprovedActions.delete(request.actionEventId);
+    this.tools.invalidateApproval?.(request.brainId, request.approvalToken);
+    const event = pending.event;
+    event.state = "stopped";
+    event.statusLabel = "Declined by you · no new action dispatched";
+    event.updatedAt = new Date().toISOString();
+    await this.service.recordConversationActions?.(request.brainId, [event]);
+    this.publish(event);
+    return structuredClone(event);
   }
 
   async approveAction(
@@ -883,23 +1065,31 @@ export class ChatActionController extends EventEmitter {
     input: string,
     signal?: AbortSignal,
     requestedTurnId?: string,
-    turnMetadata?: ChatTurnMetadata
+    turnMetadata?: ChatTurnMetadata,
+    continuation?: import("../shared/instanceLifecycleApi").InstanceResumeAttachment,
+    appInput?: NativeAppChatInput,
+    nativeAudioInput?: NativeAudioInput
   ): Promise<ChatResult> {
     const turnId = requestedTurnId?.trim() || randomUUID();
+    const turnKey = chatTurnKey(brainId, turnId);
     this.prunePreCancelledTurns();
-    const preCancelled = this.preCancelledTurns.get(turnId);
+    const preCancelled = this.preCancelledTurns.get(turnKey);
     if (preCancelled?.brainId === brainId) {
-      this.preCancelledTurns.delete(turnId);
+      this.preCancelledTurns.delete(turnKey);
       throw new DOMException("This chat turn was cancelled before it started.", "AbortError");
     }
-    if (this.activeTurns.has(turnId)) {
+    if (this.activeTurns.has(turnKey)) {
       throw new Error("This chat turn is already active.");
     }
     const steerPredecessor = turnMetadata?.kind === "steer"
-      ? this.activeTurns.get(turnMetadata.replacesTurnId)
+      ? this.activeTurns.get(chatTurnKey(brainId, turnMetadata.replacesTurnId))
       : undefined;
     const warmHandoffPredecessor =
       steerPredecessor?.brainId === brainId ? steerPredecessor : undefined;
+    this.service.requireInstanceLoaded?.(brainId, continuation?.frontier.turnId ?? warmHandoffPredecessor?.turnId);
+    const submittedInput = input;
+    let directionTracker: SteerDirectionTracker | undefined;
+    if (turnMetadata?.kind === "steer" && !nativeAudioInput) input = cleanChatInput(input);
     const controller = new AbortController();
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
@@ -911,22 +1101,26 @@ export class ChatActionController extends EventEmitter {
       brainId,
       turnId,
       controller,
-      nextSequence: 0,
+      nextSequence: continuation ? continuation.frontier.lastStreamSequence + 1 : 0,
       turnMetadata,
       runtimePhase: "pending",
       settled,
       resolveSettled,
       actions: new Map(), neuralBoundary, resolveNeuralBoundary,
-      neuralCallStarted: false, neuralEnded: false, input,
+      neuralCallStarted: false, neuralEnded: false, input, ...(nativeAudioInput ? { nativeAudioInput } : {}),
       observationOffers: new Set(), approvalLearningActions: new Set()
     };
     const abortFromCaller = (): void => controller.abort();
     signal?.addEventListener("abort", abortFromCaller, { once: true });
     if (signal?.aborted) controller.abort();
-    this.activeTurns.set(turnId, turn);
-    const seen = new Set<string>();
+    // Publish ownership synchronously, before attachment/history IO can yield.
+    // A newer Steer must find this pending predecessor, and Stop must own its
+    // actual controller rather than missing it until dispatch preparation ends.
+    this.activeTurns.set(turnKey, turn);
+    const seen = new Set<string>((continuation?.priorActions ?? []).map(actionFingerprint));
     const events: ActionEvent[] = [];
     const workerActions = new Map<string, ActionEvent>();
+    const ponderReports = new Map<string, PonderReportAccumulator>();
     const previewRevisions = new Map<string, number>();
     const executions: Array<() => Promise<ActionOutcome>> = [];
     const startedExecutions = new Set<() => Promise<ActionOutcome>>();
@@ -965,6 +1159,7 @@ export class ChatActionController extends EventEmitter {
       events.push(event);
       this.actionChatTurns.set(event, turn.turnId);
       turn.actions.set(event.id, event);
+      if (action.kind === "imagine" || action.toolId === "modality.imagine") this.imaginationObserver?.(event);
       if (workerActionId) workerActions.set(workerActionId, event);
       if (action.kind === "imagine") latestImagination = event;
       this.publishAction(turn, event);
@@ -1008,6 +1203,58 @@ export class ChatActionController extends EventEmitter {
       if (workerActionId && (action.kind === "tool" || action.kind === "imagine")) void execute();
       return event;
     };
+    const reportValue = (value: PonderReportAccumulator, state: "complete" | "partial", textSha256?: string): PonderSelfReport =>
+      validatePonderSelfReport({ format: "omni-ponder-self-report", version: 1, id: value.reportId,
+        actionId: value.actionId, phase: value.phase, text: value.chunks.join(""), state, emittedBytes: value.bytes,
+        ...(textSha256 ? { textSha256 } : {}), modelEmitted: true, selfReportNotChainOfThought: true,
+        hiddenPromptUsed: false, inferenceCompletedBeforePublication: true },
+      text => createHash("sha256").update(text).digest("hex"));
+    const retainPonderReport = (report: PonderSelfReport): void => {
+      const action = workerActions.get(report.actionId);
+      if (!action || action.action.kind !== "ponder") throw new Error("Ponder self-report lost its visible Ponder action owner.");
+      action.action.arguments = { ...action.action.arguments, ponderSelfReport: report };
+      action.updatedAt = new Date().toISOString();
+    };
+    const consumePonderReport = (frame: PonderSelfReportDelta): void => {
+      const action = workerActions.get(frame.actionId);
+      if (!action || action.action.kind !== "ponder") throw new Error("Ponder self-report arrived before its visible Ponder action.");
+      let report = ponderReports.get(frame.reportId);
+      if (!report) {
+        if (frame.chunkIndex !== 0 || frame.byteOffset !== 0) throw new Error("Ponder self-report did not begin at its first byte.");
+        if ([...ponderReports.values()].some(value => value.actionId === frame.actionId))
+          throw new Error("A visible Ponder action emitted more than one self-report.");
+        report = { reportId: frame.reportId, actionId: frame.actionId, phase: frame.phase,
+          nextChunk: 0, bytes: 0, chunks: [], complete: false };
+        ponderReports.set(frame.reportId, report);
+      }
+      if (report.complete || report.actionId !== frame.actionId || report.phase !== frame.phase ||
+          report.nextChunk !== frame.chunkIndex || report.bytes !== frame.byteOffset)
+        throw new Error("Ponder self-report publication order changed.");
+      report.chunks.push(frame.delta); report.bytes += Buffer.byteLength(frame.delta); report.nextChunk += 1;
+      this.publishStream(turn, { type: "chat-ponder-self-report", report: frame });
+      if (frame.publicationComplete) {
+        if (frame.totalBytes !== report.bytes || frame.textSha256 !== createHash("sha256").update(report.chunks.join("")).digest("hex"))
+          throw new Error("Completed Ponder self-report differs from its published bytes.");
+        report.complete = true; retainPonderReport(reportValue(report, "complete", frame.textSha256));
+        this.publishAction(turn, action);
+      }
+    };
+    const retainPartialPonderReports = (): void => {
+      for (const report of ponderReports.values()) {
+        if (report.complete || report.bytes < 1) continue;
+        retainPonderReport(reportValue(report, "partial"));
+        const action = workerActions.get(report.actionId);
+        if (action) this.publishAction(turn, action);
+      }
+      for (const action of workerActions.values()) {
+        const value = action.action.arguments.ponderSelfReport;
+        if (action.action.kind !== "ponder" || !value || typeof value !== "object" || Array.isArray(value) ||
+            (value as Record<string, unknown>).state !== "publishing" ||
+            [...ponderReports.values()].some(report => report.actionId === action.neuralActionId)) continue;
+        const { ponderSelfReport: _publishing, ...remainingArguments } = action.action.arguments;
+        action.action.arguments = remainingArguments; action.updatedAt = new Date().toISOString();
+      }
+    };
     const consumeNeuralStream = (neural: NeuralChatStreamEvent): void => {
       if (neural.type === "runtime-activity") {
         if (neural.state === "queued" && neural.queue) {
@@ -1035,14 +1282,36 @@ export class ChatActionController extends EventEmitter {
         return;
       }
       if (neural.type === "chat-input-accepted") {
-        const accepted = receivedChatInput(neural.inputReceipt, { turnId: turn.turnId, input: turn.input });
+        const accepted = receivedChatInput(neural.inputReceipt, { turnId: turn.turnId, input: turn.input,
+          ...(appInput ? { inputProvenance: appInput.provenance } : {}), ...(nativeAudioInput ? { nativeAudioInput } : {}) });
+        // These IDs were resolved/enriched by the main service, not the renderer
+        // or a worker-provided pathname. Preserve inherited original handles.
+        const attachmentIds = neural.humanMessage.taskAttachmentIds;
+        if (attachmentIds?.length) {
+          if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.some(id => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(id))) throw new Error("Accepted task attachment identities are invalid.");
+          accepted.inputReceipt.taskAttachmentIds = [...attachmentIds];
+          accepted.humanMessage.taskAttachmentIds = [...attachmentIds];
+          accepted.humanMessage.inputReceipt = accepted.inputReceipt;
+        }
         turn.inputAccepted = accepted.inputReceipt;
+        directionTracker?.received(accepted.inputReceipt, accepted.humanMessage);
         this.publishStream(turn, { type: "chat-input-accepted", ...accepted });
         return; // durable input stays valid even when its reply was just cancelled
       }
       if (controller.signal.aborted) return;
+      if (neural.type === "chat-cognition") {
+        if (!turn.outputClosed) this.publishStream(turn, { type: "chat-cognition", progress: neural.progress });
+        return;
+      }
+      if (neural.type === "chat-ponder-self-report") {
+        if (!turn.outputClosed) consumePonderReport(neural.report);
+        return;
+      }
       if (neural.type === "chat-token") {
-        this.publishStream(turn, { type: "chat-token", delta: neural.delta });
+        this.publishStream(turn, { type: "chat-token", delta: neural.delta,
+          ...(neural.outputTokens !== undefined ? { outputTokens: neural.outputTokens } : {}),
+          ...(neural.outputElapsedMs !== undefined ? { outputElapsedMs: neural.outputElapsedMs } : {}),
+          ...(neural.tokensPerSecond !== undefined ? { tokensPerSecond: neural.tokensPerSecond } : {}) });
         return;
       }
       if (neural.type === "chat-phase") {
@@ -1095,6 +1364,13 @@ export class ChatActionController extends EventEmitter {
     };
 
     try {
+      if (turnMetadata?.attachmentIds?.length) {
+        if (!this.service.bindTaskAttachments) throw new Error("Task attachments are unavailable in this runtime.");
+        await this.service.bindTaskAttachments(brainId, turnId, turnMetadata.attachmentIds);
+      }
+      controller.signal.throwIfAborted();
+      directionTracker = await this.steerDirections?.begin(brainId, turnId, turnMetadata, submittedInput, nativeAudioInput, !!continuation);
+      controller.signal.throwIfAborted();
       if (this.service.currentChatAttentionEpoch) {
         turn.attentionEpoch = await this.service.currentChatAttentionEpoch(brainId);
       }
@@ -1127,6 +1403,14 @@ export class ChatActionController extends EventEmitter {
           }
         }
         await waitForTurnNeuralBoundary(warmHandoffPredecessor, controller.signal);
+        if (warmHandoffPredecessor.neuralSteered && warmHandoffPredecessor.steerSuccessor === turnId && turn.attentionEpoch !== undefined &&
+            warmHandoffPredecessor.attentionEpoch === turn.attentionEpoch) {
+          await this.warmTaskAttachmentTransfer?.({ brainId,
+            predecessorTurnId: warmHandoffPredecessor.turnId, successorTurnId: turnId,
+            predecessorInputSha256: expectedChatInputHash(warmHandoffPredecessor.nativeAudioInput ? "" : warmHandoffPredecessor.input.replace(/\0/g, "").trim(), warmHandoffPredecessor.nativeAudioInput),
+            successorInputSha256: expectedChatInputHash(nativeAudioInput ? "" : input.replace(/\0/g, "").trim(), nativeAudioInput),
+            attentionEpoch: turn.attentionEpoch }, controller.signal);
+        }
         turn.temporarySteeringContext = inheritTemporarySteeringContext(warmHandoffPredecessor,
           turnId, turn.attentionEpoch);
         turn.runtimePhase = "pending";
@@ -1137,17 +1421,30 @@ export class ChatActionController extends EventEmitter {
         throw new EngineRequestError("Chat yielded to a newer warm steering direction before dispatch.", -32801,
           { brainId, turnId, steered: true, zeroTokenYield: true, safeBoundary: true, warm: true });
       }
+      // Reattaching a cold turn must not reconnect external handles or rerun
+      // capability preparation as if this were a newly submitted user input.
+      const capabilityWarnings = continuation ? [] : await this.prepareCapabilities?.(brainId, controller.signal) ?? [];
+      controller.signal.throwIfAborted();
+      if (turn.steerSuccessor) {
+        throw new EngineRequestError("Chat yielded to a newer warm steering direction before dispatch.", -32801,
+          { brainId, turnId, steered: true, zeroTokenYield: true, safeBoundary: true, warm: true });
+      }
       this.publishStream(turn, {
         type: "chat-state",
         state: "started",
-        turnMetadata
+        turnMetadata,
+        ...(capabilityWarnings.length ? { notices: [...capabilityWarnings] } : {})
       });
       const approvalSeconds = this.tools.preferences?.().approvalTimeoutSeconds;
       if (approvalSeconds !== undefined && (!Number.isSafeInteger(approvalSeconds) || approvalSeconds < 1 || approvalSeconds > 3_600)) {
         throw new Error("Tool observation wait requires the valid 1–3,600 second runtime approval preference.");
       }
       turn.neuralCallStarted = true;
-      let result = await this.service.chat(
+      if (continuation?.inheritedExecutionId && !this.service.resumeInheritedTurn) throw new Error("The inherited native execution adapter is unavailable.");
+      let result = continuation?.inheritedExecutionId ? await this.service.resumeInheritedTurn!(
+        brainId, continuation.inheritedExecutionId, controller.signal, consumeNeuralStream,
+        approvalSeconds === undefined ? undefined : approvalSeconds * 1_000
+      ) : await this.service.chat(
         brainId,
         input,
         controller.signal,
@@ -1155,14 +1452,20 @@ export class ChatActionController extends EventEmitter {
         turnId,
         undefined,
         turn.temporarySteeringContext,
-        approvalSeconds === undefined ? undefined : approvalSeconds * 1_000
+        approvalSeconds === undefined ? undefined : approvalSeconds * 1_000,
+        continuation?.frontier,
+        undefined,
+        appInput,
+        nativeAudioInput
       );
+      if (capabilityWarnings.length) result.capabilityWarnings = [...capabilityWarnings];
       for (const action of result.proposedActions ?? []) queueAction(action);
 
       // service.chat has returned only after its atomic neural/host turn save
       // (or exact durable receipt reconciliation). Optional artifacts and their
       // learning must not keep the completed text owned by generation controls.
       turn.neuralSteered = result.generationEnd === "steered";
+      directionTracker?.completed(result);
       this.publishStream(turn, {
         type: "chat-reply-committed",
         humanMessage: result.humanMessage,
@@ -1252,6 +1555,7 @@ export class ChatActionController extends EventEmitter {
           event.attentionEpoch ??= attentionEpoch;
         });
       }
+      retainPartialPonderReports();
       result.actionEvents = events;
       await this.service.recordConversationActions?.(brainId, events);
       result.turnMetadata = turnMetadata;
@@ -1259,6 +1563,35 @@ export class ChatActionController extends EventEmitter {
         result.generationEnd === "native-stop" ? "stopped" : result.generationEnd === "no-reply" ? "no-reply" : "complete" });
       return result;
     } catch (error) {
+      retainPartialPonderReports();
+      const suspension = chatHostSuspensionForDetach(error, { brainId, turnId,
+        inputSha256: expectedChatInputHash(nativeAudioInput ? "" : cleanChatInput(input), nativeAudioInput),
+        ...(turn.inputAccepted ? { inputReceipt: turn.inputAccepted } : {}) });
+      if (suspension) {
+        directionTracker?.detached();
+        turn.outputClosed = true; turn.neuralEnded = true; turn.resolveNeuralBoundary();
+        let historyNotice: string | undefined;
+        if (this.recordHostSuspension) try {
+          await this.recordHostSuspension(suspension, { content: input,
+            createdAt: turn.inputAccepted?.createdAt ?? turnMetadata?.createdAt ?? suspension.createdAt,
+            attachmentIds: [...new Set([...(turn.inputAccepted?.taskAttachmentIds ?? turnMetadata?.attachmentIds ?? []),
+              ...(nativeAudioInput ? [nativeAudioInput.attachment.attachmentId] : [])])] });
+        } catch { historyNotice = "The native frontier remains retained; its display receipt could not be saved."; }
+        // Drain only effects that were already started. A detach is not
+        // authority to dispatch a proposal, cancel an effect, learn again,
+        // or manufacture a failed/stopped action outcome.
+        turn.pendingDrain = (async () => {
+          for (const execution of executions) {
+            if (!startedExecutions.has(execution)) continue;
+            const { event, output } = await execution();
+            if (actualTerminalToolOutcome(event.execution)) await this.retainCompletedEvidence(event, output, input, turn.turnId);
+          }
+          await this.service.recordConversationActions?.(brainId, events);
+        })().catch(() => undefined).finally(() => { this.activeTurns.delete(turnKey); turn.resolveSettled(); });
+        this.publishStream(turn, { type: "chat-state", state: suspension.state, suspension,
+          ...(historyNotice ? { notices: [historyNotice] } : {}) });
+        throw error; // Main-only unwind; renderer uses the typed disposition.
+      }
       if (error instanceof EngineRequestError && [-32801, -32802].includes(error.code ?? 0) &&
           typeof error.data === "object" && error.data !== null &&
           ((error.data as Record<string, unknown>).steered === true ||
@@ -1267,6 +1600,7 @@ export class ChatActionController extends EventEmitter {
           (error.data as Record<string, unknown>).turnId === turnId) {
         turn.earlySteeredYield = (error.data as Record<string, unknown>).zeroTokenYield === true;
         turn.neuralSteered = error.code === -32801;
+        directionTracker?.terminal(error.code === -32801 ? "steered" : "stopped");
         turn.neuralEnded = true;
         this.publishStream(turn, { type: "chat-state", state: error.code === -32801 ? "steered" : "stopped" });
         turn.resolveNeuralBoundary();
@@ -1297,12 +1631,13 @@ export class ChatActionController extends EventEmitter {
           }
           await this.service.recordConversationActions?.(brainId, events);
         })().catch(() => undefined).finally(() => {
-          this.activeTurns.delete(turnId);
+          this.activeTurns.delete(turnKey);
           turn.resolveSettled();
         });
         throw error;
       }
       const cancelled = controller.signal.aborted;
+      directionTracker?.terminal(cancelled ? "stopped" : "failed");
       // A failed/stopped response is not authority to discard independently
       // completed host evidence. Each already-started memoized execution
       // retains only its actual complete receipt, without the turn signal.
@@ -1317,7 +1652,7 @@ export class ChatActionController extends EventEmitter {
         }
         await this.service.recordConversationActions?.(brainId, events);
       })().catch(() => undefined).finally(() => {
-        this.activeTurns.delete(turnId); turn.resolveSettled();
+        this.activeTurns.delete(turnKey); turn.resolveSettled();
       });
       const cancellationFailed = cancelled && turn.runtimeCancellationFailed === true;
       const failureMessage = error instanceof Error ? error.message : String(error);
@@ -1358,14 +1693,30 @@ export class ChatActionController extends EventEmitter {
       });
       throw error;
     } finally {
+      directionTracker?.close();
       signal?.removeEventListener("abort", abortFromCaller);
       turn.neuralEnded = true;
       turn.resolveNeuralBoundary();
       if (!turn.pendingDrain) {
-        this.activeTurns.delete(turnId);
+        this.activeTurns.delete(turnKey);
         turn.resolveSettled();
       }
     }
+  }
+
+  async resumeInstanceTurn(brainId: string, checkpointId: string): Promise<ChatResult> {
+    const continuation = await this.service.instanceResumePresentation?.(brainId);
+    if (!continuation || continuation.frontier.checkpointId !== checkpointId) throw new Error("The exact saved turn continuation is unavailable.");
+    this.service.requireInstanceLoaded?.(brainId, continuation.frontier.turnId);
+    if (this.activeTurns.has(chatTurnKey(brainId, continuation.frontier.turnId))) throw new Error("This saved turn already has an active host controller; its original promise resumes after Load.");
+    return this.send(brainId, continuation.input, undefined, continuation.frontier.turnId, undefined, continuation);
+  }
+  async resumeInheritedInstanceTurn(brainId: string, executionId: string): Promise<ChatResult> {
+    const continuation = await this.service.instanceInheritedResumePresentation?.(brainId, executionId);
+    if (!continuation || continuation.inheritedExecutionId !== executionId) throw new Error("The exact inherited continuation is unavailable.");
+    this.service.requireInstanceLoaded?.(brainId, continuation.frontier.turnId);
+    if (this.activeTurns.has(chatTurnKey(brainId, continuation.frontier.turnId))) throw new Error("This inherited turn already has an attached host controller.");
+    return this.send(brainId, continuation.input, undefined, continuation.frontier.turnId, undefined, continuation);
   }
 
   async cancelAndWait(brainId: string, turnId?: string): Promise<number> {
@@ -1401,7 +1752,7 @@ export class ChatActionController extends EventEmitter {
     }
     if (turnId !== undefined && cancelled === 0) {
       this.prunePreCancelledTurns();
-      this.preCancelledTurns.set(turnId, {
+      this.preCancelledTurns.set(chatTurnKey(brainId, turnId), {
         brainId,
         expiresAt: Date.now() + 60_000
       });

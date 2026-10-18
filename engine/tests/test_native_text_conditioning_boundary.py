@@ -28,6 +28,7 @@ class CacheFixture:
 class ScriptedTokenLoop:
     """No neural model or module: only scripted logits and cache ownership."""
     _generate_scoped = OmniDecoder._generate_scoped
+    _generate_scoped_iter = OmniDecoder._generate_scoped_iter
 
     def __init__(self, choice):
         self.config = SimpleNamespace(max_seq_len=64)
@@ -171,7 +172,7 @@ class NativeTextConditioningBoundaryTests(unittest.TestCase):
         brain = SimpleNamespace(config=SimpleNamespace(vocab_size=261),
             decoder=SimpleNamespace(action_policy=lambda _hidden: torch.zeros(1, 8), internal_action_policy=lambda _hidden: torch.zeros(1, 8)),
             _select_structured_actions=lambda *_args, **_kwargs: ({}, [{"kind": "ponder", "confidence": .95, "arguments": {"organic": True}}]),
-            _native_pre_speech_ponder=lambda *_args, **_kwargs: (refined, {"phase": "pre-speech"}))
+            _native_pre_speech_ponder=lambda *_args, **_kwargs: (refined, {"phase": "pre-speech", "completed": True, "stop_reason": "learned-action-transition"}))
         events = []
         callback = AdaptiveBrain._generation_activity_callback(brain, schemas=[], input_text="", assembly_ids=[],
             organic_state={}, action_cue=torch.zeros(1, 4), ledger=NativeActionEmissionLedger("turn"), seed=4,

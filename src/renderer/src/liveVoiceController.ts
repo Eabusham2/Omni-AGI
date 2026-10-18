@@ -155,15 +155,19 @@ export class LiveVoiceController {
   private state: LiveVoiceState;
   private readonly listeners = new Set<LiveVoiceStateListener>();
   private captureSession?: LiveVoiceCaptureSession;
+  private captureStartController?: AbortController;
   private recognitionSession?: LiveVoiceRecognitionSession;
   private synthesisSession?: LiveVoiceSynthesisSession;
   private outputSynthesis: LiveVoiceSynthesisAdapter;
   private neuralCapabilityProbe?: Promise<void>;
+  private readyCapabilityRequest?: Promise<Readonly<LiveVoiceCapabilities>>;
+  private capabilityReadyForStart = false;
   private lifecycle = 0;
   private recognitionRun = 0;
   private replyGeneration = 0;
   private utteranceSequence = 0;
   private disposed = false;
+  private disposing = false;
   private readonly removeChatStream?: () => void;
   private liveSpeechQueue: string[] = [];
   private liveSpeechBuffer = "";
@@ -219,6 +223,26 @@ export class LiveVoiceController {
     return this.state;
   }
 
+  /** Current metadata only: no microphone capture, recognizer, or hidden Load. */
+  readyCapabilities(): Promise<Readonly<LiveVoiceCapabilities>> {
+    if (this.disposed || this.disposing) return Promise.reject(new Error("Live voice controller has been disposed."));
+    if (this.readyCapabilityRequest) return this.readyCapabilityRequest;
+    const request = (async () => {
+      await this.neuralCapabilityProbe;
+      if (this.disposed || this.disposing) throw new Error("Live voice controller has been disposed.");
+      if (this.options.neural) {
+        this.neuralCapabilityProbe = this.refreshNeuralCapabilities();
+        await this.neuralCapabilityProbe;
+      }
+      if (this.disposed || this.disposing) throw new Error("Live voice controller has been disposed.");
+      this.capabilityReadyForStart = true;
+      return this.state.capabilities;
+    })();
+    this.readyCapabilityRequest = request;
+    void request.finally(() => { if (this.readyCapabilityRequest === request) this.readyCapabilityRequest = undefined; }).catch(() => undefined);
+    return request;
+  }
+
   subscribe(listener: LiveVoiceStateListener): () => void {
     this.listeners.add(listener);
     listener(this.state);
@@ -234,6 +258,10 @@ export class LiveVoiceController {
       typeof preferences.neuralVoice !== "boolean"
     ) {
       throw new Error("Invalid live voice presentation preferences.");
+    }
+    if ((this.state.enabled || this.state.phase === "starting") &&
+        (preferences.neuralListening !== this.state.preferences.neuralListening || preferences.neuralVoice !== this.state.preferences.neuralVoice)) {
+      throw new Error("End the current call before changing its audio input/output routes.");
     }
     this.patch({ preferences: { ...preferences } });
   }
@@ -251,6 +279,9 @@ export class LiveVoiceController {
         capabilities: {
           ...this.state.capabilities,
           neuralListening: listening,
+          nativeAudioChatInput: measured.nativeAudioChatInput === true && typeof this.options.chat.sendAudio === "function",
+          nativeAudioChatInputDetail: measured.nativeAudioChatInputDetail,
+          fullDuplex: this.options.capture.available && (this.options.recognition.available || measured.nativeAudioChatInput === true),
           neuralVoice: voice,
           neuralVoiceQuality: measured.voiceQuality,
           bargeIn:
@@ -265,6 +296,7 @@ export class LiveVoiceController {
         capabilities: {
           ...this.state.capabilities,
           neuralListening: false,
+          nativeAudioChatInput: false,
           neuralVoice: false,
           neuralDetail: `Neural audio readiness could not be verified: ${readableError(error)} Platform STT/TTS remain separate.`
         }
@@ -273,18 +305,21 @@ export class LiveVoiceController {
   }
 
   async start(): Promise<void> {
-    if (this.disposed) throw new Error("Live voice controller has been disposed.");
+    if (this.disposed || this.disposing) throw new Error("Live voice controller has been disposed.");
     if (this.state.enabled && this.state.phase !== "error") return;
+    const beforeProbeLifecycle = this.lifecycle;
     if (
       this.state.preferences.neuralListening ||
       this.state.preferences.neuralVoice
     ) {
-      await this.neuralCapabilityProbe;
+      if (!this.capabilityReadyForStart) await this.readyCapabilities();
+      this.capabilityReadyForStart = false;
+      if (this.disposed || this.disposing || this.lifecycle !== beforeProbeLifecycle) return;
     }
     this.bufferedRequiresFreshSpeechStart = false;
     if (
       this.state.preferences.neuralListening &&
-      !this.state.capabilities.neuralListening
+      (!this.state.capabilities.neuralListening || this.state.capabilities.nativeAudioChatInput !== true)
     ) {
       this.patch({
         enabled: false,
@@ -292,7 +327,7 @@ export class LiveVoiceController {
         error: {
           code: "neural-listening-unavailable",
           message:
-            "Neural listening was requested, but no compatible trained audio-input pack is installed. Platform speech recognition was not substituted.",
+            "Direct same-brain raw audio conversation is unavailable. Platform speech recognition was not substituted.",
           recoverable: true
         }
       });
@@ -323,7 +358,7 @@ export class LiveVoiceController {
       });
       return;
     }
-    if (!this.options.recognition.available) {
+    if (!this.state.preferences.neuralListening && !this.options.recognition.available) {
       this.patch({
         enabled: false,
         phase: "unavailable",
@@ -347,9 +382,15 @@ export class LiveVoiceController {
       activeUtterance: undefined,
       error: undefined
     });
+    const captureStart = new AbortController();
+    this.captureStartController = captureStart;
     try {
       const session = this.state.preferences.neuralListening
-        ? await this.options.neural!.startListening(this.options.brainId)
+        ? await this.options.neural!.startListening(this.options.brainId, {
+          onSpeechStart: () => this.handleSpeechStart(lifecycle),
+          onFinalAudio: (audio) => void this.handleFinal(lifecycle, { transcript: "" }, audio),
+          onError: (error) => void this.fail({ code: "capture-failed", message: readableError(error), recoverable: true })
+        }, captureStart.signal)
         : await this.options.capture.request();
       if (!this.isCurrent(lifecycle)) {
         session.stop();
@@ -357,7 +398,8 @@ export class LiveVoiceController {
       }
       this.captureSession = session;
       this.patch({ capture: "active" });
-      await this.startRecognition(lifecycle);
+      if (this.state.preferences.neuralListening) this.patch({ phase: "listening", recognition: "unavailable" });
+      else await this.startRecognition(lifecycle);
     } catch (error) {
       if (!this.isCurrent(lifecycle)) return;
       const mapped = captureError(error);
@@ -370,6 +412,8 @@ export class LiveVoiceController {
             }
           : mapped
       );
+    } finally {
+      if (this.captureStartController === captureStart) this.captureStartController = undefined;
     }
   }
 
@@ -378,6 +422,8 @@ export class LiveVoiceController {
     if (this.disposed && this.state.phase === "idle") return;
     ++this.lifecycle;
     ++this.replyGeneration;
+    this.captureStartController?.abort(new DOMException("Voice capture was stopped.", "AbortError"));
+    this.captureStartController = undefined;
     this.bufferedRequiresFreshSpeechStart = false;
     const turnId = this.state.activeUtterance?.turnId;
     this.patch({ enabled: false, phase: "stopping", interimTranscript: "" });
@@ -418,7 +464,8 @@ export class LiveVoiceController {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || this.disposing) return;
+    this.disposing = true;
     await this.stop();
     this.disposed = true;
     this.removeChatStream?.();
@@ -503,12 +550,13 @@ export class LiveVoiceController {
 
   private async handleFinal(
     lifecycle: number,
-    result: LiveVoiceRecognitionFinal
+    result: LiveVoiceRecognitionFinal,
+    nativeAudio?: import("../../shared/nativeAudioChat").NativeAudioChatRequest
   ): Promise<void> {
     if (!this.isCurrent(lifecycle)) return;
     const transcript = result.transcript.replace(/\s+/g, " ").trim();
     if (this.bufferedRequiresFreshSpeechStart) return;
-    if (!transcript) {
+    if (!transcript && !nativeAudio) {
       this.patch({ interimTranscript: "" });
       return;
     }
@@ -534,6 +582,8 @@ export class LiveVoiceController {
       id: utteranceId,
       turnId: `voice-${utteranceId}`,
       transcript,
+      ...(nativeAudio ? { nativeAudio: { ...Object.fromEntries(Object.entries(nativeAudio).filter(([key]) => key !== "dataBase64")),
+        bytes: nativeAudio.dataBase64.length / 4 * 3 - (nativeAudio.dataBase64.endsWith("==") ? 2 : nativeAudio.dataBase64.endsWith("=") ? 1 : 0) } as LiveVoiceUtterance["nativeAudio"] } : {}),
       confidence:
         typeof result.confidence === "number" && Number.isFinite(result.confidence)
           ? Math.max(0, Math.min(1, result.confidence))
@@ -556,7 +606,7 @@ export class LiveVoiceController {
     try {
       // The recognized transcript is sent verbatim. No system/persona text,
       // command prefix, or behavioral instruction exists in this path.
-      const result = await this.options.chat.send(
+      const result = nativeAudio ? await this.options.chat.sendAudio!(this.options.brainId, nativeAudio, utterance.turnId) : await this.options.chat.send(
         this.options.brainId,
         transcript,
         utterance.turnId

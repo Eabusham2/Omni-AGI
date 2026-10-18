@@ -119,6 +119,9 @@ export function workspaceChatActivityPresentation(
 export type BusyAwareWorkspaceView =
   | "chat"
   | "data"
+  | "learn"
+  | "fact-check"
+  | "schedule"
   | "map"
   | "trace"
   | "imagine"
@@ -129,13 +132,12 @@ export type BusyAwareWorkspaceView =
 
 const IMMEDIATE_BRAIN_ACTION_VIEWS = new Set<BusyAwareWorkspaceView>([
   "imagine",
-  "tools",
-  "settings",
   "agents",
   "evolution"
 ]);
 
-/** Read-only map/trace navigation and queue-aware Data controls remain usable. */
+/** Host tools/policy and editable settings remain available; neural mutations
+ * within Settings disclose and wait for their own safe operation boundary. */
 export function workspaceViewWaitsForForegroundTurn(
   view: BusyAwareWorkspaceView,
   snapshot: ChatWorkspaceActivitySnapshot

@@ -1230,6 +1230,44 @@ def _speech_pair_record(descriptor, transcript, name, bytes_read, coverage, sour
         return None
 
 
+def _teacher_media_pair_record(value, name, bytes_read, coverage, source_directory=None):
+    """Typed, hash-bound real media. Captions alone cannot become a binary record."""
+    required = {"format", "mediaPath", "mediaSha256", "kind", "mimeType", "conditioningText"}
+    if not isinstance(value, Mapping) or set(value) != required or value.get("format") != "omni-teacher-media-pair-1":
+        raise ValueError("teacher media pair has unknown or missing fields")
+    reference, declared, kind = value["mediaPath"], value["mediaSha256"], value["kind"]
+    condition, mime = value["conditioningText"], value["mimeType"]
+    extensions = {"image/png": ("image", "png"), "image/jpeg": ("image", "jpg"), "image/webp": ("image", "webp"),
+        "audio/wav": ("audio", "wav"), "audio/flac": ("audio", "flac"), "audio/mpeg": ("audio", "mp3"),
+        "video/mp4": ("video", "mp4"), "video/webm": ("video", "webm")}
+    selected = extensions.get(mime) if isinstance(mime, str) else None
+    if not selected or selected[0] != kind or not isinstance(declared, str) or not re.fullmatch(r"[a-f0-9]{64}", declared) or \
+            reference != "assets/" + declared + "." + selected[1] or source_directory is None or \
+            not isinstance(condition, str) or not condition.strip() or "\x00" in condition:
+        raise ValueError("teacher media pair path, MIME, condition or hash is invalid")
+    root = Path(source_directory).resolve()
+    unresolved = root / reference
+    target = unresolved.resolve()
+    if unresolved.is_symlink() or (root / "assets").is_symlink() or not target.is_relative_to(root) or not target.is_file() or \
+            _media_kind(target) != kind or _sha256_path(target) != declared:
+        raise ValueError("teacher media pair does not reference exact owned media bytes")
+    with target.open("rb") as stream:
+        prefix = stream.read(16)
+    valid = {"image/png": prefix.startswith(b"\x89PNG\r\n\x1a\n"), "image/jpeg": prefix.startswith(b"\xff\xd8\xff"),
+        "image/webp": prefix[:4] == b"RIFF" and prefix[8:12] == b"WEBP",
+        "audio/wav": prefix[:4] in (b"RIFF", b"RF64") and prefix[8:12] == b"WAVE", "audio/flac": prefix.startswith(b"fLaC"),
+        "audio/mpeg": prefix.startswith(b"ID3") or len(prefix) > 1 and prefix[0] == 255 and prefix[1] & 224 == 224,
+        "video/mp4": prefix[4:8] == b"ftyp", "video/webm": prefix.startswith(b"\x1a\x45\xdf\xa3")}
+    if not valid[mime]:
+        raise ValueError("teacher media pair MIME does not match its actual container")
+    require_parser_resources("teacher media condition", ram_bytes=len(condition.encode("utf-8")) * 64 + TEXT_BLOCK_CHARS * 8)
+    condition_sha = hashlib.sha256(condition.encode("utf-8")).hexdigest()
+    pair_sha = hashlib.sha256(bytes.fromhex(declared) + bytes.fromhex(condition_sha)).hexdigest()
+    return _binary_record(name=name, local_path=target, bytes_read=bytes_read, content_sha256=pair_sha,
+        kind=kind, coverage=coverage, provenance={"format": "omni-teacher-media-pair-1", "conditioning_text": condition,
+            "conditioning_text_sha256": condition_sha, "media_sha256": declared, "media_mime_type": mime})
+
+
 def _structured_record(
     value: Any,
     name: str,
@@ -1241,6 +1279,10 @@ def _structured_record(
         format_value = value.get("format")
         if isinstance(format_value, ColumnarTextValue) and len(format_value.buffer) <= 64:
             format_value = "".join(format_value.chunks())
+        if format_value == "omni-teacher-media-pair-1":
+            # This is an exact local JSONL contract. Reject malformed typed rows
+            # rather than quietly teaching their labels as ordinary text.
+            return _teacher_media_pair_record(value, name, bytes_read, coverage, source_directory)
         if format_value == "omni-speech-pair-1":
             descriptor = {"format": format_value}
             for field_name in ("audioPath", "audioSha256"):
@@ -1448,6 +1490,14 @@ def _iter_jsonl(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord
                             line = stream.readline(TEXT_BLOCK_CHARS)
                             if not line:
                                 break
+                    if _known_root_json_record(Path(raw_path), teacher_media_only=True):
+                        require_parser_resources("typed teacher JSONL descriptor", ram_bytes=raw_bytes * 8 + TEXT_BLOCK_CHARS * 8)
+                        with open(raw_path, "r", encoding="utf-8-sig" if index == 1 else "utf-8", errors="strict") as raw:
+                            typed = json.load(raw)
+                        record = _teacher_media_pair_record(typed, "%s#line-%d" % (path.name, index), raw_bytes, coverage, path.parent)
+                        if record is not None:
+                            yield record
+                        continue
                     with open(raw_path, "r", encoding="utf-8-sig" if index == 1 else "utf-8", errors="replace", newline="") as raw:
                         payload, provenance, rejection = parse_spooled_json(
                             raw, _TRAINING_TEXT_FIELDS, _METADATA_ONLY_FIELDS
@@ -1494,7 +1544,7 @@ def _iter_jsonl(path: Path, coverage: DatasetCoverage) -> Iterator[DatasetRecord
                 yield record
 
 
-def _known_root_json_record(path: Path) -> bool:
+def _known_root_json_record(path: Path, teacher_media_only: bool = False) -> bool:
     """Recognize explicit root records without materializing/skipping values.
 
     Other root maps retain their historical key/value-record semantics. This
@@ -1517,13 +1567,15 @@ def _known_root_json_record(path: Path) -> bool:
             if chars.nonspace() != ":":
                 return False
             first = chars.nonspace()
-            if name == "messages" and first == "[":
+            if name == "messages" and first == "[" and not teacher_media_only:
                 return True
             if name == "format":
                 declaration = capture_json_value(chars, first)
                 try:
-                    if not declaration.path and json.loads(declaration.text) == "omni-speech-pair-1":
-                        return True
+                    if not declaration.path:
+                        selected = json.loads(declaration.text)
+                        if selected == "omni-teacher-media-pair-1" or not teacher_media_only and selected == "omni-speech-pair-1":
+                            return True
                 finally:
                     declaration.close()
             else:

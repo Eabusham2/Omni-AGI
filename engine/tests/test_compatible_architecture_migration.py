@@ -81,7 +81,7 @@ class CompatibleArchitectureMigrationFixtures(unittest.TestCase):
         descriptor = {"format": "omni-main-selected-native-architecture", "formatVersion": 1,
                       "architecture": "OmniCortex", "externalPretrainedWeights": False,
                       "qualityEvidence": "unmeasured-native-quality-deferred", "hardwareTier": "micro",
-                      "shape": shape, "inventory": native_core_inventory(shape), "sizing": {"selected": 1}}
+                      "shape": shape, "inventory": native_core_inventory(shape, inventory_version=1), "sizing": {"selected": 1}}
         descriptor["sha256"] = native_architecture_sha256(descriptor)
         original = copy.deepcopy(descriptor)
         config = SimpleNamespace(native_architecture=descriptor, n_layers=3, router_neurons=5)

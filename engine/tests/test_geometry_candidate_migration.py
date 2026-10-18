@@ -204,7 +204,7 @@ class GeometryCandidateMigrationFixtures(unittest.TestCase):
         shape = {"dModel": 48, "layers": 1, "feedForward": 96, "nHeads": 4, "vsaDimensions": 64,
             "routerNeurons": 5, "modalityChannels": 4, "imageSize": 16, "audioSamples": 256, "videoFrames": 4,
             "workingMemoryItems": 32, "workspaceLatents": 8, "vocabSize": 261, "liquidMode": "cfc"}
-        descriptor = {"format": "omni-main-selected-native-architecture", "formatVersion": 1,
+        descriptor = {"format": "omni-main-selected-native-architecture", "formatVersion": 2,
             "architecture": "OmniCortex", "externalPretrainedWeights": False,
             "qualityEvidence": "unmeasured-native-quality-deferred", "hardwareTier": "micro",
             "shape": shape, "inventory": native_core_inventory(shape), "sizing": {"selected": 1}}

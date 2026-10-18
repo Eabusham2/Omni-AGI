@@ -17,25 +17,29 @@ from torch import nn
 
 from .bounded_tensor_io import TRANSFER_BYTES
 from .router_state_paging import (
-    MATRIX_FIELDS, RouterMutationJournal, RouterStatePager,
+    WEIGHTED_MATRIX_FIELDS as MATRIX_FIELDS, MATRIX_FIELDS as LEGACY_MATRIX_FIELDS,
+    RouterMutationJournal, RouterStatePager, ROUTER_CELL_SCRATCH_BYTES,
     pack_tile, release_router_tensor_chunk, tile_ranges, unpack_tile,
     update_historical_tensor_checksum,
 )
 from .parameter_diagnostics import (
     packed_diagnostic_write, register_sparse_zero_owner, retire_sparse_zero_owner,
 )
+from .packed_connections import connection_strengths, connection_resistance, encode_connection_state, weighted_ternary_levels
 
 
-SPARSE_LAYOUT_VERSION = 1
+SPARSE_LAYOUT_VERSION = 2
 BLOCK_ROWS = BLOCK_COLUMNS = 64
 BLOCK_METADATA_BYTES = 8192
-_KEY = re.compile(r"r(0|[1-9][0-9]*)_c(0|[1-9][0-9]*)\Z")
+_KEY = re.compile(r"r(0|[1-9][0-9]*)_c(0|[1-9][0-9]*)(?:_p([1-9][0-9]*))?\Z")
 _DTYPES = {"_packed_weights": torch.uint8, "eligibility_accumulator": torch.int16,
-           "stability": torch.float32, "uses": torch.float32}
+           "stability": torch.float32, "uses": torch.float32, "_connection_state": torch.uint8}
 
 
-def block_key(row: int, column: int) -> str:
-    return "r%d_c%d" % (row, column)
+def block_key(row: int, column: int, layer: int = 0) -> str:
+    if type(layer) is not int or layer < 0:
+        raise ValueError("parallel router layer must be a nonnegative integer")
+    return "r%d_c%d" % (row, column) + ("_p%d" % layer if layer else "")
 
 
 def parse_block_key(name: str) -> tuple[int, int]:
@@ -43,6 +47,32 @@ def parse_block_key(name: str) -> tuple[int, int]:
     if match is None:
         raise ValueError("sparse router block name is not canonical")
     return int(match[1]), int(match[2])
+
+
+def block_layer(name: str) -> int:
+    match = _KEY.fullmatch(name)
+    if match is None:
+        raise ValueError("sparse router block name is not canonical")
+    return int(match[3] or 0)
+
+
+def sparse_layout_digest(owner, keys) -> str:
+    """Process-local inspection seal for one exact allocated block layout.
+
+    Object identities deliberately bind the live owner session. This is not a
+    checkpoint/provenance digest and must never be persisted as neural state.
+    """
+    digest = hashlib.sha256(b"omni-router-inspection-layout-v1\0")
+    digest.update(str(id(owner)).encode("ascii") + b"\0")
+    digest.update(str((int(owner.post_neurons), int(owner.pre_neurons))).encode("ascii") + b"\0")
+    for key in keys:
+        block = owner.blocks[key]
+        if getattr(block, "_router_unpublished", False):
+            raise RuntimeError("router inspection encountered unpublished topology")
+        digest.update(key.encode("ascii") + b"\0")
+        digest.update(str((id(block), int(block.rows), int(block.columns),
+                           int(getattr(block, "_router_birth", 0)))).encode("ascii") + b"\0")
+    return digest.hexdigest()
 
 
 def canonical_module_walk(root, *, resource_policy=None):
@@ -66,7 +96,10 @@ def canonical_module_walk(root, *, resource_policy=None):
         children = module._modules
         if getattr(module, "_native_sparse_registry", False):
             pager = getattr(module, "_router_state_pager", None)
-            policy = resource_policy if resource_policy is not None else getattr(pager, "policy", None)
+            native_ref = getattr(module, "_native_core_pager_ref", None)
+            native = native_ref() if callable(native_ref) else None
+            policy = resource_policy if resource_policy is not None else (
+                getattr(pager, "policy", None) if pager is not None else getattr(native, "shared_resource_policy", None))
             reserve = getattr(policy, "reserve_ram", None)
             lease = reserve(1024 + len(children)*128, "canonical sparse module registry order") if callable(reserve) else nullcontext()
             with lease:
@@ -74,6 +107,8 @@ def canonical_module_walk(root, *, resource_policy=None):
                 for key in keys:
                     if pager is not None:
                         pager.check()
+                    if native is not None and getattr(native, "_closed", False):
+                        raise RuntimeError("canonical contact traversal used a closed native pager")
                     child = children[key]
                     if child is not None:
                         yield from walk(child, path + ("." if path else "") + key)
@@ -118,20 +153,29 @@ class SparseRouterBlock(nn.Module):
         packed = self._packed_weights
         if packed.dtype != torch.uint8 or tuple(packed.shape) != (self.rows, (self.columns+3)//4):
             raise ValueError("sparse packed owner shape/dtype is invalid")
-        return (packed,)
+        state = self._connection_state
+        if state.dtype != torch.uint8 or tuple(state.shape) != (self.rows, self.columns):
+            raise ValueError("sparse connection strength/plasticity shape or dtype is invalid")
+        return packed, state
 
 
-def _validate_tile(levels, eligibility, stability, uses):
+def _validate_tile(levels, eligibility, stability, uses, state=None):
     if not bool(((levels >= -1) & (levels <= 1)).all()):
         raise ValueError("sparse router contains an invalid exact ternary level")
-    if (bool((eligibility.to(torch.int32).abs() > 255).any())
+    limit = 255 if state is None else 256 * (1 + connection_resistance(state).to(torch.int32)) - 1
+    if (bool((eligibility.to(torch.int32).abs() > limit).any())
             or not bool(torch.isfinite(stability).all()) or not bool(torch.isfinite(uses).all())
             or bool(((stability < 0) | (stability > 20) | (uses < 0)).any())):
         raise ValueError("sparse router timing/stability/usage controls are invalid")
 
 
-def _stdp_replacements(owner, previous, eligibility, stability, uses, timing):
-    """Same per-cell operation order as the packed dense-native rule."""
+def _stdp_replacements(owner, previous, state, eligibility, stability, uses, timing):
+    """Signed STDP pressure changes discrete strength before crossing polarity.
+
+    Timing traces and the bounded integer eligibility are control state. The
+    learned forward value is exactly ternary sign × compact integer strength.
+    Pressure survives subthreshold events; unrelated quiet pairs do not erase it.
+    """
     delta = (owner.learning_rate / (1.0 + stability)) * timing
     active = timing.ne(0)
     agreement = previous.sign().eq(delta.sign()) | previous.eq(0)
@@ -139,16 +183,34 @@ def _stdp_replacements(owner, previous, eligibility, stability, uses, timing):
         torch.full_like(stability, -owner.metaplasticity_rate * .25)) * active).clamp_(0., 20.)
     uses.add_(active.to(uses.dtype))
     increments = (delta / max(owner.learning_rate, 1e-6) * 256.).round().clamp(-256, 256).to(torch.int32)
-    pressure = (eligibility.to(torch.int32) + increments).clamp(-256, 256)
-    transition = torch.where(pressure >= 256, torch.ones_like(pressure),
-        torch.where(pressure <= -256, -torch.ones_like(pressure), torch.zeros_like(pressure)))
-    updated = (previous.to(torch.int32) + transition).clamp(-1, 1)
-    pressure = torch.where(updated.eq(previous), 0, pressure - transition * 256).to(torch.int16)
-    difference = updated - previous.to(torch.int32)
+    resistance = connection_resistance(state).to(torch.int32)
+    threshold = 256 * (1 + resistance)
+    pressure = eligibility.to(torch.int32) + increments
+    transition = torch.where(pressure >= threshold, torch.ones_like(pressure),
+        torch.where(pressure <= -threshold, -torch.ones_like(pressure), torch.zeros_like(pressure)))
+    amplitude = previous.to(torch.int32) * connection_strengths(state).to(torch.int32)
+    proposed = amplitude + transition
+    overflow = torch.where(proposed.abs() > 16, transition, 0).to(torch.int8)
+    updated = proposed.clamp(-16, 16)
+    difference = updated - amplitude
+    pressure = (pressure - transition * threshold).to(torch.int16)
+    # Resistance rises with repeated reinforcing updates and falls as opposing
+    # evidence weakens a connection. It remains an independently stored integer.
+    strengthening = difference.ne(0) & amplitude.ne(0) & amplitude.sign().eq(transition.sign())
+    weakening = difference.ne(0) & amplitude.ne(0) & ~amplitude.sign().eq(transition.sign())
+    resistance = (resistance + strengthening.to(torch.int32) - weakening.to(torch.int32)).clamp(0, 15)
+    # A lower resistance changes the next threshold; retain any excess pressure
+    # inside its new representable control interval without fabricating a step.
+    bound = 256 * (1 + resistance) - 1
+    pressure = torch.maximum(-bound, torch.minimum(bound, pressure.to(torch.int32))).to(torch.int16)
+    next_state = torch.where(active, encode_connection_state(updated.abs().clamp_min(1), resistance), state)
     replacements = {"stability": stability, "uses": uses, "eligibility_accumulator": pressure}
-    if bool(difference.ne(0).any()):
-        replacements["_packed_weights"] = pack_tile(updated.to(torch.int8))
-    return delta, active, difference, replacements
+    next_sign = updated.sign().to(torch.int8)
+    if bool(next_sign.ne(previous).any()):
+        replacements["_packed_weights"] = pack_tile(next_sign)
+    if not torch.equal(next_state, state):
+        replacements["_connection_state"] = next_state
+    return delta, active, difference, replacements, overflow
 
 
 class SparseRouterState:
@@ -158,6 +220,7 @@ class SparseRouterState:
         self._generation = 0
         self._transaction_active = False
         self.migration_proof = None
+        self._layers = {}
         owner.packed_synapse_container = True
         registry = nn.ModuleDict()
         registry._native_sparse_registry = True
@@ -183,6 +246,11 @@ class SparseRouterState:
                 "allocatedStateBytes": sum(value.numel() * value.element_size()
                     for block in self.owner.blocks.values() for value in block.buffers()),
                 "metadataBytesEstimate": len(self.owner.blocks) * BLOCK_METADATA_BYTES,
+                "parallelLayers": sum(bool(block_layer(key)) for key in self.owner.blocks),
+                "connectionStateBytes": sum(block._connection_state.numel() for block in self.owner.blocks.values()),
+                "connectionStrengthEncoding": "uint8-low4-strength-minus-one-high4-resistance",
+                "connectionStrengthOverflow": "allocate-independent-parallel-layer-contact",
+                "parallelContactRegistryStorage": "page-backed-block-layers",
                 "implicitConnectionsAreExactZero": True, "checkpointReady": self.ready}
 
     def shape(self, row, column):
@@ -192,11 +260,13 @@ class SparseRouterState:
             raise ValueError("sparse router block is outside the declared population")
         return rows, columns
 
-    def ensure(self, row, column, *, loading=False):
-        key = block_key(row, column)
+    def ensure(self, row, column, *, loading=False, layer=0):
+        key = block_key(row, column, layer)
         existing = self.owner.blocks[key] if key in self.owner.blocks else None
         if existing is not None:
             return existing
+        from .operation_auto_registry import PRIVATE_OPERATION
+        if PRIVATE_OPERATION.get(): raise RuntimeError("private native Auto cannot grow recurrent learned contacts")
         self.owner._check()
         rows, columns = self.shape(row, column)
         if not self._transaction_active:
@@ -211,6 +281,7 @@ class SparseRouterState:
                 self.owner.blocks[key] = block
                 if not loading:
                     register_sparse_zero_owner(self.owner, key, block)
+                self._layers.setdefault((row, column), {})[layer] = key
                 block._router_unpublished = self._transaction_active or loading
             except BaseException:
                 retire_sparse_zero_owner(self.owner, key, block)
@@ -234,6 +305,7 @@ class SparseRouterState:
             if self.pager is not None:
                 self.pager.discard_unpublished_owner(block)
             del self.owner.blocks[key]
+            self._forget_layer(key)
 
     def retire_rollback_birth(self, key, block):
         """Called only by the journal proving this owner was absent at start."""
@@ -247,6 +319,15 @@ class SparseRouterState:
             else:
                 self.pager.release_owner(block)
         del self.owner.blocks[key]
+        self._forget_layer(key)
+
+    def _forget_layer(self, key):
+        position = parse_block_key(key)
+        layers = self._layers.get(position)
+        if layers is not None:
+            layers.pop(block_layer(key), None)
+            if not layers:
+                del self._layers[position]
 
     def restore_topology_boundary(self, generation):
         if self.owner._sparse_state is not self or not self.ready:
@@ -262,6 +343,8 @@ class SparseRouterState:
 
     @contextmanager
     def transaction(self):
+        from .operation_auto_registry import PRIVATE_OPERATION
+        if PRIVATE_OPERATION.get(): raise RuntimeError("private native Auto cannot begin recurrent learned mutation")
         if self._transaction_active:
             raise RuntimeError("sparse router mutation transactions may not nest")
         self._generation += 1
@@ -269,6 +352,7 @@ class SparseRouterState:
         journal = RouterMutationJournal(self.owner, self.pager,
             ram_bytes=self.pager.journal_ram_bytes if self.pager is not None else TRANSFER_BYTES)
         self._transaction_active = True
+        retained = False
         try:
             yield journal
         except BaseException:
@@ -285,8 +369,11 @@ class SparseRouterState:
             for block in self.owner.blocks.values():
                 if block._router_birth == generation:
                     block._router_unpublished = False
+            from .connected_transaction import retain_router_journal
+            retained = retain_router_journal(journal, self, generation)
         finally:
-            journal.close()
+            if not retained:
+                journal.close()
             self._transaction_active = False
 
     def regions(self, block):
@@ -304,12 +391,13 @@ class SparseRouterState:
             if not torch.equal(target.detach().cpu(), replacement):
                 if not block._router_unpublished:
                     journal.capture("blocks." + key + "." + name, r0, r1, a, b)
-                if name == "_packed_weights":
+                if name in {"_packed_weights", "_connection_state"}:
                     for row in range(r0, r1):
                         piece = replacement[row-r0].reshape(-1)
-                        with packed_diagnostic_write(block, block._packed_weights, piece,
-                                                     start=row*block._packed_weights.shape[1]+a):
-                            block._packed_weights[row, a:b].copy_(piece)
+                        target_buffer = getattr(block, name)
+                        with packed_diagnostic_write(block, target_buffer, piece,
+                                                     start=row*target_buffer.shape[1]+a):
+                            target_buffer[row, a:b].copy_(piece)
                 else:
                     target.copy_(replacement.to(target.device))
 
@@ -329,7 +417,8 @@ class SparseRouterState:
                 with self.owner._ram((r1-r0)*(c1-c0)*32 + 1024, "sparse router state validation"):
                     levels = unpack_tile(block._packed_weights, *region)
                     _validate_tile(levels, block.eligibility_accumulator[r0:r1, c0:c1],
-                                   block.stability[r0:r1, c0:c1], block.uses[r0:r1, c0:c1])
+                                   block.stability[r0:r1, c0:c1], block.uses[r0:r1, c0:c1],
+                                   block._connection_state[r0:r1, c0:c1])
                     if c1 == block.columns and block.columns % 4:
                         last = block._packed_weights[r0:r1, -1]
                         for lane in range(block.columns % 4, 4):
@@ -338,17 +427,59 @@ class SparseRouterState:
                 self.release(block, region)
 
     def iter_effective_tiles(self):
-        for key, block in self.owner.blocks.items():
-            row, column = parse_block_key(key)
-            for region in self.regions(block):
-                self.owner._check()
-                r0, r1, c0, c1 = region
+        with self.owner._ram(1024 + len(self.owner.blocks)*128, "canonical router recurrence order"):
+            for key in sorted(self.owner.blocks):
+                block = self.owner.blocks[key]
+                row, column = parse_block_key(key)
+                for region in self.regions(block):
+                    self.owner._check()
+                    r0, r1, c0, c1 = region
+                    try:
+                        with self.owner._ram((r1-r0)*(c1-c0)*16 + 1024, "allocated router signed tile"):
+                            levels = unpack_tile(block._packed_weights, *region)
+                            yield (r0 + row*BLOCK_ROWS, r1 + row*BLOCK_ROWS,
+                                   c0 + column*BLOCK_COLUMNS, c1 + column*BLOCK_COLUMNS), weighted_ternary_levels(
+                                       levels, block._connection_state[r0:r1, c0:c1])
+                    finally:
+                        self.release(block, region)
+
+    def iter_packed_tiles(self, *, include_identity=False):
+        """Admitted raw sign/gain tiles in the same canonical recurrence order.
+
+        Every allocated repeated layer is visited. Missing blocks allocate
+        nothing and contribute zero; decoding is exclusively inside the kernel.
+        """
+        with self.owner._ram(1024 + len(self.owner.blocks)*128, "canonical packed router recurrence order"):
+            keys = sorted(self.owner.blocks)
+            if include_identity:
                 try:
-                    with self.owner._ram((r1-r0)*(c1-c0)*16 + 1024, "allocated router signed tile"):
-                        yield (r0 + row*BLOCK_ROWS, r1 + row*BLOCK_ROWS,
-                               c0 + column*BLOCK_COLUMNS, c1 + column*BLOCK_COLUMNS), unpack_tile(block._packed_weights, *region)
-                finally:
-                    self.release(block, region)
+                    layout_digest = sparse_layout_digest(self.owner, keys)
+                except Exception:
+                    # Identity validation belongs only to the optional
+                    # observer. A malformed/stale observation seal must not
+                    # change recurrent neural math or its ordinary errors.
+                    layout_digest = None
+            else:
+                layout_digest = None
+            for key in keys:
+                block = self.owner.blocks[key]
+                identity = (key, layout_digest) if include_identity else None
+                row, column = parse_block_key(key)
+                for region in self.regions(block):
+                    self.owner._check()
+                    r0, r1, c0, c1 = region
+                    try:
+                        # Raw byte copies plus activity promotion/output and
+                        # validation scratch fit the existing admitted tile.
+                        with self.owner._ram((r1-r0)*(c1-c0)*3 + (c1-c0)*8 + (r1-r0)*16 + 1024,
+                                             "allocated router packed sign/gain tile"):
+                            signs = block._packed_weights[r0:r1, c0//4:(c1+3)//4].detach().contiguous()
+                            states = block._connection_state[r0:r1, c0:c1].detach().contiguous()
+                            value = ((r0 + row*BLOCK_ROWS, r1 + row*BLOCK_ROWS,
+                                      c0 + column*BLOCK_COLUMNS, c1 + column*BLOCK_COLUMNS), signs, states)
+                            yield (*value, identity) if include_identity else value
+                    finally:
+                        self.release(block, region)
 
     def stability_total(self, rows, columns):
         total = 0.0
@@ -387,6 +518,7 @@ class SparseRouterState:
     def step(self, pre, post, old_pre, old_post):
         absolute = signed = 0.0
         level_abs = level_signed = changed_count = active_count = 0
+        contact_updates = new_contacts = 0
         with self.transaction() as journal:
             vector_block = max(1, self.owner._tile_budget() // 32)
             for name in ("pre_trace", "post_trace"):
@@ -413,47 +545,98 @@ class SparseRouterState:
                     for region in tile_ranges(rows, columns, self.owner._tile_budget()):
                         self.owner._check()
                         r0, r1, c0, c1 = region
-                        with self.owner._ram((r1-r0)*(c1-c0)*96 + 1024, "exact allocated causal/anti-causal STDP tile"):
+                        with self.owner._ram((r1-r0)*(c1-c0)*ROUTER_CELL_SCRATCH_BYTES + 1024, "exact allocated causal/anti-causal STDP tile"):
                             timing = self.owner.a_plus * (post[base_row+r0:base_row+r1, None] * old_pre[None, base_column+c0:base_column+c1])
                             timing = timing - self.owner.a_minus * (old_post[base_row+r0:base_row+r1, None] * pre[None, base_column+c0:base_column+c1])
                             if not bool(timing.ne(0).any()):
                                 continue
                             # Even zero-rate activity changes uses and stability.
                             # Do not prune it by a weight-only sparsity test.
-                            block = self.ensure(row, column)
-                            previous = unpack_tile(block._packed_weights, *region)
-                            eligibility = block.eligibility_accumulator[r0:r1, c0:c1].clone()
-                            stability = block.stability[r0:r1, c0:c1].clone()
-                            uses = block.uses[r0:r1, c0:c1].clone()
-                            delta, active, difference, replacements = _stdp_replacements(
-                                self.owner, previous, eligibility, stability, uses, timing)
-                            absolute += float(delta.abs().to(torch.float64).sum())
-                            signed += float(delta.to(torch.float64).sum())
-                            active_count += int(active.sum())
-                            level_abs += int(difference.abs().sum())
-                            level_signed += int(difference.sum())
-                            changed_count += int(difference.ne(0).sum())
-                            self.capture_writes(journal, key, block, region, replacements)
-                        self.release(block, region)
-            if active_count:
-                # Preserve the original global quiet-pair eligibility reset.
-                # An entirely silent step leaves previous eligibility untouched.
-                for key, block in self.owner.blocks.items():
-                    for region in self.regions(block):
-                        self.owner._check()
-                        r0, r1, c0, c1 = region
-                        with self.owner._ram((r1-r0)*(c1-c0)*16 + 1024, "sparse quiet-pair timing reset"):
-                            target = block.eligibility_accumulator[r0:r1, c0:c1]
-                            if bool(target.ne(0).any()):
-                                if not block._router_unpublished:
-                                    journal.capture("blocks." + key + ".eligibility_accumulator", *region)
-                                target.zero_()
-                        self.release(block, region)
+                            self.ensure(row, column)
+                            layers = self._layers[(row, column)]
+                            changed = torch.zeros_like(timing, dtype=torch.bool)
+                            growing = torch.zeros_like(timing, dtype=torch.int8)
+                            with self.owner._ram(1024 + len(layers)*128, "parallel router layer order"):
+                                for layer in sorted(layers):
+                                    key = layers[layer]
+                                    block = self.owner.blocks[key]
+                                    previous = unpack_tile(block._packed_weights, *region)
+                                    state = block._connection_state[r0:r1, c0:c1].clone()
+                                    eligibility = block.eligibility_accumulator[r0:r1, c0:c1].clone()
+                                    stability = block.stability[r0:r1, c0:c1].clone()
+                                    uses = block.uses[r0:r1, c0:c1].clone()
+                                    present = previous.ne(0) | state.ne(0) | eligibility.ne(0) | stability.ne(0) | uses.ne(0)
+                                    local_timing = timing if not layer else timing * present
+                                    delta, active, difference, replacements, overflow = _stdp_replacements(
+                                        self.owner, previous, state, eligibility, stability, uses, local_timing)
+                                    absolute += float(delta.abs().to(torch.float64).sum())
+                                    signed += float(delta.to(torch.float64).sum())
+                                    contact_updates += int(active.sum())
+                                    if not layer:
+                                        active_count += int(active.sum())
+                                        growing = overflow
+                                    else:
+                                        amplitude = previous.to(torch.int32) * connection_strengths(state) + difference
+                                        available = present & (amplitude * growing.to(torch.int32) < 16)
+                                        growing = torch.where(available, 0, growing)
+                                    level_abs += int(difference.abs().sum())
+                                    level_signed += int(difference.sum())
+                                    changed |= difference.ne(0)
+                                    self.capture_writes(journal, key, block, region, replacements)
+                                    self.release(block, region)
+                            if bool(growing.ne(0).any()):
+                                count = self._grow_contacts(row, column, region, growing, journal)
+                                new_contacts += count
+                                level_abs += count
+                                level_signed += int(growing.to(torch.int32).sum())
+                                changed |= growing.ne(0)
+                            changed_count += int(changed.sum())
             self.owner._check()
             self.owner.pre_trace.mul_(self.owner.pre_decay).add_(pre.to(self.owner.pre_trace.device))
             self.owner.post_trace.mul_(self.owner.post_decay).add_(post.to(self.owner.post_trace.device))
             self.owner.plasticity_events.add_(active_count)
-        return absolute, signed, level_abs, level_signed, changed_count, active_count
+        return absolute, signed, level_abs, level_signed, changed_count, active_count, contact_updates, new_contacts
+
+    @staticmethod
+    def _present(block, region, levels=None):
+        r0, r1, c0, c1 = region
+        levels = unpack_tile(block._packed_weights, *region) if levels is None else levels
+        return (levels.ne(0) | block._connection_state[r0:r1, c0:c1].ne(0)
+                | block.eligibility_accumulator[r0:r1, c0:c1].ne(0)
+                | block.stability[r0:r1, c0:c1].ne(0) | block.uses[r0:r1, c0:c1].ne(0))
+
+    def _grow_contacts(self, row, column, region, directions, journal):
+        """Fill free contact positions, then append an admitted parallel layer.
+
+        One module stores a block of contacts, never one Python object per edge.
+        Each repeated contact keeps its own sign, strength and timing controls.
+        No layer count or connectivity ceiling is introduced.
+        """
+        r0, r1, c0, c1 = region
+        remaining = directions.clone()
+        count = int(remaining.ne(0).sum())
+        layers = self._layers[(row, column)]
+        with self.owner._ram(1024 + len(layers)*128, "parallel router available layer order"):
+            for layer in sorted((*layers, max(layers) + 1)):
+                if not layer or not bool(remaining.ne(0).any()):
+                    continue
+                block = self.ensure(row, column, layer=layer)
+                key = block_key(row, column, layer)
+                levels = unpack_tile(block._packed_weights, *region)
+                free = remaining.ne(0) & ~self._present(block, region, levels)
+                if bool(free.any()):
+                    levels = torch.where(free, remaining, levels)
+                    uses = block.uses[r0:r1, c0:c1].clone()
+                    stability = block.stability[r0:r1, c0:c1].clone()
+                    uses[free] = 1.0
+                    stability[free] = max(0.0, min(20.0, self.owner.metaplasticity_rate))
+                    self.capture_writes(journal, key, block, region, {
+                        "_packed_weights": pack_tile(levels), "uses": uses, "stability": stability})
+                    remaining = torch.where(free, 0, remaining)
+                self.release(block, region)
+        if bool(remaining.ne(0).any()):
+            raise RuntimeError("parallel router contact admission did not cover its exact requested pairs")
+        return count
 
     def decay_unused(self, amount):
         with self.transaction() as journal:
@@ -470,12 +653,21 @@ class SparseRouterState:
                             levels = unpack_tile(block._packed_weights, *region)
                             positions = ((torch.arange(r0, r1, dtype=torch.int64) + row*BLOCK_ROWS)[:, None] * self.owner.pre_neurons
                                          + (torch.arange(c0, c1, dtype=torch.int64) + column*BLOCK_COLUMNS)[None, :])
-                            draw = ((positions * 1664525 + tick * 1013904223) & 0xFFFFFFFF).float() / 4294967296.0
+                            draw = ((positions * 1664525 + tick * 1013904223 + block_layer(key)*2246822519) & 0xFFFFFFFF).float() / 4294967296.0
                             uses = block.uses[r0:r1, c0:c1]
                             decay = levels.ne(0) & (draw < amount / (1.0 + uses))
                             replacements = {"stability": block.stability[r0:r1, c0:c1] * (1.0 - amount * .1)}
                             if bool(decay.any()):
-                                replacements["_packed_weights"] = pack_tile(torch.where(decay, 0, levels).to(torch.int8))
+                                state = block._connection_state[r0:r1, c0:c1]
+                                strengths = connection_strengths(state).to(torch.int32)
+                                resistance = connection_resistance(state).to(torch.int32)
+                                faded = torch.where(decay, strengths - 1, strengths)
+                                resistance = torch.where(decay, (resistance - 1).clamp_min(0), resistance)
+                                replacements["_packed_weights"] = pack_tile(torch.where(faded.eq(0), 0, levels).to(torch.int8))
+                                replacements["_connection_state"] = encode_connection_state(faded.clamp_min(1), resistance)
+                                bound = 256*(1+resistance)-1
+                                pressure = block.eligibility_accumulator[r0:r1, c0:c1].to(torch.int32)
+                                replacements["eligibility_accumulator"] = torch.maximum(-bound, torch.minimum(bound, pressure)).to(torch.int16)
                             self.capture_writes(journal, key, block, region, replacements)
                     self.release(block, region)
 
@@ -538,7 +730,7 @@ class SparseRouterState:
                 self.owner._check()
                 block = self.owner.blocks[key]
                 digest.update(key.encode("ascii") + b"\0")
-                for field in (MATRIX_FIELDS if controls else ("_packed_weights",)):
+                for field in (MATRIX_FIELDS if controls else ("_packed_weights", "_connection_state")):
                     update_historical_tensor_checksum(digest, getattr(block, field), self.owner)
             if controls:
                 for name in ("pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
@@ -581,7 +773,7 @@ class SparseRouterState:
 
     def _dense_equivalence_proof(self, reader, prefix):
         fingerprints = {}
-        for name in (*MATRIX_FIELDS, "pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
+        for name in (*(field for field in MATRIX_FIELDS if prefix+field in reader.specs), "pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
             spec = reader.specs[prefix+name]
             source, restored = hashlib.sha256(), hashlib.sha256()
             for digest in (source, restored):
@@ -623,7 +815,7 @@ class SparseRouterState:
         with self.transaction():
             for key, old in source.owner.blocks.items():
                 row, column = parse_block_key(key)
-                new = self.ensure(row, column)
+                new = self.ensure(row, column, layer=block_layer(key))
                 for region in source.regions(old):
                     source.owner._check(); self.owner._check()
                     r0, r1, c0, c1 = region
@@ -651,6 +843,7 @@ class SparseRouterState:
             if spec is None or spec.shape != shape or spec.dtype != dtype:
                 raise ValueError("router checkpoint timing vector/counter shape or dtype is invalid: " + name)
         sparse = prefix + "_sparse_layout" in specs
+        source_version = 2 if prefix + "_connection_state" in specs else 1
         if sparse:
             layout_spec = specs[prefix + "_sparse_layout"]
             if layout_spec.shape != (5,) or layout_spec.dtype != torch.int64:
@@ -658,10 +851,12 @@ class SparseRouterState:
             with self.owner._ram(1024, "sparse router layout read"):
                 layout = torch.empty(5, dtype=torch.int64)
                 self._copy_flat(reader, prefix + "_sparse_layout", layout)
-                if not torch.equal(layout, self.owner._sparse_layout.detach().cpu()):
+                source_version = int(layout[0])
+                if source_version not in (1, SPARSE_LAYOUT_VERSION) or not torch.equal(layout[1:], self.owner._sparse_layout.detach().cpu()[1:]):
                     raise ValueError("sparse router layout does not match its declared population")
-        else:
-            for name in MATRIX_FIELDS:
+        fields = MATRIX_FIELDS if source_version >= 2 else LEGACY_MATRIX_FIELDS
+        if not sparse:
+            for name in fields:
                 spec = specs.get(prefix + name)
                 shape = (self.owner.post_neurons, (self.owner.pre_neurons+3)//4) if name == "_packed_weights" else (self.owner.post_neurons, self.owner.pre_neurons)
                 if spec is None or spec.shape != shape or spec.dtype != _DTYPES[name]:
@@ -670,20 +865,22 @@ class SparseRouterState:
             if not full_name.startswith(prefix):
                 continue
             name = full_name[len(prefix):]
-            if name in vectors or sparse and name == "_sparse_layout" or not sparse and name in MATRIX_FIELDS:
+            if name in vectors or sparse and name == "_sparse_layout" or not sparse and name in fields:
                 continue
             parts = name.split(".")
-            if not sparse or len(parts) != 3 or parts[0] != "blocks" or parts[2] not in MATRIX_FIELDS:
+            if not sparse or len(parts) != 3 or parts[0] != "blocks" or parts[2] not in fields:
                 raise ValueError("unexpected recurrent router checkpoint field: " + name)
             row, column = parse_block_key(parts[1])
+            if block_layer(parts[1]) and (source_version < 2 or prefix+"blocks."+block_key(row, column)+"._packed_weights" not in specs):
+                raise ValueError("parallel router contact layer has no native base block")
             rows, columns = self.shape(row, column)
             expected = (rows, (columns+3)//4) if parts[2] == "_packed_weights" else (rows, columns)
             if spec.shape != expected or spec.dtype != _DTYPES[parts[2]]:
                 raise ValueError("sparse router checkpoint block shape/dtype is invalid: " + name)
-            for field in MATRIX_FIELDS:
+            for field in fields:
                 if prefix + "blocks." + parts[1] + "." + field not in specs:
                     raise ValueError("sparse router checkpoint block is incomplete")
-        return sparse
+        return sparse, source_version, fields
 
     def _copy_flat(self, reader, name, target):
         spec = reader.specs[name]
@@ -733,7 +930,7 @@ class SparseRouterState:
         if self.owner.blocks:
             raise RuntimeError("recurrent checkpoint loading requires a fresh sparse owner")
         self.ready = False
-        sparse = self._checkpoint_inventory(reader, prefix)
+        sparse, source_version, fields = self._checkpoint_inventory(reader, prefix)
         with self.transaction():
             if sparse:
                 for name in reader.specs:
@@ -741,9 +938,14 @@ class SparseRouterState:
                         continue
                     key = name[len(prefix + "blocks."):].split(".")[0]
                     row, column = parse_block_key(key)
-                    block = self.ensure(row, column, loading=True)
-                    for field in MATRIX_FIELDS:
+                    block = self.ensure(row, column, layer=block_layer(key), loading=True)
+                    for field in fields:
                         self._copy_flat(reader, prefix + "blocks." + key + "." + field, getattr(block, field))
+                    if "_connection_state" not in fields:
+                        for region in self.regions(block):
+                            r0, r1, c0, c1 = region
+                            block._connection_state[r0:r1, c0:c1].zero_()
+                            self.release(block, region)
                     block._router_loaded = True
             else:
                 for row in range(math.ceil(self.owner.post_neurons/BLOCK_ROWS)):
@@ -760,14 +962,14 @@ class SparseRouterState:
                                     for lane in range(self.owner.pre_neurons % 4, 4):
                                         if bool((((packed[:, -1] >> (2*lane)) & 3) != 1).any()):
                                             raise ValueError("dense-native router has nonzero packed padding")
-                                fields = {field: self._read_region(reader, prefix + field, a+r0, a+r1, b+c0, b+c1)
-                                          for field in MATRIX_FIELDS if field != "_packed_weights"}
-                                _validate_tile(levels, fields["eligibility_accumulator"], fields["stability"], fields["uses"])
-                                nondefault = bool(levels.ne(0).any()) or any(bool(value.ne(0).any()) for value in fields.values())
+                                values = {field: self._read_region(reader, prefix + field, a+r0, a+r1, b+c0, b+c1)
+                                          for field in fields if field != "_packed_weights"}
+                                _validate_tile(levels, values["eligibility_accumulator"], values["stability"], values["uses"], values.get("_connection_state"))
+                                nondefault = bool(levels.ne(0).any()) or any(bool(value.ne(0).any()) for value in values.values())
                                 if nondefault:
                                     block = self.ensure(row, column)
                                     block._packed_weights[r0:r1, c0//4:(c1+3)//4].copy_(packed)
-                                    for field, value in fields.items():
+                                    for field, value in values.items():
                                         getattr(block, field)[r0:r1, c0:c1].copy_(value)
                                     self.release(block, region)
             for name in ("pre_trace", "post_trace", "plasticity_events", "decay_cycles"):
@@ -782,11 +984,14 @@ class SparseRouterState:
             if int(self.owner.plasticity_events) < 0 or int(self.owner.decay_cycles) < 0:
                 raise ValueError("router checkpoint counters must be nonnegative")
             proof = self._dense_equivalence_proof(reader, prefix) if not sparse else {
-                "format": "omni-router-sparse-native-load-v1", "sourceMode": "allocated-block-sparse-native",
+                "format": "omni-router-sparse-native-load-v2", "sourceMode": "allocated-block-sparse-native",
                 "destinationMode": "allocated-block-sparse-native", "legacyDenseMigration": False,
                 "populationShape": [self.owner.post_neurons, self.owner.pre_neurons],
                 "allocatedBlocks": len(self.owner.blocks), "destinationAllocatedTrits": self.allocated_trits,
                 "allNativeHeadersValidated": True, "verifiedAtLoad": True, "checkpointWritableMapped": False}
+            proof.update({"sourceConnectionStateVersion": source_version,
+                          "destinationConnectionStateVersion": SPARSE_LAYOUT_VERSION,
+                          "unitStrengthMigration": source_version == 1})
         if self.pager is not None:
             for block in self.owner.blocks.values():
                 self.pager.finish_owner_load(block, flush=False)

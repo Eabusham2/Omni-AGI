@@ -1,0 +1,19 @@
+.mcp-app-view { display: grid; min-width: 0; gap: 8px; margin-block: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; color: var(--text); background: var(--surface-solid, var(--surface)); }
+.mcp-app-view__surface { display: grid; position: static; inset: auto; gap: 8px; width: 100%; min-width: 0; max-width: none; max-height: none; box-sizing: border-box; margin: 0; padding: 0; border: 0; font: inherit; color: inherit; background: transparent; }
+.mcp-app-view__surface > header, .mcp-app-view__controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.mcp-app-view__controls { justify-content: flex-end; }
+.mcp-app-view__surface:modal { display: flex; flex-direction: column; position: fixed; inset: 0; width: 100vw; height: 100dvh; max-width: 100vw; max-height: 100dvh; margin: 0; padding: max(12px, var(--titlebar-total-h, 12px), env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); color: var(--text); background: var(--surface-solid, var(--surface)); }
+.mcp-app-view__surface:modal iframe { flex: 1; min-height: 0; height: 100% !important; }
+.mcp-app-view__surface:modal > details { max-height: 30dvh; overflow: auto; flex-shrink: 0; }
+.mcp-app-view__surface::backdrop { background: rgb(0 0 0 / .4); }
+.mcp-app-view iframe { width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.mcp-app-view details, .mcp-app-view p { min-width: 0; overflow-wrap: anywhere; }
+.mcp-app-view p { margin: 6px 0; }
+.mcp-app-view__error { border-inline-start: 3px solid currentColor; padding-inline-start: 10px; }
+.mcp-app-view__mapping { display: grid; gap: 10px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; }
+.mcp-app-view__mapping label { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; min-width: 0; }
+.mcp-app-view__mapping select { width: 100%; min-width: 0; color: var(--text); background: var(--surface-solid, var(--surface)); font: inherit; padding: 9px; border: 1px solid var(--border); border-radius: 8px; }
+.mcp-app-view__mapping input { accent-color: var(--accent); }
+.mcp-app-view__source { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.mcp-app-view__observation { border: 1px solid var(--border); border-radius: 8px; padding: 9px; font-size: .92em; }
+.mcp-app-view__observation summary { cursor: pointer; font-weight: 600; }

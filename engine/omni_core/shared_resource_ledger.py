@@ -8,6 +8,7 @@ backing path is proved absent; dev/inode identities deduplicate hardlinks.
 from __future__ import annotations
 
 import os
+import stat as stat_module
 import sqlite3
 import time
 import uuid
@@ -30,6 +31,10 @@ class SharedAllocationLease:
     def __init__(self, ledger, token, kind):
         self.ledger, self.token, self.kind = ledger, token, kind
         self.allocated = False
+        self._path = None
+        self._physical = None
+        self._promised = 0
+        self._held = False
 
     def mark_allocated(self, actual_bytes: Optional[int] = None):
         self.ledger.commit_ram(self.token, actual_bytes)
@@ -43,7 +48,18 @@ class SharedAllocationLease:
             raise ValueError("spill lease requires an owned backing path")
         self.ledger.commit_spill(self.token, path, actual_allocated_bytes, promised_bytes, retain_open_backing)
         self.allocated = True
+        self._path, self._promised, self._held = Path(path), promised_bytes, retain_open_backing
+        value = self._path.stat()
+        self._physical = int(value.st_blocks) * 512 if hasattr(value, "st_blocks") else value.st_size
         return self
+
+    def refresh_physical(self):
+        if self._path is None:
+            return
+        value = self._path.stat()
+        physical = int(value.st_blocks) * 512 if hasattr(value, "st_blocks") else value.st_size
+        if physical != self._physical:
+            self.commit(path=self._path, promised_bytes=self._promised, retain_open_backing=self._held)
 
     def release(self):
         self.ledger.release(self.token)
@@ -90,6 +106,22 @@ class SharedResourceLedger:
                     db.execute(statement)
             if "held" not in {row[1] for row in db.execute("PRAGMA table_info(leases)")}:
                 db.execute("ALTER TABLE leases ADD COLUMN held INTEGER NOT NULL DEFAULT 0")
+            for name in ("pool_id", "pool_group"):
+                if name not in {row[1] for row in db.execute("PRAGMA table_info(leases)")}:
+                    db.execute("ALTER TABLE leases ADD COLUMN %s TEXT" % name)
+            file_columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
+            if "pool_group" not in file_columns:
+                db.execute("ALTER TABLE files ADD COLUMN pool_group TEXT")
+            if "physical" not in file_columns:
+                # Unknown historical sparse promises remain conservative until
+                # the exact existing backing is observed again.
+                db.execute("ALTER TABLE files ADD COLUMN physical INTEGER NOT NULL DEFAULT 0")
+            db.execute("CREATE TABLE IF NOT EXISTS drive_pools(pool_id TEXT PRIMARY KEY, path TEXT UNIQUE NOT NULL, backing_path TEXT NOT NULL, device TEXT NOT NULL, inode TEXT NOT NULL, backing_device TEXT NOT NULL, backing_inode TEXT NOT NULL, physical_group TEXT NOT NULL, rate INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS drive_access(owner TEXT NOT NULL,pool_id TEXT NOT NULL,PRIMARY KEY(owner,pool_id))")
+            db.execute("CREATE TABLE IF NOT EXISTS drive_limits(owner TEXT NOT NULL,pool_id TEXT NOT NULL,ceiling INTEGER NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(owner,pool_id))")
+            db.execute("CREATE TABLE IF NOT EXISTS spill_volumes(device TEXT PRIMARY KEY,physical_group TEXT NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS file_pool_group ON files(pool_group)")
+            db.execute("CREATE INDEX IF NOT EXISTS lease_pool_group ON leases(pool_group,state)")
             db.execute("CREATE INDEX IF NOT EXISTS lease_state_kind ON leases(kind,state,committed)")
             db.execute("CREATE INDEX IF NOT EXISTS lease_identity ON leases(identity)")
             db.execute("INSERT OR IGNORE INTO policy SELECT 'spill_used',COALESCE(SUM(bytes),0) FROM files")
@@ -174,17 +206,19 @@ class SharedResourceLedger:
             aliases = chain((row[0] for row in db.execute("SELECT path FROM leases WHERE identity=?", (identity,))), (path,))
             present = next((candidate for candidate in aliases if candidate and Path(candidate).exists()), None)
             held = db.execute("SELECT 1 FROM leases WHERE identity=? AND held=1 LIMIT 1", (identity,)).fetchone()
-            if present is None and not held:
+            if present is None and not held and not self._drive_unavailable(db, identity=identity):
                 self._bump_spill(db, -_bytes)
                 db.execute("DELETE FROM files WHERE identity=?", (identity,))
                 db.execute("DELETE FROM leases WHERE identity=?", (identity,))
             elif present is not None and present != path:
                 db.execute("UPDATE files SET path=? WHERE identity=?", (present, identity))
-        for token, pid, path, promised in db.execute("SELECT token,pid,path,bytes FROM leases WHERE kind='spill' AND state='pending'").fetchall():
+        for token, pid, path, promised, pool_id in db.execute("SELECT token,pid,path,bytes,pool_id FROM leases WHERE kind='spill' AND state='pending'").fetchall():
             if not self.process_alive(pid):
+                if self._drive_unavailable(db, pool_id=pool_id):
+                    continue
                 if path and Path(path).exists():
                     self._adopt_pending_file(db, token, Path(path), promised)
-                else:
+                elif not self._drive_unavailable(db, pool_id=pool_id):
                     db.execute("DELETE FROM leases WHERE token=?", (token,))
         return continuation
 
@@ -197,12 +231,36 @@ class SharedResourceLedger:
     def _adopt_pending_file(db, token, path, promised):
         stat = path.stat()
         identity = "%d:%d" % (stat.st_dev, stat.st_ino)
-        allocated = max(stat.st_size, int(getattr(stat, "st_blocks", 0)) * 512, promised)
-        prior = db.execute("SELECT bytes FROM files WHERE identity=?", (identity,)).fetchone()
+        physical = int(stat.st_blocks) * 512 if hasattr(stat, "st_blocks") else stat.st_size
+        allocated = max(stat.st_size, physical, promised)
+        prior = db.execute("SELECT bytes,pool_group FROM files WHERE identity=?", (identity,)).fetchone()
         previous = prior[0] if prior else 0
         SharedResourceLedger._bump_spill(db, max(allocated, previous) - previous)
-        db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?)", (identity, max(allocated, previous), str(path)))
-        db.execute("UPDATE leases SET state='allocated',bytes=0,identity=? WHERE token=?", (identity, token))
+        pool = db.execute("SELECT pool_group FROM leases WHERE token=?", (token,)).fetchone()
+        group = prior[1] if prior and prior[1] is not None else pool[0] if pool else None
+        db.execute("INSERT OR REPLACE INTO files(identity,bytes,path,pool_group,physical) VALUES(?,?,?,?,?)",
+                   (identity, max(allocated, previous), str(path), group, physical))
+        db.execute("UPDATE leases SET state='allocated',bytes=0,identity=?,pool_group=? WHERE token=?", (identity, group, token))
+
+    @staticmethod
+    def _drive_unavailable(db, *, identity=None, pool_id=None):
+        ids = {pool_id} if pool_id is not None else set()
+        if identity is not None:
+            ids.update(row[0] for row in db.execute("SELECT DISTINCT pool_id FROM leases WHERE identity=? AND pool_id IS NOT NULL", (identity,)))
+        for selected in ids:
+            grant = db.execute("SELECT path,device,inode,backing_path,backing_device,backing_inode FROM drive_pools WHERE pool_id=?", (selected,)).fetchone()
+            if grant is None:
+                return True
+            try:
+                for path, device, inode in (grant[:3], grant[3:]):
+                    value = Path(path).lstat()
+                    if (not stat_module.S_ISDIR(value.st_mode) or stat_module.S_ISLNK(value.st_mode)
+                            or int(getattr(value, "st_file_attributes", 0)) & 0x400
+                            or (str(value.st_dev), str(value.st_ino)) != (device, inode)):
+                        return True
+            except OSError:
+                return True
+        return False
 
     def _status(self, db):
         pool = int(db.execute("SELECT COALESCE(MAX(pool),0) FROM owners").fetchone()[0])
@@ -243,6 +301,75 @@ class SharedResourceLedger:
             db.execute("INSERT INTO leases(token,owner,kind,bytes,state,pid,session,committed,identity,path) VALUES(?,?,?,?,?,?,?,?,?,?)", (token, owner, kind, byte_count, "pending", self.pid, self.session, None, None, None))
         return SharedAllocationLease(self, token, kind)
 
+    def authorized_drive_pools(self, owner: str):
+        """Read main-issued local grants; config/imported strings are not grants."""
+        with self._transaction() as db:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute("SELECT p.* FROM drive_pools p JOIN drive_access a USING(pool_id) WHERE a.owner=?", (owner,))]
+
+    def drive_cleanup_candidates(self, owner, *, after_token="", limit=128):
+        with self._transaction() as db:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute("SELECT l.token,l.pid,l.path,l.identity,l.pool_id FROM leases l JOIN drive_access a ON a.pool_id=l.pool_id WHERE a.owner=? AND l.kind='spill' AND l.path IS NOT NULL AND l.token>? ORDER BY l.token LIMIT ?",
+                (owner, after_token, max(1, min(128, int(limit)))))]
+
+    def drive_backing_has_live_owner(self, token):
+        with self._transaction() as db:
+            row = db.execute("SELECT pid,identity FROM leases WHERE token=?", (token,)).fetchone()
+            if row is None:
+                return True
+            pids = {row[0]}
+            if row[1] is not None:
+                pids.update(value[0] for value in db.execute("SELECT pid FROM leases WHERE identity=?", (row[1],)))
+            # A reused live PID conservatively keeps the file. Never infer
+            # process death from an observation timeout or lease age.
+            return any(self.process_alive(pid) for pid in pids)
+
+    @staticmethod
+    def _drive_status(db, group):
+        ceiling = int(db.execute("SELECT COALESCE(MAX(l.ceiling),0) FROM drive_limits l JOIN drive_pools p USING(pool_id) JOIN owners o ON o.owner=l.owner WHERE p.physical_group=?", (group,)).fetchone()[0])
+        used, promised = db.execute("SELECT COALESCE(SUM(bytes),0),COALESCE(SUM(MAX(0,bytes-physical)),0) FROM files f WHERE pool_group=? OR (pool_group IS NULL AND EXISTS(SELECT 1 FROM spill_volumes v WHERE v.physical_group=? AND v.device=substr(f.identity,1,instr(f.identity,':')-1)))", (group, group)).fetchone()
+        # Unbound old-path pending writes have not proved their physical group
+        # yet; reserve them conservatively until bind_path observes a directory.
+        pending = db.execute("SELECT COALESCE(SUM(bytes),0) FROM leases WHERE (pool_group=? OR pool_group IS NULL) AND kind='spill' AND state='pending'", (group,)).fetchone()[0]
+        return {"physicalGroup": group, "largestConfiguredPoolBytes": ceiling,
+                "chargedBytes": int(used), "observedAllocatedBytes": int(used) - int(promised),
+                "unmaterializedPromiseBytes": int(promised), "pendingBytes": int(pending)}
+
+    def drive_usage(self, owner):
+        with self._transaction() as db:
+            groups = [row[0] for row in db.execute("SELECT DISTINCT p.physical_group FROM drive_pools p JOIN drive_access a USING(pool_id) WHERE a.owner=? ORDER BY p.physical_group", (owner,))]
+            return [self._drive_status(db, group) for group in groups]
+
+    def reserve_drive(self, owner, pool_id, byte_count, *, proposed_ceiling, selection_signature,
+                      auto_increase, free_bytes, reserve_bytes):
+        for value in (byte_count, proposed_ceiling, free_bytes, reserve_bytes):
+            if type(value) is not int or value < 0:
+                raise ValueError("drive reservations require nonnegative integer bytes")
+        token = uuid.uuid4().hex
+        with self._transaction() as db:
+            self._reconcile(db)
+            row = db.execute("SELECT p.physical_group FROM drive_pools p JOIN drive_access a USING(pool_id) JOIN owners o ON o.owner=a.owner WHERE a.owner=? AND p.pool_id=?", (owner, pool_id)).fetchone()
+            if row is None:
+                raise SharedQuotaPause("selected drive has no local owner authorization", self._status(db))
+            previous = db.execute("SELECT ceiling,signature FROM drive_limits WHERE owner=? AND pool_id=?", (owner, pool_id)).fetchone()
+            ceiling = proposed_ceiling
+            if previous and previous[1] == selection_signature:
+                ceiling = max(previous[0], proposed_ceiling) if auto_increase else previous[0]
+            db.execute("INSERT OR REPLACE INTO drive_limits VALUES(?,?,?,?)", (owner, pool_id, ceiling, selection_signature))
+            group = row[0]
+            drive = self._drive_status(db, group)
+            global_status = self._status(db)
+            if global_status["physicalSpillUsageBytes"] + global_status["pendingSpillBytes"] + byte_count > global_status["largestConfiguredPoolBytes"]:
+                raise SharedQuotaPause("atomic shared spill reservation exceeds largest configured pool", global_status)
+            if drive["chargedBytes"] + drive["pendingBytes"] + byte_count > drive["largestConfiguredPoolBytes"]:
+                raise SharedQuotaPause("selected physical drive pool is full", drive)
+            if free_bytes - drive["pendingBytes"] - drive["unmaterializedPromiseBytes"] - byte_count <= reserve_bytes:
+                raise SharedQuotaPause("selected drive awaits its free-space reserve", drive)
+            db.execute("INSERT INTO leases(token,owner,kind,bytes,state,pid,session,pool_id,pool_group) VALUES(?,?,'spill',?,'pending',?,?,?,?)",
+                       (token, owner, byte_count, self.pid, self.session, pool_id, group))
+        return SharedAllocationLease(self, token, "spill")
+
     def commit_ram(self, token: str, actual_bytes: Optional[int]):
         with self._transaction() as db:
             row = db.execute("SELECT bytes FROM leases WHERE token=? AND kind='ram'", (token,)).fetchone()
@@ -255,6 +382,13 @@ class SharedResourceLedger:
     def bind_path(self, token: str, path: Path):
         with self._transaction() as db:
             db.execute("UPDATE leases SET path=? WHERE token=? AND kind='spill' AND state='pending'", (str(Path(path).absolute()), token))
+            try:
+                device = str(Path(path).parent.stat().st_dev)
+                group = db.execute("SELECT physical_group FROM spill_volumes WHERE device=?", (device,)).fetchone()
+                if group:
+                    db.execute("UPDATE leases SET pool_group=? WHERE token=? AND pool_group IS NULL", (group[0], token))
+            except OSError:
+                pass  # Still charged as unbound pending, never treated as zero.
 
     def commit_spill(self, token: str, path: Path, actual_bytes: Optional[int], promised_bytes: int, retain_open_backing: bool = False):
         path = Path(path).absolute()
@@ -266,18 +400,28 @@ class SharedResourceLedger:
         allocated = max(measured, int(actual_bytes or 0))
         allocated = max(allocated, int(promised_bytes))
         with self._transaction() as db:
-            row = db.execute("SELECT bytes FROM leases WHERE token=? AND kind='spill'", (token,)).fetchone()
+            row = db.execute("SELECT bytes,pool_group FROM leases WHERE token=? AND kind='spill'", (token,)).fetchone()
             if row is None:
                 raise ValueError("spill reservation is absent")
-            previous = db.execute("SELECT bytes FROM files WHERE identity=?", (identity,)).fetchone()
+            previous = db.execute("SELECT bytes,pool_group FROM files WHERE identity=?", (identity,)).fetchone()
             old = previous[0] if previous else 0
+            existing_group = previous[1] if previous else None
+            group = row[1] if row[1] is not None else existing_group
+            if existing_group is not None and row[1] is not None and existing_group != row[1]:
+                raise ValueError("one backing identity cannot belong to different physical drive groups")
             status = self._status(db)
             total = status["physicalSpillUsageBytes"] + status["pendingSpillBytes"] - row[0] + max(old, allocated) - old
             if total > status["largestConfiguredPoolBytes"]:
                 raise SharedQuotaPause("actual spill allocation exceeds atomic configured pool", status)
+            if group is not None:
+                drive = self._drive_status(db, group)
+                pending_here = row[0] if row[1] in (None, group) else 0
+                if drive["chargedBytes"] + drive["pendingBytes"] - pending_here + max(old, allocated) - old > drive["largestConfiguredPoolBytes"]:
+                    raise SharedQuotaPause("actual spill allocation exceeds selected physical drive pool", drive)
             self._bump_spill(db, max(old, allocated) - old)
-            db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?)", (identity, max(old, allocated), str(path)))
-            db.execute("UPDATE leases SET state='allocated',bytes=0,identity=?,path=?,held=? WHERE token=?", (identity, str(path), int(retain_open_backing), token))
+            db.execute("INSERT OR REPLACE INTO files(identity,bytes,path,pool_group,physical) VALUES(?,?,?,?,?)",
+                       (identity, max(old, allocated), str(path), group, measured))
+            db.execute("UPDATE leases SET state='allocated',bytes=0,identity=?,path=?,held=?,pool_group=? WHERE token=?", (identity, str(path), int(retain_open_backing), group, token))
             # An append journal can have millions of tile writes. Once the
             # SAME path/inode is proved, supersede only this process/session's
             # non-held aliases; preserve other paths, owners and mmap holders.
@@ -296,14 +440,16 @@ class SharedResourceLedger:
 
     def release(self, token: str):
         with self._transaction() as db:
-            row = db.execute("SELECT kind,state,path,identity FROM leases WHERE token=?", (token,)).fetchone()
+            row = db.execute("SELECT kind,state,path,identity,pool_id FROM leases WHERE token=?", (token,)).fetchone()
             if row is None:
                 return
             if row[1] == "pending":
+                if self._drive_unavailable(db, pool_id=row[4]):
+                    return
                 if row[0] == "spill" and row[2] and Path(row[2]).exists():
                     promised = db.execute("SELECT bytes FROM leases WHERE token=?", (token,)).fetchone()[0]
                     self._adopt_pending_file(db, token, Path(row[2]), promised)
-                else:
+                elif not self._drive_unavailable(db, pool_id=row[4]):
                     db.execute("DELETE FROM leases WHERE token=?", (token,))
             elif row[0] == "spill" and row[2] and not Path(row[2]).exists():
                 # Keep aliases for extant hardlinks; reconcile removes usage
@@ -311,7 +457,7 @@ class SharedResourceLedger:
                 aliases = chain((item[0] for item in db.execute("SELECT path FROM leases WHERE identity=?", (row[3],))),
                     (item[0] for item in db.execute("SELECT path FROM files WHERE identity=?", (row[3],))))
                 held = db.execute("SELECT 1 FROM leases WHERE identity=? AND held=1 LIMIT 1", (row[3],)).fetchone()
-                if not held and not any(path and Path(path).exists() for path in aliases):
+                if not held and not any(path and Path(path).exists() for path in aliases) and not self._drive_unavailable(db, identity=row[3]):
                     count = db.execute("SELECT bytes FROM files WHERE identity=?", (row[3],)).fetchone()
                     if count:
                         self._bump_spill(db, -count[0])

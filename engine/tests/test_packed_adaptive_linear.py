@@ -41,6 +41,8 @@ class PackedAdaptiveLinearTests(unittest.TestCase):
                 "_packed_forward_scale",
                 "_online_learning_rate",
                 "_row_stability",
+                "_connection_state",
+                "parallel_connections._next_page",
             },
         )
         self.assertTrue(
@@ -110,7 +112,8 @@ class PackedAdaptiveLinearTests(unittest.TestCase):
             )
         self.assertEqual(int(layer.effective_bias()[0]), 0)
         self.assertEqual(tuple(layer.parameters()), ())
-        self.assertEqual(layer.packed_forward_status()["packedBytes"], 2)
+        self.assertEqual(layer.packed_forward_status()["packedBytes"], 5)
+        self.assertEqual(layer.packed_forward_status()["packedSignBytes"], 2)
         self.assertIn("_packed_forward_bias", layer.state_dict())
         inputs = torch.zeros((1, 2))
         loss = torch.nn.functional.mse_loss(layer(inputs), torch.ones((1, 1)))
@@ -146,7 +149,8 @@ class PackedAdaptiveLinearTests(unittest.TestCase):
         specs = collect_module_ternary_tensors({"cortex": layer})
         self.assertEqual(len(specs), 1)
         self.assertEqual(specs[0].source_dtype, "packed-2bit")
-        self.assertTrue(torch.equal(specs[0].values, layer.effective_weight()))
+        self.assertEqual(tuple(specs[0].values.shape), tuple(layer.effective_weight().shape))
+        self.assertTrue(torch.equal(specs[0].connection_state, layer._connection_state))
         with tempfile.TemporaryDirectory() as temporary:
             manifest = export_module_ternary_shards(
                 Path(temporary), {"cortex": layer}, expected_names={"cortex.weight"}
@@ -168,7 +172,7 @@ class PackedAdaptiveLinearTests(unittest.TestCase):
     def test_fill_is_exact_and_zeroes_packed_bias_without_a_dense_weight(self):
         layer = PackedAdaptiveBitLinear(5, 3, bias=True)
         self.assertEqual(layer.logical_ternary_parameter_count, 18)
-        self.assertEqual(len(layer.authoritative_packed_tensors()), 2)
+        self.assertEqual(len(layer.authoritative_packed_tensors()), 4)
         layer.fill_ternary_(1)
         self.assertTrue(bool((layer.effective_weight() == 1).all()))
         self.assertTrue(bool((layer.effective_bias() == 0).all()))

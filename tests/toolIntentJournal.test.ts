@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { persistAuthorizedToolIntent } from "../src/main/toolIntentJournal";
 import { ToolExecutor } from "../src/main/toolExecutor";
 import type { BrainService, RuntimeJobManager } from "../src/main/brainService";
+import type { ToolExecutionResult, ToolInvocation } from "../src/shared/types";
 import { vi } from "vitest";
 
 describe("durable pre-effect tool intent", () => {
@@ -49,16 +50,32 @@ describe("durable pre-effect tool intent", () => {
     const owner = join(directory, "fixture");
     await mkdir(owner);
     let level: "off" | "ask" | "auto" | "full" = "ask";
+    const boundaries: string[] = [];
     const service = {
       repository: { brainDirectory: () => owner },
-      listToolPermissions: async () => [{ toolId: "web.fetch", level, updatedAt: "revision" }]
+      listToolPermissions: async () => [{ toolId: "web.fetch", level, updatedAt: "revision" }],
+      // Production calls this guard for every admitted tool. For ordinary
+      // web.fetch it is a no-op, after the synced intent and fresh permissions.
+      authorizeInlineImagination: vi.fn(async (invocation: ToolInvocation, executionId: string, requestId: string, intentPath: string) => {
+        expect(invocation.toolId).toBe("web.fetch");
+        expect(JSON.parse(await readFile(intentPath, "utf8"))).toMatchObject({
+          id: executionId, requestId, state: "authorized-before-side-effects"
+        });
+        boundaries.push("authorized");
+      }),
+      queueCompletedToolExecution: vi.fn(async (_invocation: ToolInvocation, result: ToolExecutionResult) => {
+        expect(result).toMatchObject({ state: "complete", dispatchStarted: true,
+          output: { body: "fixture only; no request sent" } });
+        boundaries.push("retained");
+      })
     } as unknown as BrainService;
     const executor = new ToolExecutor(service, {} as RuntimeJobManager, undefined, { execute: vi.fn() });
-    const audit = vi.spyOn(executor as unknown as { audit(): Promise<void> }, "audit").mockResolvedValue(undefined);
+    const audit = vi.spyOn(executor as unknown as { audit(): Promise<void> }, "audit").mockImplementation(async () => { boundaries.push("audited"); });
     const dispatch = vi.spyOn(executor as unknown as { dispatch(): Promise<unknown> }, "dispatch").mockImplementation(async () => {
       const receipts = await readdir(join(owner, "engine", "operational-tool-intents"));
       expect(receipts.length).toBeGreaterThan(0);
       expect(JSON.parse(await readFile(join(owner, "engine", "operational-tool-intents", receipts.at(-1)!), "utf8"))).toMatchObject({ brainId: "fixture", state: "authorized-before-side-effects" });
+      boundaries.push("dispatched");
       return { body: "fixture only; no request sent" };
     });
     const invocation = { brainId: "fixture", toolId: "web.fetch", action: "fetch", arguments: { url: "https://example.org" } };
@@ -68,7 +85,9 @@ describe("durable pre-effect tool intent", () => {
       expect(dispatch).not.toHaveBeenCalled();
       const approved = await executor.execute({ ...invocation, approvalToken: ask.approvalToken }, undefined, "turn-fixture");
       expect(approved.state).toBe("complete");
+      expect(approved.error).toBeUndefined();
       expect(dispatch).toHaveBeenCalledOnce();
+      expect(boundaries).toEqual(["authorized", "dispatched", "retained", "audited"]);
       level = "off";
       expect((await executor.execute(invocation)).state).toBe("failed");
       expect(dispatch).toHaveBeenCalledOnce();

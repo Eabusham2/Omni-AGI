@@ -150,6 +150,20 @@ class NativeActionProtocolFixtures(unittest.TestCase):
         self.assertNotIn("#private-source", json.dumps(schema))
         self.assertTrue(validate_structural_value(value, schema))
 
+    def test_resume_keeps_completed_effect_identity_when_owned_idea_view_changes(self):
+        ledger = NativeActionEmissionLedger("same-turn")
+        action = {"kind": "imagine", "toolId": "modality.imagine", "action": "generate", "arguments": {
+            "modality": "image", "conceptIdView": {"brainId": "old", "sha256": "a" * 64}, "sourceTurnId": "same-turn"}}
+        original = ledger.register(action, step=0, phase="pre-speech")
+        restored = NativeActionEmissionLedger.from_suspension_state(ledger.suspension_state(), "same-turn")
+        next_view = {**action, "arguments": {**action["arguments"], "conceptIdView": {"brainId": "copy", "sha256": "b" * 64}}}
+        self.assertIsNone(restored.register(next_view, step=3, phase="mid-generation"))
+        self.assertEqual(next(iter(restored.actions.values()))["actionId"], original["actionId"])
+        # A genuine MCP argument with the same spelling remains semantic.
+        mcp = {**action, "kind": "tool", "toolId": "mcp.fixture"}
+        self.assertIsNotNone(restored.register(mcp, step=4, phase="mid-generation"))
+        self.assertIsNotNone(restored.register({**mcp, "arguments": next_view["arguments"]}, step=5, phase="mid-generation"))
+
     def test_unseen_schema_candidates_use_the_same_projection_without_registering_answers(self):
         head = ToolRouteHead.__new__(ToolRouteHead)
         nn.Module.__init__(head)

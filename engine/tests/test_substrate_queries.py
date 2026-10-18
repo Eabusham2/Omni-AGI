@@ -15,6 +15,7 @@ def inspection_brain(*, neurons=None, assemblies=None, synapses=None):
         synapses=synapses or {},
         growth_events=0,
         state_revision=0,
+        effective_activation=lambda record: record.get("activation", 0.0),
     )
     return brain
 

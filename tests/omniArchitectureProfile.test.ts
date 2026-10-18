@@ -44,13 +44,19 @@ describe("ground-up OmniCortex architecture accounting", () => {
       exactPackedTableParameterCount: 560_608,
       exactPackedTernaryParameterCount: 1_301_695,
       packedTernaryWeightBytes: 325_454,
+      connectionStateBytes: 1_301_695,
+      packedLearnedStateBytes: 1_627_149,
       packedWorkspaceTableBytes: 131_072,
+      workspaceConnectionStateBytes: 524_288,
+      maximumProjectionBytes: 663_564,
+      pythonOwnerMetadataReserveBytes: 1_703_936,
       packedMetaplasticityReserveBytes: 72_908,
-      fixedControlBufferReserveBytes: 16_384,
-      packedUpdateScratchBytes: 4_194_304,
-      residentInferenceStateBytes: 455_706,
-      minimumTrainingStateBytes: 4_650_010,
-      checkpointTensorBytes: 1_504_282,
+      fixedControlBufferReserveBytes: 17_216,
+      packedUpdateScratchBytes: 17_825_792,
+      residentInferenceStateBytes: 3_462_169,
+      packedForwardTensorReserveBytes: 201_260,
+      minimumTrainingStateBytes: 21_489_221,
+      checkpointTensorBytes: 2_806_809,
       parameterCountBasis: "architecture-logical-neural-elements"
     });
   });
@@ -88,10 +94,11 @@ describe("ground-up OmniCortex architecture accounting", () => {
     );
     expect(profile.minimumTrainingStateBytes).toBe(
       profile.residentInferenceStateBytes +
-        profile.packedUpdateScratchBytes
+        profile.packedUpdateScratchBytes + (profile.packedForwardTensorReserveBytes ?? 0)
     );
+    expect(profile.packedLearnedStateBytes).toBe(profile.packedTernaryWeightBytes + profile.connectionStateBytes);
     expect(profile.checkpointTensorBytes).toBe(
-      profile.residentInferenceStateBytes +
+      profile.residentInferenceStateBytes - profile.pythonOwnerMetadataReserveBytes +
         1024 ** 2
     );
     expect(profile.residentInferenceStateBytes).toBeLessThan(
@@ -133,6 +140,7 @@ describe("ground-up OmniCortex architecture accounting", () => {
     expect(nativePlan.resources.modelWorkingSetBytes).toBe(
       Math.ceil(nativePlan.architecture!.residentInferenceStateBytes * 1.2)
     );
+    expect(nativePlan.resources.modelMetadataReserveBytes).toBe(nativePlan.architecture!.pythonOwnerMetadataReserveBytes);
     expect(nativePlan.resources.estimatedResidentModelBytes).toBe(
       Math.max(
         8 * 1024 ** 2,

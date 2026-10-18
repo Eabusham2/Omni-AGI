@@ -16,6 +16,26 @@ def canonical(value):
 
 
 class CorticalInspectionTests(unittest.TestCase):
+    def replace_core(self, tensors):
+        brain = json.loads((self.root / 'brain.json').read_bytes())
+        generation = json.loads((self.root / 'state' / brain['mutable_state']['generationManifest']).read_bytes())
+        scratch = self.root / 'state' / 'blobs' / 'updated.safetensors'
+        atomic_save_tensors(scratch, tensors)
+        payload = scratch.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        destination = scratch.with_name(digest + '.safetensors')
+        scratch.rename(destination)
+        generation['roles']['core'] = {'path': 'blobs/' + destination.name, 'sha256': digest, 'bytes': len(payload)}
+        generation.pop('contentSha256')
+        identity = hashlib.sha256(canonical(generation)).hexdigest()
+        generation['contentSha256'] = identity
+        relative = 'generations/' + identity + '/manifest.json'
+        path = self.root / 'state' / relative
+        atomic_write_json(path, generation)
+        brain['mutable_state'] = {'activeGeneration': identity, 'contentSha256': identity,
+            'generationManifest': relative, 'generationManifestSha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        atomic_write_json(self.root / 'brain.json', brain)
+
     def setUp(self):
         folder = tempfile.TemporaryDirectory(prefix="omni-cortex-inspection-")
         self.addCleanup(folder.cleanup)
@@ -79,6 +99,40 @@ class CorticalInspectionTests(unittest.TestCase):
         self.assertTrue(all(item["activation"] is None for item in page["records"]))
         links = query_committed_cortex(self.root, "b", {"entity": "links", "moduleId": self.name})
         self.assertTrue(all(item["semanticExplanationVerified"] is False for item in links["records"]))
+
+    def test_selected_projection_reads_actual_gain_and_resistance(self):
+        self.replace_core({self.name: torch.tensor([[0x64, 0x59], [0x64, 0x59]], dtype=torch.uint8),
+            'decoder.language_head._connection_state': torch.tensor([[0xF7, 0, 2, 0, 0, 0, 0], [0] * 7], dtype=torch.uint8)})
+        page = query_committed_cortex(self.root, 'b', {'entity': 'elements', 'moduleId': self.name, 'row': 0})
+        self.assertEqual(page['records'][0]['value'], -1)
+        self.assertEqual(page['records'][0]['strength'], 8)
+        self.assertEqual(page['records'][0]['resistance'], 15)
+        self.assertEqual(page['records'][0]['effectiveContribution'], -8)
+        self.assertEqual(page['connectionStateBytes'], 14)
+        links = query_committed_cortex(self.root, 'b', {'entity': 'links', 'moduleId': self.name, 'row': 0})
+        self.assertEqual(links['records'][0]['effectiveContribution'], -8)
+
+    def test_repeated_contact_slots_expose_real_endpoints_and_skip_tombstones(self):
+        from omni_core.model import PackedAdaptiveBitLinear
+        layer = PackedAdaptiveBitLinear(7, 2, bias=False)
+        layer.fill_ternary_(1)
+        layer.add_parallel_connection_(1, 3, sign=-1, strength=5)
+        layer.add_parallel_connection_(1, 3, sign=1, strength=7)
+        page = next(iter(layer.parallel_connections.pages.values()))
+        page.write(0, 0, 0, 0x55, 0, remove=True)
+        self.replace_core({'decoder.language_head.' + name: tensor for name, tensor in layer.state_dict().items()})
+        inventory = query_committed_cortex(self.root, 'b', {})
+        repeated = next(item for item in inventory['records'] if item.get('storageKind') == 'repeated-contact-page')
+        selected = {'entity': 'elements', 'moduleId': repeated['id'], 'row': 0, 'pageSize': 1}
+        empty = query_committed_cortex(self.root, 'b', selected)
+        self.assertEqual(empty['records'], [])
+        self.assertEqual(empty['scannedThrough'], 1)
+        next_page = query_committed_cortex(self.root, 'b', {**selected, 'cursor': empty['nextCursor']})
+        record = next_page['records'][0]
+        self.assertEqual((record['row'], record['column'], record['value'], record['strength'], record['ordinal']), (1, 3, 1, 7, 1))
+        self.assertTrue(record['isRepeatedContact'])
+        self.assertFalse(record['activationObserved'])
+        self.assertFalse(inventory['logicalInventoryComplete'])
 
 
 if __name__ == "__main__":

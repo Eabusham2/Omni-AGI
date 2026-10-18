@@ -22,6 +22,7 @@ import torch
 
 from .substrate_inspection import synapse_shard_inspection
 from .paged_assembly_view import PagedAssemblyView
+from .weighted_substrate_state import pack_strengths, synapse_strength
 from .vsa import (
     LazyPersistedSynapses,
     NeuralSubstrate,
@@ -39,7 +40,7 @@ from .vsa import (
 _BUCKETS = "0123456789abcdef"
 _MAX_SCRATCH_BATCH = 1024
 _ALLOWED_SYNAPSE_FIELDS = frozenset({
-    "id", "source_id", "target_id", "kind", *_SYNAPSE_TENSOR_FIELDS,
+    "id", "source_id", "target_id", "kind", "parallel_count", *_SYNAPSE_TENSOR_FIELDS,
 })
 
 
@@ -387,6 +388,8 @@ class BoundedSynapseShardPlan:
             "kind": "synapses", "ids": identifiers, "records": structures,
         })
         tensors = {
+            "packed_connection_strength": torch.tensor(list(pack_strengths(
+                synapse_strength(record) for _record_id, record in group)), dtype=torch.uint8),
             "packed_effective_weight": torch.tensor(
                 list(_pack_ternary_levels(weights)), dtype=torch.uint8
             ),
@@ -439,6 +442,7 @@ class BoundedSynapseShardPlan:
         changed = {
             location[0] for location in lazy._dirty_locations.values()
         }.union(location[0] for location in lazy._deleted_locations.values())
+        changed.update(self.substrate._weighted_migration_groups()["synapses"])
         ordered = iter(lazy._ordered_keys)
         current = next(ordered, None)
         for bucket in _BUCKETS:

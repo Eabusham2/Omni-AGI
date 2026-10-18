@@ -24,6 +24,7 @@ from .paged_packed_vectors import PagedPackedVectors, _decoded_row
 from .paged_vector_scoring import MAX_PAGE_ROWS, PackedVectorPage, PackedVectorRow
 from .paged_store_counts import row_count
 from .packed_vsa_vectors import _decode_exact_row
+from .weighted_vsa_row import activity as weighted_activity
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,7 @@ class PagedAssemblyVectorProvider:
         while True:
             page = self.page_rows(snapshot, cursor, page_size)
             for row in page.rows:
-                value = _decode_exact_row(row.packed, self.dimensions).to(torch.float32)
-                norm = value.norm()
-                yield row.assembly_id, value / norm if float(norm) > 0 else value
+                yield row.assembly_id, weighted_activity(row.packed, self.dimensions)
             if not page.has_more:
                 break
             cursor = page.next_cursor
@@ -213,6 +212,12 @@ class PagedAssemblyVectorProvider:
             for offset in range(0, len(identifiers), 256):
                 batch = [str(identifier) for _, identifier in identifiers[offset:offset + 256]]
                 placeholders = ",".join("?" for _ in batch)
+                payload_bytes = int(connection.execute(
+                    "SELECT COALESCE(SUM(LENGTH(packed)),0) FROM paged_vector_rows WHERE vector_id IN (%s)" % placeholders,
+                    batch,
+                ).fetchone()[0])
+                self.vectors._reserve_memory(4096 + payload_bytes * 4 + len(batch) * self.dimensions * 16,
+                    "weighted assembly scorer payloads")
                 fetched = connection.execute(
                     "SELECT sequence,vector_id,packed,updates,row_sha256 "
                     "FROM paged_vector_rows WHERE vector_id IN (%s)" % placeholders,

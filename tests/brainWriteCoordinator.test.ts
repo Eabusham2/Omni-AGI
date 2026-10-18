@@ -233,53 +233,262 @@ describe("per-brain writer coordination", () => {
     ]);
   });
 
-  it("preserves a blocked chat commit and the final Off tool permission", async () => {
+  it("changes host policy immediately while a neural writer is held and rejects its stale projection", async () => {
     const root = await mkdtemp(join(tmpdir(), "omni-brain-writer-permission-"));
     temporaryRoots.push(root);
     const repository = new BrainRepository(join(root, "brains"));
     await repository.initialize();
     const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Permission order" });
-    const chatStarted = deferred();
-    const releaseChat = deferred();
+    const writerStarted = deferred();
+    const releaseWriter = deferred();
     const service = new BrainService(
       repository,
       {
         request: vi.fn(async () => ({})),
-        requestStream: vi.fn(async () => {
-          chatStarted.resolve();
-          await releaseChat.promise;
-          return { text: "permission-safe response", trace: { id: "permission-trace" } };
-        })
+        requestStream: vi.fn(async () => ({ text: "unused", trace: { id: "unused" } }))
       } as unknown as EngineSupervisor
     );
 
-    const chat = service.chat(brain.id, "keep this turn");
-    await chatStarted.promise;
+    const writer = withBrainWrite(repository, brain.id, async () => {
+      const stale = await repository.get(brain.id);
+      writerStarted.resolve();
+      await releaseWriter.promise;
+      stale.journal = [...(stale.journal ?? []), {
+        id: "held-writer-finished",
+        createdAt: new Date().toISOString(),
+        kind: "system",
+        summary: "Held neural checkpoint committed."
+      }];
+      await repository.save(stale);
+    });
+    await writerStarted.promise;
     let permissionFinished = false;
     const permission = service
-      .setToolPermission(brain.id, "system.files", "off")
+      .setToolPermission(brain.id, "system.files", "off", "held-writer-revoke")
       .then((records) => {
         permissionFinished = true;
         return records;
       });
-    await eventLoopTurn();
-    expect(permissionFinished).toBe(false);
-
-    releaseChat.resolve();
-    await chat;
-    await expect(permission).resolves.toEqual(
+    let policyTimeout: ReturnType<typeof setTimeout> | undefined;
+    const boundedPermission = await Promise.race([
+      permission,
+      new Promise<never>((_resolve, reject) => {
+        policyTimeout = setTimeout(
+          () => reject(new Error("Host policy waited for the neural writer.")),
+          2_000
+        );
+      })
+    ]).finally(() => {
+      if (policyTimeout) clearTimeout(policyTimeout);
+    });
+    expect(permissionFinished).toBe(true);
+    expect(boundedPermission).toEqual(
       expect.arrayContaining([expect.objectContaining({ toolId: "system.files", level: "off" })])
     );
+
+    releaseWriter.resolve();
+    await writer;
     const saved = await repository.get(brain.id);
-    expect((await repository.conversationPage(brain.id)).entries.flatMap(
-      (entry) => entry.message ? [entry.message.content] : []
-    )).toEqual([
-      "keep this turn",
-      "permission-safe response"
-    ]);
+    expect(saved.journal?.at(-1)?.id).toBe("held-writer-finished");
     expect(
       saved.toolPermissions?.find((record) => record.toolId === "system.files")?.level
     ).toBe("off");
+  });
+
+  it("keeps a durable lost-ACK request idempotent after a later revocation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-host-policy-ack-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Permission ACK" });
+    const service = new BrainService(repository, {
+      request: vi.fn(async () => ({})),
+      requestStream: vi.fn(async () => ({ text: "", trace: { id: "unused" } }))
+    } as unknown as EngineSupervisor);
+
+    const granted = await service.setToolPermission(
+      brain.id,
+      "system.files",
+      "full",
+      "lost-ack-grant"
+    );
+    const grantedRevision = granted.find((record) => record.toolId === "system.files")?.revision;
+    expect(grantedRevision).toBeTypeOf("number");
+
+    const restartedRepository = new BrainRepository(join(root, "brains"));
+    await restartedRepository.initialize();
+    const restarted = new BrainService(restartedRepository, {
+      request: vi.fn(async () => ({})),
+      requestStream: vi.fn(async () => ({ text: "", trace: { id: "unused" } }))
+    } as unknown as EngineSupervisor);
+    const replay = await restarted.setToolPermission(
+      brain.id,
+      "system.files",
+      "full",
+      "lost-ack-grant"
+    );
+    expect(replay.find((record) => record.toolId === "system.files")?.revision).toBe(grantedRevision);
+
+    await restarted.setToolPermission(brain.id, "system.files", "off", "later-revocation");
+    const staleRetry = await restarted.setToolPermission(
+      brain.id,
+      "system.files",
+      "full",
+      "lost-ack-grant"
+    );
+    expect(staleRetry.find((record) => record.toolId === "system.files")?.level).toBe("off");
+  });
+
+  it("bootstraps first-call list and set from a validated saved non-default policy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-host-policy-bootstrap-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const makeLegacySavedPolicy = async (name: string) => {
+      const brain = await repository.create({
+        ...DEFAULT_CONFIG,
+        name,
+        idleCognition: false
+      });
+      brain.toolPermissions = (brain.toolPermissions ?? []).map((permission) =>
+        permission.toolId === "system.files"
+          ? { ...permission, level: "full" as const, updatedAt: "2026-10-01T00:00:00.000Z" }
+          : permission
+      );
+      await writeFile(
+        join(repository.brainDirectory(brain.id), "brain.json"),
+        JSON.stringify(brain, null, 2)
+      );
+      return brain;
+    };
+    const listedBrain = await makeLegacySavedPolicy("First list");
+    const setBrain = await makeLegacySavedPolicy("First set");
+    const service = new BrainService(repository, {
+      request: vi.fn(async () => ({})),
+      requestStream: vi.fn(async () => ({ text: "", trace: { id: "unused" } }))
+    } as unknown as EngineSupervisor);
+
+    expect((await service.listToolPermissions(listedBrain.id)).find(
+      (record) => record.toolId === "system.files"
+    )?.level).toBe("full");
+    const changedOtherTool = await service.setToolPermission(
+      setBrain.id,
+      "system.shell",
+      "off",
+      "first-set-other-tool"
+    );
+    expect(changedOtherTool.find((record) => record.toolId === "system.files")?.level).toBe("full");
+    expect(changedOtherTool.find((record) => record.toolId === "system.shell")?.level).toBe("off");
+  });
+
+  it("atomically defaults a discovered tool without overwriting a concurrent user choice", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-host-policy-ensure-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Permission ensure" });
+    const service = new BrainService(repository, {
+      request: vi.fn(async () => ({})),
+      requestStream: vi.fn(async () => ({ text: "", trace: { id: "unused" } }))
+    } as unknown as EngineSupervisor);
+
+    await service.ensureToolPermission(brain.id, "mcp.example.search", "ask", "discover-first");
+    const beforeOff = await repository.toolPermissionSnapshot(brain.id);
+    await service.setToolPermission(brain.id, "mcp.example.search", "off", "user-off");
+    const ensuredAgain = await service.ensureToolPermission(
+      brain.id,
+      "mcp.example.search",
+      "ask",
+      "discover-after-off"
+    );
+    expect(ensuredAgain.find((record) => record.toolId === "mcp.example.search")?.level).toBe("off");
+    await expect(service.setToolPermission(
+      brain.id,
+      "mcp.example.search",
+      "full",
+      "stale-settings-view",
+      beforeOff.revision
+    )).rejects.toThrow(/changed since this settings view/i);
+    expect((await service.listToolPermissions(brain.id)).find(
+      (record) => record.toolId === "mcp.example.search"
+    )?.level).toBe("off");
+  });
+
+  it("invalidates a single-use Ask token across an Off then Ask revision", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-host-policy-token-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Approval revision" });
+    const service = new BrainService(repository, {
+      request: vi.fn(async () => ({})),
+      requestStream: vi.fn(async () => ({ text: "", trace: { id: "unused" } }))
+    } as unknown as EngineSupervisor);
+    const executor = new ToolExecutor(service, {
+      generate: vi.fn(() => { throw new Error("Unexpected modality job."); })
+    } as unknown as RuntimeJobManager);
+    await service.setToolPermission(brain.id, "system.files", "ask", "token-ask-one");
+    const invocation = {
+      brainId: brain.id,
+      toolId: "system.files",
+      action: "read",
+      arguments: { path: join(root, "never-dispatched.txt") }
+    };
+    const first = await executor.execute(invocation);
+    expect(first.state).toBe("approval-required");
+    await service.setToolPermission(brain.id, "system.files", "off", "token-off");
+    await service.setToolPermission(brain.id, "system.files", "ask", "token-ask-two");
+    const retried = await executor.execute({ ...invocation, approvalToken: first.approvalToken });
+    expect(retried.state).toBe("approval-required");
+    expect(retried.approvalToken).not.toBe(first.approvalToken);
+  });
+
+  it("rechecks a concurrent revocation at the final pre-dispatch boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-policy-dispatch-"));
+    temporaryRoots.push(root);
+    const repository = new BrainRepository(join(root, "brains"));
+    await repository.initialize();
+    const brain = await repository.create({ ...DEFAULT_CONFIG, name: "Dispatch revocation" });
+    const service = new BrainService(repository, {
+      request: vi.fn(async () => ({})),
+      requestStream: vi.fn(async () => ({ text: "", trace: { id: "unused" } }))
+    } as unknown as EngineSupervisor);
+    await service.setToolPermission(brain.id, "system.files", "full", "dispatch-full");
+    const reachedBoundary = deferred();
+    const releaseBoundary = deferred();
+    vi.spyOn(service, "authorizeInlineImagination").mockImplementation(async () => {
+      reachedBoundary.resolve();
+      await releaseBoundary.promise;
+    });
+    const executor = new ToolExecutor(service, {
+      generate: vi.fn(() => { throw new Error("Unexpected modality job."); })
+    } as unknown as RuntimeJobManager);
+    const dispatch = vi.spyOn(
+      executor as unknown as { dispatch(...args: unknown[]): Promise<unknown> },
+      "dispatch"
+    );
+    vi.spyOn(
+      executor as unknown as { audit(...args: unknown[]): Promise<void> },
+      "audit"
+    ).mockResolvedValue(undefined);
+    const target = join(root, "must-not-read.txt");
+    await writeFile(target, "revoked before dispatch");
+
+    const execution = executor.execute({
+      brainId: brain.id,
+      toolId: "system.files",
+      action: "read",
+      arguments: { path: target }
+    });
+    await reachedBoundary.promise;
+    await service.setToolPermission(brain.id, "system.files", "off", "dispatch-off");
+    releaseBoundary.resolve();
+
+    await expect(execution).resolves.toMatchObject({
+      state: "failed",
+      error: expect.stringMatching(/permission changed before dispatch/i)
+    });
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it("preserves a neural chat failure and never commits a phantom turn", async () => {

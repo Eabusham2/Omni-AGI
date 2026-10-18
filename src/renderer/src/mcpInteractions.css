@@ -1,0 +1,35 @@
+.mcp-requests { min-width: 0; padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); }
+.mcp-requests > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+.mcp-requests h3, .mcp-request h4 { margin: 0; font: inherit; font-weight: 650; overflow-wrap: anywhere; }
+.mcp-requests h3 > span { margin-inline-start: 8px; font-variant-numeric: tabular-nums; }
+.mcp-requests__list { display: grid; gap: 12px; max-height: min(72vh, 850px); overflow: auto; scrollbar-gutter: stable; }
+.mcp-request { min-width: 0; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+.mcp-request form { min-width: 0; display: grid; gap: 12px; }
+.mcp-request header { display: grid; gap: 6px; }
+.mcp-request__source { font-size: .85em; font-weight: 600; overflow-wrap: anywhere; }
+.mcp-request__source-details { font-size: .85em; }
+.mcp-request__source-details p, .mcp-request p, .mcp-request small { overflow-wrap: anywhere; margin: 0; }
+.mcp-request__body { display: grid; gap: 12px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.mcp-request__field { display: grid; min-width: 0; gap: 6px; }
+.mcp-request__message { display: grid; gap: 10px; min-width: 0; }
+.mcp-request__message h5 { margin: 0; font: inherit; font-weight: 650; }
+.mcp-request__media { display: grid; gap: 6px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-solid, var(--surface)); }
+.mcp-request__media code { overflow-wrap: anywhere; }
+.mcp-request input:not([type="checkbox"]), .mcp-request textarea, .mcp-request select { box-sizing: border-box; width: 100%; min-width: 0; min-height: 38px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; font: inherit; color: var(--text); background: var(--surface-solid, var(--surface)); color-scheme: inherit; }
+.mcp-request input:not([type="checkbox"]):hover, .mcp-request textarea:hover, .mcp-request select:hover { border-color: color-mix(in srgb, var(--text) 36%, var(--border)); }
+.mcp-request select option { color: var(--text); background: var(--surface-solid, var(--surface)); }
+.mcp-request input[type="checkbox"] { width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent); }
+.mcp-request textarea { resize: vertical; min-height: 4rem; line-height: 1.5; }
+.mcp-request__choices { min-width: 0; display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.mcp-request__choices label, .mcp-request__boolean { display: flex; align-items: flex-start; gap: 10px; overflow-wrap: anywhere; }
+.mcp-request__boolean > span { display: grid; gap: 4px; }
+.mcp-request__choices input, .mcp-request__boolean input { flex: 0 0 auto; }
+.mcp-request__notice { font-size: .88em; line-height: 1.5; padding: 10px; border-inline-start: 3px solid var(--accent, #6376e9); background: var(--surface-raised, var(--surface)); }
+.mcp-request pre { max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 18rem; overflow: auto; padding: 10px; margin: 8px 0; font: .85em/1.5 var(--font-mono, monospace); }
+.mcp-request__url { border: 1px solid var(--border); border-radius: 8px; user-select: text; }
+.mcp-request footer { display: flex; flex-wrap: wrap; gap: 8px; }
+.mcp-request footer > button { min-height: 36px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.mcp-request__share { font-weight: 650; }
+.mcp-request :focus-visible { outline: 2px solid var(--accent, #6376e9); outline-offset: 3px; }
+.mcp-request__error { border-inline-start: 3px solid currentColor; padding-inline-start: 10px; }
+@media (max-width: 480px) { .mcp-requests, .mcp-request { padding: 10px; } .mcp-request footer > button { flex: 1 1 120px; } }

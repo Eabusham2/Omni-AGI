@@ -84,7 +84,9 @@ class PackedBrainAccountingTest(unittest.TestCase):
         )
         brain.liquid = LiquidController(config.idea_dim)
         brain.modalities = ModalityHub(config)
-        brain.memory = SimpleNamespace(synapses={})
+        brain.memory = SimpleNamespace(synapses={}, neuron_vectors={},
+                                       space=SimpleNamespace(dimensions=config.vsa_dim))
+        brain._reserve_core_diagnostic_state = lambda _bytes: None
 
         runtime = brain.packed_runtime_audit()
         self.assertTrue(runtime["complete"], runtime)

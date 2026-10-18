@@ -1,5 +1,21 @@
 import type { ActionEvent, StructuredAction } from "../../shared/types";
 import { conciseUiMessage } from "./uiPresentation";
+import { mcpTaskFromAction } from "./mcpTaskPresentation";
+
+/** A presentation hint only. Main-owned lookup still authorizes the opaque view. */
+export function chatActionMcpAppViewId(event: ActionEvent): string | undefined {
+  if (event.state !== "complete" || event.execution?.state !== "complete" || !event.action.toolId?.startsWith("mcp.")) return undefined;
+  const projection = event.mcpAppView;
+  if (projection?.brainId === event.brainId && projection.toolId === event.action.toolId && projection.savedArtifact === true &&
+      projection.untrusted === true && /^[a-f0-9]{64}$/.test(projection.artifactSha256) && /^[a-zA-Z0-9-]{1,128}$/.test(projection.id)) return projection.id;
+  if (event.execution.toolId !== event.action.toolId || event.execution.action !== event.action.action) return undefined;
+  const object = (value: unknown): Record<string, unknown> | undefined => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  const task = mcpTaskFromAction(event);
+  const output = task?.format === "omni-mcp-task-outcome" ? task.observedResult : event.execution.output;
+  const descriptor = object(object(object(output)?._meta)?.["omni/mcpApp"]);
+  if (!descriptor || descriptor.brainId !== event.brainId || descriptor.toolId !== event.action.toolId || descriptor.untrusted !== true) return undefined;
+  return typeof descriptor.id === "string" && /^[a-zA-Z0-9-]{1,128}$/.test(descriptor.id) ? descriptor.id : undefined;
+}
 
 export function chatActionCancellationTarget(
   event: ActionEvent,

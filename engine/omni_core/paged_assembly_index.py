@@ -57,6 +57,8 @@ _ASSEMBLY_METADATA_FIELDS = frozenset({
     "kind_provenance", "source_provenance", "confidence", "importance",
     "rehearsals", "statistical_experiences", "compressed_field",
     "created_at", "last_recalled_at", "source_label",
+    "memory_strength", "retention_score", "activity_score", "plasticity_score",
+    "reinforcement_drive", "unfinished_score", "unfinished", "settling_signals", "last_settled_at",
 })
 _SAFE_ID = re.compile(r"^[^\s\x00-\x1f\x7f]{1,512}$")
 _CREDENTIAL_MARKER = re.compile(
@@ -201,6 +203,21 @@ def _record_payload(record: Mapping[str, Any]) -> Tuple[str, str, bytes, str]:
             raise ValueError("assembly count metadata is invalid")
     if "compressed_field" in record and not isinstance(record["compressed_field"], bool):
         raise ValueError("assembly field marker is invalid")
+    for field in ("memory_strength", "retention_score", "activity_score", "plasticity_score", "reinforcement_drive", "unfinished_score"):
+        value = record.get(field)
+        if field in record and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 <= value <= 1):
+            raise ValueError("assembly settling score is invalid")
+    if "unfinished" in record and type(record["unfinished"]) is not bool:
+        raise ValueError("assembly unfinished marker is invalid")
+    signals = record.get("settling_signals")
+    if signals is not None and (not isinstance(signals, dict) or len(signals) > 64 or any(
+        not isinstance(name, str) or len(name) > 64 or any(ord(char) < 32 or ord(char) == 127 for char in name)
+        or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
+        for name, value in signals.items())):
+        raise ValueError("assembly settling signals are not bounded numeric state")
+    timestamp = record.get("last_settled_at")
+    if timestamp is not None and (not isinstance(timestamp, str) or len(timestamp) > 64 or any(ord(char) < 32 or ord(char) == 127 for char in timestamp)):
+        raise ValueError("assembly settling timestamp is invalid")
     try:
         payload = _canonical_json(projected)
     except (TypeError, ValueError) as error:
@@ -592,6 +609,10 @@ class PagedAssemblyIndex:
         )
 
     def _connect(self) -> sqlite3.Connection:
+        from .connected_transaction import borrow_paged_connection, enlist_paged_connection
+        shared = borrow_paged_connection(self.path)
+        if shared is not None:
+            return shared
         connection = sqlite3.connect(
             str(self.path), timeout=30.0, isolation_level=None
         )
@@ -600,7 +621,7 @@ class PagedAssemblyIndex:
         connection.execute("PRAGMA temp_store=FILE")
         from .paged_idle_selection import observe_idle_source_connection
         observe_idle_source_connection(connection, self.path)
-        return connection
+        return enlist_paged_connection(self.path, connection)
 
     @contextmanager
     def _transaction(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -944,7 +965,7 @@ class PagedAssemblyIndex:
             return self._decode_record(row)
 
     def get_packed_vector(self, assembly_id: str) -> Optional[bytes]:
-        """Read the single authoritative row for an indexed assembly ID."""
+        """Read only the base sign plane of an indexed assembly row."""
 
         if not isinstance(assembly_id, str) or not assembly_id:
             return None
@@ -959,6 +980,18 @@ class PagedAssemblyIndex:
             return None
         try:
             return self._vectors.packed_row(assembly_id)
+        except KeyError:
+            return None
+
+    def get_weighted_vector(self, assembly_id: str) -> Optional[bytes]:
+        """Read the full sign/strength/repeated-contact payload without loss."""
+        if not isinstance(assembly_id, str) or not assembly_id or self._vectors is None:
+            return None
+        with self._transaction() as connection:
+            if connection.execute("SELECT 1 FROM assembly_records WHERE assembly_id=?", (assembly_id,)).fetchone() is None:
+                return None
+        try:
+            return self._vectors.row_payload(assembly_id)
         except KeyError:
             return None
 

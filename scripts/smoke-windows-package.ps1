@@ -152,6 +152,17 @@ function Get-DesktopCompliance {
   return $Report
 }
 
+function Get-PortableRuntimeRecord {
+  param([Parameter(Mandatory = $true)][string]$PackageRoot)
+  $Serialized = @(& node (Join-Path $RepoRoot "scripts\verify-portable-runtime.mjs") --directory $PackageRoot --source-commit $VerifiedSourceCommit) -join [Environment]::NewLine
+  if ($LASTEXITCODE -ne 0) { throw "Packaged portable runtime receipt verification failed." }
+  $Record = $Serialized | ConvertFrom-Json
+  if ($Record.portableProtocol -ne 1 -or $Record.sourceCommit -ne $VerifiedSourceCommit -or $Record.runtimeReceiptVerified -ne $true -or $Record.selectedInstanceTested -ne $false -or $Record.destinationReservationTested -ne $false -or $Record.neuralAcceptanceTested -ne $false) {
+    throw "Portable runtime verification returned an invalid or overstated receipt."
+  }
+  return $Record
+}
+
 function Remove-TreeWithRetry {
   param(
     [Parameter(Mandatory = $true)]
@@ -325,6 +336,8 @@ try {
   $InstalledCompliance = Get-DesktopCompliance `
     -PackageRoot $InstallRoot `
     -Label "Windows NSIS install"
+  $ZipPortable = Get-PortableRuntimeRecord -PackageRoot $ZipApps[0].DirectoryName
+  $InstalledPortable = Get-PortableRuntimeRecord -PackageRoot $AppExecutable.DirectoryName
   if (
     $ZipCompliance.ffmpegPolicySha256 -ne
     $InstalledCompliance.ffmpegPolicySha256
@@ -417,6 +430,7 @@ try {
       desktopSignature = $ZipAppSignature
       rpcSmoke = $ZipSmoke | ConvertFrom-Json
       compliance = $ZipCompliance
+      portableRuntime = $ZipPortable
     }
     nsis = @{
       name = $Installer.Name
@@ -433,6 +447,7 @@ try {
       neuralAcceptanceTested = $false
       desktopLaunchSkippedReason = $LaunchSkipReason
       compliance = $InstalledCompliance
+      portableRuntime = $InstalledPortable
     }
     signing = @{
       expectedSigned = $ExpectedSigned

@@ -28,6 +28,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from .offload import NeuralStateResourcePause
+from .regional_execution import canonical_device, current_regional_target
 
 
 _ACTIVE_PAGER: contextvars.ContextVar[Optional["WorkingAttentionPager"]] = (
@@ -89,13 +90,14 @@ class _ActivityPage:
     verified_stat: Optional[Tuple[int, int, int, int]] = None
     allocated_size: int = 0
     quota_lease: Any = None
+    references: int = 1
 
 
 class _OwnedSpillLease:
     """Independent image lifetime; pager.close cannot credit a live backing."""
     def __init__(self, pager, size, shared):
         self.pager, self.shared = pager, shared
-        self.key, self.path = uuid.uuid4().hex, None
+        self.key, self.path = uuid.uuid4().hex, getattr(shared, "path", None)
         pager._owned_spill_leases[self.key] = int(size)
 
     def bind_path(self, path):
@@ -103,6 +105,9 @@ class _OwnedSpillLease:
         if self.shared is not None:
             self.shared.bind_path(path)
         return self
+
+    def open(self):
+        return self.shared.open(os.O_WRONLY) if callable(getattr(self.shared, "open", None)) else os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 
     def commit(self, actual_allocated_bytes=None, *, path=None, promised_bytes=0):
         self.bind_path(path)
@@ -181,6 +186,7 @@ class WorkingAttentionPager:
             "largestPageBytes": 0,
             "largestReadBytes": 0,
             "peakHostTransferBytes": 0,
+            "bytesTransferred": 0,
             "largestKeyTileTokens": 0,
             "largestQueryTileTokens": 0,
             "largestScoreElements": 0,
@@ -277,30 +283,40 @@ class WorkingAttentionPager:
                 operation + " exceeds its live compute reservation",
                 estimatedComputeBytes=needed,
             )
-        status = self._resource_status(needed)
+        target = self.compute_device if device is None else device
+        regional = current_regional_target(self.resource_policy)
+        if regional is not None and canonical_device(target) != canonical_device(regional):
+            raise RuntimeError("regional attention requested a different device than its current admitted region")
+        # Only the new explicitly armed regional path uses another device's
+        # allocator reading. The original single-device path is unchanged.
+        host_needed = 0 if regional is not None and target.type == "cuda" else needed
+        status = self._resource_status(host_needed)
         if status.get("memoryPressure"):
             # The hot pool is expendable. Spill before making a live resource
             # pause, but never reduce requested context or discard KV pages.
             self._evict_to(0)
             self._policy_at = 0.0
-            status = self._resource_status(needed)
+            status = self._resource_status(host_needed)
             if status.get("memoryPressure"):
                 self._pause(operation + " paused at the live RAM reserve", resource=status)
         free = status.get("acceleratorFreeMemoryBytes")
-        target = self.compute_device if device is None else device
-        if target.type != "cpu" and free is not None and needed > int(free):
+        if regional is not None:
+            self.resource_policy.require_device(target, needed, operation + " regional device allocation")
+        elif target.type != "cpu" and free is not None and needed > int(free):
             self._pause(operation + " paused at live accelerator headroom", resource=status)
         self._metrics["peakComputeTileBytes"] = max(
             self._metrics["peakComputeTileBytes"], needed
         )
 
-    def _admit_write(self, size: int) -> None:
-        allocated = math.ceil(int(size) / self._allocation_unit) * self._allocation_unit
+    def _admit_write(self, size: int, *, check_disk=True, allocated_bytes=None) -> None:
+        allocated = math.ceil(int(size) / self._allocation_unit) * self._allocation_unit if allocated_bytes is None else allocated_bytes
         if self._allocated_spill_bytes + sum(self._owned_spill_leases.values()) + allocated > self.scratch_budget_bytes:
             self._pause(
                 "working activity spill pool is full; context was not truncated",
                 requiredAdditionalSpillBytes=allocated,
             )
+        if not check_disk:
+            return  # The placed lease already checked its actual selected drive.
         status = self._resource_status()
         free = status.get("diskFreeBytes")
         reserve = int(status.get("diskReserveBytes", 0))
@@ -309,55 +325,65 @@ class WorkingAttentionPager:
 
     def reserve_owned_spill(self, size: int, operation: str = "saved activity image"):
         self.check_cancelled()
-        self._admit_write(size)
-        allocated = math.ceil(int(size) / self._allocation_unit) * self._allocation_unit
-        reserve = getattr(self.resource_policy, "reserve_spill", None)
-        shared = reserve(allocated, operation) if callable(reserve) else None
+        shared, allocated = self._reserve_page_spill(size, operation, ".saved-activation")
         return _OwnedSpillLease(self, allocated, shared)
+
+    def _reserve_page_spill(self, size, operation, suffix):
+        place = getattr(self.resource_policy, "allocate_spill_file", None)
+        placed = place(size, operation, suffix, cancelled=self.check_cancelled) if callable(place) else None
+        allocated = placed.promised_bytes if placed is not None else math.ceil(int(size) / self._allocation_unit) * self._allocation_unit
+        try:
+            self._admit_write(size, check_disk=placed is None, allocated_bytes=allocated)
+        except BaseException:
+            if placed is not None:
+                placed.release()
+            raise
+        if placed is not None:
+            return placed, allocated
+        reserve = getattr(self.resource_policy, "reserve_spill", None)
+        return (reserve(allocated, operation) if callable(reserve) else None), allocated
 
     def _spill(self, page: _ActivityPage) -> None:
         if page.path is None:
             self.check_cancelled()
-            self._admit_write(page.size)
-            self.directory.mkdir(parents=True, exist_ok=True)
-            path = self.directory / (page.identifier + ".activity")
-            reserve = getattr(self.resource_policy, "reserve_spill", None)
-            promised = math.ceil(page.size / self._allocation_unit) * self._allocation_unit
-            quota = reserve(promised, "working activity page") if callable(reserve) else None
+            quota, promised = self._reserve_page_spill(page.size, "working activity page", ".activity")
+            if getattr(quota, "path", None) is not None:
+                path = quota.path
+            else:
+                self.directory.mkdir(parents=True, exist_ok=True)
+                path = self.directory / (page.identifier + ".activity")
             if quota is not None:
                 quota.bind_path(path)
-            assert page.tensor is not None
-            # Each payload is one admitted page, never the complete context.
-            flat = page.tensor.contiguous().reshape(-1)
-            if flat.numel() and flat.stride(0) != 1:
-                flat = flat.clone(memory_format=torch.contiguous_format)
-            payload = flat.view(torch.uint8).numpy().tobytes()
             try:
-                with path.open("xb") as handle:
-                    handle.write(payload)
-            except BaseException:
-                path.unlink(missing_ok=True)
+                assert page.tensor is not None
+                # Each payload is one admitted page, never the complete context.
+                flat = page.tensor.contiguous().reshape(-1)
+                if flat.numel() and flat.stride(0) != 1:
+                    flat = flat.clone(memory_format=torch.contiguous_format)
+                payload = flat.view(torch.uint8).numpy().tobytes()
+                self.check_cancelled()
+                with (os.fdopen(quota.open(os.O_WRONLY), "wb") if callable(getattr(quota, "open", None)) else path.open("xb")) as handle:
+                    if handle.write(payload) != len(payload):
+                        raise OSError("working activity page had a short write")
+                stat = path.stat()
+                blocks = getattr(stat, "st_blocks", None)
+                allocated = (
+                    max(page.size, int(blocks) * 512)
+                    if blocks is not None
+                    else math.ceil(page.size / self._allocation_unit) * self._allocation_unit
+                )
+                if self._allocated_spill_bytes + allocated > self.scratch_budget_bytes:
+                    self._pause("physical activity-page allocation exceeds the spill pool; context was not truncated")
                 if quota is not None:
-                    quota.release()
-                raise
-            stat = path.stat()
-            blocks = getattr(stat, "st_blocks", None)
-            allocated = (
-                max(page.size, int(blocks) * 512)
-                if blocks is not None
-                else math.ceil(page.size / self._allocation_unit) * self._allocation_unit
-            )
-            if self._allocated_spill_bytes + allocated > self.scratch_budget_bytes:
-                path.unlink(missing_ok=True)
-                self._pause("physical activity-page allocation exceeds the spill pool; context was not truncated")
-            page.path = path
-            if quota is not None:
-                try:
                     quota.commit(allocated, path=path)
-                except BaseException:
+            except BaseException:
+                try:
                     path.unlink(missing_ok=True)
-                    quota.release()
-                    raise
+                finally:
+                    if quota is not None:
+                        quota.release()
+                raise
+            page.path = path
             page.quota_lease = quota
             page.digest = hashlib.sha256(payload).hexdigest()
             page.allocated_size = allocated
@@ -403,6 +429,8 @@ class WorkingAttentionPager:
             )
             if held is not None:
                 held.mark_allocated(size)
+        if tensor.device.type != "cpu":
+            self._metrics["bytesTransferred"] += size
         self._pages[page.identifier] = page
         self._hot[page.identifier] = None
         self._resident_bytes += page.size
@@ -479,15 +507,30 @@ class WorkingAttentionPager:
         self._metrics["largestReadBytes"] = max(self._metrics["largestReadBytes"], count)
         return torch.frombuffer(payload, dtype=page.dtype).reshape(end - start, *page.shape[1:])
 
+    def retain_page(self, identifier: str) -> None:
+        """Serialized immutable activity sharing, not a second allocation."""
+        self.check_cancelled()
+        page = self._pages.get(identifier)
+        if page is None or page.references < 1:
+            raise ValueError("cannot retain a released activity page")
+        page.references += 1
+
     def release_page(self, identifier: str) -> None:
-        page = self._pages.pop(identifier, None)
+        page = self._pages.get(identifier)
         if page is None:
             return
+        if page.references > 1:
+            page.references -= 1
+            return
+        if page.path is not None:
+            # Keep ownership/quota tracked if unlink fails. A snapshot close
+            # must not pretend a surviving physical backing was reclaimed.
+            page.path.unlink(missing_ok=True)
+        self._pages.pop(identifier)
         self._hot.pop(identifier, None)
         if page.tensor is not None:
             self._resident_bytes -= page.size
         if page.path is not None:
-            page.path.unlink(missing_ok=True)
             if page.quota_lease is not None:
                 page.quota_lease.release()
             self._spill_bytes -= page.size
@@ -564,6 +607,32 @@ class PagedTensorSequence:
     def length(self) -> int:
         return self._shape[self.axis]
 
+    def fork(self) -> "PagedTensorSequence":
+        """Independent append cursor over the same immutable CPU pages.
+
+        Tail coalescing writes a NEW page. Refcounts keep the original tail
+        alive while another cache needs it; no live sequence is edited.
+        """
+        if self._closed:
+            raise RuntimeError("cannot fork a released activity sequence")
+        reserve = getattr(self.pager.resource_policy, "reserve_ram", None)
+        size = 512 + len(self.pages) * 64
+        lease = reserve(size, "copy-on-write KV sequence metadata") if callable(reserve) else None
+        result = object.__new__(PagedTensorSequence)
+        result.pager, result.axis, result.dtype = self.pager, self.axis, self.dtype
+        result._shape, result.pages, result.ends = list(self._shape), [], []
+        result._closed, result._page_tokens, result._fork_meta_lease = False, self._page_tokens, lease
+        try:
+            for identifier in self.pages:
+                self.pager.retain_page(identifier)
+                result.pages.append(identifier)
+            result.ends = list(self.ends)
+            if lease is not None: lease.mark_allocated(size)
+            return result
+        except BaseException:
+            result.close()
+            raise
+
     def append(self, tensor: torch.Tensor) -> None:
         if self._closed:
             raise RuntimeError("cannot append a released activity sequence")
@@ -631,7 +700,10 @@ class PagedTensorSequence:
             position = stop
             index += 1
         values = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=self.axis)
-        return values.to(device=device)
+        result = values.to(device=device)
+        if values.device != result.device:
+            self.pager._metrics["bytesTransferred"] += values.numel() * values.element_size()
+        return result
 
     def close(self) -> None:
         if self._closed:
@@ -641,6 +713,10 @@ class PagedTensorSequence:
         self.pages.clear()
         self.ends.clear()
         self._closed = True
+        lease = getattr(self, "_fork_meta_lease", None)
+        if lease is not None:
+            lease.release()
+            self._fork_meta_lease = None
 
     def __del__(self) -> None:
         try:
@@ -811,19 +887,42 @@ class SavedActivityTensor:
             self.close()
             raise
 
+    def fork(self) -> "SavedActivityTensor":
+        """Share immutable activation pages; workspace containers stay private."""
+        if self._closed:
+            raise RuntimeError("cannot fork released saved activity")
+        reserve = getattr(self.pager.resource_policy, "reserve_ram", None)
+        size = 512 + len(self.pages) * 32
+        lease = reserve(size, "copy-on-write workspace activity metadata") if callable(reserve) else None
+        result = object.__new__(SavedActivityTensor)
+        result.pager, result.shape, result.dtype = self.pager, self.shape, self.dtype
+        result.device, result.numel, result.element_size = self.device, self.numel, self.element_size
+        result.pages, result._restore_image, result._closed = [], self._restore_image, False
+        result._fork_meta_lease = lease
+        try:
+            for identifier in self.pages:
+                self.pager.retain_page(identifier)
+                result.pages.append(identifier)
+            if lease is not None: lease.mark_allocated(size)
+            return result
+        except BaseException:
+            result.close()
+            raise
+
     def _cpu_image(self) -> _SavedActivityImage:
         if self._restore_image is not None:
             self._restore_image.verify()
             return self._restore_image
         size = self.numel * self.element_size
         lease = self.pager.reserve_owned_spill(size, "saved activation CPU image")
-        path = self.pager.directory / (uuid.uuid4().hex + ".saved-activation")
+        path = lease.path or self.pager.directory / (uuid.uuid4().hex + ".saved-activation")
         digest = hashlib.sha256()
         written = 0
         try:
             lease.bind_path(path)
-            self.pager.directory.mkdir(parents=True, exist_ok=True)
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            if path.parent == self.pager.directory:
+                self.pager.directory.mkdir(parents=True, exist_ok=True)
+            descriptor = lease.open()
             with os.fdopen(descriptor, "wb", buffering=0) as handle:
                 for identifier in self.pages:
                     self.pager.check_cancelled()
@@ -881,7 +980,9 @@ class SavedActivityTensor:
             raise RuntimeError("cannot restore a released saved activation")
         target = torch.device(self.device if device is None else device)
         size = self.numel * self.element_size
-        if target.type == "cpu":
+        manager = getattr(self.pager.resource_policy, "device_resources", None)
+        ram_only = manager is not None and manager.settings.get("allowStorageSpill") is False
+        if target.type == "cpu" and not ram_only:
             if self.numel == 0:
                 return torch.empty(self.shape, dtype=self.dtype, device=target)
             image = self._cpu_image()
@@ -896,20 +997,27 @@ class SavedActivityTensor:
                 self.pager._metrics.get("cpuSavedActivationMappingCount", 0) + 1
             )
             return result.reshape(self.shape)
-        self.pager.admit_compute(size, "saved activation complete accelerator tensor minimum", device=target)
-        result = torch.empty(self.numel, dtype=self.dtype, device=target)
-        offset = 0
-        for identifier in self.pages:
-            metadata = self.pager._pages[identifier]
-            with _saved_activity_scratch(self.pager, metadata.size * 4, "bounded saved activation accelerator transfer"):
-                page = self.pager.read_page(identifier).reshape(-1)
-                if offset + page.numel() > self.numel:
-                    raise ValueError("saved activation pages exceed the exact tensor size")
-                result[offset:offset + page.numel()].copy_(page.to(device=target))
-                offset += page.numel()
-        if offset != self.numel:
-            raise ValueError("saved activation pages do not cover the exact tensor size")
-        return result.reshape(self.shape)
+        self.pager.admit_compute(size, "saved activation complete resident tensor minimum", device=target)
+        reserve = getattr(self.pager.resource_policy, "reserve_ram", None)
+        reservation = reserve(size, "saved activation RAM-only restoration") if ram_only and callable(reserve) else nullcontext()
+        with reservation as held:
+            result = torch.empty(self.numel, dtype=self.dtype, device=target)
+            offset = 0
+            for identifier in self.pages:
+                metadata = self.pager._pages[identifier]
+                with _saved_activity_scratch(self.pager, metadata.size * 4, "bounded saved activation resident transfer"):
+                    page = self.pager.read_page(identifier).reshape(-1)
+                    if offset + page.numel() > self.numel:
+                        raise ValueError("saved activation pages exceed the exact tensor size")
+                    result[offset:offset + page.numel()].copy_(page.to(device=target))
+                    if page.device != target:
+                        self.pager._metrics["bytesTransferred"] += page.numel() * page.element_size()
+                    offset += page.numel()
+            if offset != self.numel:
+                raise ValueError("saved activation pages do not cover the exact tensor size")
+            if held is not None:
+                held.mark_allocated(size)
+            return result.reshape(self.shape)
 
     def close(self) -> None:
         if self._closed:
@@ -921,6 +1029,10 @@ class SavedActivityTensor:
         # immutable image lifetime. Dropping this reference does not unmap it.
         self._restore_image = None
         self._closed = True
+        lease = getattr(self, "_fork_meta_lease", None)
+        if lease is not None:
+            lease.release()
+            self._fork_meta_lease = None
 
     def __del__(self) -> None:
         try:
