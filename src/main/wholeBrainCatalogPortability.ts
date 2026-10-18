@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative as pathRelative, resolve } from "node:path";
+import { isAbsolute, join, relative as pathRelative, resolve, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
@@ -193,9 +193,15 @@ function checkedPointer(value: unknown, binding?: Row): Row {
   checkedIndex(row.index);
   return structuredClone(row);
 }
+export function wholeBrainCatalogSqlitePath(path: string, platform: NodeJS.Platform = process.platform): string {
+  // Node's filesystem calls handle extended-length Windows paths themselves;
+  // SQLite opens the authenticated file separately through the native VFS.
+  // Deep lineage paths can exceed MAX_PATH even for a tiny catalog.
+  return platform === "win32" ? win32.toNamespacedPath(path) : path;
+}
 async function validateIndex(file: WholeBrainCatalogFile, root: string, records: number, shards: Set<string>, options: WholeBrainCatalogReadOptions): Promise<void> {
   await admitWholeBrainCatalogMemory(options, 1024 * 1024, "SQLite/page scratch");
-  const database = new DatabaseSync(file.sourcePath!, { readOnly: true, allowExtension: false });
+  const database = new DatabaseSync(wholeBrainCatalogSqlitePath(file.sourcePath!), { readOnly: true, allowExtension: false });
   try {
     database.exec("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; PRAGMA cache_size=-512; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA threads=1");
     if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") throw new Error("Whole-brain catalog index integrity failed.");

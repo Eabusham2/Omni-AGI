@@ -83,7 +83,7 @@ do not pretend to inventory facts or expose hidden chain-of-thought.
 
 ## Focused evidence
 
-Sixteen distinct new cases in `engine/tests/test_reply_execution_planner.py`
+Seventeen distinct new cases in `engine/tests/test_reply_execution_planner.py`
 passed across affected selections. They import stdlib-only modules under an
 isolated test package, use inert metadata/clocks/callbacks, actual Events and a
 tiny real SQLite effect ledger, and inspect the actual chat/generation/Worker
@@ -102,6 +102,8 @@ seams as AST/source. Coverage includes:
 - aborted/failed delivery versus completed operation accounting.
 - publication after an already applied update, without adding another Stop or
   diagnostic pressure gate ahead of the original atomic save.
+- diagnostic metadata-lease release failure after a committed real request,
+  without repeating the body or reporting the committed request as failed.
 
 The clock values exercise the selector contract; they are not neural or
 hardware speed evidence. No model/brain/decoder constructor, Load, neural

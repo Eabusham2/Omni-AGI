@@ -12,6 +12,7 @@ import {
   userQuestionCountdown,
   userQuestionDraftError,
   userQuestionDraftResponse,
+  userQuestionInPanel,
   userQuestionResolutionLabel,
   userQuestionTimeoutSeconds,
   type UserQuestionDraft
@@ -25,6 +26,16 @@ export interface UserQuestionPanelProps {
   onResolved?: (question: UserQuestionRecord) => void;
   /** Optional task-local view; the durable question service remains shared. */
   questionIds?: string[];
+  /** Conversation reuses the cards without duplicating Learn/Fact Check trays. */
+  presentation?: "task" | "conversation";
+}
+
+const apiOwners = new WeakMap<UserQuestionsApi, number>();
+let nextApiOwner = 0;
+function apiOwner(api: UserQuestionsApi): number {
+  let owner = apiOwners.get(api);
+  if (owner === undefined) { owner = ++nextApiOwner; apiOwners.set(api, owner); }
+  return owner;
 }
 
 function errorMessage(error: unknown): string {
@@ -32,11 +43,12 @@ function errorMessage(error: unknown): string {
 }
 
 export function UserQuestionPanel(props: UserQuestionPanelProps) {
-  // Reset only when changing identities, not when new chat output arrives.
-  return <UserQuestionPanelInstance key={props.brainId} {...props} />;
+  // A replaced API is a new live owner too. Unmounting retires its subscriptions
+  // and late answers without resetting the panel on ordinary chat output.
+  return <UserQuestionPanelInstance key={JSON.stringify([props.brainId, apiOwner(props.api), props.presentation ?? "task"])} {...props} />;
 }
 
-function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: UserQuestionPanelProps) {
+function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds, presentation = "task" }: UserQuestionPanelProps) {
   const [records, setRecords] = useState<UserQuestionRecord[]>([]);
   const [preferences, setPreferences] = useState<UserQuestionPreferences>({ ...DEFAULT_USER_QUESTION_PREFERENCES });
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
@@ -44,10 +56,11 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
   const [error, setError] = useState("");
   const [reload, setReload] = useState(0);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const callback = useRef(onResolved);
-  const visibleIds = useRef(questionIds);
-  visibleIds.current = questionIds;
+  const visibleScope = useRef({ brainId, questionIds, presentation });
+  visibleScope.current = { brainId, questionIds, presentation };
   const notified = useRef(new Set<string>());
   const alive = useRef(true);
   const headingId = useId();
@@ -56,7 +69,8 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
   const notifyResolution = useCallback((record: UserQuestionRecord) => {
-    if (visibleIds.current && !visibleIds.current.includes(record.id)) return;
+    const scope = visibleScope.current;
+    if (!userQuestionInPanel(record, scope.brainId, scope.questionIds, scope.presentation)) return;
     if (!record.resolution || record.suspended || notified.current.has(record.resolution.id)) return;
     notified.current.add(record.resolution.id);
     callback.current?.(record);
@@ -75,6 +89,7 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
       unsubscribe = api.onEvent((event) => {
         if (!active || event.brainId !== brainId) return;
         if ("question" in event) {
+          if (event.question.brainId !== brainId) { setError("A question update belongs to another instance."); return; }
           if (scanning) duringScan.set(event.question.id, event.question);
           setRecords((current) => mergeUserQuestionRecords(current, [event.question]));
           if (event.type === "resolved" || event.type === "cancelled") notifyResolution(event.question);
@@ -87,7 +102,10 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
     } catch (failure) { setError(errorMessage(failure)); }
     void Promise.allSettled([api.list(brainId), api.preferences(brainId)]).then(([saved, policy]) => {
       if (!active) return;
-      if (saved.status === "fulfilled") setRecords(mergeUserQuestionRecords(saved.value, [...duringScan.values()]));
+      if (saved.status === "fulfilled") {
+        if (saved.value.some(record => record.brainId !== brainId)) setError("Saved questions belong to another instance.");
+        else setRecords(mergeUserQuestionRecords(saved.value, [...duringScan.values()]));
+      }
       if (policy.status === "fulfilled") {
         setPreferences(policyDuringScan ?? policy.value);
         setPreferencesLoaded(true);
@@ -101,9 +119,11 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
     return () => { active = false; unsubscribe(); };
   }, [api, brainId, notifyResolution, reload]);
 
-  const visible = questionIds ? records.filter(record => questionIds.includes(record.id)) : records;
+  const visible = records.filter(record => userQuestionInPanel(record, brainId, questionIds, presentation));
   const pending = visible.filter((record) => record.status === "pending");
   const history = visible.filter((record) => record.status !== "pending");
+  const activePendingIds = pending.filter(record => !record.suspended).map(record => record.id).join("\0");
+  useEffect(() => { if (presentation === "conversation" && (activePendingIds || error)) setExpanded(true); }, [activePendingIds, error, presentation]);
   const hasDeadline = pending.some((record) => !record.suspended && record.timeout.deadlineAt);
   useEffect(() => {
     if (!hasDeadline) return;
@@ -114,12 +134,15 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
 
   const receive = (saved: UserQuestionRecord[]) => {
     if (!alive.current) return;
+    if (saved.some(record => record.brainId !== brainId)) throw new Error("The question response belongs to another instance.");
     setRecords((current) => mergeUserQuestionRecords(current, saved));
   };
   const refreshAfterFailure = () => { if (alive.current) setReload((current) => current + 1); };
   const respond = async (record: UserQuestionRecord, response: UserQuestionResponse) => {
     try {
       const answered = await api.respond({ brainId, questionId: record.id, response });
+      if (!alive.current) return;
+      if (answered.id !== record.id) throw new Error("The answer receipt belongs to another question.");
       receive([answered]);
       if (alive.current) notifyResolution(answered);
     } catch (failure) { refreshAfterFailure(); throw failure; }
@@ -127,6 +150,8 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
   const cancel = async (record: UserQuestionRecord) => {
     try {
       const skipped = await api.cancel(brainId, record.id);
+      if (!alive.current) return;
+      if (skipped.id !== record.id) throw new Error("The skipped receipt belongs to another question.");
       receive([skipped]);
       if (alive.current) notifyResolution(skipped);
     } catch (failure) { refreshAfterFailure(); throw failure; }
@@ -136,11 +161,11 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
     catch (failure) { refreshAfterFailure(); throw failure; }
   };
 
-  return <section className="user-questions" aria-labelledby={headingId} aria-busy={loading || undefined}>
-    <header className="user-questions__header">
-      <h3 id={headingId}>Questions{pending.length ? <span className="user-questions__count">{pending.length}</span> : null}</h3>
-      <span className="user-questions__state" role="status">{loading ? "Loading…" : pending.length ? "Waiting for you" : "No open questions"}</span>
-    </header>
+  // Keep the subscription alive, but add no permanent empty row to chat.
+  // A real question/history event or a service error reveals the existing UI.
+  if (presentation === "conversation" && !error && visible.length === 0) return null;
+  const stateLabel = error ? "Needs attention" : loading ? "Loading…" : pending.some(record => !record.suspended) ? "Waiting for you" : pending.length ? "Paused copy" : "No open questions";
+  const contents = <>
     {error ? <div className="user-questions__error" role="alert">
       <details><summary>Questions could not update</summary><p>{error}</p></details>
       <button type="button" onClick={() => setReload((current) => current + 1)}>Retry</button>
@@ -161,6 +186,21 @@ function UserQuestionPanelInstance({ brainId, api, onResolved, questionIds }: Us
         return saved;
       }} /> : <p className="user-questions__hint">{loading ? "Loading settings…" : "Retry to load saved settings."}</p>}
     </details>
+  </>;
+  return <section className={`user-questions${presentation === "conversation" ? " user-questions--conversation" : ""}`} aria-labelledby={headingId} aria-busy={loading || undefined}>
+    {presentation === "conversation" ? <details open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}>
+      <summary className="user-questions__header">
+        <span id={headingId} className="user-questions__heading">Questions{pending.length ? <span className="user-questions__count">{pending.length}</span> : null}</span>
+        <span className="user-questions__state" role="status">{stateLabel}</span>
+      </summary>
+      <div className="user-questions__content">{contents}</div>
+    </details> : <>
+      <header className="user-questions__header">
+        <h3 id={headingId}>Questions{pending.length ? <span className="user-questions__count">{pending.length}</span> : null}</h3>
+        <span className="user-questions__state" role="status">{stateLabel}</span>
+      </header>
+      {contents}
+    </>}
   </section>;
 }
 

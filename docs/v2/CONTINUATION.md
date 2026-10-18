@@ -1,5 +1,101 @@
 # Current implementation continuation
 
+### October18 current — signing integration checked; retained-VRAM context implementation and next CI candidate pending
+
+Full source candidate `aebefaf9055382f41653162cce599ff548b62e7c` and its exact
+seven-file CI-manifest assertion correction
+`9ae0f3130a1b30ee7b501b4e45b2f6b67d6d8483` are committed and pushed to `main`.
+Primary main was fast-forwarded cleanly; no feature branch, tag or v2 release
+was created. The full goal remains active, not finished by those commits.
+
+On9ae0f31 Android and iOS passed. Both macOS/Linux architectures passed desktop
+source contracts. macOSARM64 also passed all10 no-engine UI contracts, then
+failed packaged-worker health validation. macOSIntel failed ordinary DMG
+detach with Resource busy. Both Linux packages built, then their same responsive
+case failed because compact lifecycle controls displaced the header;9 other UI
+cases passed. Windowsx64/ARM64 exposed ASAR separator, deep SQLite path and
+durable plugin throughput/shutdown defects; ARM64 additionally exposed a
+metadata-collision fixture. These are real failed runs, not green packaging.
+
+The affected fixes are composed locally and await the next reviewed candidate:
+Windows path normalization, durable per-commit plugin journals and closing-state
+custody, deterministic file-replacement/metadata fixtures, ordinary Conversation
+question rendering and compact layout, and bounded vendor DMG detach retries.
+No checks were disabled or timeouts raised to hide those failures. Current
+desktop workflows also cancel superseded branch runs; Stable release remains
+non-cancelling. Source byte/descriptor guarantees remain stated accurately.
+
+Paused activity-clock custody was already implemented; only stale public
+descriptions changed. One newly found metadata-lease cleanup failure could
+misreport committed requests; its new inert SQLite case passes. The reply
+slice now has17 cases. The current fixed eight-file Python runner passed
+**75/75**, with zero failures, errors or skips:16 earlier contracts,12 memory,
+17 reply,10 mixed,13 outer-learning and7 native-kernel integrity contracts.
+The neural-import guard remains enforced. The old67-case seven-file run below
+is historical evidence, not the current runner total.
+
+Current Node and renderer TypeScript both exited0 after the affected fixes.
+The latest local application-shell bundle also exited0 after the question/
+header changes. The separate signing-hook correction now has its affected
+dependency-level result below; full packaged smoke remains unproven.
+The release-manifest selection passed1 case with1 excluded; the documentation
+curriculum selection passed2. These are source/inert/byte-contract results,
+not model training, a full package build, remote CI or published artifacts.
+
+Ordinary chat questions had a real missing panel, now fixed using the existing
+component, trusted turn correlation and retired-owner fences. Five new source
+cases and bounded native component/keyboard/scroll/error/copy checks are
+recorded in chat-question-surface.md. Root closed its isolated preview28774
+with exit0. Compact Retry wrapping and a nested-scroll trap were reproduced
+and corrected in the affected states; history, two-selection submission,
+written input, API retirement, Learn-scope exclusion, error/Retry, paused-copy
+Resume and instance retirement were checked. Runtime answers remain retained
+ordinary evidence, not an invented
+waiting-decoder wakeup or proof of learned use. Questions do not grant access.
+
+The macOS compiler-bound payload/hash mechanism has bounded local proof.
+Build-time finalization accepts only unchanged machine payload through supported
+Mach-O relocation/signature transform, then seals the exact final whole-file
+hash. Runtime still requires that exact hash, current source hash and ABI;
+there is no signature-neutral runtime bypass or optional-kernel fallback.
+Seven stdlib contracts, five Node contracts and a tiny real ARM64 C++/ad-hoc-
+signing/ctypes fixture have their bounded evidence in
+native-kernel-package-integrity.md. This does not reconstruct the missing
+remote health payload or prove a full signed/notarized application.
+
+The signing integration is now frozen: pinned `osx-sign` requires synchronous
+`optionsForFile`; the corrected callback uses synchronous path custody and a
+bounded stdlib root finalizer. Async `afterPack` remains unchanged. One new
+actual-installed signing-loop regression with inert callbacks passed41ms;
+the five older kernel/DMG cases were not repeated. Package mac.sign schema,
+path/CJS, signing order, Windows architecture and DMG override API shapes were
+matched. This closes that source/dependency mismatch, not packaged signing smoke.
+
+One required plan-fidelity implementation gap remains active, not merely a
+hardware-evidence gap: retained-context KV capacity currently uses the CPU/disk
+WorkingAttentionPager, while the planner caps RAM/spill and appends only a
+diagnostic multidevice projection. Root assigned actual enabled-device KV
+residency and capacity-planner implementation to uncached_forward_impl.
+Existing distributed Gloo/NCCL learning and collectives are already implemented;
+it is cross-rank Auto qualification that remains unqualified, not all distributed
+training. The upcoming packaging-fix push must not claim full-plan source closure.
+
+The affected390px Call-open/close shell check now reports zero horizontal shell
+overflow with compact status font/line-height11px/13px. Evidence is
+`.runtime/responsive-overflow-cua-11px.png` and `.log`; the owned preview exited0.
+This is a bounded no-engine layout check, not all themes/devices or model speed.
+
+The affected desktop path/plugin/layout/DMG and signing fixes have scoped local
+results; retained-VRAM context source work above remains separately active. They
+have not yet been repushed or requalified remotely. Android/iOS green on9ae0f31
+does not make Windows/macOS/Linux green on the corrected tree. Do not reopen
+the frozen lanes or initialize a brain. Root's next gate is the reviewed
+candidate commit/push, required platform runs, package smoke, tag and verified
+publication. Broader hardware/provider/performance and deferred learned-
+quality/full-folder training boundaries remain unchanged.
+
+## Historical checkpoints — current status above takes precedence
+
 ### October18 current handoff — source lanes frozen; local shell build green
 
 The fixed-memory scheduler, real reply planner, six-text-kind mixed sequential

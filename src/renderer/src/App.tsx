@@ -91,6 +91,7 @@ import { projectBrainMapContact, uniqueRegionLayoutNodes } from "./brainMapGraph
 import { ComposerSubmitControl } from "./ComposerSubmitControl";
 import { ChatAttachmentMenu } from "./ChatAttachmentMenu";
 import { ChatQueueStack } from "./ChatQueueStack";
+import { UserQuestionPanel } from "./UserQuestionPanel";
 import { ChatDirectionStrip } from "./ChatDirectionStrip";
 import { useChatDirections } from "./useChatDirections";
 import { chatDirectionStripItem, isSteerDirectionMessage } from "./chatDirectionPresentation";
@@ -5652,6 +5653,7 @@ function ChatWorkspace({
           ) : null}
         </div>
         <div className="composer-wrap">
+          {window.omni?.questions ? <UserQuestionPanel brainId={brain.id} api={window.omni.questions} presentation="conversation" /> : null}
           {waitingInheritedFileReview && inheritedFileReview ? <InheritedTaskFilesReview
             review={inheritedFileReview.review} input={inheritedFileReview.input}
             busy={inheritedFileReview.busy} paused={inheritedFileReview.paused} error={inheritedFileReview.error}

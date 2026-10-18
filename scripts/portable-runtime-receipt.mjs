@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import { lstat, open, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 function verifyCompiledPortableProtocol(path) {
@@ -10,7 +10,9 @@ function verifyCompiledPortableProtocol(path) {
   const { extractFile } = require("@electron/asar");
   const packaged = JSON.parse(extractFile(path, "package.json", false).toString("utf8"));
   if (packaged.main !== "out/main/index.js") throw new Error("Portable runtime has an unexpected main entry.");
-  const main = extractFile(path, packaged.main, false).toString("utf8");
+  // package.json entry points use '/', but @electron/asar traverses its
+  // directory header with the current host's path separator on Windows.
+  const main = extractFile(path, normalize(packaged.main), false).toString("utf8");
   for (const fragment of ["omni-portable-launcher", "omni-portable-workspace", "portable-destination.json", "portable-adoption"]) {
     if (!main.includes(fragment)) throw new Error("The packaged desktop main is stale and lacks the portable workspace protocol. Rebuild before packaging.");
   }

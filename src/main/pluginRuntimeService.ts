@@ -169,7 +169,7 @@ export class PluginRuntimeService extends EventEmitter implements PluginRuntimeA
   private readonly selecting = new Set<string>();
   private readonly pending = new Map<string, Pending>();
   private readonly learning = new Map<string, Promise<void>>();
-  private readonly stopping = new Map<string, { brainId: string; promise: Promise<PluginRuntimeSession> }>();
+  private readonly stopping = new Map<string, { brainId: string; value: Live; promise: Promise<PluginRuntimeSession> }>();
   private readonly unsubscribe: () => void;
   constructor(private readonly plugins: PluginService, private readonly options: PluginRuntimeServiceOptions) {
     super(); if (!Number.isSafeInteger(options.moduleReadyTimeoutMs ?? 15000) || (options.moduleReadyTimeoutMs ?? 15000) < 1 || (options.moduleReadyTimeoutMs ?? 15000) > 60000) throw new Error("Invalid bounded module-ready timeout.");
@@ -563,7 +563,13 @@ export class PluginRuntimeService extends EventEmitter implements PluginRuntimeA
   async list(brainId: string, page: { afterRowid?: number; maxBytes?: number } = {}): Promise<import("../shared/pluginRuntime").PluginRuntimeSessionPage> {
     const maximum = page.maxBytes ?? 262144; return this.admittedRead(brainId, maximum * 12 + 65536, async () => {
       const store = await PluginRuntimeStore.open(await this.options.brainRoot(brainId), brainId, { readOnly: true }); if (!store) return { sessions: [], total: 0 };
-      try { const result = store.sessionsPage(page.afterRowid, maximum); return { ...result, sessions: result.sessions.map(session => this.live.get(session.sessionId)?.session ?? { ...session, brainId, state: "dormant" }) }; } finally { store.close(); } });
+      try { const result = store.sessionsPage(page.afterRowid, maximum); return { ...result, sessions: result.sessions.map(session => {
+        // Revoking a renderer is not the end of its pending cancellation and
+        // custody flush. Keep that exact closing session visible, without
+        // putting it back in the executable live/session registry.
+        const current = this.live.get(session.sessionId) ?? this.stopping.get(session.sessionId)?.value;
+        return current?.session.brainId === brainId ? structuredClone(current.session) : { ...session, brainId, state: "dormant" as const };
+      }) }; } finally { store.close(); } });
   }
   private async reader(brainId: string, sourceSha256?: string): Promise<PluginRuntimeStore | undefined> { const root = await this.options.brainRoot(runtimeId(brainId));
     return sourceSha256 ? openPluginRuntimeSource(root, brainId, sourceSha256) : PluginRuntimeStore.open(root, brainId, { readOnly: true }); }
@@ -611,14 +617,14 @@ export class PluginRuntimeService extends EventEmitter implements PluginRuntimeA
   async stop(brainId: string, sessionId: string): Promise<PluginRuntimeSession> { const pending = this.stopping.get(sessionId); if (pending) { if (pending.brainId !== brainId) throw new Error("Runtime stop belongs to another owner."); return pending.promise; }
     const value = this.live.get(sessionId);
     if (!value || value.session.brainId !== brainId) throw new Error("Runtime session is not active for this owner.");
-    const operation = this.finish(value, "stopped"), record = { brainId, promise: operation }; this.stopping.set(sessionId, record);
+    const operation = this.finish(value, "stopped"), record = { brainId, value, promise: operation }; this.stopping.set(sessionId, record);
     try { return await operation; } finally { if (this.stopping.get(sessionId) === record) this.stopping.delete(sessionId); } }
   private async fail(value: Live, error: string): Promise<void> {
     // The existing Stop owns its error. A fire-and-forget renderer-gone callback
     // must not mirror a rejected persistence promise as an unhandled failure.
     if (this.stopping.has(value.session.sessionId)) return;
     if (this.live.get(value.session.sessionId) === value) {
-    const operation = this.finish(value, "failed", error), record = { brainId: value.session.brainId, promise: operation }; this.stopping.set(value.session.sessionId, record);
+    const operation = this.finish(value, "failed", error), record = { brainId: value.session.brainId, value, promise: operation }; this.stopping.set(value.session.sessionId, record);
     try { await operation; } finally { if (this.stopping.get(value.session.sessionId) === record) this.stopping.delete(value.session.sessionId); } } }
   private acceptShutdownAck(value: Live, input: PluginRuntimeRpcRequest): PluginRuntimeRpcReply {
     value.controller.signal.throwIfAborted(); const pending = value.shutdown, args = input.arguments;
@@ -702,6 +708,13 @@ export class PluginRuntimeService extends EventEmitter implements PluginRuntimeA
     }
     this.publish(value, "session"); this.publish(value, "contributions"); if (failure) throw failure; return structuredClone(value.session);
   }
-  async stopOwner(brainId: string): Promise<void> { for (const value of [...this.live.values()]) if (value.session.brainId === brainId) await this.stop(brainId, value.session.sessionId); }
-  async dispose(): Promise<void> { this.unsubscribe(); for (const value of [...this.live.values()]) await this.stop(value.session.brainId, value.session.sessionId); }
+  private async settleStops(brainId?: string): Promise<void> {
+    const pending = [...this.stopping.values()].filter(value => brainId === undefined || value.brainId === brainId).map(value => value.promise);
+    for (const value of this.live.values()) if (brainId === undefined || value.session.brainId === brainId)
+      pending.push(this.stop(value.session.brainId, value.session.sessionId));
+    const failure = (await Promise.allSettled(pending)).find((value): value is PromiseRejectedResult => value.status === "rejected");
+    if (failure) throw failure.reason;
+  }
+  async stopOwner(brainId: string): Promise<void> { await this.settleStops(brainId); }
+  async dispose(): Promise<void> { this.unsubscribe(); await this.settleStops(); }
 }

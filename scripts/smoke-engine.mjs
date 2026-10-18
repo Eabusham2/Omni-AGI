@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { packagedWorkerHealthDiagnostic } from "./packaged-worker-health.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
@@ -96,6 +97,7 @@ try {
   const health = await rpc("health", "health");
   if (
     health?.ready !== true ||
+    (healthOnly && health?.loadedBrains !== 0) ||
     health?.worker !== "python" ||
     health?.protocolVersion !== 1 ||
     health?.operatingSystem !== process.platform ||
@@ -104,7 +106,8 @@ try {
     typeof health?.torchVersion !== "string" || !health.torchVersion ||
     typeof health?.platform !== "string" || !health.platform
   ) {
-    throw new Error("Packaged worker returned an invalid health response.");
+    throw new Error(`Packaged worker returned an invalid health response: ${JSON.stringify(
+      packagedWorkerHealthDiagnostic(health, process.platform))}`);
   }
 
   if (!healthOnly) {

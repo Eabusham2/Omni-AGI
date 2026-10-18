@@ -14,10 +14,15 @@
 .user-questions__header, .user-question__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .user-questions__header { justify-content: space-between; margin-bottom: 8px; }
 .user-questions__header h3 { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--text); font: inherit; font-weight: 650; }
+.user-questions__heading { display:flex;align-items:center;gap:7px;color:var(--text);font-weight:650; }
+.user-questions--conversation { padding:0;margin-bottom:10px; }
+.user-questions--conversation > details > summary { padding:9px 12px;margin:0; }
+.user-questions--conversation .user-questions__content { max-height:min(40vh,420px);overflow:auto;overscroll-behavior:contain;padding:0 12px 12px; }
 .user-questions__count { min-width: 22px; padding: 0 6px; border-radius: 99px; background: var(--violet-soft); text-align: center; font-variant-numeric: tabular-nums; }
 .user-questions__state, .user-questions__hint { color: var(--text-2); font-size: 12px; }
 .user-questions__hint { margin: 6px 0; }
 .user-questions__pending { display: grid; gap: 10px; max-height: min(60vh, 640px); overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 2px; }
+.user-questions--conversation :is(.user-questions__pending, .user-questions__history-list) { max-height: none; overflow: visible; overscroll-behavior: auto; }
 .user-question { min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; }
 .user-question form, .user-question-settings { margin: 0; min-width: 0; }
 .user-question fieldset { display: block; min-inline-size: 0; margin: 0; padding: 0; border: 0; }
@@ -50,6 +55,7 @@
 .user-question__error { max-height: 130px; overflow: auto; margin: 8px 0; font-size: 12px; }
 .user-questions__error { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 8px; margin-bottom: 8px; background: color-mix(in srgb, var(--danger) 7%, var(--card-surface)); border-radius: 7px; }
 .user-questions__error details { min-width: 0; }
+.user-questions__error > button { flex: 0 0 auto; white-space: nowrap; overflow-wrap: normal; }
 .user-questions__error p { max-height: 150px; overflow: auto; margin: 6px 0 0; }
 .user-questions__error summary { color: inherit; }
 .user-questions__history, .user-questions__settings { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 7px; }

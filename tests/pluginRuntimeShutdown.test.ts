@@ -14,6 +14,7 @@ import type { ToolExecutionResult } from "../src/shared/types";
 const roots: string[] = [], services: PluginRuntimeService[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
+  if (vi.isFakeTimers()) { await vi.runOnlyPendingTimersAsync(); vi.useRealTimers(); }
   for (const service of services.splice(0)) await service.dispose();
   for (const path of roots.splice(0)) await rm(path, { recursive: true, force: true });
 });
@@ -66,6 +67,10 @@ sdk.onDeactivate(async()=>{globalThis.observe("cleanup-enter");globalThis.entere
 sdk.onDeactivate(()=>{throw new Error("owned local cleanup error");});`, 100, true);
   const session = await f.activate(), prior = f.request("call", { toolId: "system.files", action: "read", arguments: {} }, "prior-pending").catch(() => undefined);
   await f.admitted.promise;
+  // This test inspects a held cleanup before the real 100ms deadline. Disk
+  // reads on a Windows runner are allowed to take longer than that deadline;
+  // control only its clock instead of raising the product timeout.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const stopping = f.service.stop("owner", session.sessionId); await f.entered.promise;
   expect(f.callbacks().signal.aborted).toBe(false); expect((await f.service.list("owner")).sessions[0]!.state).toBe("stopping");
   const shutdown = f.sent.find(message => message.kind === "deactivate")!;
@@ -82,6 +87,31 @@ sdk.onDeactivate(()=>{throw new Error("owned local cleanup error");});`, 100, tr
   expect(f.events).toContain("Runtime is closed"); expect(f.events.indexOf("cleanup-finished")).toBeLessThan(f.events.indexOf("abort"));
   expect(f.events.indexOf("deactivate-before-abort:true")).toBeLessThan(f.events.indexOf("cleanup-enter"));
   expect(f.terminate).toHaveBeenCalledOnce(); expect(f.release).toHaveBeenCalledOnce(); expect(f.callbacks().signal.aborted).toBe(true);
+});
+
+it("keeps revoked closing-session diagnostics and owner disposal pending until durable custody finishes", async () => {
+  const f = await fixture(`globalThis.omniRuntime.onDeactivate(()=>{});`), session = await f.activate();
+  const entered = deferred(), flush = deferred(), original = PluginRuntimeStore.prototype.record;
+  const write = vi.spyOn(PluginRuntimeStore.prototype, "record").mockImplementation(async function(this: PluginRuntimeStore, kind, value) {
+    if (kind === "runtime-shutdown") { entered.resolve(); await flush.promise; }
+    return original.call(this, kind, value);
+  });
+  const stopping = f.service.stop("owner", session.sessionId);
+  try {
+    await entered.promise;
+    expect(f.callbacks().signal.aborted).toBe(true);
+    expect((await f.service.list("owner")).sessions[0]!.state).toBe("stopping");
+    await expect(f.request("call", { toolId: "system.files", action: "read", arguments: {} })).rejects.toThrow(/stale or foreign/);
+    let ownerDone = false, disposed = false;
+    const owner = f.service.stopOwner("owner").then(() => { ownerDone = true; });
+    const disposal = f.service.dispose().then(() => { disposed = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ownerDone).toBe(false); expect(disposed).toBe(false);
+    flush.resolve();
+    expect((await stopping).state).toBe("stopped"); await owner; await disposal;
+    expect(ownerDone).toBe(true); expect(disposed).toBe(true);
+    expect(f.terminate).toHaveBeenCalledOnce(); expect(f.release).toHaveBeenCalledOnce();
+  } finally { flush.resolve(); await stopping.catch(() => undefined); write.mockRestore(); }
 });
 
 it("bounds missing cleanup ACK, persists truthful timeout and still terminates/releases on diagnostic write refusal", async () => {

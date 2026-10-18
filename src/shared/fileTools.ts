@@ -7,6 +7,7 @@ export interface FileToolSource {
   contentSha256?: string;
   displayName: string;
   bytes: number;
+  /** Host metadata fence or task-manifest binding; not a host-file opening-byte hash. */
   identity: string;
 }
 export interface FileToolPage {
@@ -19,6 +20,7 @@ export interface FileToolPage {
   content: string;
   /** SHA of exactly the returned bytes, not the unread remainder. */
   sha256: string;
+  /** SHA over the completed returned stream, not an atomic host-file-at-open snapshot. */
   wholeSha256?: string;
   complete: boolean;
   hasMore: boolean;

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { PluginInteractivePanelLaunch, PluginInteractiveToolReceipt } from "../shared/pluginInteractivePanels";
 import type { ToolInvocation } from "../shared/types";
 import { runtimeHash, runtimeId, runtimeJson } from "./pluginRuntimeValidation";
+import { configurePluginCustodyJournal } from "./pluginCustodyJournal";
 
 export const PANEL_RECEIPT_PATH = "plugin-panels/workspace.sqlite3";
 export const PANEL_RECEIPT_FORMAT = "omni-plugin-panel-receipts-1";
@@ -36,7 +37,8 @@ export class PluginPanelReceiptStore {
     if (file && (!file.isFile() || file.isSymbolicLink() || hooks && file.nlink !== 1)) throw new Error("Panel receipt file must be independently mutable.");
     const db = new DatabaseSync(path, { readOnly: !hooks, allowExtension: false });
     try { db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=2500; PRAGMA cache_size=-256; PRAGMA temp_store=FILE;");
-      if (!file && create) { db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;"); for (const sql of schema) db.exec(sql); db.prepare("INSERT INTO meta VALUES('format',?)").run(PANEL_RECEIPT_FORMAT); db.prepare("INSERT INTO meta VALUES('brainId',?)").run(owner); }
+      if (hooks) configurePluginCustodyJournal(db);
+      if (!file && create) { for (const sql of schema) db.exec(sql); db.prepare("INSERT INTO meta VALUES('format',?)").run(PANEL_RECEIPT_FORMAT); db.prepare("INSERT INTO meta VALUES('brainId',?)").run(owner); }
       regularSchema(db, owner); return new PluginPanelReceiptStore(db, owner, !hooks, hooks);
     } catch (error) { db.close(); throw error; }
   }

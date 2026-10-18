@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { BrainRepository } from "../src/main/brainRepository";
 import { adoptWholeBrainCatalog, collectWholeBrainCatalog, collectWholeBrainCatalogLineage,
-  wholeBrainCatalogCanonical, wholeBrainCatalogDigest, type WholeBrainCatalogFile } from "../src/main/wholeBrainCatalogPortability";
+  wholeBrainCatalogCanonical, wholeBrainCatalogDigest, wholeBrainCatalogSqlitePath, type WholeBrainCatalogFile } from "../src/main/wholeBrainCatalogPortability";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
@@ -47,6 +47,17 @@ async function materialize(root: string, files: Map<string, WholeBrainCatalogFil
 }
 
 describe("whole-brain catalog exact portability closure", () => {
+  it("preserves authenticated long drive and UNC index paths when SQLite needs the Windows namespace", () => {
+    const suffix = win32.join("whole-brain-catalog", "lineage", "sources", "a".repeat(64),
+      "whole-brain-catalog", "index", `${"b".repeat(64)}.sqlite3`);
+    const drive = win32.join("C:\\Users\\runneradmin\\AppData\\Local\\Temp\\omni-whole-catalog-long-fixture", suffix);
+    const unc = win32.join("\\\\server\\share\\saved-catalog", suffix);
+    expect(drive.length).toBeGreaterThan(260);
+    expect(wholeBrainCatalogSqlitePath(drive, "win32")).toBe(`\\\\?\\${drive}`);
+    expect(wholeBrainCatalogSqlitePath(unc, "win32")).toBe(`\\\\?\\UNC\\${unc.slice(2)}`);
+    expect(wholeBrainCatalogSqlitePath(`\\\\?\\${drive}`, "win32")).toBe(`\\\\?\\${drive}`);
+    expect(wholeBrainCatalogSqlitePath("/owned/catalog/index.sqlite3", "darwin")).toBe("/owned/catalog/index.sqlite3");
+  });
   it("visits only the pointer-referenced JSON chain and immutable location index", async () => {
     const value = await fixture();
     await writeFile(join(value.root, "whole-brain-catalog", "blobs", `${"f".repeat(64)}.json`), "unreferenced and corrupt");

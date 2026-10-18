@@ -17,7 +17,8 @@ it("keeps package CI on fixed source contracts and health-only worker paths", as
     "engine/tests/test_whole_path_memory_scheduler.py",
     "engine/tests/test_reply_execution_planner.py",
     "engine/tests/test_mixed_region_schedule.py",
-    "engine/tests/test_outer_learning_pipeline.py"
+    "engine/tests/test_outer_learning_pipeline.py",
+    "engine/tests/test_native_kernel_packaging_integrity.py"
   ]);
   expect(manifest.files.every(value => /^[a-f0-9]{64}$/.test(value.sha256))).toBe(true);
   for (const name of ["windows", "macos", "linux", "release"]) {

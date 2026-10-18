@@ -1,8 +1,9 @@
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import { runInNewContext } from "node:vm";
 import { createPackage } from "@electron/asar";
 import { afterEach, describe, expect, it } from "vitest";
 const roots: string[] = [];
@@ -48,5 +49,23 @@ describe("portable Windows build receipts (owned inert files only)", () => {
     const stored = JSON.parse(await readFile(receiptPath, "utf8"));
     await writeFile(receiptPath, JSON.stringify({ ...stored, sourceCommit: null }));
     await expect(receipts.verifyWindowsPortableRuntimeReceipt({ directory: root, version: "1.1.1", sourceCommit })).rejects.toThrow("source commit");
+  });
+  it("uses the host ASAR path separator without changing the exact packaged entry-point contract", async () => {
+    // Exercise the installed dependency's actual header traversal with Win32
+    // path operations, not a newly invented mock lookup or a running EXE.
+    const dependencyPath = join(dirname(require.resolve("@electron/asar")), "filesystem.js");
+    const dependency = createRequire(dependencyPath), owned = { exports: {} as { Filesystem?: new (root: string) => {
+      setHeader(header: unknown, size: number): void; getFile(path: string, follow: boolean): unknown;
+    } } };
+    runInNewContext(await readFile(dependencyPath, "utf8"), { module: owned, exports: owned.exports,
+      require: (id: string) => id === "path" ? win32 : dependency(id), Buffer, BigInt });
+    const filesystem = new owned.exports.Filesystem!("C:\\owned-inert-app");
+    filesystem.setHeader({ files: { out: { files: { main: { files: { "index.js": { size: 4, offset: "0" } } } } } } }, 0);
+    expect(() => filesystem.getFile("out/main/index.js", false)).toThrow(/not found/);
+    expect(filesystem.getFile(win32.normalize("out/main/index.js"), false)).toMatchObject({ size: 4, offset: "0" });
+    const source = await readFile(join(process.cwd(), "scripts", "portable-runtime-receipt.mjs"), "utf8");
+    expect(source).toContain('packaged.main !== "out/main/index.js"');
+    expect(source).toContain("extractFile(path, normalize(packaged.main), false)");
+    expect(source).not.toContain("extractFile(path, packaged.main, false)");
   });
 });

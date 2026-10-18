@@ -6,6 +6,11 @@ provider call or device capture was run for this slice. The user's deferred
 new-brain/merged-resume proof remains deferred. Existing prefill and one-shot
 cached-decoder interfaces remain separate and working; they were not replaced.
 
+Current research-versus-required-source dispositions are recorded in
+[final-execution-dispositions.md](final-execution-dispositions.md). In
+particular, enabled VRAM-backed retained-context capacity remains a required
+consumer gap, not a claim closed by diagnostic device projections.
+
 ## Actual source path and scope
 
 `src/shared/nativeOperationAuto.ts` supplies the additive DTOs.
@@ -927,7 +932,7 @@ argument decisions and pinned world callbacks. It dispatches the semantic-
 compatible existing complete consumer at each current frontier, consumes its
 actual measured selection and admits/accounts for non-migratable owner phases.
 Exact Worker turn-local Event custody keeps private cancellation out of opaque
-world callbacks; all real callbacks/publications remain once-only. Sixteen new
+world callbacks; all real callbacks/publications remain once-only. Seventeen new
 stdlib/inert/SQLite/AST cases have affected source evidence, not model or
 hardware proof. See [reply-execution-planner.md](reply-execution-planner.md).
 Subsequent source composition adds mixed sequential decoder regions for six

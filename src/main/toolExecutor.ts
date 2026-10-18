@@ -1402,7 +1402,7 @@ export class ToolExecutor {
           ...invocation.arguments,
           brainId: invocation.brainId,
           requestId: policyDecisionId,
-          source: { kind: "brain", actionId: policyDecisionId }
+          source: { kind: "brain", actionId: policyDecisionId, ...(chatTurnId ? { turnId: chatTurnId } : {}) }
         } as UserQuestionRequest);
       }
       case "system.memory":

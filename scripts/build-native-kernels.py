@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -120,6 +121,14 @@ def main():
     manifest = {"abi": 1, "platform": sys.platform, "architecture": architecture,
         "sourceSha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "sha256": hashlib.sha256((destination / name).read_bytes()).hexdigest(), "file": name}
+    if sys.platform == "darwin":
+        spec = importlib.util.spec_from_file_location("omni_build_native_integrity", Path(__file__).with_name("native_kernel_integrity.py"))
+        integrity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(integrity)
+        payload = integrity.macho_payload(destination / name)
+        if payload["architecture"] != architecture:
+            raise ValueError("native packed kernel compiled for the wrong architecture")
+        manifest.update(machoPayloadVersion=1, machoPayloadSha256=payload["sha256"])
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(manifest))
 

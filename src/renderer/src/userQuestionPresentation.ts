@@ -6,6 +6,17 @@ export interface UserQuestionDraft {
   other: boolean;
 }
 
+/** Renderer scope only. It cannot resume a question or grant task authority. */
+export function userQuestionInPanel(
+  question: UserQuestionRecord,
+  brainId: string,
+  questionIds?: readonly string[],
+  presentation: "task" | "conversation" = "task"
+): boolean {
+  return question.brainId === brainId && (!questionIds || questionIds.includes(question.id)) &&
+    (presentation !== "conversation" || question.source?.kind !== "learn" && question.source?.kind !== "fact-check");
+}
+
 export function mergeUserQuestionRecords(
   saved: readonly UserQuestionRecord[],
   updates: readonly UserQuestionRecord[]

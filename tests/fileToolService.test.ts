@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { isUtf8 } from "node:buffer";
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileToolEffectError, FileToolService, type FileToolContext } from "../src/main/fileToolService";
@@ -77,9 +77,26 @@ it("rejects symlinks, replaced sources, forged cursors, path swapping and revoke
   const page = await execute("read-all", { path, maxBytes: 1 }) as FileToolPage;
   await expect(execute("read-next", { cursor: page.nextCursor, path: join(root, "different") })).rejects.toThrow("differs");
   await expect(execute("read-next", { cursor: page.nextCursor!.slice(0, -1) + "z" })).rejects.toThrow("host-owned");
-  await writeFile(path, "wxyz"); await expect(execute("read-next", { cursor: page.nextCursor })).rejects.toThrow("changed");
+  // Replace the actual named file, rather than depending on a same-size write
+  // advancing the filesystem clock on a fast Windows runner.
+  const replacement = join(root, "replacement.txt"), original = await lstat(path, { bigint: true });
+  await writeFile(replacement, "wxyz"); await rename(replacement, path);
+  expect((await lstat(path, { bigint: true })).ino).not.toBe(original.ino);
+  await expect(execute("read-next", { cursor: page.nextCursor })).rejects.toThrow("changed");
   resourceHook = purpose => { if (purpose === "bounded file page and encoding") current = false; };
   await expect(execute("read-all", { path })).rejects.toThrow("revoked");
+});
+
+it("rejects in-place metadata changes without depending on an elapsed wall-clock tick", async () => {
+  const path = join(root, "in-place.txt"); await writeFile(path, "abcd");
+  const page = await execute("read-all", { path, maxBytes: 1 }) as FileToolPage;
+  const before = await lstat(path, { bigint: true });
+  await writeFile(path, "wxyz");
+  await utimes(path, Number(before.atimeMs) / 1000, Number(before.mtimeMs) / 1000 + 10);
+  const after = await lstat(path, { bigint: true });
+  expect(after.ino).toBe(before.ino); expect(after.size).toBe(before.size);
+  expect(after.mtimeNs).not.toBe(before.mtimeNs);
+  await expect(execute("read-next", { cursor: page.nextCursor })).rejects.toThrow("changed");
 });
 
 it("reuses exact continued task reads including UTF-8-short pages, and materializes once without executing", async () => {

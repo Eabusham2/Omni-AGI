@@ -10,10 +10,10 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 | 2/8 | Native strengths, plasticity, memory, connected regions, full merge | In progress: projection/router/memory migration/export checks passed; connected and nested merge lifecycle works in tiny fixtures, full host/rollback/portability integration ongoing |
 | 3/8 | Learning, research, self-review, fact checking, teachers | In progress: durable learning/teacher custody and outer media/replay/evolution owner orchestration are source-composed; provider, learned-quality and broader integration qualification remain open |
 | 4/8 | MCP, integrations, plugins, tools, automations, oversight | In progress: dated tasks, negotiated same-frame inline/fullscreen Apps, reviewed sampling, host tools, plugins and custody have scoped source checks and bounded renderer evidence. Real accounts, broader optional methods and packaged integrations remain open |
-| 5/8 | Load/unload, resource planner, devices, media lifecycle | In progress: thirteen complete-operation kinds, fixed-owner memory/STDP, actual reply and outer-learning orchestration, and mixed sequential decoder routes for six text kinds are source-composed. Concurrent/cross-rank execution, wider device/context migration and hardware/package qualification remain open; new-brain learned proof stays deferred |
-| 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | In progress: existing composer/queue, one-pair action flow, early-Steer ownership, unified map and Call controls have scoped source evidence. Current Data/runtime and MCP display inspections passed at stated boundaries; full native sequencing/theme/accessibility acceptance remains open |
+| 5/8 | Load/unload, resource planner, devices, media lifecycle | In progress: thirteen complete-operation kinds, fixed-owner memory/STDP, reply/outer-learning orchestration and six-text-kind mixed sequential routes are source-composed. Required actual VRAM-backed retained-context capacity is missing and assigned for implementation; existing Gloo/NCCL learning collectives are implemented, while cross-rank Auto remains unqualified. Broader device/hardware/package proof and deferred new-brain quality stay separate |
+| 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | In progress: existing composer/queue, one-pair action flow, early-Steer ownership, unified map and Call controls have scoped source evidence. Ordinary Conversation questions now have five new source contracts and bounded actual component/keyboard/scroll/retirement evidence. Full native sequencing/theme/accessibility acceptance remains open |
 | 7/8 | Focused fixtures, visual audit, complete feature audit and documentation | Coordinated source groups, bounded visual checks and current UI-spec/type reconciliation are recorded; full feature/theme/platform audit, actual UI runner and final documentation/curriculum remain open |
-| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | Pending |
+| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | In progress: main candidate9ae0f31 is pushed and Android/iOS passed. Windows/macOS/Linux failures have affected local fixes; the corrected candidate has not yet been repushed or remotely requalified. No v2 package/release completion claim |
 
 ## Settled scope changes
 
@@ -26,6 +26,33 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 - New v2 goal authorizes GitHub CI and package release after audits.
 
 ## Evidence
+
+- Current post-CI correction boundary: the fixed eight-file stdlib-only runner
+  passed **75/75** with zero failures/errors/skips (16 earlier +12 memory +17
+  reply +10 mixed +13 outer +7 native-kernel). Neural imports, brain creation,
+  Load and training remain forbidden. Current Node/Web TypeScript exited0;
+  the release-manifest selection passed1 case/1 excluded, and curriculum2
+  passed. The Mac native-kernel payload/hash mechanism preserves exact runtime
+  hash/ABI checks, not a signature-neutral bypass. Pinned synchronous
+  `optionsForFile` integration is now fixed and frozen; one new installed-
+  signing-loop regression with inert callbacks passed41ms, with five older
+  kernel/DMG cases not repeated. Full packaged signing smoke remains unproven.
+  Full-plan source closure remains open: actual enabled-device retained-KV
+  residency/capacity is assigned because the current pager is CPU/disk and
+  planner device projection is diagnostic only. Existing Gloo/NCCL learning
+  collectives are not missing; cross-rank Auto qualification is separate.
+  Five new question source contracts plus the bounded native component pass
+  record the genuine compact Retry/scroll fixes and their affected evidence.
+  The affected390px Call-open/close layout check reports zero shell horizontal
+  overflow at11px/13px status typography, with the exact screenshot/log in
+  `.runtime/responsive-overflow-cua-11px.*` and owned preview exit0.
+  These local checks do not make desktop CI or packages green: Android/iOS
+  passed on9ae0f31, but corrected Windows/macOS/Linux work still awaits the
+  next reviewed push and remote qualification. See CONTINUATION.md,
+  coordinated-source-gate-2026-10-18.md, native-kernel-package-integrity.md and
+  chat-question-surface.md. Broader performance/provider/quality limits remain.
+
+### Historical scoped results
 
 - October18 current source freeze: the real fixed-memory/STDP request scheduler,
   ordinary reply planner, outer learning/publication orchestration and mixed

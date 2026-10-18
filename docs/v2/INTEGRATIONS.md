@@ -576,6 +576,24 @@ paths. Copied questions are suspended until explicit resume. Durable resolution
 delivery is acknowledged only after the corresponding conversation/action
 receipt exists.
 
+The existing question panel is mounted in Conversation as a compact section
+that opens for pending questions or service errors and is absent when there
+are no questions, history or errors. Conversation excludes `learn` and
+`fact-check` source records; those stay scoped to their task's question IDs.
+Changing the current instance or API owner retires old reads, subscriptions
+and pending response UI. Response receipts must name the same question and
+instance. This renderer scope does not grant or revoke a host capability.
+
+`studio.question.ask` returns its durable pending request; it does not await a
+native decoder continuation. Main supplies its source action/turn identity,
+overriding generated `source`, `brainId` and `requestId` operands.
+`studio.question.status` reads the current owned record. A later answer,
+timeout assumption or cancellation is staged by `UserQuestionDelivery` as
+ordinary completed-action evidence before its delivery acknowledgement. The
+selected instance's normal learning scheduler may consume that evidence.
+There is no automatic hidden-prompt insertion, forced follow-up chat, direct
+waiting-decoder wakeup or demonstrated learned use implied by this wire.
+
 ## Instance lifecycle API
 
 `InstanceLifecycleApi` exposes:
@@ -608,11 +626,22 @@ The production schema-1 host portability path and newer schema-2 components
 have focused evidence. A fresh complete inherited schema-2 Worker path, trained
 fluency, all external handles, and all-platform execution remain open. Existing
 exact evidence is same-host CPU: the stored backend name is not a full
-OS/ISA/kernel/GPU compatibility seal. Native activity decay also still derives
-elapsed time from a wall-clock baseline, so a long suspended interval can add
-transient decay after Load. A persisted logical activity clock that excludes
-suspended time, without falsifying audit/tool wall timestamps, remains required
-for post-learning equivalence.
+OS/ISA/kernel/GPU compatibility proof. New executable native frontiers already
+require their runtime/kernel/hardware compatibility seal and paused
+`ActivityClock` state, checked against the exact learned-state metadata before
+cache adoption. Missing old seals remain explicitly unsupported, not fabricated.
+
+The persisted owner activity clock excludes unloaded/suspended time from
+transient decay and idle cadence. Cold working pages use that owner's activity
+coordinates with a persisted authenticated checkpoint baseline for older rows;
+current wall/file time does not create a new age or recency advantage. Borrowed
+regional owners hydrate and re-persist their own paused source clocks. Audit
+dates, provenance and user time/timer tools remain wall-clock based. Source
+and focused evidence are recorded in [instance lifecycle](instance-lifecycle.md#october-11-active-time-runtime-seal-and-recovery-additions)
+and its [cold-page correction](instance-lifecycle.md#october-13-cold-working-page-recency-correction).
+Full current-format inherited-Worker and post-learning equivalence acceptance
+remain open; clock source/component evidence is not cross-hardware or broad
+learned-capability proof.
 
 ## Optional Ponder self-report stream
 

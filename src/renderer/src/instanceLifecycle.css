@@ -12,3 +12,24 @@
 .instance-load-auto { display: flex; align-items: flex-start; gap: 10px; margin-top: 20px; line-height: 1.5; }
 .instance-load-auto input { margin-top: 4px; accent-color: var(--accent); }
 .instance-load-dialog .button:hover { color: var(--text); }
+
+@media (max-width: 720px) {
+  /* Keep both lifecycle status and its action in the existing 49px compact
+     header. An unshrinking horizontal status+button group otherwise pushes
+     Assistant/inspector/duplicate beyond the shell on Linux font metrics. */
+  .workspace-header__actions > .instance-lifecycle-controls {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 0;
+    max-width: 45vw;
+  }
+
+  .workspace-header__actions > .instance-lifecycle-controls > span {
+    overflow: hidden;
+    font-size: 11px;
+    line-height: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}

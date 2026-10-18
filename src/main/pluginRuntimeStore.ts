@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginRuntimeRpcReply, PluginRuntimeSession, PluginRuntimeSchemaLearning, PluginRuntimeSessionPage, PluginRuntimeHistoryPage, PluginRuntimeStateSourcePage, PluginRuntimeStateConflictPage } from "../shared/pluginRuntime";
 import { RUNTIME_SHA, runtimeHash, runtimeId, runtimeJson } from "./pluginRuntimeValidation";
+import { configurePluginCustodyJournal } from "./pluginCustodyJournal";
 
 export const PLUGIN_RUNTIME_WORKSPACE = "plugin-runtime/workspace.sqlite3";
 export const PLUGIN_RUNTIME_STORE_FORMAT = "omni-plugin-runtime-workspace-1";
@@ -61,8 +62,8 @@ export class PluginRuntimeStore {
         if (row.type === "index" && row.sql === null && String(row.name).startsWith("sqlite_autoindex_") || row.name === "sqlite_sequence") continue;
         if (row.type !== "table" || !allowed.has(normalizedSql(row.sql))) throw new Error("Runtime workspace contains unsupported executable schema.");
       }
+      if (!options.readOnly) configurePluginCustodyJournal(db);
       if (!options.readOnly && options.create) {
-        db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
         for (const sql of schema) db.exec(sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"));
         db.prepare("INSERT OR IGNORE INTO meta VALUES('format',?)").run(PLUGIN_RUNTIME_STORE_FORMAT);
         db.prepare("INSERT OR IGNORE INTO meta VALUES('brainId',?)").run(owner);

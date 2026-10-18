@@ -5,7 +5,76 @@ kernel-library checks. No brain was constructed, Loaded, trained or benchmarked.
 No provider account was used. These results do not mean GitHub CI or a released
 package is green.
 
-## Initial integrated groups and affected corrections
+## Current post-CI correction boundary
+
+The current fixed Python runner passes **75/75** across eight explicit files:
+16 earlier contracts,12 fixed-memory scheduler,17 reply planner,10 mixed
+sequential decoder,13 outer-learning and7 native-kernel integrity cases.
+There are zero failures, errors or skips. Neural runtime imports, full test
+discovery, brain construction, Load and training remain forbidden by that
+runner. Its earlier67-case/seven-file result below is historical.
+
+Current Node and renderer TypeScript both exited0. The selected release-
+manifest contract passed1 case with1 excluded, and the documentation
+curriculum selection passed2 cases. Those results describe the affected source
+and exact byte/declaration contracts, not a repeated full-suite or package run.
+The latest application-shell bundle also exited0 after the current question/
+header fixes. The signing integration has its separate focused result below;
+full packaged smoke remains pending.
+
+The macOS Mach-O packaging/hash mechanism has bounded local proof. Build-time
+finalization binds permitted relocation/signature changes to the original
+compiler-issued source/architecture/machine payload, then writes the exact
+final whole-file hash. The runtime still checks full final bytes, current C++
+source and ABI before loading; it has no signature-neutral bypass or optional
+native-kernel fallback. Seven stdlib cases, five Node contracts and a small
+real ARM64 C++/ad-hoc-signing/ctypes fixture have their exact boundaries in
+[native-kernel-package-integrity.md](native-kernel-package-integrity.md).
+These do not prove a full signed/notarized app or reconstruct the omitted
+remote health payload.
+
+A dependency-level check found that pinned `osx-sign` requires synchronous
+`optionsForFile`. The corrected callback now uses synchronous path custody and
+a bounded stdlib root finalizer, preserving async `afterPack`. One new actual-
+installed signing-loop regression with inert callbacks passed41ms; five older
+kernel/DMG cases were not rerun. mac.sign schema, path/CJS, signing order,
+Windows architecture and DMG override API shapes matched. The lane is frozen
+at that source/dependency boundary, not full signed/notarized package proof.
+
+Full-plan source closure is still not claimed: required enabled-device retained
+KV capacity remains missing. The existing WorkingAttentionPager is CPU/disk;
+the context planner caps RAM/spill and adds a diagnostic device projection,
+not actual VRAM-backed retained context. Its concrete residency/planner path is
+assigned to the uncached lane. Existing distributed Gloo/NCCL learning and
+collectives already exist; cross-rank Auto qualification remains distinct and
+unqualified. The75-case runner is not proof that this missing source is complete.
+
+The ordinary Conversation question gap also has bounded actual component UI
+evidence: empty hiding, minimum selections/keyboard submission, history/written
+input, retired API/brain ownership, Learn-scope exclusion, error/Retry and
+explicit paused-copy Resume. The affected compact Retry wrapping and nested
+scroll trap were reproduced and corrected. Captures were reopened and the
+isolated preview exited0. See
+[chat-question-surface.md](chat-question-surface.md). Its API and placement
+markers are synthetic; this is not full App/main-IPC/native learning, live
+waiting-decoder use or universal accessibility/theme/package acceptance.
+
+The affected390px Call-open/close preview also reports zero shell horizontal
+overflow with11px/13px compact status typography. The bounded evidence is
+`.runtime/responsive-overflow-cua-11px.png` and `.log`; the preview exited0.
+This does not extend that check into a full theme/device/native-backend pass.
+
+The pushed `main` candidate9ae0f31 has Android/iOS green. Its Windows/macOS/
+Linux runs failed as recorded in CONTINUATION.md. The affected desktop fixes
+have scoped local results, including the signing-hook correction. Required
+retained-VRAM context remains separate source work. These local packaging
+fixes have **not yet been repushed or remotely requalified**.
+Do not turn these local results or the mobile successes into an all-platform
+green/release claim. The next root-owned gate is the reviewed next candidate,
+required CI/package smoke, then tag and verified publication. Full-folder
+training/new-brain learned qualification remains user-deferred.
+
+## Historical initial groups and affected corrections
 
 - The first133-file v2 contracts selector finished505 passed/1 failed. The
   failure was an old exact-source assertion for the Build-overlay condition;
@@ -38,7 +107,7 @@ independent additions include9 MCP display contracts. The source CI selector
 includes their paths, standalone native-library packaging, current steering
 and documentation contracts. Remote CI still must execute that exact candidate.
 
-## Current compiler, Python and documentation points
+## Historical compiler, Python and documentation checkpoints
 
 - Node and renderer TypeScript exited0 under the app's bundled runtime after
   the13-kind forward composition, typed teacher fixes, negotiated MCP display,
@@ -50,7 +119,7 @@ and documentation contracts. Remote CI still must execute that exact candidate.
 - After adding the12 new fixed-memory scheduler cases with an isolation-safe
   explicit helper import, the coordinated fixed Python selector passed28 cases
   in0.261s. Its import guard still rejects neural runtimes and full discovery.
-- The final fixed seven-file selector additionally includes the16 real-reply
+- The then-final fixed seven-file selector additionally includes the16 real-reply
   planner,10 mixed sequential decoder and13 outer-learning contracts. It passed
   all67 cases in0.854s, with0 failures, errors or skips. Shared inert helpers
   load by exact file under Python isolation; no search-path widening, neural
@@ -72,7 +141,7 @@ and documentation contracts. Remote CI still must execute that exact candidate.
   custody remain asserted. The final public manuals were then bundled again
   through the supported Electron/Node24 runtime; main/preloads/renderer built0.
 
-## Native UI and repository hygiene
+## Historical shell, UI and repository hygiene checkpoints
 
 The final `npm run build` exited0 after Node and renderer TypeScript checks,
 then built main, both preload entries and the renderer. This is an Electron
@@ -100,8 +169,10 @@ unchanged, including the user's trailing spaces and final blank line. Its
 verbatim exception is not a source-code whitespace exemption. Two unrelated
 UI-evidence documents had an extra final blank line removed.
 
-The primary `main` checkout was clean, and GitHub reported only `main`, both at
+At this earlier metadata-only checkpoint the primary `main` checkout was clean,
+and GitHub reported only `main`, both at
 17fe5558856fbb9fc09c6c1781193e33a98c1e29. No commit, push, tag or remote run was
-created by these checks. The named native planner slices are now frozen with
+created by those checks; the newer pushed candidate and failed CI are recorded
+above. The named native planner slices are frozen with
 the affected results above; hardware placement and measured improvement remain
 unverified. Learned-capability and new-brain qualification remain user-deferred.

@@ -104,3 +104,43 @@ safe-only generated patch. No governance automation was added.
 No remote CI, package, new brain, Load, neural training, tag, push, release,
 credential inspection or hardware benchmark was performed in this preparation
 pass. Current full-goal audit and remote package/release gates remain open.
+
+## October 18 Windows contract corrections
+
+Hosted Windows x64 job `117785824818`, run `39164947102` at `9ae0f313`,
+failed four portable-receipt cases and five catalog-lineage cases before
+packaging. ASAR header traversal requires host separators even though the
+validated `package.json` main entry is POSIX-form; the receipt reader now
+normalizes that exact entry. Deep catalog-lineage SQLite paths now use the
+Windows extended-length namespace after the existing ownership/hash checks.
+Read-only opening, extension refusal, schema/count checks and exact archive
+closure remain unchanged. Separate plugin lifecycle/timing failures are not
+attributed to these two fixes.
+
+Two new selected-file cases cover actual installed ASAR traversal using Win32
+path operations, and drive/UNC/already-prefixed catalog paths. The nine affected
+existing cases plus the two new cases passed locally. Embedded Electron Node24
+needed `ELECTRON_NO_ASAR=1` for the four physical-ASAR cases so its virtual ASAR
+filesystem did not replace normal Node filesystem behavior; CI uses Node22.
+This is not a Windows rerun, native SQLite-on-Windows proof, package smoke, or
+release result. No model, Load, training, commit, push or CI rerun was performed
+by this correction lane.
+
+## October 18 Intel macOS DMG detach control
+
+Hosted macOS Intel job `117785824405`, run `39164947011` at `9ae0f313`,
+completed worker/application staging and ZIP creation but the pinned
+`dmg-builder@1.2.5` helper failed its ordinary detach with `Resource busy`.
+The supported `CUSTOM_DMGBUILD_PATH` override now delegates to that same
+checksum-pinned helper and requests its built-in `--detach-retries 30` option
+after checking its help. The existing builder exposes no corresponding DMG
+configuration field. An explicitly supplied custom helper is preserved.
+
+The helper remains responsible for its own temporary image and mount. The
+wrapper does not enumerate or unmount disks, force eject, change Spotlight,
+rebuild the image after failure, or skip any format/signing/smoke gate. A
+nonzero helper status remains fatal. Two new inert build-control cases in the
+existing selected release-compatibility file passed in9ms; JavaScript/Bash
+syntax and scoped whitespace passed. No binary download, actual helper/image
+execution, model, local package or remote rerun occurred in this lane. Actual
+DMG build and package smoke success remain CI evidence, not these fixtures.

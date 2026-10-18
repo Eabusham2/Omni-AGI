@@ -113,6 +113,11 @@ if [[ "${TARGET_PLATFORM}" == "mac" ]]; then
   else
     BUILDER_ARGS+=(--config.mac.notarize=false)
   fi
+  # Use the pinned vendor's own bounded ordinary-detach retry option. Keep an
+  # explicitly supplied custom builder intact; never unmount ambient devices.
+  if [[ -z "${CUSTOM_DMGBUILD_PATH:-}" ]]; then
+    export CUSTOM_DMGBUILD_PATH="${REPO_ROOT}/scripts/dmgbuild-with-detach-retries.mjs"
+  fi
   npx electron-builder "${BUILDER_ARGS[@]}"
 else
   npx electron-builder --linux "--${TARGET_ARCH}" --publish never

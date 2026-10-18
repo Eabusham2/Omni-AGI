@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const read = (path: string): string => readFileSync(resolve(path), "utf8");
@@ -24,6 +26,56 @@ function workflowStep(job: string, stepName: string): string {
 }
 
 describe("native release Python compatibility", () => {
+  it("delegates DMG construction once to the installed hash-pinned vendor with bounded ordinary detach retries", async () => {
+    const wrapper = await import(pathToFileURL(resolve("scripts/dmgbuild-with-detach-retries.mjs")).href) as {
+      pinnedDmgbuildToolset(architecture: string): { releaseName: string; filenameWithExt: string; checksums: Record<string, string> };
+      runDmgbuild(args: string[], options: Record<string, unknown>): Promise<number>;
+    };
+    const vendorSource = readFileSync(createRequire(import.meta.url).resolve("dmg-builder"), "utf8");
+    for (const architecture of ["x64", "arm64"]) {
+      const toolset = wrapper.pinnedDmgbuildToolset(architecture);
+      expect(vendorSource).toContain(toolset.releaseName);
+      for (const [file, checksum] of Object.entries(toolset.checksums)) { expect(vendorSource).toContain(file); expect(vendorSource).toContain(checksum); }
+    }
+    const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    const args = ["-s", resolve("work/owned-settings.json"), "Owned fixture", resolve("work/owned-output.dmg")];
+    const result = await wrapper.runDmgbuild(args, { platform: "darwin", architecture: "x64",
+      download: async (value: unknown) => { expect(value).toEqual(wrapper.pinnedDmgbuildToolset("x64")); return resolve("work/owned-vendor"); },
+      execute: (command: string, invocation: string[], options: Record<string, unknown>) => {
+        calls.push({ command, args: invocation, options });
+        return { status: 0, stdout: invocation[0] === "--help" ? "--detach-retries {1,...,30}" : "" };
+      } });
+    expect(result).toBe(0); expect(calls).toHaveLength(2);
+    expect(calls[0]!.args).toEqual(["--help"]); expect(calls[0]!.options.timeout).toBe(10_000);
+    expect(calls[1]!.args).toEqual(["--detach-retries", "30", ...args]);
+    expect(calls[1]!.options).toMatchObject({ stdio: "inherit", shell: false });
+    expect(calls.every(call => call.command === resolve("work/owned-vendor/dmgbuild"))).toBe(true);
+    const source = read("scripts/package-posix.sh");
+    expect(source).toContain('if [[ -z "${CUSTOM_DMGBUILD_PATH:-}" ]]');
+    expect(source).toContain('export CUSTOM_DMGBUILD_PATH="${REPO_ROOT}/scripts/dmgbuild-with-detach-retries.mjs"');
+    expect(source).toContain('--config.mac.notarize=true');
+    expect(source).toContain('npx electron-builder "${BUILDER_ARGS[@]}"');
+  });
+
+  it("keeps a failed DMG fatal and refuses unsupported detach controls without rebuilding or unmounting devices", async () => {
+    const wrapper = await import(pathToFileURL(resolve("scripts/dmgbuild-with-detach-retries.mjs")).href) as {
+      runDmgbuild(args: string[], options: Record<string, unknown>): Promise<number>;
+    };
+    const args = ["-s", resolve("work/owned-settings.json"), "Owned fixture", resolve("work/owned-output.dmg")];
+    let images = 0, help = "--detach-retries";
+    const options = { platform: "darwin", architecture: "arm64", download: async () => resolve("work/owned-vendor"),
+      execute: (_command: string, invocation: string[]) => invocation[0] === "--help" ? { status: 0, stdout: help } : (images++, { status: 16 }) };
+    expect(await wrapper.runDmgbuild(args, options)).toBe(16); expect(images).toBe(1);
+    help = "no such option";
+    await expect(wrapper.runDmgbuild(args, options)).rejects.toThrow("does not advertise"); expect(images).toBe(1);
+    await expect(wrapper.runDmgbuild(args, { ...options, platform: "linux" })).rejects.toThrow("requires macOS");
+    await expect(wrapper.runDmgbuild(["--detach-retries", "999", ...args], options)).rejects.toThrow("Unexpected");
+    expect(images).toBe(1);
+    const source = read("scripts/dmgbuild-with-detach-retries.mjs");
+    expect(source).not.toContain('"hdiutil"'); expect(source).not.toContain('"diskutil"');
+    expect(source).not.toContain('"-force"');
+  });
+
   it("keeps every top-level runtime dependency exact and preserves Intel fallbacks", () => {
     const requirements = read("engine/requirements.txt");
     for (const line of requirements.split(/\r?\n/u)) {

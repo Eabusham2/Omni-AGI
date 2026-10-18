@@ -3,6 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UserQuestionService, validateUserQuestionRecord } from "../src/main/userQuestions";
+import { UserQuestionDelivery } from "../src/main/userQuestionDelivery";
+import { ToolExecutor } from "../src/main/toolExecutor";
+import type { BrainService, RuntimeJobManager } from "../src/main/brainService";
+import type { ToolInvocation } from "../src/shared/types";
 import {
   DEFAULT_USER_QUESTION_PREFERENCES,
   type UserQuestionEvent,
@@ -40,6 +44,37 @@ describe("durable structured task questions", () => {
     for (const current of services.splice(0)) current.close();
     vi.useRealTimers();
     await rm(directory, { recursive: true, force: true });
+  });
+
+  it("routes an ordinary chat question with trusted turn ownership and delivers its answer only as retained action evidence", async () => {
+    const executor = new ToolExecutor({} as BrainService, {} as RuntimeJobManager, undefined, { execute: vi.fn() });
+    executor.setQuestionService(service);
+    const invocation: ToolInvocation = { brainId: "first", toolId: "studio.question", action: "ask", arguments: {
+      prompt: "Which section should I discuss?", mode: "single",
+      options: [{ id: "intro", label: "Introduction" }, { id: "details", label: "Details" }],
+      brainId: "second", requestId: "generated-request-id", source: { kind: "host", turnId: "generated-turn", actionId: "generated-action" }
+    } };
+    const dispatch = executor as unknown as { dispatch(invocation: ToolInvocation, signal: AbortSignal, requestId: string,
+      progress: undefined, permission: "auto", actionId: string, learning: undefined, chatTurnId: string): Promise<unknown> };
+    const created = await dispatch.dispatch(invocation, new AbortController().signal, "effect-fixture", undefined, "auto", "main-action", undefined, "main-turn");
+    expect(created).toMatchObject({ brainId: "first", requestId: "main-action", status: "pending",
+      source: { kind: "brain", actionId: "main-action", turnId: "main-turn" } });
+    const current = validateUserQuestionRecord(created, "first");
+    const sink = { queueCompletedToolExecution: vi.fn(async () => undefined) }, errors = vi.fn();
+    const delivery = new UserQuestionDelivery(service, sink, errors);
+    try {
+      expect(sink.queueCompletedToolExecution).not.toHaveBeenCalled();
+      await service.respond({ brainId: "first", questionId: current.id, response: { optionIds: ["intro"] } });
+      await delivery.settle("first");
+      expect(sink.queueCompletedToolExecution).toHaveBeenCalledOnce();
+      expect(sink.queueCompletedToolExecution).toHaveBeenCalledWith(expect.objectContaining({ brainId: "first", toolId: "studio.question" }),
+        expect.objectContaining({ state: "complete", output: expect.objectContaining({ questionId: current.id,
+          resolution: expect.objectContaining({ source: "user", authority: "task-choice-only", permissionsGranted: false }) }) }), "main-turn");
+      expect((await service.get("first", current.id)).deliveredAt).toBeDefined();
+      expect(errors).not.toHaveBeenCalled();
+      // The sink deliberately exposes no native inbox, chat, model or tool API.
+      // This proves retained-delivery wiring, not live decoder use or learning.
+    } finally { delivery.close(); }
   });
 
   it("persists exact prompts, ranks recommendations, isolates instances, and idempotently retries", async () => {

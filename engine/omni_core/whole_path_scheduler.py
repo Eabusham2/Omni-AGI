@@ -254,7 +254,9 @@ class WholePathScheduler:
                 "wholeReplyPlacementQualified": False, "wholeReplySpeedupMeasured": False}
             try: self.ops.record(record)
             except Exception: pass  # Diagnostics cannot retry/fail committed learning.
-            finally: lease.release()
+            finally:
+                try: lease.release()
+                except Exception: pass  # Metadata cleanup cannot fail a committed actual request.
 
     @contextmanager
     def effect(self, path, stage, *, admit=True):

@@ -384,6 +384,25 @@ class ReplyPlannerCases(unittest.TestCase):
         self.assertEqual(f.rows[-1]["effectsObserved"], 1)
         self.assertEqual(f.rows[-1]["fixedMemoryNanoseconds"], "5")
 
+    def test_request_metadata_release_failure_does_not_fail_or_repeat_a_committed_request(self):
+        f = self.fixture()
+        def reserve(_size):
+            lease = types.SimpleNamespace(closed=False)
+            def release():
+                lease.closed = True
+                raise RuntimeError("diagnostic lease release failed")
+            lease.release = release
+            f.leases.append(lease)
+            return lease
+        f.reserve_metadata = reserve
+        with f.scope():
+            f.db.execute("INSERT INTO effects VALUES('committed-request')")
+        self.assertEqual(f.db.total_changes, 1)
+        self.assertEqual(len(f.rows), 1)
+        self.assertTrue(f.rows[0]["completed"])
+        self.assertTrue(f.leases[0].closed)
+        self.assertIsNone(S.current_owned_path())
+
     def test_new_actual_source_seams_keep_existing_sampling_calls_and_once_only_world_boundaries(self):
         brain = ast.parse((ROOT / "omni_core" / "brain.py").read_text())
         chat = next(node for node in ast.walk(brain) if isinstance(node, ast.FunctionDef) and node.name == "chat")

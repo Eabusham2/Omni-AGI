@@ -69,6 +69,14 @@ rm -rf -- "${DIST_ROOT}" "${WORK_ROOT}"
   --collect-all rpds \
   "${WORKER}"
 
+# Mach-O relocation/signing changes final bytes after the compiler manifest.
+# Reseal only if its compiled machine payload, source and architecture agree;
+# runtime still verifies the exact complete packaged file hash.
+if [[ "${HOST_PLATFORM}" == "mac" ]]; then
+  "${PYTHON_BIN}" "${REPO_ROOT}/scripts/finalize-native-kernel-manifest.py" \
+    --worker-root "${DIST_ROOT}/omni-engine"
+fi
+
 # Keep imageio-ffmpeg's BSD wrapper, but do not convey the separately licensed
 # wheel-provided FFmpeg executable without complete corresponding source and
 # build material. Fail closed if PyInstaller placed another FFmpeg executable

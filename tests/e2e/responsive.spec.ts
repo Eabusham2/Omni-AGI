@@ -96,6 +96,18 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
         await expect(page.getByLabel("Live voice settings")).toHaveCount(0);
         await expect(page.getByRole("group", { name: "Delivery" })).toHaveCount(0);
 
+        // Lifecycle status must not displace the identity or header actions
+        // when Linux font metrics are wider than the Apple default pack.
+        await expect(page.locator(".workspace-header__identity strong")).toBeVisible();
+        const headerActions = await page.locator(".workspace-header__actions").getByRole("button").evaluateAll(buttons =>
+          buttons.map(button => { const bounds = button.getBoundingClientRect(); return {
+            label: button.getAttribute("aria-label") || button.textContent?.trim(), left: bounds.left, right: bounds.right
+          }; }));
+        for (const action of headerActions) {
+          expect(action.left, `${viewport.name} header action ${action.label} must stay reachable`).toBeGreaterThanOrEqual(0);
+          expect(action.right, `${viewport.name} header action ${action.label} must stay reachable`).toBeLessThanOrEqual(viewport.width + 1);
+        }
+
         const overflow = await page.evaluate(() => ({
           document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
           body: document.body.scrollWidth - document.body.clientWidth,

@@ -164,11 +164,22 @@ Focused native continuation and host portability fixtures exist, but the newest
 schema-2 inherited-Worker end-to-end acceptance is still open. Do not treat
 Unload as a guarantee that every future plugin, external process, device, or OS
 handle can resume exactly. Current exact continuation evidence is same-host CPU;
-a saved backend label is not a cross-OS, ISA, GPU, or bitwise stochastic
-compatibility seal. A long unloaded interval can also affect transient decay
-because the persisted logical activity clock does not yet exclude every
-suspended wall-time gap. Post-learning equivalence across that boundary remains
-open.
+new executable frontiers require their recorded runtime/kernel/hardware seal
+and exact paused clock, not merely a saved backend label. Matching seals do not
+prove cross-OS, ISA, GPU, or bitwise stochastic compatibility.
+
+The per-instance activity clock pauses at a supported suspension or explicit
+Unload and resumes only at supported native work. Unloaded time does not age
+its transient activity. Cold working pages use the same owner's paused
+coordinates rather than current file or wall time; borrowed regional owners
+retain their separate clocks. Real dates, provenance and timer tools remain
+wall-clock based. Older state without the required seals is not silently
+upgraded into exact resumability. See the [active-time and runtime-seal
+contract](instance-lifecycle.md#october-11-active-time-runtime-seal-and-recovery-additions)
+and [cold-page recency correction](instance-lifecycle.md#october-13-cold-working-page-recency-correction).
+Full current-format inherited-Worker acceptance and post-learning equivalence
+remain separate, unverified gates; the implemented clock is not a claim that
+every device or external handle resumes identically.
 
 ## Conversation
 
@@ -274,11 +285,18 @@ it. Direct UI starts obey the instance's `data.fact-check` permission.
 
 ## Questions from the instance
 
-Learn and Fact Check can show single-choice, multiple-choice, or written
-questions for their dependent tasks. Recommended choices appear first. Answers
-belong to the instance and survive restart. The durable host API and native
-`studio.question` route also exist, but a general question tray outside these
-task workspaces is not yet a completed user-interface claim.
+The instance can show single-choice, multiple-choice, or written questions
+directly in Conversation. New open questions expand the compact Questions
+section above the message box; an empty conversation has no extra question
+row. Past questions and question settings remain available when that section
+has content. Recommended choices appear first. Learn and Fact Check keep their
+dependent questions in their own task workspace rather than duplicating them
+in Conversation. Answers belong to the instance and survive restart.
+
+An answer is retained as ordinary action evidence for the instance's learning
+path. It does not inject a hidden prompt, automatically start a second chat
+turn, or establish that a running reply has already used the answer. The
+instance's question tool can inspect a saved question's current status.
 
 Automatic assumptions are off by default. If enabled, the default wait is 20
 minutes. At expiry, Studio can use an explicit suggested choice or enough

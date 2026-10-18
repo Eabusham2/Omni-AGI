@@ -70,6 +70,15 @@ after awaited reads. POSIX opens use `O_NOFOLLOW`. Directory identities are
 checked during traversal. This is explicitly checked-open-file consistency,
 **not an atomic whole-filesystem snapshot**.
 
+A live host file is not an immutable opening-time byte snapshot either. Its
+identity is a metadata fence, not a full-content digest: an in-place write that
+preserves every observed metadata field (including a filesystem timestamp
+collision) is not guaranteed to be detected. Each page hash covers exactly the
+returned bytes; a completed `wholeSha256` covers the complete returned stream,
+not an asserted earlier version of unread source bytes. Captured task files
+instead carry their separately verified original content/manifest identity.
+No cursor, page hash or metadata identity grants additional access.
+
 Task sources use the existing continued-task reader and exact original
 attachment hash, manifest, size, and source identity. Warm/inherited task files
 retain original owning brain/turn identities; those are not rewritten to pretend
