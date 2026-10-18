@@ -181,6 +181,14 @@ Full current-format inherited-Worker acceptance and post-learning equivalence
 remain separate, unverified gates; the implemented clock is not a claim that
 every device or external handle resumes identically.
 
+### Active Mode
+
+In **Device & runtime**, Active Mode selects the one instance allowed to work
+during idle time. The scheduler does not add duration-proportional rest after
+a completed cycle by default. Its regular interval, worker-requested cooldown,
+resource admission, startup recovery and foreground/training priority still
+apply. Enabling Active Mode does not bypass tool permissions or force Ponder.
+
 ## Conversation
 
 Each instance has one durable conversation.

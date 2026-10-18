@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { closeOwnedPackagedApplication, type OwnedPackagedApplication } from "./e2e/packaged-shell-lifecycle";
 
 const read = (path: string): string => readFileSync(resolve(path), "utf8");
 
@@ -26,6 +28,39 @@ function workflowStep(job: string, stepName: string): string {
 }
 
 describe("native release Python compatibility", () => {
+  it("requires normal packaged-shell shutdown and never turns exact-child force cleanup into success", async () => {
+    vi.useFakeTimers();
+    try {
+      const phases: string[] = [], child = Object.assign(new EventEmitter(), {
+        pid: 4242, exitCode: null as number | null, signalCode: null as NodeJS.Signals | null,
+        kill: vi.fn((signal: NodeJS.Signals) => { child.signalCode = signal; child.emit("exit", null, signal); return true; })
+      });
+      const close = vi.fn(() => new Promise<void>(() => undefined));
+      const failure = expect(closeOwnedPackagedApplication({ process: () => child, close }, {
+        normalCloseMs: 30, forceExitMs: 5, observe: value => phases.push(value)
+      })).rejects.toThrow("normal shutdown exceeded 30 ms");
+      await vi.advanceTimersByTimeAsync(30); await failure;
+      expect(close).toHaveBeenCalledTimes(1); expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+      expect(phases).toEqual(["normal-close-start", "normal-close-failed", "owned-child-force-cleanup-start", "owned-child-force-cleanup-complete"]);
+      expect(child.listenerCount("exit")).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("accepts an acknowledged normal packaged-shell exit without killing another process or hiding a close error", async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 4243, exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null, kill: vi.fn(() => false) });
+    const close = vi.fn(async () => { child.exitCode = 0; child.emit("exit", 0, null); });
+    await closeOwnedPackagedApplication({ process: () => child, close });
+    expect(child.kill).not.toHaveBeenCalled(); expect(close).toHaveBeenCalledTimes(1);
+    expect(child.listenerCount("exit")).toBe(0);
+    const exact = new Error("normal close rejected before acknowledgement");
+    await expect(closeOwnedPackagedApplication({ process: () => child, close: async () => { throw exact; } })).rejects.toBe(exact);
+    expect(child.kill).not.toHaveBeenCalled();
+    await expect(closeOwnedPackagedApplication({ process: () => ({ ...child, pid: undefined }), close } as unknown as OwnedPackagedApplication))
+      .rejects.toThrow("no exact owned child");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it("delegates DMG construction once to the installed hash-pinned vendor with bounded ordinary detach retries", async () => {
     const wrapper = await import(pathToFileURL(resolve("scripts/dmgbuild-with-detach-retries.mjs")).href) as {
       pinnedDmgbuildToolset(architecture: string): { releaseName: string; filenameWithExt: string; checksums: Record<string, string> };

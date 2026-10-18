@@ -160,7 +160,10 @@ class NativeFullForwardOperationOps(NativeCachedWholeOperationOps):
         return {"input": tensor_layout(window), "cue": tensor_layout(cue), "mask": tensor_layout(attention_mask),
             "wholeWorkspace": use_global_workspace, "owners": rows,
             "pageTokens": int(pager.page_tokens), "tileBudgetBytes": int(pager.device_tile_budget_bytes),
-            "residentBudgetBytes": int(pager.resident_budget_bytes), "scratchBudgetBytes": int(pager.scratch_budget_bytes)}
+            "residentBudgetBytes": int(pager.resident_budget_bytes), "scratchBudgetBytes": int(pager.scratch_budget_bytes),
+            "retainedContextPools": [{key: pool.get(key) for key in ("deviceId", "executionDevice", "memoryGroupId", "budgetBytes", "pageBytes",
+                                         "partitionMode", "minimumPackedOwnerBytes", "controlReserveBytes", "transferReserveBytes")}
+                                     for pool in getattr(pager, "_retained_context_pools", ())]}
 
     def valid_forward(self, window, cue, use_global_workspace, attention_mask):
         try:

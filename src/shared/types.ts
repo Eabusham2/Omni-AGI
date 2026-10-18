@@ -1155,6 +1155,15 @@ export interface WorkingMemoryResourcePlan {
       selectedContextResidentBytes: number;
       selectedContextSpillBytes?: number;
       contextOffloadBudgetBytes?: number;
+      /** Distinct actual tensor-storage partitions, not a compute-speed claim. */
+      retainedDeviceContextBytes?: number;
+      selectedContextDeviceBytes?: number;
+      contextCheckpointReserveBytes?: number;
+      contextCheckpointCapacityBytes?: number;
+      maximumPackedOwnerBytes?: number;
+      nonpackedControlBytes?: number;
+      manualCoreRebalance?: boolean;
+      retainedContextPageBytes?: number;
       selectedDriveCapacityBytes?: number;
       selectedDriveAvailableBytes?: number;
       residentContextMaximumTokens?: number;

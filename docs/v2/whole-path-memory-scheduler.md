@@ -126,11 +126,23 @@ Subsequent source slices are now implemented:
    current admitted selection; mutable outer phases stay on their real owners,
    not a privately relocated whole pipeline. See outer-learning-pipeline.md.
 
-Remaining R1 implementation breadth is concurrent multi-device/cross-rank
-execution and collective custody, retained GPU cache/context subtree migration,
-unsupported direct accelerator kernels, and mixed consumers beyond those six
-text kinds where supported. A local complete-operation sample does not
-authorize distributed training or a globally optimal schedule.
+Actual retained-context RAM/VRAM/storage ownership and host capacity are now
+implemented; see retained-context-storage.md. Device pages, physical groups,
+actual owner/control minima, indivisible allocation geometry and the separate
+primary paused snapshot/extra-drive cold-spill bounds are consumed, not merely
+projected diagnostics. The final primary-plus-extra-spill correction has its
+new affected host result. The fixed nine-file non-neural runner passes93/93
+with no errors/skips: the earlier75 plus18 retained-context cases. The empty
+pager fixture now matches the actual constructor's device-count state.
+
+Existing cross-rank Gloo/NCCL training and canonical packed collective custody
+are real source paths. Cross-rank **Auto comparison**, simultaneous GPU streams,
+arbitrary live-cache subtree migration, unsupported direct accelerators and
+mixed consumers beyond the six text kinds are not implemented/qualified claims.
+Additional candidate backends retain the plan's supported/if-beneficial and
+whole-path evidence conditions; see final-execution-dispositions.md. A local
+sample never authorizes a distributed reorder or a globally optimal schedule.
+Do not reopen the completed ordinary reply or outer-learning consumers.
 
 Missing evidence, rather than automatically another code gap: real native
 memory/learning quality, actual accelerator/drive/transfer performance, complete

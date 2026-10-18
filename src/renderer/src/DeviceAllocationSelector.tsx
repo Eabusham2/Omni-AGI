@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { OmniApi, SystemRamMode } from "../../shared/types";
-import { DEFAULT_DEVICE_RESOURCE_SETTINGS, type DeviceResourceAllocation, type DeviceResourcePlan,
+import { DEFAULT_DEVICE_RESOURCE_SETTINGS, retainedDeviceStorageSupported, type DeviceResourceAllocation, type DeviceResourcePlan,
   type DeviceResourceSettings, type DeviceResourceTopology, type ResourceDevice } from "../../shared/deviceResources";
 import "./deviceAllocation.css";
 
@@ -23,7 +23,7 @@ export function deviceAllocationChoice(device: ResourceDevice, settings: DeviceR
 }
 
 export function deviceAvailability(device: ResourceDevice): string | undefined {
-  if (device.kind !== "storage" && !device.nativeComputeSupported) return device.unavailableReason || "Native computation is unavailable on this device.";
+  if (device.kind !== "storage" && !device.nativeComputeSupported && !retainedDeviceStorageSupported(device)) return device.unavailableReason || "Native computation and verified tensor storage are unavailable on this device.";
   if (device.kind === "storage") {
     if (device.readOnly) return "This filesystem is read-only.";
     if (!device.poolDirectory || !device.filesystemDeviceId || device.memoryGroupId === "darwin:storage-unverified") return "Physical storage identity is not verified.";
@@ -67,6 +67,7 @@ export function DeviceAllocationCards({ topology, settings, ramMode, ramPercent,
           disabled={disabled || Boolean(unavailable && !choice.enabled && !reviewedCpuFallback)} onChange={(event) => update(device, { enabled: event.target.checked })} /> Enabled for this instance</label>
           : <p className="device-allocation-note">Default checkpoint/spill volume; select this folder to customize its spill budget.</p>}
         {unavailable ? <p className="device-allocation-warning">{unavailable}</p> : null}
+        {!device.nativeComputeSupported && retainedDeviceStorageSupported(device) ? <p className="device-allocation-note">Retained working-memory storage is supported. {device.unavailableReason || "Native packed computation is unavailable."} Enabling storage does not authorize a compute fallback route.</p> : null}
         {reviewedCpuFallback ? <p className="device-allocation-note">A selected manual route explicitly permits packed CPU-tile fallback. This does not provide a native CUDA kernel or a measured speedup.</p> : null}
         {device.kind === "storage" && settings?.allowStorageSpill === false ? <p className="device-allocation-note">Storage overflow is off; this drive preference is inactive.</p> : null}
         {shared.length ? <p className="device-allocation-shared">Same physical pool as {shared.map((entry) => entry.label).join(", ")}. These bytes are not added together.</p> : null}

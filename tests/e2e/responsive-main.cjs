@@ -27,7 +27,10 @@ app.whenReady().then(async () => {
       nodeIntegration: false
     }
   });
-  await window.loadFile(path.join(repository, "out", "renderer", "index.html"));
+  // This no-preload helper is explicitly a design preview, never a native app.
+  await window.loadFile(path.join(repository, "out", "renderer", "index.html"), {
+    query: { "omni-preview": "1" }
+  });
   window.show();
 });
 

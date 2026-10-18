@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ClockPage, ClockWorkspaceSnapshot, NativeInferenceRate, ScheduleRecord, ScheduledOccurrence, StopwatchLap, StopwatchRecord } from "../../shared/clock";
 import type { ToolInvocation, ToolExecutionResult } from "../../shared/types";
 import "./clockWorkspace.css";
+import { workspaceReadStatus } from "./workspaceReadStatus";
 
 export interface ClockWorkspacePanelProps { brainId: string; onToast?(message: string): void; onActiveMode?(): void; onEditAutomationSchedule?(schedule: ScheduleRecord): void }
 function clockStudio() { if (!window.omni?.clock) throw new Error("The desktop clock connection is unavailable."); return window.omni; }
@@ -132,7 +133,9 @@ export function ClockWorkspacePanel({ brainId, onToast, onActiveMode, onEditAuto
   const delta = Math.max(0, clockTick - sampledAt);
   const wallDelta = Math.max(0, clockTick - clockSampledAt);
   return <section className="clock-workspace" aria-label="Timers and scheduled tasks">
-    <header className="clock-header"><div><h2>Time & schedules</h2>{snapshot ? <p><time dateTime={snapshot.clock.utc}>{when(new Date(snapshot.clock.epochMilliseconds + wallDelta).toISOString(), snapshot.clock.timeZone)}</time> · {snapshot.clock.timeZone}</p> : <p role="status">Reading host time…</p>}</div>
+    <header className="clock-header"><div><h2>Time & schedules</h2>{snapshot ? <p><time dateTime={snapshot.clock.utc}>{when(new Date(snapshot.clock.epochMilliseconds + wallDelta).toISOString(), snapshot.clock.timeZone)}</time> · {snapshot.clock.timeZone}</p> : <p role="status">{workspaceReadStatus(Boolean(window.omni?.clock), Boolean(error), {
+      pending: "Reading host time…", unavailable: "Host time is unavailable. Use Refresh to try again.",
+      disconnected: "Host time is unavailable without the desktop connection." })}</p>}</div>
       <button type="button" onClick={() => void refresh()} title="Refresh the actual saved clock state">Refresh</button></header>
     {error ? <div className="clock-error" role="alert" tabIndex={-1} ref={errorRegion}><strong>Action needs attention</strong><details open><summary>Details</summary><p>{error}</p></details></div> : null}
     {approval ? <section className="clock-approval" role="region" tabIndex={-1} ref={approvalRegion} aria-label="Clock action approval"><h3>Approve this clock action?</h3><p>{approval.invocation.toolId} · {approval.invocation.action}</p>

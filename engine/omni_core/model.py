@@ -4886,6 +4886,9 @@ class OmniDecoder(nn.Module):
             id(working_pager), working_pager.resident_budget_bytes,
             working_pager.scratch_budget_bytes, working_pager.device_tile_budget_bytes,
             working_pager.page_tokens,
+            tuple(tuple(pool.get(key) for key in ("deviceId", "executionDevice", "memoryGroupId", "budgetBytes", "pageBytes",
+                        "partitionMode", "minimumPackedOwnerBytes", "controlReserveBytes", "transferReserveBytes"))
+                  for pool in getattr(working_pager, "_retained_context_pools", ())),
         )
         return (
             parameters,

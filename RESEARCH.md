@@ -2,14 +2,11 @@
 
 This ledger maps research ideas to concrete, independently testable parts of OmniCortex. Biological terms describe engineering analogies, not evidence of biological equivalence or consciousness.
 
-Current implementation descriptions were reconciled through 2026-09-30 with
-`docs/IMPLEMENTATION_STATUS.md` and the packed update/retention source.
-Research inspiration is not a claim of identical training machinery or useful
-native quality. The v1.1.0 code/package release is complete; newer committed
-source corrections for v1.1.1 and deferred native training/recall evidence are
-separate. See `docs/CURRENT_AGREEMENT_LEDGER.md` for current dispositions rather
-than the historical audit's old partial labels. The independent six-target video runtime is published;
-the new application packages are not yet published.
+This ledger describes the v2 native representation and integration boundaries.
+Research inspiration is not a claim of identical training machinery, useful
+learned quality, measured hardware speed or a published application package.
+The current plan, method dispositions and exact evidence are in `docs/v2/`;
+historical implementation audits do not override those recorded boundaries.
 
 | Source | Adopted idea | Omni implementation boundary | Code/license boundary |
 | --- | --- | --- | --- |
@@ -24,7 +21,7 @@ the new application packages are not yet published.
 | [Elastic Weight Consolidation](https://doi.org/10.1073/pnas.1611835114) and [SYNERgy](https://proceedings.mlr.press/v199/sarfraz22a.html) | Retention/rehearsal inspiration, not a claim of unchanged floating EWC machinery | Native packed projections use checkpointed uint8 output-row resistance (`_PackedRowMetaplasticity`) in direct ternary updates, alongside selective replay and rollback. Legacy floating-anchor/importance helpers have no native packed weight parameters to penalize; they are not the current cortical retention path. This row-level approximation is not a full per-synapse Fisher/anchor model or proof of non-forgetting. | Method-level inspiration and deliberate packed-state departure; independently implemented with no third-party checkpoints. |
 | [Dynamically Expandable Networks](https://arxiv.org/abs/1708.01547), [GROWN](https://arxiv.org/abs/2110.00908), and [Switch Transformers](https://arxiv.org/abs/2101.03961) | Add capacity after sustained error while stabilizing old knowledge and sparsely routing inputs through experts | Omni grows distributed substrate structures and small ternary residual experts after sustained novelty, resets the optimizer for new parameters, routes by learned prototype, and persists them at the next atomic save. Arbitrary incompatible live tensor reshaping is deliberately rejected. | Paper-level architectural ideas, independently implemented. |
 | [Darwin Gödel Machine](https://arxiv.org/abs/2505.22954) and its [reference repository](https://github.com/jennyzzt/dgm) | Preserve an open-ended lineage of self-improvement experiments instead of greedily retaining only one candidate | `EvolutionController` forms isolated neural, data, architecture, or source candidates; binds them to immutable evaluation evidence; archives parentage and promising failures; promotes supported gains; and can recursively reassess the improved improvement process. Host permission, evaluator, origin, and rollback boundaries remain outside candidate-writable state. | Method-level inspiration only; DGM source is not copied, imported, or executed. Omni's controller and Git/safe-tensor isolation are independently implemented. |
-| [Model Context Protocol 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18) | Discover and invoke external typed tools over negotiated Streamable HTTP or stdio JSON-RPC | Omni independently implements initialize, initialized notification, paged tool discovery, and calls. Only tool names and structural input schemas enter neural learning; descriptions, credentials, and transport metadata cannot become behavioral prompts. Host permission and audit enforcement remain outside candidate-writable state. | Protocol interoperability only; no MCP SDK or server code is copied or bundled. |
+| [Model Context Protocol](https://modelcontextprotocol.io/specification/2025-11-25) | Negotiated Streamable HTTP/stdio tools, resources, prompts, notifications and durable tasks | Omni's independent client has current-owner permission checks, paged discovery, reviewed sampling/elicitation, same-frame interactive Apps and negotiated 2025-11-25 server-owned task custody. Names and typed tool schemas can enter ordinary neural learning; untrusted descriptions, credentials and transport authority do not become behavioral prompts. Unsupported optional methods remain explicit. | Protocol integration only; no MCP SDK/server source or account is bundled. Local fixtures do not establish every server or live provider's interoperability. |
 | [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/methods/create), [Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create), and [Gemini Interactions](https://ai.google.dev/api/interactions-api) | Optional teacher-model response imitation from explicit user questions | Provider responses are converted into attributable corpus-prediction trajectories and learned through OmniCortex's existing synapse/assembly/slow-weight path. No provider model is used during normal chat inference; there is no hidden system prompt, preference optimization, or exported credential. | Wire-protocol integration only; provider SDKs, source, and weights are not copied or bundled. API use remains subject to each provider's terms and the user's account. |
 | [OpenAI List models](https://developers.openai.com/api/reference/resources/models/methods/list), [Anthropic List Models](https://platform.claude.com/docs/en/api/models/list), and [Gemini Models API](https://ai.google.dev/api/models) | Account-visible external-teacher model discovery | Main uses the providers' fixed HTTPS list routes and documented pagination to return bounded metadata candidates. Manual selection remains unchanged and every result says visibility is not generation compatibility. | Wire-level read only; no provider SDK/catalog copy, key creation, source, or weights are bundled. Fake HTTP/vault fixtures are not live-provider evidence. |
 | [Diffusion Transformers](https://arxiv.org/abs/2212.09748) | Transformer denoising in a compressed visual latent space | The VQ image pack uses a small ternary, idea/time-conditioned latent transformer with a latent noise-prediction loss and iterative denoising sampler. It is a trainable baseline, not a claim of Stable Diffusion quality. | Paper-level architecture; no DiT code or weights are bundled. |
@@ -33,6 +30,15 @@ the new application packages are not yet published.
 | [DFlash2](https://docs.vllm.ai/projects/speculators/en/latest/user_guide/algorithms/dflash2/), [authors' method](https://inco.ai/blog/dflash2/), and [speculative sampling](https://arxiv.org/abs/2211.17192) | Parallel local candidate features, predecessor-conditioned selection, and exact acceptance/positive-residual verification | A separate own packed auxiliary research region shares Omni's embedding/readout. Thirteen focused cases and eighteen paired native decoder comparisons passed their measurement/isolation contract; the serial-verified path was slower and a grown-expert fixture disproved naive one-long-forward verification. **Evaluated, not enabled**; no runtime switch or default change. See `docs/v2/native-drafting.md`. | Independently written method adaptation, not a complete DFlash2 reproduction. No upstream weights/module imported or executed. Pinned upstream MIT notice preserved in `licenses/DFlash-MIT.txt`; sampling equations attributed to Leviathan et al. |
 
 ## Reference-source boundary
+
+### v2 optional execution frameworks
+
+[Backend compatibility decisions](docs/v2/backend-research-dispositions.md)
+record the reviewed MLX, vLLM, DeepSpeed and NPU interfaces. Existing direct
+packed Metal and canonical native collectives remain supported source paths;
+additional adapters are not silently enabled. A device's usable tensor storage
+does not imply a native packed arithmetic kernel. New backend defaults require
+representation-preserving, end-to-end resource and correctness evidence.
 
 ### v2 integration references (October 11, 2026)
 

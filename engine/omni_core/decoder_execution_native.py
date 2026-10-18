@@ -360,7 +360,8 @@ class NativeDecoderExecutionOps:
             "policyDevice": brain.resource_policy.execution_device,
             "gpuAttributes": copy.copy(getattr(brain, "_native_gpu_state_attributes", set())),
             "working": (brain.working_attention_pager.compute_device, brain.working_attention_pager.resident_budget_bytes,
-                brain.working_attention_pager.scratch_budget_bytes, brain.working_attention_pager.device_tile_budget_bytes),
+                brain.working_attention_pager.scratch_budget_bytes, brain.working_attention_pager.device_tile_budget_bytes,
+                tuple(getattr(brain.working_attention_pager, "_retained_context_pools", ()))),
             "chunks": [(block.attention, block.attention.query_chunk_tokens, block.attention.key_chunk_tokens) for block in decoder.blocks],
             "workspaceChunk": decoder.global_workspace.query_chunk_slots}
         try:
@@ -395,7 +396,8 @@ class NativeDecoderExecutionOps:
                 brain._native_gpu_state_attributes = old["gpuAttributes"]
                 brain.resource_policy.execution_device = old["policyDevice"]
                 pager = brain.working_attention_pager
-                pager.compute_device, pager.resident_budget_bytes, pager.scratch_budget_bytes, pager.device_tile_budget_bytes = old["working"]
+                pager.compute_device, pager.resident_budget_bytes, pager.scratch_budget_bytes, pager.device_tile_budget_bytes = old["working"][:4]
+                pager.configure_retained_context_pools(old["working"][4])
                 for attention, query, key in old["chunks"]:
                     attention.query_chunk_tokens, attention.key_chunk_tokens = query, key
                 decoder.global_workspace.query_chunk_slots = old["workspaceChunk"]

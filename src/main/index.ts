@@ -628,7 +628,8 @@ async function createWindow(): Promise<BrowserWindow> {
       navigateOnDragDrop: false
     }
   });
-  trustedStudioWebContentsId = window.webContents.id;
+  const studioWebContentsId = window.webContents.id;
+  trustedStudioWebContentsId = studioWebContentsId;
   window.on("focus", () => touchBarController?.refresh());
   window.on("blur", () => touchBarController?.refresh());
   window.webContents.on("did-start-navigation", details => {
@@ -659,7 +660,7 @@ async function createWindow(): Promise<BrowserWindow> {
   window.once("ready-to-show", () => window.show());
   window.on("closed", () => {
     touchBarController?.resetOwner();
-    if (trustedStudioWebContentsId === window.webContents.id) trustedStudioWebContentsId = undefined;
+    if (trustedStudioWebContentsId === studioWebContentsId) trustedStudioWebContentsId = undefined;
     if (mainWindow === window) mainWindow = undefined;
   });
 
@@ -1674,7 +1675,6 @@ async function bootstrap(): Promise<void> {
     intervalMs: 12_000,
     startupDelayMs: 30_000,
     minimumIdleSeconds: 6,
-    maxDutyCycle: 0.12,
     isLearning: (brainId) =>
       jobs.isLearning(brainId) || learning.isLearning(brainId) || service.isChatParameterLearningActive(brainId),
     isInitializationBusy: () => initialization.isBusy(),

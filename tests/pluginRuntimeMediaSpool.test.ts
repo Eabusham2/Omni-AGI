@@ -1,16 +1,20 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PluginRuntimeMediaSpool, type PluginRuntimeMediaSpoolOptions } from "../src/main/pluginRuntimeMediaSpool";
 import { extractStreamingZip, streamFileSha256 } from "../src/main/streamingZip";
 
+// Each workspace owns its extraction children; never race two recursive removers over the same tree.
 const roots: string[] = [];
 const sha = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  await Promise.all(roots.splice(0).map(async root => {
+    await rm(root, { recursive: true, force: true });
+    await expect(lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+  }));
 });
 
 async function fixture(overrides: Partial<PluginRuntimeMediaSpoolOptions> = {}) {
@@ -62,12 +66,18 @@ describe("runtime-stream media asset custody", () => {
     ]);
     expect(result.provenance.bundleSha256).toBe(await streamFileSha256(result.bundlePath));
     const extracted = await extractStreamingZip(result.bundlePath, value.workspaceRoot, { checkDisk: async () => undefined });
-    roots.push(extracted.root);
+    expect(dirname(extracted.root)).toBe(value.workspaceRoot);
     expect([...extracted.entries.keys()]).toEqual(["media/00000000.png", "media/00000001.wav", "media/00000002.mp4"]);
     expect(extracted.entries.has("manifest.json")).toBe(false);
+    for (const asset of result.provenance.assets) {
+      expect(await streamFileSha256(extracted.entries.get(asset.memberName)!.path)).toBe(asset.sha256);
+    }
     expect(value.admissions).toContain(512 * 1024);
     expect(value.disk.some(bytes => bytes >= png.length + wav.length + mp4.length)).toBe(true);
     await result.cleanup();
+    await expect(lstat(join(value.workspaceRoot, "plugin-runtime-media", "c".repeat(64))))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(extracted.root)).isDirectory()).toBe(true);
   });
 
   it("fails the whole source transaction on kind/signature or ordering mismatch and removes partial custody", async () => {

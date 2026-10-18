@@ -27,7 +27,8 @@ export interface IdleCognitionSchedulerOptions {
   minimumIdleSeconds?: number;
   /**
    * Maximum fraction of wall time that prompt-free cognition may occupy.
-   * This is hardware policy, not a personality or curiosity control.
+   * Defaults to 1: no duration-proportional rest beyond the normal interval.
+   * A smaller explicit host policy is not a personality or curiosity control.
    */
   maxDutyCycle?: number;
   /** Quiet window in which an immediate user retry outranks idle reload. */
@@ -123,7 +124,7 @@ export class IdleCognitionScheduler {
     );
     this.maxDutyCycle = Math.max(
       0.01,
-      Math.min(0.5, options.maxDutyCycle ?? 0.12)
+      Math.min(1, options.maxDutyCycle ?? 1)
     );
     this.postCancelCooldownMs = Math.max(
       1_000,
@@ -151,7 +152,7 @@ export class IdleCognitionScheduler {
     if (this.timer || this.startupTimer) return;
     // Startup/recovery and a user-started Build have priority over optional
     // prompt-free work. Once the grace period has elapsed, the normal
-    // duty-capped cadence keeps the mind active without monopolizing the host.
+    // interval/resource-driven cadence retains foreground and learning priority.
     this.updateStatus("startup-delay", "Waiting for startup and recovery work.");
     this.startupTimer = setTimeout(() => {
       this.startupTimer = undefined;
@@ -292,7 +293,7 @@ export class IdleCognitionScheduler {
       const leasedBrain = documents[leasedIndex]!;
       this.activeModeBrainId = leasedBrain.id;
       let deferredPhase: IdleCognitionSchedulerPhase = "waiting";
-      let deferredDetail = "Waiting for the next duty-capped idle cycle.";
+      let deferredDetail = "Waiting for the next idle cycle.";
       let earliestEligibleAt: number | undefined;
       for (const brain of [leasedBrain]) {
         // This persisted marker is authoritative. Unlike RuntimeJobManager's
@@ -363,7 +364,10 @@ export class IdleCognitionScheduler {
         );
         this.nextEligibleAt.set(
           brain.id,
-          completedAt + Math.max(dutyCooldownMs, workerCooldownMs)
+          // An acknowledged completion must not erase a newer user-cancel
+          // quiet window reserved while this cycle was still in flight.
+          Math.max(this.nextEligibleAt.get(brain.id) ?? 0,
+            completedAt + Math.max(dutyCooldownMs, workerCooldownMs))
         );
         this.lastCycleAt = completedAt;
         this.activeBrainId = undefined;
@@ -376,7 +380,7 @@ export class IdleCognitionScheduler {
           result.reason === "foreground-work"
             ? "Foreground work preempted optional cognition."
             : result.reason === "instance-unloaded" ? "Instance is unloaded; Active Mode waits for explicit Load."
-            : "Waiting for the next duty-capped idle cycle.",
+            : "Waiting for the next idle cycle.",
           undefined,
           false,
           nextAt

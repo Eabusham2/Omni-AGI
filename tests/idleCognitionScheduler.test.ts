@@ -251,6 +251,38 @@ describe("IdleCognitionScheduler", () => {
     expect(actions.idle).toHaveBeenCalledTimes(2);
   });
 
+  it("allows default and explicitly full-duty Active work to resume at the interval after a long completed cycle", async () => {
+    for (const maxDutyCycle of [undefined, 1]) {
+      let clock = 0;
+      const repository = { list: vi.fn().mockResolvedValue([summary("active")]), get: vi.fn().mockResolvedValue(brain("active", true)) };
+      const actions = { idle: vi.fn(async () => { clock += 60_000; return { brainId: "active", ran: true, actions: [] }; }) };
+      const scheduler = new IdleCognitionScheduler(repository, actions, { intervalMs: 1_000, now: () => clock,
+        ...(maxDutyCycle === undefined ? {} : { maxDutyCycle }) });
+
+      await scheduler.tick();
+      expect(scheduler.status()).toMatchObject({ maxDutyCycle: 1, lastCycleAt: 60_000, nextEligibleAt: 61_000 });
+      clock = 60_999;
+      await scheduler.tick(); expect(actions.idle).toHaveBeenCalledOnce();
+      clock = 61_000;
+      await scheduler.tick(); expect(actions.idle).toHaveBeenCalledTimes(2);
+      expect(scheduler.status().lastCycleAt).toBe(121_000);
+    }
+  });
+
+  it("continues honoring an explicitly fractional host policy after a long Active cycle", async () => {
+    let clock = 0;
+    const repository = { list: vi.fn().mockResolvedValue([summary("active")]), get: vi.fn().mockResolvedValue(brain("active", true)) };
+    const actions = { idle: vi.fn(async () => { clock += 20_000; return { brainId: "active", ran: true, actions: [] }; }) };
+    const scheduler = new IdleCognitionScheduler(repository, actions, { intervalMs: 1_000, maxDutyCycle: .25, now: () => clock });
+
+    await scheduler.tick();
+    expect(scheduler.status()).toMatchObject({ maxDutyCycle: .25, lastCycleAt: 20_000, nextEligibleAt: 80_000 });
+    clock = 79_999;
+    await scheduler.tick(); expect(actions.idle).toHaveBeenCalledOnce();
+    clock = 80_000;
+    await scheduler.tick(); expect(actions.idle).toHaveBeenCalledTimes(2);
+  });
+
   it("honors a longer neural cooldown returned by the worker", async () => {
     let clock = 0;
     const repository = {
@@ -350,6 +382,7 @@ describe("IdleCognitionScheduler", () => {
   });
 
   it("publishes visible running state and cancels only the optional worker request", async () => {
+    let clock = 10_000;
     let finish = (_value: IdleCycleResult): void => undefined;
     const pending = new Promise<IdleCycleResult>((resolve) => {
       finish = resolve;
@@ -362,7 +395,7 @@ describe("IdleCognitionScheduler", () => {
     const scheduler = new IdleCognitionScheduler(
       repository,
       { idle: vi.fn().mockReturnValue(pending) },
-      { preemptBackground }
+      { preemptBackground, now: () => clock }
     );
     const statuses: string[] = [];
     scheduler.onStatus((status) => statuses.push(status.phase));
@@ -373,13 +406,14 @@ describe("IdleCognitionScheduler", () => {
       activeBrainId: "resident",
       activeModeBrainId: "resident",
       cancellable: true,
-      maxDutyCycle: 0.12
+      maxDutyCycle: 1
     });
 
     await expect(scheduler.cancelActive()).resolves.toBe(true);
     expect(preemptBackground).toHaveBeenCalledOnce();
     expect(scheduler.status().phase).toBe("cancelling");
 
+    clock = 11_000;
     finish({
       brainId: "resident",
       ran: false,
@@ -389,7 +423,8 @@ describe("IdleCognitionScheduler", () => {
     await expect(cycle).resolves.toMatchObject({ reason: "foreground-work" });
     expect(scheduler.status()).toMatchObject({
       phase: "paused-foreground",
-      cancellable: false
+      cancellable: false,
+      nextEligibleAt: 70_000
     });
     expect(statuses).toEqual(
       expect.arrayContaining(["stopped", "running", "cancelling", "paused-foreground"])

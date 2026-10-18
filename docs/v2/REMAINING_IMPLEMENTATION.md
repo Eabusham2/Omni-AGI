@@ -9,6 +9,38 @@ quality, or user-deferred evidence into missing source code. Conversely, a
 focused test or rendered synthetic fixture does not hide a real missing runtime
 consumer, persistence path, or authority boundary.
 
+## Current correction boundary — October18
+
+The supported source consumers described below are implemented, including real
+RAM/VRAM/storage retained-context capacity; that item is no longer assigned or
+diagnostic-only. The final primary-snapshot plus extra-only-spill accounting
+correction passed its new host case. The fixed nine-file non-neural runner is
+**93/93** with no errors/skips; Node/Web TypeScript, the affected seven-file
+desktop selection (**20/20**) and the application shell bundle exit0. The
+empty-pager fixture now matches the actual constructor's device-count state.
+See retained-context-storage.md and desktop-bootstrap-boundary.md.
+
+The actual isolated compiled-main Library/Build-form/Cmd+Q check passed with
+0 independent identities and no brain creation/Load/training. It closes the
+observed sandbox-preload/hidden-preview and destroyed-window-quit source faults,
+not packaged-platform startup or neural inference. Public ordinary curriculum22
+contains8 manuals; the affected two cases pass. The residual no-engine report
+has31 numbered captures,30 in its accepted index and one rejected scroll capture;
+its finite evidence is not universal U1/accessibility/backend qualification.
+
+All8 jobs on fdd16a4 are terminal: Android/iOS passed; all6 desktop jobs failed.
+Their new affected corrections are local and **not remotely requalified**.
+Active's fixed12% default/50% ceiling is removed; default/clamp is1 while
+interval, actual resource/preemption, worker retry and newer cancel-cooldown
+custody remain. The three affected inert cases passed, followed by root's
+complete16/16 file check after adding it to fixed Node CI. Final Node/Web types
+and the ordinary pack's two cases pass after the Active paragraph. The broader
+resource/UI run was59/60 plus only the corrected affected capacity case passing,
+not a claimed full rerun. Final reviewed push, required green package jobs, tag, publication and
+artifact verification are not replaced by these local results. Existing
+provider/hardware limitations and explicit new-brain/full-folder deferrals
+remain unchanged. No full-v2 or released-package completion is claimed here.
+
 ## Status vocabulary
 
 | Disposition | Meaning in this document |
@@ -145,15 +177,24 @@ The neural-import guard remains intact; five mixed-candidate desktop contract
 cases have separate focused evidence. These prove source/custody/once-only
 boundaries, not a model, device, training or speed result.
 
-Actual remaining implementation breadth is concurrent/cross-rank execution
-and collective custody, retained device-cache/context subtree migration,
-unsupported direct accelerator kernels, and mixed intra-operation consumers
-outside those six text kinds where such routes are to be supported. Do not
-reopen the completed ordinary reply or outer-learning orchestration as absent.
-One physical unified-memory group, real transfer costs, current per-device
-budgets, context occupancy, slow-storage opt-in and ordinary fallback remain
-required. Primitive timings cannot establish full-brain placement or speedup;
-representative end-to-end hardware/pressure/package evidence is still missing.
+Actual RAM/VRAM/storage retained-page ownership and planner capacity now consume
+the enabled physical pools; see retained-context-storage.md. Host metadata,
+whole-owner/control minima, indivisible pages, unified aliases, primary paused
+snapshots and authorized cold-spill quotas are accounted separately. The final
+primary-plus-extra-spill host case is recorded there; this is not GPU evidence.
+
+Existing cross-rank Gloo/NCCL learning and its canonical packed collective are
+real source paths, not missing implementation. Cross-rank **Auto comparison**,
+simultaneous GPU streams, arbitrary live-cache migration, direct unsupported
+accelerators and mixed candidates beyond the six text kinds are not supported
+claims. These are conditional candidate/qualification breadth under the plan's
+investigate/supported/if-beneficial language, not permission to claim them
+implemented or an unconditional requirement to invent every backend. See
+final-execution-dispositions.md and backend-research-dispositions.md. Preserve
+the completed reply, memory and outer-learning consumers and their once-only
+effects. Physical admission, real transfer costs, current budgets, context
+occupancy, storage opt-in and ordinary fallback remain required. Representative
+hardware/pressure/performance and clean package evidence are still separate.
 
 ### 2. API-teacher custody: implemented; real provider/neural evidence remains
 
@@ -276,18 +317,21 @@ unsupported optional methods should stay advertised as unavailable. Real
 Adobe/mail/provider account operations are service-dependent acceptance, not a
 reason to fabricate local success.
 
-### 7. Brain-versus-biology explanation: written; final docs pack reconciliation pending
+### 7. Brain-versus-biology explanation and ordinary documentation: source reconciled
 
 **Rows:** R071, R072, R076, R078–R080, R084, R145, R154, R212 and A10.
 
 The user guide now contains the plain mechanism comparison with primary
 biological references, software-state mapping and explicit non-equivalence,
 retention and consciousness boundaries. See brain-versus-biology.md.
-New provider/teacher/file/Ponder interfaces are described. Reconcile the
-remaining stable runtime controls into `USER_GUIDE.md`,
-`INTEGRATIONS.md`, plugin/API references, and one newly versioned ordinary
-documentation curriculum pack. Internal failure chronology and corrective
-audit prose must not enter that training document pack.
+New provider/teacher/file/Ponder interfaces and supported runtime boundaries are
+described in the public manuals/plugin/API references. Ordinary documentation
+pack22 contains the same8 public manuals and its affected two-case check passes.
+This is exact source/pack custody, not proof that a brain learned those manuals.
+Internal failure chronology, private transcripts and corrective audit prose
+remain excluded. Any final in-flight control change still updates its ordinary
+manual and pack hashes before release; it does not revive all historical docs
+work as missing.
 
 ## Implemented source whose remaining work is evidence or qualification
 
@@ -363,8 +407,11 @@ restart them as missing features without a reproduced defect.
 
 ## External, hardware, service, and broad-acceptance work
 
-These are required acceptance gates but are not evidence of a missing local
-implementation by themselves:
+These are remaining availability and qualification boundaries, not evidence of
+a missing local implementation by themselves. Do not convert an explicitly
+deferred model run, unavailable account/device or unsupported optional route
+into a fabricated pass. The current goal's required cross-platform CI/package/
+release gates remain mandatory independently:
 
 1. Real provider/account checks for MCP, mail/Adobe presets, maps, API teachers,
    external advice/reviewer, OAuth, and interactive Apps (R007, R014, R055,
@@ -390,13 +437,17 @@ implementation by themselves:
    R125, R157, R170, R178, R193–R196, R209, R213, R216, R224–R225,
    R229–R232, R241).
 
-October18 current Data/runtime and MCP display inspections close their stated
-bounded renderer checks only. Five CI UI specs now match the current renderer
-and passed a scoped TypeScript check with zero diagnostics. That alignment did
-not run the UI runner or measure its contrast/geometry. Inert injected action,
-camera, meter and SVG samples remain explicitly CSS-only evidence. See
-desktop-current-ui-2026-10-18.md, mcp-display-ui-2026-10-18.md and
-ui-contract-source-alignment-2026-10-18.md.
+October18 Data/runtime, MCP display and residual existing-App inspections close
+their named bounded renderer checks only. The residual report has31 numbered
+captures,30 accepted indexed captures and one rejected scroll capture. Since the
+earlier static spec alignment, both Mac jobs and Linux x64 on fdd16a4 passed all
+ten no-engine UI contracts, but subsequently failed actual packaged-shell smoke.
+Those theme/geometry contracts and CSS-only action/camera/meter/SVG samples are
+not full U1, live backend, device or learned-map proof. The actual local compiled
+main now requires its real preload and passed empty Library/Build/normal quit;
+clean packaged requalification is still pending. See desktop-current-ui-2026-10-18.md,
+mcp-display-ui-2026-10-18.md, residual-ui-audit-2026-10-18.md and
+desktop-bootstrap-boundary.md.
 
 ## Explicitly deferred or superseded work
 
@@ -425,9 +476,13 @@ ui-contract-source-alignment-2026-10-18.md.
 
 ## Research decisions still needing comparison, not blind integration
 
-vLLM (R197), DeepSpeed (R201), broader MLX/Metal (R124), NPU execution (R218),
-and further attention alternatives (R185) still need an explicit compatibility
-and end-to-end measurement record. A backend is adopted only if it preserves
+The primary-documentation/source compatibility dispositions for vLLM (R197),
+DeepSpeed (R201), broader MLX/Metal (R124) and NPU execution (R218) are now in
+[backend-research-dispositions.md](backend-research-dispositions.md). Direct
+Metal is retained, stock floating optimizer conversion is rejected, and
+additional framework/direct-kernel adapters remain conditional candidates,
+not implemented integrations or measured speedups. End-to-end measurement
+and further attention alternatives (R185) remain gated. A backend is adopted only if it preserves
 native packed state, exact dataset coverage, sampling semantics, and current
 authority boundaries while improving the whole path. This research follows a
 representative baseline; it does not precede correctness and custody closure.
@@ -436,9 +491,11 @@ representative baseline; it does not precede correctness and custody closure.
 
 1. Preserve the resolved catalog/map choices and exact reviewed-saved-copy
    exception; do not widen it into global file access or inherited authority.
-2. Preserve the now source-frozen request-memory/reply/outer-learning and
-   six-text-kind mixed consumers; address only the explicitly unsupported
-   execution breadth above, not another copy of those implementations.
+2. Preserve source-frozen request-memory/reply/outer-learning, actual retained
+   device capacity and six-text-kind sequential mixed consumers. Active's
+   restrictive duty policy is now corrected; finish the composed review, while unsupported
+   candidate optimizations require their actual compatibility/measurement
+   gate, not another copy of completed implementations.
 3. Keep format-safe catalog archives, durable API-teacher custody, search/
    streaming file tools and scoped OS leases closed at their recorded source
    boundary; their real service/platform qualification remains separate.
@@ -447,11 +504,12 @@ representative baseline; it does not precede correctness and custody closure.
    or full-folder training is not silently started for that proof.
 5. Implement only the approved useful remainder of optional MCP/App methods and
    provider integrations; retain explicit unsupported results elsewhere.
-6. Perform live-host/device/service and full U1 UI acceptance. Fix only
-   reproduced defects and preserve failures as evidence.
-7. Reconcile the final user/plugin/API documentation and publish a new ordinary
-   documentation pack; then update `FEATURE_MATRIX.md`, `CONTINUATION.md`, and
-   the final compliance matrix from exact results.
+6. Preserve accepted scoped UI evidence, fix only reproduced defects and keep
+   remaining host/device/service/U1 qualification explicitly bounded. Do not
+   start the user-deferred brain/corpus work to close an evidence label.
+7. Keep public user/plugin/API manuals and ordinary pack22 synchronized with
+   final in-flight controls; update the current closure ledger and final
+   compliance matrix from exact results rather than historical open labels.
 8. Run the required local selectors and package smoke tests, commit/push the
    exact reviewed candidate, then run remote CI on every required runner.
    Only after all required jobs are green: merge the verified commit to `main`,
@@ -461,8 +519,9 @@ representative baseline; it does not precede correctness and custody closure.
 
 ## Release boundary
 
-The repository is not ready to call the full v2 goal complete today. The
-remaining local code items are finite and named above; most other open matrix
-rows are acceptance breadth, external availability, research decisions, or
-explicitly deferred model-quality work. No green-CI, package, signing, GitHub
-release, full-folder training, or biological/AGI claim follows from this ledger.
+The full v2 goal is not complete: final reviewed-candidate delivery and required
+remote CI/package/release gates remain. Older open matrix labels do not by
+themselves prove missing source; most describe acceptance breadth, external
+availability, conditional research or explicitly deferred model-quality work.
+No all-green CI, clean package, signing, published release, full-folder training
+or biological/AGI claim follows from this ledger.

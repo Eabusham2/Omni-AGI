@@ -46,6 +46,9 @@ class NativeFullPrefixOperationOps(NativeCachedWholeOperationOps):
         return {"batch": batch, "prefixTokens": length, "inputDtype": str(window.dtype),
             "pageTokens": int(pager.page_tokens), "tileBudgetBytes": int(pager.device_tile_budget_bytes),
             "residentBudgetBytes": int(pager.resident_budget_bytes), "scratchBudgetBytes": int(pager.scratch_budget_bytes),
+            "retainedContextPools": [{key: pool.get(key) for key in ("deviceId", "executionDevice", "memoryGroupId", "budgetBytes", "pageBytes",
+                                         "partitionMode", "minimumPackedOwnerBytes", "controlReserveBytes", "transferReserveBytes")}
+                                     for pool in getattr(pager, "_retained_context_pools", ())],
             "owners": rows}
 
     def valid_prefix(self, window, cue, cache):

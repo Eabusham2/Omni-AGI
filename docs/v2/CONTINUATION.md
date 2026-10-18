@@ -1,6 +1,89 @@
 # Current implementation continuation
 
-### October18 current — signing integration checked; retained-VRAM context implementation and next CI candidate pending
+## October18 current — local source corrections verified; remote requalification and release pending
+
+This current entry supersedes the historical checkpoints below. The full v2
+goal remains active; source composition is not a green CI/release claim.
+
+- All eight jobs on pushed commit
+  `fdd16a4bef57d1e27b5bd0b0c0bb52ea15a5919d` finished. Android39168241386
+  and iOS39168241311 passed. Linux39168241441, Windows39168241268 and
+  macOS39168241195 failed on their desktop matrices. Do not keep polling those
+  terminal handles or restart them on an observation timeout. No v2 tag or
+  release was created. Root owns the next reviewed candidate and remote gates.
+- The new desktop corrections have affected local proof but are **not yet
+  remotely requalified**. Windows fixture/ASAR writer-close, exact numeric
+  filesystem identity and media-handle cleanup, plus Linux's explicit launch
+  readiness fixture, retain their scoped evidence. Both Mac architectures and
+  Linux x64 passed packaging, worker health and all ten no-engine UI contracts,
+  then timed out in packaged-shell navigation/normal-close. Those are failed
+  smokes, not failed neural training or green packages.
+- Root reproduced real source-shell faults: sandbox preload attempted
+  node:crypto and silently fell into design preview; normal quit read a
+  destroyed webContents. The current preload uses browser UUID generation;
+  startup fails honestly without its actual bridge; the closed callback keeps
+  its alive-time owner ID. Sandboxing, nodeIntegration:false and IPC authority
+  stay intact. Packaged smoke now requires the actual platform IPC/no-preview
+  boundary, records phases/preload diagnostics and bounds only the exact test
+  child's teardown. Forced cleanup remains a failure, never a passed quit.
+- The rebuilt **application shell only** then passed an actual isolated local
+  main check: real Library with0 independent identities, actual Build Identity
+  form, no Continue/Create, ordinary Cmd+Q exit0 and no surviving owned process.
+  See desktop-bootstrap-boundary.md. No brain was created, Loaded, queried or
+  trained. The unlocked local Python environment's missing jsonschema is not
+  evidence about the locked packaged runtime or working neural inference.
+- Actual retained-context RAM/VRAM/storage ownership and resource-derived
+  capacity are now source-implemented. Main and native consumers use exact
+  page geometry, physical-group deduplication and admitted owner/control costs.
+  The final primary-snapshot plus extra-only-spill correction passed its new
+  host case; separate primary capacity, cold-placement quota and their union
+  are not conflated or double-counted. See retained-context-storage.md. Do not
+  reopen this as a CPU/disk-only or diagnostic-only implementation.
+- The fixed **nine-file non-neural Python runner passes93/93**, with no errors
+  or skips, after the empty-pager fixture was aligned with real constructor
+  device-count state. Its neural-import guard remains. Node/Web TypeScript,
+  root's affected seven-file desktop selection (**20/20**) and the shell bundle
+  exit0. These are source/inert/host boundaries, not model or GPU evidence.
+- Public ordinary documentation pack22 retains8 manuals; its affected two
+  cases pass again after the final Active paragraph. The residual current-App report records31 numbered captures,
+  30 in its accepted index and one explicitly rejected pre-fix scroll capture.
+  See residual-ui-audit-2026-10-18.md. No-engine UI, fixture callback and CSS
+  evidence must not be promoted to all-theme/accessibility/live-backend proof.
+- Existing Gloo/NCCL canonical packed learning is implemented. Cross-rank Auto,
+  simultaneous GPU streams, unsupported direct accelerators, arbitrary live
+  cache migration and mixed routes outside the six text kinds are not claimed
+  supported. Backend suggestions retain their investigate/if-beneficial
+  disposition. Active's fixed12% default/50% ceiling is now removed; default/
+  clamp is1 with interval, actual resource/preemption, worker retry and newer
+  cancel-cooldown custody preserved. The three affected inert-clock cases
+  passed; root then added the file to fixed Node CI and its complete16/16
+  passed112ms. Real providers/hardware remain qualified
+  separately. New-brain merged-resume/full-folder learned proof stays deferred.
+
+Final root Node/Web compilers exit0. Its broad resource/UI selection first
+passed59/60; the lone older expectation omitted the now separate paused-context
+snapshot reserve. Only that affected case was corrected/retried and passed23ms;
+no all-group rerun is claimed. The2.0.0 signed-ready metadata verifier passes,
+including diagnostic-artifact compression configuration, not signing/packages.
+
+Next: finish the reviewed-candidate composition/staging, update the exact
+source/delivery ledger, then root commits/pushes the reviewed candidate and
+verifies the required CI/package/release gates. Do not create a brain or rerun
+closed suites to change a counter. Deliver the Downloads/ai train/rented-GPU
+estimate reminder at final handoff, not an invented completed qualification.
+
+## Historical October18 checkpoint — fdd16a4 dispatched, before its jobs and retained-context work finished
+
+The following record describes the earlier source point. Its running-job,
+75-case and CPU/disk-only statements are superseded by the current entry above.
+
+Packaging/UI correction commit `fdd16a4bef57d1e27b5bd0b0c0bb52ea15a5919d`
+is committed, the clean primary checkout was fast-forwarded, and `main` was
+pushed normally. GitHub confirmed five active workflows on that exact SHA:
+Linux39168241441, Windows39168241268, macOS39168241195,
+Android39168241386 and iOS39168241311. They are running, not green evidence.
+The release lane owns observation of those exact jobs; do not duplicate its
+polling or restart a live job on an observation timeout. No tag was created.
 
 Full source candidate `aebefaf9055382f41653162cce599ff548b62e7c` and its exact
 seven-file CI-manifest assertion correction
@@ -17,7 +100,7 @@ cases passed. Windowsx64/ARM64 exposed ASAR separator, deep SQLite path and
 durable plugin throughput/shutdown defects; ARM64 additionally exposed a
 metadata-collision fixture. These are real failed runs, not green packaging.
 
-The affected fixes are composed locally and await the next reviewed candidate:
+The affected fixes are composed in that pushed correction commit:
 Windows path normalization, durable per-commit plugin journals and closing-state
 custody, deterministic file-replacement/metadata fixtures, ordinary Conversation
 question rendering and compact layout, and bounded vendor DMG detach retries.
@@ -78,7 +161,7 @@ diagnostic multidevice projection. Root assigned actual enabled-device KV
 residency and capacity-planner implementation to uncached_forward_impl.
 Existing distributed Gloo/NCCL learning and collectives are already implemented;
 it is cross-rank Auto qualification that remains unqualified, not all distributed
-training. The upcoming packaging-fix push must not claim full-plan source closure.
+training. The packaging-fix push does not claim full-plan source closure.
 
 The affected390px Call-open/close shell check now reports zero horizontal shell
 overflow with compact status font/line-height11px/13px. Evidence is
@@ -86,11 +169,11 @@ overflow with compact status font/line-height11px/13px. Evidence is
 This is a bounded no-engine layout check, not all themes/devices or model speed.
 
 The affected desktop path/plugin/layout/DMG and signing fixes have scoped local
-results; retained-VRAM context source work above remains separately active. They
-have not yet been repushed or requalified remotely. Android/iOS green on9ae0f31
+results; retained-VRAM context source work above remains separately active. The
+fixes are pushed onfdd16a4 but not yet requalified remotely. Android/iOS green on9ae0f31
 does not make Windows/macOS/Linux green on the corrected tree. Do not reopen
-the frozen lanes or initialize a brain. Root's next gate is the reviewed
-candidate commit/push, required platform runs, package smoke, tag and verified
+the frozen lanes or initialize a brain. Root's next gate is the remaining
+source/audit work and required platform runs, package smoke, tag and verified
 publication. Broader hardware/provider/performance and deferred learned-
 quality/full-folder training boundaries remain unchanged.
 

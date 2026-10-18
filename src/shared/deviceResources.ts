@@ -34,6 +34,16 @@ export interface ResourceDevice {
   readOnly?: boolean;
 }
 
+/** Verified tensor storage is distinct from a native packed math kernel. */
+export function retainedDeviceStorageSupported(device: ResourceDevice): boolean {
+  return device.kind === "gpu" && device.unifiedMemory === false && device.memoryGroupId !== "ram:system"
+    && typeof device.executionDevice === "string"
+    && (device.backend === "cuda" && /^cuda:[0-9]+$/.test(device.executionDevice)
+      || device.backend === "mps" && device.executionDevice === "mps")
+    && Number.isSafeInteger(device.totalBytes) && Number(device.totalBytes) > 0
+    && Number.isSafeInteger(device.availableBytes) && Number(device.availableBytes) >= 0;
+}
+
 export interface ResourceTransferLink {
   from: string;
   to: string;

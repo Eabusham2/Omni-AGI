@@ -739,11 +739,13 @@ class NativeCorePager:
                     self.cool_to_budget()
 
     @torch.no_grad()
-    def _copy_bounded(self, source: torch.Tensor, target: torch.Tensor) -> int:
+    def _copy_bounded(self, source: torch.Tensor, target: torch.Tensor, *, cancelled=None) -> int:
         source_flat, target_flat = source.reshape(-1), target.reshape(-1)
         elements = max(1, self.chunk_bytes // source.element_size())
         copied = 0
         for start in range(0, source.numel(), elements):
+            if cancelled is not None:
+                cancelled()
             end = min(source.numel(), start + elements)
             target_flat[start:end].copy_(source_flat[start:end], non_blocking=False)
             count = (end - start) * source.element_size()
@@ -752,7 +754,7 @@ class NativeCorePager:
             self._peak_transfer_bytes = max(self._peak_transfer_bytes, count)
         return copied
 
-    def evict(self, module: torch.nn.Module) -> None:
+    def evict(self, module: torch.nn.Module, *, cancelled=None) -> None:
         with self._lock:
             owner = self._owners.get(module)
             if owner is None or owner.device is None:
@@ -763,7 +765,8 @@ class NativeCorePager:
             for name, target in owner.cold.items():
                 source = module._buffers[name]
                 if name in owner.dirty_names or int(source._version) != owner.versions.get(name):
-                    copied = self._copy_bounded(source, target)
+                    copied = (self._copy_bounded(source, target) if cancelled is None
+                              else self._copy_bounded(source, target, cancelled=cancelled))
                     self._writeback_bytes += copied
                     if name in owner.maps:
                         owner.maps[name].dirty = True
@@ -777,6 +780,29 @@ class NativeCorePager:
             self._invalidate_validation(module)
             self._page_outs += 1
             self._event("accelerator-evict", owner, self._owner_bytes(owner))
+
+    def reclaim_device_for_context(self, device, needed: int, *, core_minimum_bytes: int, cancelled) -> None:
+        """Manual context borrows only safely evictable packed hot residency.
+
+        No learned bytes are dropped or reinitialized. Refuse before eviction
+        when a pinned/current learning owner prevents changing this partition.
+        An interrupted bounded writeback leaves the accelerator authoritative.
+        """
+        name = canonical_device(device)
+        with self._lock:
+            owners = [(module, owner) for module, owner in self._owners.items()
+                      if owner.device is not None and canonical_device(owner.device) == name]
+            if (any(owner.pins for _module, owner in owners)
+                    or any(getattr(module, "_online_transaction", None) is not None for module in self._owners)):
+                self._pause("manual context allocation awaits pinned or learning packed owners")
+            for module, owner in sorted(owners, key=lambda pair: pair[1].heat):
+                cancelled()
+                current = self.shared_resource_policy.device_budget(device, fresh=True)
+                if (current and current.get("enabled") and current.get("capacityMeasured")
+                        and current.get("remainingBytes", 0) >= needed
+                        and self._accelerator_usage().get(name, 0) <= core_minimum_bytes):
+                    return
+                self.evict(module, cancelled=cancelled)
 
     def _release_page(self, page: _Map) -> None:
         if page.dirty:
@@ -807,18 +833,23 @@ class NativeCorePager:
                 page.mapping.madvise(mmap.MADV_DONTNEED, begin, end - begin)
                 self._advice_calls += 1
 
-    def cool_to_budget(self, cpu_hot_bytes: Optional[int] = None) -> None:
+    def cool_to_budget(self, cpu_hot_bytes: Optional[int] = None, *, cancelled=None) -> None:
         """Spill cold heap owners on pressure; never drop/update learned bytes."""
         with self._lock:
             if cpu_hot_bytes is not None:
                 self.cpu_hot_bytes = max(0, int(cpu_hot_bytes))
             for module, owner in sorted(list(self._owners.items()), key=lambda pair: pair[1].heat):
+                if cancelled is not None:
+                    cancelled()
                 if owner.pins or not owner.loaded:
                     continue
                 self._observe_mutations(module, owner)
                 if self._heap_bytes() > self.cpu_hot_bytes:
                     if owner.device is not None:
-                        self.evict(module)
+                        if cancelled is None:
+                            self.evict(module)
+                        else:
+                            self.evict(module, cancelled=cancelled)
                     for name, source in list(owner.cold.items()):
                         if name in owner.maps or source.numel() == 0:
                             continue
@@ -827,7 +858,20 @@ class NativeCorePager:
                         if source.numel() * source.element_size() < 1024:
                             continue
                         target = self._map_tensor(owner, name, tuple(source.shape), source.dtype)
-                        self._copy_bounded(source, target)
+                        try:
+                            if cancelled is None:
+                                self._copy_bounded(source, target)
+                            else:
+                                self._copy_bounded(source, target, cancelled=cancelled)
+                        except BaseException:
+                            # The original heap tensor is still authoritative.
+                            # Never leave an incomplete mapping registered as
+                            # if future calls could skip copying this owner.
+                            pending = owner.maps.pop(name, None)
+                            del target
+                            if pending is not None:
+                                self._unlink_owned_page(pending.path)
+                            raise
                         owner.cold[name] = target
                         owner.maps[name].dirty = True
                         self._spill_bytes += target.numel() * target.element_size()

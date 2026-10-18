@@ -80,7 +80,11 @@ it("rejects symlinks, replaced sources, forged cursors, path swapping and revoke
   // Replace the actual named file, rather than depending on a same-size write
   // advancing the filesystem clock on a fast Windows runner.
   const replacement = join(root, "replacement.txt"), original = await lstat(path, { bigint: true });
-  await writeFile(replacement, "wxyz"); await rename(replacement, path);
+  await writeFile(replacement, "wxyz");
+  // Windows permits moving the shared original handle but not replacing an
+  // existing open destination. Both names remain inside this owned fixture.
+  await rename(path, join(root, "retired-original.txt"));
+  await rename(replacement, path);
   expect((await lstat(path, { bigint: true })).ino).not.toBe(original.ino);
   await expect(execute("read-next", { cursor: page.nextCursor })).rejects.toThrow("changed");
   resourceHook = purpose => { if (purpose === "bounded file page and encoding") current = false; };

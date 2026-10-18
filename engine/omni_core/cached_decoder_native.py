@@ -134,7 +134,9 @@ class NativeCachedDecoderOps(NativeDecoderExecutionOps):
                 raw = value.detach().view(torch.uint8).reshape(-1)
                 for start in range(0, raw.numel(), 256 * 1024):
                     pager.check_cancelled()
-                    hasher.update(memoryview(raw[start:start + 256 * 1024].numpy()))
+                    # Retained immutable pages may now own admitted VRAM.
+                    # Hash one bounded host fragment, never a whole GPU cache.
+                    hasher.update(memoryview(raw[start:start + 256 * 1024].to(device="cpu", non_blocking=False).contiguous().numpy()))
                 if signature[2] != int(value._version): raise RuntimeError("hot cache activity changed while hashing")
             result = hasher.hexdigest()
         else:

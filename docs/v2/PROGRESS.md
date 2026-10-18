@@ -7,13 +7,13 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 | Step | Work | State |
 | --- | --- | --- |
 | 1/8 | Preserve authority and map every requirement | Complete: exact original request and approved plan saved; every nonempty source line mapped in FEATURE_MATRIX.md |
-| 2/8 | Native strengths, plasticity, memory, connected regions, full merge | In progress: projection/router/memory migration/export checks passed; connected and nested merge lifecycle works in tiny fixtures, full host/rollback/portability integration ongoing |
-| 3/8 | Learning, research, self-review, fact checking, teachers | In progress: durable learning/teacher custody and outer media/replay/evolution owner orchestration are source-composed; provider, learned-quality and broader integration qualification remain open |
-| 4/8 | MCP, integrations, plugins, tools, automations, oversight | In progress: dated tasks, negotiated same-frame inline/fullscreen Apps, reviewed sampling, host tools, plugins and custody have scoped source checks and bounded renderer evidence. Real accounts, broader optional methods and packaged integrations remain open |
-| 5/8 | Load/unload, resource planner, devices, media lifecycle | In progress: thirteen complete-operation kinds, fixed-owner memory/STDP, reply/outer-learning orchestration and six-text-kind mixed sequential routes are source-composed. Required actual VRAM-backed retained-context capacity is missing and assigned for implementation; existing Gloo/NCCL learning collectives are implemented, while cross-rank Auto remains unqualified. Broader device/hardware/package proof and deferred new-brain quality stay separate |
-| 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | In progress: existing composer/queue, one-pair action flow, early-Steer ownership, unified map and Call controls have scoped source evidence. Ordinary Conversation questions now have five new source contracts and bounded actual component/keyboard/scroll/retirement evidence. Full native sequencing/theme/accessibility acceptance remains open |
-| 7/8 | Focused fixtures, visual audit, complete feature audit and documentation | Coordinated source groups, bounded visual checks and current UI-spec/type reconciliation are recorded; full feature/theme/platform audit, actual UI runner and final documentation/curriculum remain open |
-| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | In progress: main candidate9ae0f31 is pushed and Android/iOS passed. Windows/macOS/Linux failures have affected local fixes; the corrected candidate has not yet been repushed or remotely requalified. No v2 package/release completion claim |
+| 2/8 | Native strengths, plasticity, memory, connected regions, full merge | Source implemented and scoped-tested: packed state, connected/nested parents and complete host/archive custody. New-brain merged-resume and broad retention/intelligence qualification remain explicitly deferred, not failed source work |
+| 3/8 | Learning, research, self-review, fact checking, teachers | Source implemented at the supported boundary: durable learning/teacher custody, ordinary experience, self-review and outer owner orchestration. Research dispositions are recorded; real provider interoperability and learned quality are separate qualification |
+| 4/8 | MCP, integrations, plugins, tools, automations, oversight | Source implemented for the advertised supported transports/capabilities and host boundaries; focused contracts and bounded renderer evidence are recorded. Optional unsupported methods, real accounts/devices and packaged integrations are not claimed passed |
+| 5/8 | Load/unload, resource planner, devices, media lifecycle | Actual RAM/VRAM/storage retained-context ownership and capacity are implemented, including primary snapshot plus extra-drive spill accounting. Existing Gloo/NCCL training, thirteen complete-operation kinds and six-text-kind sequential mixed routes are preserved. Active's fixed12%/50% duty restrictions are removed while actual admission/preemption remains; broader hardware/concurrent/direct-accelerator qualification stays distinct |
+| 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | Source implemented with scoped component/control evidence. The actual compiled main now opens a real empty Library and Build form and quits normally without creating a brain. Full native learned sequencing and universal theme/accessibility/device acceptance are not inferred |
+| 7/8 | Focused fixtures, visual audit, complete feature audit and documentation | Current non-neural runner93/93, affected desktop20/20, Node/Web types and shell bundle pass; public curriculum22 preserves8 manuals. Residual no-engine walkthrough has31 numbered captures,30 in its accepted index and one rejected scroll capture. These are bounded results, not full U1/live-engine proof |
+| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | Not complete: all8 jobs on fdd16a4 are terminal; Android/iOS passed, all6 desktop jobs failed. New desktop corrections are local and not remotely requalified. No v2 tag/release completion claim |
 
 ## Settled scope changes
 
@@ -27,30 +27,55 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 
 ## Evidence
 
-- Current post-CI correction boundary: the fixed eight-file stdlib-only runner
-  passed **75/75** with zero failures/errors/skips (16 earlier +12 memory +17
-  reply +10 mixed +13 outer +7 native-kernel). Neural imports, brain creation,
-  Load and training remain forbidden. Current Node/Web TypeScript exited0;
-  the release-manifest selection passed1 case/1 excluded, and curriculum2
-  passed. The Mac native-kernel payload/hash mechanism preserves exact runtime
-  hash/ABI checks, not a signature-neutral bypass. Pinned synchronous
-  `optionsForFile` integration is now fixed and frozen; one new installed-
-  signing-loop regression with inert callbacks passed41ms, with five older
-  kernel/DMG cases not repeated. Full packaged signing smoke remains unproven.
-  Full-plan source closure remains open: actual enabled-device retained-KV
-  residency/capacity is assigned because the current pager is CPU/disk and
-  planner device projection is diagnostic only. Existing Gloo/NCCL learning
-  collectives are not missing; cross-rank Auto qualification is separate.
-  Five new question source contracts plus the bounded native component pass
-  record the genuine compact Retry/scroll fixes and their affected evidence.
-  The affected390px Call-open/close layout check reports zero shell horizontal
-  overflow at11px/13px status typography, with the exact screenshot/log in
-  `.runtime/responsive-overflow-cua-11px.*` and owned preview exit0.
-  These local checks do not make desktop CI or packages green: Android/iOS
-  passed on9ae0f31, but corrected Windows/macOS/Linux work still awaits the
-  next reviewed push and remote qualification. See CONTINUATION.md,
-  coordinated-source-gate-2026-10-18.md, native-kernel-package-integrity.md and
-  chat-question-surface.md. Broader performance/provider/quality limits remain.
+### Current local correction boundary — October18
+
+- The fixed **nine-file, non-neural** Python runner passes **93/93**, with no
+  errors or skips: the earlier75 cases plus18 retained-context contracts. The
+  extracted empty-pager fixture now matches the real constructor's device-count
+  state. Its import guard still prohibits neural runtimes, brain creation,
+  Load and training. Node/Web TypeScript, the affected seven-file desktop
+  selection (**20/20**) and the main/preload/renderer shell bundle exit0.
+- Retained K/V now has real admitted RAM/VRAM/storage page ownership and host
+  capacity consumption. The final primary-snapshot plus extra-drive-spill
+  correction has its new affected host result; an extra-only spill quota cannot
+  incorrectly cap a larger primary snapshot or credit the same disk twice.
+  See retained-context-storage.md. This is source/fixture evidence, not GPU,
+  transfer, pressure, latency or model-quality qualification.
+- Root's actual compiled-main check used a fresh owned profile: real Library,
+  **0 independent identities**, actual Build Identity form, no Continue/Create,
+  and ordinary Cmd+Q with exit0 and no surviving owned process. Sandbox preload
+  UUID and destroyed-window close regressions were corrected without relaxing
+  sandbox/IPC authority. See desktop-bootstrap-boundary.md. The unlocked local
+  Python environment's missing jsonschema remains honestly reported; this did
+  not prove neural inference or clean packaged startup.
+- The public ordinary documentation corpus is **pack22 / 8 manuals**; its
+  affected two-case selection passes. Internal transcripts/audits remain outside
+  the pack. The residual existing-App walkthrough has31 numbered captures,
+  **30 in the accepted index**;08 is explicitly rejected as bottom proof. Its
+  before/corrected states and scoped no-engine limits are preserved in
+  residual-ui-audit-2026-10-18.md. It is not a universal U1/accessibility pass.
+- All eight original jobs on
+  **fdd16a4bef57d1e27b5bd0b0c0bb52ea15a5919d** are terminal. Android/iOS are
+  green; Windows x64/ARM64, Linux x64/ARM64 and macOS Intel/ARM64 failed.
+  Mac2/Linux x64 passed their package, worker-health and ten UI contracts before
+  the packaged-shell timeout; the other failures have their exact scoped
+  fixture/identity/media-handle corrections. New local fixes are **not remotely
+  requalified**. No all-platform-green, signed/notarized or released-v2 result
+  follows. Root owns the next reviewed push and required package/release gates.
+- Active's fixed12% default/50% ceiling is removed; default/clamp is1 while
+  interval, resource, foreground/learning/initialization, worker-retry and newer
+  cancel-cooldown custody remain. The three affected inert-clock cases passed;
+  root then added this file to fixed Node CI and its complete16/16 passed112ms.
+  The ordinary pack's two cases passed again after its Active paragraph; both
+  final TypeScript projects exit0. Root's broader resource/UI selection first
+  passed59/60; its one old capacity expectation omitted the separate paused
+  snapshot reserve and passed the affected retry23ms after correction. That is
+  not an invented all-group rerun. verify:release exits0 for2.0.0 metadata only,
+  including the diagnostic-artifact compression setting, not signing/packages.
+- Concurrent GPU streams, cross-rank Auto, arbitrary live-cache migration and
+  mixed routes beyond six text kinds are not implemented/qualified claims.
+  Existing canonical distributed learning is real source, not wholly missing.
+  Direct CUDA/XPU/NPU/vendor adapters remain conditional research.
 
 ### Historical scoped results
 

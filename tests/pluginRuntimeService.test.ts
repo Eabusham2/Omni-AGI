@@ -24,19 +24,19 @@ async function fixture(options: { frame?: number; module?: PluginRuntimeModuleDe
   let launch!: PluginRuntimeLaunch, callbacks!: Parameters<PluginRuntimeProcessFactory["launch"]>[1], listener: ((event: any) => void) | undefined;
   const entry = { pluginId: "fixture.feature", enabled: true, activeContentSha256: hash, revision: 1 }, access = { enabled: true, contentSha256: hash, revision: 2, capabilities: [{ toolId: "system.files", enabled: true, actions: ["read"] }] };
   const plugin = { list: async () => [entry], instance: async () => access, package: async () => ({ manifest: { runtimeModules: [definition] } }), onEvent: (fn: typeof listener) => { listener = fn; return () => { listener = undefined; }; } } as unknown as PluginService;
-  const terminate = vi.fn(async () => undefined), check = vi.fn(async (_pid?: number) => undefined), release = vi.fn(async () => undefined), ready = deferred<void>();
+  const terminate = vi.fn(async () => undefined), check = vi.fn(async (_pid?: number) => undefined), release = vi.fn(async () => undefined), ready = deferred<void>(), launched = deferred<void>();
   const execute = vi.fn(options.execute ?? (async () => complete({ exact: "actual result" }))), cancel = vi.fn(async () => 1), invalidated: string[] = [], retire = vi.fn(async (_brain: string, _ids: string[]) => undefined);
   const service = new PluginRuntimeService(plugin, { brainRoot: () => directory, admit: async () => ({ maxMessageBytes: options.frame ?? 8192, check, release }), admitRead: async () => ({ release: () => undefined }),
     tools: { execute, cancelAndWait: cancel, invalidateApproval: (_brain, token) => { invalidated.push(token); return true; } },
     moduleReadyTimeoutMs: 50,
-    processFactory: { launch: async (input, observed) => { launch = input; callbacks = observed; if (options.delayedLaunch) await ready.promise;
+    processFactory: { launch: async (input, observed) => { launch = input; callbacks = observed; launched.resolve(); if (options.delayedLaunch) await ready.promise;
       if (options.readiness !== "none") setImmediate(() => { void observed.receive(23, input.url, { format: "omni-plugin-runtime-rpc", version: 1, sessionId: input.session.sessionId, nonce: input.nonce, id: "owned-bootstrap-ready", operation: "ready", arguments: options.readiness === "failed" ? { ok: false, error: "Owned source initialization failed" } : { ok: true } }).catch(() => undefined); });
       return { senderId: 23, processId: 4321, send: message => sent.push(message), terminate }; } },
     publishTools: async (_brain, tools) => { published.push(...tools); }, retireTools: retire, isBrainLoaded: () => options.loaded ?? false,
     learnSchemas: async job => { schemas.push(job); return { sourceSha256: job.sourceSha256, receipt: { actual: "fake source-only callback" } }; } }); services.push(service);
   const request: PluginRuntimeActivationRequest = { brainId: "owner", pluginId: entry.pluginId, contentSha256: hash, moduleId: definition.id, expectedCatalogRevision: 1, expectedInstanceRevision: 2, requestId: "human-activation" };
   const activate = () => service.activate(request), call = (operation: string, args: Record<string, unknown> = {}, id: string = randomUUID(), sender = 23, url?: string) => service.receive(sender, url ?? launch.url, { format: "omni-plugin-runtime-rpc", version: 1, sessionId: launch.session.sessionId, nonce: launch.nonce, id, operation, arguments: args });
-  return { service, directory, hash, definition, entry, access, sent, published, schemas, request, activate, call, execute, cancel, terminate, check, release, ready, launch: () => launch, callbacks: () => callbacks, invalidate: invalidated, retire, mutate: () => listener?.({ type: "instance", brainId: "owner", pluginId: entry.pluginId }) };
+  return { service, directory, hash, definition, entry, access, sent, published, schemas, request, activate, call, execute, cancel, terminate, check, release, ready, launchEntered: launched.promise, launch: () => launch, callbacks: () => callbacks, invalidate: invalidated, retire, mutate: () => listener?.({ type: "instance", brainId: "owner", pluginId: entry.pluginId }) };
 }
 async function settle(test: () => boolean): Promise<void> { for (let i = 0; i < 200; i++) { if (test()) return; await new Promise(resolve => setImmediate(resolve)); } throw new Error("Owned async fixture did not settle."); }
 
@@ -121,7 +121,11 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
   });
 
   it("waits for the same genuine ACK on concurrent activation and does not parse oversized retry replies", async () => {
-    const f = await fixture({ delayedLaunch: true }), first = f.activate(); await settle(() => Boolean(f.launch())); let resolved = false; const second = f.activate().then(value => { resolved = true; return value; });
+    const f = await fixture({ delayedLaunch: true }), first = f.activate();
+    // Await the actual factory boundary after admitted filesystem/custody work,
+    // not an arbitrary number of event-loop turns that may finish before I/O.
+    // The real bootstrap ACK and its production deadline remain unchanged.
+    await f.launchEntered; let resolved = false; const second = f.activate().then(value => { resolved = true; return value; });
     await new Promise(resolve => setImmediate(resolve)); expect(resolved).toBe(false); f.ready.resolve(); expect((await first).sessionId).toBe((await second).sessionId);
     const store = (await PluginRuntimeStore.open(f.directory, "owner"))!, id = "huge-retry", payload = "retained🙂".repeat(4000); try {
       await store.beginRpc(f.launch().session.sessionId, id, "call", { real: 1 }); await store.markRpc(f.launch().session.sessionId, id, "complete", { format: "omni-plugin-runtime-reply", version: 1, id, state: "complete", value: payload });

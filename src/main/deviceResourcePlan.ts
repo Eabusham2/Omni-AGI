@@ -2,6 +2,7 @@ import type {
   DeviceResourceAllocation, DeviceResourceBudget, DeviceResourceDemand, DeviceResourcePlan,
   DeviceResourceSettings, DeviceResourceTopology, RegionalExecutionSettings, ResourceDevice, ResourceRateMeasurement
 } from "../shared/deviceResources";
+import { retainedContextPools } from "./retainedContextCapacity";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;
 const record = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -126,11 +127,16 @@ export function planDeviceResources(rawTopology: DeviceResourceTopology, rawSett
     if (enabled && capacity === null) blockers.push(`${device.label}: memory capacity is unknown.`);
     const acknowledgedFallback = device.backend === "cuda" && settings.regionalExecution?.enabled
       && settings.regionalExecution.routes.some(route => route.deviceId === device.id && route.executionMode === "packed-cpu-tile-fallback" && route.acknowledgePackedCpuFallback === true);
-    if (enabled && device.kind !== "storage" && !device.nativeComputeSupported && !acknowledgedFallback) blockers.push(`${device.label}: its native compute backend is unavailable.`);
-    return { deviceId: device.id, memoryGroupId: device.memoryGroupId, kind: device.kind, enabled,
+    const budget: DeviceResourceBudget = { deviceId: device.id, memoryGroupId: device.memoryGroupId, kind: device.kind, enabled,
       capacityBytes: capacity, ceilingBytes: enabled ? ceiling : 0, currentlyAvailableBytes: device.availableBytes,
       reserveBytes: reserve, selection: selected.mode, autoIncrease: selected.autoIncrease,
       ...(capacity === null ? { reason: "capacity-unavailable" } : {}) };
+    const retainedStorage = retainedContextPools(topology, [budget]).length > 0;
+    if (enabled && device.kind !== "storage" && !device.nativeComputeSupported && !acknowledgedFallback && !retainedStorage)
+      blockers.push(`${device.label}: its native compute backend and retained-context storage interface are unavailable.`);
+    // Storage permission does not activate a regional route or label CUDA
+    // packed arithmetic native. A supported compute device is still required.
+    return budget;
   });
   const devices = new Map(topology.devices.map((device) => [device.id, device]));
   for (const selection of settings.allocations) if (selection.enabled && !devices.has(selection.deviceId)) blockers.push(`Selected device ${selection.deviceId} is unavailable.`);

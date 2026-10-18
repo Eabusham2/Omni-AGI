@@ -477,6 +477,54 @@ test("appearance controls and explicit CSS-only state samples meet contrast at d
   ).toEqual([]);
 });
 
+test("actual imagination controls and recovery-origin badge remain readable across packs", async () => {
+  const application = await launchAppearanceApplication();
+  const report: Record<string, ContrastResult[]> = {};
+  const targets: ContrastTarget[] = [
+    { id: "selected-modality", selector: ".modality-switcher button.is-active", minimum: 4.5 },
+    { id: "selected-output-policy", selector: ".media-output-mode button.is-active", minimum: 4.5 }
+  ];
+  try {
+    const page = await application.firstWindow();
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    for (const viewport of viewports) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      for (const mode of ["light", "dark"] as const) {
+        for (const pack of packs) {
+          const matrix = `${viewport.id}/${mode}/${pack.id}`;
+          await selectAppearance(page, mode, pack.palette, pack.layout);
+          await page.getByRole("button", { name: "Imagination", exact: true }).click();
+          const selected = page.locator(".modality-switcher button.is-active");
+          const policy = page.locator(".media-output-mode button.is-active");
+          await expect(selected).toBeVisible();
+          for (const [state, control] of [["modality-hover-focus", selected], ["output-hover-focus", policy]] as const) {
+            await control.scrollIntoViewIfNeeded();
+            await control.hover();
+            await control.focus();
+            await expect(control).toBeFocused();
+            const results = await measureContrast(page, targets);
+            report[`${matrix}/${state}`] = results;
+            for (const result of results) {
+              expect(result.ratio, `${matrix}/${state} ${result.id}: ${result.foreground} on ${result.background}`)
+                .toBeGreaterThanOrEqual(result.minimum);
+            }
+          }
+          await page.getByRole("button", { name: "Forks & agents", exact: true }).click();
+          const badge = page.locator(".lineage-pill");
+          await badge.scrollIntoViewIfNeeded();
+          await expect(badge).toHaveText("Recovery origin");
+          const origin = await measureContrast(page, [{ id: "recovery-origin", selector: ".lineage-pill", minimum: 4.5 }]);
+          report[`${matrix}/recovery-origin`] = origin;
+          for (const result of origin) expect(result.ratio, `${matrix} ${result.id}`).toBeGreaterThanOrEqual(result.minimum);
+        }
+      }
+    }
+  } finally {
+    await application.close();
+  }
+  console.log(`IMAGINATION_CONTROL_CONTRAST_REPORT=${JSON.stringify(report)}`);
+});
+
 test("whole-brain unavailable state and isolated graph-label CSS meet contrast in every pack", async () => {
   const application = await launchAppearanceApplication();
   const failures: Array<{ matrix: string; result: ContrastResult }> = [];

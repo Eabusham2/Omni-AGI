@@ -147,6 +147,7 @@ class WorkingAttentionPager:
         resource_policy: Optional[Any] = None,
         page_tokens: int = 256,
         compute_device: Optional[torch.device] = None,
+        retained_context_pools: Tuple[Dict[str, Any], ...] = (),
     ):
         self.directory = Path(directory).resolve()
         self.resident_budget_bytes = max(0, int(resident_budget_bytes))
@@ -159,6 +160,10 @@ class WorkingAttentionPager:
         self._owned_spill_leases: Dict[str, int] = {}
         self._hot: OrderedDict[str, None] = OrderedDict()
         self._resident_bytes = 0
+        self._device_hot: Dict[str, OrderedDict[str, None]] = {}
+        self._device_resident_bytes: Dict[str, int] = {}
+        self._retained_context_pools: Tuple[Dict[str, Any], ...] = ()
+        self.configure_retained_context_pools(retained_context_pools)
         self._spill_bytes = 0
         self._allocated_spill_bytes = 0
         probe = self.directory
@@ -205,6 +210,12 @@ class WorkingAttentionPager:
             "deviceTileBudgetBytes": self.device_tile_budget_bytes,
             "residentBudgetExcludesBoundedTransfers": True,
             "residentBytes": self._resident_bytes,
+            "retainedDeviceBytes": sum(self._device_resident_bytes.values()),
+            "retainedContextPools": [{**pool, "residentBytes": self._device_resident_bytes.get(pool["executionDevice"], 0)}
+                                     for pool in self._retained_context_pools],
+            "retainedDeviceResidency": dict(self._device_resident_bytes),
+            "retainedContextCapacityBytes": self.resident_budget_bytes + sum(pool["budgetBytes"] for pool in self._retained_context_pools),
+            "retainedDeviceStorageIsPackedCompute": False,
             "spillBytes": self._allocated_spill_bytes + sum(self._owned_spill_leases.values()),
             "ownedSpillBytes": sum(self._owned_spill_leases.values()),
             "logicalSpillBytes": self._spill_bytes,
@@ -222,6 +233,138 @@ class WorkingAttentionPager:
 
     def _pause(self, message: str, **extra: Any) -> None:
         raise NeuralStateResourcePause(message, {**self.status(), **extra, "paused": True})
+
+    def configure_retained_context_pools(self, pools) -> None:
+        """Bind current owner-derived partitions, never a renderer projection.
+
+        Reconfiguration does not drop/migrate pages or shrink chosen context.
+        Retired owners remain charged until their original pages are released.
+        """
+        checked, groups, devices = [], set(), set()
+        for raw in pools:
+            pool = dict(raw)
+            device, group = pool["executionDevice"], pool["memoryGroupId"]
+            if (device in devices or group in groups or group == "ram:system"
+                    or type(pool["budgetBytes"]) is not int or pool["budgetBytes"] < 0
+                    or torch.device(device).type not in {"cuda", "mps"}):
+                raise ValueError("retained context pools must be distinct admitted device partitions")
+            devices.add(device); groups.add(group); checked.append(pool)
+        self._retained_context_pools = tuple(checked)
+
+    def retained_pool_policy(self):
+        return [{key: pool.get(key) for key in ("deviceId", "executionDevice", "memoryGroupId", "budgetBytes", "pageBytes",
+            "partitionMode", "minimumPackedOwnerBytes", "controlReserveBytes", "transferReserveBytes")}
+            for pool in self._retained_context_pools]
+
+    def _touch(self, page: _ActivityPage) -> None:
+        if page.tensor is None:
+            return
+        device = str(page.tensor.device)
+        hot = self._hot if device == "cpu" else self._device_hot[device]
+        hot.move_to_end(page.identifier)
+
+    def _register_resident(self, page: _ActivityPage) -> None:
+        device = str(page.tensor.device)
+        if device == "cpu":
+            self._hot[page.identifier] = None
+            self._resident_bytes += page.size
+            self._metrics["peakResidentBytes"] = max(self._metrics["peakResidentBytes"], self._resident_bytes)
+        else:
+            self._device_hot.setdefault(device, OrderedDict())[page.identifier] = None
+            self._device_resident_bytes[device] = self._device_resident_bytes.get(device, 0) + page.size
+
+    def _forget_resident(self, page: _ActivityPage) -> None:
+        if page.tensor is None:
+            return
+        device = str(page.tensor.device)
+        if device == "cpu":
+            self._hot.pop(page.identifier, None); self._resident_bytes -= page.size
+        else:
+            self._device_hot[device].pop(page.identifier, None)
+            self._device_resident_bytes[device] -= page.size
+
+    def _copy(self, tensor: torch.Tensor, device: torch.device, *, copy=False) -> torch.Tensor:
+        """One bounded admitted transfer; no eager whole-cache migration."""
+        self.check_cancelled()
+        device = torch.device(device)
+        size = tensor.numel() * tensor.element_size()
+        if tensor.device == device and not copy:
+            return tensor
+        if size * 4 > self.device_tile_budget_bytes:
+            self._pause("retained context transfer exceeds the bounded tile", pageBytes=size)
+        if device.type != "cpu":
+            require = getattr(self.resource_policy, "require_device", None)
+            if not callable(require):
+                self._pause("retained device context awaits its current owner policy")
+            try:
+                require(device, size, "retained context device transfer")
+            except NeuralStateResourcePause:
+                reclaim = getattr(self, "reclaim_packed", None)
+                if not callable(reclaim):
+                    raise
+                reclaim(device, size)
+                require(device, size, "retained context device transfer after safe core reclaim")
+        host_bytes = size * 2 if tensor.device.type != "cpu" and device.type != "cpu" and tensor.device != device else size if device.type == "cpu" else 0
+        reserve = getattr(self.resource_policy, "reserve_ram", None)
+        reservation = reserve(host_bytes, "bounded retained-context transfer") if host_bytes and callable(reserve) else nullcontext()
+        with reservation as held:
+            source = tensor.detach()
+            # Unknown peer routing is not a permission to allocate an
+            # unaccounted peer staging buffer. The supported path is bounded.
+            if host_bytes and device.type != "cpu":
+                source = source.to(device="cpu", copy=True)
+            result = source.to(device=device, copy=copy or source.device != device).contiguous()
+            self.check_cancelled()
+            if held is not None and device.type == "cpu":
+                held.mark_allocated(size)
+        if tensor.device != device:
+            self._metrics["bytesTransferred"] += size
+            if host_bytes:
+                self._metrics["peakHostTransferBytes"] = max(self._metrics["peakHostTransferBytes"], host_bytes)
+        return result
+
+    def _replacement_credit(self, identifier, device) -> int:
+        page = self._pages.get(identifier)
+        return (page.size if page is not None and page.references == 1 and page.tensor is not None
+                and str(page.tensor.device) == str(device) else 0)
+
+    def _save_device_page(self, tensor: torch.Tensor, pool: Dict[str, Any], *, replaces=None) -> str:
+        device = pool["executionDevice"]
+        size = tensor.numel() * tensor.element_size()
+        if self._device_resident_bytes.get(device, 0) + size > pool["budgetBytes"] + self._replacement_credit(replaces, device):
+            self._pause("retained context device partition is full")
+        value = self._copy(tensor, torch.device(device), copy=True)
+        page = _ActivityPage(uuid.uuid4().hex, tuple(int(value) for value in tensor.shape), tensor.dtype, int(size), value)
+        self._pages[page.identifier] = page
+        self._register_resident(page)
+        self._metrics["largestPageBytes"] = max(self._metrics["largestPageBytes"], size)
+        return page.identifier
+
+    def reclaim_device(self, device: torch.device, needed: int) -> None:
+        """Demote cold retained pages only after a fresh failed allocation.
+
+        Original storage remains authoritative until a successful CPU copy or
+        fully verified spill publication. Stop/pressure never drops a page.
+        """
+        budget = getattr(self.resource_policy, "device_budget", None)
+        if not callable(budget):
+            return
+        name = str(device)
+        while self._device_hot.get(name):
+            self.check_cancelled()
+            status = budget(device, fresh=True)
+            if status and status.get("enabled") and status.get("capacityMeasured") and status.get("remainingBytes", 0) >= needed:
+                return
+            page = self._pages[next(iter(self._device_hot[name]))]
+            if self._resident_bytes + page.size <= self.resident_budget_bytes:
+                try:
+                    value = self._copy(page.tensor, torch.device("cpu"), copy=True)
+                except NeuralStateResourcePause:
+                    self._spill(page)
+                else:
+                    self._forget_resident(page); page.tensor = value; self._register_resident(page)
+            else:
+                self._spill(page)
 
     def check_cancelled(self) -> None:
         self._metrics["cancellationChecks"] += 1
@@ -300,8 +443,12 @@ class WorkingAttentionPager:
             if status.get("memoryPressure"):
                 self._pause(operation + " paused at the live RAM reserve", resource=status)
         free = status.get("acceleratorFreeMemoryBytes")
-        if regional is not None:
-            self.resource_policy.require_device(target, needed, operation + " regional device allocation")
+        if regional is not None or self._device_resident_bytes.get(str(target), 0):
+            try:
+                self.resource_policy.require_device(target, needed, operation + " device allocation")
+            except NeuralStateResourcePause:
+                self.reclaim_device(target, needed)
+                self.resource_policy.require_device(target, needed, operation + " device allocation")
         elif target.type != "cpu" and free is not None and needed > int(free):
             self._pause(operation + " paused at live accelerator headroom", resource=status)
         self._metrics["peakComputeTileBytes"] = max(
@@ -357,10 +504,13 @@ class WorkingAttentionPager:
             try:
                 assert page.tensor is not None
                 # Each payload is one admitted page, never the complete context.
-                flat = page.tensor.contiguous().reshape(-1)
-                if flat.numel() and flat.stride(0) != 1:
-                    flat = flat.clone(memory_format=torch.contiguous_format)
-                payload = flat.view(torch.uint8).numpy().tobytes()
+                reserve = getattr(self.resource_policy, "reserve_ram", None)
+                reservation = reserve(page.size * 2, "bounded activity spill transfer") if callable(reserve) else nullcontext()
+                with reservation:
+                    flat = self._copy(page.tensor, torch.device("cpu")).contiguous().reshape(-1)
+                    if flat.numel() and flat.stride(0) != 1:
+                        flat = flat.clone(memory_format=torch.contiguous_format)
+                    payload = flat.view(torch.uint8).numpy().tobytes()
                 self.check_cancelled()
                 with (os.fdopen(quota.open(os.O_WRONLY), "wb") if callable(getattr(quota, "open", None)) else path.open("xb")) as handle:
                     if handle.write(payload) != len(payload):
@@ -376,6 +526,7 @@ class WorkingAttentionPager:
                     self._pause("physical activity-page allocation exceeds the spill pool; context was not truncated")
                 if quota is not None:
                     quota.commit(allocated, path=path)
+                self.check_cancelled()
             except BaseException:
                 try:
                     path.unlink(missing_ok=True)
@@ -395,10 +546,8 @@ class WorkingAttentionPager:
             self._metrics["peakSpillBytes"] = max(
                 self._metrics["peakSpillBytes"], self._allocated_spill_bytes
             )
-        if page.tensor is not None:
-            self._resident_bytes -= page.size
-            page.tensor = None
-        self._hot.pop(page.identifier, None)
+        self._forget_resident(page)
+        page.tensor = None
 
     def _evict_to(self, target: int) -> None:
         target = max(0, int(target))
@@ -406,22 +555,46 @@ class WorkingAttentionPager:
             identifier = next(iter(self._hot))
             self._spill(self._pages[identifier])
 
-    def save_page(self, tensor: torch.Tensor) -> str:
+    def save_page(self, tensor: torch.Tensor, *, retained_context: bool = False, replaces=None) -> str:
         self.check_cancelled()
         size = tensor.numel() * tensor.element_size()
         # Reserve before copying an accelerator tensor to host. The temporary
         # copy is bounded by page size even when the hot pool is zero bytes.
         if size * 4 > self.device_tile_budget_bytes:
             self._pause("activity page exceeds bounded transfer reservation", pageBytes=size)
-        self._evict_to(max(0, self.resident_budget_bytes - size))
+        if retained_context and self._retained_context_pools:
+            # Keep RAM-first behavior for CPU producers. A producer already on
+            # an admitted GPU avoids a needless host roundtrip; all other
+            # devices are overflow, ordered by measured rates where known.
+            pools = sorted(self._retained_context_pools, key=lambda item: item["executionDevice"] != str(tensor.device))
+            cpu_fits = self._resident_bytes + size <= self.resident_budget_bytes + self._replacement_credit(replaces, "cpu") and not self._resource_status(size).get("memoryPressure")
+            for pool in pools:
+                if cpu_fits and pool["executionDevice"] != str(tensor.device):
+                    break
+                try:
+                    return self._save_device_page(tensor, pool, replaces=replaces)
+                except (NeuralStateResourcePause, torch.OutOfMemoryError):
+                    continue  # Another selected tier may fit; never truncate.
+        replacement_credit = self._replacement_credit(replaces, "cpu")
+        self._evict_to(max(0, self.resident_budget_bytes + replacement_credit - size))
+        reclaim = getattr(self, "reclaim_packed", None)
+        reclaimed = False
         status = self._resource_status(size)
         if status.get("memoryPressure"):
+            if callable(reclaim):
+                reclaim(torch.device("cpu"), size); reclaimed = True
             self._evict_to(0)
             self._policy_at = 0.0
             if self._resource_status(size).get("memoryPressure"):
                 self._pause("activity page transfer paused at live RAM reserve")
         reserve_ram = getattr(self.resource_policy, "reserve_ram", None)
-        reservation = reserve_ram(size, "working activity hot page") if callable(reserve_ram) else nullcontext()
+        try:
+            reservation = reserve_ram(size, "working activity hot page") if callable(reserve_ram) else nullcontext()
+        except NeuralStateResourcePause:
+            if reclaimed or not callable(reclaim):
+                raise
+            reclaim(torch.device("cpu"), size)
+            reservation = reserve_ram(size, "working activity hot page after safe core reclaim")
         with reservation as held:
             page = _ActivityPage(
                 uuid.uuid4().hex, tuple(int(value) for value in tensor.shape), tensor.dtype, int(size),
@@ -432,12 +605,11 @@ class WorkingAttentionPager:
         if tensor.device.type != "cpu":
             self._metrics["bytesTransferred"] += size
         self._pages[page.identifier] = page
-        self._hot[page.identifier] = None
-        self._resident_bytes += page.size
+        self._register_resident(page)
         self._metrics["largestPageBytes"] = max(self._metrics["largestPageBytes"], size)
         self._metrics["peakHostTransferBytes"] = max(self._metrics["peakHostTransferBytes"], size)
         try:
-            self._evict_to(self.resident_budget_bytes)
+            self._evict_to(self.resident_budget_bytes + replacement_credit)
         except BaseException:
             self.release_page(page.identifier)
             raise
@@ -473,39 +645,55 @@ class WorkingAttentionPager:
         return page.path
 
     def read_page(self, identifier: str) -> torch.Tensor:
+        """Canonical CPU page for checkpoint/training codecs; bounded copy."""
         self.check_cancelled()
         page = self._pages[identifier]
         if page.tensor is not None:
-            self._hot.move_to_end(identifier)
-            return page.tensor
-        payload = bytearray(self._verified_file(page).read_bytes())
+            self._touch(page)
+            return self._copy(page.tensor, torch.device("cpu"))
+        reserve = getattr(self.resource_policy, "reserve_ram", None)
+        reservation = reserve(page.size * 2, "bounded cold activity page") if callable(reserve) else nullcontext()
+        with reservation as held:
+            payload = bytearray(self._verified_file(page).read_bytes())
+            result = torch.frombuffer(payload, dtype=page.dtype).reshape(page.shape)
+            if held is not None:
+                held.mark_allocated(page.size)
         self._metrics["pageReads"] += 1
         self._metrics["bytesRead"] += page.size
         self._metrics["largestReadBytes"] = max(self._metrics["largestReadBytes"], page.size)
         # Cold scans do not evict recently appended hot KV just to cache every
         # old key on the way through. Returned page lifetime is one key tile.
-        return torch.frombuffer(payload, dtype=page.dtype).reshape(page.shape)
+        return result
 
-    def read_page_range(self, identifier: str, start: int, end: int) -> torch.Tensor:
+    def read_page_range(self, identifier: str, start: int, end: int, *, device: Optional[torch.device] = None) -> torch.Tensor:
         """Read only a contiguous token range from a time-major activity page."""
         self.check_cancelled()
         page = self._pages[identifier]
         if start < 0 or end <= start or end > page.shape[0]:
             raise ValueError("activity subpage range is invalid")
         if page.tensor is not None:
-            self._hot.move_to_end(identifier)
-            return page.tensor[start:end]
+            self._touch(page)
+            result = page.tensor[start:end]
+            return self._copy(result, device if device is not None else torch.device("cpu"))
         row_bytes = page.size // page.shape[0]
         count = (end - start) * row_bytes
-        with self._verified_file(page).open("rb") as handle:
-            handle.seek(start * row_bytes)
-            payload = bytearray(handle.read(count))
+        reserve = getattr(self.resource_policy, "reserve_ram", None)
+        reservation = reserve(count * 2, "bounded cold activity fragment") if callable(reserve) else nullcontext()
+        with reservation as held:
+            with self._verified_file(page).open("rb") as handle:
+                handle.seek(start * row_bytes)
+                payload = bytearray(handle.read(count))
+            if len(payload) != count:
+                raise ValueError("activity page became shorter during a bounded read")
+            result = torch.frombuffer(payload, dtype=page.dtype).reshape(end - start, *page.shape[1:])
+            if held is not None:
+                held.mark_allocated(count)
         if len(payload) != count:
             raise ValueError("activity page became shorter during a bounded read")
         self._metrics["pageReads"] += 1
         self._metrics["bytesRead"] += count
         self._metrics["largestReadBytes"] = max(self._metrics["largestReadBytes"], count)
-        return torch.frombuffer(payload, dtype=page.dtype).reshape(end - start, *page.shape[1:])
+        return self._copy(result, device) if device is not None else result
 
     def retain_page(self, identifier: str) -> None:
         """Serialized immutable activity sharing, not a second allocation."""
@@ -527,9 +715,7 @@ class WorkingAttentionPager:
             # must not pretend a surviving physical backing was reclaimed.
             page.path.unlink(missing_ok=True)
         self._pages.pop(identifier)
-        self._hot.pop(identifier, None)
-        if page.tensor is not None:
-            self._resident_bytes -= page.size
+        self._forget_resident(page)
         if page.path is not None:
             if page.quota_lease is not None:
                 page.quota_lease.release()
@@ -608,7 +794,7 @@ class PagedTensorSequence:
         return self._shape[self.axis]
 
     def fork(self) -> "PagedTensorSequence":
-        """Independent append cursor over the same immutable CPU pages.
+        """Independent append cursor over the same immutable retained pages.
 
         Tail coalescing writes a NEW page. Refcounts keep the original tail
         alive while another cache needs it; no live sequence is edited.
@@ -650,41 +836,47 @@ class PagedTensorSequence:
         )
         self._page_tokens = page_tokens
         start = 0
-        if self.pages and tensor.shape[self.axis]:
-            previous_start = 0 if len(self.ends) == 1 else self.ends[-2]
-            previous_tokens = self.ends[-1] - previous_start
-            if previous_tokens < page_tokens:
-                count = min(page_tokens - previous_tokens, int(tensor.shape[self.axis]))
-                size = (previous_tokens + count) * per_token
-                self.pager.admit_compute(size * 4, "bounded KV/activity tail coalescing", device=torch.device("cpu"))
-                old_identifier = self.pages[-1]
-                old = self.pager.read_page(old_identifier)
-                incoming = tensor.narrow(self.axis, 0, count).movedim(self.axis, 0).detach().to(device="cpu", copy=True).contiguous()
-                merged = torch.cat((old, incoming), dim=0)
-                del old, incoming
-                # KV is invocation-local scratch. After a resource/cancel
-                # failure the decoder closes the entire cache and retries its
-                # source prefix; no saved experience/gradient source is lost.
-                # Release before replacement so a full spill pool needs only
-                # the allocation *delta*, not a duplicate trailing page.
+        staged, ends, old_identifier = [], [], None
+        length = self.length
+        try:
+            if self.pages and tensor.shape[self.axis]:
+                previous_start = 0 if len(self.ends) == 1 else self.ends[-2]
+                previous_tokens = self.ends[-1] - previous_start
+                if previous_tokens < page_tokens:
+                    count = min(page_tokens - previous_tokens, int(tensor.shape[self.axis]))
+                    size = (previous_tokens + count) * per_token
+                    self.pager.admit_compute(size * 4, "bounded KV/activity tail coalescing", device=torch.device("cpu"))
+                    old_identifier = self.pages[-1]
+                    # One bounded canonical buffer, even if the tail lives on
+                    # a different GPU. Keep the original until full admission.
+                    with _saved_activity_scratch(self.pager, size * 3, "transactional KV tail buffer"):
+                        old = self.pager.read_page(old_identifier)
+                        incoming = self.pager._copy(tensor.narrow(self.axis, 0, count).movedim(self.axis, 0), torch.device("cpu"))
+                        merged = torch.cat((old, incoming), dim=0)
+                        staged.append(self.pager.save_page(merged, retained_context=True, replaces=old_identifier))
+                    length += count; ends.append(length); start = count
+            for start in range(start, tensor.shape[self.axis], page_tokens):
+                count = min(page_tokens, tensor.shape[self.axis] - start)
+                identifier = self.pager.save_page(tensor.narrow(self.axis, start, count).movedim(self.axis, 0), retained_context=True)
+                staged.append(identifier); length += int(count); ends.append(length)
+            self.pager.check_cancelled()
+        except BaseException:
+            for identifier in staged:
+                self.pager.release_page(identifier)
+            raise
+        # Retire the old tail only after all new pages survived cancellation.
+        # A failed unlink preserves both the original cursor and its quota.
+        if old_identifier is not None:
+            try:
                 self.pager.release_page(old_identifier)
-                try:
-                    replacement = self.pager.save_page(merged)
-                except BaseException:
-                    self.close()
-                    raise
-                self.pages[-1] = replacement
-                self._shape[self.axis] += count
-                self.ends[-1] = self.length
-                start = count
-        for start in range(start, tensor.shape[self.axis], page_tokens):
-            count = min(page_tokens, tensor.shape[self.axis] - start)
-            # Time-major bytes let a cold key tile seek only its actual token
-            # range rather than loading a complete multi-head backing page.
-            identifier = self.pager.save_page(tensor.narrow(self.axis, start, count).movedim(self.axis, 0))
-            self.pages.append(identifier)
-            self._shape[self.axis] += int(count)
-            self.ends.append(self.length)
+            except BaseException:
+                for identifier in staged:
+                    self.pager.release_page(identifier)
+                raise
+            self.pages[-1:], self.ends[-1:] = staged, ends
+        else:
+            self.pages.extend(staged); self.ends.extend(ends)
+        self._shape[self.axis] = length
 
     def read(self, start: int, end: int, device: torch.device) -> torch.Tensor:
         if start < 0 or end <= start or end > self.length:
@@ -695,15 +887,14 @@ class PagedTensorSequence:
         while position < end:
             page_start = 0 if index == 0 else self.ends[index - 1]
             stop = min(end, self.ends[index])
-            tensor = self.pager.read_page_range(self.pages[index], position - page_start, stop - page_start)
+            tensor = self.pager.read_page_range(self.pages[index], position - page_start, stop - page_start, device=device)
             pieces.append(tensor.movedim(0, self.axis))
             position = stop
             index += 1
         values = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=self.axis)
-        result = values.to(device=device)
-        if values.device != result.device:
-            self.pager._metrics["bytesTransferred"] += values.numel() * values.element_size()
-        return result
+        # Each fragment is already on the requested target. Never concatenate
+        # mixed-owner pages first or stage the complete context on host.
+        return values
 
     def close(self) -> None:
         if self._closed:

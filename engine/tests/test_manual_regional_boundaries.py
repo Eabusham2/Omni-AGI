@@ -53,6 +53,7 @@ class RegionalBoundaryFixtures(unittest.TestCase):
             return {"memoryPressure": False, "acceleratorFreeMemoryBytes": 1}  # Root cuda:0, not target cuda:1.
         pager = SimpleNamespace(device_tile_budget_bytes=1024, compute_device=Device(), check_cancelled=lambda: None,
             _resource_status=status, _pause=pause, _metrics={"peakComputeTileBytes": 0},
+            _device_resident_bytes={},
             resource_policy=SimpleNamespace(require_device=lambda target, size, label: calls.append((str(target), size, label))))
         namespace["admit_compute"](pager, 32, "new regional tile", device=Device())
         self.assertEqual(calls[0][:2], ("cuda:1", 32))

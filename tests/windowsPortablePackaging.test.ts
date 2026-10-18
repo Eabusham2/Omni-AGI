@@ -4,6 +4,8 @@ import { dirname, join, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
+import type { Writable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { createPackage } from "@electron/asar";
 import { afterEach, describe, expect, it } from "vitest";
 const roots: string[] = [];
@@ -16,7 +18,11 @@ async function fixture(portable: boolean) {
   const source = join(root, "owned-inert-asar"); await mkdir(join(source, "out", "main"), { recursive: true });
   await writeFile(join(source, "package.json"), JSON.stringify({ version: "1.1.1", main: "out/main/index.js" }));
   await writeFile(join(source, "out", "main", "index.js"), portable ? "/* Never executed fixture: omni-portable-launcher omni-portable-workspace portable-destination.json portable-adoption */" : "/* Deliberately stale inert main */");
-  await createPackage(source, join(root, "resources", "app.asar")); return root;
+  // This pinned ASAR version resolves to out.end()'s Writable before its OS
+  // handle is closed. A receipt must inspect completed actual archive bytes.
+  const archive = await createPackage(source, join(root, "resources", "app.asar")) as unknown as Writable;
+  await finished(archive, { cleanup: true }); expect(archive.closed).toBe(true);
+  return root;
 }
 describe("portable Windows build receipts (owned inert files only)", () => {
   it("afterPack uses the installed builder's real Arch enum, verifies compiled source presence and records only actual package-byte evidence", async () => {

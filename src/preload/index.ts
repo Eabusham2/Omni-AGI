@@ -1,5 +1,4 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import { randomUUID } from "node:crypto";
 import type {
   ActionEvent,
   BrainImportFailure,
@@ -41,7 +40,7 @@ const substrateApi: OmniApi["substrate"] = {
   plan: (brainId, planId) => invoke(IPC.substrate.plan, brainId, planId),
   stop: (brainId, jobId) => invoke(IPC.substrate.stop, brainId, jobId),
   onEvent: (brainId, listener) => {
-    const subscriptionId = randomUUID();
+    const subscriptionId = globalThis.crypto.randomUUID();
     let ready = false, disposed = false;
     const buffered = new Map<string, Extract<import("../shared/sparseSubstrateTransfer").SparseSubstrateUiEvent, { kind: "job" }>>();
     const seen = new Map<string, number>();

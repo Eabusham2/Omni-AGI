@@ -283,6 +283,10 @@ class NativeCachedWholeOperationOps(NativeCachedDecoderOps):
                                 attention_tile_bytes(b, h, d, 1, k, e, training=False))
                         rows.append({"owner": owner + ".block" + str(index) + "." + role, "axis": axis, "shape": shape, "dtype": str(sequence.dtype),
                             "tokenBytes": token_bytes, "pageTokens": pager.page_tokens, "tileBudgetBytes": pager.device_tile_budget_bytes,
+                            "retainedPoolPolicySha256": digest([{key: pool.get(key) for key in
+                                ("deviceId", "executionDevice", "memoryGroupId", "budgetBytes", "pageBytes", "partitionMode",
+                                 "minimumPackedOwnerBytes", "controlReserveBytes", "transferReserveBytes")}
+                                for pool in getattr(pager, "_retained_context_pools", ())]),
                             "previousPageTokens": sequence._page_tokens, "ends": list(sequence.ends),
                             "configuredKeyTokens": configured, "maximumSafeKeyTokens": safe})
         return cached_operation_range(length, capacity, rows)

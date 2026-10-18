@@ -24,6 +24,8 @@ import { nativeCheckpointMemory, type SavedTensorShape } from "./nativeCheckpoin
 import { connectedResourceProfile, type NativeContextGeometry } from "./connectedResourceProfile";
 import { authorizedSpillCapacity } from "./authorizedSpillCapacity";
 import { planDeviceResources, validateDeviceResourceSettings } from "./deviceResourcePlan";
+import { retainedContextPools, checkpointPackedOwnerMinimum, checkpointNonpackedControls, contextCapacity, contextSnapshotBytes, contextColdSpillBytes,
+  type RetainedContextPool, type RetainedContextMinimum } from "./retainedContextCapacity";
 import type { AuthorizedSpillStorageSnapshot, DeviceResourceSettings, DeviceResourceTopology } from "../shared/deviceResources";
 import {
   validateNativeProjectionComputeProfile,
@@ -376,6 +378,8 @@ function prospectiveGroundUpWorkingMemoryItems(
 }
 
 export function planWorkingMemory(input: {
+  /** Main-derived current tensor-storage pools; never renderer capacity authority. */
+  retainedContextPools?: RetainedContextPool[];
   spillStorage?: AuthorizedSpillStorageSnapshot;
   allowStorageSpill?: boolean;
   request: WorkingMemoryPlanRequest;
@@ -393,6 +397,8 @@ export function planWorkingMemory(input: {
   modelLayers?: number;
   modelContextGeometry?: NativeContextGeometry;
   maximumNativeBufferBytes?: number;
+  maximumPackedOwnerBytes?: number;
+  nonpackedControlBytes?: number;
   modelUpdateScratchBytes?: number;
   /** Saved learned latent geometry, independent of runtime context mode. */
   modelWorkspaceSlots?: number;
@@ -510,7 +516,14 @@ export function planWorkingMemory(input: {
   const fullFoundationRuntimeBytes =
     Math.max(modelWorkingSetBytes, estimatedResidentModelBytes) +
     BASE_RUNTIME_MEMORY_BYTES;
-  const minimumLayerResidencyBytes = architectureProfile
+  const maximumPackedOwnerBytes = input.maximumPackedOwnerBytes ?? architectureProfile?.maximumProjectionBytes;
+  const inventory = architectureProfile?.nativeArchitecture?.inventory;
+  const nonpackedControlBytes = input.nonpackedControlBytes ?? (inventory
+    ? inventory.routerNonweightTensorBytes + inventory.freshRouteControlBytes + inventory.liquidStateBytes : undefined);
+  const actualManualCoreMinimum = request.mode === "manual" && maximumPackedOwnerBytes !== undefined && nonpackedControlBytes !== undefined
+    ? Math.max(8 * MIB, maximumPackedOwnerBytes + nonpackedControlBytes + (architectureProfile?.pythonOwnerMetadataReserveBytes ?? runtimeMetadataReserveBytes))
+    : undefined;
+  const minimumLayerResidencyBytes = actualManualCoreMinimum ?? (architectureProfile
     ? Math.max(
         8 * MIB,
         architectureProfile.fixedControlBufferReserveBytes +
@@ -532,7 +545,7 @@ export function planWorkingMemory(input: {
     : Math.max(input.modelUpdateScratchBytes ?? 0,
         192 * MIB,
         Math.min(512 * MIB, Math.floor((estimatedResidentModelBytes - runtimeMetadataReserveBytes) / 4))
-      ) + runtimeMetadataReserveBytes;
+      ) + runtimeMetadataReserveBytes);
   const minimumFoundationContextTokens = Math.min(
     256,
     modelContextLimitTokens
@@ -582,7 +595,11 @@ export function planWorkingMemory(input: {
   // core residency is preferred; cold core and K/V can spill independently.
   const residualRamBytes = Math.max(0, safeRamBytes - BASE_RUNTIME_MEMORY_BYTES);
   const transferBudgetBytes = Math.floor(residualRamBytes * 0.15);
-  pageTokens = Math.max(1, Math.min(256, Math.floor(transferBudgetBytes / Math.max(1, 16 * modelHiddenSize))));
+  const attentionWidths = input.modelContextGeometry?.leaves.map(leaf => leaf.width) ?? [modelHiddenSize];
+  const maximumAttentionWidth = Math.max(modelHiddenSize, ...attentionWidths);
+  pageTokens = Math.max(1, Math.min(256, Math.floor(transferBudgetBytes / Math.max(1, 16 * maximumAttentionWidth))));
+  const retainedContextPageBytes = Math.max(...attentionWidths.map(width =>
+    Math.max(1, Math.min(256, Math.floor(transferBudgetBytes / Math.max(1, 16 * width)))) * width * 4));
   contextMetadataBytesPerToken = Math.ceil(2048 * 2 * modelLayers / pageTokens);
   residentIndexBytesPerToken = residentTokenBytesPerToken + contextMetadataBytesPerToken;
   const querySlotsPerChunk = Math.max(1, Math.min(256, workspaceSlots,
@@ -594,17 +611,17 @@ export function planWorkingMemory(input: {
   const defaultDiskUnit = Math.max(platform() === "win32" ? 65536 : 4096, safeWhole(resources.diskBlockSizeBytes ?? 16384));
   const diskBlockSizeBytes = selectedDrives?.groups.reduce((largest, group) => Math.max(largest, group.allocationUnitBytes), defaultDiskUnit) ?? defaultDiskUnit;
   const pagedKvBytesPerToken = estimatedKvActivationBytesPerToken + Math.ceil(2 * modelLayers * diskBlockSizeBytes / pageTokens);
-  const plannedResidentModelBytes = Math.min(estimatedResidentModelBytes,
-    Math.max(minimumLayerResidencyBytes, Math.floor(residualRamBytes * 0.55)));
+  const manualCoreRebalance = request.mode === "manual" && maximumPackedOwnerBytes !== undefined && maximumPackedOwnerBytes > 0;
+  const plannedResidentModelBytes = Math.min(estimatedResidentModelBytes, manualCoreRebalance
+    ? minimumLayerResidencyBytes : Math.max(minimumLayerResidencyBytes, Math.floor(residualRamBytes * 0.55)));
   const planningFoundationResidentBytes = BASE_RUNTIME_MEMORY_BYTES + plannedResidentModelBytes;
   const safeRamAfterModelBytes = Math.max(
     0,
     safeRamBytes - planningFoundationResidentBytes
   );
-  const contextResidentBudgetBytes = Math.max(0, Math.min(
-    safeRamAfterModelBytes - Math.floor(residualRamBytes * 0.15),
-    Math.floor(residualRamBytes * 0.30)
-  ));
+  const contextResidentBudgetBytes = Math.max(0, manualCoreRebalance
+    ? safeRamAfterModelBytes - transferBudgetBytes
+    : Math.min(safeRamAfterModelBytes - Math.floor(residualRamBytes * 0.15), Math.floor(residualRamBytes * 0.30)));
   const trainingSourceBytes = safeWhole(request.trainingSourceBytes ?? 0);
   const trainingScratchBytes = Math.max(512 * MIB,
     Math.ceil(trainingSourceBytes * 0.1), Math.ceil(modelBytes * 0.5));
@@ -632,12 +649,25 @@ export function planWorkingMemory(input: {
   const contextSpillCapacityBytes = allowStorageSpill ? Math.max(0,
     (selectedDriveCapacity?.capacityBytes ?? (boundedStoragePoolCapacity - primaryRequiredBytes)) - plannedCoreScratchBytes) : 0;
   const contextResidentWorkingBytes = Math.max(0, contextResidentBudgetBytes - workspaceResidentBytes);
-  const storageBackedContextMaximumTokens = Math.min(modelContextLimitTokens,
-    safeWhole(contextResidentWorkingBytes / Math.max(1, residentIndexBytesPerToken)),
-    safeWhole(contextSpillCapacityBytes / Math.max(1, pagedKvBytesPerToken)));
-  const residentContextMaximumTokens = Math.min(modelContextLimitTokens,
-    safeWhole(contextResidentWorkingBytes / Math.max(1, estimatedKvActivationBytesPerToken + residentIndexBytesPerToken)));
-  const contextMaximumTokens = Math.max(residentContextMaximumTokens, storageBackedContextMaximumTokens);
+  const retainedDeviceContextBytes = safeWhole((input.retainedContextPools ?? []).reduce((sum, pool) => sum + pool.budgetBytes, 0));
+  // Every selected window must remain serializable on the checkpoint volume,
+  // independently of whether optional *runtime* disk spill is enabled.
+  const contextCheckpointCapacityBytes = Math.max(0, Math.min(primaryPoolCapacityBytes, boundedStoragePoolCapacity)
+    - primaryRequiredBytes - plannedCoreScratchBytes - workspaceResidentBytes);
+  const contextSharedStorageCapacityBytes = Math.max(0,
+    boundedStoragePoolCapacity - primaryRequiredBytes - plannedCoreScratchBytes - workspaceResidentBytes);
+  // Selected-drive capacity constrains runtime cold spill, NOT snapshots.
+  // Checkpoints stay on primary even when only extra drives were authorized
+  // for spill. The bounded shared pool already caps the deduplicated physical
+  // union (primary once + nonprimary groups), while the two independent
+  // capacity predicates above constrain primary snapshot and cold placement.
+  const capacity = contextCapacity({ ramWorkingBytes: safeWhole(contextResidentWorkingBytes), deviceContextBytes: retainedDeviceContextBytes,
+    kvBytesPerToken: safeWhole(estimatedKvActivationBytesPerToken), indexBytesPerToken: safeWhole(residentIndexBytesPerToken),
+    modelLimitTokens: modelContextLimitTokens, spillCapacityBytes: safeWhole(contextSpillCapacityBytes),
+    pagedKvBytesPerToken: safeWhole(pagedKvBytesPerToken), checkpointCapacityBytes: safeWhole(contextCheckpointCapacityBytes), pageTokens, layers: modelLayers,
+    sharedStorageCapacityBytes: safeWhole(contextSharedStorageCapacityBytes) });
+  const residentContextMaximumTokens = capacity.residentMaximumTokens;
+  const contextMaximumTokens = capacity.maximumTokens;
   // Auto favors RAM on slow drives. Extended may use the explicitly budgeted
   // attention spill, but storage bandwidth never masquerades as RAM capacity.
   const autoContextRamFraction = Math.min(
@@ -657,7 +687,7 @@ export function planWorkingMemory(input: {
     return Math.floor(bounded / CONTEXT_TOKEN_QUANTUM) * CONTEXT_TOKEN_QUANTUM;
   };
   const measuredAutoContext = quantizeContext(
-    contextResidentWorkingBytes * autoContextRamFraction /
+    (contextResidentWorkingBytes + retainedDeviceContextBytes) * autoContextRamFraction /
       (estimatedKvActivationBytesPerToken + residentIndexBytesPerToken)
   );
   const declaredResidentBaseline = architectureProfile?.nativeArchitecture?.sizing.selectionMode === "ram-first-headroom-default"
@@ -694,12 +724,25 @@ export function planWorkingMemory(input: {
   const selectedContextKvBytes = selectedContextTokens * estimatedKvActivationBytesPerToken;
   const selectedContextKvResidentBytes = Math.min(selectedContextKvBytes,
     Math.max(0, contextResidentWorkingBytes - selectedContextIndexBytes));
-  const selectedContextSpillBytes = Math.max(0, selectedContextKvBytes - selectedContextKvResidentBytes);
-  // Reserve backing for the whole declared window so live RAM pressure can
-  // demote its cold pages without silently shrinking the saved context.
-  const contextOffloadBudgetBytes = allowStorageSpill ? selectedContextTokens * pagedKvBytesPerToken : 0;
+  const selectedContextDeviceBytes = Math.min(retainedDeviceContextBytes, Math.max(0, selectedContextKvBytes - selectedContextKvResidentBytes));
+  const selectedContextSpillBytes = Math.max(0, selectedContextKvBytes - selectedContextKvResidentBytes - selectedContextDeviceBytes);
+  const contextCheckpointReserveBytes = contextSnapshotBytes(selectedContextTokens, {
+    kvBytesPerToken: estimatedKvActivationBytesPerToken, indexBytesPerToken: residentIndexBytesPerToken, pageTokens, layers: modelLayers
+  }) + workspaceResidentBytes;
+  // The full paused snapshot is reserved separately. Runtime spill covers the
+  // allocation-rounded cold remainder, not an artificial choose-one tier or
+  // a second copy of every hot RAM/VRAM page. New pressure pauses, never crops.
+  const contextOffloadBudgetBytes = allowStorageSpill ? contextColdSpillBytes(selectedContextTokens, {
+    ramWorkingBytes: contextResidentWorkingBytes, deviceContextBytes: retainedDeviceContextBytes,
+    kvBytesPerToken: estimatedKvActivationBytesPerToken, indexBytesPerToken: residentIndexBytesPerToken,
+    pagedKvBytesPerToken, pageTokens
+  }) : 0;
   const selectedContextResidentBytes = workspaceResidentBytes + selectedContextIndexBytes + selectedContextKvResidentBytes;
-  const residentModelBytes = plannedResidentModelBytes;
+  // Maximum-context capacity can borrow cold core cache, but a smaller
+  // selected window should retain a fitting model and avoid needless spill.
+  const residentModelBytes = manualCoreRebalance ? Math.min(estimatedResidentModelBytes,
+    Math.max(minimumLayerResidencyBytes, Math.min(Math.max(minimumLayerResidencyBytes, Math.floor(residualRamBytes * 0.55)),
+      safeRamBytes - BASE_RUNTIME_MEMORY_BYTES - selectedContextResidentBytes - transferBudgetBytes))) : plannedResidentModelBytes;
   const residentFoundationBytes =
     BASE_RUNTIME_MEMORY_BYTES + residentModelBytes;
   const modelSpillBytes = Math.max(
@@ -725,7 +768,7 @@ export function planWorkingMemory(input: {
   const diskForPagedMemoryBytes = allowStorageSpill ? Math.max(
     0,
     Math.min(usableDiskAfterReserveBytes, boundedStoragePoolCapacity - fixedBuildWriteBytes)
-      - primaryEphemeralBytes - trainingScratchBytes - baseGrowthHeadroomBytes
+      - primaryEphemeralBytes - contextCheckpointReserveBytes - trainingScratchBytes - baseGrowthHeadroomBytes
   ) : 0;
   const residentItems = safeWhole(
     residentMemoryBytes / ramBytesPerMemoryItem
@@ -787,6 +830,7 @@ export function planWorkingMemory(input: {
       modelOffloadScratchBytes +
       memorySpillBytes +
       contextOffloadBudgetBytes +
+      contextCheckpointReserveBytes +
       trainingScratchBytes +
       futureGrowthHeadroomBytes
   );
@@ -797,7 +841,7 @@ export function planWorkingMemory(input: {
     components: {
       selectedDatasetBytes: trainingSourceBytes,
       modelBytes: initialModelWriteBytes,
-      checkpointBytes: checkpointWriteBytes,
+      checkpointBytes: checkpointWriteBytes + contextCheckpointReserveBytes,
       maximumWorkingMemorySpillBytes:
         admissionScope === "existing-runtime" ? 0 : memorySpillBytes + (primaryEphemeralBytes > 0 ? contextOffloadBudgetBytes : 0),
       futureGrowthBytes:
@@ -846,8 +890,8 @@ export function planWorkingMemory(input: {
     resources.diskFreeBytes >
     diskReserveBytes + (
       admissionScope === "existing-runtime"
-        ? checkpointHeadroomBytes
-        : fixedBuildWriteBytes + (primaryEphemeralBytes > 0 ? modelOffloadScratchBytes : 0)
+        ? checkpointHeadroomBytes + contextCheckpointReserveBytes
+        : fixedBuildWriteBytes + contextCheckpointReserveBytes + (primaryEphemeralBytes > 0 ? modelOffloadScratchBytes : 0)
     );
   const diskFitsSelection =
     !diskSpace.paused;
@@ -884,7 +928,7 @@ export function planWorkingMemory(input: {
   if (selectedDriveCapacity) {
     const ephemeralBytes = modelOffloadScratchBytes + contextOffloadBudgetBytes;
     if (ephemeralBytes > selectedDriveCapacity.currentlyAvailableBytes) blockers.push("Selected spill drives are temporarily occupied or have pending writes. The selected context is retained; free space or wait for those operations to finish.");
-    const largestFile = Math.max(pageTokens * modelHiddenSize * 4, modelSpillBytes > 0 ? input.maximumNativeBufferBytes ?? architectureProfile?.maximumProjectionBytes ?? 0 : 0);
+    const largestFile = Math.max(retainedContextPageBytes, modelSpillBytes > 0 ? input.maximumNativeBufferBytes ?? architectureProfile?.maximumProjectionBytes ?? 0 : 0);
     if (largestFile > selectedDriveCapacity.largestSingleAllocationBytes) blockers.push("No selected drive can hold the largest native page. Increase one drive's allocation; several drives cannot split one mapped page.");
   }
   if (!manualSystemShareValid) {
@@ -1158,6 +1202,14 @@ export function planWorkingMemory(input: {
         selectedContextResidentBytes,
         selectedContextSpillBytes,
         contextOffloadBudgetBytes,
+        retainedDeviceContextBytes,
+        selectedContextDeviceBytes,
+        contextCheckpointReserveBytes,
+        contextCheckpointCapacityBytes,
+        maximumPackedOwnerBytes,
+        nonpackedControlBytes,
+        manualCoreRebalance,
+        retainedContextPageBytes,
         residentContextMaximumTokens,
         contextSpillCapacityBytes,
         ...(selectedDriveCapacity ? { selectedDriveCapacityBytes: selectedDriveCapacity.capacityBytes,
@@ -1374,6 +1426,8 @@ interface CheckpointModelProfile {
   workingMemoryItems?: number;
   modelContextGeometry?: NativeContextGeometry;
   maximumNativeBufferBytes?: number;
+  maximumPackedOwnerBytes?: number;
+  nonpackedControlBytes?: number;
   modelUpdateScratchBytes?: number;
 }
 
@@ -1428,6 +1482,8 @@ async function checkpointModelProfile(
       runtimeMetadataReserveBytes: memory.runtimeMetadataReserveBytes,
       modelContextGeometry,
       maximumNativeBufferBytes,
+      maximumPackedOwnerBytes: checkpointPackedOwnerMinimum(tensors),
+      nonpackedControlBytes: checkpointNonpackedControls(tensors),
       modelUpdateScratchBytes,
       ...(hardwareTier ? { hardwareTier } : {}),
       ...(Number.isSafeInteger(hidden) && hidden > 0
@@ -1447,6 +1503,7 @@ async function checkpointModelProfile(
 }
 
 interface ResourcePlannerOptions {
+  retainedContextPools?: RetainedContextPool[];
   spillStorage?: AuthorizedSpillStorageSnapshot;
   allowStorageSpill?: boolean;
   hardwareTier?: HardwareTier;
@@ -1459,6 +1516,8 @@ interface ResourcePlannerOptions {
   modelLayers?: number;
   modelContextGeometry?: NativeContextGeometry;
   maximumNativeBufferBytes?: number;
+  maximumPackedOwnerBytes?: number;
+  nonpackedControlBytes?: number;
   modelUpdateScratchBytes?: number;
   modelWorkspaceSlots?: number;
   fixedWorkingMemoryItems?: number;
@@ -1552,16 +1611,38 @@ export class ResourcePlanner {
       const tokenIndexBytes = base.context.evidence.residentTokenBytesPerToken;
       const pageMetadataBytes = base.context.evidence.contextMetadataBytesPerToken;
       if (workspaceBytes === undefined || tokenIndexBytes === undefined || pageMetadataBytes === undefined) throw new Error("The saved context geometry is unavailable for device placement.");
-      const selected = planDeviceResources(topology, settings, {
-        modelBytes: base.resources.modelBytes,
-        fixedRuntimeBytes: base.resources.runtimeOverheadBytes + (base.resources.modelMetadataReserveBytes ?? 0)
-          + workspaceBytes + (base.architecture?.packedUpdateScratchBytes ?? 0)
-          + (base.architecture?.packedForwardTensorReserveBytes ?? 0),
-        contextBytesPerToken: base.context.evidence.estimatedKvActivationBytesPerToken + tokenIndexBytes + pageMetadataBytes,
-        requestedContextTokens: base.context.selectedTokens,
-        systemRamBudgetBytes: base.resources.systemRamBudgetBytes,
-        diskReserveBytes: base.resources.mandatoryFreeDiskBytes
+      const placement = (plan: WorkingMemoryResourcePlan) => planDeviceResources(topology, settings, {
+        modelBytes: plan.resources.modelBytes,
+        fixedRuntimeBytes: plan.resources.runtimeOverheadBytes + (plan.resources.modelMetadataReserveBytes ?? 0)
+          + workspaceBytes + (plan.architecture?.packedUpdateScratchBytes ?? 0)
+          + (plan.architecture?.packedForwardTensorReserveBytes ?? 0),
+        contextBytesPerToken: plan.context.evidence.estimatedKvActivationBytesPerToken + tokenIndexBytes + pageMetadataBytes,
+        requestedContextTokens: plan.context.selectedTokens,
+        systemRamBudgetBytes: plan.resources.systemRamBudgetBytes,
+        diskReserveBytes: plan.resources.mandatoryFreeDiskBytes
       });
+      let selected = placement(base);
+      const minimums: Record<string, RetainedContextMinimum> = {};
+      for (const device of topology.devices) {
+        if (!device.executionDevice) continue;
+        const compute = device.nativeComputeSupported || settings.regionalExecution?.enabled
+          && settings.regionalExecution.routes.some(route => route.deviceId === device.id);
+        if (!compute && base.context.evidence.nonpackedControlBytes !== undefined) minimums[device.executionDevice] = {
+          packedOwnerBytes: 0, controlBytes: base.context.evidence.nonpackedControlBytes,
+          transferBytes: (base.context.evidence.retainedContextPageBytes ?? 0) * 4 };
+        else if (base.context.evidence.maximumPackedOwnerBytes !== undefined && base.context.evidence.nonpackedControlBytes !== undefined) {
+          minimums[device.executionDevice] = { packedOwnerBytes: base.context.evidence.maximumPackedOwnerBytes,
+            controlBytes: base.context.evidence.nonpackedControlBytes,
+            transferBytes: base.context.evidence.reservedTrainingTransferBytes };
+        }
+      }
+      const pools = retainedContextPools(topology, selected.budgets, { manual: request.mode === "manual", minimums,
+        pageBytes: base.context.evidence.retainedContextPageBytes });
+      if (pools.length) {
+        base = await this.planCore(selectedRequest, { ...options, spillStorage, allowStorageSpill: settings.allowStorageSpill,
+          retainedContextPools: pools });
+        selected = placement(base);
+      }
       selected.admittedContextMaximumTokens = base.context.maximumTokens;
       if (spillStorage) selected.appliedStorage = {
         largestSharedPoolBytes: Math.max(spillStorage.largestSharedPoolBytes, base.resources.sharedStoragePoolBytes),
@@ -1601,6 +1682,7 @@ export class ResourcePlanner {
         ? String(options.config.storagePoolBytes)
         : undefined);
     const sharedInput = {
+      retainedContextPools: options.retainedContextPools,
       spillStorage: options.spillStorage,
       allowStorageSpill: options.allowStorageSpill,
       request: {
@@ -1620,6 +1702,8 @@ export class ResourcePlanner {
       modelLayers: options.modelLayers ?? checkpoint.modelLayers,
       modelContextGeometry: options.modelContextGeometry ?? checkpoint.modelContextGeometry,
       maximumNativeBufferBytes: options.maximumNativeBufferBytes ?? checkpoint.maximumNativeBufferBytes,
+      maximumPackedOwnerBytes: options.maximumPackedOwnerBytes ?? checkpoint.maximumPackedOwnerBytes,
+      nonpackedControlBytes: options.nonpackedControlBytes ?? checkpoint.nonpackedControlBytes,
       modelUpdateScratchBytes: options.modelUpdateScratchBytes ?? checkpoint.modelUpdateScratchBytes,
       modelWorkspaceSlots: options.modelWorkspaceSlots ?? checkpoint.modelWorkspaceSlots ??
         (options.brainDirectory && options.config ? options.config.nativeArchitecture?.shape.workspaceLatents ?? Math.max(8, Math.floor(options.config.workingMemorySlots / 4)) : undefined),

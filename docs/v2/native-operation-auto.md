@@ -8,8 +8,9 @@ cached-decoder interfaces remain separate and working; they were not replaced.
 
 Current research-versus-required-source dispositions are recorded in
 [final-execution-dispositions.md](final-execution-dispositions.md). In
-particular, enabled VRAM-backed retained-context capacity remains a required
-consumer gap, not a claim closed by diagnostic device projections.
+particular, [retained-context-storage.md](retained-context-storage.md) records
+the actual required retained-page ownership/admission/Manual-rebalance consumer
+and its evidence boundary; diagnostic device projections alone never close it.
 
 ## Actual source path and scope
 

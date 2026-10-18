@@ -1,0 +1,46 @@
+{
+  "topology": {
+    "format": "omni-device-resource-topology", "version": 1,
+    "measuredAt": "2026-10-18T00:00:00Z", "platform": "inert", "architecture": "inert",
+    "measurementRequested": true, "neuralModelConstructed": false, "warnings": [],
+    "devices": [
+      {"id":"ram:system","kind":"ram","backend":"cpu","executionDevice":"cpu","memoryGroupId":"ram:system","totalBytes":64000,"availableBytes":60000,"nativeComputeSupported":true},
+      {"id":"mps:unified","kind":"gpu","backend":"mps","executionDevice":"mps","memoryGroupId":"ram:system","unifiedMemory":true,"totalBytes":64000,"availableBytes":60000,"nativeComputeSupported":true},
+      {"id":"cuda:physical-a","kind":"gpu","backend":"cuda","executionDevice":"cuda:0","memoryGroupId":"gpu:a","unifiedMemory":false,"totalBytes":10000,"availableBytes":9000,"nativeComputeSupported":false,"measurement":{"bytesPerSecond":1000}},
+      {"id":"cuda:alias-a","kind":"gpu","backend":"cuda","executionDevice":"cuda:2","memoryGroupId":"gpu:a","unifiedMemory":false,"totalBytes":10000,"availableBytes":9000,"nativeComputeSupported":false},
+      {"id":"cuda:physical-b","kind":"gpu","backend":"cuda","executionDevice":"cuda:1","memoryGroupId":"gpu:b","unifiedMemory":false,"totalBytes":16000,"availableBytes":14000,"nativeComputeSupported":false},
+      {"id":"xpu:unsupported","kind":"gpu","backend":"xpu","executionDevice":"xpu:0","memoryGroupId":"gpu:xpu","unifiedMemory":false,"totalBytes":50000,"availableBytes":50000,"nativeComputeSupported":false},
+      {"id":"cuda:unmeasured","kind":"gpu","backend":"cuda","executionDevice":"cuda:3","memoryGroupId":"gpu:unknown","unifiedMemory":false,"totalBytes":50000,"availableBytes":null,"nativeComputeSupported":false}
+    ],
+    "links": [
+      {"from":"ram:system","to":"cuda:physical-a","measurement":{"bytesPerSecond":500}},
+      {"from":"cuda:physical-a","to":"ram:system","measurement":{"bytesPerSecond":500}}
+    ]
+  },
+  "budgets": [
+    {"deviceId":"ram:system","memoryGroupId":"ram:system","enabled":true,"ceilingBytes":50000},
+    {"deviceId":"mps:unified","memoryGroupId":"ram:system","enabled":true,"ceilingBytes":50000},
+    {"deviceId":"cuda:physical-a","memoryGroupId":"gpu:a","enabled":true,"ceilingBytes":8000},
+    {"deviceId":"cuda:alias-a","memoryGroupId":"gpu:a","enabled":true,"ceilingBytes":6000},
+    {"deviceId":"cuda:physical-b","memoryGroupId":"gpu:b","enabled":true,"ceilingBytes":12000},
+    {"deviceId":"xpu:unsupported","memoryGroupId":"gpu:xpu","enabled":true,"ceilingBytes":40000},
+    {"deviceId":"cuda:unmeasured","memoryGroupId":"gpu:unknown","enabled":true,"ceilingBytes":40000}
+  ],
+  "expectedPools": [
+    {"deviceId":"cuda:physical-a","executionDevice":"cuda:0","memoryGroupId":"gpu:a","budgetBytes":2400,"selectedCeilingBytes":8000,"effectiveCopyBytesPerSecond":200,"copyTimingMeasured":true},
+    {"deviceId":"cuda:physical-b","executionDevice":"cuda:1","memoryGroupId":"gpu:b","budgetBytes":3600,"selectedCeilingBytes":12000,"effectiveCopyBytesPerSecond":null,"copyTimingMeasured":false}
+  ],
+  "manualMinimums": {
+    "cuda:0": {"packedOwnerBytes":0,"controlBytes":0,"transferBytes":1000},
+    "cuda:1": {"packedOwnerBytes":3000,"controlBytes":1000,"transferBytes":2000}
+  },
+  "manualExpectedBudgets": {"cuda:0":7000,"cuda:1":6000},
+  "capacityCases": [
+    {"name":"RAM only","input":{"ramWorkingBytes":10000,"deviceContextBytes":0,"kvBytesPerToken":100,"indexBytesPerToken":10,"modelLimitTokens":10000,"spillCapacityBytes":0,"pagedKvBytesPerToken":110,"checkpointCapacityBytes":10000000,"pageTokens":256,"layers":2},"expected":{"residentMaximumTokens":90,"storageMaximumTokens":0,"maximumTokens":90,"metadataMaximumTokens":1000},"snapshotTokens":90,"snapshotBytes":272044},
+    {"name":"over RAM with two distinct GPU pools","input":{"ramWorkingBytes":10000,"deviceContextBytes":6000,"kvBytesPerToken":100,"indexBytesPerToken":10,"modelLimitTokens":10000,"spillCapacityBytes":0,"pagedKvBytesPerToken":110,"checkpointCapacityBytes":10000000,"pageTokens":256,"layers":2},"expected":{"residentMaximumTokens":145,"storageMaximumTokens":0,"maximumTokens":145,"metadataMaximumTokens":1000},"snapshotTokens":145,"snapshotBytes":278094},
+    {"name":"metadata remains RAM resident","input":{"ramWorkingBytes":100,"deviceContextBytes":6000,"kvBytesPerToken":100,"indexBytesPerToken":10,"modelLimitTokens":10000,"spillCapacityBytes":0,"pagedKvBytesPerToken":110,"checkpointCapacityBytes":10000000,"pageTokens":256,"layers":2},"expected":{"residentMaximumTokens":10,"storageMaximumTokens":0,"maximumTokens":10,"metadataMaximumTokens":10},"snapshotTokens":10,"snapshotBytes":263244},
+    {"name":"full checkpoint quota limits otherwise usable VRAM","input":{"ramWorkingBytes":10000,"deviceContextBytes":6000,"kvBytesPerToken":100,"indexBytesPerToken":10,"modelLimitTokens":10000,"spillCapacityBytes":0,"pagedKvBytesPerToken":110,"checkpointCapacityBytes":263244,"pageTokens":256,"layers":2},"expected":{"residentMaximumTokens":10,"storageMaximumTokens":0,"maximumTokens":10,"metadataMaximumTokens":1000},"snapshotTokens":10,"snapshotBytes":263244},
+    {"name":"authorized spill retains a host metadata floor","input":{"ramWorkingBytes":10000,"deviceContextBytes":6000,"kvBytesPerToken":100,"indexBytesPerToken":10,"modelLimitTokens":10000,"spillCapacityBytes":110000,"pagedKvBytesPerToken":110,"checkpointCapacityBytes":10000000,"pageTokens":256,"layers":2},"expected":{"residentMaximumTokens":145,"storageMaximumTokens":843,"maximumTokens":843,"metadataMaximumTokens":1000},"snapshotTokens":843,"snapshotBytes":1141306},
+    {"name":"simultaneous RAM GPU and one cold page group","input":{"ramWorkingBytes":10000,"deviceContextBytes":6000,"kvBytesPerToken":100,"indexBytesPerToken":10,"modelLimitTokens":10000,"spillCapacityBytes":28160,"pagedKvBytesPerToken":110,"checkpointCapacityBytes":10000000,"sharedStorageCapacityBytes":600000,"pageTokens":256,"layers":2},"expected":{"residentMaximumTokens":145,"storageMaximumTokens":378,"maximumTokens":378,"metadataMaximumTokens":1000},"snapshotTokens":378,"snapshotBytes":565868}
+  ]
+}

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PluginRuntimeStreamParser, type PluginRuntimeTrainingParserHost } from "../src/main/pluginRuntimeStreamParser";
 import { canonicalPluginPackage } from "../src/main/pluginCatalog";
@@ -15,9 +15,15 @@ import type { PluginRuntimeEvent, PluginRuntimeModuleDefinition, PluginRuntimePa
   PluginRuntimeTrainingParserActivationRequest } from "../src/shared/pluginRuntime";
 import type { PluginTrainingFormatBinding } from "../src/shared/types";
 
+// Each workspace owns its extraction children; never race two recursive removers over the same tree.
 const roots: string[] = [];
 const sha = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
-afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map(async root => {
+    await rm(root, { recursive: true, force: true });
+    await expect(lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+  }));
+});
 
 const output: PluginRuntimeMediaOutputDeclaration = { kind: "media-assets", mediaTypes: ["image/png", "audio/wav", "video/mp4"] };
 const moduleDefinition = (): PluginRuntimeModuleDefinition => ({ id: "media", title: "Media", description: "Typed assets.",
@@ -115,7 +121,8 @@ describe("runtime-stream typed media parser", () => {
     expect(prepared.provenance).toMatchObject({ outputKind: "media-assets", outputAssets: 3, outputRecords: 3,
       outputModalityCounts: { image: 1, audio: 1, video: 1 }, sourceSha256: sha(value.bytes) });
     expect(host.activation?.output).toEqual(output);
-    const archive = await extractStreamingZip(prepared.path, value.root, { checkDisk: async () => undefined }); roots.push(archive.root);
+    const archive = await extractStreamingZip(prepared.path, value.root, { checkDisk: async () => undefined });
+    expect(dirname(archive.root)).toBe(value.root);
     expect([...archive.entries.keys()]).toEqual(["media/00000000.png", "media/00000001.wav", "media/00000002.mp4"]);
     expect([...archive.entries.keys()].some(name => /\.jsonl?$/.test(name))).toBe(false);
     expect(await readFile(archive.entries.get("media/00000000.png")!.path)).toEqual(expect.any(Buffer));
@@ -128,6 +135,10 @@ describe("runtime-stream typed media parser", () => {
     await prepared.cleanup();
     expect(await readFile((reused as typeof prepared).path)).toEqual(await readFile(prepared.path));
     await reused.cleanup();
+    await expect(lstat(prepared.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(join(value.root, "plugin-runtime-parser", `${value.request.transactionKey}.receipt.json`)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(archive.root)).isDirectory()).toBe(true);
   });
 
   it("returns an explicit no-assets source without a native archive or learned-input surrogate", async () => {

@@ -130,7 +130,7 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     }
   });
 
-  it("derives the slider maximum only after model, checkpoint, RAM, and 20 GiB disk reserves", () => {
+  it("derives the slider maximum only after model, paused context, checkpoint, RAM, and 20 GiB disk reserves", () => {
     const modelBytes = 3 * GIB;
     const plan = planWorkingMemory({
       request: { mode: "auto" },
@@ -158,6 +158,7 @@ describe("hardware-safe recurrent/paged memory planning", () => {
       Math.ceil(modelBytes * MODEL_CHECKPOINT_HEADROOM_RATIO) -
       plan.offload.modelOffloadScratchBytes -
       (plan.context.evidence.contextOffloadBudgetBytes ?? 0) -
+      (plan.context.evidence.contextCheckpointReserveBytes ?? 0) -
       plan.resources.trainingScratchBytes -
       plan.resources.futureGrowthHeadroomBytes;
     const pagedItems = Math.floor(
@@ -166,6 +167,7 @@ describe("hardware-safe recurrent/paged memory planning", () => {
     );
 
     expect(plan.sliderMaximumItems).toBe(residentItems + pagedItems);
+    expect(plan.context.evidence.contextCheckpointReserveBytes).toBeGreaterThan(0);
     expect(plan.resources.mandatoryFreeDiskBytes).toBe(20 * GIB);
     expect(plan.resources.checkpointHeadroomBytes).toBe(
       Math.ceil(modelBytes * 0.2)

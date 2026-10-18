@@ -7,6 +7,48 @@ including repetitions and the explanatory brain analogy. Repetition does not
 create a second implementation: it remains visible and points to the same
 acceptance requirement.
 
+## Current source and delivery reconciliation — October18
+
+Later exact evidence supersedes the initial-baseline wording in individual rows
+and the historical source index below. An old `open` label can describe
+qualification or conditional research; it is not evidence that its already
+implemented runtime path must be rebuilt. No row is blanket-promoted to full
+live/model/platform acceptance by this reconciliation.
+
+- Supported source composition now includes actual retained RAM/VRAM/storage
+  K/V ownership/capacity, primary snapshot plus extra-drive-spill accounting,
+  real request/reply/outer-learning consumers and exact archive custody. The
+  fixed nine-file non-neural Python selector passes93/93, with no errors/skips.
+  Root's affected seven-file desktop selection passes20/20; Node/Web types and
+  the shell bundle exit0. See retained-context-storage.md and
+  desktop-bootstrap-boundary.md for the exact evidence and exclusions.
+- Source Active mode no longer has the fixed12% default/50% ceiling. Its
+  default/clamp is1; actual foreground, learning, initialization, interval,
+  resource and worker-retry checks remain, and completion preserves a newer
+  cancel cooldown. Three affected inert-clock cases passed with13 old cases
+  skipped; root subsequently added the file to fixed Node CI and its full16/16
+  passed112ms. This is neither continuous full-CPU utilization nor trained agency.
+- Public ordinary curriculum22 contains8 manuals; the affected two cases pass
+  again after the final Active paragraph. Final Node/Web TypeScript exits0.
+  The broad resource/UI check was59/60 plus its lone corrected affected capacity
+  case passing23ms; no all-group rerun is claimed. The residual UI walkthrough has31 numbered
+  captures,30 in its accepted index and08 retained only as failed-scroll
+  diagnostics. This is finite no-engine evidence, not universal U1 coverage.
+- The actual isolated compiled main now opens a real Library with0 independent
+  identities and a Build Identity form, then ordinary Cmd+Q exits0. No brain
+  was created, Loaded or trained. This fixes observed preload/preview/quit
+  regressions; locked packaged-worker and clean artifact startup remain separate.
+- All8 jobs on fdd16a4 are terminal: Android/iOS passed, all6 desktop jobs
+  failed. New desktop corrections are locally checked but **not remotely
+  requalified**. Required green CI, package smokes, tag, release and artifact
+  provenance are still open; version2.0.0 signed-ready metadata is not signing
+  or publication evidence.
+- Existing Gloo/NCCL native learning is not missing. Cross-rank Auto,
+  simultaneous GPU streams, arbitrary live-cache migration, direct unsupported
+  accelerators and mixed candidates outside the six text kinds are not claimed
+  implemented. Preserve their conditional research/qualification boundaries in
+  final-execution-dispositions.md, not a universal compatibility/speed claim.
+
 ## Authority and evidence
 
 - Baseline inspected: commit `17fe555`. In-progress edits by other implementation
@@ -74,7 +116,7 @@ inspected for this matrix, with their observed scope.
 | --- | --- | --- | --- | --- |
 | R006 | Remove personal memories only in export copy | STORAGE; later cancellation | `superseded` | Preserve complete exports; do not add a sanitizer that claims to erase identity from learned weights. |
 | R007 | MCP support | MCP | `source-tested` | Local stdio and remote HTTP/session discovery, validation, invocation, refresh, cancellation and removal have scoped fixtures. Dated2025-11-25 tasks preserve original-tool Ask, unknown/no-resend custody, current/dormant history and distinct Stop waiting/remote Cancel. The coordinated task selector passed41 cases; ten bounded native-renderer task steps are recorded. Same-frame inline/fullscreen has separate9 source contracts and bounded Electron evidence. No real account, trained learning, full accessibility or packaged cross-platform acceptance follows; unsupported optional bounds remain in R055/R101/R226. |
-| R009 | Merge entire brains and reset settings | `fullMergeCoordinator.ts`, native `full_merge.py`/connected regions; full-merge.md | `open` | Real native/nested merges, settings review, unchanged parents, host history and fork/export/import/recovery proofs exist; not merely reviewed overlays. Current schema-2 inherited-turn execution, suspended-time neutrality and final integration/quality acceptance remain distinct open gates. |
+| R009 | Merge entire brains and reset settings | `fullMergeCoordinator.ts`, native `full_merge.py`/connected regions; full-merge.md | `source-tested` | Real native/nested merges, settings review, unchanged parents, complete host history and fork/export/import/recovery custody exist; not merely reviewed overlays. Suspended activity-clock custody is implemented. The current-format new-brain merged-resume proof is explicitly user-deferred, not a current missing source task or passed quality gate. |
 | R011 | Change instance settings | RESOURCE; `brain.update` | `existing-needs-verification` | Saved settings take effect on the selected instance, with live fit checks and no learned-shape replacement. |
 | R012 | PNN | CORE/SUBSTRATE packed growth; [method disposition](research-methods.md) | `research-disposition-recorded` | Existing expert/depth growth and regional exchange retain the compatible expansion idea; shared routing remains plastic. Literal frozen-column PNN is deferred until its own routing/retention/growth-cost comparison. No PNN guarantee, new default or whole-brain quality claim. |
 | R013 | Fact-check page, web evidence, questions, steering, normal learning | LearningCoordinator + LearningWorkspace; learning.md/learning-ui-visual.md | `source-tested` | Dedicated scoped claim/evidence/correction workspace, real tool-receipt binding, task questions and live steering have focused backend and synthetic-transport UI evidence. No universal fact inventory/truth guarantee or broad trained-quality claim. |
@@ -272,11 +314,11 @@ inspected for this matrix, with their observed scope.
 | R194 | Queue UI | CHAT/UI; repeat R027 | `open` | One correct stack and controls across active/idle/recovery states. |
 | R195 | Model subagents with resource awareness | AGENTS/RESOURCE | `existing-needs-verification` | Real COW child tasks, measured added demand, exact action receipts and reviewed return. |
 | R196 | Stop exposing raw IDs everywhere | UI | `open` | Friendly labels in common views; IDs accessible only where needed for inspection/copy. |
-| R197 | vLLM | Native runtime backend research | `open` | Compatibility/performance decision documented; cannot silently replace native brain with a supported foreign model. |
+| R197 | vLLM | Native runtime backend research; backend-research-dispositions.md | `research-disposition-recorded` | No foreign serving-model substitution. A native adapter is a conditional candidate requiring packed-owner, sampler/cache/learning custody and representative whole-path benefit; it is not installed or measured faster. |
 | R198 | Voluntary internal Ponder with adaptive duration | CORE/CHAT/IDLE; `brain.py` `_native_pre_speech_ponder` | `source-tested` | Learned continuation/transition, convergence, Stop/Steer and real pressure replace fixed pass/time cutoffs. Six focused Ponder fixtures and a tiny selected-Ponder chat check passed; ordinary decoding stays single-pass. Measured cognition UI/idle integration and trained capability are not inferred. See [native cognition evidence](native-cognition.md). |
 | R199 | Best Work branches/search/verification and reward-loop suggestion | CORE/AGENTS; `best_work.py`, `cooperative_generation.py`; later reward exclusion | `source-tested` | Optional same-brain interleaved search, private cache/action state, resource admission, failed-branch isolation and one selected live replay have focused evidence. Syntax/schema and exact-output agreement are not correctness proof; no RL/PRM/reward training added. Host settings persistence and bounded synthetic UI editing/apply passed; broader connected/tool integration remains. See native-cognition.md and action-plugin-ui-visual.md. |
 | R200 | Max temperature .95, extra ordinary branch, adaptive tuning | Best Work configuration and native scheduler | `source-tested` | Default off; requested exploration budget 1–16 plus ordinary branch; temperature ceiling .95; entropy/disagreement expansion and support-based early stop tested. Low-entropy turns retain direct ordinary streaming. Bounded settings UI rejects17, accepts16 only at an apply boundary and retains exact operands; signals remain uncalibrated and trained quality is open. See native-cognition.md and action-plugin-ui-visual.md. |
-| R201 | DeepSpeed | Distributed/native backend research | `open` | Compare compatible collective/offload support; preserve canonical packed state and exact dataset coverage. |
+| R201 | DeepSpeed | Distributed/native backend research; backend-research-dispositions.md | `research-disposition-recorded` | Existing canonical packed collectives remain implemented. Stock floating optimizer conversion is rejected; a custom transport/offload adapter remains conditional on exact native state/coverage and measured benefit. |
 | R202 | Steer must not reset reply | CHAT | `existing-needs-verification` | Same turn/worker receives safe-boundary steering; prior emitted text retained and remaining work changes. |
 | R203 | Liquid `0.63x` | Repeat R019 | `open` | Remove stale factor from common UI; only meaningful live measurements remain. |
 | R204 | Ternary sign, individual strength/plasticity | CORE; repeat R054 | `source-tested` | Same bounded evidence and remaining acceptance as R054; no separate blanket completion claim. |
@@ -293,7 +335,7 @@ inspected for this matrix, with their observed scope.
 | R215 | User research is exploratory | Settled research decisions | `existing-needs-verification` | Treat named methods as suggestions subject to evidence, not an automatic checklist of forced algorithms. |
 | R216 | Truly different layouts, not recolors | UI/appearanceWorkspace | `open` | Layouts change panel/button/composer arrangement; every theme/layout combination remains readable. |
 | R217 | Full merge plus measured multidevice allocations/context | AGENTS/RESOURCE partial | `open` | Complete detailed contracts M1 and R1 below, including transfer cost, per-device controls and distinct unified RAM. |
-| R218 | NPU if beneficial | RESOURCE/backend research | `open` | Enumerate supported operators and benchmark total path; fallback is explicit when unsuitable. |
+| R218 | NPU if beneficial | RESOURCE/backend research; backend-research-dispositions.md | `research-disposition-recorded` | Direct packed NPU/XPU kernels are unavailable/unverified, not enabled by topology labels. Adoption requires real operators, derivative/update custody, transfers and whole-path benefit. Actual enabled tensor-storage capacity is separate from packed compute. |
 | R219 | Timers/calendar/event wakeup with prompts/repeats | clockService.ts, clockStore.ts, ClockWorkspacePanel.tsx | `open` | Durable timed/calendar/event tasks, repeats, missed-time rules, reviewed resource-admitted Load and visible edit/cancel are implemented with focused backend fixtures and synthetic UI evidence. Actual production native scheduled wake and broader suspend/restart/platform acceptance remain open. |
 | R220 | Unload button and locked inactive operations | STORAGE/RESOURCE | `open` | Release neural memory, preserve saved UI/settings access, require load for neural work. |
 | R221 | Auto-load off; fit dialog live; safe settings minimum | RESOURCE/UI | `open` | Opt-in auto-load, continuously rechecked capacity, pause fit retry while editing, no shrink below live occupancy. |
@@ -362,16 +404,22 @@ real block-call seam for six text kinds only: ordinary/connected cached steps,
 full prefixes and uncached forwards. All selected targets/home participants,
 physical budget groups, current context and storage opt-in retain admission.
 
-The coordinated fixed stdlib runner passed67 cases with its neural-import
-guard intact:16 earlier,12 memory,16 reply,10 mixed and13 outer. Five mixed
-desktop contracts have separate focused evidence. These close the named
-source slices, not actual neural/hardware speed, learned quality or full R1.
-Concurrent/cross-rank/collective execution, retained device-cache/context
-subtree migration, unsupported direct accelerators and mixed consumers outside
-those six text kinds remain distinct source breadth. Representative hardware,
-large-state pressure and packaged-platform qualification remain missing
-evidence. Do not restart ordinary reply or outer-learning orchestration as
-though it were absent, or count pinned once-only phases as private migration.
+The current fixed nine-file non-neural runner passes93 cases with its import
+guard intact: the earlier75 plus18 retained-context cases. Actual retained
+RAM/VRAM/storage K/V ownership and planner capacity now include admitted device
+pages, shared physical groups, complete owner/control costs and separate primary
+snapshot/cold-spill bounds. The final primary-plus-extra-spill correction has
+its affected host result. See retained-context-storage.md. These close the
+named source consumers, not actual neural/hardware speed or learned quality.
+
+Existing cross-rank Gloo/NCCL training/packed collectives are real source, while
+cross-rank **Auto comparison**, simultaneous device streams, arbitrary live-cache
+subtree migration, direct unsupported accelerators and mixed consumers outside
+six text kinds are not supported claims. Backend additions remain conditional
+on actual compatibility/whole-path benefit, as reconciled in
+final-execution-dispositions.md. Representative hardware, large-state pressure
+and packaged-platform qualification remain separate. Do not restart completed
+reply/outer learning or mistake pinned once-only effects for private migration.
 
 1. Enumerate system RAM, distinct GPU memories, unified memory, drives and usable
    accelerators. Unified memory counts once.
@@ -444,16 +492,17 @@ this does not close item 6 or the broader research/backend decisions.
 
 ### U1 — UI and telemetry acceptance
 
-October18 adds bounded current-App Data/runtime wide/compact/scroll-bottom
-inspection and two observed ordering/spacing fixes, plus actual same-frame MCP
-App Open/Expand/Escape, timeout, retirement and fresh reopen inspection. The
-five existing CI UI specs now match current Call,12 workspace routes, unified
-map/no-API state and composer/gallery controls. Their scoped TypeScript check
-had zero diagnostics; that static reconciliation did not run Playwright or
-establish contrast/layout results. Injected action/camera/meter/SVG samples are
-explicit CSS-only fixtures, never native action, device or learned-map proof.
-See desktop-current-ui-2026-10-18.md,
-mcp-display-ui-2026-10-18.md and ui-contract-source-alignment-2026-10-18.md.
+October18 adds bounded Data/runtime and actual same-frame MCP presentation
+checks, plus the finite residual existing-App walkthrough:31 numbered captures,
+30 accepted indexed captures and08 rejected as bottom proof. The five CI UI
+specs match current Call,12 workspace routes, unified map/no-API and composer/
+gallery controls. Since the earlier static alignment, both Mac jobs and Linux
+x64 on fdd16a4 passed all10 no-engine UI contracts, then failed packaged-shell
+smoke. The corrected actual local main passed real empty Library/Build/normal
+quit without creating a brain. No broad live-generation/platform inference
+follows. Injected action/camera/meter/SVG samples stay explicitly CSS-only.
+See desktop-current-ui-2026-10-18.md, mcp-display-ui-2026-10-18.md,
+residual-ui-audit-2026-10-18.md and desktop-bootstrap-boundary.md.
 
 The October15 affected workspace and composer checks are recorded in
 [header/attachment evidence](chat-workspace-audit-2026-10-15.md) and
@@ -490,16 +539,16 @@ not a full workspace/theme/platform or live-backend completion claim.
 | ID | Requirement | State | Acceptance |
 | --- | --- | --- | --- |
 | A01 | Privacy cleanup canceled; complete exports retained | `superseded` | R006 remains excluded; full export/import coverage unchanged. |
-| A02 | Weighted native ternary signs/strength/plasticity/repetition | `open` | Kernels, accounting, paging, learning, migration and export all agree on the same representation. |
+| A02 | Weighted native ternary signs/strength/plasticity/repetition | `source-tested` | Supported kernels, accounting, paging, learning, migration and archive consumers preserve the same native representation. Scoped source/fixture evidence does not establish broad learned quality or unsupported hardware. |
 | A03 | JEV/RLCD/externally rewarded RLVR/preference/reward loops excluded | `superseded` | No hidden addition through research, Best Work or teacher paths. |
-| A04 | Full merge creates a new instance from multiple parents | `open` | M1 fixture and unchanged-parent hashes. |
+| A04 | Full merge creates a new instance from multiple parents | `source-tested` | Complete native/host/archive composition and unchanged-parent evidence are recorded under M1. The new-brain merged-resume proof remains user-deferred, not passed or a missing source task. |
 | A05 | DMA means OS-permitted access | `open` | R043 source implements current OS rights only, no physical-RAM/protection/elevation bypass; actual macOS denial preserved honestly. See process-memory.md for precise source/fixture/OS/UI limits. |
 | A06 | External reviewer gets relevant context within budget | `open` | Data scope, truncation summary and approval behavior tested; credentials never included. |
 | A07 | 200B speech threshold with independent manual overrides | `open` | Backend/shared exact threshold, measured-count provenance, CAS/manual choices, fresh Auto/eligible legacy migration and portable settings passed21 focused cases. Capability-aware Call UI is integrated with four new controls cases and bounded synthetic Electron checks. Direct native-input and packaged voice proof remain open; voice-routing.md records boundaries. |
 | A08 | Portable folder and destination-local empty reservation | `open` | Clean-machine portable start, data/settings continuity and real fit accounting. |
 | A09 | Short temporary fixtures and thorough UI allowed; long training deferred | `existing-needs-verification` | Fixture budgets visible, no supplied-corpus training accidentally launched. |
-| A10 | Comprehensive user/plugin/API docs and curriculum | `open` | Current USER_GUIDE/INTEGRATIONS plus separately versioned ordinary corpus pack are source-tested; complete final feature/plugin/API docs and release-wide audit remain open. |
-| A11 | v2 GitHub commit/push, all required green CI and packages released | `open` | Local [workflow source audit](workflow-source-audit.md) adds bounded non-neural Python contracts, health-only package boundaries and scoped publication credentials with exact repository/tag binding. Local syntax and focused checks do not prove remote CI. Exact v2 release commit/tag, required successful runs, downloadable checksummed artifacts and provenance remain required. |
+| A10 | Comprehensive user/plugin/API docs and curriculum | `source-tested` | Public manuals/plugin/API references are reconciled into ordinary pack22 with8 manuals; affected pack cases pass. Final in-flight control changes still update their manual/hash custody. Internal transcripts/audits stay excluded, and pack bytes do not prove learned comprehension. |
+| A11 | v2 GitHub commit/push, all required green CI and packages released | `open` | All8 fdd16a4 jobs finished: Android/iOS passed, all6 desktop jobs failed; new corrections are local and not remotely requalified. Current source/metadata checks preserve exact repository/tag/hash boundaries but do not prove signing or release. Reviewed candidate, required green package runs, exact v2 tag and downloadable checksummed/provenanced artifacts remain mandatory. |
 | A12 | Full original message remains verbatim | `existing-needs-verification` | Text equality against source message; 239 nonempty source-body lines all mapped here. |
 | A13 | End reminder for full-folder qualification and GPU estimate | `open` | Delivered with final result; no premature claim that broad capability was proved. |
 | A14 | Complete format2 exports over older-app compatibility | wholeBrainCatalogArchive/Portability + BrainRepository; [evidence](whole-brain-catalog-archives.md) | `source-tested` | New format2 requires exact current/origin/catalog-lineage closure and supported required features. Copied re-export uses verified archive-only projection, never an invented registry/Load.11 new archive and51 selected affected repository host cases passed across scoped runs, including portable import/collision/re-export/import. Current app-family/physical/heap admission is wired; root memory helper3 cases pass. Fixed optional-root recovery, historical continuation fabrication and distinct teacher-history projection collisions; preserved originals/unsanitized history and strict validation. Real large-state, native and packaged-platform qualification remains open. |

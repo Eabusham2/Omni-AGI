@@ -794,6 +794,36 @@ class AdaptiveBrain:
         # Very large recurrent state leaves room for cortical owners and spills
         # the remainder; this is a cache budget, not a neuron cardinality cap.
         router_reserve = min(matrix_bytes, budget["corePartitionBytes"] // 2)
+        manual = getattr(self.config, "working_memory_mode", "auto") == "manual"
+        minimum_owner = max(int(paging.get("maximumPackedOwnerBytes") or 0),
+            int(((getattr(self.config, "native_architecture", None) or {}).get("inventory") or {}).get("maximumProjectionBytes", 0)))
+        if manual and minimum_owner > 0:
+            router_reserve = min(matrix_bytes, MIN_ROUTER_TILE_BYTES)
+            # Manual may trade hot weight caching for exact retained context.
+            # A complete packed owner and one real recurrent tile remain.
+            width = max(1, int(self.config.d_model))
+            layers = max(1, int(self.config.n_layers))
+            decoder = getattr(self, "decoder", None)
+            if decoder is not None:
+                widths = [int(module.n_heads * module.head_dim) for module in decoder.modules()
+                          if hasattr(module, "n_heads") and hasattr(module, "head_dim")]
+            else:
+                widths = []
+            if widths:
+                width, layers, kv_per_token = max(widths), len(widths), sum(widths) * 8
+            else:
+                kv_per_token = width * layers * 8
+            page_tokens = max(1, min(256, int(budget["trainingTransferPartitionBytes"]) // max(1, 16 * width)))
+            index_per_token = 96 + math.ceil(4096 * layers / page_tokens)
+            workspace = 4 * max(8, int(self.config.working_memory_slots) // 4) * (2 * width + 1) + 12288 * layers
+            requested_activity = int(self.config.max_seq_len) * (kv_per_token + index_per_token) + workspace
+            capacity_activity = max(0, int(budget["residualEnvelopeBytes"]) - int(budget["trainingTransferPartitionBytes"]) - minimum_owner - router_reserve)
+            requested_activity = min(capacity_activity, requested_activity)
+            selected_core = max(minimum_owner + router_reserve, int(budget["residualEnvelopeBytes"])
+                - int(budget["trainingTransferPartitionBytes"]) - requested_activity)
+            budget["manualContextRamReservationBytes"] = requested_activity
+            budget["corePartitionBytes"] = min(budget["corePartitionBytes"], selected_core)
+            budget["liveCoreHotBytes"] = min(budget["liveCoreHotBytes"], budget["corePartitionBytes"])
         budget["routerCoreReservationBytes"] = router_reserve
         budget["sharedCorePartitionBytes"] = budget["corePartitionBytes"]
         budget["corePartitionBytes"] -= router_reserve
@@ -825,8 +855,36 @@ class AdaptiveBrain:
                 hot = min(max(0, int(selected_device["liveCeilingBytes"]) * 55 // 100),
                           max(0, int(selected_device["remainingBytes"])) + admitted)
             budget["selectedDeviceBudget"] = selected_device
+        if manual and device.type != "cpu":
+            activity = getattr(self, "working_attention_pager", None)
+            pool = next((pool for pool in getattr(activity, "_retained_context_pools", ())
+                         if pool["executionDevice"] == canonical_device(device) and pool.get("partitionMode") == "manual-admitted-minimums"), None)
+            if pool is not None:
+                hot = min(hot, pool["minimumPackedOwnerBytes"])
         budget["acceleratorCoreHotBytes"] = max(0, int(hot))
         return budget
+
+    def _reclaim_packed_for_context(self, device, needed) -> None:
+        """Owner-bound manual rebalance; never a tool or private world effect."""
+        if getattr(self.config, "working_memory_mode", "auto") != "manual":
+            return
+        pager = self.working_attention_pager
+        pager.check_cancelled()
+        if device.type == "cpu":
+            current = self.core_pager.status()
+            if current["pinnedOwners"] or any(getattr(module, "_online_transaction", None) is not None for module in self.core_pager._owners):
+                raise NeuralStateResourcePause("manual RAM context awaits packed pins or a learning transaction", {"paused": True})
+            if getattr(self.router_state_pager, "_active", 0):
+                raise NeuralStateResourcePause("manual RAM context awaits the current recurrent tile", {"paused": True})
+            budget = self._native_core_budget_for_device(current)
+            self.core_pager.cool_to_budget(budget["liveCoreHotBytes"], cancelled=pager.check_cancelled)
+            self.router_state_pager.hot_bytes = self._router_state_budget(self.router_state_pager.status())["hotBytes"]
+            self.router_state_pager.cool_to_budget()
+        else:
+            pool = next((pool for pool in pager._retained_context_pools if pool["executionDevice"] == str(device)), None)
+            if pool is not None and pool.get("partitionMode") == "manual-admitted-minimums":
+                self.core_pager.reclaim_device_for_context(device, needed,
+                    core_minimum_bytes=pool["minimumPackedOwnerBytes"], cancelled=pager.check_cancelled)
 
     def _regional_quiescent(self) -> None:
         from .connected_execution import require_joint_mutation_allowed
@@ -1306,6 +1364,7 @@ class AdaptiveBrain:
 
         readings = self.resource_policy.status()
         selected = max(0, int(readings.get("systemRamBudgetBytes") or 0))
+        manual = getattr(self.config, "working_memory_mode", "auto") == "manual"
         # The core pager and activity pager share 55/30/15 percent of the same
         # post-baseline capacity. The final share is reserved for transfers and
         # bounded training scratch, not independently promised to both pools.
@@ -1329,7 +1388,12 @@ class AdaptiveBrain:
         if configured_compute and self.device.type != "cpu":
             compute_capacity = min(compute_capacity, configured_compute)
         if isinstance(accelerator_free, int) and self.device.type != "cpu":
-            compute_capacity = min(compute_capacity, max(1, accelerator_free * 15 // 100))
+            if not manual:
+                compute_capacity = min(compute_capacity, max(1, accelerator_free * 15 // 100))
+        minimum_core = self._native_core_budget_for_device(core_status) if manual else {"sharedCorePartitionBytes": residual * 55 // 100}
+        if manual:
+            activity_capacity = max(0, residual - int(minimum_core["sharedCorePartitionBytes"]) - compute_capacity)
+            activity_live = min(activity_capacity, available + old_resident)
         disk_headroom = max(0, int(readings.get("diskFreeBytes") or 0)
                             - int(readings.get("diskReserveBytes") or 0))
         # Existing model pages and the next rollback/checkpoint also need the
@@ -1343,6 +1407,44 @@ class AdaptiveBrain:
         context_allowance = self.config.working_attention_scratch_budget_bytes
         device_manager = getattr(self.resource_policy, "device_resources", None)
         drive_settings = device_manager.settings if device_manager is not None else None
+        retained_pools = []
+        if device_manager is not None and callable(getattr(device_manager, "topology", None)) and callable(getattr(device_manager, "budgets", None)):
+            from .retained_context_capacity import retained_context_pools
+            topology = device_manager.topology()
+            widths = [int(module.n_heads * module.head_dim) for module in self.decoder.modules()
+                      if hasattr(module, "n_heads") and hasattr(module, "head_dim")]
+            page_width = max(widths or [int(self.config.d_model)])
+            tokens_per_page = max(1, min(256, compute_capacity // max(1, 16 * page_width)))
+            page_bytes = max(max(1, min(256, compute_capacity // max(1, 16 * width))) * width * 4
+                             for width in (widths or [page_width]))
+            minimums = {}
+            owner_minimum = int(core_status.get("maximumPackedOwnerBytes") or 0)
+            # Current non-packed device storage is a real fixed cost, including
+            # connected parents. Deduplicate tensor views by physical storage.
+            controls_by_device, seen_storage = {}, set()
+            for root in self._trainable_modules():
+                for module in root.modules():
+                    if module in self.core_pager._owners:
+                        continue
+                    for value in module._buffers.values():
+                        if not isinstance(value, torch.Tensor) or value.device.type == "cpu":
+                            continue
+                        storage = value.untyped_storage()
+                        key = (str(value.device), storage.data_ptr())
+                        if key not in seen_storage:
+                            seen_storage.add(key)
+                            controls_by_device[key[0]] = controls_by_device.get(key[0], 0) + storage.nbytes()
+            regional = drive_settings.get("regionalExecution", {})
+            for entry in topology["devices"]:
+                name = entry.get("executionDevice")
+                compute = entry.get("nativeComputeSupported") or regional.get("enabled") and any(
+                    route.get("deviceId") == entry["id"] for route in regional.get("routes", []))
+                if not compute:
+                    minimums[name] = {"packedOwnerBytes": 0, "controlBytes": controls_by_device.get(name, 0), "transferBytes": page_bytes * 4}
+                elif owner_minimum > 0:
+                    minimums[name] = {"packedOwnerBytes": owner_minimum, "controlBytes": controls_by_device.get(name, 0), "transferBytes": compute_capacity}
+            retained_pools = retained_context_pools(topology, device_manager.budgets(readings), manual=manual,
+                minimums=minimums, page_bytes=page_bytes)
         selected_drives = bool(drive_settings and drive_settings.get("storageDirectories"))
         if selected_drives:
             # Real placed leases recheck each authorized volume and the shared
@@ -1367,25 +1469,32 @@ class AdaptiveBrain:
                 device_tile_budget_bytes=compute_capacity,
                 resource_policy=self.resource_policy,
                 compute_device=self.device,
+                retained_context_pools=tuple(retained_pools),
             )
         else:
             old.resident_budget_bytes = activity_live
             old.scratch_budget_bytes = scratch_capacity
             old.device_tile_budget_bytes = compute_capacity
+            old.configure_retained_context_pools(retained_pools)
             if old.resource_policy is not self.resource_policy:
                 old.resource_policy = self.resource_policy
                 old._policy_snapshot = None
                 old._policy_at = 0.0
+        self.working_attention_pager.reclaim_packed = self._reclaim_packed_for_context if manual else None
         self.decoder.configure_working_attention(self.working_attention_pager)
         self._working_attention_envelope = {
             "selectedRamBytes": selected, "measuredBaselineBytes": baseline,
             "residualRamBytes": residual, "activityCapacityBytes": activity_capacity,
             "activityLiveBudgetBytes": activity_live, "computeTileBudgetBytes": compute_capacity,
+            "retainedDeviceContextCapacityBytes": sum(pool["budgetBytes"] for pool in retained_pools),
+            "retainedDeviceContextPools": retained_pools,
             "scratchCapacityBytes": scratch_capacity,
             "designatedStoragePoolBytes": designated_pool,
             "designatedContextAllowanceBytes": context_allowance,
             "scratchPlacement": "selected-drives" if selected_drives else "primary-volume",
-            "sharedPartition": {"corePercent": 55, "activityPercent": 30, "transferPercent": 15},
+            "sharedPartition": ({"mode": "manual-current-owner-minimums", "coreBytes": int(minimum_core["sharedCorePartitionBytes"]),
+                                 "activityBytes": activity_capacity, "transferBytes": compute_capacity}
+                                if manual else {"corePercent": 55, "activityPercent": 30, "transferPercent": 15}),
             "capacityShrunk": False,
         }
 
@@ -23311,6 +23420,23 @@ class AdaptiveBrain:
         Learned growth must use an isolated validated architecture operation.
         """
 
+        policy_fields = {"workingMemoryMode": "working_memory_mode", "contextWindowTokens": "max_seq_len",
+            "deviceResources": "device_resource_settings", "storagePoolBytes": "storage_pool_bytes",
+            "contextOffloadBudgetBytes": "working_attention_scratch_budget_bytes", "memoryOffloadBytes": "memory_offload_bytes",
+            "memoryResidentItems": "memory_resident_items", "storageBytesPerSecond": "storage_bytes_per_second"}
+        policy_change = any(key in raw and raw[key] != getattr(self.config, attribute, None) for key, attribute in policy_fields.items())
+        if "systemRamSharePercent" in raw or "systemRamMode" in raw:
+            requested_share = float(raw.get("systemRamSharePercent", self.config.system_ram_share_percent)) if raw.get(
+                "systemRamMode", "manual" if self.config.system_ram_share_percent else "auto") == "manual" else 0.0
+            policy_change = policy_change or requested_share != self.config.system_ram_share_percent
+        activity = getattr(self, "working_attention_pager", None)
+        if policy_change and (activity is not None and activity.status().get("livePages", 0)
+                              or self.core_pager.status().get("pinnedOwners", 0)):
+            # Refuse BEFORE retiring Auto sessions, touching rotary tables,
+            # rebinding policy or changing limits. Unload's exact checkpoint
+            # can later re-admit every page under the new setting.
+            raise NeuralStateResourcePause("resource repartition waits for exact activity to unload; no context was discarded",
+                {"paused": True, "resourcePolicyBoundaryRequired": True})
         # A source/capacity change cannot keep a lease bound to the old policy
         # or clear a running cache. Portable preferences themselves never arm it.
         operation_auto = getattr(self, "_native_operation_auto", None)
@@ -23545,6 +23671,7 @@ class AdaptiveBrain:
             "memory_offload_bytes", "memory_resident_items", "storage_pool_bytes",
             "working_attention_scratch_budget_bytes",
             "device_resource_settings",
+            "working_memory_mode",
         }):
             self._configure_working_attention_resources()
             self.core_pager.refresh_budget(force=True)

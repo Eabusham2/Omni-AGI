@@ -88,6 +88,16 @@ jobs:
           --release-root release
           --desktop-shell
 
+      - name: Upload packaged-shell diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: omni-shell-diagnostics-macos-${{ matrix.arch }}
+          compression-level: 0
+          if-no-files-found: ignore
+          retention-days: 7
+          path: test-results/packaged-shell-*/
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

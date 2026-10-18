@@ -11243,7 +11243,7 @@ function AgentsWorkspace({
         <section className="surface lineage-surface">
           <div className="surface-title">
             <div><h2>Living lineage</h2><p>One live instance · generation {brain.lineage.generation} · recovery origin remains immutable</p></div>
-            <span className="lineage-pill"><Icon name="check" size={13} /> Origin verified</span>
+            <span className="lineage-pill"><Icon name="archive" size={13} /> Recovery origin</span>
           </div>
           <div className="lineage-tree">
             <div className="lineage-origin">
@@ -11251,7 +11251,7 @@ function AgentsWorkspace({
               <span>
                 <small>STORED RECOVERY ORIGIN · NOT A RUNNING BRAIN</small>
                 <strong>{brain.name} / initial checkpoint</strong>
-                <em>{brain.originChecksum ? `Verified · ${brain.originChecksum.slice(0, 10)}… · content-addressed` : "Immutable recovery point"}</em>
+                <em title={brain.originChecksum || undefined}>{brain.originChecksum ? `Stored checksum · ${brain.originChecksum.slice(0, 10)}… · content-addressed` : "No origin checksum recorded"}</em>
               </span>
             </div>
             <span className="lineage-stem" />

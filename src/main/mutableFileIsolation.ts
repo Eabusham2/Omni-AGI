@@ -70,23 +70,29 @@ async function promotePrivateFile(temporary: string, destination: string): Promi
       movedExisting = false;
     }
   } catch (error) {
-    if (movedExisting && await pathExists(backup)) {
-      await rename(backup, destination).catch(() => undefined);
+    if (movedExisting) {
+      try {
+        await rename(backup, destination);
+      } catch (restoreError) {
+        // The backup may now be the only copy of the previous destination.
+        throw new AggregateError([error, restoreError],
+          `Private mutable-state promotion and restoration failed. Recovery backup: ${backup}`);
+      }
     }
     throw error;
-  } finally {
-    await rm(backup, { force: true }).catch(() => undefined);
   }
 }
 
 async function assertPrivateMaterialization(
   source: string,
   destination: string,
-  expectedBytes: number
+  expectedBytes: bigint
 ): Promise<void> {
+  // Windows file IDs can exceed Number.MAX_SAFE_INTEGER; rounding distinct IDs
+  // to numbers can falsely report a shared inode (or miss a source replacement).
   const [sourceInfo, destinationInfo] = await Promise.all([
-    stat(source),
-    stat(destination)
+    stat(source, { bigint: true }),
+    stat(destination, { bigint: true })
   ]);
   if (!destinationInfo.isFile() || destinationInfo.size !== expectedBytes) {
     throw new Error("Private mutable-state materialization is incomplete.");
@@ -111,7 +117,7 @@ export async function copyMutableFileIsolated(
   destination: string,
   options: IsolatedFileCopyOptions = {}
 ): Promise<number> {
-  const before = await lstat(source);
+  const before = await lstat(source, { bigint: true });
   if (!before.isFile() || before.isSymbolicLink()) {
     throw new Error("Mutable copy source is not a safe regular file.");
   }
@@ -127,14 +133,16 @@ export async function copyMutableFileIsolated(
         await handle.close();
       }
     }
-    const [after, copied] = await Promise.all([lstat(source), lstat(temporary)]);
+    const [after, copied] = await Promise.all([
+      lstat(source, { bigint: true }), lstat(temporary, { bigint: true })
+    ]);
     if (
       !after.isFile() ||
       after.isSymbolicLink() ||
       after.dev !== before.dev ||
       after.ino !== before.ino ||
       after.size !== before.size ||
-      after.mtimeMs !== before.mtimeMs ||
+      after.mtimeNs !== before.mtimeNs ||
       copied.size !== before.size
     ) {
       throw new Error("Mutable copy source changed during materialization.");
@@ -148,7 +156,7 @@ export async function copyMutableFileIsolated(
     await syncFile(temporary);
     await promotePrivateFile(temporary, destination);
     await assertPrivateMaterialization(source, destination, before.size);
-    return before.size;
+    return Number(before.size);
   } finally {
     await rm(temporary, { force: true }).catch(() => undefined);
   }
@@ -218,8 +226,9 @@ export async function snapshotMutableSqliteIsolated(
     }
     await syncFile(temporary);
     await promotePrivateFile(temporary, destination);
-    await assertPrivateMaterialization(source, destination, (await stat(destination)).size);
-    return (await stat(destination)).size;
+    const materialized = await stat(destination, { bigint: true });
+    await assertPrivateMaterialization(source, destination, materialized.size);
+    return Number(materialized.size);
   } finally {
     await Promise.all([
       rm(temporary, { force: true }),

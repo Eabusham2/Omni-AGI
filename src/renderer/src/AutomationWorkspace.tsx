@@ -6,6 +6,7 @@ import { actionFileInputs, actionScheduleDraft, actionScheduleEditRequest, actio
 import "./automationWorkspace.css";
 import { ActionCanvasEditor } from "./ActionCanvasEditor";
 import { actionCanvasProgram } from "./actionCanvas";
+import { workspaceReadStatus } from "./workspaceReadStatus";
 
 interface PendingAction { invocation: ToolInvocation; result: ToolExecutionResult; step?: AutomationStepReceipt }
 const emptyPage = <T,>(): AutomationPage<T> => ({ entries: [], total: 0 });
@@ -137,7 +138,9 @@ export function AutomationWorkspace({ brainId, scheduleToEdit, onScheduleEditFin
   const reviewingEffects = approval?.invocation.toolId === "studio.automation" && approval.invocation.action === "review";
   return <section className="automation-workspace" aria-labelledby="automation-title">
     <header><div><h2 id="automation-title">Action files</h2><p>Reusable steps run independently of the brain. Each effect uses current tool access.</p></div><button type="button" disabled={busy} onClick={() => void refresh()}>Refresh</button></header>
-    {snapshot ? <small>{snapshot.counts.definitions} {snapshot.counts.definitions === 1 ? "file" : "files"} · {snapshot.counts.activeRuns} active runs · {snapshot.counts.reviewRequired} need review. The app must remain running.</small> : <p role="status">Reading saved action files…</p>}
+    {snapshot ? <small>{snapshot.counts.definitions} {snapshot.counts.definitions === 1 ? "file" : "files"} · {snapshot.counts.activeRuns} active runs · {snapshot.counts.reviewRequired} need review. The app must remain running.</small> : <p role="status">{workspaceReadStatus(Boolean(window.omni?.automation), Boolean(error), {
+      pending: "Reading saved action files…", unavailable: "Saved action files are unavailable. Use Refresh to try again.",
+      disconnected: "Saved action files are unavailable without the desktop connection." })}</p>}
     {error ? <p className="automation-error" role="alert" ref={errorRegion} tabIndex={-1}>{error}</p> : null}
     {approval ? <section className="automation-approval" ref={approvalRegion} tabIndex={-1} aria-labelledby="automation-approval-title"><h3 id="automation-approval-title">Review this exact request</h3>
       <p>{approvingNested ? approval.step?.invocation?.toolId ?? approval.invocation.toolId : approval.invocation.toolId} · {approvingNested ? approval.step?.invocation?.action ?? approval.invocation.action : approval.invocation.action}</p>

@@ -136,7 +136,8 @@ class ExecutionStateWriter:
             return {"kind": "recall-view", "file": name, "count": count}
         if isinstance(value, PagedTensorSequence):
             return {"kind": "paged-sequence", "shape": list(value.shape), "axis": value.axis,
-                "ends": list(value.ends), "pages": [self.tensor(value.pager.read_page(page)) for page in value.pages]}
+                "ends": list(value.ends), "pageTokens": value._page_tokens,
+                "pages": [self.tensor(value.pager.read_page(page)) for page in value.pages]}
         if isinstance(value, SavedActivityTensor):
             return {"kind": "saved-activity", "shape": list(value.shape), "device": str(value.device),
                 "pages": [self.tensor(value.pager.read_page(page)) for page in value.pages]}
@@ -247,12 +248,16 @@ class ExecutionStateReader:
             if kind == "paged-sequence":
                 result = PagedTensorSequence(self.pager, tuple(value["shape"]), first.dtype, value["axis"])
                 self._owners.append(result)
+                page_tokens = value.get("pageTokens")
+                if page_tokens is not None and (type(page_tokens) is not int or page_tokens < 1):
+                    raise ValueError("paged execution activity has invalid tail geometry")
+                result._page_tokens = page_tokens
                 for item in pages:
                     tensor = first if item is pages[0] else self.tensor(item["file"], page=True)
                     expected = list(value["shape"]); expected.pop(result.axis)
                     if tensor.dtype != result.dtype or list(tensor.shape[1:]) != expected:
                         raise ValueError("paged execution activity geometry changed")
-                    result.pages.append(self.pager.save_page(tensor))
+                    result.pages.append(self.pager.save_page(tensor, retained_context=True))
                     result._shape[result.axis] += tensor.shape[0]
                     result.ends.append(result.length)
                 if list(result.shape) != value["shape"] or result.ends != value["ends"]:
