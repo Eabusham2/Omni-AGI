@@ -10,7 +10,15 @@ it("keeps package CI on fixed source contracts and health-only worker paths", as
   expect(listed.status, listed.stderr).toBe(0);
   const manifest = JSON.parse(listed.stdout) as { files: Array<{ path: string; sha256: string }> };
   expect(manifest).toMatchObject({ fullTestDiscovery: false, neuralRuntimeImportsAllowed: false, brainCreated: false, trainingPerformed: false });
-  expect(manifest.files.map(value => value.path)).toEqual(["engine/tests/test_native_compute_tensor_bytes.py", "engine/tests/test_manual_regional_execution.py", "engine/tests/test_manual_regional_boundaries.py"]);
+  expect(manifest.files.map(value => value.path)).toEqual([
+    "engine/tests/test_native_compute_tensor_bytes.py",
+    "engine/tests/test_manual_regional_execution.py",
+    "engine/tests/test_manual_regional_boundaries.py",
+    "engine/tests/test_whole_path_memory_scheduler.py",
+    "engine/tests/test_reply_execution_planner.py",
+    "engine/tests/test_mixed_region_schedule.py",
+    "engine/tests/test_outer_learning_pipeline.py"
+  ]);
   expect(manifest.files.every(value => /^[a-f0-9]{64}$/.test(value.sha256))).toBe(true);
   for (const name of ["windows", "macos", "linux", "release"]) {
     const workflow = await readFile(join(root, `.github/workflows/${name}.yml`), "utf8");
