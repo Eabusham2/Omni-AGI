@@ -236,14 +236,29 @@ class RetainedContextCapacityCases(unittest.TestCase):
                 self.assertEqual(pager.status()["retainedDeviceBytes"], 4)
 
     def test_verified_GPU_spill_keeps_bytes_and_releases_only_actual_resident_owner(self):
-        pager, policy = self.pager(ram=0, scratch=8192)
-        identifier = pager.save_page(BytesTensor(b"abcd", "cuda:0"), retained_context=True)
-        policy.blocked.add("cuda:0")
-        pager.reclaim_device(Device("cuda:0"), 1)
-        self.assertIsNone(pager._pages[identifier].tensor)
-        self.assertEqual(pager.status()["retainedDeviceBytes"], 0)
-        self.assertEqual(pager.read_page(identifier).values, b"abcd")
-        self.assertGreater(pager.status()["spillBytes"], 0)
+        # The payload is four bytes, not a four-byte physical allocation.
+        # Windows lacks statvfs and the real pager conservatively reserves a
+        # 64-KiB allocation unit. Exercise both geometries on every host;
+        # never weaken production physical-quota admission for this fixture.
+        for allocation_unit in (4096, 65536):
+            with self.subTest(allocationUnitBytes=allocation_unit):
+                pager, policy = self.pager(ram=0, scratch=allocation_unit - 1)
+                pager._allocation_unit = allocation_unit  # Explicit inert filesystem geometry.
+                identifier = pager.save_page(BytesTensor(b"abcd", "cuda:0"), retained_context=True)
+                original = pager._pages[identifier].tensor
+                policy.blocked.add("cuda:0")
+                with self.assertRaises(Pause) as refused:
+                    pager.reclaim_device(Device("cuda:0"), 1)
+                self.assertEqual(refused.exception.status["requiredAdditionalSpillBytes"], allocation_unit)
+                self.assertIs(pager._pages[identifier].tensor, original)
+                self.assertIsNone(pager._pages[identifier].path)
+                pager.scratch_budget_bytes = allocation_unit * 2
+                pager.reclaim_device(Device("cuda:0"), 1)
+                self.assertIsNone(pager._pages[identifier].tensor)
+                self.assertEqual(pager.status()["retainedDeviceBytes"], 0)
+                self.assertEqual(pager.read_page(identifier).values, b"abcd")
+                self.assertGreater(pager.status()["spillBytes"], 0)
+                self.assertLessEqual(pager.status()["spillBytes"], pager.scratch_budget_bytes)
 
     def test_transactional_tail_replacement_failure_preserves_original_sequence(self):
         pager, _ = self.pager()

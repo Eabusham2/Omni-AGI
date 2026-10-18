@@ -1,5 +1,26 @@
 # Current implementation continuation
 
+### Hosted source-contract follow-up on7db7cea
+
+The reviewed source candidate `7db7ceae0d02f4b4e1f09d92ccc947820b529800`
+was committed and pushed to the sole remote `main`; both local checkouts were
+clean. Its five workflows started. Android39173317679 passed; other current
+handles are Windows39173317682, macOS39173317761, Linux39173317753 and
+iOS39173317681. This is not an all-platform-green or release claim.
+
+The next corrections are test-only and follow exact hosted failures. Windows
+x64 passed92/93 fixed Python contracts; the new spill fixture's8-KiB pool could
+not admit the real64-KiB allocation reservation. That same case now explicitly
+checks4-KiB/64-KiB refusal-without-loss and successful admitted spill; its affected
+stdlib case passes. Mac2/Linux2 exposed the old assertion that verified CUDA
+storage must require a compute route; its updated affected case passes while
+keeping the native-compute flag false and admitted context absent at that
+lower-level projection. Linux x64 additionally exposed a distinct resource-
+pressure fixture spinning before actual process-factory entry. It now waits
+for that entry and the real abort event; the affected case passes15ms.
+Production quotas, permission gates and timeouts are unchanged. Root owns
+batching this correction and confirming a fresh exact-commit platform run.
+
 ## October18 current — local source corrections verified; remote requalification and release pending
 
 This current entry supersedes the historical checkpoints below. The full v2

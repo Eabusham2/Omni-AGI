@@ -20,7 +20,7 @@ it("preserves absent settings and requires exact manual routes, device enablemen
   }
 });
 
-it("keeps unsupported native CUDA false while acknowledging only that explicit route, without crediting real context", () => {
+it("admits verified CUDA storage without granting native computation, an implicit route, or a real context maximum", () => {
   const topology: DeviceResourceTopology = { format: "omni-device-resource-topology", version: 1, measuredAt: "2026-10-15T00:00:00Z",
     platform: "fixture", architecture: "fixture", measurementRequested: false, neuralModelConstructed: false, warnings: [], links: [],
     devices: [{ id: "ram:system", label: "RAM", kind: "ram", backend: "cpu", executionDevice: "cpu", memoryGroupId: "ram:system",
@@ -32,7 +32,12 @@ it("keeps unsupported native CUDA false while acknowledging only that explicit r
   const demand = { modelBytes: 1024, fixedRuntimeBytes: 1024, contextBytesPerToken: 128, requestedContextTokens: 32,
     systemRamBudgetBytes: 8 * 1024 ** 3, diskReserveBytes: 20 * 1024 ** 3 };
   const without = planDeviceResources(topology, { ...original, allocations: [allocation] }, demand);
-  expect(without.executionBlockers.join(" ")).toContain("native compute backend is unavailable");
+  // Verified tensor storage is useful without a native packed CUDA kernel.
+  // Only ResourcePlanner's actual retained-page geometry can admit context;
+  // this lower-level device projection must not grant a compute route.
+  expect(without.executionBlockers).toEqual([]);
+  expect(without.admittedContextMaximumTokens).toBeUndefined();
+  expect(validateDeviceResourceSettings({ ...original, allocations: [allocation] })).not.toHaveProperty("regionalExecution");
   const acknowledged = planDeviceResources(topology, { ...original, allocations: [allocation], regionalExecution: {
     version: 1, enabled: true, mode: "manual", routes: [{ regionId: "decoder.blocks.0", deviceId: allocation.deviceId,
       executionMode: "packed-cpu-tile-fallback", acknowledgePackedCpuFallback: true }] } }, demand);

@@ -101,8 +101,13 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
   });
 
   it("checks whole-family resource pressure while the process factory is still starting", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] }); const f = await fixture({ delayedLaunch: true }), activating = f.activate(); await settle(() => Boolean(f.launch()));
-    f.check.mockRejectedValue(new Error("Actual family pressure")); await vi.advanceTimersByTimeAsync(1001); await settle(() => f.callbacks().signal.aborted); f.ready.resolve();
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] }); const f = await fixture({ delayedLaunch: true }), activating = f.activate();
+    // Custody I/O must reach the actual starting-factory boundary before the
+    // fake pressure clock advances; event-loop spin counts are not I/O fences.
+    await f.launchEntered;
+    const signal = f.callbacks().signal, aborted = new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    f.check.mockRejectedValue(new Error("Actual family pressure")); await vi.advanceTimersByTimeAsync(1001); await aborted;
+    expect(signal.aborted).toBe(true); f.ready.resolve();
     await expect(activating).rejects.toThrow(/stopped while/); expect(f.release).toHaveBeenCalledTimes(1);
   });
 
