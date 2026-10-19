@@ -10,9 +10,9 @@ const normalized = (text: string): string => `${text.replace(/\r\n?/g, "\n").tri
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object"
   ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, child]) => [key, canonical(child)])) : value;
 
-it("binds exact pack22 regional instructions and eight public records without invented hardware or activation outcomes", () => {
+it("binds exact pack23 regional instructions and eight public records without invented hardware or activation outcomes", () => {
   const pack = declaredDocumentationCurriculumPack();
-  expect(pack).toMatchObject({ version: 22, id: "omni-v2-user-documentation-22", format: "omni-ordinary-document-curriculum",
+  expect(pack).toMatchObject({ version: 23, id: "omni-v2-user-documentation-23", format: "omni-ordinary-document-curriculum",
     sourceKind: "project-authored-user-documentation", ordinaryNeuralLearning: true, hiddenPrompt: false, behavioralPersona: false,
     preferenceLabels: false, rewardModel: false, executedHostActions: false });
   expect(pack.records.map(row => row.path)).toEqual([
@@ -35,7 +35,7 @@ it("binds exact pack22 regional instructions and eight public records without in
     "concurrent\ndevice execution", "thirteen individually registered operation kinds",
     "Mutable\nmemory and learning state stays with its actual owner"])
     expect(guide).toContain(text);
-  for (const text of ["Pack version 22", "window.omni.regionalExecution", "activate({ brainId, reviewId })", "deactivate({ brainId, epoch })",
+  for (const text of ["Pack version 23", "window.omni.regionalExecution", "activate({ brainId, reviewId })", "deactivate({ brainId, epoch })",
     "opaque current review ID", "never exported, copied", "packed-cpu-tile-fallback", "nativeComputeSupported:false",
     "no regional\ntraining", "native-mixed-sequential", "actual Worker request",
     "training do not advertise this mixed mode", "not privately replay or relocate"])

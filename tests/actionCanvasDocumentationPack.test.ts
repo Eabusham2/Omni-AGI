@@ -6,12 +6,12 @@ const sha256 = (value: string): string =>
   createHash("sha256").update(value, "utf8").digest("hex");
 
 describe("action-canvas documentation curriculum declaration", () => {
-  it("reviews pack 16 as the existing eight ordinary records with current canvas instructions", () => {
+  it("reviews pack 23 as the existing eight ordinary records with current canvas instructions", () => {
     const pack = declaredDocumentationCurriculumPack();
     expect(pack).toMatchObject({
       format: "omni-ordinary-document-curriculum",
-      version: 22,
-      id: "omni-v2-user-documentation-22",
+      version: 23,
+      id: "omni-v2-user-documentation-23",
       ordinaryNeuralLearning: true,
       hiddenPrompt: false,
       behavioralPersona: false,
@@ -34,7 +34,7 @@ describe("action-canvas documentation curriculum declaration", () => {
     expect(guide.content).toContain("Save** writes an inert,\ncontent-addressed action-file revision and does not run it");
     expect(integrations.content).toContain("## Action-file canvas metadata");
     expect(integrations.content).toContain("the `steps` array remains the only execution order");
-    expect(integrations.content).toContain("Pack version 22");
+    expect(integrations.content).toContain("Pack version 23");
     for (const record of [guide, integrations]) {
       expect(record.contentSha256).toBe(sha256(record.content));
       expect(record.bytes).toBe(Buffer.byteLength(record.content));

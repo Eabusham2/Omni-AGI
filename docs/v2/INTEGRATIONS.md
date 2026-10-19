@@ -57,7 +57,7 @@ display label or permission token.
 [`managed-environments.md`](managed-environments.md),
 [`clipboard.md`](clipboard.md), and
 [`api-teacher-model-discovery.md`](api-teacher-model-discovery.md) as raw build
-inputs. Pack version 22
+inputs. Pack version 23
 declares a separate ordinary-document corpus
 containing record names, paths, bytes, content hashes, provenance URLs,
 license, and a canonical pack hash.
