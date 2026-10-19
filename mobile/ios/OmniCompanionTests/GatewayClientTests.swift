@@ -38,7 +38,8 @@ final class GatewayClientTests: XCTestCase {
     }
 
     func testHostGatewayRoundTripWhenProvided() async throws {
-        guard let endpoint = ProcessInfo.processInfo.environment["OMNI_GATEWAY_ENDPOINT"] else {
+        guard let endpoint = ProcessInfo.processInfo.environment["OMNI_GATEWAY_ENDPOINT"],
+              !endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw XCTSkip("The host fake gateway is only present in simulator CI.")
         }
         let paired = try await GatewayClient(endpoint: endpoint).pair(code: "123456", deviceName: "iOS unit test")

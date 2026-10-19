@@ -31,9 +31,9 @@ deletion, production-backup replacement or polling workaround was retained.
 
 ## Local command
 
-CI selects Node 22 LTS explicitly; `.nvmrc` selects the same major for local
-development. To exercise this check using the application's actual installed
-runtime on macOS:
+CI and `.nvmrc` now select Node24.18.0, matching the application's bundled
+runtime. The earlier Node22 selection is historical evidence, not the current
+qualification runtime. To exercise this check with the installed runtime on macOS:
 
 ```bash
 ELECTRON_RUN_AS_NODE=1 \
@@ -45,5 +45,25 @@ ELECTRON_RUN_AS_NODE=1 \
 `ELECTRON_RUN_AS_NODE` starts a Node process, not the desktop application or a
 brain worker. This controlled result does not claim that all Node 26 versions,
 all operating systems or untested future runtime versions share this issue.
-Current remote Node 22 CI and native platform package results remain separate
+Current exact-commit CI and native platform package results remain separate
 release evidence.
+
+## Windows filename semantics
+
+The Windows run additionally exposed a version-specific API difference:
+Node22's incremental `backup()` destination does not interpret SQLite URI
+filenames, unlike `DatabaseSync`/`VACUUM INTO`; the supported Node24 implementation
+does. The destination flags differ in the official
+[Node22.23.3 backup implementation](https://github.com/nodejs/node/blob/v22.23.3/src/node_sqlite.cc#L449)
+and [Node24.0.0 implementation](https://github.com/nodejs/node/blob/v24.0.0/src/node_sqlite.cc#L443).
+Supplying the constructor's long-path URI to the older backup API is not
+a valid cross-version adapter. Backup destinations therefore have their own
+version-aware filename boundary. CI is pinned to24.18.0 so that its native
+Windows fixtures qualify the actual shipped runtime, including deep paths;
+the existing assertions and incremental cancellation behavior are not removed.
+
+The official release provides both architectures on Windows, macOS and Linux:
+[Node24.18.0 release checksums](https://nodejs.org/download/release/v24.18.0/SHASUMS256.txt).
+Older-runtime limitations remain explicit; no global VFS switch, non-locking
+mode, blocking replacement for incremental backup or extra staging copy is
+used to claim compatibility.

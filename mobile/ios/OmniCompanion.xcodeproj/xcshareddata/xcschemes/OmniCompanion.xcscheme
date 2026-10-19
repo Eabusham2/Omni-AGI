@@ -21,6 +21,9 @@
       <BuildableProductRunnable runnableDebuggingMode="0">
          <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="100000000000000000000401" BuildableName="Omni AGI Companion.app" BlueprintName="OmniCompanion" ReferencedContainer="container:OmniCompanion.xcodeproj"/>
       </BuildableProductRunnable>
+      <EnvironmentVariables>
+         <EnvironmentVariable key="OMNI_GATEWAY_ENDPOINT" value="$(OMNI_GATEWAY_ENDPOINT)" isEnabled="YES"/>
+      </EnvironmentVariables>
    </LaunchAction>
    <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES">
       <BuildableProductRunnable runnableDebuggingMode="0">

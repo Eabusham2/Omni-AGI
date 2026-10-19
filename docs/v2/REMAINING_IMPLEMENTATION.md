@@ -9,6 +9,10 @@ quality, or user-deferred evidence into missing source code. Conversely, a
 focused test or rendered synthetic fixture does not hide a real missing runtime
 consumer, persistence path, or authority boundary.
 
+For the latest exact-commit hosted results and the current backup/runtime and
+test-completion corrections, see the first entry in CONTINUATION.md. Historical
+run results below are not current green status; v2 is not yet tagged or released.
+
 ## Current correction boundary — October18
 
 The supported source consumers described below are implemented, including real

@@ -16,4 +16,5 @@ xcodebuild \
   -scheme OmniCompanion \
   -destination "$DESTINATION" \
   -resultBundlePath "${OMNI_IOS_RESULT_BUNDLE:-$REPO_ROOT/mobile/ios/OmniCompanion.xcresult}" \
+  "OMNI_GATEWAY_ENDPOINT=${OMNI_GATEWAY_ENDPOINT:-}" \
   test

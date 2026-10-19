@@ -11,7 +11,7 @@ import { writeMutableFileIsolated } from "./mutableFileIsolation";
 import { captureMcpTaskCustody } from "./mcpTaskCustody";
 import { MCP_TASK_DIRECTORY } from "./mcpTaskStore";
 import { mcpTaskEnginePath } from "./mcpTaskArchive";
-import { sqliteFilename } from "./sqliteFilename";
+import { sqliteBackupFilename, sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-full-brain-merge";
 const VERSION = 1;
@@ -154,7 +154,7 @@ async function snapshotSqlite(source: string, target: string, signal: AbortSigna
     database.exec("PRAGMA busy_timeout=1000; PRAGMA cache_size=-1024");
     // The asynchronous incremental API yields between pages, allowing Pause
     // while a large history/replay database is being captured.
-    await backup(database, sqliteFilename(target), { rate: 128, progress: () => signal.throwIfAborted() });
+    await backup(database, sqliteBackupFilename(target), { rate: 128, progress: () => signal.throwIfAborted() });
     signal.throwIfAborted();
   } finally { database.close(); }
   const handle = await open(target, "r+");

@@ -25,20 +25,22 @@ async function fixture(options: { frame?: number; module?: PluginRuntimeModuleDe
   const entry = { pluginId: "fixture.feature", enabled: true, activeContentSha256: hash, revision: 1 }, access = { enabled: true, contentSha256: hash, revision: 2, capabilities: [{ toolId: "system.files", enabled: true, actions: ["read"] }] };
   const plugin = { list: async () => [entry], instance: async () => access, package: async () => ({ manifest: { runtimeModules: [definition] } }), onEvent: (fn: typeof listener) => { listener = fn; return () => { listener = undefined; }; } } as unknown as PluginService;
   const terminate = vi.fn(async () => undefined), check = vi.fn(async (_pid?: number) => undefined), release = vi.fn(async () => undefined), ready = deferred<void>(), launched = deferred<void>();
-  const execute = vi.fn(options.execute ?? (async () => complete({ exact: "actual result" }))), cancel = vi.fn(async () => 1), invalidated: string[] = [], retire = vi.fn(async (_brain: string, _ids: string[]) => undefined);
+  const executing = deferred<void>(), toolInvocation = deferred<PluginRuntimeDelivery>();
+  const execute = vi.fn(async (invocation: ToolInvocation) => { executing.resolve(); return options.execute ? options.execute(invocation) : complete({ exact: "actual result" }); }), cancel = vi.fn(async () => 1), invalidated: string[] = [], retire = vi.fn(async (_brain: string, _ids: string[]) => undefined);
   const service = new PluginRuntimeService(plugin, { brainRoot: () => directory, admit: async () => ({ maxMessageBytes: options.frame ?? 8192, check, release }), admitRead: async () => ({ release: () => undefined }),
     tools: { execute, cancelAndWait: cancel, invalidateApproval: (_brain, token) => { invalidated.push(token); return true; } },
     moduleReadyTimeoutMs: 50,
     processFactory: { launch: async (input, observed) => { launch = input; callbacks = observed; launched.resolve(); if (options.delayedLaunch) await ready.promise;
       if (options.readiness !== "none") setImmediate(() => { void observed.receive(23, input.url, { format: "omni-plugin-runtime-rpc", version: 1, sessionId: input.session.sessionId, nonce: input.nonce, id: "owned-bootstrap-ready", operation: "ready", arguments: options.readiness === "failed" ? { ok: false, error: "Owned source initialization failed" } : { ok: true } }).catch(() => undefined); });
-      return { senderId: 23, processId: 4321, send: message => sent.push(message), terminate }; } },
+      return { senderId: 23, processId: 4321, send: message => { sent.push(message); if (message.kind === "invoke-tool") toolInvocation.resolve(message); }, terminate }; } },
     publishTools: async (_brain, tools) => { published.push(...tools); }, retireTools: retire, isBrainLoaded: () => options.loaded ?? false,
     learnSchemas: async job => { schemas.push(job); return { sourceSha256: job.sourceSha256, receipt: { actual: "fake source-only callback" } }; } }); services.push(service);
   const request: PluginRuntimeActivationRequest = { brainId: "owner", pluginId: entry.pluginId, contentSha256: hash, moduleId: definition.id, expectedCatalogRevision: 1, expectedInstanceRevision: 2, requestId: "human-activation" };
   const activate = () => service.activate(request), call = (operation: string, args: Record<string, unknown> = {}, id: string = randomUUID(), sender = 23, url?: string) => service.receive(sender, url ?? launch.url, { format: "omni-plugin-runtime-rpc", version: 1, sessionId: launch.session.sessionId, nonce: launch.nonce, id, operation, arguments: args });
-  return { service, directory, hash, definition, entry, access, sent, published, schemas, request, activate, call, execute, cancel, terminate, check, release, ready, launchEntered: launched.promise, launch: () => launch, callbacks: () => callbacks, invalidate: invalidated, retire, mutate: () => listener?.({ type: "instance", brainId: "owner", pluginId: entry.pluginId }) };
+  return { service, directory, hash, definition, entry, access, sent, published, schemas, request, activate, call, execute, cancel, terminate, check, release, ready,
+    launchEntered: launched.promise, executionEntered: executing.promise, toolInvocation: toolInvocation.promise,
+    launch: () => launch, callbacks: () => callbacks, invalidate: invalidated, retire, mutate: () => listener?.({ type: "instance", brainId: "owner", pluginId: entry.pluginId }) };
 }
-async function settle(test: () => boolean): Promise<void> { for (let i = 0; i < 200; i++) { if (test()) return; await new Promise(resolve => setImmediate(resolve)); } throw new Error("Owned async fixture did not settle."); }
 
 describe("optional lifecycle modules - new source/fake-host edges only", () => {
   it("preserves old manifest hashes when runtimeModules is absent, while reviewed scripts alter the hash", () => {
@@ -56,7 +58,7 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
 
   it("coalesces exact concurrent requests before awaits and refuses changed actual operands", async () => {
     const gate = deferred<ToolExecutionResult>(), f = await fixture({ execute: async () => gate.promise }); await f.activate(); const args = { toolId: "system.files", action: "read", arguments: { path: "owned-fixture" } };
-    const first = f.call("call", args, "same-rpc"); await settle(() => f.execute.mock.calls.length === 1); const retry = f.call("call", args, "same-rpc");
+    const first = f.call("call", args, "same-rpc"); await f.executionEntered; const retry = f.call("call", args, "same-rpc");
     await expect(f.call("call", { ...args, arguments: { path: "changed" } }, "same-rpc")).rejects.toThrow(/changed actual/); gate.resolve(complete({ exact: 7 })); expect(await first).toEqual(await retry); expect(f.execute).toHaveBeenCalledTimes(1);
   });
 
@@ -84,7 +86,7 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
     const f = await fixture({ loaded: true }); await f.activate(); const definition = { id: "a".repeat(64), title: "Max local id", description: "Actual typed tool", actions: [{ id: "compute", description: "Compute", inputSchema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } }] };
     expect((await f.call("register-tool", { definition })).state).toBe("complete"); await f.service.flushSchemaLearning("owner"); const tool = f.published[0]!;
     expect(tool.toolId).toMatch(/^extension\.[a-f0-9]{64}$/); expect(tool.toolId.length).toBe(74); expect(tool.definition.id).toBe(definition.id); expect(f.schemas).toHaveLength(1); expect(runtimeHash(f.schemas[0]!.text)).toBe(f.schemas[0]!.sourceSha256); expect(f.schemas[0]!.sourceSha256).toBe(tool.sourceSha256);
-    const output = f.service.executeTool("owner", tool.toolId, "compute", { n: 6 }, "actual-host-id", new AbortController().signal); await settle(() => f.sent.some(row => row.kind === "invoke-tool")); const invocation = f.sent.find(row => row.kind === "invoke-tool")!;
+    const output = f.service.executeTool("owner", tool.toolId, "compute", { n: 6 }, "actual-host-id", new AbortController().signal), invocation = await f.toolInvocation;
     await f.call("tool-result", { id: invocation.id, value: 720 }, "result"); expect(await output).toBe(720);
   });
 
@@ -96,7 +98,7 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
   });
 
   it("cancels a still-starting process and releases its admitted lease", async () => {
-    const f = await fixture({ delayedLaunch: true }), activating = f.activate(); await settle(() => Boolean(f.launch())); const sessionId = f.launch().session.sessionId;
+    const f = await fixture({ delayedLaunch: true }), activating = f.activate(); await f.launchEntered; const sessionId = f.launch().session.sessionId;
     await f.service.stop("owner", sessionId); expect(f.callbacks().signal.aborted).toBe(true); f.ready.resolve(); await expect(activating).rejects.toThrow(/stopped while/); expect(f.terminate).toHaveBeenCalledTimes(1); expect(f.release).toHaveBeenCalledTimes(1);
   });
 
@@ -120,7 +122,7 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
     const f = await fixture(); await f.activate(); const schema = { type: "object", properties: { n: { type: "integer", minimum: 1 }, label: { type: "string", default: "must-not-be-added" } }, required: ["n"], additionalProperties: false };
     expect((await f.call("register-tool", { definition: { id: "typed", title: "Typed", description: "Actual input schema", actions: [{ id: "compute", description: "Compute", inputSchema: schema }] } })).state).toBe("complete");
     const tool = f.published[0]!; await expect(f.service.executeTool("owner", tool.toolId, "compute", { n: "6" }, "invalid-args", new AbortController().signal)).rejects.toThrow(/actual|Actual/); expect(f.sent.filter(row => row.kind === "invoke-tool")).toHaveLength(0);
-    const args = { n: 6 }, output = f.service.executeTool("owner", tool.toolId, "compute", args, "typed-call", new AbortController().signal); await settle(() => f.sent.some(row => row.kind === "invoke-tool")); const invoked = f.sent.find(row => row.kind === "invoke-tool")!; expect(invoked.data).toEqual({ n: 6 }); expect(args).toEqual({ n: 6 }); await f.call("tool-result", { id: invoked.id, value: 720 }, "typed-result"); expect(await output).toBe(720);
+    const args = { n: 6 }, output = f.service.executeTool("owner", tool.toolId, "compute", args, "typed-call", new AbortController().signal), invoked = await f.toolInvocation; expect(invoked.data).toEqual({ n: 6 }); expect(args).toEqual({ n: 6 }); await f.call("tool-result", { id: invoked.id, value: 720 }, "typed-result"); expect(await output).toBe(720);
     expect((await f.call("register-tool", { definition: { id: "remote", title: "Remote ref", description: "Must fail locally", actions: [{ id: "compute", description: "Compute", inputSchema: { type: "object", $ref: "https://example.invalid/schema" } }] } })).state).toBe("failed"); expect(f.published).toHaveLength(1);
     expect((await f.call("register-tool", { definition: { id: "async", title: "Async schema", description: "Must not bypass synchronous dispatch", actions: [{ id: "compute", description: "Compute", inputSchema: { type: "object", $async: true } }] } })).state).toBe("failed"); expect(f.published).toHaveLength(1);
   });
@@ -147,15 +149,19 @@ describe("optional lifecycle modules - new source/fake-host edges only", () => {
 
 describe("owned program bootstrap and CSS subset", () => {
   it("runs generic owned JS handlers through fixed fake transport and installs tool handlers before registration ACK", async () => {
-    const requests: any[] = [], reports: unknown[] = []; let delivery!: (message: PluginRuntimeDelivery) => void; const done = deferred<void>();
+    const requests: any[] = [], reports: unknown[] = []; let delivery!: (message: PluginRuntimeDelivery) => void;
+    const done = deferred<void>(), activeReported = deferred<void>(), eventReported = deferred<void>();
     const module = moduleDefinition(`const sdk=globalThis.omniRuntime;sdk.onActivate(async()=>{await sdk.registerTool({id:"math",title:"Math",description:"Compute",actions:[{id:"factorial",description:"Product",inputSchema:{type:"object"}}]},{factorial:({n})=>{let x=1;for(let i=2;i<=n;i++)x*=i;return x;}});globalThis.report("active");});sdk.on("task.changed",data=>globalThis.report(data));`);
     const launch: PluginRuntimeLaunch = { session: { format: "omni-plugin-runtime-session", version: 1, brainId: "owner", pluginId: "fixture.feature", contentSha256: "a".repeat(64), moduleId: "feature", sessionId: randomUUID(), catalogRevision: 1, instanceRevision: 2, state: "starting", startedAt: new Date().toISOString() }, nonce: "b".repeat(64), maxMessageBytes: 8192, url: "unused" };
     const transport = { subscribe: (fn: typeof delivery) => { delivery = fn; }, request: async (request: any): Promise<PluginRuntimeRpcReply> => { requests.push(request);
       if (request.operation === "register-tool") delivery({ kind: "invoke-tool", id: "racing-call", toolId: "math", action: "factorial", data: { n: 6 } }); if (request.operation === "tool-result") done.resolve();
       return { format: "omni-plugin-runtime-reply", version: 1, id: request.id, state: "complete" }; } };
     // new Function executes ONLY this test-owned body; it is not the production security boundary.
-    new Function("globalThis", "crypto", "setTimeout", pluginRuntimeScript(launch, module))({ __omniRuntimeTransport: transport, report: (value: unknown) => reports.push(value) }, { randomUUID }, setTimeout);
-    delivery({ kind: "activate", id: "activate" }); await done.promise; expect(requests.find(row => row.operation === "tool-result")?.arguments.value).toBe(720); await settle(() => reports.includes("active")); delivery({ kind: "event", id: "event", topic: "task.changed", data: { exact: 1 } }); await settle(() => reports.length === 2); expect(reports[1]).toEqual({ exact: 1 });
+    new Function("globalThis", "crypto", "setTimeout", pluginRuntimeScript(launch, module))({ __omniRuntimeTransport: transport, report: (value: unknown) => {
+      reports.push(value); if (value === "active") activeReported.resolve(); if (reports.length === 2) eventReported.resolve();
+    } }, { randomUUID }, setTimeout);
+    delivery({ kind: "activate", id: "activate" }); await done.promise; expect(requests.find(row => row.operation === "tool-result")?.arguments.value).toBe(720);
+    await activeReported.promise; delivery({ kind: "event", id: "event", topic: "task.changed", data: { exact: 1 } }); await eventReported.promise; expect(reports[1]).toEqual({ exact: 1 });
     const document = pluginRuntimeDocument(launch, module); expect(document.headers.get("Content-Security-Policy")).toContain("connect-src 'none'"); expect(document.headers.get("Content-Security-Policy")).not.toContain("unsafe-eval");
   });
 

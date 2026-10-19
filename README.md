@@ -68,7 +68,7 @@ Long-term substrate decay can reduce activation and plastic strength but never c
 
 Prerequisites:
 
-- Node.js 22 LTS, selected by `.nvmrc`; the bundled Electron runtime uses Node.js 24
+- Node.js 24.18.0 LTS, selected by `.nvmrc` and CI to match the bundled Electron runtime
 - Python 3.10–3.12
 - PyTorch matching the machine's CPU or CUDA runtime
 - A C++17 compiler for the packed CPU library; Windows builds use Visual Studio C++ Build Tools
@@ -86,6 +86,11 @@ wakeup; increasing a test timeout does not fix it. The application's bundled
 Node 24.18.0 completes the affected merge checks normally. See
 [the SQLite runtime note](docs/v2/sqlite-runtime-completion.md) for the measured
 boundary and a command that uses the actual bundled runtime.
+
+Node 22 remains compatible with ordinary development paths, but its incremental
+SQLite backup API cannot select the Windows long-path VFS. Use the selected
+Node 24 runtime for complete Windows path support. Packaged desktop users do
+not need to install Node separately.
 
 Release worker packaging specifically uses CPython 3.11. The platform build
 scripts install the matching binary-only SHA-256 lock from `engine/locks`

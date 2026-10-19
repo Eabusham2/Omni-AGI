@@ -1,5 +1,42 @@
 # Current implementation continuation
 
+### Exact current boundary —85b5f93; backup API and deterministic completion corrections
+
+The latest hosted state is mixed, not full-plan completion: Android and both
+macOS architectures passed. Windows x64/ARM64, Linux x64 and iOS failed; Linux
+ARM64 was still running at the last observation. No v2 tag or release exists.
+
+Windows now passes the centralized reader/snapshot path checks but exposed a
+separate incremental-backup API difference. Node22 does not parse the backup
+destination as a SQLite URI and can create a literal URI-named file instead of
+the requested destination. Node24 does parse it. A distinct backup adapter now
+uses raw extended Windows paths on22, explicitly refuses its actual VFS byte
+boundary, and uses the locking long-path URI on24. Both backup call sites use
+that adapter; all109 constructor paths retain their existing adapter. No global
+VFS switch, synchronous replacement, extra staging copy or relaxed Stop occurs.
+Thirty-six bounded file/SQLite checks pass on actual22.23.3 and24.18.0; native
+Windows >1200-character incremental-backup qualification remains the hosted
+gate. CI and development now select24.18.0, matching the bundled desktop runtime,
+without removing the deep-path tests or changing the model architecture.
+
+Linux x64's one failing plugin cancellation fixture spun a fixed number of
+event-loop turns rather than awaiting process entry. All six fixed-spin waits
+in that test file now await actual launch, execution, invocation or report
+signals; all16 affected cases pass under24. Production behavior, assertions and
+deadlines are unchanged. Node/Web TypeScript and release configuration verify
+locally; these are not hosted package or release results.
+
+The new iOS failure is separate: compilation, pairing and streaming reached the
+reply assertion, but the later sent-human-text UI check failed. Its cause is not
+proven. The smoke now reveals rows only inside the existing conversation before
+retaining the same exact human-text assertion; no message state was changed.
+The configured test gateway is explicitly forwarded through the inherited
+scheme environment so its unit roundtrip is no longer unintentionally omitted.
+Swift/XML parsing, shell syntax and whitespace checks pass; hosted receipt and
+gateway verification remain required. The Xcode version check consumes all
+output instead of provoking a broken pipe through head. No failed run is being
+relabeled successful. No brain was created, Loaded or trained for these checks.
+
 ### Windows reader follow-through afterd0e1486
 
 The actual Windows x64 job117824575115 passed the original long-path snapshot

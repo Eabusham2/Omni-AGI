@@ -12,7 +12,7 @@ import { ArtifactIndexStore, parseArtifactIndex, type PersistedGeneratedArtifact
 import { captureMcpTaskCustody } from "./mcpTaskCustody";
 import { MCP_TASK_DIRECTORY } from "./mcpTaskStore";
 import { adoptFullMergeMcpTasks } from "./fullMergeMcpTasks";
-import { sqliteFilename } from "./sqliteFilename";
+import { sqliteBackupFilename, sqliteFilename } from "./sqliteFilename";
 
 export function mergeCanonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(mergeCanonical).join(",")}]`;
@@ -150,7 +150,7 @@ export async function sealFullMergeParent(root: string, brain: BrainDocument, si
         try {
           database.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;");
           const snapshot = join(temporary, "snapshot.sqlite3");
-          await backup(database, sqliteFilename(snapshot), { rate: 128, progress: () => signal?.throwIfAborted() });
+          await backup(database, sqliteBackupFilename(snapshot), { rate: 128, progress: () => signal?.throwIfAborted() });
           bytes = (await lstat(snapshot)).size;
           sha = await fullMergeFileHash(snapshot, signal);
         } finally { database.close(); await rm(temporary, { recursive: true, force: true }); }

@@ -106,6 +106,7 @@ private struct ChatView: View {
                     .padding(.horizontal, 14).padding(.vertical, 18)
                 }
                 .scrollDismissesKeyboard(.interactively)
+                .accessibilityIdentifier("conversationScrollView")
                 .onChange(of: model.messages) { _ in
                     guard let id = model.messages.last?.id else { return }
                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .bottom) }

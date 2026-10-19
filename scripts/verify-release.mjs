@@ -271,6 +271,11 @@ function requireArchitecture(path, jobName, architecture, fields) {
 }
 
 for (const [path, source] of workflows) {
+  const nodeSetups = (source.match(/uses:\s+actions\/setup-node@/g) ?? []).length;
+  requireValue(
+    nodeSetups > 0 && (source.match(/^\s*node-version:\s+24\.18\.0\s*$/gm) ?? []).length === nodeSetups,
+    `${path} must test and package with Node24.18.0, matching the shipped SQLite runtime.`
+  );
   const remoteActions = [
     ...source.matchAll(/uses:\s+[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+@([^\s#]+)/g)
   ];
@@ -315,7 +320,7 @@ for (const [path, jobName] of [
   const job = workflowJob(path, jobName);
   for (const requiredFragment of [
     "actions/setup-node@",
-    "node-version: 22",
+    "node-version: 24.18.0",
     "actions/setup-java@",
     'java-version: "17"',
     "verify-signature: true",
@@ -346,7 +351,7 @@ for (const [path, jobName] of [
   const job = workflowJob(path, jobName);
   for (const requiredFragment of [
     "DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer",
-    'test "$(xcodebuild -version | head -n 1)" = "Xcode 16.4"',
+    `test "$(xcodebuild -version | sed -n '1p')" = "Xcode 16.4"`,
     "com.apple.CoreSimulator.SimRuntime.iOS-18-5",
     "xcrun simctl bootstatus",
     "npm run test:ios",

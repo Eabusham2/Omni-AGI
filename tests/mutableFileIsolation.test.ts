@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { join, win32 } from "node:path";
+import { backup, DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import * as ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
   snapshotMutableSqliteIsolated,
   writeMutableFileIsolated
 } from "../src/main/mutableFileIsolation";
+import { sqliteBackupFilename } from "../src/main/sqliteFilename";
 
 vi.mock("node:fs/promises", async original => {
   const actual = await original<typeof import("node:fs/promises")>();
@@ -159,12 +160,85 @@ describe("mutable file isolation", () => {
     } finally { database.close(); }
   });
 
-  it.each(["file:owned.sqlite3?immutable=1", "file::memory:?cache=shared", "file:///owned.sqlite3?vfs=win32-none"])(
+  it.each(["file:owned.sqlite3?immutable=1", "file::memory:?cache=shared", "file:///owned.sqlite3?vfs=win32-none", "FILE:///owned.sqlite3?immutable=1"])(
     "does not accept caller-provided SQLite URI options: %s", path => {
       expect(() => privateSqliteFilename(path, "win32")).toThrow(/filesystem path, not a URI/);
       expect(() => privateSqliteFilename(path, "darwin")).toThrow(/filesystem path, not a URI/);
+      expect(() => sqliteBackupFilename(path, "win32", "22.23.3")).toThrow(/filesystem path, not a URI/);
+      expect(() => sqliteBackupFilename(path, "win32", "24.18.0")).toThrow(/filesystem path, not a URI/);
+      expect(() => sqliteBackupFilename(path, "darwin", "22.23.3")).toThrow(/filesystem path, not a URI/);
     }
   );
+
+  it.each([String.raw`C:\owned\teacher's #% & data\workspace.sqlite3`, String.raw`\\server\share\owned\workspace.sqlite3`])(
+    "uses raw extended Windows backup paths on Node 22 and longpath URIs on Node 24: %s", path => {
+      expect(sqliteBackupFilename(path, "win32", "22.23.3")).toBe(win32.toNamespacedPath(path));
+      expect(sqliteBackupFilename(path, "win32", "24.18.0")).toBe(privateSqliteFilename(path, "win32"));
+      expect(sqliteBackupFilename(path, "darwin", "22.23.3")).toBe(path);
+      expect(sqliteBackupFilename(path, "darwin", "24.18.0")).toBe(path);
+    }
+  );
+
+  it("fails closed at Node 22's actual Windows backup VFS bound without limiting Node 24's longpath VFS", () => {
+    const prefix = "C:\\" + Array(16).fill(`owned-${"x".repeat(48)}`).join("\\") + "\\limit";
+    const remaining = 1032 - Buffer.byteLength(win32.toNamespacedPath(prefix), "utf8");
+    const limit = prefix + "x".repeat(remaining);
+    expect(sqliteBackupFilename(limit, "win32", "22.23.3")).toBe(win32.toNamespacedPath(limit));
+    for (const path of [limit + "x", prefix + "é".repeat(Math.ceil(remaining / 2) + 1)]) {
+      expect(() => sqliteBackupFilename(path, "win32", "22.23.3")).toThrow(/exceeds 1032 UTF-8 bytes/);
+      expect(sqliteBackupFilename(path, "win32", "24.18.0")).toBe(privateSqliteFilename(path, "win32"));
+    }
+    expect(() => sqliteBackupFilename("file:owned.sqlite3?vfs=win32-none", "win32", "22.23.3")).toThrow(/not a URI/);
+  });
+
+  it.each([false, true])("materializes the exact incremental backup destination with independent bytes and page progress (deep=%s)", async deep => {
+    const root = await mkdtemp(join(tmpdir(), "omni-incremental-backup-")); roots.push(root);
+    const source = join(root, "source.sqlite3"); let directory = join(root, "copies");
+    if (deep) {
+      const minimumLength = process.platform === "win32" ? 1200 : 320;
+      for (let i = 0; directory.length < minimumLength; i++) directory = join(directory, `owned-${i}-${"x".repeat(48)}`);
+    }
+    await mkdir(directory, { recursive: true });
+    const destination = join(directory, "snapshot's #&%.sqlite3");
+    const writer = new DatabaseSync(privateSqliteFilename(source));
+    try { writer.exec("PRAGMA page_size=512; CREATE TABLE owned(id INTEGER PRIMARY KEY, payload BLOB); WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<64) INSERT INTO owned SELECT id, zeroblob(1024) FROM n;"); }
+    finally { writer.close(); }
+    const before = digest(await readFile(source));
+    const database = new DatabaseSync(privateSqliteFilename(source), { readOnly: true });
+    try {
+      if (deep && process.platform === "win32" && Number(process.versions.node.split(".")[0]) < 24) {
+        expect(() => sqliteBackupFilename(destination)).toThrow(/Node 22 incremental SQLite backup/);
+        expect(await readdir(directory)).toEqual([]); return;
+      }
+      let progressed = 0;
+      await backup(database, sqliteBackupFilename(destination), { rate: 1, progress: () => { progressed++; } });
+      expect(progressed).toBeGreaterThan(0);
+      expect(await readdir(directory)).toEqual(["snapshot's #&%.sqlite3"]);
+      const [original, copy] = await Promise.all([stat(source, { bigint: true }), stat(destination, { bigint: true })]);
+      expect([copy.dev, copy.ino]).not.toEqual([original.dev, original.ino]);
+      const snapshot = new DatabaseSync(privateSqliteFilename(destination));
+      try {
+        expect(snapshot.prepare("SELECT COUNT(*) AS n FROM owned").get()?.n).toBe(64);
+        expect(snapshot.prepare("PRAGMA quick_check").get()?.quick_check).toBe("ok");
+        snapshot.exec("DELETE FROM owned;");
+      } finally { snapshot.close(); }
+      expect(digest(await readFile(source))).toBe(before);
+    } finally { database.close(); }
+  });
+
+  it("keeps incremental backup Stop effective and closes its destination before rejecting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omni-incremental-stop-")); roots.push(root);
+    const source = join(root, "source.sqlite3"), destination = join(root, "stopped.sqlite3");
+    const writer = new DatabaseSync(privateSqliteFilename(source));
+    try { writer.exec("CREATE TABLE owned(payload BLOB); INSERT INTO owned VALUES(zeroblob(65536));"); }
+    finally { writer.close(); }
+    const before = digest(await readFile(source)), stopped = new Error("Stopped between native backup pages");
+    const database = new DatabaseSync(privateSqliteFilename(source), { readOnly: true });
+    try { await expect(backup(database, sqliteBackupFilename(destination), { rate: 1, progress: () => { throw stopped; } })).rejects.toBe(stopped); }
+    finally { database.close(); }
+    const { rm } = await import("node:fs/promises");
+    await rm(destination); expect(digest(await readFile(source))).toBe(before);
+  });
 
   it("routes every main-process SQLite open, backup, and VACUUM target through the standalone filename boundary", async () => {
     const root = fileURLToPath(new URL("../src/main/", import.meta.url));
@@ -175,7 +249,7 @@ describe("mutable file isolation", () => {
         if (entry.isDirectory()) { await visitDirectory(path); continue; }
         if (!entry.name.endsWith(".ts")) continue;
         const source = ts.createSourceFile(path, await readFile(path, "utf8"), ts.ScriptTarget.Latest, true);
-        const adapters = new Set<string>(), nativeConstructors = new Set(["DatabaseSync"]), nativeBackups = new Set<string>(), nativeNamespaces = new Set<string>();
+        const adapters = new Set<string>(), backupAdapters = new Set<string>(), nativeConstructors = new Set(["DatabaseSync"]), nativeBackups = new Set<string>(), nativeNamespaces = new Set<string>();
         const aliases = new Map<string, ts.Expression>();
         for (const statement of source.statements) if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
           const bindings = statement.importClause?.namedBindings;
@@ -184,6 +258,7 @@ describe("mutable file isolation", () => {
           for (const item of bindings.elements) {
             const imported = item.propertyName?.text ?? item.name.text;
             if (statement.moduleSpecifier.text === "./sqliteFilename" && imported === "sqliteFilename") adapters.add(item.name.text);
+            if (statement.moduleSpecifier.text === "./sqliteFilename" && imported === "sqliteBackupFilename") backupAdapters.add(item.name.text);
             if (statement.moduleSpecifier.text === "node:sqlite" && imported === "DatabaseSync") nativeConstructors.add(item.name.text);
             if (statement.moduleSpecifier.text === "node:sqlite" && imported === "backup") nativeBackups.add(item.name.text);
           }
@@ -216,7 +291,7 @@ describe("mutable file isolation", () => {
             }
           }
           const routed = argument && (kind === "VACUUM destination" ? usesAdapter(argument) : ts.isCallExpression(argument) &&
-            ts.isIdentifier(argument.expression) && adapters.has(argument.expression.text));
+            ts.isIdentifier(argument.expression) && (kind === "backup destination" ? backupAdapters : adapters).has(argument.expression.text));
           if (kind && !routed) unchecked.push(`${entry.name}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1} ${kind}`);
           ts.forEachChild(node, inspect);
         }

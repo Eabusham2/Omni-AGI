@@ -28,6 +28,30 @@ function workflowStep(job: string, stepName: string): string {
 }
 
 describe("native release Python compatibility", () => {
+  it("pins source checks and package tooling to the shipped Node24 SQLite behavior", () => {
+    expect(read(".nvmrc").trim()).toBe("24.18.0");
+    for (const name of ["windows", "macos", "linux", "android", "ios", "release", "video-runtime"]) {
+      const source = read(`.github/workflows/${name}.yml`);
+      const setups = source.match(/uses:\s+actions\/setup-node@/g) ?? [];
+      expect(setups.length, name).toBeGreaterThan(0);
+      expect(source.match(/^\s*node-version:\s+24\.18\.0\s*$/gm), name).toHaveLength(setups.length);
+      expect(source, name).not.toMatch(/^\s*node-version:\s+22\s*$/m);
+    }
+  });
+
+  it("forwards the configured iOS test gateway into the inherited native test environment", () => {
+    const scheme = read("mobile/ios/OmniCompanion.xcodeproj/xcshareddata/xcschemes/OmniCompanion.xcscheme");
+    expect(scheme).toMatch(/<TestAction[^>]*shouldUseLaunchSchemeArgsEnv="YES"/);
+    expect(scheme).toContain('<EnvironmentVariable key="OMNI_GATEWAY_ENDPOINT" value="$(OMNI_GATEWAY_ENDPOINT)" isEnabled="YES"/>');
+    expect(read("scripts/test-ios.sh")).toContain('"OMNI_GATEWAY_ENDPOINT=${OMNI_GATEWAY_ENDPOINT:-}"');
+    for (const name of ["ios", "release"]) {
+      expect(read(`.github/workflows/${name}.yml`)).toContain("OMNI_GATEWAY_ENDPOINT: http://127.0.0.1:41838");
+    }
+    const smoke = read("mobile/ios/OmniCompanionUITests/CompanionSmokeTests.swift");
+    expect(smoke).toContain('app.scrollViews["conversationScrollView"]');
+    expect(smoke).toContain("XCTAssertTrue(human.exists)");
+  });
+
   it("requires normal packaged-shell shutdown and never turns exact-child force cleanup into success", async () => {
     vi.useFakeTimers();
     try {

@@ -24,7 +24,7 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 24.18.0
 
       - name: Install hash-locked JavaScript dependencies
         run: npm ci
@@ -32,7 +32,7 @@ jobs:
       - name: Select an available iPhone simulator
         id: simulator
         run: |
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 16.4"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 16.4"
           SIMULATOR_RUNTIME="com.apple.CoreSimulator.SimRuntime.iOS-18-5"
           UDID="$(xcrun simctl list devices available -j | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"].get(sys.argv[1], []); print(next((device["udid"] for device in devices if device.get("isAvailable") and device.get("name", "").startswith("iPhone")), ""))' "$SIMULATOR_RUNTIME")"
           test -n "$UDID"
