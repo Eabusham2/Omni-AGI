@@ -132,3 +132,21 @@ The new dedicated no-engine matrix is authored separately. Its planned
 these six accepted captures and previous bounded component proofs do not by
 themselves close that matrix. Screenshots alone do not establish WCAG
 compliance, runtime effects, neural learning or learned capability.
+
+## First frozen full cohort and compact rail correction
+
+The first full three-preview attempt (82cf5b7) is stopped/incomplete under
+`.runtime/u1-full-82cf5b7394b1.NolKH2`. It must not be reported as a full pass.
+It exposed3px clipping of Trace after hover/focus in compact Spectrum/Expressive
+dark Stacked and Mixed layouts. An independent repro confirmed actual geometry
+and hit-testing, not pixel rounding: button right387 versus nav clip384; the
+center worked but the last3px did not hit the button.
+
+The desktop Expressive gap4 survived the compact generic gap3 selector. After
+all cohort processes stopped, the compact surface-specific override was added
+without changing desktop spacing or relaxing the audit threshold. One new
+source assertion passes. A fresh actual hover/focus repro now shows right384,
+clipped0px, far-edge hits on BUTTON, scrollLeft0 and rail width561 instead of572.
+Root reopened the actual hover screenshot at
+`.runtime/u1-nav-cell258-4FjI3S/trace-hover.png`; raw geometry is in that folder.
+No old cohort row is promoted. The next full traversal uses a new frozen cohort.

@@ -1,5 +1,32 @@
 # Current implementation continuation
 
+### First frozen full-matrix cohort stopped for a precise compact fix
+
+The first three-preview cohort is preserved under
+`.runtime/u1-full-82cf5b7394b1.NolKH2`. It is incomplete/red, not accepted full
+coverage. The exact failure is a3-pixel right edge on Trace in compact
+Spectrum/Expressive dark Stacked/Mixed chat. A separate isolated repro confirms
+the higher-specificity desktop Expressive gap4 survived the compact gap3 rule:
+the rail was572 pixels wide and scroll-snap left the button ending at387
+behind its384 clip. Center activation worked; the edge was genuinely clipped.
+
+Root set the exact cohort STOP marker, interrupted only its three verified
+Playwright CLI processes, and observed all workers terminal before any source
+change. Their incomplete evidence is retained. The correction adds only the
+compact per-surface gap3 override; desktop Expressive gap4 and the audit's2px
+threshold remain. The one new responsive source case passes. After shell
+rebuild, the exact hover/focus repro ends at384 with clipping0; far-edge hit
+tests reach BUTTON, scrollLeft0 and rail width561. Root inspected the saved
+`.runtime/u1-nav-cell258-4FjI3S/trace-hover.png`; no model or cohort page was used.
+Full matrix must run as a new frozen cohort, not mix the old partial rows.
+
+The Windows-only diagnostic changes are being composed in the clean primary
+main checkout, not this frozen UI worktree. Both hosted Windows architectures
+now pass native compilation/packaging and fail health with clean exit0/empty
+stderr. The new distinct stdlib-only frozen transport check precedes the heavy
+worker freeze; opt-in bounded startup labels will classify import versus stdio
+exit. It cannot satisfy or replace real worker health. No new AI is authorized.
+
 ### Composed U1/Ponder corrections and latest hosted boundary —037f3c6
 
 The actual first compact no-engine matrix pilot reached12/12 core routes and

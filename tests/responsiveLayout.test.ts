@@ -43,4 +43,21 @@ describe("responsive application shell", () => {
     expect(e2e).toContain('getByLabel("Workspace")');
     expect(e2e).toContain('getByLabel("Open cortex inspector")');
   });
+
+  it("keeps compact per-surface rail gaps at 3px without changing desktop Expressive spacing", () => {
+    const css = read("src/renderer/src/styles.css");
+    const mediaStart = css.indexOf("@media (max-width: 720px)");
+    expect(mediaStart).toBeGreaterThanOrEqual(0);
+    const opening = css.indexOf("{", mediaStart);
+    let depth = 1, end = opening + 1;
+    while (depth > 0 && end < css.length) {
+      if (css[end] === "{") depth++;
+      if (css[end] === "}") depth--;
+      end++;
+    }
+    expect(depth).toBe(0);
+    const compact = css.slice(opening + 1, end - 1);
+    expect(compact).toMatch(/:root\[data-layout="classic"\] \.workspace-rail nav,\s*:root\[data-layout="expressive"\] \.workspace-rail nav,\s*:root\[data-layout="glass"\] \.workspace-rail nav\s*\{\s*gap:\s*3px;/);
+    expect(css.slice(0, mediaStart)).toMatch(/:root\[data-layout="expressive"\] \.workspace-rail nav\s*\{[^}]*gap:\s*4px;/);
+  });
 });

@@ -13350,6 +13350,14 @@ textarea:focus-visible,
     display: none;
   }
 
+  /* Compact 44px targets share the same rail pitch. Match surface-selector
+     specificity so a desktop gap cannot leave a focused edge behind its clip. */
+  :root[data-layout="classic"] .workspace-rail nav,
+  :root[data-layout="expressive"] .workspace-rail nav,
+  :root[data-layout="glass"] .workspace-rail nav {
+    gap: 3px;
+  }
+
   .workspace-rail nav button {
     flex: 0 0 44px;
     scroll-snap-align: center;
