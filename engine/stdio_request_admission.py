@@ -6,6 +6,10 @@ import json
 import threading
 
 
+CONTROL_WORKING_SET_BYTES = 65536
+SHUTDOWN_FRAME_BYTES = 1024
+
+
 class RequestMemoryPressure(RuntimeError):
     def __init__(self, message, *, status=None, prefix=b""):
         super().__init__(message)
@@ -125,6 +129,55 @@ class _RetainedRequestAllocation:
     def release(self):
         receipt, self.receipt = self.receipt, None
         if receipt is not None: receipt.release()
+
+
+class _PrepaidControlAllocation:
+    """A suballocation already charged to the still-owned control reservation."""
+    def mark_allocated(self, *args): return self
+    def release(self): pass
+
+
+class PreAdmittedShutdownFrame:
+    """One small shutdown frame may use the existing control working set.
+
+    Raw copies and conservative JSON allocation are priced before parsing.
+    This does not admit ordinary work or acquire an unaccounted RAM exception.
+    """
+    def __init__(self, receipt):
+        self.receipt = receipt
+        self.allocation = receipt.retain()
+        self.used = SHUTDOWN_FRAME_BYTES * 2 + 1024
+
+    def reserve(self, size, operation):
+        del operation
+        if type(size) is not int or size < 0 or self.used + size > CONTROL_WORKING_SET_BYTES:
+            raise RequestMemoryPressure("shutdown frame exceeds the pre-admitted control working set")
+        self.used += size
+        return _PrepaidControlAllocation()
+
+    def parse(self, raw):
+        if len(raw) > SHUTDOWN_FRAME_BYTES or not raw.endswith(b"\n"):
+            return None
+        self.reserve(decoded_request_bound(raw), "pre-admitted shutdown JSON")
+        request = json.loads(raw.decode("utf-8"))
+        if (type(request) is not dict or set(request) != {"jsonrpc", "id", "method", "params"}
+                or request["jsonrpc"] != "2.0" or request["method"] != "shutdown"
+                or type(request["params"]) is not dict or request["params"]):
+            return None
+        identity = request["id"]
+        if not ((type(identity) is str and len(identity) <= 128)
+                or (type(identity) is int and identity.bit_length() <= 64)):
+            return None
+        return request
+
+    def transfer(self):
+        allocation, self.allocation = self.allocation, None
+        return allocation
+
+    def close(self):
+        if self.allocation is not None:
+            self.allocation.release()
+            self.allocation = None
 
 
 class AdmittedRequest(dict):

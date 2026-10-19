@@ -283,11 +283,15 @@ describe("structured chat actions", () => {
     const evolution = { start: vi.fn() };
     const controller = new ChatActionController(service, tools, evolution);
     const streamed: string[] = [];
+    const streamedActions: ActionEvent[] = [];
     const phases: ChatStreamEvent[] = [];
     const globalEvents: string[] = [];
     controller.on("event", (event) => globalEvents.push(event.state));
     controller.on("stream", (event) => {
-      if (event.type === "chat-action") streamed.push(event.actionEvent.state);
+      if (event.type === "chat-action") {
+        streamed.push(event.actionEvent.state);
+        streamedActions.push(structuredClone(event.actionEvent));
+      }
       if (event.type === "chat-phase") phases.push(event);
     });
 
@@ -340,7 +344,12 @@ describe("structured chat actions", () => {
     expect(result.actionEvents).toEqual([
       expect.objectContaining({ state: "complete", execution })
     ]);
-    expect(streamed).toEqual(["proposed", "running", "complete"]);
+    // This older inert result has no canonical turn/token binding. Removing
+    // its provisional live anchor is a real metadata update, not a re-run.
+    expect(streamed).toEqual(["proposed", "running", "running", "complete"]);
+    expect(new Set(streamedActions.map(event => event.id)).size).toBe(1);
+    expect(streamedActions[1]?.replyAnchor).toMatchObject({ turnId: "turn-visible-imagination", utf16Offset: 0 });
+    expect(streamedActions[2]).not.toHaveProperty("replyAnchor");
     expect(globalEvents).toEqual([]);
   });
 
@@ -768,8 +777,14 @@ describe("structured chat actions", () => {
       { state: "running", progress: 0.18, label: "Forming temporal latents" },
       { state: "running", progress: 0.72, label: "Decoding frames and sound" },
       { state: "running", progress: 0.9, label: "Refreshing the live preview" },
+      { state: "complete", progress: 0.9, label: "Refreshing the live preview" },
       { state: "complete", progress: 0.9, label: "Refreshing the live preview" }
     ]);
+    const completedActionUpdates = turnStream.flatMap(event => event.type === "chat-action" && event.actionEvent.state === "complete" ? [event.actionEvent] : []);
+    expect(completedActionUpdates).toHaveLength(2);
+    expect(completedActionUpdates[0]?.replyAnchor).toMatchObject({ turnId: "turn-story", utf16Offset: "The scene ".length });
+    expect(completedActionUpdates[1]).not.toHaveProperty("replyAnchor");
+    expect(completedActionUpdates[0]?.id).toBe(completedActionUpdates[1]?.id);
     expect(globalEvents).toEqual([]);
     const serializedTurnStream = JSON.stringify(turnStream);
     expect(serializedTurnStream.match(/c2Vjb25k/g)).toHaveLength(1);
@@ -786,6 +801,41 @@ describe("structured chat actions", () => {
       preview: { revision: 1 },
       execution
     });
+  });
+
+  it("publishes real canonical anchor changes but not unchanged final-only action metadata", async () => {
+    for (const streamed of [false, true]) {
+      const action = { kind: "tool" as const, source: "brain" as const, actionId: "fedcba9876543210fedcba9876543210",
+        toolId: "web.search", action: "search", arguments: { query: "inert anchor fixture" } };
+      const service = { chat: vi.fn(async (_id: string, _input: string, _signal: AbortSignal | undefined,
+        emit: ((event: NeuralChatStreamEvent) => void) | undefined) => {
+        if (streamed) {
+          emit?.({ type: "chat-token", sequence: 0, delta: "Opening. " });
+          emit?.({ type: "chat-action", sequence: 1, actionId: action.actionId, action });
+          emit?.({ type: "chat-token", sequence: 2, delta: "End." });
+        }
+        const result = chatResult("Opening. End.", [action]);
+        result.brainMessage.turnId = "anchor-turn"; result.humanMessage.turnId = "anchor-turn";
+        return result;
+      }), learnStructuredExperience: vi.fn(async () => ({})) };
+      const execution: ToolExecutionResult = { id: "inert-anchor-execution", toolId: action.toolId, action: action.action,
+        state: "complete", startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), output: { results: [] } };
+      const tools = { execute: vi.fn(async () => execution), cancel: vi.fn(() => 0) };
+      const controller = new ChatActionController(service, tools, { start: vi.fn() });
+      const updates: ActionEvent[] = [];
+      controller.on("stream", (event: ChatStreamEvent) => { if (event.type === "chat-action") updates.push(structuredClone(event.actionEvent)); });
+      const actual = await controller.send("inert-anchor-brain", "input", undefined, "anchor-turn");
+      expect(tools.execute).toHaveBeenCalledOnce(); expect(new Set(updates.map(event => event.id)).size).toBe(1);
+      expect(updates).toHaveLength(streamed ? 4 : 3);
+      if (streamed) {
+        expect(updates.some(event => event.replyAnchor?.messageId === undefined && event.replyAnchor?.utf16Offset === 9)).toBe(true);
+        expect(actual.actionEvents?.[0]?.replyAnchor).toMatchObject({ turnId: "anchor-turn", messageId: "brain", utf16Offset: 9 });
+        expect(updates.filter((event, index) => event.replyAnchor?.messageId && updates[index - 1]?.replyAnchor?.messageId !== event.replyAnchor.messageId)).toHaveLength(1);
+      } else {
+        expect(updates.every(event => event.replyAnchor === undefined)).toBe(true);
+        expect(actual.actionEvents?.[0]).not.toHaveProperty("replyAnchor");
+      }
+    }
   });
 
   it("finalizes a streamed inline imagination when the worker turn fails", async () => {

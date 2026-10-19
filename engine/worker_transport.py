@@ -7,6 +7,7 @@ import threading
 import traceback
 from collections import deque
 from stdio_request_admission import (AdmittedRequest, RequestAllocationReceipt, RequestMemoryPressure,
+    CONTROL_WORKING_SET_BYTES, SHUTDOWN_FRAME_BYTES, PreAdmittedShutdownFrame,
     decoded_request_bound, request_id_hint, reserve_request_bytes)
 
 
@@ -135,10 +136,13 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
             receipt.release()
 
     def reject_frame(prefix, error):
+        cause_class = type(error.__cause__).__name__ if error.__cause__ is not None else type(error).__name__
+        if not cause_class.isidentifier() or len(cause_class) > 80: cause_class = "Exception"
         send({"jsonrpc": "2.0", "id": request_id_hint(prefix), "error": {
             "code": -32010, "message": str(error), "data": {"resourcePaused": True,
                 "recoverable": True, "frameRejected": True, "inputTruncated": False,
-                "workerRestartRequired": False, "status": getattr(error, "status", {})}}})
+                "workerRestartRequired": False, "causeClass": cause_class,
+                "status": getattr(error, "status", {})}}})
 
     def drain_rejected(prefix=b""):
         discard = getattr(stream, "discard_line", None)
@@ -151,15 +155,58 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
 
     def read_requests():
         drain_lease = None
+        drain_receipt = None
+
+        def reserved_shutdown(prefix=b"", complete=False):
+            if drain_receipt is None or len(prefix) > SHUTDOWN_FRAME_BYTES:
+                return None
+            # Only this bounded terminal control may borrow the already-held
+            # working set; ordinary frames keep their normal allocation gate.
+            budget = PreAdmittedShutdownFrame(drain_receipt)
+            raw = prefix
+            try:
+                if not complete and not raw.endswith(b"\n"):
+                    remaining = SHUTDOWN_FRAME_BYTES - len(raw)
+                    if isinstance(stream, ProtocolLineReader):
+                        previous_reserve, previous_line = stream.reserve_memory, stream.line_lease
+                        try:
+                            # Charge these bounded reads/copies to the held
+                            # control budget, not an unaccounted None callback.
+                            stream.reserve_memory = budget.reserve
+                            raw += stream.readline(remaining)
+                        finally:
+                            stream.reserve_memory, stream.line_lease = previous_reserve, previous_line
+                    else:
+                        budget.reserve(remaining * 2 + 256, "pre-admitted shutdown raw read")
+                        raw += stream.readline(remaining)
+                complete = complete or not raw or raw.endswith(b"\n")
+                request = budget.parse(raw) if complete else None
+                if request is not None:
+                    return request, budget.transfer(), raw, complete
+                return None, None, raw, complete
+            except (RequestMemoryPressure, ValueError, UnicodeError, RecursionError, MemoryError, OverflowError):
+                return None, None, raw, complete
+            finally:
+                budget.close()
+
+        def queue_shutdown(attempt):
+            if attempt is None or attempt[0] is None:
+                return False
+            request, allocation, _raw, _complete = attempt
+            requests.put((AdmittedRequest(request, drain_receipt), allocation))
+            return True
+
         try:
             # Small fixed control/drain working set is reserved before normal
             # work starts, so a rejected large frame never disables its suffix.
             while worker.running and drain_lease is None and reserve_request_memory is not None:
                 try:
-                    drain_lease = reserve_request_bytes(reserve_request_memory, 65536, "stdio control/drain safety working set")
+                    drain_lease = reserve_request_bytes(reserve_request_memory, CONTROL_WORKING_SET_BYTES, "stdio control/drain safety working set")
                 except RequestMemoryPressure as error:
                     reject_frame(b"", error)
                     threading.Event().wait(0.25)
+            if drain_lease is not None:
+                drain_receipt = RequestAllocationReceipt([drain_lease])
             while worker.running:
                 available = available_memory()
                 limit = max(1, available // 8) if available is not None else None
@@ -170,13 +217,23 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
                 try:
                     raw = stream.readline(limit + 1) if limit is not None else stream.readline()
                 except (RequestMemoryPressure, MemoryError, OverflowError) as error:
-                    prefix = drain_rejected()
+                    attempt = reserved_shutdown()
+                    if queue_shutdown(attempt): return
+                    if attempt is not None and not attempt[2]: break
+                    if attempt is None: prefix = drain_rejected()
+                    elif attempt[3]: prefix = attempt[2][:4096]
+                    else: prefix = drain_rejected(attempt[2][:4096])
                     reject_frame(prefix, error); continue
                 if not raw:
                     break
                 raw_lease = getattr(stream, "line_lease", None)
                 if isinstance(stream, ProtocolLineReader): stream.line_lease = None
                 if limit is not None and len(raw) > limit:
+                    attempt = reserved_shutdown(raw, raw.endswith(b"\n"))
+                    if queue_shutdown(attempt):
+                        if raw_lease is not None: RequestAllocationReceipt([raw_lease]).release()
+                        return
+                    if attempt is not None: raw = attempt[2]
                     prefix = raw[:4096] if raw.endswith(b"\n") else drain_rejected(raw[:4096])
                     reject_frame(prefix, RequestMemoryPressure("request frame exceeds the selected-budget protocol envelope"))
                     if raw_lease is not None: RequestAllocationReceipt([raw_lease]).release()
@@ -186,6 +243,10 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
                     decode_lease = reserve_request_bytes(reserve_request_memory, decoded_request_bound(raw), "stdio decoded request")
                     request = json.loads(raw.decode("utf-8"))
                 except RequestMemoryPressure as error:
+                    attempt = reserved_shutdown(raw, True)
+                    if queue_shutdown(attempt):
+                        if raw_lease is not None: RequestAllocationReceipt([raw_lease]).release()
+                        return
                     reject_frame(raw[:4096], error)
                     if raw_lease is not None: RequestAllocationReceipt([raw_lease]).release()
                     continue
@@ -216,7 +277,7 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
         finally:
             retire_private = getattr(worker, "retire_private_native_work", None)
             if callable(retire_private): retire_private()
-            if drain_lease is not None: drain_lease.release()
+            if drain_receipt is not None: drain_receipt.release()
             if worker.running: requests.put(eof)
             else: release_queued()
 

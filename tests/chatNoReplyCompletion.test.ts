@@ -118,7 +118,8 @@ describe("receipt-bound ordinary no-reply completion", () => {
     const bubble = source.slice(source.indexOf("function MessageBubble("), source.indexOf("function CortexOrb("));
     expect(bubble).toContain('const noReply = isBrain && deliveryState === "no-reply";');
     expect(bubble).toContain("chatNoReplyPresentation(message)");
-    expect(bubble).toContain("{noReply ? null : <div className=\"message__content\">{message.content}</div>}");
+    expect(bubble).toContain("{noReply ? null : <div className=\"message__content\">{contentProjection ?? message.content}</div>}");
+    expect(bubble).toContain("contentProjection?: ReactNode;");
     expect(bubble).toContain("!noReply && Boolean(message.content.trim())");
     expect(bubble).toContain("{message.content ? <button aria-label=\"Copy response\"");
   });

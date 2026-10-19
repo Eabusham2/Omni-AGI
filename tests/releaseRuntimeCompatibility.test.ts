@@ -28,6 +28,25 @@ function workflowStep(job: string, stepName: string): string {
 }
 
 describe("native release Python compatibility", () => {
+  it("restricts allocation-failure package diagnostics to approved numeric boolean and cause-class fields", async () => {
+    const { packagedWorkerRpcDiagnostic } = await import(pathToFileURL(resolve("scripts/packaged-worker-health.mjs")).href) as {
+      packagedWorkerRpcDiagnostic(error: unknown): unknown;
+    };
+    const diagnostic = packagedWorkerRpcDiagnostic({ code: -32010, message: "OWNED_PRIVATE_MESSAGE",
+      data: { causeClass: "OperationalError", resourcePaused: true, recoverable: true,
+        privatePath: "OWNED_PRIVATE_PATH", status: { memoryPressure: false, ramAdmissionVerified: true,
+          systemRamBudgetBytes: 8192, admissionResidentMemoryBytes: 4096, availableMemoryBytes: NaN,
+          privatePath: "OWNED_PRIVATE_PATH", sharedQuota: { ramEscrowBytes: 64, privatePath: "OWNED_PRIVATE_PATH" } } } });
+    expect(diagnostic).toEqual({ code: -32010, causeClass: "OperationalError", resourcePaused: true, recoverable: true,
+      status: { memoryPressure: false, ramAdmissionVerified: true, systemRamBudgetBytes: 8192,
+        admissionResidentMemoryBytes: 4096, ramEscrowBytes: 64 } });
+    expect(JSON.stringify(diagnostic)).not.toContain("OWNED_PRIVATE");
+    expect(packagedWorkerRpcDiagnostic({ code: "private", data: { causeClass: "OWNED_PRIVATE_CLASS", status: { ramReserveBytes: "private" } } }))
+      .toEqual({ code: null, causeClass: "unclassified", status: {} });
+    expect(read("scripts/smoke-engine.mjs")).toContain("packagedWorkerRpcDiagnostic(message.error)");
+    expect(read("scripts/smoke-engine.mjs")).not.toContain("${message.error.message}");
+  });
+
   it("pins source checks and package tooling to the shipped Node24 SQLite behavior", () => {
     expect(read(".nvmrc").trim()).toBe("24.18.0");
     for (const name of ["windows", "macos", "linux", "android", "ios", "release", "video-runtime"]) {

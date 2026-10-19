@@ -1273,9 +1273,10 @@ export class ChatActionController extends EventEmitter {
       await this.service.recordConversationActions?.(brainId, events);
     };
     const bindReplyAnchors = (result: ChatResult): void => {
+      const before = new Map(events.map(event => [event, JSON.stringify([event.replyAnchor, event.updatedAt])]));
       publicReplyAnchors.bind(events, result.brainMessage, result.publicTextBinding);
       for (const event of events) {
-        this.publishAction(turn, event);
+        if (before.get(event) !== JSON.stringify([event.replyAnchor, event.updatedAt])) this.publishAction(turn, event);
       }
     };
     const reportValue = (value: PonderReportAccumulator, state: "complete" | "partial", textSha256?: string): PonderSelfReport =>

@@ -23,3 +23,28 @@ export function packagedWorkerHealthDiagnostic(health, expectedPlatform) {
     nativeKernelFailure: nativeError
   };
 }
+
+export function packagedWorkerRpcDiagnostic(error) {
+  const data = error?.data, status = data?.status;
+  const causes = new Set(["RequestMemoryPressure", "NeuralStateResourcePause", "SharedQuotaPause",
+    "MemoryError", "OverflowError", "OperationalError", "DatabaseError", "IntegrityError",
+    "OSError", "PermissionError", "TimeoutError", "RuntimeError", "ValueError"]);
+  const result = { code: Number.isSafeInteger(error?.code) ? error.code : null,
+    causeClass: causes.has(data?.causeClass) ? data.causeClass : "unclassified" };
+  for (const key of ["resourcePaused", "recoverable", "frameRejected", "inputTruncated", "workerRestartRequired"]) {
+    if (typeof data?.[key] === "boolean") result[key] = data[key];
+  }
+  const numeric = {};
+  for (const key of ["systemRamBudgetBytes", "admissionResidentMemoryBytes", "availableMemoryBytes",
+    "ramReserveBytes", "managedMemorySampleDurationMs", "managedMemorySampleAgeSeconds"]) {
+    if (typeof status?.[key] === "number" && Number.isFinite(status[key]) && status[key] >= 0) numeric[key] = status[key];
+  }
+  for (const key of ["memoryPressure", "ramAdmissionVerified", "managedMemorySampleCached"]) {
+    if (typeof status?.[key] === "boolean") numeric[key] = status[key];
+  }
+  for (const key of ["ramEscrowBytes", "globalRamCeilingBytes"]) {
+    const value = status?.sharedQuota?.[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) numeric[key] = value;
+  }
+  return { ...result, status: numeric };
+}

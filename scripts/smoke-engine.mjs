@@ -4,7 +4,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { packagedWorkerHealthDiagnostic } from "./packaged-worker-health.mjs";
+import { packagedWorkerHealthDiagnostic, packagedWorkerRpcDiagnostic } from "./packaged-worker-health.mjs";
 
 function option(name) {
   const inline = process.argv.find((entry) => entry.startsWith(`${name}=`));
@@ -86,7 +86,7 @@ async function rpc(id, method, params = {}) {
     }
     if (message.id !== id) continue;
     if (message.error) {
-      throw new Error(`Packaged worker RPC ${method} failed: ${message.error.message}`);
+      throw new Error(`Packaged worker RPC ${method} failed: ${JSON.stringify(packagedWorkerRpcDiagnostic(message.error))}`);
     }
     return message.result;
   }
