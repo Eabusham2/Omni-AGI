@@ -274,6 +274,36 @@ class NativeKernelPackagingIntegrityCases(unittest.TestCase):
         self.assertEqual(build.count('--runtime-hook (Join-Path $RepoRoot "scripts\\pyinstaller-worker-startup-hook.py")'), 2)
         self.assertIn('if ($HealthOnly) {\n  $StartInfo.Environment["OMNI_WORKER_STARTUP_DIAGNOSTICS"] = "1"', smoke)
 
+    def test_windows_smoke_uses_bom_free_bytes_and_framework_cleanup_preserves_original_failure(self):
+        smoke = (ROOT / "scripts/smoke-engine.ps1").read_text()
+        self.assertIn('[System.Text.UTF8Encoding]::new($false)', smoke)
+        self.assertIn('$InputEncodingProperty = $StartInfo.GetType().GetProperty("StandardInputEncoding")', smoke)
+        modern = smoke.split('if ($null -ne $InputEncodingProperty) {', 1)[1].split('}', 1)[0]
+        self.assertIn('$StartInfo.StandardInputEncoding = $WireEncoding', modern)
+        framework = smoke.split('if ($null -eq $InputEncodingProperty) {', 1)[1].split('if (-not $Worker.Start())', 1)[0]
+        self.assertIn('$PreviousInputEncoding.GetPreamble().Length -gt 0', framework)
+        self.assertIn('[Console]::InputEncoding = $WireEncoding', framework)
+        self.assertIn('finally {\n  if ($null -ne $RestoreInputEncoding) { [Console]::InputEncoding = $RestoreInputEncoding }', smoke)
+        self.assertIn('$WireEncoding.GetBytes($Request + "`n")', smoke)
+        self.assertIn('$Worker.StandardInput.BaseStream.Write($RequestBytes, 0, $RequestBytes.Length)', smoke)
+        self.assertNotIn('$Worker.StandardInput.WriteLine(', smoke)
+        correlation = smoke.index('if ($Message.id -ne $Id -and $null -ne $Message.error)')
+        self.assertLess(correlation, smoke.index('if ($Message.id -ne $Id)'))
+        self.assertIn('throw "Packaged worker returned an uncorrelated protocol error during $Method."', smoke)
+        cleanup = smoke.split('function Stop-OwnedWorkerForFailure {', 1)[1].split('function Invoke-WorkerRpc', 1)[0]
+        self.assertIn('GetMethod("Kill", [type[]]@([bool]))', cleanup)
+        self.assertIn('if ($null -ne $KillTreeMethod) { $Worker.Kill($true) }\n  else { $Worker.Kill() }', cleanup)
+        self.assertIn('$Worker.WaitForExit(5000)', cleanup)
+        failure = smoke.split('$PrimaryFailure = $_', 1)[1]
+        self.assertLess(failure.index('Stop-OwnedWorkerForFailure'), failure.index('Get-WorkerExitDiagnostic'))
+        self.assertIn('catch { $CleanupFailureClass = $_.Exception.GetType().Name }', failure)
+        self.assertIn('throw $PrimaryFailure', failure)
+        self.assertNotIn('$Worker.WaitForExit()', smoke)
+        self.assertNotIn('Get-Process', cleanup)
+        packet = '{"jsonrpc":"2.0","id":"health","method":"health","params":{}}\n'.encode("utf-8")
+        self.assertEqual(json.loads(packet.decode("utf-8"))["method"], "health")
+        with self.assertRaises(ValueError): json.loads((b"\xef\xbb\xbf" + packet).decode("utf-8"))
+
     def fixture(self):
         temporary = TemporaryDirectory(prefix="omni-native-packaging-contract-")
         self.addCleanup(temporary.cleanup)

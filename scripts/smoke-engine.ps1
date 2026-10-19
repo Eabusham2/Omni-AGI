@@ -32,6 +32,13 @@ $StartInfo.CreateNoWindow = $true
 $StartInfo.RedirectStandardInput = $true
 $StartInfo.RedirectStandardOutput = $true
 $StartInfo.RedirectStandardError = $true
+$WireEncoding = [System.Text.UTF8Encoding]::new($false)
+$StartInfo.StandardOutputEncoding = $WireEncoding
+$StartInfo.StandardErrorEncoding = $WireEncoding
+$InputEncodingProperty = $StartInfo.GetType().GetProperty("StandardInputEncoding")
+if ($null -ne $InputEncodingProperty) {
+  $StartInfo.StandardInputEncoding = $WireEncoding
+}
 $StartInfo.Environment["PYTHONUNBUFFERED"] = "1"
 $StartInfo.Environment["OMNI_PROTOCOL_VERSION"] = "1"
 if ($HealthOnly) {
@@ -40,8 +47,23 @@ if ($HealthOnly) {
 
 $Worker = [System.Diagnostics.Process]::new()
 $Worker.StartInfo = $StartInfo
-if (-not $Worker.Start()) {
-  throw "Failed to start packaged OmniCortex worker at $Executable"
+$RestoreInputEncoding = $null
+try {
+  if ($null -eq $InputEncodingProperty) {
+    # Framework's Process creates an AutoFlush StreamWriter using the console
+    # encoding. Suppress its preamble before creation, then restore the host.
+    $PreviousInputEncoding = [Console]::InputEncoding
+    if ($PreviousInputEncoding.GetPreamble().Length -gt 0) {
+      [Console]::InputEncoding = $WireEncoding
+      $RestoreInputEncoding = $PreviousInputEncoding
+    }
+  }
+  if (-not $Worker.Start()) {
+    throw "Failed to start packaged OmniCortex worker at $Executable"
+  }
+}
+finally {
+  if ($null -ne $RestoreInputEncoding) { [Console]::InputEncoding = $RestoreInputEncoding }
 }
 $WorkerErrorReadTask = $Worker.StandardError.ReadToEndAsync()
 
@@ -66,6 +88,18 @@ function Get-WorkerExitDiagnostic {
   return "workerExited=$Exited; exitCode=$Code; exitHex=$Hex; stderrComplete=$StderrComplete`n$DiagnosticError"
 }
 
+function Stop-OwnedWorkerForFailure {
+  if ($Worker.HasExited) { return }
+  # Kill(bool) is absent on Windows PowerShell's .NET Framework. Never fall
+  # back to a process-name/tree search or let cleanup replace the RPC failure.
+  $KillTreeMethod = $Worker.GetType().GetMethod("Kill", [type[]]@([bool]))
+  if ($null -ne $KillTreeMethod) { $Worker.Kill($true) }
+  else { $Worker.Kill() }
+  if (-not $Worker.WaitForExit(5000)) {
+    throw "Exact packaged worker did not exit during bounded failure cleanup."
+  }
+}
+
 function Invoke-WorkerRpc {
   param(
     [Parameter(Mandatory = $true)]
@@ -82,8 +116,10 @@ function Invoke-WorkerRpc {
     method = $Method
     params = $Params
   } | ConvertTo-Json -Compress -Depth 30
-  $Worker.StandardInput.WriteLine($Request)
-  $Worker.StandardInput.Flush()
+  # Write canonical UTF-8 bytes independently of Framework console codepages.
+  $RequestBytes = $WireEncoding.GetBytes($Request + "`n")
+  $Worker.StandardInput.BaseStream.Write($RequestBytes, 0, $RequestBytes.Length)
+  $Worker.StandardInput.BaseStream.Flush()
 
   while ($true) {
     $ReadTask = $Worker.StandardOutput.ReadLineAsync()
@@ -95,6 +131,9 @@ function Invoke-WorkerRpc {
       throw "Packaged worker closed stdout during $Method. $(Get-WorkerExitDiagnostic)"
     }
     $Message = $Line | ConvertFrom-Json
+    if ($Message.id -ne $Id -and $null -ne $Message.error) {
+      throw "Packaged worker returned an uncorrelated protocol error during $Method."
+    }
     if ($Message.id -ne $Id) {
       continue
     }
@@ -311,10 +350,17 @@ try {
     generatedModalities = $GeneratedModalities
   } | ConvertTo-Json -Depth 10
 }
+catch {
+  $PrimaryFailure = $_
+  $FailureCleanupAttempted = -not $Worker.HasExited
+  $CleanupFailureClass = "none"
+  try { Stop-OwnedWorkerForFailure }
+  catch { $CleanupFailureClass = $_.Exception.GetType().Name }
+  try { $FailureDiagnostic = Get-WorkerExitDiagnostic }
+  catch { $FailureDiagnostic = "diagnosticFailureClass=" + $_.Exception.GetType().Name }
+  Write-Host "Packaged worker failure diagnostics: failureCleanupAttempted=$FailureCleanupAttempted; cleanupFailureClass=$CleanupFailureClass`n$FailureDiagnostic"
+  throw $PrimaryFailure
+}
 finally {
-  if (-not $Worker.HasExited) {
-    $Worker.Kill($true)
-    $Worker.WaitForExit()
-  }
   $Worker.Dispose()
 }
