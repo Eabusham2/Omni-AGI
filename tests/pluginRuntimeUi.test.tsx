@@ -106,7 +106,7 @@ describe("plugin feature runtime UI boundaries", () => {
     expect(ownedPluginRuntimeContributions("brain-a", "brain-a", [previous])).toEqual([previous]);
   });
 
-  it("keeps raw request identities collapsed and uses ordinary grouped action buttons", () => {
+  it("keeps raw request identities collapsed and expands menu actions through a native disclosure", () => {
     const session = { format: "omni-plugin-runtime-session" as const, version: 1 as const, brainId: "brain-a", pluginId: entry.pluginId,
       contentSha256: HASH, moduleId: module.id, sessionId: "session-visible-only-in-details", catalogRevision: 7,
       instanceRevision: 9, state: "active" as const, startedAt: "2026-10-15T00:00:00.000Z" };
@@ -124,6 +124,7 @@ describe("plugin feature runtime UI boundaries", () => {
     const menuHtml = renderToStaticMarkup(<PluginRuntimeContributionItems slot="tools"
       values={[contribution({ kind: "menu", slot: "tools" })]} pending="" visibleError="" onInvoke={vi.fn()} />);
     expect(menuHtml).toContain('role="group"');
+    expect(menuHtml).toContain('<details class="plugin-runtime-menu"><summary>Plugin actions</summary>');
     expect(menuHtml).toContain('<button type="button"');
     expect(menuHtml).not.toContain('role="menu"');
     expect(menuHtml).not.toContain('role="menuitem"');

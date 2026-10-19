@@ -10,7 +10,9 @@ import type {
   ChatTaskAttachmentKind,
   ChatTaskAttachmentReadResult,
   ChatTaskAttachmentResolved,
-  ChatTaskAttachmentState
+  ChatTaskAttachmentState,
+  ChatTaskAttachmentSelection,
+  TaskFolderTraversal
 } from "../shared/taskAttachments";
 import { TASK_ATTACHMENT_FORMAT, TASK_ATTACHMENT_VERSION } from "../shared/taskAttachments";
 import type { ExperienceUploadKind } from "../shared/uploadSupport";
@@ -19,13 +21,14 @@ import { TaskAttachmentReadVerifier, taskAttachmentFileIdentity } from "./taskAt
 import type { WebImageDownload } from "../shared/webImages";
 import { checkedWebImageDownload } from "./webImageReferences";
 import { sqliteFilename } from "./sqliteFilename";
+import { buildTaskFolderContainer, readTaskFolderAttachment, TASK_FOLDER_MIME } from "./taskFolderContainer";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const MIME = /^[a-z0-9][a-z0-9.+-]{0,80}\/[a-z0-9][a-z0-9.+-]{0,80}$/;
 export const TASK_ATTACHMENT_DATABASE = "registry.sqlite3";
 
 export interface TaskAttachmentPrivateSource {
-  kind: "local-file" | "captured-audio" | "web-image";
+  kind: "local-file" | "local-folder" | "captured-audio" | "web-image";
   originalPath?: string;
   captureSessionId?: string;
   utteranceId?: string;
@@ -124,7 +127,7 @@ function inferredKind(mimeType: string): ChatTaskAttachmentKind {
 }
 
 export function validatedTaskAttachmentSource(value: TaskAttachmentPrivateSource): TaskAttachmentPrivateSource {
-  if (!value || !["local-file", "captured-audio", "web-image"].includes(value.kind) ||
+  if (!value || !["local-file", "local-folder", "captured-audio", "web-image"].includes(value.kind) ||
       typeof value.selectedAt !== "string" || !Number.isFinite(Date.parse(value.selectedAt)) ||
       (value.originalPath !== undefined && (typeof value.originalPath !== "string" || value.originalPath.includes("\0"))) ||
       (value.captureSessionId !== undefined && !SAFE_ID.test(value.captureSessionId)) ||
@@ -201,9 +204,9 @@ async function exists(path: string): Promise<boolean> {
   try { await access(path); return true; } catch { return false; }
 }
 
-async function fileSha256(path: string): Promise<string> {
+async function fileSha256(path: string, signal?: AbortSignal): Promise<string> {
   const digest = createHash("sha256");
-  for await (const chunk of createReadStream(path)) digest.update(chunk);
+  for await (const chunk of createReadStream(path, { signal })) digest.update(chunk);
   return digest.digest("hex");
 }
 
@@ -212,7 +215,8 @@ async function syncFile(path: string): Promise<void> {
   try { await file.sync(); } finally { await file.close(); }
 }
 
-async function promoteContentAddressed(temporary: string, destination: string, expectedSha256: string, expectedBytes: number): Promise<void> {
+async function promoteContentAddressed(temporary: string, destination: string, expectedSha256: string, expectedBytes: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   await mkdir(dirname(destination), { recursive: true });
   try {
     await link(temporary, destination);
@@ -225,7 +229,7 @@ async function promoteContentAddressed(temporary: string, destination: string, e
   }
   await syncFile(destination);
   const info = await lstat(destination);
-  if (!info.isFile() || info.isSymbolicLink() || info.size !== expectedBytes || await fileSha256(destination) !== expectedSha256) {
+  if (!info.isFile() || info.isSymbolicLink() || info.size !== expectedBytes || await fileSha256(destination, signal) !== expectedSha256) {
     throw new Error("Content-addressed attachment promotion failed integrity validation.");
   }
 }
@@ -389,15 +393,38 @@ export class TaskAttachmentStore {
     });
   }
 
-  async stagePaths(requestId: string, sources: readonly TaskAttachmentStagePath[], selection: ExperienceUploadKind, signal?: AbortSignal): Promise<ChatTaskAttachmentHandle[]> {
+  async stagePaths(requestId: string, sources: readonly TaskAttachmentStagePath[], selection: ChatTaskAttachmentSelection, signal?: AbortSignal,
+    onProgress?: (progress: Readonly<TaskFolderTraversal>) => void): Promise<ChatTaskAttachmentHandle[]> {
     await this.initialize(); requireId(requestId, "attachment request id");
     if (!sources.length) return [];
-    const selectedKind = kindForSelection(selection), prepared = [] as Array<{
+    const selectedKind = selection === "folder" ? undefined : kindForSelection(selection), prepared = [] as Array<{
       contentSha256: string; bytes: number; mimeType: string; kind: ChatTaskAttachmentKind;
       displayName: string; source: TaskAttachmentPrivateSource;
     }>;
     try {
       for (const source of sources) {
+        if (selection === "folder") {
+          const temporary = join(this.blobs, `.folder-stage-${randomUUID()}.sqlite3`);
+          try {
+            this.readVerifier.reserveMemory(4 * 1024 * 1024, "Folder staging SQLite cache and streaming buffer");
+            let lastProgress = -Infinity;
+            await buildTaskFolderContainer(source.path, temporary, inferredMimeType, signal, progress => {
+              const now = performance.now();
+              if (progress.complete || now - lastProgress >= 100) { lastProgress = now; onProgress?.(progress); }
+            });
+            signal?.throwIfAborted();
+            const info = await lstat(temporary);
+            if (!info.isFile() || info.isSymbolicLink() || !Number.isSafeInteger(info.size)) throw new Error("Owned folder container changed before publication.");
+            const contentSha256 = await fileSha256(temporary, signal);
+            // This newly created, closed private container has no external
+            // writer. Promote it directly; do not copy a whole folder twice.
+            prepared.push({ contentSha256, bytes: info.size,
+              mimeType: TASK_FOLDER_MIME, kind: "file", displayName: safeName(source.displayName ?? (basename(resolve(source.path)) || "Folder")),
+              source: validatedTaskAttachmentSource({ kind: "local-folder", originalPath: resolve(source.path), selectedAt: new Date().toISOString() }) });
+            await promoteContentAddressed(temporary, join(this.blobs, `${contentSha256}.data`), contentSha256, info.size, signal);
+          } finally { await rm(temporary, { force: true }).catch(() => undefined); }
+          continue;
+        }
         const materialized = await this.materializePath(source.path, signal);
         const mimeType = safeMimeType(source.mimeType ?? inferredMimeType(materialized.actual));
         prepared.push({ contentSha256: materialized.sha256, bytes: materialized.bytes, mimeType,
@@ -598,13 +625,20 @@ export class TaskAttachmentStore {
     return this.withVerifiedRead(turnId, attachmentId, authority, async () => authority.descriptor, signal);
   }
 
-  async readForTurn(turnId: string, attachmentId: string, offset = 0, maximumBytes = 64 * 1024, signal?: AbortSignal): Promise<ChatTaskAttachmentReadResult> {
+  async readForTurn(turnId: string, attachmentId: string, offset = 0, maximumBytes = 64 * 1024, signal?: AbortSignal, entryPath?: string): Promise<ChatTaskAttachmentReadResult> {
     signal?.throwIfAborted(); await this.initialize(); requireId(turnId, "attachment turn id"); requireId(attachmentId, "attachment id");
     const authority = await this.readAuthority(turnId, attachmentId), descriptor = authority.descriptor;
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > descriptor.bytes ||
         !Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || maximumBytes > 1024 * 1024) {
       throw new Error("Attachment read range is invalid.");
     }
+    if (descriptor.mimeType === TASK_FOLDER_MIME) {
+      this.readVerifier.reserveMemory(8 * maximumBytes + 4 * 1024 * 1024, "Saved folder page and SQLite cache");
+      return this.withVerifiedRead(turnId, attachmentId, authority, opened => readTaskFolderAttachment(
+        handle(authority.row), join(this.blobs, `${authority.row.content_sha256}.data`), opened,
+        offset, maximumBytes, entryPath, signal), signal);
+    }
+    if (entryPath !== undefined) throw new Error("Entry paths are available only inside a saved folder attachment.");
     const buffer = await this.withVerifiedRead(turnId, attachmentId, authority, async file => {
       const length = Math.min(maximumBytes, descriptor.bytes - offset);
       this.readVerifier.reserveMemory(8 * length + 64 * 1024, "Task attachment page and encoding buffer");

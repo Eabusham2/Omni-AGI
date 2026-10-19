@@ -175,19 +175,15 @@ describe("stable brain inspection service", () => {
       "utf8"
     );
 
-    expect(renderer).toContain("const visibleGraphNodes = useMemo<SubstrateMapNode[]>");
-    expect(renderer).toContain("...(pathwayPage?.synapses ?? [])");
-    expect(renderer).toContain(
-      "selectedMapNode?.clusterCount || selectedMapNode?.activityOnly"
-    );
-    expect(renderer).toContain("A live STDP/activation update invalidates continuation cursors");
-    expect(renderer).toContain("Latest change on page");
-    expect(renderer.match(/persistedSubstrateOverview\(brain\.id\)/g)).toHaveLength(3);
-    expect(renderer).toContain("Loading detailed map…");
-    expect(renderer).toContain("persistedOverview.totals.neurons");
-    expect(renderer).toContain("overview.parameterAccounting");
-    expect(renderer).toContain("overview.latestCompletedCoverage");
-    expect(renderer).toContain("Completed dataset traversal");
+    const map = readFileSync(resolve(process.cwd(), "src/renderer/src/WholeBrainMap.tsx"), "utf8");
+    expect(renderer.includes("<WholeBrainMap brainId={brain.id}")).toBe(true);
+    expect(renderer.includes("api={window.omni?.wholeBrainInspection}")).toBe(true);
+    expect(map.includes("projectWholeBrainInspection({ pages, router: activity })")).toBe(true);
+    expect(map.includes("sameWholeBrainSnapshot(anchor, value)")).toBe(true);
+    expect(map.includes("wholeBrainMapNextQuery")).toBe(true);
+    expect(map.includes("effectiveContribution: edge.effectiveWeight * edge.strength")).toBe(true);
+    expect(renderer.includes("overview?.latestCompletedCoverage")).toBe(true);
+    expect(renderer.includes("Dataset traversal complete")).toBe(true);
     expect(renderer).toContain("brain.substrateTotals?.assemblies ?? brain.concepts");
     expect(renderer).toContain("persistedConnections: brain.substrateTotals?.synapses");
     expect(renderer).toContain("mirroredConnections: brain.synapses");
@@ -197,7 +193,6 @@ describe("stable brain inspection service", () => {
     );
     expect(renderer).toContain("storage-operation-card");
     expect(renderer).toContain("Cancel {storageOperation.kind}");
-    expect(renderer).toContain("}, [brain.id, brain.updatedAt]);");
     expect(renderer).not.toContain("[brain.id, brain.updatedAt, sending]");
   });
 

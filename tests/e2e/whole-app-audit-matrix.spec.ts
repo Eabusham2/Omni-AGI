@@ -4,8 +4,11 @@ import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { _electron as electron, expect, test, type ElectronApplication, type Locator, type Page } from "@playwright/test";
 import type { WholeAppCompositionControl } from "./whole-app-audit-contract";
+import auditScope from "./whole-app-audit-scope.json";
+import { assertAuditResources, AuditResourcePauseError, type AuditResourceSnapshot } from "./whole-app-audit-resources.mjs";
 
 /**
  * Missing U1 composition coverage, not a replacement for the closed 11 UI tests.
@@ -15,7 +18,8 @@ import type { WholeAppCompositionControl } from "./whole-app-audit-contract";
  *
  * Default traversal is the full Cartesian product, not only the four paired
  * appearance packs: 4 palettes * 4 surfaces * 2 schemes * 4 arrangements *
- * 3 sizes = 384 cells, and 12 actual workspace routes = 4,608 route visits.
+ * 3 sizes = 384 cells. Five routes plus 12 design states give 6,528 core
+ * visits; 25 typed event/composition states give 9,600 additional visits.
  * A shard/range is useful for bounded runs but never reports full coverage.
  *
  * Opt in with OMNI_WHOLE_APP_AUDIT=1; it is not added to existing CI here.
@@ -37,23 +41,20 @@ const sizes = [
   { id: "normal", width: 1280, height: 800 },
   { id: "large", width: 1920, height: 1080 }
 ] as const;
-const routes = [
-  { id: "chat", label: "Conversation", selector: ".chat-layout:not([hidden])" },
-  { id: "data", label: "Data & training", selector: ".data-page" },
-  { id: "learn", label: "Learn", selector: ".learning-workspace" },
-  { id: "fact-check", label: "Fact Check", selector: ".learning-workspace" },
-  { id: "schedule", label: "Time & schedules", selector: ".time-workspace" },
-  { id: "map", label: "Brain map", selector: '[aria-label="Whole brain map"]' },
-  { id: "trace", label: "Trace & journal", selector: ".trace-page" },
-  { id: "imagine", label: "Imagination", selector: ".imagine-page" },
-  { id: "tools", label: "Tools & permissions", selector: ".tools-page" },
-  { id: "settings", label: "Device & runtime", selector: ".resource-settings-page" },
-  { id: "agents", label: "Forks & agents", selector: ".agents-page" },
-  { id: "evolution", label: "Evolution", selector: ".evolution-page" }
-] as const;
+const routes = auditScope.routes, designStates = auditScope.designStates;
+const coreStates = [...routes.map(route => route.id), ...designStates];
 type Cell = { index: number; key: string; palette: typeof palettes[number]; surface: typeof surfaces[number]; scheme: typeof schemes[number]; arrangement: typeof arrangements[number]; size: typeof sizes[number] };
 type Issue = { kind: string; control?: string; detail: string };
-type Capture = { path: string; purpose: string; visualReview: "not-yet-reviewed" };
+type CaptureScrollPosition = { owner: string; top: number; maximum: number; reachedBottom: boolean };
+type Capture = { path: string; purpose: string; visualReview: "not-yet-reviewed"; scrollPositions?: CaptureScrollPosition[] };
+type StaticArtifactFile = { path: string; bytes: number; sha256: string };
+type StaticFixtureManifest = {
+  format: "omni-u1-static-fixture"; version: 1; repositoryRoot: string; sourceCommit: string;
+  sourceFingerprint: string; sourceFiles: StaticArtifactFile[]; buildInputs: StaticArtifactFile[]; auditSpecSha256: string; fixtureSha256: string;
+  productRendererBytesSha256: string; artifactBytesSha256: string; entryPath: string; files: StaticArtifactFile[]; noHmr: true;
+  buildBase: "./";
+  boundaries: { ipc: false; models: 0; weights: 0; create: 0; load: 0; training: 0; tools: 0; providers: 0; devices: 0; externalEffects: 0 };
+};
 type NoticeGeometry = {
   notice: { left: number; right: number; top: number; bottom: number };
   conversation: { left: number; right: number; top: number; bottom: number };
@@ -70,7 +71,8 @@ type ControlSample = {
 type Visit = {
   key: string; cellIndex: number; route: string; state: string; status: "visited" | "failed";
   startedAt: string; elapsedMs: number; controls: ControlSample[];
-  scroll: Array<{ owner: string; top: number; bottom: number; maximum: number; sampledOffsets: number[]; reachedBottom: boolean }>;
+  scroll: Array<{ owner: string; top: number; bottom: number; maximum: number; sampledOffsets: number[]; reachedBottom: boolean;
+    postKeyboardTop?: number; captureTop?: number; captureMaximum?: number; captureReachedBottom?: boolean }>;
   captures: Capture[]; issues: Issue[];
   noticeGeometry?: { before?: NoticeGeometry; after?: NoticeGeometry };
 };
@@ -120,14 +122,13 @@ async function configureCell(page: Page, cell: Cell): Promise<void> {
     await expect(page.locator("html")).toHaveAttribute(attribute, value);
   }
   expect(await page.evaluate(() => typeof (window as Window & { readonly omni?: unknown }).omni)).toBe("undefined");
-  await page.locator("article.brain-card").filter({ has: page.getByRole("heading", { name: "Aster", exact: true }) }).click();
-  await expect(page.getByLabel("Message Aster")).toBeVisible();
+  await expect(page.locator(".library-page")).toBeVisible();
 }
 
 /** Real computed styles, not inserted look-alike controls. No CSS is changed. */
 async function sampleControls(root: Locator, onlyId?: string): Promise<ControlSample[]> {
   return root.evaluate((element, selectedId) => {
-    const query = 'button, input:not([type="hidden"]), select, textarea, summary, a[href], [role="button"], [role="switch"], [role="tab"]';
+    const query = 'button, input:not([type="hidden"]), select, textarea, summary, a[href], [role="button"], [role="switch"], [role="tab"], [role="checkbox"]';
     const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
     const context = canvas.getContext("2d", { willReadFrequently: true });
     const rgba = (color: string): number[] => {
@@ -268,7 +269,39 @@ async function walkContent(page: Page, root: Locator, record: Visit): Promise<vo
 async function capture(page: Page, directory: string, record: Visit, suffix: string): Promise<void> {
   const path = join(directory, `${record.key}-${suffix}.jpg`);
   await page.screenshot({ path, type: "jpeg", quality: 78, animations: "disabled" });
-  record.captures.push({ path, purpose: suffix, visualReview: "not-yet-reviewed" });
+  record.captures.push({ path, purpose: suffix, visualReview: "not-yet-reviewed",
+    ...(suffix === "lower-content" ? { scrollPositions: record.scroll.map(owner => ({ owner: owner.owner,
+      top: owner.captureTop!, maximum: owner.captureMaximum!, reachedBottom: owner.captureReachedBottom === true })) } : {}) });
+}
+
+async function restoreLowerContentAfterKeyboard(page: Page, record: Visit): Promise<void> {
+  // Tab is a real keyboard check above and may reveal an earlier focused
+  // control. Restore measured owners afterward; a filename is not evidence
+  // that the captured viewport still shows their bottom content.
+  const restored = await page.evaluate(owners => owners.map(owner => {
+    const node = document.querySelector<HTMLElement>(`[data-whole-app-audit-scroll="${owner}"]`);
+    if (!node) return { owner, missing: true as const };
+    const postKeyboardTop = node.scrollTop;
+    node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+    return { owner, missing: false as const, postKeyboardTop };
+  }), record.scroll.map(owner => owner.owner));
+  await settledFrame(page);
+  const measured = await page.evaluate(owners => owners.map(owner => {
+    const node = document.querySelector<HTMLElement>(`[data-whole-app-audit-scroll="${owner}"]`);
+    if (!node) return { owner, missing: true as const };
+    const top = node.scrollTop, maximum = Math.max(0, node.scrollHeight - node.clientHeight);
+    return { owner, missing: false as const, top, maximum, reachedBottom: top >= maximum - 2 };
+  }), record.scroll.map(owner => owner.owner));
+  for (const owner of record.scroll) {
+    const before = restored.find(value => value.owner === owner.owner), after = measured.find(value => value.owner === owner.owner);
+    if (!before || before.missing || !after || after.missing) {
+      record.issues.push({ kind: "capture-scroll-owner-missing", detail: `Measured owner ${owner.owner} disappeared before lower-content capture.` });
+      continue;
+    }
+    owner.postKeyboardTop = before.postKeyboardTop;
+    owner.captureTop = after.top; owner.captureMaximum = after.maximum; owner.captureReachedBottom = after.reachedBottom;
+    if (!after.reachedBottom) record.issues.push({ kind: "capture-scroll-bottom-unreached", detail: `Owner ${owner.owner}: capture at ${after.top} of ${after.maximum}.` });
+  }
 }
 
 function representative(cell: Cell): boolean {
@@ -299,6 +332,70 @@ function fileInventory(sourceDirectories: string[]): Array<{ path: string; bytes
 
 function rendererFingerprint(sourceDirectories = [join(repository, "out", "renderer")]): string {
   return createHash("sha256").update(JSON.stringify(fileInventory(sourceDirectories))).digest("hex");
+}
+function loopbackPreloadInventory() {
+  const supplied = process.env.OMNI_AUDIT_LOOPBACK_PRELOAD;
+  if (!supplied) return null;
+  const path = resolve(supplied);
+  if (path !== resolve(repository, "work/audit-loopback-bind.cjs") || !existsSync(path) || lstatSync(path).isSymbolicLink()) throw new Error("Only the explicit owned loopback CLI preload may be recorded.");
+  return { path, sha256: createHash("sha256").update(readFileSync(path)).digest("hex"), scope: "test CLI loopback binding only; no OS or product change" };
+}
+function admitAuditCell(output: string, label: string) {
+  const pending = join(output, "RESOURCE_PAUSE.json");
+  if (existsSync(pending)) throw new AuditResourcePauseError(JSON.parse(readFileSync(pending, "utf8")) as AuditResourceSnapshot);
+  return assertAuditResources(repository, output, label);
+}
+
+async function verifyStaticFixture(url: URL, expected: { sourceCommit: string; sourceFingerprint: string; fixtureSha256: string }) {
+  const localPath = process.env.OMNI_WHOLE_APP_STATIC_MANIFEST;
+  if (!localPath) throw new Error("OMNI_WHOLE_APP_STATIC_MANIFEST must name the owned compiled-fixture manifest; dev/HMR servers are not accepted.");
+  const manifestPath = resolve(localPath), within = relative(join(repository, ".runtime"), manifestPath);
+  if (!within || isAbsolute(within) || within === ".." || within.startsWith(`..${sep}`) || lstatSync(manifestPath).isSymbolicLink()) throw new Error("Static fixture manifest must be an owned regular runtime file in this exact checkout.");
+  const manifestBytes = readFileSync(manifestPath), manifest = JSON.parse(manifestBytes.toString("utf8")) as StaticFixtureManifest;
+  expect(manifest.format).toBe("omni-u1-static-fixture"); expect(manifest.version).toBe(1);
+  expect(manifest.repositoryRoot).toBe(repository); expect(manifest.sourceCommit).toBe(expected.sourceCommit);
+  expect(manifest.sourceFingerprint).toBe(expected.sourceFingerprint); expect(manifest.fixtureSha256).toBe(expected.fixtureSha256);
+  expect(manifest.sourceFiles).toEqual(fileInventory([join(repository, "src/renderer"), join(repository, "src/shared")]));
+  expect(manifest.buildInputs).toEqual(["tests/e2e/whole-app-state-composition-fixture.html", "tests/e2e/whole-app-state-composition-fixture.tsx",
+    "tests/e2e/whole-app-audit-contract.ts", "tests/e2e/whole-app-audit-scope.json", "tests/e2e/whole-app-audit-resources.mjs", "tests/e2e/whole-app-audit-resources.d.mts",
+    "tests/e2e/whole-app-audit-matrix.spec.ts", "tests/e2e/responsive-main.cjs", "package.json", "package-lock.json", "work/u1-static-fixture.mjs"]
+    .map(path => { const bytes = readFileSync(resolve(repository, path)); return { path, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") }; }));
+  expect(manifest.auditSpecSha256).toBe(createHash("sha256").update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex"));
+  expect(manifest.productRendererBytesSha256).toBe(rendererFingerprint()); expect(manifest.noHmr).toBe(true);
+  expect(manifest.boundaries).toEqual({ ipc: false, models: 0, weights: 0, create: 0, load: 0, training: 0, tools: 0, providers: 0, devices: 0, externalEffects: 0 });
+  expect(url.search).toBe(""); expect(url.hash).toBe(""); expect(manifest.buildBase).toBe("./");
+  const site = join(resolve(manifestPath, ".."), "site");
+  if (url.protocol === "file:") expect(url.href).toBe(pathToFileURL(resolve(site, manifest.entryPath.slice(1))).href);
+  else expect(manifest.entryPath).toBe(url.pathname);
+  if (!Array.isArray(manifest.files) || !manifest.files.length) throw new Error("Static fixture artifact inventory is empty.");
+  const seen = new Set<string>();
+  for (const file of manifest.files) {
+    if (!file.path || isAbsolute(file.path) || file.path.includes("\\") || file.path.split("/").some(part => !part || part === "." || part === "..") ||
+        seen.has(file.path) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || !/^[a-f0-9]{64}$/.test(file.sha256)) throw new Error("Invalid/ambiguous static artifact inventory path/hash.");
+    seen.add(file.path);
+  }
+  expect(seen.has(manifest.entryPath.slice(1))).toBe(true);
+  expect(manifest.artifactBytesSha256).toBe(createHash("sha256").update(JSON.stringify(manifest.files)).digest("hex"));
+  const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+  const manifestUrl = url.protocol === "file:" ? pathToFileURL(manifestPath).href : new URL("/__omni_u1_manifest.json", url.origin).href;
+  if (url.protocol === "file:") {
+    expect(fileInventory([site]).map(file => ({ ...file, path: relative(site, resolve(repository, file.path)) }))).toEqual(manifest.files);
+    return { manifestPath, manifestUrl, manifestSha256, manifest, site, transport: "owned-file-static" as const };
+  }
+  const fetchBytes = async (href: string, bytes: number, sha256: string): Promise<Buffer> => {
+    const response = await fetch(href, { redirect: "error", signal: AbortSignal.timeout(5000) });
+    expect(response.status, href).toBe(200); expect(response.headers.get("x-omni-u1-sha256"), href).toBe(sha256);
+    expect(response.headers.get("content-length"), href).toBe(String(bytes));
+    const body = Buffer.from(await response.arrayBuffer());
+    expect(body.byteLength, href).toBe(bytes); expect(createHash("sha256").update(body).digest("hex"), href).toBe(sha256);
+    return body;
+  };
+  expect(await fetchBytes(manifestUrl, manifestBytes.length, manifestSha256)).toEqual(manifestBytes);
+  for (const file of manifest.files) {
+    const body = await fetchBytes(new URL(`/${file.path}`, url.origin).href, file.bytes, file.sha256);
+    if (`/${file.path}` === manifest.entryPath && body.toString("utf8").includes("/@vite/client")) throw new Error("Dev/HMR fixture response is not an immutable static artifact.");
+  }
+  return { manifestPath, manifestUrl, manifestSha256, manifest, site, transport: "owned-loopback-http" as const };
 }
 
 function dirtyFileInventory(): Array<{ status: string; path: string; previousPath?: string; sha256?: string; removed?: true; symlinkTarget?: string }> {
@@ -333,8 +430,77 @@ async function journalRows(path: string, requiredKeys: Set<string>): Promise<Map
   return rows;
 }
 
+const designSelectors: Record<string, string> = {
+  "home-default": ".library-page", "home-selection": ".library-page", "home-selected-search": ".library-page",
+  "home-export-menu": ".library-selection-toolbar", "home-delete-confirmation": ".instance-delete-dialog",
+  "build-identity": ".builder-page", "build-initial-learning": ".builder-page", "build-source-menu": ".universal-source-picker__menu:popover-open",
+  "build-memory-storage": ".builder-page", "build-access-review": ".builder-page",
+  "training-expanded-form": ".training-evolution-page", "settings-custom-budgets": ".resource-settings-page"
+};
+async function openDesignBrain(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Open brain Aster", exact: true }).click();
+  await expect(page.getByLabel("Message Aster")).toBeVisible();
+}
+async function workspaceRoute(page: Page, label: string): Promise<void> {
+  await page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button", { name: label, exact: true }).click();
+  await expect(page.locator(".workspace-header__view")).toHaveText(label);
+}
+/** Only ordinary local navigation/drafts. Never Create, save, import/export, delete or run. */
+async function prepareDesignState(page: Page, state: string): Promise<void> {
+  if (state === "home-selection") {
+    await page.getByRole("button", { name: "Select", exact: true }).click();
+    await page.getByRole("button", { name: "Select all", exact: true }).click();
+    await expect(page.getByRole("toolbar", { name: "Manage selected brains" })).toBeVisible();
+    expect(await page.getByRole("checkbox", { name: /^Select brain / }).count()).toBeGreaterThan(1);
+  } else if (state === "home-selected-search") {
+    await page.getByRole("textbox", { name: "Search brains" }).fill("Aster");
+    await expect(page.locator(".library-selection-count")).toContainText("outside this search");
+  } else if (state === "home-export-menu") {
+    await page.locator(".library-export-menu > summary").click();
+    await expect(page.getByRole("group", { name: "Brain export options" })).toBeVisible();
+  } else if (state === "home-delete-confirmation") {
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "Delete", exact: true }).click();
+    await expect(page.locator(".instance-delete-dialog")).toContainText("Confirmation 1 of 3");
+  } else if (state === "build-identity") {
+    if (await page.locator(".instance-delete-dialog").isVisible()) await page.locator(".instance-delete-dialog").getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.getByRole("button", { name: "Done", exact: true }).click();
+    await page.getByRole("button", { name: "Build a new brain", exact: true }).click();
+  } else if (state === "build-initial-learning") {
+    await page.getByRole("button", { name: /^Step 2:/ }).click();
+    await expect(page.getByRole("heading", { name: "Initial learning", exact: true })).toBeVisible();
+  } else if (state === "build-source-menu") {
+    await page.getByRole("button", { name: "Add source", exact: true }).click();
+  } else if (state === "build-memory-storage") {
+    await page.keyboard.press("Escape"); await page.getByRole("button", { name: /^Step 3:/ }).click();
+    await expect(page.getByRole("heading", { name: "Memory & storage", exact: true })).toBeVisible();
+  } else if (state === "build-access-review") {
+    await page.getByRole("button", { name: /^Step 4:/ }).click();
+    await page.getByRole("checkbox", { name: /^Full Authority/ }).check();
+    await expect(page.getByRole("button", { name: /^Create Nova/ })).toBeVisible();
+  } else if (state === "training-expanded-form") {
+    await workspaceRoute(page, "Training & Evolution");
+    await page.getByLabel("Text to learn", { exact: true }).fill("UI-only draft. No source ingestion or learning is requested.");
+    await page.getByLabel("Instructions or improvement goal", { exact: true }).fill("UI-only improvement draft; do not submit.");
+    const disclosure = page.locator(".learning-workspace details").filter({ has: page.locator("summary", { hasText: "Web scope and dates" }) }).first();
+    if (await disclosure.getAttribute("open") === null) await disclosure.locator(":scope > summary").click();
+    await expect(page.getByLabel("Only these sites · optional", { exact: true })).toBeVisible();
+    await expect(page.locator(".training-evolution-sidebar")).toBeVisible();
+    await expect(page.locator(".learning-workspace__form").getByRole("button", { name: "Learn", exact: true })).toBeDisabled();
+  } else if (state === "settings-custom-budgets") {
+    await workspaceRoute(page, "Settings");
+    await page.getByRole("group", { name: "Omni-wide RAM policy" }).getByRole("button", { name: /^Advanced cap/ }).click();
+    await page.getByRole("group", { name: "Working-memory size" }).getByRole("button", { name: /^Manual/ }).click();
+    await page.getByRole("group", { name: "Shared-storage policy" }).getByRole("button", { name: /^Custom size/ }).click();
+    await page.getByLabel("Omni share of safe pool", { exact: false }).fill("60");
+    await page.getByLabel("Working-memory tokens", { exact: true }).fill("32768");
+    await page.getByLabel("Shared pool capacity", { exact: true }).fill("24");
+    await expect(page.getByText("Unsaved changes", { exact: true })).toBeVisible();
+  }
+}
+
 test("U1 full whole-App stock appearance/workspace matrix records exact no-engine coverage", async ({}, testInfo) => {
-  test.skip(process.env.OMNI_WHOLE_APP_AUDIT !== "1", "Explicit opt-in required for the full serial 4,608-visit U1 audit.");
+  test.skip(process.env.OMNI_WHOLE_APP_AUDIT !== "1", "Explicit opt-in required for the full serial 384-cell U1 audit.");
   const timeout = boundedInteger(process.env.OMNI_WHOLE_APP_AUDIT_TIMEOUT_MS, 90 * 60_000, "whole-App audit timeout");
   if (timeout < 30_000 || timeout > 12 * 60 * 60_000) throw new Error("Whole-App audit timeout must be 30 seconds to 12 hours.");
   test.setTimeout(timeout);
@@ -343,6 +509,7 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
   const renderedBytesSha256 = rendererFingerprint();
   const renderedFiles = fileInventory([join(repository, "out", "renderer")]), dirtyFiles = dirtyFileInventory();
   const auditSpecSha256 = createHash("sha256").update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex");
+  const loopbackPreload = loopbackPreloadInventory();
   // This serial journal is outside Playwright's auto-cleared output directory.
   // Completed exact-byte visits can resume; new renderer bytes never inherit
   // prior coverage. Do not run parallel writers against the same output path.
@@ -359,9 +526,10 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
   let application: ElectronApplication | undefined;
   let child: ReturnType<ElectronApplication["process"]> | undefined;
   let terminal: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  let resourcePause: AuditResourceSnapshot | undefined;
   const startedAt = new Date().toISOString();
   const started = performance.now(); let newlyVisited = 0;
-  const requiredKeys = new Set(cells.flatMap(cell => routes.map(route => `${String(cell.index).padStart(3, "0")}-${cell.key}-${route.id}`)));
+  const requiredKeys = new Set(cells.flatMap(cell => coreStates.map(state => `${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`)));
   if (existsSync(metadata)) {
     const previous = JSON.parse(readFileSync(metadata, "utf8")) as { format?: string; sourceCommit?: string; renderedBytesSha256?: string; auditSpecSha256?: string };
     if (previous.format !== "omni-whole-app-ui-audit" || previous.sourceCommit !== sourceCommit || previous.renderedBytesSha256 !== renderedBytesSha256 || previous.auditSpecSha256 !== auditSpecSha256) {
@@ -372,24 +540,28 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
       for (const value of prior.values()) if (value.status === "visited" && value.issues.length === 0) visits.push({ key: value.key, status: value.status, route: value.route, cellIndex: value.cellIndex });
     }
   }
-  const writeCoverage = (state: "running" | "complete" | "incomplete"): void => atomicJson(metadata, {
-    format: "omni-whole-app-ui-audit", version: 1, state, sourceCommit, dirtyFiles, renderedFiles, renderedBytesSha256, auditSpecSha256, startedAt,
-    updatedAt: new Date().toISOString(), dimensions: { palettes, surfaces, schemes, arrangements, sizes, routes },
+  const writeCoverage = (state: "running" | "complete" | "incomplete" | "paused"): void => atomicJson(metadata, {
+    format: "omni-whole-app-ui-audit", version: 1, scopeId: auditScope.id, loopbackPreload, state, sourceCommit, dirtyFiles, renderedFiles, renderedBytesSha256, auditSpecSha256, startedAt,
+    updatedAt: new Date().toISOString(), dimensions: { palettes, surfaces, schemes, arrangements, sizes, routes, designStates },
     requiredCells: cells.length, requiredRouteVisits: cells.length * routes.length,
+    requiredDesignVisits: cells.length * designStates.length, requiredCoreVisits: cells.length * coreStates.length,
     selectedCellIndexes: selected.map(cell => cell.index), expectedSelectedRouteVisits: selected.length * routes.length,
-    visitedRouteCount: visits.length, visited: visits, failures, prohibitedRequests,
-    progress: { completedRouteVisits: visits.length, totalRouteVisits: cells.length * routes.length,
+    expectedSelectedDesignVisits: selected.length * designStates.length, expectedSelectedCoreVisits: selected.length * coreStates.length,
+    visitedRouteCount: visits.filter(visit => routes.some(route => route.id === visit.route)).length,
+    visitedCoreCount: visits.length, visited: visits, failures, prohibitedRequests,
+    progress: { completedCoreVisits: visits.length, totalCoreVisits: cells.length * coreStates.length,
       elapsedMs: Math.round(performance.now() - started), newVisitsThisAttempt: newlyVisited,
       ...(newlyVisited > 0 ? { averageVisitsPerSecond: newlyVisited / ((performance.now() - started) / 1000),
-        estimatedRemainingMs: Math.round((cells.length * routes.length - visits.length) * (performance.now() - started) / newlyVisited) } : {}) },
-    fullTraversal: visits.length === cells.length * routes.length && new Set(visits.map(visit => visit.key)).size === cells.length * routes.length,
+        estimatedRemainingMs: Math.round((cells.length * coreStates.length - visits.length) * (performance.now() - started) / newlyVisited) } : {}) },
+    fullTraversal: visits.length === cells.length * coreStates.length && new Set(visits.map(visit => visit.key)).size === cells.length * coreStates.length,
     visualAcceptance: "not-established-by-metrics-or-unreviewed-captures",
     boundaries: { preview: true, preload: false, modelsCreated: 0, modelsLoaded: 0, training: 0, providers: 0, permissions: 0, externalEffects: 0 },
-    profile, childTerminal: terminal ?? null,
+    profile, childTerminal: terminal ?? null, resourcePause: resourcePause ?? null,
     exclusions: ["real host/neural transitions", "real account/device/platform interoperability", "unbounded user-authored CSS", "screen-reader conformance"]
   });
   writeCoverage("running");
   try {
+    admitAuditCell(directory, "core-before-owned-launch");
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[0] !== "ELECTRON_RUN_AS_NODE"));
     application = await electron.launch({ args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
       env: { ...env, NODE_ENV: "test", OMNI_RESPONSIVE_REPOSITORY: repository, OMNI_RESPONSIVE_USER_DATA_DIR: profile } });
@@ -400,16 +572,23 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
     await page.emulateMedia({ reducedMotion: "reduce" });
     await expect(page.locator(".app-shell")).toBeVisible();
     for (const cell of selected) {
-      if (routes.every(route => visits.some(value => value.key === `${String(cell.index).padStart(3, "0")}-${cell.key}-${route.id}`))) continue;
+      if (coreStates.every(state => visits.some(value => value.key === `${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`))) continue;
+      admitAuditCell(directory, `core-before-cell-${cell.index}`);
       await configureCell(page, cell);
-      for (const route of routes) {
+      const entries = [...designStates.slice(0, 10).map(id => ({ id, label: id, selector: designSelectors[id]! })), ...routes,
+        ...designStates.slice(10).map(id => ({ id, label: id, selector: designSelectors[id]! }))];
+      for (const route of entries) {
         const begin = performance.now();
         const record: Visit = { key: `${String(cell.index).padStart(3, "0")}-${cell.key}-${route.id}`, cellIndex: cell.index,
           route: route.id, state: "actual-production-preview/no-host-connection", status: "visited", startedAt: new Date().toISOString(), elapsedMs: 0, controls: [], scroll: [], captures: [], issues: [] };
-        if (visits.some(value => value.key === record.key)) continue;
         try {
-          await page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button", { name: route.label, exact: true }).click();
-          await expect(page.locator(".workspace-header__view")).toHaveText(route.label);
+          if (designStates.includes(route.id)) await prepareDesignState(page, route.id);
+          else {
+            if (await page.locator(".builder-page").isVisible()) await page.getByRole("button", { name: "Brain Library", exact: true }).click();
+            if (await page.locator(".library-page").isVisible()) await openDesignBrain(page);
+            await workspaceRoute(page, route.label);
+          }
+          if (visits.some(value => value.key === record.key)) continue;
           const root = page.locator(route.selector);
           await expect(root).toBeVisible();
           // Inspect shared titlebar/rail/header controls once in every cell,
@@ -418,6 +597,7 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
           await settledFrame(page);
           if (representative(cell)) await capture(page, screenshots, record, "entry");
           await walkContent(page, auditRoot, record);
+          await restoreLowerContentAfterKeyboard(page, record);
           if (representative(cell)) await capture(page, screenshots, record, "lower-content");
           if (record.issues.length) { record.status = "failed"; await capture(page, screenshots, record, "failure"); }
         } catch (error) {
@@ -434,9 +614,13 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
       writeCoverage("running");
     }
     expect(prohibitedRequests, "No provider or external HTTP request is authorized by this audit").toEqual([]);
-    expect(visits.filter(value => selected.some(cell => cell.index === value.cellIndex)).length).toBe(selected.length * routes.length);
+    expect(visits.filter(value => selected.some(cell => cell.index === value.cellIndex)).length).toBe(selected.length * coreStates.length);
     expect(new Set(visits.map(visit => visit.key)).size).toBe(visits.length);
+    expect(loopbackPreloadInventory()).toEqual(loopbackPreload);
     expect(failures, `Read ${journal} and inspect captures before changing UI; captures are not automatically accepted`).toEqual([]);
+  } catch (error) {
+    if (error instanceof AuditResourcePauseError) resourcePause = error.snapshot;
+    else throw error;
   } finally {
     let closeFailure: unknown;
     if (application && child) {
@@ -450,20 +634,17 @@ test("U1 full whole-App stock appearance/workspace matrix records exact no-engin
       if (child.exitCode !== null || child.signalCode !== null) terminal ??= { code: child.exitCode, signal: child.signalCode };
       if (!terminal || terminal.code !== 0 || terminal.signal !== null) closeFailure ??= new Error("Whole-App audit did not observe a clean exit of its exact owned child.");
     }
-    const complete = visits.length === cells.length * routes.length && failures.length === 0 && prohibitedRequests.length === 0 && !closeFailure;
-    writeCoverage(complete ? "complete" : "incomplete");
+    const complete = visits.length === cells.length * coreStates.length && failures.length === 0 && prohibitedRequests.length === 0 && !closeFailure;
+    writeCoverage(resourcePause ? "paused" : complete ? "complete" : "incomplete");
     if (terminal && existsSync(profile)) rmSync(profile, { recursive: true, force: false });
     await testInfo.attach("whole-app-coverage", { path: metadata, contentType: "application/json" });
     if (existsSync(journal)) await testInfo.attach("whole-app-visits", { path: journal, contentType: "application/x-ndjson" });
     if (closeFailure) throw closeFailure;
   }
+  test.skip(Boolean(resourcePause), "Paused at the measured resource boundary; partial coverage is not a passed gate.");
 });
 
-const compositionStates = [
-  "chat-idle", "chat-streaming-before-ponder", "chat-ponder-tool-nesting", "chat-approval-during-ponder", "chat-continuation-chronology",
-  "chat-offpage-active", "chat-offpage-complete-return", "chat-restored-in-memory-ledger", "chat-failed-input-preserved",
-  ...["extracting", "learning", "saving", "finalizing", "complete"].flatMap(phase => [`training-${phase}`, `appearance-over-training-${phase}`])
-] as const;
+const compositionStates = auditScope.compositionStates;
 
 async function composition(page: Page, method: Exclude<keyof WholeAppCompositionControl, "status" | "training" | "storage" | "finish">): Promise<void> {
   await page.evaluate(name => { if (!window.omniWholeAppComposition) throw new Error("Synthetic composition control is missing."); return window.omniWholeAppComposition[name](); }, method);
@@ -490,9 +671,9 @@ async function noticeGeometry(page: Page): Promise<NoticeGeometry | undefined> {
 test("U1 whole-App active chronology, off-page completion and overlay composition use typed inert events", async ({}, testInfo) => {
   test.skip(process.env.OMNI_WHOLE_APP_AUDIT !== "1", "Explicit opt-in required for the serial U1 audit.");
   const fixtureUrl = process.env.OMNI_WHOLE_APP_STATE_URL;
-  test.skip(!fixtureUrl, "Set OMNI_WHOLE_APP_STATE_URL to the owned local Vite fixture; absence is not a passed composition gate.");
+  test.skip(!fixtureUrl, "Set OMNI_WHOLE_APP_STATE_URL to the owned compiled static fixture; absence is not a passed composition gate.");
   const url = new URL(fixtureUrl!);
-  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.pathname !== "/tests/e2e/whole-app-state-composition-fixture.html") throw new Error("Only the explicit owned loopback composition fixture is allowed.");
+  if (url.protocol !== "file:" && (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.pathname !== "/tests/e2e/whole-app-state-composition-fixture.html")) throw new Error("Only the manifest-bound owned static file or explicit loopback composition fixture is allowed.");
   const timeout = boundedInteger(process.env.OMNI_WHOLE_APP_AUDIT_TIMEOUT_MS, 90 * 60_000, "whole-App composition timeout");
   if (timeout < 30_000 || timeout > 12 * 60 * 60_000) throw new Error("Whole-App composition timeout must be 30 seconds to 12 hours.");
   test.setTimeout(timeout);
@@ -504,7 +685,11 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
   const fixtureSha256 = createHash("sha256").update(sourceFingerprint)
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-state-composition-fixture.tsx")))
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-contract.ts")))
+    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-scope.json")))
+    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-resources.mjs")))
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex");
+  const staticArtifact = await verifyStaticFixture(url, { sourceCommit, sourceFingerprint, fixtureSha256 });
+  const loopbackPreload = loopbackPreloadInventory();
   const directory = process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR
     ? join(resolve(process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR), "composition")
     : join(repository, ".runtime", "whole-app-ui-composition", sourceCommit, fixtureSha256);
@@ -514,8 +699,9 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
   const stateKeys = new Set(cells.flatMap(cell => compositionStates.map(state => `${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`)));
   const resumedCells = new Set<number>();
   if (existsSync(metadata)) {
-    const previous = JSON.parse(readFileSync(metadata, "utf8")) as { format?: string; sourceCommit?: string; fixtureSha256?: string };
-    if (previous.format !== "omni-whole-app-composition" || previous.sourceCommit !== sourceCommit || previous.fixtureSha256 !== fixtureSha256) throw new Error("Existing composition output belongs to different fixture/source bytes; choose a new output directory.");
+    const previous = JSON.parse(readFileSync(metadata, "utf8")) as { format?: string; sourceCommit?: string; fixtureSha256?: string; staticArtifact?: { manifestSha256?: string } };
+    if (previous.format !== "omni-whole-app-composition" || previous.sourceCommit !== sourceCommit || previous.fixtureSha256 !== fixtureSha256 ||
+        previous.staticArtifact?.manifestSha256 !== staticArtifact.manifestSha256) throw new Error("Existing composition output belongs to different fixture/source/served artifact bytes; choose a new output directory.");
     const prior = await journalRows(journal, stateKeys);
     for (const cell of cells) {
       const values = compositionStates.map(state => prior.get(`${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`));
@@ -527,39 +713,69 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
   }
   const started = performance.now();
   const resumedCount = records.length; let lastSummary = started;
-  const externalRequests: string[] = [], runtimeErrors: string[] = [];
+  const externalRequests: string[] = [], runtimeErrors: string[] = [], servedByteErrors: string[] = [];
+  const navigationEvents: Array<{ event: string; url: string; at: string; status?: number; error?: string }> = [];
+  const pendingResponseChecks = new Set<Promise<void>>();
   let application: ElectronApplication | undefined, child: ReturnType<ElectronApplication["process"]> | undefined;
   let terminal: { code: number | null; signal: NodeJS.Signals | null } | undefined;
-  const write = (state: "running" | "complete" | "incomplete"): void => atomicJson(metadata, {
-    format: "omni-whole-app-composition", version: 1, state, sourceCommit, dirtyFiles, sourceFiles, sourceFingerprint, fixtureSha256,
+  let resourcePause: AuditResourceSnapshot | undefined;
+  const write = (state: "running" | "complete" | "incomplete" | "paused"): void => atomicJson(metadata, {
+    format: "omni-whole-app-composition", version: 1, scopeId: auditScope.id, loopbackPreload, state, sourceCommit, dirtyFiles, sourceFiles, sourceFingerprint, fixtureSha256,
     requiredCells: cells.length, selectedCellIndexes: selected.map(cell => cell.index), states: compositionStates,
     expectedFullStateVisits: cells.length * compositionStates.length, visited: records, failures, externalRequests, runtimeErrors,
+    staticArtifact, servedByteErrors, navigationEvents,
     elapsedMs: Math.round(performance.now() - started),
     resumedExactStateCount: resumedCount,
     ...(records.length > resumedCount ? { measuredStatesPerSecond: (records.length - resumedCount) / ((performance.now() - started) / 1000),
       estimatedRemainingMs: Math.round((cells.length * compositionStates.length - records.length) * (performance.now() - started) / (records.length - resumedCount)) } : {}),
     fullTraversal: records.length === cells.length * compositionStates.length && new Set(records.map(record => record.key)).size === records.length,
     visualAcceptance: "not-established-by-metrics-or-unreviewed-captures",
-    transport: "typed synthetic in-memory events through actual App controller",
+    transport: `typed synthetic in-memory events through actual App controller; manifest-bound static ${url.protocol === "file:" ? "files" : "HTTP"} without HMR`,
     boundaries: { ipc: false, preload: false, models: 0, weights: 0, create: 0, load: 0, training: 0, tools: 0, providers: 0, devices: 0, externalEffects: 0 },
     exclusions: ["real neural/host sequencing", "persisted filesystem restart", "same-brain inference", "provider/device/platform qualification"],
-    childTerminal: terminal ?? null
+    childTerminal: terminal ?? null, resourcePause: resourcePause ?? null
   });
   write("running");
   try {
+    const resourceRoot = process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR ? resolve(process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR) : directory;
+    admitAuditCell(resourceRoot, "composition-before-owned-launch");
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[0] !== "ELECTRON_RUN_AS_NODE"));
     application = await electron.launch({ args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
       env: { ...env, NODE_ENV: "test", OMNI_RESPONSIVE_REPOSITORY: repository, OMNI_RESPONSIVE_USER_DATA_DIR: profile } });
     child = application.process(); child.once("exit", (code, signal) => { terminal = { code, signal }; });
     await application.context().route(/^https?:\/\//, async request => {
-      if (new URL(request.request().url()).origin === url.origin) await request.continue();
+      const requested = new URL(request.request().url());
+      if (url.protocol === "http:" && requested.origin === url.origin && staticArtifact.manifest.files.some(file => `/${file.path}` === requested.pathname) && !requested.search) await request.continue();
+      else { externalRequests.push(request.request().url()); await request.abort("blockedbyclient"); }
+    });
+    if (url.protocol === "file:") await application.context().route(/^file:\/\//, async request => {
+      const requested = new URL(request.request().url());
+      if (!requested.search && !requested.hash && staticArtifact.manifest.files.some(file => pathToFileURL(resolve(staticArtifact.site, file.path)).href === requested.href)) await request.continue();
       else { externalRequests.push(request.request().url()); await request.abort("blockedbyclient"); }
     });
     const page = await application.firstWindow();
     page.on("pageerror", error => runtimeErrors.push(error.message));
+    page.on("request", request => { if (request.isNavigationRequest()) navigationEvents.push({ event: "request", url: request.url(), at: new Date().toISOString() }); });
+    page.on("requestfailed", request => { if (request.isNavigationRequest()) navigationEvents.push({ event: "requestfailed", url: request.url(), at: new Date().toISOString(), error: request.failure()?.errorText }); });
+    page.on("domcontentloaded", () => navigationEvents.push({ event: "domcontentloaded", url: page.url(), at: new Date().toISOString() }));
+    page.on("load", () => navigationEvents.push({ event: "load", url: page.url(), at: new Date().toISOString() }));
+    page.on("response", response => {
+      const requested = new URL(response.url());
+      if (requested.protocol !== url.protocol || url.protocol === "http:" && requested.origin !== url.origin) return;
+      const file = staticArtifact.manifest.files.find(value => url.protocol === "file:"
+        ? resolve(staticArtifact.site, value.path) === fileURLToPath(requested) : `/${value.path}` === requested.pathname);
+      const check = (async () => {
+        if (!file || (url.protocol === "file:" ? ![0, 200].includes(response.status()) : response.status() !== 200 || response.headers()["x-omni-u1-sha256"] !== file.sha256)) throw new Error(`Unexpected static response: ${response.status()} ${response.url()}`);
+        const body = await response.body();
+        if (body.byteLength !== file.bytes || createHash("sha256").update(body).digest("hex") !== file.sha256) throw new Error(`Served bytes differ from the frozen artifact: ${response.url()}`);
+        if (response.request().isNavigationRequest()) navigationEvents.push({ event: "response", url: response.url(), status: response.status(), at: new Date().toISOString() });
+      })().catch(error => { servedByteErrors.push(error instanceof Error ? error.message : String(error)); });
+      pendingResponseChecks.add(check); void check.finally(() => pendingResponseChecks.delete(check));
+    });
     await page.goto(url.href); await page.emulateMedia({ reducedMotion: "reduce" });
     for (const cell of selected) {
       if (resumedCells.has(cell.index)) continue;
+      admitAuditCell(resourceRoot, `composition-before-cell-${cell.index}`);
       await page.setViewportSize({ width: cell.size.width, height: cell.size.height });
       await expect.poll(() => page.evaluate(() => ({ width: innerWidth, height: innerHeight }))).toEqual({ width: cell.size.width, height: cell.size.height });
       await page.evaluate(value => {
@@ -579,6 +795,7 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
           if (state === "chat-failed-input-preserved") record.noticeGeometry = { before: await noticeGeometry(page) };
           if (representative(cell)) await capture(page, screenshots, record, "entry");
           await walkContent(page, root, record);
+          await restoreLowerContentAfterKeyboard(page, record);
           if (state === "chat-failed-input-preserved") record.noticeGeometry = { ...record.noticeGeometry, after: await noticeGeometry(page) };
           if (representative(cell)) await capture(page, screenshots, record, "lower-content");
         } catch (error) { record.issues.push({ kind: "composition-error", detail: error instanceof Error ? error.message : String(error) }); }
@@ -591,6 +808,22 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
         if (performance.now() - lastSummary >= 10_000) { write("running"); lastSummary = performance.now(); }
       };
       await inspect("chat-idle", ".chat-layout:not([hidden])");
+      for (const kind of ["Attach", "Learn"] as const) {
+        await page.getByRole("button", { name: kind, exact: true }).click();
+        await inspect(`chat-${kind.toLowerCase()}-menu`, ".universal-source-picker__menu:popover-open", async () => {
+          const menu = page.locator(".universal-source-picker__menu:popover-open");
+          return await menu.getByRole("button", { name: "Files & media", exact: true }).count() === 1 &&
+            await menu.getByRole("button", { name: "Folder", exact: true }).count() === 1 ? [] : [{ kind: "source-menu-missing-choice", detail: "Unified source menu must expose files/media and folders without invoking a picker." }];
+        });
+        await page.keyboard.press("Escape");
+      }
+      await workspaceRoute(page, "Tools & permissions");
+      await inspect("plugins-maker", ".plugin-manager");
+      for (const [starter, state] of [["Feature & menu", "plugins-feature-source"], ["App styling", "plugins-style-source"], ["Training format", "plugins-training-parser"]] as const) {
+        await page.getByRole("button", { name: `+ ${starter}`, exact: true }).click();
+        await inspect(state, ".plugin-module-authoring");
+      }
+      await workspaceRoute(page, "Conversation");
       const input = page.getByLabel("Message UI Fixture — no model");
       await input.fill("Synthetic composition request. Do not run a tool, model or host action.");
       await page.getByRole("button", { name: "Send message", exact: true }).click();
@@ -620,7 +853,7 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
         return opening && ponder && resumed && opening.compareBoundaryPoints(Range.START_TO_START, ponder) < 0 && ponder.compareBoundaryPoints(Range.START_TO_START, resumed) < 0
           ? [] : [{ kind: "reply-ponder-order", detail: "Opening text, emitted Ponder and resumed ordinary text are not in their actual stream order." }];
       }));
-      await page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button", { name: "Trace & journal", exact: true }).click();
+      await workspaceRoute(page, "Brain map");
       await inspect("chat-offpage-active", ".workspace-body");
       await page.evaluate(() => window.omniWholeAppComposition!.finish());
       await expect.poll(async () => (await compositionStatus(page)).pendingTurns.length).toBe(0);
@@ -665,9 +898,15 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
     }
     expect(records.filter(value => selected.some(cell => cell.index === value.cellIndex)).length).toBe(selected.length * compositionStates.length);
     expect(new Set(records.map(record => record.key)).size).toBe(records.length);
-    expect(rendererFingerprint([join(repository, "src", "renderer"), join(repository, "src", "shared")]), "Source changed during live Vite inspection; do not combine different runtime bytes").toBe(sourceFingerprint);
+    expect(rendererFingerprint([join(repository, "src", "renderer"), join(repository, "src", "shared")]), "Source changed during static fixture inspection; do not combine different runtime bytes").toBe(sourceFingerprint);
+    await Promise.all([...pendingResponseChecks]); expect(servedByteErrors).toEqual([]);
+    expect(await verifyStaticFixture(url, { sourceCommit, sourceFingerprint, fixtureSha256 })).toEqual(staticArtifact);
     expect(externalRequests).toEqual([]); expect(runtimeErrors).toEqual([]);
+    expect(loopbackPreloadInventory()).toEqual(loopbackPreload);
     expect(failures, `Inspect ${journal}; typed fixture transitions do not prove real runtime behavior`).toEqual([]);
+  } catch (error) {
+    if (error instanceof AuditResourcePauseError) resourcePause = error.snapshot;
+    else throw error;
   } finally {
     let closeFailure: unknown;
     if (application && child) {
@@ -677,10 +916,11 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
       if (child.exitCode !== null || child.signalCode !== null) terminal ??= { code: child.exitCode, signal: child.signalCode };
       if (!terminal || terminal.code !== 0 || terminal.signal !== null) closeFailure ??= new Error("Exact composition child did not exit cleanly.");
     }
-    write(records.length === cells.length * compositionStates.length && !failures.length && !externalRequests.length && !runtimeErrors.length && !closeFailure ? "complete" : "incomplete");
+    write(resourcePause ? "paused" : records.length === cells.length * compositionStates.length && !failures.length && !externalRequests.length && !runtimeErrors.length && !servedByteErrors.length && !closeFailure ? "complete" : "incomplete");
     if (terminal && existsSync(profile)) rmSync(profile, { recursive: true, force: false });
     await testInfo.attach("whole-app-composition-coverage", { path: metadata, contentType: "application/json" });
     if (existsSync(journal)) await testInfo.attach("whole-app-composition-states", { path: journal, contentType: "application/x-ndjson" });
     if (closeFailure) throw closeFailure;
   }
+  test.skip(Boolean(resourcePause), "Paused at the measured resource boundary; partial coverage is not a passed gate.");
 });

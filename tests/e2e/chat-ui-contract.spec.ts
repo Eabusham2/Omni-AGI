@@ -32,9 +32,10 @@ test("offline Electron design preview preserves drafts and navigation without pr
     const sendButton = page.getByLabel("Send message");
     await expect(composer).toBeVisible();
     await expect(page.getByRole("group", { name: "Message controls", exact: true }).getByRole("button")).toHaveCount(1);
-    await expect(page.getByRole("button", { name: "Add files", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Attach", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Learn", exact: true })).toBeVisible();
     await expect(page.getByText(
-      "Neural engine unavailable in this design preview. Drafts stay in the composer; no chat or learning runs."
+      "Preview only — no brain is connected. Sending and learning are unavailable."
     )).toBeVisible();
 
     const humanCount = await page.locator(".message--human").count();
@@ -58,8 +59,8 @@ test("offline Electron design preview preserves drafts and navigation without pr
     await expect(page.getByLabel("Steer current turn")).toHaveCount(0);
     await expect(page.getByLabel("Stop current turn")).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Data & training", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Data & training" })).toBeVisible();
+    await page.getByRole("button", { name: "Training & Evolution", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Training & Evolution" })).toBeVisible();
     await expect(page.locator(".workspace-header__chat-status")).toHaveCount(0);
     await page.getByRole("button", { name: "Back to conversation", exact: true }).click();
     await expect(composer).toBeVisible();
@@ -67,11 +68,9 @@ test("offline Electron design preview preserves drafts and navigation without pr
     await page.getByRole("button", { name: "Brain map", exact: true }).click();
     const wholeMap = page.getByRole("region", { name: "Whole brain map", exact: true });
     await expect(wholeMap.getByRole("heading", { name: "Brain Map", exact: true })).toBeVisible();
-    await expect(wholeMap.getByText("Whole-brain inspection is unavailable; no substitute map or model was created.", { exact: true })).toBeVisible();
-    for (const layer of ["Parameters and owners", "Ideas and neurons", "Connections"]) {
-      await expect(wholeMap.getByRole("checkbox", { name: layer, exact: true })).toBeChecked();
-    }
-    await expect(wholeMap.getByRole("button", { name: "Refresh whole brain", exact: true })).toBeDisabled();
+    await expect(wholeMap.getByText("Brain Map is unavailable in this UI-only preview.", { exact: true })).toBeVisible();
+    await expect(wholeMap.getByRole("checkbox")).toHaveCount(0);
+    await expect(wholeMap.getByRole("button", { name: "Refresh brain map", exact: true })).toBeDisabled();
     await expect(wholeMap.locator(".brain-map-graph")).toHaveCount(0);
     await expect(page.locator(".workspace-header__chat-status")).toHaveCount(0);
     await wholeMap.getByRole("button", { name: "Back to chat", exact: true }).click();

@@ -8,8 +8,8 @@ import managedEnvironments from "../../docs/v2/managed-environments.md?raw";
 import clipboard from "../../docs/v2/clipboard.md?raw";
 import apiTeacherModelDiscovery from "../../docs/v2/api-teacher-model-discovery.md?raw";
 
-const PACK_ID = "omni-v2-user-documentation-23";
-const PACK_VERSION = 23;
+const PACK_ID = "omni-v2-user-documentation-24";
+const PACK_VERSION = 24;
 const LICENSE = "PolyForm-Noncommercial-1.0.0-or-commercial-license";
 const REPOSITORY = "https://github.com/Eabusham2/Omni-AGI";
 

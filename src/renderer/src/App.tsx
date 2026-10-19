@@ -20,7 +20,6 @@ import {
   type BuildProgressEvent,
   type BuildResourceSelection,
   type CatalogEntry,
-  type ChatCancellationState,
   type ChatDeliveryReceiptState,
   type ChatMessage,
   type ChatQueueState,
@@ -31,27 +30,21 @@ import {
   type DeleteInstanceResult,
   type DatasetPreviewProgress,
   type DatasetResumeCandidate,
-  type GeneratedArtifact,
   type HardwareTier,
   type HardwareProfile as SystemHardwareProfile,
   type IngestResult,
   type MobileGatewayStatus,
   type MobilePairingSession,
-  type ModalityGenerationSettings,
   type PersistedDatasetCoverageSummary,
-  type PersistedSubstrateOverview,
   type RuntimeJob,
-  type InstalledModalityPack,
   type ToolInvocation,
   type ToolExecutionResult,
   type ToolPermissionRecord,
-  type AgentMergePreview,
   type ActionEvent,
   type AppearanceLayout,
   type AppearanceMode,
   type AppearancePalette,
   type AppearancePreferences,
-  type SubstratePage,
   type WorkspaceSnapshot,
   type StoragePoolMode,
   type SystemRamMode,
@@ -66,7 +59,6 @@ import type {
   BrainActiveModeResult,
   BrainSnapshotSummary
 } from "@shared/types";
-import { BRAIN_EXPORT_DISCLOSURE } from "@shared/brainExportDisclosure";
 import { chatInputCapacity } from "@shared/chatInput";
 import { chatHostSuspensionStatus } from "@shared/chatSuspension";
 import { pausedOutputLabel, savedChatSuspension } from "./chatSuspensionPresentation";
@@ -86,18 +78,17 @@ import type {
 } from "@shared/liveVoice";
 import { demoSummaries, makeDemoBrain } from "./demo";
 import { EvolutionWorkspace } from "./EvolutionWorkspace";
-import { BrainMapCortex } from "./BrainMapCortex";
-import { BrainMapSubstrateGraph, type BrainMapGraphEdge } from "./BrainMapSubstrateGraph";
-import { projectBrainMapContact, uniqueRegionLayoutNodes } from "./brainMapGraphProjection";
 import { ComposerSubmitControl } from "./ComposerSubmitControl";
-import { ChatAttachmentMenu } from "./ChatAttachmentMenu";
+import { UniversalSourcePicker } from "./UniversalSourcePicker";
+import "./universalSourcePicker.css";
+import "./streamlinedBrainControls.css";
+import { librarySelection, toggleLibrarySelection, selectVisibleLibraryBrains } from "./librarySelection";
 import { ChatQueueStack } from "./ChatQueueStack";
 import { UserQuestionPanel } from "./UserQuestionPanel";
 import { ChatDirectionStrip } from "./ChatDirectionStrip";
 import { useChatDirections } from "./useChatDirections";
 import { chatDirectionStripItem, isSteerDirectionMessage } from "./chatDirectionPresentation";
 import { chatMessageAttribution } from "./chatMessageAttribution";
-import { BestWorkSettings } from "./BestWorkSettings";
 import { McpAuthenticationPanel } from "./McpAuthenticationPanel";
 import { McpCredentialPanel } from "./McpCredentialPanel";
 import { McpPresetPicker } from "./McpPresetPicker";
@@ -111,17 +102,14 @@ import { McpInteractionPanel } from "./McpInteractionPanel";
 import { McpAppView } from "./McpAppView";
 import { HtmlArtifactView } from "./HtmlArtifactView";
 import { chatHtmlArtifactRequest } from "./htmlArtifactPresentation";
-import { TimeWorkspace } from "./TimeWorkspace";
 import { PluginManager } from "./PluginManager";
 import { PluginApprovalReviewView, PluginToolApprovalReviewView } from "./PluginApprovalReview";
 import { LearningWorkspace } from "./LearningWorkspace";
 import { ExternalAdvicePanel } from "./ExternalAdvicePanel";
 import { ActionReviewDetails } from "./ActionReviewDetails";
 import { BuildProgressStatus, StorageOperationTiming } from "./BuildProgressStatus";
-import { PluginThemeHost, loadPluginThemeSelection, savePluginThemeSelection, clearPluginThemeSelection } from "./PluginThemes";
-import { PortableWorkspaceControls } from "./PortableWorkspaceControls";
+import { PluginThemeHost, savePluginThemeSelection, clearPluginThemeSelection } from "./PluginThemes";
 import { applyPortablePresentationOnce } from "./portablePresentation";
-import { DatasetParserPicker, useDatasetParserPicker } from "./DatasetParserPicker";
 import { PluginRuntimeContributionsProvider, PluginRuntimeSlot } from "./PluginRuntimeContributions";
 import { PluginRuntimeApprovalQueue } from "./PluginRuntimeApprovals";
 import { SparseSubstrateJobsProvider, SparseSubstrateJobsPanel, SparseSubstrateJobCard, useSparseSubstrateActionJob } from "./SparseSubstrateJobs";
@@ -145,7 +133,6 @@ import { WholeBrainMap } from "./WholeBrainMap";
 import { InstanceLifecycleControls } from "./InstanceLifecycleControls";
 import { InheritedTaskFilesReview } from "./InheritedTaskFilesReview";
 import { ImaginationCaptureControls } from "./ImaginationCaptureControls";
-import { RouterSpikeView } from "./RouterSpikeView";
 import { ProcessMemorySettings } from "./ProcessMemorySettings";
 import { ToastNotice } from "./ToastNotice";
 import { ApiTeacherPanel } from "./ApiTeacherPanel";
@@ -156,11 +143,6 @@ import type { ToolDescription } from "../../shared/toolDescriptions";
 import type { InheritedTaskFileReview } from "../../shared/inheritedTaskFiles";
 import type { InstanceLifecycleState } from "../../shared/instanceLifecycle";
 import type { DeviceResourceSettings } from "@shared/deviceResources";
-import {
-  presentJournalKind,
-  presentTraceEvidence,
-  presentTraceSignalMeasures
-} from "./memoryPresentation";
 import { Icon, type IconName } from "./icons";
 import {
   createTextFrameBatcher,
@@ -168,12 +150,6 @@ import {
   patchChatActionPreview,
   type TextFrameBatcher
 } from "./chatStreaming";
-import {
-  imaginationRevisionCopy,
-  imaginationSeedCopy,
-  jobImaginationMedia,
-  persistedArtifactMediaPresentation
-} from "./imaginationPresentation";
 import {
   anchoredTimelineScrollTop,
   latestChatTimelineWindow,
@@ -197,7 +173,6 @@ import {
 } from "./chatGenerationLifecycle";
 import {
   EMPTY_CHAT_WORKSPACE_ACTIVITY,
-  dataActionAvailableDuringTurn,
   isChatVisibleLearningJob,
   mergeChatVisibleLearningJob,
   workspaceChatActivityPresentation,
@@ -297,8 +272,6 @@ import {
   initialManualSystemRamSharePercent
 } from "./resourceEnvelope";
 import {
-  compactParameterCount,
-  nativeConnectionLabel,
   neuralParameterAccounting,
   neuralResourceRuntimeRows,
   type NeuralParameterAccountingPresentation
@@ -311,7 +284,6 @@ import {
   conciseUiMessage,
   isPristineBrainSummary,
   recoveryPointCreationErrorMessage,
-  substrateOverviewCount,
   utf8DraftTokenCount
 } from "./uiPresentation";
 import {
@@ -335,10 +307,6 @@ import {
 } from "./runtimeJobPresentation";
 import { webLearningUrlAllowed } from "./remoteUrlPolicy";
 import {
-  AgentForkSubmissionGate,
-  agentForkCompletionPresentation
-} from "./agentForkPresentation";
-import {
   chatCancellationStatus,
   chatQueueStatus
 } from "./chatRuntimePresentation";
@@ -360,16 +328,9 @@ const WORKSPACE_TELEMETRY_REFRESH_MS = 1_250;
 type WorkspaceView =
   | "chat"
   | "data"
-  | "learn"
-  | "fact-check"
-  | "schedule"
   | "map"
-  | "trace"
-  | "imagine"
   | "tools"
-  | "settings"
-  | "agents"
-  | "evolution";
+  | "settings";
 type HardwareChoice = "auto" | "micro" | "personal" | "gpu" | "workstation";
 type PermissionLevel = "off" | "ask" | "auto" | "full";
 type ModalityId = "vision" | "image" | "audio" | "video";
@@ -453,17 +414,10 @@ const recipeMeta: Array<{
 
 const navItems: Array<{ id: WorkspaceView; label: string; icon: IconName }> = [
   { id: "chat", label: "Conversation", icon: "chat" },
-  { id: "data", label: "Data & training", icon: "database" },
-  { id: "learn", label: "Learn", icon: "memory" },
-  { id: "fact-check", label: "Fact Check", icon: "search" },
-  { id: "schedule", label: "Time & schedules", icon: "activity" },
+  { id: "data", label: "Training & Evolution", icon: "database" },
   { id: "map", label: "Brain map", icon: "brain" },
-  { id: "trace", label: "Trace & journal", icon: "trace" },
-  { id: "imagine", label: "Imagination", icon: "sparkles" },
   { id: "tools", label: "Tools & permissions", icon: "terminal" },
-  { id: "settings", label: "Device & runtime", icon: "settings" },
-  { id: "agents", label: "Forks & agents", icon: "fork" },
-  { id: "evolution", label: "Evolution", icon: "pulse" }
+  { id: "settings", label: "Settings", icon: "settings" }
 ];
 
 const buildToolProtocolIds: Record<string, string[]> = {
@@ -1108,24 +1062,71 @@ function LibraryPage({
   onDelete,
   onBuild,
   onImport,
+  onExport,
   onMerged,
-  demo,
-  portableControls
+  demo
 }: {
   summaries: BrainSummary[];
   loading: boolean;
   onOpen: (summary: BrainSummary | string) => void;
-  onDuplicate: (summary: BrainSummary) => void;
-  onDelete: (summary: BrainSummary) => void;
+  onDuplicate: (summaries: BrainSummary[]) => Promise<void>;
+  onDelete: (summaries: BrainSummary[]) => void;
   onBuild: () => void;
   onImport: () => void;
+  onExport: (summaries: BrainSummary[], mode?: BrainExportMode) => Promise<void>;
   onMerged: () => void;
   demo: boolean;
-  portableControls?: import("react").ReactNode;
 }) {
   const [query, setQuery] = useState("");
+  const [selecting, setSelecting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [pendingAction, setPendingAction] = useState<"duplicate" | "export" | null>(null);
+  const [actionError, setActionError] = useState("");
+  const actionInFlight = useRef(false), libraryAlive = useRef(true);
+  const exportMenu = useRef<HTMLDetailsElement>(null);
   const visible = summaries.filter((brain) => brain.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+  const selection = librarySelection(summaries, selectedIds, visible);
+  const busy = loading || pendingAction !== null;
   const runtimeNotice = libraryRuntimePresentation(demo);
+  useEffect(() => { libraryAlive.current = true; return () => { libraryAlive.current = false; }; }, []);
+  useEffect(() => {
+    const closeOutside = (event: PointerEvent): void => {
+      if (exportMenu.current?.open && event.target instanceof Node && !exportMenu.current.contains(event.target)) exportMenu.current.open = false;
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => document.removeEventListener("pointerdown", closeOutside);
+  }, []);
+  useEffect(() => {
+    const available = new Set(summaries.map(brain => brain.id));
+    setSelectedIds(current => {
+      const next = new Set([...current].filter(id => available.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [summaries]);
+  const closeExportMenu = (restoreFocus = false): void => {
+    if (!exportMenu.current) return;
+    exportMenu.current.open = false;
+    if (restoreFocus) exportMenu.current.querySelector("summary")?.focus();
+  };
+  const toggleBrain = (id: string): void => {
+    if (busy) return;
+    closeExportMenu();
+    setMergeOpen(false); setActionError("");
+    setSelectedIds(current => toggleLibrarySelection(current, id));
+  };
+  const manage = async (action: "duplicate" | "export", mode: BrainExportMode = "current"): Promise<void> => {
+    if (actionInFlight.current || busy || !selection.selected.length) return;
+    const captured = [...selection.selected];
+    closeExportMenu(action === "export");
+    actionInFlight.current = true; setPendingAction(action); setActionError(""); setMergeOpen(false);
+    try {
+      if (action === "duplicate") await onDuplicate(captured);
+      else await onExport(captured, mode);
+    } catch (error) {
+      if (libraryAlive.current) setActionError(error instanceof Error ? error.message : `The selected brains could not be ${action === "duplicate" ? "duplicated" : "exported"}.`);
+    } finally { actionInFlight.current = false; if (libraryAlive.current) setPendingAction(null); }
+  };
 
   return (
     <main className="library-page">
@@ -1144,11 +1145,11 @@ function LibraryPage({
             Create a private, adaptive intelligence whose experiences become pathways—not prompt history.
           </p>
           <div className="library-hero__actions">
-            <Button kind="primary" icon="plus" onClick={onBuild}>
+            <Button kind="primary" icon="plus" onClick={onBuild} disabled={busy}>
               Build a new brain
             </Button>
-            <Button icon="upload" onClick={onImport} title="Import a portable native OmniCortex brain">
-              Import .omni
+            <Button icon="upload" onClick={onImport} disabled={busy} title="Import a complete .omni brain export">
+              Import brain
             </Button>
           </div>
           <div className="privacy-note">
@@ -1164,24 +1165,54 @@ function LibraryPage({
       </section>
 
       <section className="library-content">
-        <FullMergePanel summaries={summaries} api={window.omni} onPublished={onMerged} onOpen={onOpen} />
-        {portableControls}
         <div className="section-heading">
           <div>
-            <h2>Your instances</h2>
-            <p>{loading ? "Looking for local instances…" : `${summaries.length} independent identities on this device`}</p>
+            <h2>Your brains</h2>
+            <p>{loading ? "Looking for saved brains…" : `${summaries.length} saved ${summaries.length === 1 ? "brain" : "brains"}`}</p>
           </div>
-          <label className="search-field">
+          <div className="library-heading-actions"><label className="search-field">
             <Icon name="search" size={16} />
             <input
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => { closeExportMenu(); setQuery(event.target.value); }}
               placeholder="Search brains"
               aria-label="Search brains"
             />
-            <kbd>Ctrl K</kbd>
           </label>
+          {summaries.length || selecting ? <Button disabled={busy} aria-pressed={selecting} onClick={() => {
+            closeExportMenu(); setSelecting(current => !current); setSelectedIds(new Set()); setMergeOpen(false); setActionError("");
+          }}>{selecting ? "Done" : "Select"}</Button> : null}</div>
         </div>
+
+        {selecting ? <div className="library-selection-toolbar" role="toolbar" aria-label="Manage selected brains">
+          <span className="library-selection-count" role="status">{selection.selected.length} selected{selection.hiddenSelected ? ` · ${selection.hiddenSelected} outside this search` : ""}</span>
+          <Button disabled={busy || !visible.length || selection.allVisibleSelected} onClick={() => {
+            closeExportMenu(); setSelectedIds(current => selectVisibleLibraryBrains(current, visible)); setMergeOpen(false);
+          }}>{query ? "Select all results" : "Select all"}</Button>
+          <Button disabled={busy || !selection.selected.length} onClick={() => { closeExportMenu(); setSelectedIds(new Set()); setMergeOpen(false); }}>Clear</Button>
+          <span className="library-selection-divider" aria-hidden="true" />
+          <Button icon="copy" disabled={busy || !selection.selected.length} onClick={() => void manage("duplicate")}>Duplicate</Button>
+          <details className="library-export-menu" ref={exportMenu} onKeyDown={(event) => {
+            if (event.key === "Escape") { event.preventDefault(); closeExportMenu(true); }
+          }}>
+            <summary className="button button--secondary" aria-disabled={busy || !selection.selected.length} tabIndex={busy || !selection.selected.length ? -1 : 0} onClick={(event) => {
+              if (busy || !selection.selected.length) event.preventDefault();
+            }}><Icon name="download" size={16} /><span>Export brain</span><span aria-hidden="true">▾</span></summary>
+            <div className="library-export-options" role="group" aria-label="Brain export options">
+              <button type="button" className="library-export-option" disabled={busy || !selection.selected.length} onClick={() => void manage("export", "current")}><span>Current brain</span><small>Complete saved state · default</small></button>
+              <button type="button" className="library-export-option" disabled={busy || !selection.selected.length} onClick={() => void manage("export", "origin")}><span>Original origin</span><small>Original recovery state</small></button>
+              <button type="button" className="library-export-option" disabled={busy || !selection.selected.length} onClick={() => void manage("export", "referenced")}><span>Local reference</span><small>Depends on this device's saved blobs</small></button>
+            </div>
+          </details>
+          <Button disabled={busy || !selection.canMerge || !window.omni?.brain.startFullMerge} title={!window.omni?.brain.startFullMerge ? "Merging requires the desktop native runtime." : selection.mergeReason || "Create a new brain while preserving every selected parent."} onClick={() => { closeExportMenu(); setActionError(""); setMergeOpen(true); }}>Merge</Button>
+          <Button kind="danger" disabled={busy || !selection.selected.length} onClick={() => {
+            closeExportMenu(); setMergeOpen(false); onDelete([...selection.selected]);
+          }}>Delete</Button>
+        </div> : null}
+        {pendingAction ? <p className="library-management-status" role="status">{pendingAction === "duplicate" ? "Duplicating selected brains…" : "Exporting selected brains…"}</p> : null}
+        {actionError ? <p className="library-management-error" role="alert">{actionError}</p> : null}
+        <FullMergePanel summaries={summaries} selectedParentIds={selection.selected.map(brain => brain.id)} open={mergeOpen}
+          onClose={() => setMergeOpen(false)} api={window.omni} onPublished={onMerged} onOpen={onOpen} />
 
         {visible.length > 0 ? (
           <div className="brain-grid">
@@ -1198,12 +1229,19 @@ function LibraryPage({
               });
               return (
                 <article
-                  className="brain-card"
+                  className={cx("brain-card", selecting && "brain-card--selectable", selecting && selectedIds.has(brain.id) && "brain-card--selected")}
                   key={brain.id}
-                  tabIndex={0}
-                  onClick={() => onOpen(brain)}
+                  tabIndex={busy ? -1 : 0}
+                  role={selecting ? "checkbox" : "button"}
+                  aria-label={`${selecting ? "Select" : "Open"} brain ${brain.name}`}
+                  aria-checked={selecting ? selectedIds.has(brain.id) : undefined}
+                  aria-disabled={busy}
+                  onClick={() => { if (!busy) { if (selecting) toggleBrain(brain.id); else onOpen(brain); } }}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") onOpen(brain);
+                    if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+                      event.preventDefault();
+                      if (!busy) { if (selecting) toggleBrain(brain.id); else onOpen(brain); }
+                    }
                   }}
                 >
                   <div className="brain-card__top">
@@ -1211,30 +1249,7 @@ function LibraryPage({
                       <Icon name={meta.icon} size={25} />
                       {brain.activeMode ? <span className="brain-avatar__live" title="Active Mode" /> : null}
                     </div>
-                    <div className="brain-card__instance-actions">
-                      <button
-                        className="brain-card__duplicate"
-                        aria-label={`Duplicate instance ${brain.name}`}
-                        title={`Duplicate instance ${brain.name} with copy-on-write neural storage`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onDuplicate(brain);
-                        }}
-                      >
-                        <Icon name="copy" size={13} /> Duplicate instance
-                      </button>
-                      <button
-                        className="brain-card__delete"
-                        aria-label={`Delete instance ${brain.name}`}
-                        title={`Permanently delete instance ${brain.name}`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onDelete(brain);
-                        }}
-                      >
-                        <Icon name="close" size={13} />
-                      </button>
-                    </div>
+                    {selecting ? <span className="library-selection-indicator" aria-hidden="true">{selectedIds.has(brain.id) ? <Icon name="check" size={16} /> : null}</span> : null}
                   </div>
                   <div className="brain-card__identity">
                     <h3>{brain.name}</h3>
@@ -1284,19 +1299,12 @@ function LibraryPage({
                   <div className="brain-card__footer">
                     <span>{relativeTime(brain.updatedAt)}</span>
                     <span className="brain-card__open">
-                      Open mind <Icon name="arrow" size={14} />
+                      {selecting ? selectedIds.has(brain.id) ? "Selected" : "Select brain" : <>Open mind <Icon name="arrow" size={14} /></>}
                     </span>
                   </div>
                 </article>
               );
             })}
-            <button className="new-brain-card" onClick={onBuild}>
-              <span className="new-brain-card__plus">
-                <Icon name="plus" size={23} />
-              </span>
-              <strong>Build another instance</strong>
-              <span>Create one independent identity and continuous chat</span>
-            </button>
           </div>
         ) : (
           <div className="library-empty">
@@ -1323,12 +1331,6 @@ function LibraryPage({
             {runtimeNotice.badge ? <span className="system-card__pill system-card__pill--demo">
               {runtimeNotice.badge}
             </span> : null}
-          </div>
-          <div className="tip-card">
-            <Icon name="sparkles" size={18} />
-            <span>
-              <strong>Storage:</strong> Each card is one live identity. Origins are recovery points, shared by content hash—not extra running brains.
-            </span>
           </div>
         </div>
       </section>
@@ -1774,6 +1776,7 @@ function SimpleBuildWizard({
     try {
       await onCreate(extendedConfig, {
         ...extras,
+        modalities: { vision: true, image: true, audio: true, video: true },
         initialTraining: extras.initialResources.length > 0
       });
     } finally {
@@ -1946,17 +1949,12 @@ function SimpleBuildWizard({
         <span><Icon name="memory" size={22} /></span>
         <div>
           <strong>Memory</strong>
-          <p>
-            Each whole experience changes what is active now, spreads through related pathways,
-            and can be rehearsed into longer-lasting learning. Novelty, timing, reuse, importance,
-            prediction, interference, stability, and decay continuously decide what strengthens or
-            fades; there is no manual memory step or routine second source copy.
-          </p>
+          <p>Working memory holds current activity. Learning updates neural state over time.</p>
           <div className="working-memory-planner">
             <div className="working-memory-planner__heading">
               <span>
-                <strong>Active context &amp; neural memory</strong>
-                <small>Measured from the live device, model, accelerator, and storage before Build and every start.</small>
+                <strong>Working memory</strong>
+                <small>Sized for this brain and device; checked again before loading.</small>
               </span>
               <em>
                 {memoryPlanPending
@@ -2111,6 +2109,8 @@ function SimpleBuildWizard({
                 </span>
               </div>
             ) : null}
+            <details className="brain-settings-disclosure">
+              <summary>GPU memory &amp; drives</summary>
             <DeviceAllocationSelector catalog={window.omni?.catalog} settings={effectiveDeviceResources}
               ramMode={systemRamMode} ramPercent={systemRamSharePercent} disabled={building}
               plan={memoryPlan?.deviceResources} planPending={memoryPlanPending}
@@ -2120,6 +2120,7 @@ function SimpleBuildWizard({
                 if (ram) { setSystemRamMode(ram.mode); setSystemRamSharePercent(ram.percent); }
                 if (selectionId) setExtras((current) => ({ ...current, spillPoolSelectionId: selectionId }));
               }} />
+            </details>
             <details className="system-ram-budget">
               <summary>
                 <span>
@@ -2320,47 +2321,13 @@ function SimpleBuildWizard({
       <div className="builder-stage__intro">
         <span className="stage-number">02</span>
         <div>
-          <h2 tabIndex={-1}>What can it experience first?</h2>
-          <p>Enable shared neural senses now. You can add whole datasets, folders, web sources, or media later from the same chat.</p>
+          <h2 tabIndex={-1}>Initial learning</h2>
+          <p>Add files, media, folders, or a website. Text, vision, audio, and video are included.</p>
         </div>
       </div>
-      <h3 className="minor-heading">Perception and imagination</h3>
-      <div className="modality-grid">
-        {(
-          [
-            ["vision", "Vision", "Understand images in the shared workspace.", "eye"],
-            ["image", "Image imagination", "Generate from internal idea assemblies.", "image"],
-            ["audio", "Audio", "Encode and imagine sound or speech.", "volume"],
-            ["video", "Video", "Learn and imagine temporal scenes.", "video"]
-          ] as const
-        ).map(([id, title, copy, icon]) => (
-          <div
-            key={id}
-            className="modality-card is-selected"
-          >
-            <span className="modality-card__icon"><Icon name={icon} size={20} /></span>
-            <span><strong>{title}</strong><p>{copy}</p></span>
-            <span className="modality-card__check"><Icon name="check" size={12} /></span>
-          </div>
-        ))}
-      </div>
-      <h3 className="minor-heading minor-heading--tools">Initial learning source</h3>
       <div className="build-resource-actions">
-        <Button icon="file" onClick={() => void selectInitialResource("files")}>
-          Files & datasets
-        </Button>
-        <Button icon="image" onClick={() => void selectInitialResource("files", "images")}>
-          Images
-        </Button>
-        <Button icon="volume" onClick={() => void selectInitialResource("files", "audio")}>
-          Audio
-        </Button>
-        <Button icon="video" onClick={() => void selectInitialResource("files", "video")}>
-          Video
-        </Button>
-        <Button icon="archive" onClick={() => void selectInitialResource("folder")}>
-          Whole folder
-        </Button>
+        <UniversalSourcePicker label="Add source" icon="plus" disabled={building}
+          onSelect={selection => void selectInitialResource(selection)} />
         <label className="build-resource-url">
           <Icon name="search" size={15} />
           <input
@@ -2490,16 +2457,15 @@ function SimpleBuildWizard({
         <dl>
           <div><dt>Identity</dt><dd>One continuous adaptive mind</dd></div>
           <div><dt>Learning</dt><dd>Continuous · whole-experience adaptation</dd></div>
-          <div><dt>Active context</dt><dd>{memoryPlan ? `${memoryPlan.context.selectedTokens.toLocaleString()} tokens · RAM resident` : "Hardware-sized automatically"}</dd></div>
-          <div><dt>Omni RAM</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.resources.systemRamBudgetBytes)} · ${memoryPlan.resources.systemRamSharePercent}% safe pool` : "Measuring device"}</dd></div>
+          <div><dt>Working memory</dt><dd>{memoryPlan ? `${memoryPlan.context.selectedTokens.toLocaleString()} tokens` : "Hardware-sized automatically"}</dd></div>
+          <div><dt>RAM budget</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.resources.systemRamBudgetBytes)} · ${memoryPlan.resources.systemRamSharePercent}% after system reserve` : "Measuring device"}</dd></div>
           <div><dt>Shared storage</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.resources.sharedStoragePoolBytes)} · ${storagePoolMode === "auto" ? "Auto" : "Custom"}` : "Measuring device"}</dd></div>
           <div><dt>Disk space left</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.diskSpace.projectedRemainingBytes)} · ${formatBytes(memoryPlan.diskSpace.projectedAboveReserveBytes)} above reserve` : "Measuring device"}</dd></div>
-          <div><dt>Neural memory</dt><dd>{memoryPlan ? `${memoryPlan.selectedItems.toLocaleString()} recurrent/paged items${memoryPlan.offload.required ? " · storage assisted" : ""}` : "Hardware-sized automatically"}</dd></div>
           <div><dt>Native core</dt><dd>{memoryPlan?.architecture ? `${memoryPlan.architecture.exactLogicalParameterCount.toLocaleString()} logical neural parameters · locally initialized` : "Calculating exact architecture"}</dd></div>
           <div><dt>System access</dt><dd>{!systemAccessEnabled ? "Off" : fullAuthorityEnabled ? "Full Authority" : "On · risky actions ask"}</dd></div>
           <div><dt>Self-improvement</dt><dd>Available under chosen access</dd></div>
           <div><dt>First learning</dt><dd>{extras.initialResources.length ? `Tool basics + ${extras.initialResources.length} queued source${extras.initialResources.length === 1 ? "" : "s"} · ${formatBytes(selectedTrainingBytes)} sizing input` : "Tool basics only · language starts primitive"}</dd></div>
-          <div><dt>Modalities</dt><dd>{Object.values(extras.modalities).filter(Boolean).length} enabled</dd></div>
+          <div><dt>Inputs &amp; imagination</dt><dd>Text, vision, audio, video</dd></div>
           <div><dt>Behavioral prompt / RLHF</dt><dd>None</dd></div>
         </dl>
       </div>
@@ -2590,7 +2556,6 @@ function WorkspaceShell({
   view,
   onView,
   onLibrary,
-  onDuplicate,
   onActiveModeChange,
   onBrainChange,
   onToast
@@ -2599,7 +2564,6 @@ function WorkspaceShell({
   view: WorkspaceView;
   onView: (view: WorkspaceView) => void;
   onLibrary: () => void;
-  onDuplicate: () => void;
   onActiveModeChange: (result: BrainActiveModeResult) => Promise<void>;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
@@ -2771,18 +2735,6 @@ function WorkspaceShell({
                 <Icon name={compactInspectorOpen ? "close" : "brain"} size={16} />
               </button>
             ) : null}
-            <button
-              className="workspace-duplicate"
-              aria-label={chatActivity.turnActive
-                ? `Duplicate instance ${brain.name}; waiting for current reply`
-                : `Duplicate instance ${brain.name}`}
-              title={chatActivity.turnActive
-                ? "Waiting for the current reply; return to Conversation to Queue or Steer"
-                : "Duplicate this instance as an independent copy-on-write identity"}
-              onClick={() => runOutsideForegroundTurn(onDuplicate)}
-            >
-              <Icon name="copy" size={14} /> <span>Duplicate instance</span>
-            </button>
           </div>
         </header>
         <McpInteractionPanel brainId={brain.id} />
@@ -2800,6 +2752,7 @@ function WorkspaceShell({
           inheritedExecutionId={instanceState?.inheritedExecutions?.entries.find(entry => entry.status === "queued" || entry.status === "suspended")?.id}
           hidden={view !== "chat"}
           onBrainChange={onBrainChange}
+          onActiveModeChange={onActiveModeChange}
           onToast={onToast}
           onNavigate={onView}
           onActivityChange={setChatActivity}
@@ -2808,7 +2761,7 @@ function WorkspaceShell({
           <div className={cx("workspace-view-host", viewWaitsForTurn && "is-waiting")}>
             <div
               className="workspace-view-host__content"
-              inert={viewWaitsForTurn || (!runtimeLoaded && view !== "settings" && view !== "tools" && view !== "trace" && view !== "schedule") || undefined}
+              inert={viewWaitsForTurn || (!runtimeLoaded && view !== "settings" && view !== "tools") || undefined}
               aria-busy={viewWaitsForTurn || undefined}
             >
               {view === "data" ? (
@@ -2818,18 +2771,10 @@ function WorkspaceShell({
                   onBack={() => onView("chat")}
                   onBrainChange={onBrainChange}
                   onToast={onToast}
+                  onOpenPermissions={() => onView("tools")}
                 />
-              ) : view === "learn" || view === "fact-check" ? (
-                <LearningWorkspace brainId={brain.id} mode={view === "learn" ? "specific-learn" : "fact-check"}
-                  api={window.omni?.learning} questions={window.omni?.questions} data={window.omni?.data} localTeacher={window.omni?.localTeacher} />
-              ) : view === "schedule" ? (
-                <TimeWorkspace key={brain.id} brainId={brain.id} onToast={onToast} onActiveMode={() => onView("settings")} />
               ) : view === "map" ? (
                 <BrainMapWorkspace brain={brain} onBack={() => onView("chat")} />
-              ) : view === "trace" ? (
-                <TraceWorkspace brain={brain} />
-              ) : view === "imagine" ? (
-                <ImaginationWorkspace brain={brain} onToast={onToast} />
               ) : view === "tools" ? (
                 <ToolsWorkspace key={brain.id} brain={brain} onBrainChange={onBrainChange} onToast={onToast} />
               ) : view === "settings" ? (
@@ -2838,19 +2783,10 @@ function WorkspaceShell({
                   brain={brain}
                   foregroundTurnActive={chatActivity.turnActive && chatActivity.phase !== "reply-complete-learning" && chatActivity.phase !== "action-result-learning"}
                   instanceState={instanceState} onReviewLoad={() => setLoadReviewRequest((value) => value + 1)}
-                  onActiveModeChange={onActiveModeChange}
                   onBrainChange={onBrainChange}
                   onToast={onToast}
                 />
-              ) : view === "agents" ? (
-                <AgentsWorkspace brain={brain} onBrainChange={onBrainChange} onToast={onToast} />
-              ) : (
-                <EvolutionWorkspace
-                  brain={brain}
-                  onOpenPermissions={() => onView("tools")}
-                  onToast={onToast}
-                />
-              )}
+              ) : null}
             </div>
             {viewWaitsForTurn ? (
               <div className="workspace-view-host__waiting" role="status" aria-live="polite">
@@ -3025,7 +2961,7 @@ function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, 
         <ChatImaginationMedia event={event} placement="audit" />
         {studioUiDestination(event) ? (
           <span className="chat-action-card__artifact">
-            <Icon name={studioUiDestination(event) === "imagine" ? "sparkles" : "settings"} size={14} /> {studioUiDestination(event) === "imagine" ? "Creativity workspace" : "Permissions workspace"} opened locally · reversible
+            <Icon name={studioUiDestination(event) === "imagine" ? "sparkles" : "settings"} size={14} /> {studioUiDestination(event) === "imagine" ? "Imagination stays in Conversation" : "Permissions available in Tools"}
           </span>
         ) : null}
         {mcpAppViewId ? <McpAppView brainId={event.brainId} viewId={mcpAppViewId} /> : null}
@@ -3219,6 +3155,7 @@ function ChatWorkspace({
   onBrainChange,
   onToast,
   onNavigate,
+  onActiveModeChange,
   onActivityChange
 }: {
   brain: BrainDocument;
@@ -3229,6 +3166,7 @@ function ChatWorkspace({
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
   onNavigate: (view: WorkspaceView) => void;
+  onActiveModeChange: (result: BrainActiveModeResult) => Promise<void>;
   onActivityChange: (activity: ChatWorkspaceActivitySnapshot) => void;
 }) {
   const [input, setInput] = useState("");
@@ -3237,6 +3175,19 @@ function ChatWorkspace({
   const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
   const [captureOpen, setCaptureOpen] = useState(false);
+  const [chatPreferenceBusy, setChatPreferenceBusy] = useState<"best-work" | "active" | null>(null);
+  const [chatPreferenceStatus, setChatPreferenceStatus] = useState("");
+  const chatPreferenceOwner = useRef({ brainId: brain.id, pending: false, active: true });
+  if (chatPreferenceOwner.current.brainId !== brain.id) chatPreferenceOwner.current = { brainId: brain.id, pending: false, active: true };
+  useEffect(() => {
+    const owner = chatPreferenceOwner.current;
+    owner.active = true;
+    setChatPreferenceBusy(null);
+    setChatPreferenceStatus("");
+    return () => {
+      owner.active = false;
+    };
+  }, [brain.id]);
   const [attachmentReceipts, setAttachmentReceipts] = useState<
     AttachmentLearningReceipt[]
   >([]);
@@ -3526,7 +3477,7 @@ function ChatWorkspace({
     // A brain-originated creativity action stays in the chronological chat as
     // an expandable artifact instead of unexpectedly replacing the page.
     if (destination && event.action.source === "human") {
-      onNavigateRef.current(destination);
+      onNavigateRef.current(destination === "imagine" ? "chat" : destination);
     }
   };
 
@@ -5498,6 +5449,38 @@ function ChatWorkspace({
   const liveReplyKey = activeTurnId ? `live-${activeTurnId}` : "";
   const liveReplyHasActions = Boolean(replyActionsBySource.get(liveReplyKey)?.length);
 
+  const changeChatPreference = async (kind: "best-work" | "active", enabled: boolean): Promise<void> => {
+    const owner = chatPreferenceOwner.current;
+    if (!window.omni || !owner.active || owner.pending || turnActive) return;
+    owner.pending = true;
+    setChatPreferenceBusy(kind);
+    setChatPreferenceStatus("");
+    try {
+      if (kind === "active") {
+        const result = await window.omni.brain.setActiveMode(brain.id, enabled);
+        if (chatPreferenceOwner.current !== owner || !owner.active) return;
+        await onActiveModeChange(result);
+        if (chatPreferenceOwner.current !== owner || !owner.active) return;
+        const switched = result.deactivated.map(item => item.name).join(", ");
+        setChatPreferenceStatus(enabled && switched ? `Active mode enabled; ${switched} switched off.` : `Active mode ${enabled ? "enabled" : "off"}.`);
+      } else {
+        const updated = await window.omni.brain.update(brain.id, { ...brain.config, bestWorkEnabled: enabled });
+        if (chatPreferenceOwner.current !== owner || !owner.active) return;
+        onBrainChange(updated);
+        setChatPreferenceStatus(`Best Work ${enabled ? "enabled" : "off"}.`);
+      }
+    } catch (error) {
+      if (chatPreferenceOwner.current === owner && owner.active) {
+        const message = error instanceof Error ? error.message : "Chat preference could not be saved.";
+        setChatPreferenceStatus(message);
+        onToast(message);
+      }
+    } finally {
+      owner.pending = false;
+      if (chatPreferenceOwner.current === owner && owner.active) setChatPreferenceBusy(null);
+    }
+  };
+
   return (
     <div className="chat-layout" hidden={hidden}>
       <section
@@ -5532,10 +5515,24 @@ function ChatWorkspace({
           <div className="chat-attachment-drop" role="status">
             <span><Icon name="upload" size={24} /></span>
             <strong>Attach files, images, audio, or video</strong>
-            <small>Available for the task, without automatic training. Use Learn for folders.</small>
+            <small>Attached for this task. Choose Learn to train from a source.</small>
           </div>
         ) : null}
         <div className="chat-call-toolbar">
+          <div className="chat-work-preferences" role="group" aria-label="Chat modes">
+            <label title={turnActive ? "Change after the current reply finishes" : "Use extra computation on harder replies"}>
+              <input type="checkbox" checked={brain.config.bestWorkEnabled ?? false}
+                disabled={!window.omni || Boolean(chatPreferenceBusy) || turnActive}
+                onChange={event => void changeChatPreference("best-work", event.target.checked)} />
+              <span>Best Work</span>
+            </label>
+            <label title={turnActive ? "Change after the current reply finishes" : "Allow this brain to work during idle time; existing tool permissions still apply"}>
+              <input type="checkbox" checked={brain.config.idleCognition}
+                disabled={!window.omni || Boolean(chatPreferenceBusy) || turnActive}
+                onChange={event => void changeChatPreference("active", event.target.checked)} />
+              <span>Active mode</span>
+            </label>
+          </div>
           <button type="button" aria-expanded={callOpen} aria-controls="chat-call-panel"
             onClick={() => setCallOpen(current => !current)} title="Voice, camera and screen sharing">
             <Icon name="microphone" size={15} /> Call
@@ -5546,6 +5543,7 @@ function ChatWorkspace({
             <Icon name="video" size={15} /> Record
           </button>
         </div>
+        {chatPreferenceStatus ? <p className="chat-preference-status" role="status" aria-live="polite">{chatPreferenceStatus}</p> : null}
         <div id="chat-capture-panel" className="chat-capture-panel" hidden={!captureOpen}>
           {captureOpen && !hidden ? <ImaginationCaptureControls brainId={brain.id} api={window.omni?.modality.capture} /> : null}
         </div>
@@ -5686,8 +5684,6 @@ function ChatWorkspace({
                 contentProjection={renderPublicReply(entry.id, entry.message.content)}
                 brainId={brain.id}
                 brainName={brain.name}
-                onToast={onToast}
-                onTrace={() => onNavigate("trace")}
                 onOwnVoice={() => playSavedReplyWithOwnVoice(entry.message)}
                 ownVoicePhase={savedReplyVoice?.messageId === entry.message.id ? savedReplyVoice.phase : undefined}
                 ownVoiceUnavailable={!liveVoiceState?.capabilities.neuralVoice || liveVoiceState.enabled}
@@ -5911,25 +5907,14 @@ function ChatWorkspace({
               </div>
             ) : null}
             <div className="composer__bottom">
-              <ChatAttachmentMenu key={brain.id} active={!hidden}>
-                  {([
-                    ["files", "file", "Attach files"], ["images", "image", "Attach images"],
-                    ["audio", "volume", "Attach audio"], ["video", "video", "Attach video"]
-                  ] as const).map(([kind, icon, label]) => <button type="button" key={`task-${kind}`} disabled={taskAttachmentDraft.busy}
-                    onClick={() => { void taskAttachmentDraft.stage(kind); }}>
-                    <Icon name={icon} size={16} /> {label}</button>)}
-                  {([
-                    ["files", "file", "Learn from files"],
-                    ["images", "image", "Learn from images"],
-                    ["audio", "volume", "Learn from audio"],
-                    ["video", "video", "Learn from video"],
-                    ["folder", "archive", "Learn from a folder"]
-                  ] as const).map(([kind, icon, label]) => (
-                    <button type="button" key={kind} disabled={attaching || !runtimeLoaded} onClick={() => {
-                      void attachExperience(kind);
-                    }}><Icon name={icon} size={16} /> {label}</button>
-                  ))}
-              </ChatAttachmentMenu>
+              <div className="composer__source-actions">
+                <UniversalSourcePicker key={`attach-${brain.id}`} label="Attach" active={!hidden}
+                  disabled={taskAttachmentDraft.busy || !window.omni}
+                  onSelect={selection => void taskAttachmentDraft.stage(selection)} />
+                <UniversalSourcePicker key={`learn-${brain.id}`} label="Learn" icon="brain" active={!hidden}
+                  disabled={attaching || !runtimeLoaded || !window.omni}
+                  onSelect={selection => void attachExperience(selection)} />
+              </div>
               <span className="composer__input-count" title={composerTelemetryAriaLabel}
                 aria-label={`${draftTokenCount.toLocaleString()} input tokens. ${composerTelemetryAriaLabel}`}>
                 {draftTokenCount ? compactNumber(draftTokenCount) : ""}
@@ -5942,9 +5927,9 @@ function ChatWorkspace({
             </div>
           </div>
           {!window.omni ? <p className="composer-disclaimer" role="status">
-            Neural engine unavailable in this design preview. Drafts stay in the composer; no chat or learning runs.
+            Preview only — no brain is connected. Sending and learning are unavailable.
           </p> : null}
-          {window.omni && !runtimeLoaded ? <p className="composer-disclaimer" role="status">Load is required. Unload retains the supported turn; Stop is a separate action.</p> : null}
+          {window.omni && !runtimeLoaded ? <p className="composer-disclaimer" role="status">Load this brain to chat.</p> : null}
         </div>
         </CallLayout>
       </section>
@@ -5999,11 +5984,12 @@ function ChatWorkspace({
                 {!recentTrace ? <span className="organic-empty">Signals form after the first neural turn.</span> : null}
               </div>
             </div>
-            <button className="trace-link" onClick={() => onNavigate("trace")}>
-              <Icon name="trace" size={15} />
-              Open latest operational trace
-              <Icon name="arrow" size={13} />
-            </button>
+            {recentTrace ? <details className="chat-activity-details">
+              <summary>Latest activity</summary>
+              <ol>{recentTrace.steps.map((step, index) => <li key={`${recentTrace.id}-${index}`}>
+                <strong>{step.stage}</strong><span>{step.detail}</span>{step.value ? <small>{step.value}</small> : null}
+              </li>)}</ol>
+            </details> : null}
           </>
         ) : (
           <RuntimeCard
@@ -6022,8 +6008,6 @@ function MessageBubble({
   contentProjection,
   brainId,
   brainName,
-  onToast,
-  onTrace,
   onOwnVoice,
   ownVoicePhase,
   ownVoiceUnavailable,
@@ -6035,8 +6019,6 @@ function MessageBubble({
   contentProjection?: ReactNode;
   brainId: string;
   brainName: string;
-  onToast: (message: string) => void;
-  onTrace: () => void;
   onOwnVoice?: () => void;
   ownVoicePhase?: "preparing" | "playing";
   ownVoiceUnavailable?: boolean;
@@ -6143,12 +6125,6 @@ function MessageBubble({
             {message.content ? <button aria-label="Copy response" onClick={() => void navigator.clipboard?.writeText(message.content)}>
               <Icon name="copy" size={14} />
             </button> : null}
-            <button
-              aria-label="Show trace"
-              onClick={() => (message.traceId ? onTrace() : onToast("No trace is attached to this message."))}
-            >
-              <Icon name="trace" size={14} />
-            </button>
             {onOwnVoice && !uncommittedOutputState && !noReply && Boolean(message.content.trim()) ? (
               <button
                 aria-label={ownVoicePhase ? "Stop own waveform playback" : "Play reply with own neural voice"}
@@ -6484,9 +6460,6 @@ function RuntimeCard({
   workspace?: WorkspaceSnapshot | null;
   telemetry?: WorkspaceTelemetryPresentation;
 }) {
-  const stableConfig = brain.config as BrainConfig & {
-    recursiveImprovement?: boolean;
-  };
   const enabledTools = (brain.toolPermissions ?? [])
     .filter((permission) => permission.level !== "off")
     .map((permission) => permission.toolId);
@@ -6546,9 +6519,8 @@ function RuntimeCard({
         ? `${workspace.learning.fastNeuralMemory.connectionUpdatesTotal.toLocaleString()} local connection updates · ${workspace.learning.fastNeuralMemory.parameterStepsTotal.toLocaleString()} optimizer steps across all training`
         : "Measuring worker-owned neural counters…"
     ],
-    ["Recursive improvement", evolutionPermission === "off" || stableConfig.recursiveImprovement === false ? "Off" : `${evolutionPermission} permission`],
-    ["Tool schemas", enabledTools.length ? `${enabledTools.length} visible` : "None enabled"],
-    ["Trace detail", brain.config.traceDetail]
+    ["Program changes", `${evolutionPermission} permission`],
+    ["Tool schemas", enabledTools.length ? `${enabledTools.length} visible` : "None enabled"]
   ];
   return (
     <div className="runtime-card">
@@ -6595,7 +6567,6 @@ function DeviceRuntimeWorkspace({
   foregroundTurnActive = false,
   instanceState,
   onReviewLoad,
-  onActiveModeChange,
   onBrainChange,
   onToast
 }: {
@@ -6603,7 +6574,6 @@ function DeviceRuntimeWorkspace({
   foregroundTurnActive?: boolean;
   instanceState?: InstanceLifecycleState;
   onReviewLoad?: () => void;
-  onActiveModeChange: (result: BrainActiveModeResult) => Promise<void>;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
 }) {
@@ -6649,8 +6619,6 @@ function DeviceRuntimeWorkspace({
   const [mobileBusy, setMobileBusy] = useState(false);
   const [mobileError, setMobileError] = useState("");
   const [freshAttentionBusy, setFreshAttentionBusy] = useState(false);
-  const [activeModeBusy, setActiveModeBusy] = useState(false);
-  const [activeModeStatus, setActiveModeStatus] = useState("");
 
   useEffect(() => {
     const nextMode = brain.config.systemRamMode ?? "auto";
@@ -6939,47 +6907,13 @@ function DeviceRuntimeWorkspace({
     }
   };
 
-  const setActiveModeEnabled = async (enabled: boolean): Promise<void> => {
-    if (activeModeBusy) return;
-    if (!window.omni) {
-      const updated = {
-        ...brain,
-        config: { ...brain.config, idleCognition: enabled },
-        updatedAt: new Date().toISOString()
-      };
-      onBrainChange(updated);
-      setActiveModeStatus("Design preview only; no background scheduler is connected.");
-      return;
-    }
-    setActiveModeBusy(true);
-    setActiveModeStatus(enabled ? "Selecting this identity for Active Mode…" : "Turning Active Mode off…");
-    try {
-      const result = await window.omni.brain.setActiveMode(brain.id, enabled);
-      await onActiveModeChange(result);
-      const switched = result.deactivated.map((item) => item.name).join(", ");
-      const message = enabled
-        ? switched
-          ? `${brain.name} is now active; ${switched} was switched off.`
-          : `${brain.name} is now the Active Mode identity.`
-        : `${brain.name} will no longer think or learn while Studio is idle.`;
-      setActiveModeStatus(message);
-      onToast(message);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Active Mode could not be changed.";
-      setActiveModeStatus(message);
-      onToast(message);
-    } finally {
-      setActiveModeBusy(false);
-    }
-  };
-
   return (
     <div className="content-page resource-settings-page">
       <div className="content-page__title resource-settings-page__title">
         <div>
-          <span className="eyebrow-text">DEVICE RESOURCE POLICY</span>
-          <h1>Memory &amp; shared storage</h1>
-          <p>Change this instance&apos;s active context while one device-wide envelope governs its model, training, media, caches, and agents.</p>
+          <span className="eyebrow-text">BRAIN SETTINGS</span>
+          <h1>Memory &amp; storage</h1>
+          <p>Adjust working memory and the RAM, GPU memory, and drives this brain can use.</p>
         </div>
         <span
           className={cx("resource-settings-save-state", dirty && "is-dirty")}
@@ -6987,57 +6921,23 @@ function DeviceRuntimeWorkspace({
           aria-live="polite"
         >
           <Icon name={dirty ? "warning" : "check"} size={14} />
-          {dirty ? "Unsaved changes" : "Resource plan saved"}
+          {dirty ? "Unsaved changes" : "Settings saved"}
         </span>
       </div>
 
       <div className="resource-settings-layout">
-        {onReviewLoad ? <section className="surface resource-settings-residency"><h2>Instance residency</h2>
-          <p>{instanceState?.phase === "loaded" ? "Learned runtime loaded." : "Offline settings can be edited without loading neural state."}
+        {onReviewLoad ? <section className="surface resource-settings-residency"><h2>Brain loading</h2>
+          <p>{instanceState?.phase === "loaded" ? "Loaded and ready." : "Not loaded. You can edit settings before loading."}
             {instanceState?.resume ? ` The saved turn retains ${instanceState.resume.publishedTokens.toLocaleString()} published tokens.` : ""}</p>
-          <Button onClick={onReviewLoad}>Review Load and current fit</Button>
+          <Button onClick={onReviewLoad}>Check memory and load</Button>
         </section> : null}
-        <BestWorkSettings
-          key={`${brain.id}:${brain.config.bestWorkEnabled}:${brain.config.bestWorkExplorationBranches}`}
-          preferences={{ bestWorkEnabled: brain.config.bestWorkEnabled ?? false, bestWorkExplorationBranches: brain.config.bestWorkExplorationBranches ?? 16 }}
-          applyBlockedReason={foregroundTurnActive ? "Edit now; apply after the current reply finishes." : undefined}
-          onSave={async (preferences) => {
-            const config = { ...brain.config, ...preferences };
-            const updated = window.omni
-              ? await window.omni.brain.update(brain.id, config)
-              : { ...brain, config, updatedAt: new Date().toISOString() };
-            onBrainChange(updated);
-            onToast(window.omni ? "Best Work preference saved." : "Preview only; no model is connected.");
-          }}
-        />
-        <section className="surface active-mode-card" aria-labelledby="active-mode-heading">
-          <div className="resource-settings-section-heading">
-            <span className="resource-settings-section-icon"><Icon name="pulse" size={18} /></span>
-            <span>
-              <h2 id="active-mode-heading">Active Mode</h2>
-              <p>Choose the one identity allowed to think and learn during safe idle windows.</p>
-            </span>
-          </div>
-          <Toggle
-            checked={brain.config.idleCognition}
-            disabled={activeModeBusy || foregroundTurnActive}
-            onChange={(enabled) => void setActiveModeEnabled(enabled)}
-            label={brain.config.idleCognition ? "Active for this identity" : "Inactive for this identity"}
-            description="Enabling this identity atomically switches Active Mode off for every other brain. It does not change Ponder, personality, or foreground replies."
-          />
-          <p className="active-mode-card__status" role="status" aria-live="polite">
-            {foregroundTurnActive ? "The current reply continues normally. Switch the background identity after it finishes." : activeModeStatus || (brain.config.idleCognition
-              ? "Selected · bounded idle cognition may run when no foreground work is active."
-              : "Off · this identity remains stored and responds normally when you open it.")}
-          </p>
-        </section>
 
         <section className="surface resource-settings-policy" aria-labelledby="ram-policy-heading">
           <div className="resource-settings-section-heading">
             <span className="resource-settings-section-icon"><Icon name="memory" size={19} /></span>
             <span>
               <h2 id="ram-policy-heading">RAM allocation</h2>
-              <p>Auto is the default. Advanced limits are a share of memory left after the adaptive device/OS reserve.</p>
+              <p>Auto leaves room for the system. A custom limit uses a share of the remaining memory.</p>
             </span>
           </div>
 
@@ -7120,12 +7020,12 @@ function DeviceRuntimeWorkspace({
             <div className="resource-settings-section-heading">
               <span className="resource-settings-section-icon"><Icon name="brain" size={18} /></span>
               <span>
-                <h2>Active context</h2>
-                <p>The current token window and hottest activity stay in RAM. Cold attention can use the designated storage pool while experience moves through neural memory.</p>
+                <h2>Working memory</h2>
+                <p>Recent activity stays in faster memory. Older attention can move to the storage pool.</p>
               </span>
             </div>
             <fieldset className="resource-settings-mode-picker resource-settings-mode-picker--three">
-              <legend>Active-context policy</legend>
+              <legend>Working-memory size</legend>
               {(
                 [
                   ["auto", "Auto", "Measured speed and capability sweet spot", "sparkles"],
@@ -7149,7 +7049,7 @@ function DeviceRuntimeWorkspace({
               <div className="resource-settings-custom-cap">
                 <label htmlFor="settings-context-tokens">
                   <span>
-                    <strong>Active context tokens</strong>
+                    <strong>Working-memory tokens</strong>
                     <small id="settings-context-help">The green band is measured for this model and device. Typed values receive the same physical preflight.</small>
                   </span>
                   <span className="resource-settings-custom-cap__value resource-settings-custom-cap__value--wide">
@@ -7161,7 +7061,7 @@ function DeviceRuntimeWorkspace({
                       onChange={(event) => setManualContextTokens(
                         event.target.value.replace(/[^0-9]/g, "")
                       )}
-                      aria-label="Active context tokens"
+                      aria-label="Working-memory tokens"
                       aria-describedby="settings-context-help"
                       aria-invalid={planBlocked || undefined}
                     />
@@ -7183,7 +7083,7 @@ function DeviceRuntimeWorkspace({
                   )}
                   disabled={contextFloorTokens > contextMaximumTokens}
                   onChange={(event) => setManualContextTokens(event.target.value)}
-                  aria-label="Resident active-context tokens"
+                  aria-label="Working-memory token limit"
                   aria-describedby="settings-context-help"
                   style={resourcePlan ? contextCapacityBandStyle(resourcePlan) as React.CSSProperties : undefined}
                 />
@@ -7200,8 +7100,8 @@ function DeviceRuntimeWorkspace({
             <div className="resource-settings-section-heading">
               <span className="resource-settings-section-icon"><Icon name="archive" size={18} /></span>
               <span>
-                <h2>Shared storage pool</h2>
-                <p>One reusable pool covers the largest active instance&apos;s model offload, training scratch, cold neural pages, checkpoints, and growth—not one reservation per duplicate.</p>
+                <h2>Storage pool</h2>
+                <p>One shared pool covers model overflow, learning, saved state, and growth.</p>
               </span>
             </div>
             <fieldset className="resource-settings-mode-picker">
@@ -7273,6 +7173,8 @@ function DeviceRuntimeWorkspace({
             ) : null}
           </div>
 
+          <details className="brain-settings-disclosure">
+            <summary>GPU memory &amp; drives</summary>
           <DeviceAllocationSelector catalog={window.omni?.catalog} brainId={brain.id} settings={effectiveDeviceResources}
             ramMode={systemRamMode} ramPercent={systemRamSharePercent} disabled={saving}
             plan={resourcePlan?.deviceResources} planPending={resourcePlanPending}
@@ -7281,16 +7183,19 @@ function DeviceRuntimeWorkspace({
               const ram = settings.allocations.find((entry) => entry.deviceId === "ram:system");
               if (ram) { setSystemRamMode(ram.mode); setSystemRamSharePercent(ram.percent); }
             }} />
-          <DecoderExecutionControls api={window.omni?.decoderExecution} brainId={brain.id}
+          </details>
+          {window.omni?.decoderExecution || window.omni?.cachedDecoderExecution || window.omni?.nativeOperationAuto || window.omni?.regionalExecution ? <details className="brain-settings-disclosure">
+            <summary>Advanced execution</summary>
+          {window.omni?.decoderExecution ? <DecoderExecutionControls api={window.omni.decoderExecution} brainId={brain.id}
             loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
-            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} />
-          <CachedDecoderExecutionControls api={window.omni?.cachedDecoderExecution} brainId={brain.id}
+            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} /> : null}
+          {window.omni?.cachedDecoderExecution ? <CachedDecoderExecutionControls api={window.omni.cachedDecoderExecution} brainId={brain.id}
             loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
-            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} />
-          <NativeOperationAutoControls api={window.omni?.nativeOperationAuto} brainId={brain.id}
+            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} /> : null}
+          {window.omni?.nativeOperationAuto ? <NativeOperationAutoControls api={window.omni.nativeOperationAuto} brainId={brain.id}
             loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
-            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} />
-          <RegionalExecutionControls api={window.omni?.regionalExecution} brainId={brain.id}
+            foregroundTurnActive={foregroundTurnActive} dirty={dirty} disabled={saving} /> : null}
+          {window.omni?.regionalExecution ? <RegionalExecutionControls api={window.omni.regionalExecution} brainId={brain.id}
             loaded={instanceState?.phase === "loaded" && instanceState.learnedRuntimeResident === true}
             foregroundTurnActive={foregroundTurnActive} settings={effectiveDeviceResources} dirty={dirty} disabled={saving}
             onChange={settings => {
@@ -7298,7 +7203,8 @@ function DeviceRuntimeWorkspace({
               // separately selected global RAM policy or raise its ceiling.
               setDeviceResources(synchronizeDeviceRam(settings, systemRamMode, systemRamSharePercent));
               setResourcePlanPending(Boolean(window.omni));
-            }} />
+            }} /> : null}
+          </details> : null}
           <div
             className={cx(
               "resource-settings-preflight",
@@ -7318,14 +7224,14 @@ function DeviceRuntimeWorkspace({
                 {resourcePlanPending
                   ? "Measuring this device…"
                   : resourceError
-                    ? "Resource preflight unavailable"
+                    ? "Memory check unavailable"
                     : planBlocked
-                      ? "This custom envelope is unsafe"
+                      ? "These settings do not fit safely"
                       : resourcePlan
                         ? systemRamMode === "auto"
-                          ? `Auto recommends ${resourcePlan.resources.systemRamSharePercent}% of the safe pool`
-                          : `${resourcePlan.resources.systemRamSharePercent}% passes the live preflight`
-                        : "Packaged runtime required for a live measurement"}
+                          ? `Auto recommends ${resourcePlan.resources.systemRamSharePercent}% after the system reserve`
+                          : `${resourcePlan.resources.systemRamSharePercent}% passes the memory check`
+                        : "Connect the desktop runtime to measure this device"}
               </strong>
               <small>
                 {resourceError ||
@@ -7367,11 +7273,12 @@ function DeviceRuntimeWorkspace({
         </section>
 
         <aside className="resource-settings-sidebar">
-          <section className="surface resource-settings-device" aria-labelledby="safe-pool-heading">
+          <details className="surface resource-settings-device brain-settings-disclosure">
+            <summary>Memory use &amp; limits</summary>
             <div className="resource-settings-section-heading">
               <span className="resource-settings-section-icon"><Icon name="activity" size={18} /></span>
               <span>
-                <h2 id="safe-pool-heading">Live safe pool</h2>
+                <h2 id="safe-pool-heading">Device memory</h2>
                 <p>{detectedHardware ? `${detectedHardware.platform} · ${detectedHardware.architecture} · ${detectedHardware.recommendedTier}` : "Detecting hardware…"}</p>
               </span>
             </div>
@@ -7417,19 +7324,15 @@ function DeviceRuntimeWorkspace({
             ) : (
               <p className="resource-settings-empty">Live values appear after the packaged runtime completes its bounded probe.</p>
             )}
-            <p className="resource-settings-note">
-              <Icon name="info" size={14} />
-              Saved context and cortex capacity are derived from physical RAM and do not shrink when another app opens. Under pressure, Omni waits and retries while asking you to close memory-heavy apps.
-            </p>
-          </section>
+          </details>
         </aside>
 
-        <section className="surface resource-settings-benchmarks" aria-labelledby="throughput-heading">
+        <details className="surface resource-settings-benchmarks brain-settings-disclosure">
+          <summary>Measured speed</summary>
           <div className="resource-settings-section-heading">
             <span className="resource-settings-section-icon"><Icon name="pulse" size={18} /></span>
             <span>
-              <h2 id="throughput-heading">Measured throughput</h2>
-              <p>Bounded diagnostics guide Auto and warn when a custom choice would perform poorly.</p>
+              <h2 id="throughput-heading">Device measurements</h2>
             </span>
           </div>
           {resourcePlan ? (
@@ -7458,14 +7361,14 @@ function DeviceRuntimeWorkspace({
           ) : (
             <p className="resource-settings-empty">Throughput results are not available in this renderer session.</p>
           )}
-        </section>
+        </details>
 
-        <section className="surface resource-settings-training" aria-labelledby="adaptive-training-heading">
+        <details className="surface resource-settings-training brain-settings-disclosure">
+          <summary>Training memory</summary>
           <div className="resource-settings-section-heading">
             <span className="resource-settings-section-icon"><Icon name="database" size={18} /></span>
             <span>
-              <h2 id="adaptive-training-heading">Lower-memory training</h2>
-              <p>Training changes its working shape, not which source records it visits.</p>
+              <h2 id="adaptive-training-heading">Current training allocation</h2>
             </span>
           </div>
           {resourcePlan ? (
@@ -7480,7 +7383,7 @@ function DeviceRuntimeWorkspace({
             <Icon name="archive" size={15} />
             <span><strong>Storage boundary</strong>{STORAGE_BOUNDARY_COPY}</span>
           </p>
-        </section>
+        </details>
 
         <details className="research-diagnostics resource-settings-diagnostics">
           <summary>
@@ -7525,12 +7428,13 @@ function DeviceRuntimeWorkspace({
           onToast={onToast}
         />
 
-        <section className="surface mobile-companion" aria-labelledby="mobile-companion-heading">
+        <details className="surface mobile-companion brain-settings-disclosure">
+          <summary>Phone companion</summary>
           <div className="resource-settings-section-heading">
             <span className="resource-settings-section-icon"><Icon name="agents" size={18} /></span>
             <span>
-              <h2 id="mobile-companion-heading">Phone companion</h2>
-              <p>The Android and iOS companion apps open this same persistent identity, conversation, neural state, tools, and action audit. They do not create a mobile model copy.</p>
+              <h2 id="mobile-companion-heading">Connect a phone</h2>
+              <p>Use the same brain and conversation from the companion app.</p>
             </span>
           </div>
 
@@ -7621,7 +7525,7 @@ function DeviceRuntimeWorkspace({
           ) : (
             <p className="resource-settings-empty">No phone is paired. Pairing does not export weights or credentials.</p>
           )}
-        </section>
+        </details>
       </div>
     </div>
   );
@@ -7662,2886 +7566,178 @@ function DataWorkspace({
   brain,
   foregroundTurnActive,
   onBack,
+  onOpenPermissions,
   onBrainChange,
   onToast
 }: {
   brain: BrainDocument;
   foregroundTurnActive: boolean;
   onBack: () => void;
+  onOpenPermissions: () => void;
   onBrainChange: (brain: BrainDocument) => void;
   onToast: (message: string) => void;
 }) {
-  const [mode, setMode] = useState<"uploads" | "catalog" | "web">("uploads");
-  const learningPolicy = "pretrain" as const;
-  const [demoTraining, setDemoTraining] = useState(false);
-  const [demoProgress, setDemoProgress] = useState(0);
-  const [localIngestStatus, setLocalIngestStatus] = useState("");
   const [activeJob, setActiveJob] = useState<RuntimeJob | null>(null);
-  const [resumableManifest, setResumableManifest] =
-    useState<DatasetResumeCandidate | null>(null);
-  const [activePreview, setActivePreview] = useState<DatasetPreviewProgress | null>(null);
-  const [substrateTotals, setSubstrateTotals] = useState<SubstratePage["totals"] | null>(null);
-  const [provenanceRuntimeCard, setProvenanceRuntimeCard] =
-    useState<Record<string, unknown> | null>(null);
-  const [parameterAccounting, setParameterAccounting] =
-    useState<NeuralParameterAccountingPresentation | null>(null);
-  const [persistedCoverage, setPersistedCoverage] =
-    useState<PersistedDatasetCoverageSummary | null>(null);
-  const [catalogEntries, setCatalogEntries] = useState<CatalogEntry[]>(
-    window.omni
-      ? []
-      : [
-          { id: "demo-1", name: "FineWeb-Edu recipe", description: "Curated language learning manifest", sourceUrl: "https://example.com/demo", license: "ODC-By", kind: "dataset" },
-          { id: "demo-2", name: "Audio concepts pack", description: "Demo modality recipe", sourceUrl: "https://example.com/demo", license: "CC BY 4.0", kind: "modality-pack" }
-        ]
-  );
-  const [crawlUrl, setCrawlUrl] = useState("");
-  const crawlUrlAllowed = webLearningUrlAllowed(crawlUrl);
-  const [respectRobots, setRespectRobots] = useState(true);
-  const [followExternalLinks, setFollowExternalLinks] = useState(false);
-  const [quarantine, setQuarantine] = useState(true);
-  const [dragging, setDragging] = useState(false);
-  const [displayedSources, setDisplayedSources] = useState(brain.trainingSources);
-  const [sourceCursor, setSourceCursor] = useState<string | undefined>();
-  const [sourcePageDepth, setSourcePageDepth] = useState(0);
-  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [resumableManifest, setResumableManifest] = useState<DatasetResumeCandidate | null>(null);
+  const [persistedCoverage, setPersistedCoverage] = useState<PersistedDatasetCoverageSummary | null>(null);
+  const [catalogEntries, setCatalogEntries] = useState<CatalogEntry[]>([]);
+  const [controlBusy, setControlBusy] = useState(false);
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [statusError, setStatusError] = useState("");
   const announcedJobs = useRef(new Set<string>());
-  const previewRequestId = useRef<string | null>(null);
-  const parserPicker = useDatasetParserPicker(brain.id);
-
-  const loadSourcePage = useCallback(async (cursor?: string, depth = 0) => {
-    if (!window.omni) {
-      setDisplayedSources(brain.trainingSources.slice(-60));
-      setSourceCursor(undefined);
-      setSourcePageDepth(0);
-      return;
-    }
-    setSourcesLoading(true);
-    try {
-      const page = await window.omni.data.sources(brain.id, cursor, 60);
-      setDisplayedSources(page.entries.map((entry) => entry.source));
-      setSourceCursor(page.nextCursor);
-      setSourcePageDepth(depth);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The source ledger could not be loaded.");
-    } finally {
-      setSourcesLoading(false);
-    }
-  }, [brain.id, brain.trainingSources, onToast]);
-
-  useEffect(() => {
-    void loadSourcePage(undefined, 0);
-  }, [loadSourcePage, brain.activity?.trainingSourceHeadSha256]);
-
-  const activeJobStop = runtimeJobStopPresentation(activeJob);
-  const activeJobProgress = runtimeJobProgressPresentation(activeJob);
-  const busy = demoTraining || activeJobStop.active;
-  const previewFileProgress = activePreview?.currentFileBytes
-    ? Math.round(
-        Math.max(0, Math.min(1, (activePreview.currentFileHashedBytes ?? 0) / activePreview.currentFileBytes)) * 100
-      )
-    : null;
-  const progress = demoTraining
-    ? previewFileProgress ?? demoProgress
-    : activeJob
-      ? activeJobProgress.percent
-      : persistedCoverage?.complete
-        ? 100
-        : 0;
-  const jobOutput = valueRecord(activeJob?.output);
-  const telemetryPresentation = activeJob?.telemetry && activeJobProgress.showTelemetry
-    ? presentTrainingTelemetry(activeJob.telemetry)
-    : undefined;
-  const coverageValue = activeJobProgress.showCoverage
-    ? valueRecord(jobOutput?.coverage)
-    : undefined;
-  const activeCoverage =
-    coverageValue &&
+  const controlPending = useRef(false);
+  const currentOwner = useRef(brain.id);
+  currentOwner.current = brain.id;
+  const stopState = runtimeJobStopPresentation(activeJob);
+  const jobProgress = runtimeJobProgressPresentation(activeJob);
+  const output = valueRecord(activeJob?.output);
+  const coverageValue = jobProgress.showCoverage ? valueRecord(output?.coverage) : undefined;
+  const activeCoverage = coverageValue &&
     typeof coverageValue.discoveredRecords === "number" &&
     typeof coverageValue.processedRecords === "number" &&
     typeof coverageValue.rejectedRecords === "number" &&
     typeof coverageValue.discoveredFiles === "number" &&
     typeof coverageValue.processedFiles === "number" &&
     typeof coverageValue.rejectedFiles === "number"
-      ? {
-          discoveredRecords: coverageValue.discoveredRecords,
-          processedRecords: coverageValue.processedRecords,
-          rejectedRecords: coverageValue.rejectedRecords,
-          discoveredFiles: coverageValue.discoveredFiles,
-          processedFiles: coverageValue.processedFiles,
-          rejectedFiles: coverageValue.rejectedFiles,
-          complete: coverageValue.complete === true
-        }
-      : null;
-  const displayedCoverage = runtimeJobScopedDatasetCoverage(
-    activeJob,
-    activeCoverage,
-    !busy ? persistedCoverage : null
-  );
+    ? { discoveredRecords: coverageValue.discoveredRecords, processedRecords: coverageValue.processedRecords,
+        rejectedRecords: coverageValue.rejectedRecords, discoveredFiles: coverageValue.discoveredFiles,
+        processedFiles: coverageValue.processedFiles, rejectedFiles: coverageValue.rejectedFiles,
+        complete: coverageValue.complete === true }
+    : null;
+  const coverage = runtimeJobScopedDatasetCoverage(activeJob, activeCoverage, !stopState.active ? persistedCoverage : null);
+  const progress = activeJob ? jobProgress.percent : persistedCoverage?.complete ? 100 : null;
+  const telemetry = activeJob?.telemetry && jobProgress.showTelemetry
+    ? presentTrainingTelemetry(activeJob.telemetry) : undefined;
+
   useEffect(() => {
-    if (!window.omni) return;
+    const api = window.omni;
     let active = true;
-    setPersistedCoverage(null);
-    setResumableManifest(null);
-    setSubstrateTotals(null);
-    setParameterAccounting(null);
-    setProvenanceRuntimeCard(null);
-    void window.omni.brain.persistedSubstrateOverview(brain.id).then(
-      (overview) => {
-        if (!active || !overview) return;
-        setSubstrateTotals(overview.totals);
-        setPersistedCoverage(overview.latestCompletedCoverage ?? null);
-        const persistedAccounting = overview.parameterAccounting
-          ? neuralParameterAccounting({
-              parameterAccounting: overview.parameterAccounting
-            })
-          : undefined;
-        if (persistedAccounting) {
-          setParameterAccounting(persistedAccounting);
-        }
-      },
-      () => undefined
-    );
-    void Promise.all([
-      window.omni.catalog.list(),
-      window.omni.train.list(brain.id),
-      window.omni.data.resumable(brain.id)
-    ]).then(
-      ([entries, jobs, resumable]) => {
-        if (!active) return;
-        setCatalogEntries(entries);
-        setResumableManifest(resumable);
-        setActiveJob(
-          jobs
-            .filter((job) => job.brainId === brain.id)
-            .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0] ?? null
-        );
-      }
-    );
-    const unsubscribe = window.omni.train.onEvent(({ job }) => {
-      if (job.brainId !== brain.id) return;
-      setActiveJob(job);
-      if (job.state === "complete") {
-        void window.omni?.brain.get(brain.id).then(onBrainChange);
-        void window.omni?.data.resumable(brain.id)
-          .then(setResumableManifest)
-          .catch(() => undefined);
-        void window.omni?.brain
-          .persistedSubstrateOverview(brain.id)
-          .then((overview) => {
-            if (!overview) return;
-            setSubstrateTotals(overview.totals);
-            setPersistedCoverage(overview.latestCompletedCoverage ?? null);
-            const accounting = overview.parameterAccounting
-              ? neuralParameterAccounting({
-                  parameterAccounting: overview.parameterAccounting
-                })
-              : undefined;
-            if (accounting) setParameterAccounting(accounting);
-          });
-      }
-      if (
-        (job.state === "complete" || job.state === "failed") &&
-        !announcedJobs.current.has(job.id)
-      ) {
-        announcedJobs.current.add(job.id);
-        onToast(
-          job.state === "complete"
-            ? `${job.label} completed.`
-            : `${job.label} failed${job.error ? `: ${job.error}` : "."}`
-        );
-      }
-      if (job.kind === "ingestion" && ["cancelled", "failed"].includes(job.state)) {
-        void window.omni?.data.resumable(brain.id)
-          .then(setResumableManifest)
-          .catch(() => undefined);
-      }
-    });
-    const unsubscribePreview = window.omni.data.onPreviewProgress((event) => {
-      if (
-        event.brainId !== brain.id ||
-        event.requestId !== previewRequestId.current
-      ) return;
-      setActivePreview(event);
-      setLocalIngestStatus(event.message);
-    });
-    return () => {
-      active = false;
-      unsubscribe();
-      unsubscribePreview();
+    currentOwner.current = brain.id;
+    controlPending.current = false;
+    setActiveJob(null); setPersistedCoverage(null); setResumableManifest(null);
+    setCatalogEntries([]); setControlBusy(false); setConfirmStop(false); setStatusError("");
+    if (!api) return;
+    const refreshSaved = async () => {
+      await Promise.all([
+        api.data.resumable(brain.id).then(resume => { if (active) setResumableManifest(resume); }),
+        api.brain.persistedSubstrateOverview(brain.id).then(overview => { if (active) setPersistedCoverage(overview?.latestCompletedCoverage ?? null); })
+      ]);
     };
-  }, [brain.id, onBrainChange]);
-
-  const applyResults = (results: Awaited<ReturnType<NonNullable<typeof window.omni>["data"]["ingestFiles"]>>) => {
-    if (results.length > 0) {
-      onBrainChange(results.at(-1)!.brain);
-      onToast(`${results.length} source${results.length === 1 ? "" : "s"} encoded into ${brain.name}.`);
-    }
-  };
-
-  const ingest = async (
-    kind: "files" | "folder" = "files",
-    selection: ExperienceUploadKind = "files"
-  ) => {
-    if (demoTraining) return;
-    setDemoTraining(true);
-    setDemoProgress(4);
-    setLocalIngestStatus(
-      kind === "folder"
-        ? "Choosing a whole folder"
-        : `Choosing ${EXPERIENCE_UPLOADS[selection].shortLabel}`
-    );
-    try {
-      if (window.omni) {
-        const requestId = globalThis.crypto?.randomUUID?.() ??
-          `dataset-preview-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        previewRequestId.current = requestId;
-        setActivePreview(null);
-        const manifest = await window.omni.data.preview({
-          brainId: brain.id,
-          policy: learningPolicy,
-          requestId,
-          selection: kind === "folder" ? "folder" : selection,
-          ...(parserPicker.selection ? { parserSelection: parserPicker.selection } : {})
-        });
-        if (!manifest) {
-          previewRequestId.current = null;
-          setActivePreview(null);
-          setLocalIngestStatus("Selection cancelled");
-          return;
-        }
-        previewRequestId.current = null;
-        setActivePreview(null);
-        setDemoProgress(10);
-        setLocalIngestStatus(
-          `Committed ${manifest.discoveredFiles} source${manifest.discoveredFiles === 1 ? "" : "s"} to a resumable traversal manifest`
-        );
-        const job = await window.omni.data.start({
-          brainId: brain.id,
-          manifestId: manifest.id,
-          policy: learningPolicy,
-          epochs: 1,
-          resume: true
-        });
-        setActiveJob(job);
-        onToast(
-          `${manifest.discoveredFiles} source${manifest.discoveredFiles === 1 ? "" : "s"} queued; live neural-learning progress is shown here.`
-        );
-      } else {
-        for (const value of [18, 36, 57, 76, 100]) {
-          await new Promise((resolve) => window.setTimeout(resolve, 230));
-          setDemoProgress(value);
-        }
-        onToast("Demo source encoded: 42 ideas and 188 synaptic changes.");
-      }
-    } catch (error) {
-      previewRequestId.current = null;
-      onToast(error instanceof Error ? error.message : "Could not ingest the selected files.");
-    } finally {
-      setDemoTraining(false);
-    }
-  };
-
-  const ingestDrop = async (files: File[]) => {
-    setDragging(false);
-    if (!files.length || busy) return;
-    if (!dataActionAvailableDuringTurn("immediate-write", foregroundTurnActive)) {
-      onToast(
-        "Dropped-file learning is waiting for the current reply. Start a queued upload or return to Conversation to Queue or Steer."
-      );
-      return;
-    }
-    if (!window.omni) {
-      onToast(`${files.length} dropped file${files.length === 1 ? "" : "s"} recognized in demo preview; no learning ran.`);
-      return;
-    }
-    setDemoTraining(true);
-    setDemoProgress(6);
-    setLocalIngestStatus(
-      `Encoding ${files.length} dropped file${files.length === 1 ? "" : "s"} into neural state`
-    );
-    try {
-      const results = await window.omni.data.ingestDropped(
-        { brainId: brain.id, policy: learningPolicy },
-        files
-      );
-      setDemoProgress(100);
-      applyResults(results);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Dropped files could not be ingested.");
-    } finally {
-      setDemoTraining(false);
-    }
-  };
-
-  const startCrawl = async () => {
-    if (!crawlUrlAllowed || demoTraining) return;
-    if (!window.omni) {
-      onToast("Web crawling is disabled in the browser design preview.");
-      return;
-    }
-    setDemoTraining(true);
-    setLocalIngestStatus("Adding the crawl to the shared learning queue");
-    try {
-      const job = await window.omni.data.crawlWeb({
-        brainId: brain.id,
-        url: crawlUrl,
-        policy: learningPolicy,
-        quarantine,
-        respectRobots,
-        sameOrigin: !followExternalLinks,
-        followExternalLinks
-      });
+    void api.train.list(brain.id).then(jobs => {
+      if (!active) return;
+      const latest = jobs.filter(job => job.brainId === brain.id).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null;
+      setActiveJob(current => current && (!latest || current.updatedAt >= latest.updatedAt) ? current : latest);
+    }).catch(error => { if (active) setStatusError(conciseUiMessage(error, "Saved progress could not load.")); });
+    void api.catalog.list().then(entries => { if (active) setCatalogEntries(entries); })
+      .catch(error => { if (active) setStatusError(conciseUiMessage(error, "Dataset sources could not load.")); });
+    void refreshSaved().catch(error => { if (active) setStatusError(conciseUiMessage(error, "Saved coverage could not load.")); });
+    const unsubscribe = api.train.onEvent(({ job }) => {
+      if (!active || job.brainId !== brain.id) return;
       setActiveJob(job);
-      onToast(`${quarantine ? "Quarantined " : ""}continuous crawl started. It will run until stopped or resources pause it.`);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The web crawl could not start.");
-    } finally {
-      setDemoTraining(false);
-    }
-  };
-
-  const ingestPage = async () => {
-    if (!crawlUrlAllowed || busy) return;
-    if (!dataActionAvailableDuringTurn("immediate-write", foregroundTurnActive)) {
-      onToast(
-        "Single-page learning is waiting for the current reply. Queue a crawl, or return to Conversation to Queue or Steer."
-      );
-      return;
-    }
-    if (!window.omni) {
-      onToast("Single-page web ingestion is disabled in the browser design preview.");
-      return;
-    }
-    try {
-      const result = await window.omni.data.ingestWeb({
-        brainId: brain.id,
-        url: crawlUrl,
-        policy: learningPolicy,
-        quarantine
-      });
-      onBrainChange(result.brain);
-      onToast(`Encoded ${result.source.name} with retained provenance.`);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The web page could not be ingested.");
-    }
-  };
-
-  const cancelActiveJob = async () => {
-    if (!window.omni) return;
-    if (previewRequestId.current) {
-      const cancelled = await window.omni.data.cancelPreview(previewRequestId.current);
-      if (cancelled) {
-        setLocalIngestStatus("Cancelling discovery and hashing; removing the partial manifest…");
-        onToast("Dataset preview cancellation requested.");
+      if (["complete", "cancelled", "failed"].includes(job.state))
+        void refreshSaved().catch(error => { if (active) setStatusError(conciseUiMessage(error)); });
+      if (job.state === "complete")
+        void api.brain.get(brain.id).then(value => { if (active) onBrainChange(value); }).catch(() => undefined);
+      if (["complete", "failed"].includes(job.state) && !announcedJobs.current.has(job.id)) {
+        announcedJobs.current.add(job.id);
+        onToast(job.state === "complete" ? job.label + " completed." : conciseUiMessage(job.error, job.label + " failed."));
       }
-      return;
-    }
-    if (!activeJob || !activeJobStop.requestAllowed) return;
-    const requestedJob = activeJob;
-    setActiveJob({
-      ...requestedJob,
-      state: "cancelling",
-      label: `Cancelling ${requestedJob.kind} · waiting for acknowledgement`,
-      error: undefined,
-      updatedAt: new Date().toISOString()
     });
+    return () => { active = false; if (currentOwner.current === brain.id) currentOwner.current = ""; unsubscribe(); };
+  }, [brain.id, onBrainChange, onToast]);
+
+  const controlJob = async (action: "pause" | "stop") => {
+    const api = window.omni, job = activeJob, owner = brain.id;
+    if (!api || !job || controlPending.current) return;
+    if (action === "stop" && !stopState.requestAllowed) return;
+    controlPending.current = true; setControlBusy(true); setStatusError("");
+    if (action === "stop") setActiveJob({ ...job, state: "cancelling", label: "Stopping " + job.label, updatedAt: new Date().toISOString() });
     try {
-      const cancelled = requestedJob.kind === "crawl" || requestedJob.kind === "ingestion"
-        ? await window.omni.data.cancel(requestedJob.id)
-        : await window.omni.train.cancel(requestedJob.id);
-      setActiveJob(cancelled);
-      onToast(
-        requestedJob.kind === "crawl"
-          ? "The crawler stopped after acknowledgement; its frontier is saved."
-          : "The neural worker acknowledged cancellation."
-      );
+      const updated = action === "pause" ? await api.data.pause(job.id)
+        : ["ingestion", "crawl"].includes(job.kind) ? await api.data.cancel(job.id) : await api.train.cancel(job.id);
+      const resume = await api.data.resumable(owner);
+      if (currentOwner.current === owner) { setActiveJob(updated); setResumableManifest(resume); setConfirmStop(false); }
     } catch (error) {
-      const reason = conciseUiMessage(
-        error instanceof Error ? error.message : String(error),
-        "Cancellation is still awaiting acknowledgement."
-      );
-      const current = await window.omni.train
-        .list(brain.id)
-        .then((jobs) => jobs.find((candidate) => candidate.id === requestedJob.id))
-        .catch(() => undefined);
-      setActiveJob(current ?? {
-        ...requestedJob,
-        state: "cancelling",
-        label: `${requestedJob.kind} stop needs acknowledgement`,
-        error: reason,
-        updatedAt: new Date().toISOString()
-      });
-      onToast(`${reason} Retry stop when ready.`);
-    }
+      const jobs = await api.train.list(owner).catch(() => []);
+      if (currentOwner.current === owner) {
+        setActiveJob(jobs.find(value => value.id === job.id) ?? (action === "stop"
+          ? { ...job, state: "cancelling", error: conciseUiMessage(error), updatedAt: new Date().toISOString() } : job));
+        setStatusError(conciseUiMessage(error, "The request needs acknowledgement."));
+      }
+    } finally { if (currentOwner.current === owner) { controlPending.current = false; setControlBusy(false); } }
   };
-
-  const pauseActiveJob = async () => {
-    if (
-      !window.omni ||
-      !activeJob ||
-      !["ingestion", "crawl"].includes(activeJob.kind) ||
-      !["queued", "running"].includes(activeJob.state)
-    ) {
-      return;
-    }
-    const paused = await window.omni.data.pause(activeJob.id);
-    setActiveJob(paused);
-    onToast(`${activeJob.label} paused at its durable cursor and can resume later.`);
-  };
-
-  const resumePersistedManifest = async (): Promise<void> => {
-    if (!window.omni || !resumableManifest || activeJobStop.active) return;
-    setLocalIngestStatus("Resuming the persisted dataset cursor");
+  const resumeDataset = async () => {
+    const api = window.omni, manifest = resumableManifest, owner = brain.id;
+    if (!api || !manifest || controlPending.current || stopState.active) return;
+    controlPending.current = true; setControlBusy(true); setStatusError("");
     try {
-      const job = await window.omni.data.resume({
-        brainId: brain.id,
-        manifestId: resumableManifest.manifestId,
-        policy: learningPolicy,
-        epochs: resumableManifest.requestedEpochs,
-        resume: true
-      });
-      setResumableManifest(null);
-      setActiveJob(job);
-      onToast("Dataset learning resumed from its durable cursor.");
-    } catch (error) {
-      onToast(
-        error instanceof Error
-          ? error.message
-          : "The persisted dataset could not resume."
-      );
-    }
+      const job = await api.data.resume({ brainId: owner, manifestId: manifest.manifestId,
+        policy: "pretrain", epochs: manifest.requestedEpochs, resume: true });
+      if (currentOwner.current === owner) { setActiveJob(job); setResumableManifest(null); }
+    } catch (error) { if (currentOwner.current === owner) setStatusError(conciseUiMessage(error, "The dataset could not resume.")); }
+    finally { if (currentOwner.current === owner) { controlPending.current = false; setControlBusy(false); } }
   };
-  const dataProvenance = brainProvenancePresentation({
-    provenance: brain.provenance,
-    runtimeCard: provenanceRuntimeCard,
-    trainingSources: displayedSources
-  });
-  const sourceCount = brain.activity?.trainingSourceCount ?? brain.trainingSources.length;
-  const learnedConceptTotal = brain.activity?.learnedConcepts ??
-    brain.trainingSources.reduce((sum, source) => sum + source.learnedConcepts, 0);
-  const learnedSynapseTotal = brain.activity?.learnedSynapses ??
-    brain.trainingSources.reduce((sum, source) => sum + source.learnedSynapses, 0);
 
-  return (
-    <div className="content-page data-page" data-training-active={Boolean(activeJob && activeJob.state !== "complete" && activeJob.state !== "cancelled")}>
-      <div className="content-page__title">
-        <div>
-          <button
-            className="content-page__back"
-            aria-label="Back to conversation"
-            onClick={onBack}
-          >
-            <Icon name="arrow" size={13} className="map-arrow-back" /> Conversation
-          </button>
-          <span className="eyebrow-text">CONTINUOUS EXPERIENCE LEARNING</span>
-          <h1>Data & training</h1>
-          <p>Each document, dataset, code sample, sound, image, video, or page enters the same continuous whole-experience learning flow.</p>
-        </div>
-        <Button icon="upload" kind="primary" onClick={() => void ingest("files")}>
-          Add experience
-        </Button>
-      </div>
-      {dataProvenance ? (
-        <div
-          className="data-provenance-note"
-          role="note"
-          title={dataProvenance.ariaLabel}
-          aria-label={dataProvenance.ariaLabel}
-        >
-          <strong>{dataProvenance.originLabel}</strong>
-          <span>{dataProvenance.compactLabel}</span>
-        </div>
-      ) : null}
-      {foregroundTurnActive ? (
-        <div className="data-foreground-queue-note" role="status" aria-live="polite">
-          <Icon name="chat" size={15} />
-          <span>
-            <strong>Current reply continues in Conversation</strong>
-            <small>Uploads, training, and crawls started here join the visible queue. Immediate learning waits; use Queue or Steer in Conversation.</small>
-          </span>
-        </div>
-      ) : null}
-      {resumableManifest && !activeJobStop.active ? (
-        <div className="dataset-resume-note" role="status" aria-live="polite">
-          <Icon name="database" size={16} />
-          <span>
-            <strong>
-              {resumableManifest.state === "interrupted"
-                ? "Interrupted dataset is ready to resume"
-                : "Paused dataset is ready to resume"}
-            </strong>
-            <small>
-              {resumableManifest.processedFiles.toLocaleString()} of {(resumableManifest.discoveredFiles * resumableManifest.requestedEpochs).toLocaleString()} file passes settled · manifest {resumableManifest.manifestId.slice(0, 8)}…
-            </small>
-          </span>
-          <Button kind="primary" icon="play" onClick={() => void resumePersistedManifest()}>
-            Resume dataset
-          </Button>
-        </div>
-      ) : null}
-      <div className="data-layout">
-        <section>
-          <div className="surface ingest-surface">
-            <div className="surface-tabs">
-              {(
-                [
-                  ["uploads", "Uploads", "upload"],
-                  ["catalog", "Dataset catalog", "library"],
-                  ["web", "Web crawler", "search"]
-                ] as const
-              ).map(([id, label, icon]) => (
-                <button key={id} className={mode === id ? "is-active" : ""} onClick={() => setMode(id)}>
-                  <Icon name={icon} size={15} /> {label}
-                </button>
-              ))}
-            </div>
-            {mode === "uploads" ? (
-              <div className="upload-panel">
-                <div
-                  className={cx("drop-zone", dragging && "is-dragging")}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => void ingest("files")}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") void ingest("files");
-                  }}
-                  onDragEnter={(event) => {
-                    event.preventDefault();
-                    setDragging(true);
-                  }}
-                  onDragOver={(event) => event.preventDefault()}
-                  onDragLeave={(event) => {
-                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    void ingestDrop(Array.from(event.dataTransfer.files));
-                  }}
-                >
-                  <span className="drop-zone__rings">
-                    <Icon name="upload" size={25} />
-                  </span>
-                  <strong>Drop files or folders here</strong>
-                  <p>Documents, datasets, code, images, audio, and video are traversed and encoded; rejected records stay visible.</p>
-                  <span>Browse all supported material</span>
-                </div>
-                <div className="upload-kind-actions" aria-label="Upload by experience type">
-                  <Button icon="file" disabled={demoTraining} onClick={() => void ingest("files", "files")}>
-                    Files & datasets
-                  </Button>
-                  <Button icon="image" disabled={demoTraining} onClick={() => void ingest("files", "images")}>
-                    Images
-                  </Button>
-                  <Button icon="volume" disabled={demoTraining} onClick={() => void ingest("files", "audio")}>
-                    Audio
-                  </Button>
-                  <Button icon="video" disabled={demoTraining} onClick={() => void ingest("files", "video")}>
-                    Video
-                  </Button>
-                  <Button icon="archive" disabled={demoTraining} onClick={() => void ingest("folder")}>
-                    Whole folder
-                  </Button>
-                </div>
-                <DatasetParserPicker model={parserPicker} disabled={busy} />
-              </div>
-            ) : mode === "catalog" ? (
-              <div className="catalog-list">
-                <p className="catalog-list__status">
-                  Catalog entries are research and data references. New minds always initialize the native OmniCortex; a listing cannot change its architecture, origin, behavior, or tool permissions.
-                </p>
-                {catalogEntries.map((entry) => (
-                  <div key={entry.id}>
-                    <span className="catalog-list__icon">
-                      <Icon name="database" size={17} />
-                    </span>
-                    <span>
-                      <strong>{entry.name}</strong>
-                      <small>{entry.kind} · {entry.description}</small>
-                    </span>
-                    <em>{entry.license}</em>
-                    <Button onClick={() => void (window.omni?.window.openExternal(entry.sourceUrl))}>
-                      Inspect source
-                    </Button>
-                  </div>
-                ))}
-                {!catalogEntries.length ? <div className="table-empty">No verified catalog sources are configured.</div> : null}
-              </div>
-            ) : (
-              <div className="crawler-form">
-                <label>
-                  <span>Starting URL</span>
-                  <div>
-                    <Icon name="search" size={16} />
-                    <input value={crawlUrl} onChange={(event) => setCrawlUrl(event.target.value)} placeholder="https://docs.example.com or http://127.0.0.1:8000" />
-                  </div>
-                  <small>Remote sources require HTTPS. HTTP is accepted only for verified loopback hosts.</small>
-                </label>
-                <div className="crawler-options">
-                  <Toggle checked={respectRobots} onChange={setRespectRobots} label="Respect robots.txt" />
-                  <Toggle checked={followExternalLinks} onChange={setFollowExternalLinks} label="Follow external links" />
-                  <Toggle checked={quarantine} onChange={setQuarantine} label="Quarantine before learning" />
-                </div>
-                {!respectRobots ? (
-                  <div className="crawler-warning">
-                    <Icon name="warning" size={15} />
-                    Disabling robots compliance may violate site terms or overload a server. Pacing and private-network protections still apply.
-                  </div>
-                ) : null}
-                <div className="crawler-actions">
-                  <Button
-                    icon="download"
-                    disabled={!crawlUrlAllowed || busy || foregroundTurnActive}
-                    title={foregroundTurnActive
-                      ? "Waiting for the current reply; use Queue or Steer in Conversation"
-                      : "Learn this page now"}
-                    onClick={() => void ingestPage()}
-                  >
-                    Learn this page
-                  </Button>
-                  <Button kind="primary" icon="play" disabled={!crawlUrlAllowed || demoTraining} onClick={() => void startCrawl()}>
-                    Crawl until stopped
-                  </Button>
-                </div>
-              </div>
-            )}
-            <div className="ingest-policy">
-              <span>
-                <strong>Learn each whole experience</strong>
-                <small>Every valid record is visited. Timing, novelty, importance, interference, rehearsal, stability, and decay determine how it changes the same neural memory; provenance stays attached.</small>
-              </span>
-              <span className="representation-pill">Automatic</span>
-            </div>
-          </div>
-
-          <div className="surface sources-surface">
-            <div className="surface-title">
-              <div>
-                <h2>Encoded source ledger</h2>
-                <p>Provenance and reported neural deltas stay attached to each successfully encoded source.</p>
-              </div>
-            </div>
-            <div className="source-table">
-              <div className="source-table__header">
-                <span>Source</span>
-                <span>Neural change</span>
-                <span>Stored as</span>
-                <span>Added</span>
-                <span />
-              </div>
-              {displayedSources.map((source) => (
-                <div className="source-row" key={source.id}>
-                  <span className="source-identity">
-                    <i className={`file-kind file-kind--${source.kind}`}>
-                      <Icon name={source.kind === "code" ? "code" : "file"} size={17} />
-                    </i>
-                    <span>
-                      <strong>{source.name}</strong>
-                      <small>
-                        {(source.bytes / 1_048_576).toFixed(source.bytes > 1_048_576 ? 1 : 2)} MB · {source.kind.toUpperCase()} · {source.license ?? "License undeclared"}
-                      </small>
-                    </span>
-                  </span>
-                  <span
-                    className="source-neural-change"
-                    aria-label={
-                      `${source.learnedConcepts.toLocaleString("en-US")} concept or neuron changes, ` +
-                      `${source.learnedSynapses.toLocaleString("en-US")} synaptic changes, ` +
-                      (source.learnedParameterSteps === undefined
-                        ? "Optimizer steps were not reported. "
-                        : `${source.learnedParameterSteps.toLocaleString("en-US")} optimizer steps. `) +
-                      (source.parametersChanged === undefined
-                        ? "Composite neural checksum was not reported."
-                        : source.parametersChanged
-                          ? "Composite neural checksum changed; dense model weight change is not separately verified."
-                          : "Composite neural checksum did not change.")
-                    }
-                  >
-                    <strong
-                      title={`${source.learnedConcepts.toLocaleString("en-US")} concept or neuron changes`}
-                    >
-                      {compactParameterCount(source.learnedConcepts)} concepts / neurons
-                    </strong>
-                    <small title={`${source.learnedSynapses.toLocaleString("en-US")} synaptic changes`}>
-                      {compactParameterCount(source.learnedSynapses)} synaptic changes
-                    </small>
-                    <small
-                      title={source.learnedParameterSteps === undefined
-                        ? "Optimizer steps were not reported for this source"
-                        : `${source.learnedParameterSteps.toLocaleString("en-US")} optimizer steps across this source`}
-                    >
-                      {source.learnedParameterSteps === undefined
-                        ? "Optimizer steps unknown"
-                        : `${compactParameterCount(source.learnedParameterSteps)} optimizer steps`} · {source.parametersChanged === undefined
-                          ? "composite checksum unknown"
-                          : source.parametersChanged
-                            ? "composite neural checksum changed"
-                            : "no composite checksum change"}
-                    </small>
-                  </span>
-                  <span>
-                    <i className="representation-pill">
-                      {source.rawTextRetained ? "Neural memory + source" : "Neural memory"}
-                    </i>
-                  </span>
-                  <span>{relativeTime(source.importedAt)}</span>
-                  <span />
-                </div>
-              ))}
-              {sourceCount === 0 ? (
-                <div className="table-empty">No external experiences have been encoded yet.</div>
-              ) : null}
-            </div>
-            {sourceCount > 0 ? (
-              <div className="source-ledger-pager" aria-live="polite">
-                <span>
-                  Showing {displayedSources.length.toLocaleString("en-US")} of {sourceCount.toLocaleString("en-US")} sources
-                  {sourcePageDepth > 0 ? ` · older page ${sourcePageDepth + 1}` : " · newest page"}
-                </span>
-                {sourcePageDepth > 0 ? (
-                  <Button disabled={sourcesLoading} onClick={() => void loadSourcePage(undefined, 0)}>
-                    Newest
-                  </Button>
-                ) : null}
-                {sourceCursor ? (
-                  <Button
-                    disabled={sourcesLoading}
-                    onClick={() => void loadSourcePage(sourceCursor, sourcePageDepth + 1)}
-                  >
-                    Older sources
-                  </Button>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        </section>
-
-        <aside className="training-sidebar">
-          <div className="surface training-card">
-            <div className="training-card__head">
-              <span className="training-card__icon">
-                <Icon name={busy ? "pulse" : activeJob?.state === "complete" || persistedCoverage ? "check" : "info"} size={20} />
-              </span>
-              <span>
-                <small>{busy ? "ACTIVE JOB" : activeJob ? "LATEST JOB" : persistedCoverage ? "LATEST COMPLETED MANIFEST" : "TRAINING QUEUE"}</small>
-                <strong>
-                  {demoTraining
-                    ? localIngestStatus || "Encoding experience"
-                    : busy
-                      ? activeJob?.label ?? "Encoding experience"
-                      : activeJob?.label ?? (persistedCoverage ? "Completed dataset traversal" : "No jobs yet")}
-                </strong>
-              </span>
-              {busy && (activeJob || activePreview) ? (
-                <div className="training-card__controls">
-                  {activeJob && ["ingestion", "crawl"].includes(activeJob.kind) && activeJob.state !== "cancelling" ? (
-                    <button className="icon-button" onClick={() => void pauseActiveJob()} aria-label="Pause active job">
-                      <Icon name="pause" size={15} />
-                    </button>
-                  ) : null}
-                  <button
-                    className="icon-button"
-                    disabled={Boolean(activeJob && !activeJobStop.requestAllowed)}
-                    onClick={() => void cancelActiveJob()}
-                    aria-label={
-                      activeJobStop.waitingForAcknowledgement
-                        ? "Waiting for active job stop acknowledgement"
-                        : activeJobStop.retryAvailable
-                          ? "Retry stopping active job"
-                          : "Cancel active job"
-                    }
-                    title={activeJob ? activeJobStop.label : "Cancel active job"}
-                  >
-                    <Icon name={activeJobStop.waitingForAcknowledgement ? "pulse" : "close"} size={15} />
-                  </button>
-                </div>
-              ) : null}
-            </div>
-            <div className={cx("training-progress", progress === null && "is-indeterminate")}>
-              <span>
-                <strong>{progress === null ? "—" : `${progress}%`}</strong>
-                <em>
-                  {demoTraining
-                    ? "processing"
-                    : busy
-                      ? activeJob?.state ?? "processing"
-                      : activeJob?.state ?? (persistedCoverage ? "complete" : "idle")}
-                </em>
-              </span>
-              <i>
-                <b style={progress === null ? undefined : { width: `${progress}%` }} />
-              </i>
-            </div>
-            {telemetryPresentation ? (
-              <TrainingTelemetryMetrics telemetry={telemetryPresentation} />
-            ) : null}
-            <div className="training-metrics">
-              <span>
-                <small>Manifest coverage</small>
-                <strong>
-                  {displayedCoverage
-                    ? `${displayedCoverage.processedRecords + displayedCoverage.rejectedRecords} / ${displayedCoverage.discoveredRecords}`
-                    : activeJob && (activeJob.kind === "ingestion" || activeJob.kind === "crawl")
-                      ? progress === null ? "—" : `${progress}%`
-                      : "—"}
-                </strong>
-                <em>
-                  {displayedCoverage
-                    ? `${displayedCoverage.processedRecords} encoded · ${displayedCoverage.rejectedRecords} rejected · ${displayedCoverage.processedFiles + displayedCoverage.rejectedFiles}/${displayedCoverage.discoveredFiles} file visits${displayedCoverage.complete ? " · complete" : " · incomplete/resumable"}`
-                    : activeJob && (activeJob.kind === "ingestion" || activeJob.kind === "crawl")
-                      ? progress === null
-                        ? activeJobProgress.statusText
-                        : "committed traversal in progress"
-                      : "no manifest run"}
-                </em>
-              </span>
-              <span>
-                <small>Concept / neuron deltas</small>
-                <strong
-                  title={`${learnedConceptTotal.toLocaleString("en-US")} total concept or neuron changes`}
-                >
-                  {sourceCount
-                    ? compactParameterCount(learnedConceptTotal)
-                    : "—"}
-                </strong>
-                <em>{sourceCount.toLocaleString("en-US")} encoded sources</em>
-              </span>
-              <span>
-                <small>Cumulative learned updates</small>
-                <strong
-                  title={`${learnedSynapseTotal.toLocaleString("en-US")} cumulative learned connection updates`}
-                >
-                  {sourceCount
-                    ? compactParameterCount(learnedSynapseTotal)
-                    : "—"}
-                </strong>
-                <em>activity total · not unique connections</em>
-              </span>
-            </div>
-            <div className="training-log">
-              <Icon name="terminal" size={15} />
-              <span className="training-log__message">
-                {demoTraining
-                  ? localIngestStatus
-                  : activeJob?.error
-                    ? conciseUiMessage(activeJob.error)
-                    : activeJob?.label ?? (persistedCoverage ? "Completed manifest coverage verified from durable progress" : "No runtime log entries yet")}
-              </span>
-              <span className="training-log__time">{activeJob ? relativeTime(activeJob.updatedAt) : persistedCoverage ? relativeTime(persistedCoverage.updatedAt) : ""}</span>
-            </div>
-          </div>
-          <div className="surface memory-health">
-            <div className="surface-title">
-              <div>
-                <h2>Memory</h2>
-                <p>Automatic, continuous learning</p>
-              </div>
-              <span
-                className="memory-connection-count"
-                title={substrateTotals
-                  ? `${substrateTotals.synapses.toLocaleString("en-US")} unique live connections from validated persisted substrate`
-                  : "Loading validated persisted connection total"}
-                aria-label={substrateTotals
-                  ? `${substrateTotals.synapses.toLocaleString("en-US")} unique live connections`
-                  : "Loading unique live connection total"}
-              >
-                {substrateTotals?.synapses.toLocaleString() ?? "…"}
-              </span>
-            </div>
-            <div className="memory-continuum-totals" aria-label="Current neural substrate totals">
-              <span>
-                <small>Neural parameters</small>
-                {parameterAccounting ? (
-                  <NeuralParameterCount accounting={parameterAccounting} />
-                ) : (
-                  <strong>…</strong>
-                )}
-              </span>
-              <span><small>Neurons</small><strong>{substrateTotals?.neurons.toLocaleString() ?? "…"}</strong></span>
-              <span><small>Assemblies</small><strong>{substrateTotals?.assemblies.toLocaleString() ?? "…"}</strong></span>
-              <span><small>Unique connections</small><strong>{substrateTotals?.synapses.toLocaleString() ?? "…"}</strong></span>
-            </div>
-            <p className="memory-health__automatic">
-              Each experience can affect immediate activity, related pathways, and longer-lasting
-              learning together. Novelty, timing, reuse, importance, prediction, interference,
-              rehearsal, stability, and decay continuously decide what strengthens or fades.
-            </p>
-          </div>
-          <div className="surface provenance-card">
-            <Icon name="archive" size={18} />
-            <span>
-              <strong>Research ledger</strong>
-              Every architecture, dataset, and derived checkpoint keeps its source and license.
-            </span>
-            <Icon name="arrow" size={14} />
-          </div>
-        </aside>
-      </div>
+  const runtimeStatus = <section className="surface training-card" aria-label="Dataset progress">
+    <div className="training-card__head">
+      <span className="training-card__icon"><Icon name={stopState.active ? "pulse" : coverage?.complete ? "check" : "info"} size={20} /></span>
+      <span><small>{stopState.active ? "ACTIVE JOB" : "SAVED PROGRESS"}</small>
+        <strong>{activeJob?.label ?? (persistedCoverage ? "Dataset traversal complete" : "No dataset runs yet")}</strong></span>
+      {stopState.active ? <div className="training-card__controls">
+        {activeJob && ["ingestion", "crawl"].includes(activeJob.kind) && ["queued", "running"].includes(activeJob.state)
+          ? <button className="icon-button" disabled={controlBusy} onClick={() => void controlJob("pause")} aria-label="Pause active job"><Icon name="pause" size={15} /></button> : null}
+        <button className="icon-button" disabled={controlBusy || !stopState.requestAllowed}
+          onClick={() => setConfirmStop(true)} aria-label={stopState.retryAvailable ? "Retry stopping active job" : "Stop active job"} title={stopState.label}>
+          <Icon name={stopState.waitingForAcknowledgement ? "pulse" : "close"} size={15} /></button>
+      </div> : null}
     </div>
-  );
+    {activeJob || persistedCoverage ? <div className={cx("training-progress", progress === null && "is-indeterminate")}>
+      <span><strong>{progress === null ? "—" : progress + "%"}</strong><em>{activeJob?.state ?? "complete"}</em></span>
+      <i><b style={progress === null ? undefined : { width: progress + "%" }} /></i>
+    </div> : null}
+    {telemetry ? <TrainingTelemetryMetrics telemetry={telemetry} /> : null}
+    {coverage ? <div className="training-coverage" role="status">
+      <strong>{(coverage.processedRecords + coverage.rejectedRecords).toLocaleString()} / {coverage.discoveredRecords.toLocaleString()} records visited</strong>
+      <small>{coverage.processedRecords.toLocaleString()} learned · {coverage.rejectedRecords.toLocaleString()} rejected · {(coverage.processedFiles + coverage.rejectedFiles).toLocaleString()} / {coverage.discoveredFiles.toLocaleString()} file passes{coverage.complete ? " · complete" : " · resumable"}</small>
+    </div> : null}
+    {resumableManifest && !stopState.active ? <div className="dataset-resume-note">
+      <span><strong>Dataset ready to resume</strong><small>{resumableManifest.processedFiles.toLocaleString()} / {(resumableManifest.discoveredFiles * resumableManifest.requestedEpochs).toLocaleString()} file passes settled</small></span>
+      <Button kind="primary" icon="play" disabled={controlBusy} onClick={() => void resumeDataset()}>Resume</Button>
+    </div> : null}
+    {confirmStop ? <div className="training-stop-confirm" role="group" aria-label="Confirm stopping dataset work">
+      <p>Stop this job? Saved learning and its resume cursor stay intact.</p>
+      <Button disabled={controlBusy} onClick={() => void controlJob("stop")}>Stop job</Button>
+      <Button disabled={controlBusy} onClick={() => setConfirmStop(false)}>Keep running</Button>
+    </div> : null}
+    {statusError ? <p className="learning-workspace__error" role="alert">{statusError}</p> : null}
+    {activeJob?.error ? <p className="learning-workspace__error">{conciseUiMessage(activeJob.error)}</p> : null}
+    {catalogEntries.length ? <details className="training-catalog"><summary>Dataset sources</summary>
+      {catalogEntries.map(entry => <div key={entry.id}><span><strong>{entry.name}</strong><small>{entry.license}</small></span>
+        <Button onClick={() => void window.omni?.window.openExternal(entry.sourceUrl)}>Inspect source</Button></div>)}
+    </details> : null}
+  </section>;
+
+  return <div className="content-page data-page training-evolution-page" data-training-active={stopState.active}>
+    <div className="content-page__title"><div>
+      <button className="content-page__back" aria-label="Back to conversation" onClick={onBack}><Icon name="arrow" size={13} className="map-arrow-back" /> Conversation</button>
+      <h1>Training &amp; Evolution</h1>
+    </div></div>
+    {foregroundTurnActive ? <div className="data-foreground-queue-note" role="status"><Icon name="chat" size={15} />
+      <span>Current reply continues. New learning joins the shared queue.</span></div> : null}
+    <LearningWorkspace brainId={brain.id} embedded api={window.omni?.learning} questions={window.omni?.questions}
+      data={window.omni?.data} localTeacher={window.omni?.localTeacher} runtimeStatus={runtimeStatus}
+      renderImprovement={objective => <EvolutionWorkspace key={brain.id} brain={brain} objective={objective} embedded
+        onOpenPermissions={onOpenPermissions} onToast={onToast} />} />
+  </div>;
 }
-
-interface SubstrateMapNode {
-  id: string;
-  label: string;
-  region?: string;
-  activation: number;
-  activationObserved?: boolean;
-  importance: number;
-  uncertainty: number;
-  exposures: number;
-  members: string[];
-  clusterCount?: number;
-  /** Activity can be real while a unique-node topology is not yet readable. */
-  activityOnly?: boolean;
-  lastActivatedAt?: string;
-}
-
-type SubstrateMapEdge = BrainMapGraphEdge;
-
-function stableMapHash(value: string) {
-  let hash = 2_166_136_261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16_777_619);
-  }
-  return hash >>> 0;
-}
-
 function BrainMapWorkspace({ brain, onBack }: { brain: BrainDocument; onBack: () => void }) {
   return <WholeBrainMap brainId={brain.id} api={window.omni?.wholeBrainInspection} observeActivity={window.omni?.brain.routerActivity} onBack={onBack} />;
 }
 
-function SubstrateBrainMapWorkspace({
-  brain,
-  onBack
-}: {
-  brain: BrainDocument;
-  onBack: () => void;
-}) {
-  const [selected, setSelected] = useState("");
-  const [filter, setFilter] = useState<"all" | "active" | "salient">("all");
-  const [query, setQuery] = useState("");
-  const [zoom, setZoom] = useState(0.72);
-  const [offset, setOffset] = useState(0);
-  const [region, setRegion] = useState<string | undefined>();
-  const [cursor, setCursor] = useState<string | undefined>();
-  const [cursorHistory, setCursorHistory] = useState<Array<string | undefined>>([]);
-  const [substratePage, setSubstratePage] = useState<SubstratePage | null>(null);
-  const [persistedOverview, setPersistedOverview] =
-    useState<PersistedSubstrateOverview | null>(null);
-  const [substrateLoading, setSubstrateLoading] = useState(false);
-  const [pathwayCursor, setPathwayCursor] = useState<string | undefined>();
-  const [pathwayCursorHistory, setPathwayCursorHistory] = useState<Array<string | undefined>>([]);
-  const [pathwayOffset, setPathwayOffset] = useState(0);
-  const [pathwayPage, setPathwayPage] = useState<SubstratePage | null>(null);
-  const [pathwayLoading, setPathwayLoading] = useState(false);
-  const concepts = useMemo(() => {
-    const live = Object.values(brain.concepts);
-    return live.length ? live : window.omni ? [] : Object.values(makeDemoBrain().concepts);
-  }, [brain.concepts]);
-  const filteredConcepts = useMemo(
-    () =>
-      concepts.filter((concept) => {
-        const matchesQuery = concept.label.toLocaleLowerCase().includes(query.toLocaleLowerCase());
-        const matchesFilter =
-          filter === "all" ||
-          (filter === "active" && concept.activation >= 0.5) ||
-          (filter === "salient" && concept.importance >= 0.75);
-        return matchesQuery && matchesFilter;
-      }),
-    [concepts, filter, query]
-  );
-  const clustered = zoom < 1;
-  const pageSize = Math.max(48, Math.round(72 * zoom));
-  const clampedOffset = Math.max(0, Math.min(offset, Math.max(0, filteredConcepts.length - pageSize)));
-  const connectionCounts = connectionCountPresentation({
-    queriedConnections:
-      substratePage?.brainId === brain.id
-        ? substratePage.totals.synapses
-        : undefined,
-    persistedConnections:
-      persistedOverview?.brainId === brain.id
-        ? persistedOverview.totals.synapses
-        : undefined,
-    mirroredConnections: Object.keys(brain.synapses).length,
-    cumulativeUpdates: brain.counters.plasticityEvents
-  });
-  const connectionCountSourceLabel = connectionCounts.uniqueSource === "queried-substrate"
-    ? "Paged from authoritative substrate"
-    : connectionCounts.uniqueSource === "persisted-substrate"
-      ? "Validated persisted substrate overview"
-      : "Local compatibility mirror";
 
-  useEffect(() => {
-    if (!window.omni?.brain.persistedSubstrateOverview) return;
-    let active = true;
-    void window.omni.brain.persistedSubstrateOverview(brain.id).then(
-      (overview) => {
-        if (active) setPersistedOverview(overview);
-      },
-      () => {
-        if (active) setPersistedOverview(null);
-      }
-    );
-    return () => {
-      active = false;
-    };
-  }, [brain.id, brain.updatedAt]);
 
-  useEffect(() => {
-    if (!window.omni?.brain.querySubstrate) {
-      setSubstratePage(null);
-      return;
-    }
-    let active = true;
-    setSubstrateLoading(true);
-    const timer = window.setTimeout(() => {
-      void window.omni!.brain.querySubstrate(brain.id, {
-        entity: clustered ? "overview" : zoom >= 1.8 ? "neurons" : "assemblies",
-        cursor,
-        pageSize,
-        region,
-        search: query.trim() || undefined,
-        zoom
-      }).then((page) => {
-        if (active) setSubstratePage(page);
-      }).catch(() => {
-        if (!active) return;
-        // A live STDP/activation update invalidates continuation cursors. Go
-        // back to the first page instead of leaving the map in a dead local
-        // fallback state with the same stale cursor.
-        if (cursor) {
-          setCursor(undefined);
-          setCursorHistory([]);
-        } else {
-          setSubstratePage(null);
-        }
-      }).finally(() => {
-        if (active) setSubstrateLoading(false);
-      });
-    }, 120);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [brain.id, brain.updatedAt, clustered, cursor, pageSize, query, region, zoom]);
 
-  const mapNodes = useMemo<SubstrateMapNode[]>(() => {
-    if (substratePage) {
-      if (clustered && substratePage.clusters.length) {
-        return substratePage.clusters
-          .filter((cluster) => cluster.kind !== "pathway")
-          .filter((cluster) =>
-            filter === "all" ||
-            (filter === "active" && cluster.activeCount > 0) ||
-            (filter === "salient" && cluster.maxActivation >= 0.75)
-          )
-          .map((cluster) => ({
-            id: cluster.id,
-            label: cluster.label,
-            region: cluster.region,
-            activation: cluster.meanActivation,
-            activationObserved: Number.isFinite(cluster.meanActivation),
-            importance: cluster.maxActivation,
-            uncertainty: 1 - cluster.meanActivation,
-            exposures: cluster.activeCount,
-            members: [cluster.id],
-            clusterCount: cluster.count
-          }));
-      }
-      if (!clustered && substratePage.entity === "assemblies") {
-        return substratePage.assemblies
-          .filter((assembly) =>
-            filter === "all" ||
-            (filter === "active" && assembly.activationObserved === true && (assembly.activation ?? 0) >= 0.5) ||
-            (filter === "salient" && assembly.importance >= 0.75)
-          )
-          .map((assembly) => ({
-            id: assembly.id,
-            label: assembly.label,
-            region: assembly.region,
-            activation: assembly.activationObserved === true ? assembly.activation ?? 0 : 0,
-            activationObserved: assembly.activationObserved === true,
-            importance: assembly.importance,
-            uncertainty: 1 - assembly.confidence,
-            exposures: assembly.rehearsals,
-            members: [assembly.id, ...assembly.neuronIds],
-            lastActivatedAt: assembly.lastRecalledAt
-          }));
-      }
-      if (!clustered && substratePage.entity === "neurons") {
-        return substratePage.neurons
-          .filter((neuron) =>
-            filter === "all" ||
-            (filter === "active" && neuron.activation >= 0.5) ||
-            (filter === "salient" && neuron.importance >= 0.75)
-          )
-          .map((neuron) => ({
-            id: neuron.id,
-            label: neuron.label,
-            region: neuron.region,
-            activation: neuron.activation,
-            activationObserved: Number.isFinite(neuron.activation),
-            importance: neuron.importance,
-            uncertainty: neuron.uncertainty,
-            exposures: neuron.exposures,
-            members: [neuron.id],
-            lastActivatedAt: neuron.lastActivatedAt
-          }));
-      }
-    }
-    if (!filteredConcepts.length && filter === "all" && !query.trim()) {
-      const endpointIds = [...new Set(
-        Object.values(brain.synapses).flatMap((synapse) => [synapse.sourceId, synapse.targetId])
-      )].slice(0, pageSize);
-      if (endpointIds.length) {
-        return endpointIds.map((id) => {
-          const mirror = brain.concepts[id];
-          return {
-            id,
-            label: mirror?.label ?? `Neuron ${id.slice(0, 8)}`,
-            activation: mirror?.activation ?? 0,
-            activationObserved: Boolean(mirror && Number.isFinite(mirror.activation)),
-            importance: mirror?.importance ?? 0.35,
-            uncertainty: mirror?.uncertainty ?? 0.5,
-            exposures: mirror?.exposures ?? 0,
-            members: [id],
-            lastActivatedAt: mirror?.lastActivatedAt
-          };
-        });
-      }
-      const measuredCount = substrateOverviewCount({
-        neurons:
-          (substratePage?.brainId === brain.id
-            ? substratePage.totals.neurons
-            : undefined) ??
-          (persistedOverview?.brainId === brain.id
-            ? persistedOverview.totals.neurons
-            : undefined),
-        assemblies:
-          (substratePage?.brainId === brain.id
-            ? substratePage.totals.assemblies
-            : undefined) ??
-          (persistedOverview?.brainId === brain.id
-            ? persistedOverview.totals.assemblies
-            : undefined),
-        plasticityEvents: 0
-      });
-      const activityOnly = measuredCount === 0 && connectionCounts.cumulativeUpdates > 0;
-      const representedCount = measuredCount || (activityOnly ? 1 : 0);
-      if (representedCount > 0) {
-        return [{
-          id: "substrate-overview",
-          label: activityOnly ? "Cumulative learning activity" : "Persisted neural substrate",
-          region: "whole brain",
-          activation: 0,
-          importance: 0.5,
-          uncertainty: 0,
-          exposures: connectionCounts.cumulativeUpdates,
-          members: ["substrate-overview"],
-          clusterCount: activityOnly ? undefined : representedCount,
-          activityOnly
-        }];
-      }
-    }
-    if (!clustered) {
-      return filteredConcepts
-        .slice(clampedOffset, clampedOffset + pageSize)
-        .map((concept) => ({
-          id: concept.id,
-          label: concept.label,
-          activation: concept.activation,
-          activationObserved: Number.isFinite(concept.activation),
-          importance: concept.importance,
-          uncertainty: concept.uncertainty,
-          exposures: concept.exposures,
-          members: [concept.id],
-          lastActivatedAt: concept.lastActivatedAt
-        }));
-    }
-    const bucketCount = Math.max(12, Math.min(64, Math.ceil(Math.sqrt(filteredConcepts.length || 1) * 1.6)));
-    const buckets = new Map<number, typeof filteredConcepts>();
-    filteredConcepts.forEach((concept) => {
-      const bucket = stableMapHash(concept.id) % bucketCount;
-      const members = buckets.get(bucket) ?? [];
-      members.push(concept);
-      buckets.set(bucket, members);
-    });
-    return [...buckets.entries()].map(([bucket, members]) => {
-      const divisor = Math.max(1, members.length);
-      const strongest = [...members].sort((a, b) => b.importance - a.importance)[0]!;
-      return {
-        id: `cluster-${bucket}`,
-        label: members.length === 1 ? strongest.label : `${strongest.label} + ${members.length - 1}`,
-        activation: members.reduce((sum, concept) => sum + concept.activation, 0) / divisor,
-        activationObserved: members.every(concept => Number.isFinite(concept.activation)),
-        importance: members.reduce((sum, concept) => sum + concept.importance, 0) / divisor,
-        uncertainty: members.reduce((sum, concept) => sum + concept.uncertainty, 0) / divisor,
-        exposures: members.reduce((sum, concept) => sum + concept.exposures, 0),
-        members: members.map((concept) => concept.id)
-      };
-    });
-  }, [
-    brain.concepts,
-    brain.counters.plasticityEvents,
-    brain.synapses,
-    clampedOffset,
-    clustered,
-    filter,
-    filteredConcepts,
-    pageSize,
-    persistedOverview,
-    query,
-    substratePage
-  ]);
-  const visibleGraphNodes = useMemo<SubstrateMapNode[]>(() => {
-    if (!pathwayPage?.synapses.length) return mapNodes;
-    const present = new Set(mapNodes.map((node) => node.id));
-    const connectedIds = new Set<string>();
-    pathwayPage.synapses.forEach((synapse) => {
-      connectedIds.add(synapse.sourceId);
-      connectedIds.add(synapse.targetId);
-    });
-    const connected = [...connectedIds]
-      .filter((id) => !present.has(id))
-      .map((id) => {
-        const mirror = brain.concepts[id];
-        return {
-          id,
-          label: mirror?.label ?? id,
-          region: "connected pathway",
-          activation: mirror?.activation ?? 0,
-          activationObserved: Boolean(mirror && Number.isFinite(mirror.activation)),
-          importance: mirror?.importance ?? 0.35,
-          uncertainty: mirror?.uncertainty ?? 0.5,
-          exposures: mirror?.exposures ?? 0,
-          members: [id],
-          lastActivatedAt: mirror?.lastActivatedAt
-        };
-      });
-    return [...mapNodes, ...connected];
-  }, [brain.concepts, mapNodes, pathwayPage]);
-  const realToView = useMemo(() => {
-    const lookup = new Map<string, string>();
-    visibleGraphNodes.forEach((node) => {
-      lookup.set(node.id, node.id);
-      node.members.forEach((member) => lookup.set(member, node.id));
-    });
-    return lookup;
-  }, [visibleGraphNodes]);
-  const graphEdges = useMemo<SubstrateMapEdge[]>(() => {
-    if (substratePage) {
-      const authoritative = new Map(
-        [...substratePage.synapses, ...(pathwayPage?.synapses ?? [])]
-          .map((synapse) => [synapse.id, synapse] as const)
-      );
-      const directEdges = [...authoritative.values()].flatMap((synapse) => {
-        const edge = projectBrainMapContact(synapse, realToView);
-        return edge ? [edge] : [];
-      });
-      if (directEdges.length) return directEdges;
-      const regionNodes = uniqueRegionLayoutNodes(mapNodes, substratePage.clusters);
-      const clusteredEdges = substratePage.clusters.flatMap((cluster) => {
-        if (cluster.kind !== "pathway" || !cluster.sourceRegion || !cluster.targetRegion) return [];
-        const sourceId = regionNodes.get(cluster.sourceRegion);
-        const targetId = regionNodes.get(cluster.targetRegion);
-        if (!sourceId || !targetId) return [];
-        const signed = cluster.effectiveWeights.positive - cluster.effectiveWeights.negative;
-        const total = Math.max(1, cluster.effectiveWeights.negative + cluster.effectiveWeights.zero + cluster.effectiveWeights.positive);
-        const signedStrength = signed / total;
-        return [{
-          id: cluster.id,
-          sourceId,
-          targetId,
-          effectiveWeight: signedStrength > 0.15 ? 1 as const : signedStrength < -0.15 ? -1 as const : 0 as const,
-          signedStrength,
-          stability: cluster.activeCount / Math.max(1, cluster.count),
-          pathways: cluster.count,
-          aggregate: true, aggregateSignCounts: cluster.effectiveWeights
-        }];
-      });
-      if (clusteredEdges.length || clustered) return clusteredEdges;
-    }
-    if (!clustered) return Object.values(brain.synapses).flatMap(synapse => {
-      const edge = projectBrainMapContact(synapse, realToView);
-      return edge ? [edge] : [];
-    });
-    const aggregated = new Map<string, {
-      sourceId: string;
-      targetId: string;
-      signed: number;
-      stability: number;
-      pathways: number;
-    }>();
-    Object.values(brain.synapses).forEach((synapse) => {
-      const sourceId = realToView.get(synapse.sourceId);
-      const targetId = realToView.get(synapse.targetId);
-      if (!sourceId || !targetId) return;
-      const key = `${sourceId}\u0000${targetId}`;
-      const current = aggregated.get(key) ?? {
-        sourceId,
-        targetId,
-        signed: 0,
-        stability: 0,
-        pathways: 0
-      };
-      current.signed += synapse.effectiveWeight;
-      current.stability += synapse.stability;
-      current.pathways += 1;
-      aggregated.set(key, current);
-    });
-    return [...aggregated.entries()].map(([id, edge]) => {
-      const signedStrength = edge.signed / edge.pathways;
-      return {
-        id,
-        sourceId: edge.sourceId,
-        targetId: edge.targetId,
-        effectiveWeight: signedStrength > 0.15 ? 1 : signedStrength < -0.15 ? -1 : 0,
-        signedStrength,
-        stability: edge.stability / edge.pathways,
-        pathways: edge.pathways,
-        aggregate: true
-      };
-    });
-  }, [brain.synapses, clustered, mapNodes, pathwayPage, realToView, substratePage]);
-  const selectedMapNode =
-    visibleGraphNodes.find((node) => node.id === selected || node.members.includes(selected)) ??
-    visibleGraphNodes[0];
-  // The authoritative worker page may contain nodes absent from the bounded
-  // BrainDocument compatibility mirror. Inspect the selected map node itself.
-  const selectedConcept = selectedMapNode?.clusterCount || selectedMapNode?.activityOnly
-    ? undefined
-    : selectedMapNode;
-  const selectedNodeId = selectedConcept?.id ?? "";
-  const pathwayPageSize = Math.max(12, Math.round(Math.sqrt(pageSize) * 2));
-  const allLocalConnectedSynapses = useMemo(
-    () =>
-      selectedConcept
-        ? Object.values(brain.synapses)
-            .filter((synapse) => synapse.sourceId === selectedConcept.id || synapse.targetId === selectedConcept.id)
-            .sort((a, b) => Math.abs(b.effectiveWeight) - Math.abs(a.effectiveWeight) || b.uses - a.uses)
-        : [],
-    [brain.synapses, selectedConcept]
-  );
-  const connectedSynapses = pathwayPage
-    ? pathwayPage.synapses
-    : allLocalConnectedSynapses.slice(pathwayOffset, pathwayOffset + pathwayPageSize);
-  const connectedSynapseCount = pathwayPage?.matched ?? allLocalConnectedSynapses.length;
-  const connectedSynapseCountLabel = pathwayLoading && !pathwayPage
-    ? "Loading…"
-    : `${compactNumber(connectedSynapseCount)} total`;
-  const selectedStability = connectedSynapses.length
-    ? connectedSynapses.reduce((sum, synapse) => sum + synapse.stability, 0) / connectedSynapses.length
-    : 0;
-  const recentSynapse = [...connectedSynapses].sort((a, b) =>
-    (b.lastUpdatedAt ?? "").localeCompare(a.lastUpdatedAt ?? "")
-  )[0];
-  const persistedInitialCount =
-    persistedOverview?.brainId === brain.id &&
-    filter === "all" &&
-    !query.trim() &&
-    !region
-      ? persistedOverview.totals.neurons
-      : 0;
-  const matchedCount =
-    substratePage?.matched ?? (persistedInitialCount || filteredConcepts.length);
-  const visibleStart = matchedCount
-    ? (substratePage ? (substratePage.offset ?? cursorHistory.length * pageSize) + 1 : clampedOffset + 1)
-    : 0;
-  const visibleEnd = Math.min(matchedCount, visibleStart + mapNodes.length - 1);
-  const showingSubstrateOverview =
-    mapNodes.length === 1 && mapNodes[0]?.id === "substrate-overview";
 
-  useEffect(() => {
-    setPathwayCursor(undefined);
-    setPathwayCursorHistory([]);
-    setPathwayOffset(0);
-    setPathwayPage(null);
-  }, [selectedNodeId]);
-
-  useEffect(() => {
-    if (!selectedNodeId || !window.omni?.brain.querySubstrate) {
-      setPathwayPage(null);
-      setPathwayLoading(false);
-      return;
-    }
-    let active = true;
-    setPathwayLoading(true);
-    void window.omni.brain.querySubstrate(brain.id, {
-      entity: "synapses",
-      connectedTo: selectedNodeId,
-      cursor: pathwayCursor,
-      pageSize: pathwayPageSize,
-      zoom: 1
-    }).then((page) => {
-      if (active) setPathwayPage(page);
-    }).catch(() => {
-      if (!active) return;
-      if (pathwayCursor) {
-        setPathwayCursor(undefined);
-        setPathwayCursorHistory([]);
-      } else {
-        setPathwayPage(null);
-      }
-    }).finally(() => {
-      if (active) setPathwayLoading(false);
-    });
-    return () => {
-      active = false;
-    };
-  }, [brain.id, brain.updatedAt, pathwayCursor, pathwayPageSize, selectedNodeId]);
-
-  useEffect(() => {
-    setOffset(0);
-    setCursor(undefined);
-    setCursorHistory([]);
-  }, [filter, query]);
-
-  const openNode = (node: SubstrateMapNode) => {
-    const firstMember = node.members[0];
-    if (!firstMember) return;
-    setSelected(firstMember);
-    if (clustered && (node.clusterCount ?? node.members.length) > 1) {
-      if (node.region) setRegion(node.region);
-      const index = filteredConcepts.findIndex((concept) => concept.id === firstMember);
-      if (index >= 0) setOffset(index);
-      setCursor(undefined);
-      setCursorHistory([]);
-      setZoom(2);
-    }
-  };
-
-  return (
-    <div className="content-page map-page">
-      <div className="content-page__title content-page__title--compact">
-        <div>
-          <button className="content-page__back" onClick={onBack}>
-            <Icon name="arrow" size={13} className="map-arrow-back" /> Conversation
-          </button>
-          <span className="eyebrow-text">MULTIRESOLUTION SUBSTRATE</span>
-          <h1>Brain map</h1>
-          <p>Zoom from whole-brain assembly clusters into individual neurons and ternary pathways.</p>
-        </div>
-        <div className="map-toolbar">
-          {region ? (
-            <button className="map-region-chip" onClick={() => {
-              setRegion(undefined);
-              setZoom(0.72);
-              setCursor(undefined);
-              setCursorHistory([]);
-            }}>
-              {region} <Icon name="close" size={11} />
-            </button>
-          ) : null}
-          <label
-            className={cx("search-field", "search-field--small", substrateLoading && "is-searching")}
-            aria-busy={substrateLoading || undefined}
-          >
-            <Icon name={substrateLoading ? "pulse" : "search"} size={15} />
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Find an assembly"
-              aria-label="Search neural assemblies"
-            />
-            <span className="visually-hidden" role="status" aria-live="polite">
-              {substrateLoading
-                ? persistedInitialCount > 0
-                  ? "Loading detailed map"
-                  : "Searching neural substrate"
-                : query.trim()
-                  ? `${matchedCount.toLocaleString()} matching neural assemblies`
-                  : "Neural substrate ready"}
-            </span>
-          </label>
-          <div className="segmented">
-            {(["all", "active", "salient"] as const).map((item) => (
-              <button
-                key={item}
-                className={filter === item ? "is-active" : ""}
-                title={item === "salient" ? "High importance in detailed views; high peak activation in clustered views" : undefined}
-                onClick={() => setFilter(item)}
-              >
-                {item[0]?.toUpperCase() + item.slice(1)}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-      <div className="map-layout scalable-map-layout">
-        <section className="surface graph-surface">
-          <div className="graph-legend">
-            <span><i className="legend-dot legend-dot--active" /> Active now</span>
-            <span><i className="legend-dot legend-dot--stable" /> Stable</span>
-            <span><i className="legend-line" /> Excitatory</span>
-            <span><i className="legend-line legend-line--negative" /> Inhibitory</span>
-            <strong>
-              {substrateLoading
-                ? persistedInitialCount > 0
-                  ? `Loading detailed map… ${compactNumber(
-                      persistedOverview!.totals.neurons
-                    )} persisted neurons`
-                  : "Querying substrate…"
-                : showingSubstrateOverview
-                  ? mapNodes[0]?.activityOnly
-                    ? `Cumulative activity · ${compactNumber(connectionCounts.cumulativeUpdates)} connection updates · ${connectionCounts.topologyPending ? "unique topology loading" : `${compactNumber(connectionCounts.uniqueConnections)} unique connections`}`
-                    : `Persisted substrate · ${compactNumber(connectionCounts.uniqueConnections)} unique connections`
-                  : clustered
-                  ? `${mapNodes.length} clusters · ${compactNumber(
-                      substratePage?.totals.neurons ??
-                        persistedOverview?.totals.neurons ??
-                        filteredConcepts.length
-                    )} neurons`
-                  : `${visibleStart}–${visibleEnd} of ${compactNumber(matchedCount)}`}
-            </strong>
-          </div>
-          <div className="brain-graph brain-graph--scalable">
-            {!mapNodes.length ? (
-              <div className="graph-empty">
-                <Icon name="brain" size={28} />
-                <strong>No neural assemblies match this view</strong>
-                <span>Clear the filter or begin a conversation to form connected assemblies.</span>
-              </div>
-            ) : null}
-            <BrainMapSubstrateGraph nodes={visibleGraphNodes} edges={graphEdges} selectedId={selected}
-              clustered={clustered} onSelect={node => {
-                const actual = visibleGraphNodes.find(value => value.id === node.id);
-                if (actual) openNode(actual);
-              }} />
-            <div className="map-viewport-controls">
-              <button aria-label="Zoom out" onClick={() => setZoom((value) => Math.max(0.45, Number((value - 0.25).toFixed(2))))}>−</button>
-              <span>{Math.round(zoom * 100)}% · {clustered ? "cluster view" : "assembly detail"}</span>
-              <button aria-label="Zoom in" onClick={() => setZoom((value) => Math.min(3, Number((value + 0.25).toFixed(2))))}>+</button>
-              <i />
-              <button
-                aria-label={clustered ? "Previous substrate clusters" : "Previous substrate page"}
-                disabled={substratePage ? cursorHistory.length === 0 : clampedOffset === 0}
-                onClick={() => {
-                  if (substratePage) {
-                    setCursorHistory((history) => {
-                      const next = [...history];
-                      setCursor(next.pop());
-                      return next;
-                    });
-                  } else {
-                    setOffset(Math.max(0, clampedOffset - pageSize));
-                  }
-                }}
-              >
-                <Icon name="arrow" size={13} className="map-arrow-back" />
-              </button>
-              <button
-                aria-label={clustered ? "Next substrate clusters" : "Next substrate page"}
-                disabled={substratePage ? !substratePage.hasMore || !substratePage.nextCursor : clampedOffset + pageSize >= filteredConcepts.length}
-                onClick={() => {
-                  if (substratePage?.nextCursor) {
-                    setCursorHistory((history) => [...history, cursor]);
-                    setCursor(substratePage.nextCursor);
-                  } else {
-                    setOffset(clampedOffset + pageSize);
-                  }
-                }}
-              >
-                <Icon name="arrow" size={13} />
-              </button>
-            </div>
-          </div>
-          <div className="graph-status">
-            <span><i /> {compactNumber(connectionCounts.cumulativeUpdates)} cumulative connection updates</span>
-            <span>
-              {connectionCounts.uniqueConnections > 0
-                ? `${compactNumber(connectionCounts.uniqueConnections)} unique live connections`
-                : connectionCounts.topologyPending
-                  ? "Unique live connection topology is still loading"
-                  : "No unique live connections yet"}
-            </span>
-            <span>{connectionCountSourceLabel} · no display ceiling</span>
-          </div>
-        </section>
-        <aside className="map-inspector">
-          {selectedConcept ? (
-            <>
-              <div className="map-inspector__head">
-                <span className="map-inspector__node"><i /></span>
-                <span><small>{selectedConcept.region === "assembly" ? "SELECTED ASSEMBLY" : "SELECTED NEURON"}</small><h2>{selectedConcept.label}</h2></span>
-              </div>
-              <div className="activation-score">
-                <div style={{ "--score": `${selectedConcept.activation * 360}deg` } as React.CSSProperties}>
-                  <span>{selectedMapNode?.activationObserved === false ? "—" : Math.round(selectedConcept.activation * 100)}</span>
-                </div>
-                <span><strong>{selectedMapNode?.activationObserved === false ? "Activation unobserved" : "Current activation"}</strong><small>{selectedMapNode?.activationObserved === false ? "No measured firing for this inspection source" : selectedConcept.lastActivatedAt ? relativeTime(selectedConcept.lastActivatedAt) : selectedConcept.activation > 0.8 ? "Highly active" : "Available"}</small></span>
-              </div>
-              <dl className="inspector-stats">
-                <div><dt>Importance</dt><dd>{Math.round(selectedConcept.importance * 100)}%</dd></div>
-                <div><dt>Stability</dt><dd>{connectedSynapses.length ? `${Math.round(selectedStability * 100)}%` : "—"}</dd></div>
-                <div><dt>Uncertainty</dt><dd>{Math.round(selectedConcept.uncertainty * 100)}%</dd></div>
-                <div><dt>Exposures</dt><dd>{compactNumber(selectedConcept.exposures)}</dd></div>
-              </dl>
-              <div className="panel-section">
-                <div className="panel-section__head"><span>Connected pathways</span><em>{connectedSynapseCountLabel}</em></div>
-                <div className="pathway-list">
-                  {connectedSynapses.map((synapse) => {
-                    const otherId = synapse.sourceId === selectedConcept.id ? synapse.targetId : synapse.sourceId;
-                    return (
-                      <div key={synapse.id}>
-                        <span><i /> {brain.concepts[otherId]?.label ?? otherId}</span>
-                        <em>{nativeConnectionLabel(synapse)}</em>
-                      </div>
-                    );
-                  })}
-                  {pathwayLoading && !pathwayPage ? (
-                    <span className="pathway-empty">Loading authoritative pathways…</span>
-                  ) : !connectedSynapses.length ? (
-                    <span className="pathway-empty">No synapses connect this assembly yet.</span>
-                  ) : null}
-                </div>
-                {connectedSynapseCount > pathwayPageSize ? (
-                  <div className="map-viewport-controls pathway-pagination">
-                    <button
-                      aria-label="Previous connected pathways"
-                      disabled={pathwayPage ? pathwayCursorHistory.length === 0 : pathwayOffset === 0}
-                      onClick={() => {
-                        if (pathwayPage) {
-                          setPathwayCursorHistory((history) => {
-                            const next = [...history];
-                            setPathwayCursor(next.pop());
-                            return next;
-                          });
-                        } else {
-                          setPathwayOffset((value) => Math.max(0, value - pathwayPageSize));
-                        }
-                      }}
-                    >
-                      <Icon name="arrow" size={13} className="map-arrow-back" />
-                    </button>
-                    <span>
-                      {(pathwayPage?.offset ?? pathwayOffset) + 1}–
-                      {Math.min(connectedSynapseCount, (pathwayPage?.offset ?? pathwayOffset) + connectedSynapses.length)}
-                    </span>
-                    <button
-                      aria-label="Next connected pathways"
-                      disabled={pathwayPage
-                        ? !pathwayPage.hasMore || !pathwayPage.nextCursor
-                        : pathwayOffset + pathwayPageSize >= connectedSynapseCount}
-                      onClick={() => {
-                        if (pathwayPage?.nextCursor) {
-                          setPathwayCursorHistory((history) => [...history, pathwayCursor]);
-                          setPathwayCursor(pathwayPage.nextCursor);
-                        } else {
-                          setPathwayOffset((value) => value + pathwayPageSize);
-                        }
-                      }}
-                    >
-                      <Icon name="arrow" size={13} />
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-              <div className="panel-section">
-                <div className="panel-section__head"><span>Latest change on page</span><em>STDP</em></div>
-                {recentSynapse ? (
-                  <div className="change-note">
-                    <Icon name="pulse" size={16} />
-                    <span>
-                      Latest connected synapse changed with <strong>{brain.concepts[recentSynapse.sourceId === selectedConcept.id ? recentSynapse.targetId : recentSynapse.sourceId]?.label ?? "another assembly"}</strong>.
-                      <small>{recentSynapse.lastUpdatedAt ? relativeTime(recentSynapse.lastUpdatedAt) : "Time unavailable"} · {nativeConnectionLabel(recentSynapse)}</small>
-                    </span>
-                  </div>
-                ) : <span className="pathway-empty">No connection change has been recorded for this assembly.</span>}
-              </div>
-            </>
-          ) : selectedMapNode ? (
-            <>
-              <div className="map-inspector__head">
-                <span className="map-inspector__node"><i /></span>
-                <span>
-                  <small>{selectedMapNode.activityOnly ? "ACTIVITY SUMMARY" : selectedMapNode.clusterCount ? "SELECTED CLUSTER" : substratePage?.entity === "neurons" ? "SELECTED NEURON" : "SELECTED ASSEMBLY"}</small>
-                  <h2>{selectedMapNode.label}</h2>
-                </span>
-              </div>
-              <div className="activation-score">
-                <div style={{ "--score": `${selectedMapNode.activation * 360}deg` } as React.CSSProperties}>
-                  <span>{selectedMapNode.activityOnly || selectedMapNode.activationObserved === false ? "—" : Math.round(selectedMapNode.activation * 100)}</span>
-                </div>
-                <span>
-                  <strong>{selectedMapNode.activityOnly
-                    ? connectionCounts.topologyPending
-                      ? "Unique topology loading"
-                      : "No unique live connections"
-                    : "Measured activation"}</strong>
-                  <small>{selectedMapNode.activityOnly ? "Updates are activity, not live edge count" : selectedMapNode.region ?? "Unified substrate"}</small>
-                </span>
-              </div>
-              {selectedMapNode.activityOnly ? (
-                <dl className="inspector-stats">
-                  <div><dt>Cumulative updates</dt><dd>{compactNumber(connectionCounts.cumulativeUpdates)}</dd></div>
-                  <div><dt>Unique connections</dt><dd>{connectionCounts.topologyPending ? "Loading" : compactNumber(connectionCounts.uniqueConnections)}</dd></div>
-                </dl>
-              ) : (
-                <dl className="inspector-stats">
-                  <div><dt>Importance</dt><dd>{Math.round(selectedMapNode.importance * 100)}%</dd></div>
-                  <div><dt>Uncertainty</dt><dd>{Math.round(selectedMapNode.uncertainty * 100)}%</dd></div>
-                  <div><dt>{selectedMapNode.clusterCount ? "Neurons" : "Exposures"}</dt><dd>{compactNumber(selectedMapNode.clusterCount ?? selectedMapNode.exposures)}</dd></div>
-                  <div><dt>Pathways on page</dt><dd>{graphEdges.filter((edge) => edge.sourceId === selectedMapNode.id || edge.targetId === selectedMapNode.id).length}</dd></div>
-                </dl>
-              )}
-              {selectedMapNode.clusterCount ? (
-                <Button kind="primary" icon="expand" onClick={() => openNode(selectedMapNode)}>
-                  Open this region
-                </Button>
-              ) : null}
-              <div className="panel-section">
-                <div className="panel-section__head">
-                  <span>{selectedMapNode.activityOnly ? "Unique connection topology" : "Ternary pathways"}</span>
-                  <em>{selectedMapNode.activityOnly ? "not inferred from updates" : selectedMapNode.clusterCount ? "aggregate page" : connectedSynapseCountLabel}</em>
-                </div>
-                <div className="pathway-list">
-                  {(selectedMapNode.clusterCount
-                    ? graphEdges.filter((edge) => edge.sourceId === selectedMapNode.id || edge.targetId === selectedMapNode.id)
-                    : connectedSynapses
-                  ).map((edge) => {
-                      const referenceId = selectedNodeId || selectedMapNode.id;
-                      const otherId = edge.sourceId === referenceId ? edge.targetId : edge.sourceId;
-                      return (
-                        <div key={edge.id}>
-                          <span><i /> {brain.concepts[otherId]?.label ?? mapNodes.find((node) => node.id === otherId)?.label ?? otherId}</span>
-                          <em>{"pathways" in edge && edge.pathways > 1 ? `${compactNumber(edge.pathways)} pathways` : nativeConnectionLabel(edge)}</em>
-                        </div>
-                      );
-                    })}
-                  {!selectedMapNode.clusterCount && pathwayLoading && !pathwayPage ? (
-                    <span className="pathway-empty">Loading authoritative pathways…</span>
-                  ) : !selectedMapNode.clusterCount && !connectedSynapses.length ? (
-                    <span className="pathway-empty">
-                      {selectedMapNode.activityOnly
-                        ? "Validated live connections will appear when the substrate topology is available."
-                        : "No synapses connect this neural node yet."}
-                    </span>
-                  ) : null}
-                </div>
-                {!selectedMapNode.activityOnly && !selectedMapNode.clusterCount && connectedSynapseCount > pathwayPageSize ? (
-                  <div className="map-viewport-controls pathway-pagination">
-                    <button
-                      aria-label="Previous connected pathways"
-                      disabled={pathwayPage ? pathwayCursorHistory.length === 0 : pathwayOffset === 0}
-                      onClick={() => {
-                        if (pathwayPage) {
-                          setPathwayCursorHistory((history) => {
-                            const next = [...history];
-                            setPathwayCursor(next.pop());
-                            return next;
-                          });
-                        } else {
-                          setPathwayOffset((value) => Math.max(0, value - pathwayPageSize));
-                        }
-                      }}
-                    >
-                      <Icon name="arrow" size={13} className="map-arrow-back" />
-                    </button>
-                    <span>
-                      {(pathwayPage?.offset ?? pathwayOffset) + 1}–
-                      {Math.min(connectedSynapseCount, (pathwayPage?.offset ?? pathwayOffset) + connectedSynapses.length)}
-                    </span>
-                    <button
-                      aria-label="Next connected pathways"
-                      disabled={pathwayPage
-                        ? !pathwayPage.hasMore || !pathwayPage.nextCursor
-                        : pathwayOffset + pathwayPageSize >= connectedSynapseCount}
-                      onClick={() => {
-                        if (pathwayPage?.nextCursor) {
-                          setPathwayCursorHistory((history) => [...history, pathwayCursor]);
-                          setPathwayCursor(pathwayPage.nextCursor);
-                        } else {
-                          setPathwayOffset((value) => value + pathwayPageSize);
-                        }
-                      }}
-                    >
-                      <Icon name="arrow" size={13} />
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            </>
-          ) : (
-            <div className="graph-empty graph-empty--inspector">
-              <Icon name="brain" size={25} />
-              <strong>Select an assembly</strong>
-              <span>Zoom or search to inspect its local ternary pathways.</span>
-            </div>
-          )}
-        </aside>
-      </div>
-    </div>
-  );
-}
-
-function TraceWorkspace({ brain }: { brain: BrainDocument }) {
-  const fallbackTraces = brain.traces.length > 0 ? brain.traces : window.omni ? [] : [makeDemoBrain().traces[0]!];
-  const [traces, setTraces] = useState(fallbackTraces);
-  const [selectedId, setSelectedId] = useState(fallbackTraces.at(-1)?.id ?? "");
-  const [tab, setTab] = useState<"trace" | "journal">("trace");
-
-  useEffect(() => {
-    if (!window.omni) {
-      setTraces(fallbackTraces);
-      return;
-    }
-    void window.omni.trace.list(brain.id, { limit: 100 }).then(setTraces);
-  }, [brain.id, brain.traces]);
-
-  if (!traces.length) {
-    const hasJournal = (brain.activity?.journalCount ?? brain.journal?.length ?? 0) > 0;
-    return (
-      <div className="content-page trace-page">
-        <div className="content-page__title content-page__title--compact">
-          <div>
-            <span className="eyebrow-text">VERIFIABLE ACTIVITY</span>
-            <h1>Trace & journal</h1>
-            <p>
-              {hasJournal
-                ? "Browse the append-only operational journal while inference traces are still empty."
-                : "Operational traces will appear after this brain performs inference or learning."}
-            </p>
-          </div>
-        </div>
-        {hasJournal ? (
-          <JournalView brain={brain} />
-        ) : (
-          <div className="journal-empty surface">
-            <span><Icon name="trace" size={24} /></span>
-            <h2>No operational traces yet</h2>
-            <p>Start a conversation or encode an experience. Real activation and mutation events will be recorded here.</p>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  const selected = traces.find((traceItem) => traceItem.id === selectedId) ?? traces.at(-1)!;
-  const traceEvidence = presentTraceEvidence(selected);
-  const traceSignalMeasures = presentTraceSignalMeasures(selected);
-  const connectionChangeSteps = selected.steps.filter((stepItem) =>
-    /plastic|synap|hebb|stdp|connection learning|strengthen/i.test(`${stepItem.stage} ${stepItem.detail}`)
-  );
-  const liquidStep = selected.steps.find((stepItem) => /liquid|time constant|integration/i.test(`${stepItem.stage} ${stepItem.detail}`));
-
-  const exportTrace = () => {
-    const url = URL.createObjectURL(new Blob([JSON.stringify(selected, null, 2)], { type: "application/json" }));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${brain.name}-${selected.id}.trace.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <div className="content-page trace-page">
-      <div className="content-page__title content-page__title--compact">
-        <div>
-          <span className="eyebrow-text">VERIFIABLE ACTIVITY</span>
-          <h1>Trace & journal</h1>
-          <p>Follow activations and real mutations. Prose reflections remain clearly labeled self-reports.</p>
-        </div>
-        <div className="segmented segmented--large">
-          <button className={tab === "trace" ? "is-active" : ""} onClick={() => setTab("trace")}>
-            <Icon name="trace" size={15} /> Operational trace
-          </button>
-          <button className={tab === "journal" ? "is-active" : ""} onClick={() => setTab("journal")}>
-            <Icon name="file" size={15} /> Inner journal
-          </button>
-        </div>
-      </div>
-      {tab === "trace" ? (
-        <div className="trace-layout">
-          <aside className="surface trace-list">
-            <div className="trace-list__head">
-              <strong>Recent inference</strong>
-            </div>
-            {[...traces].reverse().map((item, index) => (
-              <button key={item.id} className={selected.id === item.id ? "is-active" : ""} onClick={() => setSelectedId(item.id)}>
-                <span className="trace-list__pulse"><i /></span>
-                <span>
-                  <strong>{item.input}</strong>
-                  <small>{relativeTime(item.createdAt)} · {item.steps.length} recorded operations</small>
-                </span>
-                <em>{index === 0 ? "latest" : ""}</em>
-              </button>
-            ))}
-            {!window.omni ? (
-              <>
-                <div className="trace-list__day">DEMO EVENTS</div>
-                {[1, 2, 3].map((index) => (
-                  <button key={index} className="is-muted">
-                    <span className="trace-list__pulse"><i /></span>
-                    <span>
-                      <strong>{index === 1 ? "Connections updated" : index === 2 ? "Document learned" : "Autonomous reflection"}</strong>
-                      <small>demo preview · no live event</small>
-                    </span>
-                  </button>
-                ))}
-              </>
-            ) : null}
-          </aside>
-          <section className="surface trace-detail">
-            <div className="trace-detail__head">
-              <div>
-                <span className="eyebrow-text">TRACE · {selected.seed.toString(16).toUpperCase()}</span>
-                <h2>{selected.input}</h2>
-                <p>{new Date(selected.createdAt).toLocaleString()} · {selected.runtime}</p>
-              </div>
-              <Button icon="download" onClick={exportTrace}>Export trace</Button>
-            </div>
-            <div className="trace-summary">
-              <div><span>Branches</span><strong>{selected.branches}</strong><small>selected #{selected.selectedBranch}</small></div>
-              <div><span>Recalled idea previews</span><strong>{selected.recalledIdeas.length}</strong><small>{selected.activatedConcepts.length} labeled concept activations captured</small></div>
-              {traceSignalMeasures.length ? (
-                <div>
-                  <span>Neural signal measures</span>
-                  <strong>{traceSignalMeasures[0]}</strong>
-                  <small>{traceSignalMeasures.slice(1).join(" · ") || "Worker-recorded signal/vector activity"}</small>
-                </div>
-              ) : null}
-              <div><span>Connection changes</span><strong>{connectionChangeSteps.length}</strong><small>{connectionChangeSteps[0]?.value ?? "none recorded"}</small></div>
-              <div><span>Timing adjustment</span><strong>{liquidStep?.value ?? "—"}</strong><small>{liquidStep ? "recorded" : "not recorded"}</small></div>
-            </div>
-            {traceEvidence.activatedConcepts.length ||
-            traceEvidence.recalledIdeas.length ||
-            traceEvidence.candidates.length ? (
-              <div className="trace-evidence" aria-label="Measured trace evidence">
-                {traceEvidence.activatedConcepts.length ? (
-                  <section className="trace-evidence__group">
-                    <span className="trace-evidence__head">
-                      <small>ACTIVATION MEASUREMENT</small>
-                      <strong>{traceEvidence.activatedConcepts.length} ideas observed</strong>
-                    </span>
-                    <div className="trace-concepts">
-                      {traceEvidence.activatedConcepts.map((concept) => (
-                        <span key={concept.id}>
-                          {concept.label}<i>{Math.round(concept.activation * 100)}</i>
-                        </span>
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
-                {traceEvidence.recalledIdeas.length ? (
-                  <section className="trace-evidence__group">
-                    <span className="trace-evidence__head">
-                      <small>RECALL MEASUREMENT</small>
-                      <strong>{traceEvidence.recalledIdeas.length} learned ideas recalled</strong>
-                    </span>
-                    <div className="trace-recalls">
-                      {traceEvidence.recalledIdeas.map((idea) => (
-                        <span key={idea.id}>
-                          {idea.preview}<i>{Math.round(idea.score * 100)}</i>
-                        </span>
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
-                {traceEvidence.candidates.length ? (
-                  <section className="trace-evidence__group">
-                    <span className="trace-evidence__head">
-                      <small>CANDIDATE MEASUREMENT</small>
-                      <strong>{traceEvidence.candidates.length} alternatives compared</strong>
-                    </span>
-                    <div className="branch-row">
-                      {traceEvidence.candidates.map((candidate) => (
-                        <span key={candidate.id} className={candidate.outcome === "selected" ? "is-selected" : ""}>
-                          {candidate.label}<i>{candidate.outcome}</i>
-                        </span>
-                      ))}
-                    </div>
-                  </section>
-                ) : null}
-              </div>
-            ) : null}
-            <div className="trace-mechanisms__head">
-              <span>
-                <small>RECORDED MECHANISMS</small>
-                <strong>{traceEvidence.mechanisms.length} observed operations</strong>
-              </span>
-              <p>Unordered evidence from this event; it is not a fixed memory sequence.</p>
-            </div>
-            <ul
-              className="trace-mechanisms"
-              aria-label="Recorded mechanisms; visual order does not imply a fixed sequence"
-            >
-              {traceEvidence.mechanisms.map((mechanism) => (
-                <li
-                  className={`trace-mechanism trace-mechanism--${mechanism.kind}`}
-                  key={mechanism.id}
-                >
-                  <span className="trace-mechanism__marker" aria-hidden="true"><i /></span>
-                  <div>
-                    <span className="trace-mechanism__title">
-                      <strong>{mechanism.title}</strong>
-                      {mechanism.measure ? <em>{mechanism.measure}</em> : null}
-                    </span>
-                    <p>{mechanism.detail}</p>
-                  </div>
-                </li>
-              ))}
-              {!traceEvidence.mechanisms.length ? (
-                <li className="trace-mechanisms__empty">No mechanism operations were recorded for this trace.</li>
-              ) : null}
-            </ul>
-            <div className="trace-note">
-              <Icon name="info" size={16} />
-              <span>{selected.note}</span>
-            </div>
-          </section>
-        </div>
-      ) : (
-        <JournalView brain={brain} />
-      )}
-    </div>
-  );
-}
-
-function JournalView({ brain }: { brain: BrainDocument }) {
-  const [entries, setEntries] = useState((brain.journal ?? []).slice(-60));
-  const [cursor, setCursor] = useState<string | undefined>();
-  const [pageDepth, setPageDepth] = useState(0);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState("");
-  const [selectedId, setSelectedId] = useState(entries.at(-1)?.id ?? entries[0]?.id ?? "");
-
-  const loadPage = useCallback(async (nextCursor?: string, depth = 0) => {
-    if (!window.omni) {
-      const fallback = (brain.journal ?? []).slice(-60);
-      setEntries(fallback);
-      setCursor(undefined);
-      setPageDepth(0);
-      setSelectedId(fallback.at(-1)?.id ?? fallback[0]?.id ?? "");
-      return;
-    }
-    setLoading(true);
-    try {
-      const page = await window.omni.brain.journalPage(brain.id, nextCursor, 60);
-      const nextEntries = page.entries.map((entry) => entry.entry);
-      setEntries(nextEntries);
-      setCursor(page.nextCursor);
-      setPageDepth(depth);
-      setSelectedId(nextEntries.at(-1)?.id ?? nextEntries[0]?.id ?? "");
-      setLoadError("");
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : "The journal page could not be loaded.");
-    } finally {
-      setLoading(false);
-    }
-  }, [brain.id, brain.journal]);
-
-  useEffect(() => {
-    void loadPage(undefined, 0);
-  }, [loadPage, brain.activity?.journalHeadSha256]);
-
-  const selected = entries.find((entry) => entry.id === selectedId) ?? entries.at(-1);
-  const selectedKind = selected ? presentJournalKind(selected.kind) : "";
-
-  if (!selected) {
-    return (
-      <div className="journal-empty surface">
-        <span><Icon name="file" size={24} /></span>
-        <h2>No journal entries yet</h2>
-        <p>
-          {loadError || "Journal entries appear only after the brain records real learning, a tool, a fork, or a system event."}
-        </p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="journal-layout">
-      <section className="surface journal-entry">
-        <div className="journal-entry__top">
-          <span className="journal-date">
-            <strong>{new Date(selected.createdAt).getDate()}</strong>
-            <small>{new Date(selected.createdAt).toLocaleString("en", { month: "short" }).toUpperCase()}</small>
-          </span>
-          <span>
-            <small>{selectedKind.toUpperCase()} EVENT · {new Date(selected.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
-            <h2>{selected.summary}</h2>
-          </span>
-          <em>{selectedKind}</em>
-        </div>
-        <div className="journal-prose">
-          {(selected.detail ?? selected.summary).split(/\n{2,}/).map((paragraph, index) => <p key={index}>{paragraph}</p>)}
-        </div>
-        <div className="journal-entry__footer">
-          <span><Icon name="brain" size={14} /> Recorded by {brain.name}</span>
-          <span><Icon name="pulse" size={14} /> Verifiable {selectedKind} event</span>
-          <span>{relativeTime(selected.createdAt)}</span>
-        </div>
-      </section>
-      <aside className="surface journal-sidebar">
-        <h3>Recorded entries</h3>
-        <div className="journal-entry-list">
-          {[...entries].reverse().map((entry) => (
-            <button key={entry.id} className={entry.id === selected.id ? "is-active" : ""} onClick={() => setSelectedId(entry.id)}>
-              <span>{entry.summary}</span>
-              <small>{presentJournalKind(entry.kind)} · {relativeTime(entry.createdAt)}</small>
-            </button>
-          ))}
-        </div>
-        <div className="journal-page-controls">
-          {pageDepth > 0 ? (
-            <Button disabled={loading} onClick={() => void loadPage(undefined, 0)}>
-              Newest
-            </Button>
-          ) : null}
-          {cursor ? (
-            <Button disabled={loading} onClick={() => void loadPage(cursor, pageDepth + 1)}>
-              Older entries
-            </Button>
-          ) : null}
-        </div>
-        <dl className="journal-facts">
-          <div>
-            <dt>Recorded events</dt>
-            <dd>{(brain.activity?.journalCount ?? entries.length).toLocaleString("en-US")}</dd>
-          </div>
-          <div>
-            <dt>Measured novelty</dt>
-            <dd>{brain.traces.at(-1) ? `${Math.round(brain.traces.at(-1)!.driveScores.novelty * 100)}%` : "Awaiting activity"}</dd>
-          </div>
-          <div><dt>Trace detail</dt><dd>{brain.config.traceDetail}</dd></div>
-        </dl>
-        <div className="journal-disclosure">
-          <Icon name="info" size={16} />
-          <p>
-            Reflective prose is the brain’s interpretation of its state. Operational events are factual; prose is not a
-            guaranteed transcript of a private recurrent scratchpad.
-          </p>
-        </div>
-      </aside>
-    </div>
-  );
-}
-
-function PersistedArtifactMedia({ artifact }: { artifact: GeneratedArtifact }) {
-  const presentation = persistedArtifactMediaPresentation(artifact);
-  if (!artifact.available || !artifact.mediaUrl || presentation.kind === "unavailable") {
-    return (
-      <span className="imagination-gallery__unavailable" aria-label={presentation.ariaLabel}>
-        <Icon name="warning" size={22} />
-        {artifact.unavailableReason === "missing"
-          ? "Artifact file is missing"
-          : "Artifact integrity could not be verified"}
-      </span>
-    );
-  }
-  if (presentation.kind === "animated-video") {
-    return (
-      <span className="imagination-gallery__animated-video">
-        <img src={artifact.mediaUrl} alt={presentation.ariaLabel} />
-        <small>{presentation.animationCopy}</small>
-      </span>
-    );
-  }
-  if (presentation.kind === "image") {
-    return <img src={artifact.mediaUrl} alt={presentation.ariaLabel} />;
-  }
-  if (presentation.kind === "video") {
-    return (
-      <video
-        src={artifact.mediaUrl}
-        controls
-        muted
-        preload="metadata"
-        aria-label={presentation.ariaLabel}
-      />
-    );
-  }
-  return (
-    <span className="imagination-gallery__audio">
-      <Icon name="wave" size={24} />
-      <audio
-        src={artifact.mediaUrl}
-        controls
-        preload="metadata"
-        aria-label={presentation.ariaLabel}
-      />
-    </span>
-  );
-}
-
-function ImaginationWorkspace({ brain, onToast }: { brain: BrainDocument; onToast: (message: string) => void }) {
-  const [mode, setMode] = useState<ModalityId>("image");
-  const [prompt, setPrompt] = useState("A memory palace growing new luminous pathways after rain");
-  const [outputMode, setOutputMode] = useState<"auto" | "exact">("auto");
-  const [outputWidth, setOutputWidth] = useState("256");
-  const [outputHeight, setOutputHeight] = useState("256");
-  const [outputDurationMs, setOutputDurationMs] = useState("2000");
-  const [outputSampleRate, setOutputSampleRate] = useState("16000");
-  const [outputFps, setOutputFps] = useState("8");
-  const [includeAudio, setIncludeAudio] = useState(true);
-  const [mediaPlaybackFailed, setMediaPlaybackFailed] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [variation, setVariation] = useState(0);
-  const [job, setJob] = useState<RuntimeJob | null>(null);
-  const [installedPacks, setInstalledPacks] = useState<InstalledModalityPack[]>([]);
-  const [artifacts, setArtifacts] = useState<GeneratedArtifact[]>([]);
-  const [artifactTotal, setArtifactTotal] = useState(0);
-  const [artifactCursor, setArtifactCursor] = useState<string | undefined>();
-  const [galleryOpen, setGalleryOpen] = useState(false);
-  const [galleryLoading, setGalleryLoading] = useState(false);
-  const [packUrl, setPackUrl] = useState("");
-  const [packBusy, setPackBusy] = useState(false);
-  const settledJobs = useRef(new Set<string>());
-  const demo = !window.omni;
-
-  const reloadPacks = async () => {
-    if (!window.omni) return;
-    setInstalledPacks(await window.omni.catalog.listModalityPacks(brain.id));
-  };
-
-  const reloadArtifacts = async () => {
-    if (!window.omni) return;
-    setGalleryLoading(true);
-    try {
-      const page = await window.omni.modality.artifacts(brain.id, undefined, 48);
-      setArtifacts(page.artifacts);
-      setArtifactTotal(page.totalArtifacts);
-      setArtifactCursor(page.nextCursor);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The imagination gallery could not load.");
-    } finally {
-      setGalleryLoading(false);
-    }
-  };
-
-  const loadMoreArtifacts = async () => {
-    if (!window.omni || !artifactCursor || galleryLoading) return;
-    setGalleryLoading(true);
-    try {
-      const page = await window.omni.modality.artifacts(brain.id, artifactCursor, 48);
-      setArtifacts((current) => {
-        const merged = new Map(current.map((artifact) => [artifact.id, artifact]));
-        page.artifacts.forEach((artifact) => merged.set(artifact.id, artifact));
-        return [...merged.values()];
-      });
-      setArtifactTotal(page.totalArtifacts);
-      setArtifactCursor(page.nextCursor);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Older imagination artifacts could not load.");
-    } finally {
-      setGalleryLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    setGalleryOpen(false);
-    setArtifacts([]);
-    setArtifactTotal(0);
-    setArtifactCursor(undefined);
-    void reloadPacks();
-    void reloadArtifacts();
-  }, [brain.id]);
-
-  useEffect(() => {
-    if (!galleryOpen) return;
-    const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
-      if (event.key === "Escape") setGalleryOpen(false);
-    };
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [galleryOpen]);
-
-  useEffect(() => {
-    const trackedId = job?.id;
-    if (!window.omni || !trackedId) return;
-    const applyJob = (eventJob: RuntimeJob) => {
-      if (eventJob.id !== trackedId) return;
-      setJob(eventJob);
-      if (["complete", "failed", "cancelled"].includes(eventJob.state)) {
-        setGenerating(false);
-        if (settledJobs.current.has(eventJob.id)) return;
-        settledJobs.current.add(eventJob.id);
-        if (eventJob.state === "complete") {
-          setVariation((current) => current + 1);
-          void reloadArtifacts();
-          onToast("Local modality artifact completed.");
-        } else if (eventJob.error) {
-          onToast(eventJob.error);
-        }
-      }
-    };
-    const unsubscribe = window.omni.train.onEvent(({ job: eventJob }) => {
-      applyJob(eventJob);
-    });
-    // A tiny local pack can finish before React commits the new job id and
-    // installs the event subscription. The durable job list closes that race.
-    void window.omni.train
-      .list(brain.id)
-      .then((jobs) => {
-        const current = jobs.find((candidate) => candidate.id === trackedId);
-        if (current) applyJob(current);
-      })
-      .catch(() => undefined);
-    return unsubscribe;
-  }, [brain.id, job?.id, onToast]);
-
-  const generate = async () => {
-    setGenerating(true);
-    setJob(null);
-    setMediaPlaybackFailed(false);
-    try {
-      if (window.omni) {
-        const positiveInteger = (raw: string, label: string): number => {
-          if (!/^\d+$/.test(raw.trim())) throw new Error(`${label} must be a positive whole number.`);
-          const value = Number(raw);
-          if (!Number.isSafeInteger(value) || value < 1) {
-            throw new Error(`${label} must be a positive whole number.`);
-          }
-          return value;
-        };
-        const positiveNumber = (raw: string, label: string): number => {
-          const value = Number(raw);
-          if (!Number.isFinite(value) || value <= 0) throw new Error(`${label} must be positive.`);
-          return value;
-        };
-        let settings: ModalityGenerationSettings | undefined;
-        if (mode !== "vision") {
-          settings = outputMode === "auto"
-            ? { outputMode: "auto" }
-            : mode === "image"
-              ? {
-                  outputMode: "exact",
-                  width: positiveInteger(outputWidth, "Width"),
-                  height: positiveInteger(outputHeight, "Height")
-                }
-              : mode === "audio"
-                ? {
-                    outputMode: "exact",
-                    durationMs: positiveNumber(outputDurationMs, "Duration"),
-                    sampleRate: positiveInteger(outputSampleRate, "Sample rate")
-                  }
-                : {
-                    outputMode: "exact",
-                    width: positiveInteger(outputWidth, "Width"),
-                    height: positiveInteger(outputHeight, "Height"),
-                    durationMs: positiveNumber(outputDurationMs, "Duration"),
-                    sampleRate: positiveInteger(outputSampleRate, "Sample rate"),
-                    fps: positiveInteger(outputFps, "FPS"),
-                    includeAudio
-                  };
-        }
-        const request = {
-          brainId: brain.id,
-          modality: mode,
-          prompt,
-          conceptIds: brain.workingMemory.map((item) => item.conceptId),
-          ...(settings ? { settings } : {})
-        };
-        const started =
-          mode === "vision"
-            ? await window.omni.modality.selectInput(request)
-            : await window.omni.modality.generate(request);
-        if (!started) {
-          setGenerating(false);
-          return;
-        }
-        setJob(started);
-        onToast(`${started.label} queued in the local Python engine.`);
-      } else {
-        await new Promise((resolve) => window.setTimeout(resolve, 1100));
-        onToast("Demo preview rendered; no modality model ran.");
-        setVariation((current) => current + 1);
-        setGenerating(false);
-      }
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The modality job could not start.");
-      setGenerating(false);
-    }
-  };
-
-  const cancelGeneration = async () => {
-    if (!window.omni || !job) {
-      setGenerating(false);
-      return;
-    }
-    const stop = runtimeJobStopPresentation(job);
-    if (!stop.requestAllowed) return;
-    const requestedJob = job;
-    setJob({
-      ...requestedJob,
-      state: "cancelling",
-      label: `Cancelling ${requestedJob.kind} · waiting for acknowledgement`,
-      error: undefined,
-      updatedAt: new Date().toISOString()
-    });
-    setGenerating(true);
-    try {
-      const cancelled = await window.omni.train.cancel(requestedJob.id);
-      setJob(cancelled);
-      setGenerating(false);
-      onToast("Imagination stopped after worker acknowledgement; the last real decoder revision remains visible.");
-    } catch (error) {
-      const reason = conciseUiMessage(
-        error instanceof Error ? error.message : String(error),
-        "The modality job is still awaiting stop acknowledgement."
-      );
-      const current = await window.omni.train
-        .list(brain.id)
-        .then((jobs) => jobs.find((candidate) => candidate.id === requestedJob.id))
-        .catch(() => undefined);
-      setJob(current ?? {
-        ...requestedJob,
-        state: "cancelling",
-        label: `${requestedJob.kind} stop needs acknowledgement`,
-        error: reason,
-        updatedAt: new Date().toISOString()
-      });
-      onToast(`${reason} Retry stop when ready.`);
-    }
-  };
-
-  const installPack = async (source: "url" | "file") => {
-    if (!window.omni) {
-      onToast("Pack installation is available in the packaged desktop app.");
-      return;
-    }
-    setPackBusy(true);
-    try {
-      const installed =
-        source === "url"
-          ? await window.omni.catalog.installModalityPackUrl({
-              brainId: brain.id,
-              url: packUrl.trim()
-            })
-          : await window.omni.catalog.installModalityPackFile(brain.id);
-      if (!installed) return;
-      await reloadPacks();
-      onToast(
-        `Installed ${installed.name} for ${installed.modalities.join(", ")}; safe tensors are active.`
-      );
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The modality pack could not be installed.");
-    } finally {
-      setPackBusy(false);
-    }
-  };
-
-  const output =
-    job && typeof job.output === "object" && job.output !== null
-      ? (job.output as Record<string, unknown>)
-      : null;
-  const media = jobImaginationMedia(job, mode);
-  useEffect(() => setMediaPlaybackFailed(false), [media.sourceUrl]);
-  const generationStop = runtimeJobStopPresentation(job);
-  const embedding = Array.isArray(output?.embedding) ? output.embedding : null;
-  const qualityNote = typeof output?.qualityNote === "string"
-    ? output.qualityNote
-    : null;
-  const finalMediaOutput = output?.mediaOutput && typeof output.mediaOutput === "object"
-    ? output.mediaOutput as Record<string, unknown>
-    : null;
-  const mediaEvidence = finalMediaOutput ?? (
-    job?.preview && typeof job.preview === "object"
-      ? job.preview as unknown as Record<string, unknown>
-      : null
-  );
-  const trainingState = mediaEvidence?.trainingState === "untrained-diagnostic" ||
-    mediaEvidence?.trainingState === "trained-unverified-quality"
-    ? mediaEvidence.trainingState
-    : null;
-  const finalMediaPlan = output?.mediaOutputPlan && typeof output.mediaOutputPlan === "object"
-    ? output.mediaOutputPlan as Record<string, unknown>
-    : null;
-  const outputShape = finalMediaPlan
-    ? mode === "image"
-      ? `${String(finalMediaPlan.width)} × ${String(finalMediaPlan.height)} px`
-      : mode === "audio"
-        ? `${Math.round(Number(finalMediaPlan.durationMs))} ms · ${String(finalMediaPlan.sampleRate)} Hz`
-        : mode === "video"
-          ? `${String(finalMediaPlan.width)} × ${String(finalMediaPlan.height)} px · ${String(finalMediaPlan.totalFrames)} frames @ ${String(finalMediaPlan.fps)} fps`
-          : null
-    : null;
-  const seedCopy = imaginationSeedCopy(
-    output,
-    job?.preview,
-    brain.workingMemory.length
-  );
-  const downloadOutput = () => {
-    if (!media.isFinal || !media.downloadUrl) return;
-    const mimeType = typeof output?.mimeType === "string" ? output.mimeType : "application/octet-stream";
-    const extension = mimeType.includes("mp4")
-      ? "mp4"
-      : mimeType.includes("png")
-        ? "png"
-        : mimeType.includes("wav")
-          ? "wav"
-          : "bin";
-    const anchor = document.createElement("a");
-    anchor.href = media.downloadUrl;
-    anchor.download = `${brain.name}-${mode}-${job?.id ?? Date.now()}.${extension}`;
-    anchor.click();
-  };
-
-  return (
-    <div className="content-page imagine-page">
-      <div className="content-page__title content-page__title--compact">
-        <div>
-          <span className="eyebrow-text">SHARED IDEA SPACE</span>
-          <h1>Imagination</h1>
-          <p>Let an internal idea become image, sound, or motion without routing it through long-term text.</p>
-        </div>
-        <span className="pack-status">
-          <i /> Shared neural image · audio · video · vision pathways · {installedPacks.length} verified pack{installedPacks.length === 1 ? "" : "s"}
-        </span>
-      </div>
-      <div className="imagine-layout">
-        <section className="surface imagination-canvas">
-          <div className={cx("generated-art", generating && "is-generating", `generated-art--${variation % 3}`)}>
-            {media.sourceUrl && media.mimeType.startsWith("audio/") && !mediaPlaybackFailed ? (
-              <div className="generated-media generated-media--audio">
-                <Icon name="wave" size={42} />
-                <audio
-                  key={`audio-${job?.id}-${media.revision ?? "final"}`}
-                  src={media.sourceUrl}
-                  controls
-                  onError={() => setMediaPlaybackFailed(true)}
-                />
-                <span>{media.isLiveRevision ? "Growing neural codec waveform" : "Final local neural audio artifact"}</span>
-              </div>
-            ) : media.sourceUrl && media.mimeType.startsWith("video/") && !mediaPlaybackFailed ? (
-              <video
-                key={`video-${job?.id}-${media.revision ?? "final"}`}
-                className="generated-media-video"
-                src={media.sourceUrl}
-                controls
-                autoPlay={!media.isLiveRevision}
-                loop={!media.isLiveRevision}
-                muted
-                onError={() => setMediaPlaybackFailed(true)}
-                aria-label={media.isLiveRevision ? "Live locally decoded video revision" : "Locally generated video artifact"}
-              />
-            ) : media.sourceUrl && media.mimeType.startsWith("image/") ? (
-              <img
-                className="generated-media-image"
-                src={media.sourceUrl}
-                alt={media.isLiveRevision ? `Live ${media.modality ?? mode} decoder revision` : `Locally generated ${media.modality ?? mode} artifact`}
-              />
-            ) : generating ? (
-              <span className="generation-state">
-                <Icon name={generationStop.waitingForAcknowledgement ? "pulse" : "sparkles"} size={22} />
-                {job?.state === "cancelling"
-                  ? generationStop.retryAvailable
-                    ? "Stop acknowledgement failed · retry available"
-                    : "Stopping generation · waiting for worker acknowledgement…"
-                  : mode === "vision"
-                    ? "Encoding selected image…"
-                    : media.statusLabel}
-              </span>
-            ) : mediaPlaybackFailed && media.downloadUrl ? (
-              <span className="imagination-empty" role="status">
-                <Icon name="warning" size={25} />
-                <strong>Inline playback unavailable for this output</strong>
-                <small>The generated artifact is intact and remains available with Download output.</small>
-              </span>
-            ) : embedding ? (
-              <div className="vision-result">
-                <span><Icon name="eye" size={30} /></span>
-                <strong>Vision encoding complete</strong>
-                <p>{embedding.length}-dimension embedding mapped into {brain.name}’s shared idea space.</p>
-              </div>
-            ) : demo ? (
-              <>
-                <div className="generated-art__mist" />
-                <div className="generated-art__structure">
-                  {Array.from({ length: 7 }).map((_, index) => <i key={index} />)}
-                </div>
-                <div className="generated-art__path" />
-                <span className="generated-art__label">
-                  <small>DEMO PREVIEW · NO MODEL RAN</small>
-                  <strong>Memory palace, visual concept</strong>
-                </span>
-              </>
-            ) : (
-              <span className="imagination-empty">
-                <Icon name={mode === "vision" ? "eye" : "sparkles"} size={25} />
-                <strong>{mode === "vision" ? "Choose an image to understand" : "No generated artifact yet"}</strong>
-                <small>{mode === "vision" ? "The file path stays in the main process." : "Run the local modality pack to create one."}</small>
-              </span>
-            )}
-            {trainingState === "untrained-diagnostic" || output?.randomlyInitialized === true ? (
-              <span className="baseline-quality">Untrained diagnostic decoder · semantic quality not claimed</span>
-            ) : trainingState === "trained-unverified-quality" ? (
-              <span className="baseline-quality">Trained decoder · semantic quality unverified</span>
-            ) : qualityNote ? (
-              <span className="baseline-quality" title={qualityNote}>Tiny local research decoder · training-dependent quality</span>
-            ) : null}
-            {job && mode !== "vision" && (job.preview || job.state === "complete") ? (
-              <span
-                className="generation-live-revision"
-                role="status"
-                aria-live="polite"
-              >
-                <strong>{media.isFinal ? "FINAL ARTIFACT" : `Progressive imagination · decoder r${media.revision ?? 0}`}</strong>
-                <small>{imaginationRevisionCopy(media)}</small>
-              </span>
-            ) : null}
-          </div>
-          <div className="canvas-footer">
-            <span>
-              <Icon name="brain" size={15} /> {seedCopy}
-            </span>
-            <div>
-              <button className="icon-button" aria-label="Create variation" disabled={generating} onClick={() => void generate()}>
-                <Icon name="sparkles" size={16} />
-              </button>
-              <button className="icon-button" aria-label="Download output" disabled={!media.isFinal || !media.downloadUrl} onClick={downloadOutput}>
-                <Icon name="download" size={16} />
-              </button>
-            </div>
-          </div>
-        </section>
-        <aside className="surface imagination-controls">
-          <ImaginationCaptureControls brainId={brain.id} api={window.omni?.modality.capture} />
-          <div className="modality-switcher">
-            {(
-              [
-                ["image", "Image", "image"],
-                ["audio", "Audio", "volume"],
-                ["video", "Video", "video"],
-                ["vision", "Vision", "eye"]
-              ] as const
-            ).map(([id, label, icon]) => (
-              <button key={id} disabled={generating} className={mode === id ? "is-active" : ""} onClick={() => setMode(id)}>
-                <Icon name={icon} size={16} /> {label}
-              </button>
-            ))}
-          </div>
-          {mode !== "vision" ? (
-            <fieldset className="media-output-controls" disabled={generating}>
-              <legend>Output sizing</legend>
-              <div className="media-output-mode" role="group" aria-label="Media output sizing mode">
-                <button type="button" className={outputMode === "auto" ? "is-active" : ""} onClick={() => setOutputMode("auto")}>Auto</button>
-                <button type="button" className={outputMode === "exact" ? "is-active" : ""} onClick={() => setOutputMode("exact")}>Exact</button>
-              </div>
-              {outputMode === "auto" ? (
-                <small>Benchmarks this brain’s native decoder, then sizes output from current memory, storage, and timing headroom.</small>
-              ) : (
-                <div className="media-output-fields">
-                  {mode !== "audio" ? (
-                    <>
-                      <label><span>Width</span><input inputMode="numeric" value={outputWidth} onChange={(event) => setOutputWidth(event.target.value)} /></label>
-                      <label><span>Height</span><input inputMode="numeric" value={outputHeight} onChange={(event) => setOutputHeight(event.target.value)} /></label>
-                    </>
-                  ) : null}
-                  {mode !== "image" ? (
-                    <label><span>Duration ms</span><input inputMode="decimal" value={outputDurationMs} onChange={(event) => setOutputDurationMs(event.target.value)} /></label>
-                  ) : null}
-                  {mode === "video" ? (
-                    <label><span>FPS</span><input inputMode="numeric" value={outputFps} onChange={(event) => setOutputFps(event.target.value)} /></label>
-                  ) : null}
-                  {mode !== "image" ? (
-                    <label><span>Sample rate</span><input inputMode="numeric" value={outputSampleRate} onChange={(event) => setOutputSampleRate(event.target.value)} /></label>
-                  ) : null}
-                  {mode === "video" ? (
-                    <label className="media-output-audio"><input type="checkbox" checked={includeAudio} onChange={(event) => setIncludeAudio(event.target.checked)} /><span>Same-brain audio when trained</span></label>
-                  ) : null}
-                </div>
-              )}
-              <small>Exact values are never reduced silently. The engine either generates that request or reports measured resource pressure.</small>
-            </fieldset>
-          ) : null}
-          <details className="pack-installer">
-            <summary>
-              <span><Icon name="archive" size={14} /> Modality packs</span>
-              <small>{installedPacks.length} verified install{installedPacks.length === 1 ? "" : "s"}</small>
-            </summary>
-            {installedPacks.map((pack) => (
-              <div className="pack-installer__installed" key={`${pack.id}-${pack.sha256}`}>
-                <span><strong>{pack.name}</strong><small>{pack.modalities.join(" · ")} · {pack.version}</small></span>
-                <em>{pack.license}</em>
-              </div>
-            ))}
-            <label>
-              <span>HTTPS `.omnipack` URL</span>
-              <input
-                value={packUrl}
-                onChange={(event) => setPackUrl(event.target.value)}
-                placeholder="https://github.com/…/vision.omnipack"
-              />
-            </label>
-            <div>
-              <Button
-                icon="download"
-                disabled={packBusy || !packUrl.trim()}
-                onClick={() => void installPack("url")}
-              >
-                Install URL
-              </Button>
-              <Button
-                icon="upload"
-                disabled={packBusy}
-                onClick={() => void installPack("file")}
-              >
-                Open local
-              </Button>
-            </div>
-            <p>Only checksummed Omni manifests and namespaced safetensors load. No code runs.</p>
-          </details>
-          <label className="imagination-prompt">
-            <span>Manual seed idea · optional</span>
-            <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={5} />
-            <small>
-              <Icon name="brain" size={13} /> Leave blank to use only active learned neural activity. Organic imagination enters this same continuous learning system from the learned action head.
-            </small>
-          </label>
-          <div className="builder-note">
-            <Icon name="pulse" size={15} />
-            <span>Creative behavior still emerges from neural state. Output sizing changes only the decoder canvas or timeline, never the brain’s learned behavior.</span>
-          </div>
-          <Button
-            kind="primary"
-            icon={mode === "vision" ? "upload" : "sparkles"}
-            disabled={generating}
-            onClick={() => void generate()}
-          >
-            {generating ? "Working…" : mode === "vision" ? "Choose image to understand" : `Imagine ${mode}`}
-          </Button>
-          {generating && job ? (
-            <Button
-              kind="ghost"
-              icon={generationStop.waitingForAcknowledgement ? "pulse" : "close"}
-              disabled={!generationStop.requestAllowed}
-              onClick={() => void cancelGeneration()}
-            >
-              {generationStop.retryAvailable
-                ? "Retry stop"
-                : generationStop.waitingForAcknowledgement
-                  ? "Stopping generation…"
-                  : "Stop generation"}
-            </Button>
-          ) : null}
-          <p className="imagination-footnote">
-            {outputShape
-              ? `${outputShape} · ${trainingState === "untrained-diagnostic" ? "untrained diagnostic" : "trained quality unverified"} · no semantic quality claim.`
-              : demo
-                ? "Design preview only; no modality engine is connected."
-                : `Uses the local ${mode} pack. Nothing is sent to a hosted model.`}
-          </p>
-        </aside>
-      </div>
-      <div className="generation-strip">
-        <div className="surface-title">
-          <div><h2>Recent imagination</h2><p>Outputs may be fed back as experience.</p></div>
-          <Button
-            icon="image"
-            onClick={() => {
-              setGalleryOpen(true);
-              void reloadArtifacts();
-            }}
-          >
-            Open gallery
-          </Button>
-        </div>
-        <div className="generation-thumbs">
-          {demo ? (
-            [0, 1, 2, 3].map((item) => (
-              <div key={item} className={`generation-thumb generation-thumb--${item}`}>
-                <span />
-                <em>{item === 0 ? "Demo · memory palace" : item === 1 ? "Demo · liquid mechanism" : item === 2 ? "Demo · rain language" : "Demo · unsaid idea"}</em>
-              </div>
-            ))
-          ) : artifacts.length ? (
-            artifacts.slice(0, 4).map((artifact) => (
-              <div key={artifact.id} className="generation-thumb generation-thumb--artifact">
-                {artifact.available && artifact.mediaUrl && artifact.mimeType.startsWith("image/") ? (
-                  <img src={artifact.mediaUrl} alt={`Saved ${artifact.modality} imagination`} />
-                ) : artifact.available && artifact.mediaUrl && artifact.mimeType.startsWith("video/") ? (
-                  <video src={artifact.mediaUrl} muted preload="metadata" aria-label="Saved video imagination" />
-                ) : (
-                  <span><Icon name={artifact.modality === "audio" ? "wave" : "warning"} size={18} /></span>
-                )}
-                <em>
-                  {artifact.modality} · {artifact.available ? relativeTime(artifact.createdAt) : "artifact unavailable"}
-                </em>
-              </div>
-            ))
-          ) : media.sourceUrl || embedding ? (
-            <div className="generation-thumb generation-thumb--0">
-              <span />
-              <em>{mode} · {job?.state} · {relativeTime(job?.updatedAt ?? new Date().toISOString())}</em>
-            </div>
-          ) : (
-            <div className="generation-history-empty">No persisted modality artifacts for this brain.</div>
-          )}
-        </div>
-      </div>
-      {galleryOpen ? (
-        <div
-          className="imagination-gallery-backdrop"
-          onPointerDown={(event) => {
-            if (event.target === event.currentTarget) setGalleryOpen(false);
-          }}
-        >
-          <section
-            className="imagination-gallery"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="imagination-gallery-title"
-          >
-            <header>
-              <span>
-                <small>PERSISTED LOCAL OUTPUTS</small>
-                <h2 id="imagination-gallery-title">{brain.name} imagination gallery</h2>
-                <p>Verified artifacts stay attached to this brain and use expiring renderer-safe playback leases.</p>
-              </span>
-              <button
-                className="icon-button"
-                aria-label="Close imagination gallery"
-                autoFocus
-                onClick={() => setGalleryOpen(false)}
-              >
-                <Icon name="close" size={15} />
-              </button>
-            </header>
-            <div className="imagination-gallery__grid">
-              {artifacts.map((artifact) => (
-                <article key={artifact.id} className="imagination-gallery__item">
-                  <div className="imagination-gallery__media">
-                    <PersistedArtifactMedia artifact={artifact} />
-                  </div>
-                  <footer>
-                    <span>
-                      <strong>{artifact.modality}</strong>
-                      <small>{new Date(artifact.createdAt).toLocaleString()} · {formatBytes(artifact.bytes)}</small>
-                    </span>
-                    {artifact.seed !== undefined ? <em>seed {artifact.seed}</em> : null}
-                    {artifact.qualityNote ? <p>{artifact.qualityNote}</p> : null}
-                  </footer>
-                </article>
-              ))}
-              {!artifacts.length && !galleryLoading ? (
-                <div className="imagination-gallery__empty">
-                  <Icon name="image" size={28} />
-                  <strong>No persisted artifacts for {brain.name}</strong>
-                  <span>{demo ? "The browser design preview does not create local files." : "Generate an image, sound, or video and it will appear here."}</span>
-                </div>
-              ) : null}
-            </div>
-            <footer className="imagination-gallery__footer">
-              <span>
-                {demo
-                  ? "Design preview"
-                  : `Showing ${artifacts.length.toLocaleString()} of ${artifactTotal.toLocaleString()} artifacts`}
-              </span>
-              {artifactCursor ? (
-                <Button disabled={galleryLoading} onClick={() => void loadMoreArtifacts()}>
-                  {galleryLoading ? "Loading…" : "Load older artifacts"}
-                </Button>
-              ) : null}
-            </footer>
-          </section>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 const nativeToolExamples = nativeSystemToolExamples(
   typeof navigator === "undefined" ? "" : navigator.platform
@@ -11088,425 +8284,6 @@ function ToolsWorkspace({
   );
 }
 
-function AgentsWorkspace({
-  brain,
-  onBrainChange,
-  onToast
-}: {
-  brain: BrainDocument;
-  onBrainChange: (brain: BrainDocument) => void;
-  onToast: (message: string) => void;
-}) {
-  const [forking, setForking] = useState(false);
-  const [branches, setBranches] = useState<BrainDocument[]>([]);
-  const [preview, setPreview] = useState<AgentMergePreview | null>(null);
-  const [previewingId, setPreviewingId] = useState("");
-  const [objective, setObjective] = useState("Explore alternative explanations and return evidence-backed ideas.");
-  const [agentApproval, setAgentApproval] = useState("");
-  const [agentRunning, setAgentRunning] = useState(false);
-  const [agentRunStatus, setAgentRunStatus] = useState("");
-  const agentSubmissionGate = useRef(new AgentForkSubmissionGate());
-  const [catalogUrl, setCatalogUrl] = useState("");
-
-  const reloadBranches = async (): Promise<BrainDocument[]> => {
-    if (!window.omni) {
-      const demoCode = makeDemoBrain("demo-code-fork", `${brain.name} · code`, brain.config);
-      const demoDream = makeDemoBrain("demo-dream-fork", `${brain.name} · dream`, brain.config);
-      const next = [demoCode, demoDream].map((item, index) => ({
-          ...item,
-          lineage: {
-            rootId: brain.lineage.rootId,
-            parentId: brain.id,
-            generation: brain.lineage.generation + 1 + index
-          }
-        }));
-      setBranches(next);
-      return next;
-    }
-    const summaries = await window.omni.brain.list();
-    const documents = await Promise.all(
-      summaries
-        .filter(
-          (summary) =>
-            summary.id !== brain.id &&
-            summary.rootId === brain.lineage.rootId
-        )
-        .map((summary) => window.omni!.brain.get(summary.id))
-    );
-    const next = documents.filter(
-      (document) => document.lineage.rootId === brain.lineage.rootId
-    );
-    setBranches(next);
-    return next;
-  };
-
-  useEffect(() => {
-    void reloadBranches();
-  }, [brain.id, brain.lineage.rootId]);
-
-  const fork = async () => {
-    setForking(true);
-    try {
-      if (window.omni) {
-        const forked = await window.omni.agent.fork(brain.id, `${brain.name} · explorer`);
-        setBranches((current) => [...current, forked]);
-        onToast(`Forked into ${forked.name}.`);
-      } else {
-        await new Promise((resolve) => window.setTimeout(resolve, 650));
-        onToast("Created an isolated demo fork with copy-on-write memory.");
-      }
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Could not fork this brain.");
-    } finally {
-      setForking(false);
-    }
-  };
-
-  const inspectMerge = async (sourceId: string) => {
-    if (!window.omni) {
-      setPreview({
-        sourceBrainId: sourceId,
-        targetBrainId: brain.id,
-        reviewToken: "demo-review-token",
-        substrate: {
-          schemaVersion: 1,
-          engineSchemaVersion: 1,
-          digest: "0".repeat(64),
-          sourceStateSha256: "1".repeat(64),
-          targetStateSha256: "2".repeat(64),
-          sourceParameterSha256: "3".repeat(64),
-          targetParameterSha256: "4".repeat(64),
-          sourceConfigSha256: "5".repeat(64),
-          targetConfigSha256: "6".repeat(64),
-          sourceCounts: {
-            neurons: 180,
-            assemblies: 40,
-            synapses: 710,
-            replayExamples: 24
-          },
-          targetCounts: {
-            neurons: 162,
-            assemblies: 36,
-            synapses: 639,
-            replayExamples: 20
-          },
-          additions: {
-            neurons: 18,
-            assemblies: 4,
-            synapses: 71,
-            replayExamples: 4
-          },
-          duplicates: {
-            neurons: 162,
-            assemblies: 36,
-            synapses: 639,
-            replayExamples: 20
-          },
-          divergent: { neurons: 1, assemblies: 1, synapses: 2 },
-          weightsAveraged: false
-        },
-        newConcepts: 18,
-        newIdeas: 4,
-        newSynapses: 71,
-        newEvidence: 3,
-        duplicateEvidence: 1,
-        newFiles: 2,
-        duplicateFiles: 1,
-        skippedFiles: 0,
-        fileBytes: 48_120,
-        files: [],
-        conflicts: ["Demo conflict: identity → specialization"],
-        note: "Demo preview only. No models will be merged."
-      });
-      setPreviewingId(sourceId);
-      return;
-    }
-    try {
-      setPreviewingId(sourceId);
-      setPreview(await window.omni.agent.previewMerge(sourceId, brain.id));
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "Merge preview failed.");
-    }
-  };
-
-  const merge = async () => {
-    if (!preview || !window.omni) {
-      onToast("Demo merge preview closed without changing a brain.");
-      setPreview(null);
-      return;
-    }
-    try {
-      const merged = await window.omni.agent.merge(
-        preview.sourceBrainId,
-        preview.targetBrainId,
-        preview.reviewToken
-      );
-      onBrainChange(merged);
-      setPreview(null);
-      onToast(
-        `Merged ${preview.newIdeas} ideas, ${preview.newEvidence} evidence records, and ${preview.newFiles} files after review.`
-      );
-      await reloadBranches();
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The reviewed merge failed.");
-    }
-  };
-
-  const startSubagent = async () => {
-    if (!objective.trim() || !agentSubmissionGate.current.begin()) return;
-    if (!window.omni) {
-      onToast("Demo subagent prepared visually; no fork or agent process ran.");
-      agentSubmissionGate.current.finish();
-      return;
-    }
-    const approvalToken = agentApproval;
-    const beforeForkIds = new Set(branches.map((branch) => branch.id));
-    let executionSettled = false;
-    setAgentRunning(true);
-    setAgentRunStatus(
-      approvalToken
-        ? "Approval consumed · creating the isolated fork…"
-        : "Checking the saved tool permission…"
-    );
-    // Ask tokens are single-use in the main process. Disarm the button before
-    // awaiting any copy/chat work so a stale armed control cannot fork twice.
-    if (approvalToken) setAgentApproval("");
-    try {
-      if (approvalToken) {
-        void (async () => {
-          while (!executionSettled) {
-            await new Promise((resolve) => window.setTimeout(resolve, 750));
-            if (executionSettled) return;
-            const current = await reloadBranches().catch(() => []);
-            const created = current.filter((branch) => !beforeForkIds.has(branch.id));
-            if (!created.length) continue;
-            setAgentRunStatus(
-              `${created.length} isolated fork${created.length === 1 ? "" : "s"} created · subagent work is still running…`
-            );
-            return;
-          }
-        })();
-      }
-      const result = await window.omni.tool.execute({
-        brainId: brain.id,
-        toolId: "agent.fork",
-        action: "start",
-        arguments: { objective },
-        approvalToken: approvalToken || undefined
-      });
-      executionSettled = true;
-      if (result.state === "approval-required" && result.approvalToken) {
-        setAgentApproval(result.approvalToken);
-        setAgentRunStatus("Approval required · review the unchanged objective, then approve once.");
-        onToast("Subagent fork requires approval. Review the objective and approve once more.");
-      } else {
-        const refreshed = await reloadBranches();
-        const createdForks = refreshed.filter(
-          (branch) => !beforeForkIds.has(branch.id)
-        ).length;
-        const presentation = agentForkCompletionPresentation(result, createdForks);
-        setAgentRunStatus(presentation.message);
-        onToast(presentation.message);
-      }
-    } catch (error) {
-      executionSettled = true;
-      const refreshed = await reloadBranches().catch(() => branches);
-      const createdForks = refreshed.filter(
-        (branch) => !beforeForkIds.has(branch.id)
-      ).length;
-      const presentation = agentForkCompletionPresentation({
-        state: "failed",
-        error: error instanceof Error ? error.message : "Subagent tool failed."
-      }, createdForks);
-      setAgentRunStatus(presentation.message);
-      onToast(presentation.message);
-    } finally {
-      executionSettled = true;
-      agentSubmissionGate.current.finish();
-      setAgentRunning(false);
-    }
-  };
-
-  const installCatalogBrain = async () => {
-    if (!catalogUrl.trim()) return;
-    if (!window.omni) {
-      onToast("Demo import did not download or install anything.");
-      return;
-    }
-    try {
-      const imported = await window.omni.catalog.importUrl({ url: catalogUrl });
-      onBrainChange(imported);
-      onToast(`Installed verified Omni brain ${imported.name}.`);
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "The remote Omni bundle could not be installed.");
-    }
-  };
-  const exportBrain = async (mode: BrainExportMode = "current") => {
-    if (window.omni) {
-      const path = await window.omni.brain.export(brain.id, mode);
-      if (path) {
-        const label =
-          mode === "origin"
-            ? "Immutable origin"
-            : mode === "referenced"
-              ? "Lightweight local reference"
-              : "Portable brain";
-        onToast(
-          `${label} exported to ${path}. Saved content is unsanitized; share only with trusted recipients.`
-        );
-      }
-    } else {
-      onToast("Export preview: manifest, safe weights, concept graph, lineage, and checksums.");
-    }
-  };
-
-  return (
-    <div className="content-page agents-page">
-      <div className="content-page__title">
-        <div>
-          <span className="eyebrow-text">LINEAGE & COLLABORATION</span>
-          <h1>Forks & agents</h1>
-          <p>Explore in isolated minds, then merge useful ideas and evidence without averaging identities.</p>
-          <p className="agents-export-disclosure">{BRAIN_EXPORT_DISCLOSURE}</p>
-        </div>
-        <div>
-          <Button icon="archive" onClick={() => void exportBrain("referenced")}>Local reference</Button>
-          <Button icon="download" onClick={() => void exportBrain("current")}>Export .omni</Button>
-          <Button kind="primary" icon="fork" disabled={forking} onClick={() => void fork()}>
-            {forking ? "Forking…" : "Fork this mind"}
-          </Button>
-        </div>
-      </div>
-      <div className="agents-layout">
-        <section className="surface lineage-surface">
-          <div className="surface-title">
-            <div><h2>Living lineage</h2><p>One live instance · generation {brain.lineage.generation} · recovery origin remains immutable</p></div>
-            <span className="lineage-pill"><Icon name="archive" size={13} /> Recovery origin</span>
-          </div>
-          <div className="lineage-tree">
-            <div className="lineage-origin">
-              <span className="lineage-node lineage-node--origin"><BrandMark size={33} /></span>
-              <span>
-                <small>STORED RECOVERY ORIGIN · NOT A RUNNING BRAIN</small>
-                <strong>{brain.name} / initial checkpoint</strong>
-                <em title={brain.originChecksum || undefined}>{brain.originChecksum ? `Stored checksum · ${brain.originChecksum.slice(0, 10)}… · content-addressed` : "No origin checksum recorded"}</em>
-              </span>
-            </div>
-            <span className="lineage-stem" />
-            <div className="lineage-generation">
-              <div className="lineage-branch lineage-branch--active">
-                <span className="lineage-node"><Icon name="brain" size={18} /></span>
-                <span><small>LIVE INSTANCE · G{brain.lineage.generation}</small><strong>{brain.name}</strong><em>Current identity · independently learning</em></span>
-              </div>
-              {branches.map((branch, index) => (
-                <div className="lineage-branch" key={branch.id}>
-                  <span className="lineage-node"><Icon name={index % 2 ? "sparkles" : "code"} size={18} /></span>
-                  <span>
-                    <small>FORK · G{branch.lineage.generation}</small>
-                    <strong>{branch.name}</strong>
-                    <em>{branch.ideas.length} ideas · updated {relativeTime(branch.updatedAt)}</em>
-                  </span>
-                  <button onClick={() => void inspectMerge(branch.id)}>
-                    {previewingId === branch.id && preview ? "Selected" : "Review merge"}
-                  </button>
-                </div>
-              ))}
-              {!branches.length ? <div className="lineage-empty">No forks share this origin yet.</div> : null}
-            </div>
-          </div>
-          {preview ? (
-            <div className="merge-preview">
-              <div>
-                <span className="merge-preview__icon"><Icon name="fork" size={18} /></span>
-                <span>
-                  <small>MERGE PREVIEW · NO WEIGHTS CHANGED YET</small>
-                  <strong>{preview.note}</strong>
-                </span>
-                <button className="icon-button" onClick={() => setPreview(null)}><Icon name="close" size={15} /></button>
-              </div>
-              <dl>
-                <span><dt>Ideas</dt><dd>+{preview.newIdeas}</dd></span>
-                <span><dt>Concepts</dt><dd>+{preview.newConcepts}</dd></span>
-                <span><dt>Synapses</dt><dd>+{preview.newSynapses}</dd></span>
-                <span><dt>Replay</dt><dd>+{preview.substrate.additions.replayExamples}</dd></span>
-                <span><dt>Evidence</dt><dd>+{preview.newEvidence}</dd></span>
-                <span><dt>Files</dt><dd>+{preview.newFiles}</dd></span>
-                <span><dt>File bytes</dt><dd>{formatBytes(preview.fileBytes)}</dd></span>
-                <span><dt>Conflicts</dt><dd>{preview.conflicts.length}</dd></span>
-              </dl>
-              {preview.conflicts.length ? (
-                <p><Icon name="warning" size={14} /> {preview.conflicts.join(" · ")}</p>
-              ) : null}
-              <p>
-                Reviewed neural state <code>{preview.substrate.digest.slice(0, 12)}…</code>
-              </p>
-              <Button kind="primary" icon="check" onClick={() => void merge()}>Merge reviewed overlay</Button>
-            </div>
-          ) : null}
-          <div className="copy-on-write-note">
-            <Icon name="database" size={17} />
-            <span><strong>Copy-on-write storage</strong>Forks share immutable blobs and write only their changed state.</span>
-          </div>
-        </section>
-        <aside className="agent-sidebar">
-          <div className="surface subagent-card">
-            <div className="surface-title">
-              <div><h2>Subagents</h2><p>Think in parallel, merge deliberately.</p></div>
-              <span className="beta-pill">LAB</span>
-            </div>
-            <div className="agent-illustration">
-              <span className="agent-core"><BrandMark size={34} /></span>
-              {[0, 1, 2].map((index) => (
-                <Fragment key={index}>
-                  <i className={`agent-line agent-line--${index}`} />
-                  <span className={`agent-satellite agent-satellite--${index}`}>
-                    <Icon name={index === 0 ? "search" : index === 1 ? "code" : "sparkles"} size={15} />
-                  </span>
-                </Fragment>
-              ))}
-            </div>
-            <p>Spawn isolated overlays to research, code, or imagine. Merge ideas, files, and replay examples—not entire weights.</p>
-            <label className="agent-objective">
-              <span>Objective</span>
-              <textarea value={objective} onChange={(event) => {
-                setObjective(event.target.value);
-                setAgentApproval("");
-                setAgentRunStatus("");
-              }} rows={3} />
-            </label>
-            <Button
-              kind="primary"
-              icon={agentApproval ? "check" : "agents"}
-              disabled={agentRunning || !objective.trim()}
-              onClick={() => void startSubagent()}
-            >
-              {agentRunning
-                ? "Fork running…"
-                : agentApproval
-                  ? "Approve isolated fork"
-                  : "Start a subagent session"}
-            </Button>
-            {agentRunStatus ? <small role="status" aria-live="polite">{agentRunStatus}</small> : null}
-          </div>
-          <div className="surface export-card">
-            <div className="export-card__icon"><Icon name="archive" size={21} /></div>
-            <span><strong>Portable identity</strong><small>Safe tensors · ideas · lineage · journal</small></span>
-            <button className="origin-export" onClick={() => void exportBrain("origin")}>Export origin</button>
-          </div>
-          <div className="surface github-card github-card--install">
-            <Icon name="download" size={18} />
-            <span>
-              <strong>Import a portable instance</strong>
-              <small>Creates one editable local identity from a verified .omni bundle; repository scripts never run</small>
-              <input aria-label="Portable instance URL" value={catalogUrl} onChange={(event) => setCatalogUrl(event.target.value)} placeholder="https://github.com/…/brain.omni" />
-            </span>
-            <button className="icon-button" aria-label="Import portable instance from URL" title="Import .omni from this URL" disabled={!catalogUrl.trim()} onClick={() => void installCatalogBrain()}><Icon name="arrow" size={14} /></button>
-          </div>
-        </aside>
-      </div>
-    </div>
-  );
-}
 
 export function App() {
   const demo = !window.omni;
@@ -11541,6 +8318,7 @@ export function App() {
   const [summaries, setSummaries] = useState<BrainSummary[]>(demo ? demoSummaries : []);
   const [activeBrain, setActiveBrain] = useState<BrainDocument | null>(null);
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("chat");
+  const selectedWorkspaceView = navItems.some(item => item.id === workspaceView) ? workspaceView : "chat";
   const [loading, setLoading] = useState(!demo);
   const [buildProgress, setBuildProgress] = useState<BuildProgressEvent | null>(null);
   const [activeBuildJob, setActiveBuildJob] = useState<RuntimeJob | null>(null);
@@ -11553,6 +8331,7 @@ export function App() {
   const [deleteTarget, setDeleteTarget] = useState<
     Pick<BrainSummary, "id" | "name" | "rootId"> | null
   >(null);
+  const pendingDeleteTargets = useRef<Array<Pick<BrainSummary, "id" | "name" | "rootId">>>([]);
   const [deletingInstance, setDeletingInstance] = useState(false);
   const [storageOperation, setStorageOperation] =
     useState<BrainStorageOperationEvent | null>(null);
@@ -11712,7 +8491,7 @@ export function App() {
     }
   }, [appearanceWorkspace]);
 
-  const showToast = (message: string) => {
+  const showToast = useCallback((message: string) => {
     const presentedMessage = conciseUiMessage(message);
     setToast({ id: ++toastSequence.current, text: presentedMessage });
     dispatchLocalNotification({
@@ -11723,7 +8502,7 @@ export function App() {
       lastDispatchedAt: notificationDispatchTimes.current,
       environment: browserNotificationEnvironment()
     });
-  };
+  }, [appearanceWorkspace.notificationsEnabled]);
 
   useEffect(() => {
     const api = window.omni?.portable; if (!api) return;
@@ -12096,7 +8875,7 @@ export function App() {
     }
   };
 
-  const updateActiveBrain = (document: BrainDocument) => {
+  const updateActiveBrain = useCallback((document: BrainDocument) => {
     // A turn may finish after the user has returned to the library or opened a
     // different identity. Persist its summary, but never let that late result
     // replace whichever brain is currently active.
@@ -12121,7 +8900,7 @@ export function App() {
           : summary
       )
     );
-  };
+  }, []);
 
   const applyActiveModeResult = async (result: BrainActiveModeResult): Promise<void> => {
     updateActiveBrain(result.brain);
@@ -12183,6 +8962,7 @@ export function App() {
       showToast(`Duplicate instance ${duplicate.name} created with copy-on-write neural storage.`);
     } catch (error) {
       showToast(error instanceof Error ? error.message : "This brain could not be duplicated.");
+      throw error;
     } finally {
       setLoading(false);
     }
@@ -12219,7 +8999,7 @@ export function App() {
         setActiveBrain(null);
         setPage("library");
       }
-      setDeleteTarget(null);
+      setDeleteTarget(pendingDeleteTargets.current.shift() ?? null);
       showToast(
         `${result.name} was permanently deleted and cannot be recovered.${
           result.reclaimedBytes > 0
@@ -12234,10 +9014,28 @@ export function App() {
     }
   };
 
-  const portableControls = <PortableWorkspaceControls api={window.omni?.portable} summaries={summaries}
-    presentation={() => ({ appearance, workspace: appearanceWorkspace, theme: loadPluginThemeSelection(window.localStorage) })}
-    onCreated={result => showToast(`Portable Windows folder created: ${result.destination}`)}
-    onEditSettings={id => { void openBrain(id, "settings"); }} />;
+  const duplicateSelectedBrains = async (selected: BrainSummary[]): Promise<void> => {
+    for (const target of selected) await duplicateBrain(target);
+  };
+  const requestSelectedDeletion = (selected: BrainSummary[]): void => {
+    if (deleteTarget || deletingInstance) return;
+    const current = new Map(summaries.map(summary => [summary.id, summary]));
+    const targets = [...new Set(selected.map(summary => summary.id))]
+      .flatMap(id => current.has(id) ? [current.get(id)!] : [])
+      .map(({ id, name, rootId }) => ({ id, name, rootId }));
+    pendingDeleteTargets.current = targets.slice(1);
+    setDeleteTarget(targets[0] ?? null);
+  };
+  const exportSelectedBrains = async (selected: BrainSummary[], mode: BrainExportMode = "current"): Promise<void> => {
+    if (!window.omni) { showToast("Export requires the connected desktop runtime."); return; }
+    let completed = 0;
+    for (const target of selected) {
+      const destination = await window.omni.brain.export(target.id, mode);
+      if (!destination) { showToast(`Export stopped; ${completed} completed.`); return; }
+      completed += 1;
+    }
+    showToast(`${completed} brain${completed === 1 ? "" : "s"} exported.`);
+  };
 
   return (
     <div className="app-shell">
@@ -12261,13 +9059,13 @@ export function App() {
           summaries={summaries}
           loading={loading}
           onOpen={(summary) => void openBrain(summary)}
-          onDuplicate={(summary) => void duplicateBrain(summary)}
-          onDelete={setDeleteTarget}
+          onDuplicate={duplicateSelectedBrains}
+          onDelete={requestSelectedDeletion}
+          onExport={exportSelectedBrains}
           onBuild={() => setPage("build")}
           onImport={() => void importBrain()}
           onMerged={() => { if (window.omni) void window.omni.brain.list().then(setSummaries).catch((error: unknown) => showToast(error instanceof Error ? error.message : "Library refresh failed.")); }}
           demo={demo}
-          portableControls={portableControls}
         />
       ) : page === "build" ? (
         <SimpleBuildWizard
@@ -12385,13 +9183,9 @@ export function App() {
       ) : activeBrain ? (
         <WorkspaceShell
           brain={activeBrain}
-          view={workspaceView}
+          view={selectedWorkspaceView}
           onView={setWorkspaceView}
           onLibrary={() => setPage("library")}
-          onDuplicate={() => {
-            const summary = summaries.find((item) => item.id === activeBrain.id);
-            if (summary) void duplicateBrain(summary);
-          }}
           onActiveModeChange={applyActiveModeResult}
           onBrainChange={updateActiveBrain}
           onToast={showToast}
@@ -12401,12 +9195,12 @@ export function App() {
           summaries={summaries}
           loading={loading}
           onOpen={(summary) => void openBrain(summary)}
-          onDuplicate={(summary) => void duplicateBrain(summary)}
-          onDelete={setDeleteTarget}
+          onDuplicate={duplicateSelectedBrains}
+          onDelete={requestSelectedDeletion}
+          onExport={exportSelectedBrains}
           onBuild={() => setPage("build")}
           onImport={() => void importBrain()}
           demo={demo}
-          portableControls={portableControls}
           onMerged={() => { if (window.omni) void window.omni.brain.list().then(setSummaries).catch((error: unknown) => showToast(error instanceof Error ? error.message : "Library refresh failed.")); }}
         />
       )}
@@ -12506,7 +9300,10 @@ export function App() {
           target={deleteTarget}
           busy={deletingInstance}
           onCancel={() => {
-            if (!deletingInstance) setDeleteTarget(null);
+            if (!deletingInstance) {
+              pendingDeleteTargets.current = [];
+              setDeleteTarget(null);
+            }
           }}
           onConfirm={permanentlyDeleteInstance}
         />

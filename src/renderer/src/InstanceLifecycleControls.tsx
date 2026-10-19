@@ -3,7 +3,7 @@ import type { InstanceLifecycleState } from "../../shared/instanceLifecycle";
 import type { InstanceLifecycleApi, InstanceLoadFit } from "../../shared/instanceLifecycleApi";
 import "./instanceLifecycle.css";
 
-const labels: Record<InstanceLifecycleState["phase"], string> = { unloaded: "Unloaded", checking: "Checking fit", loading: "Loading",
+const labels: Record<InstanceLifecycleState["phase"], string> = { unloaded: "Unloaded", checking: "Checking resources", loading: "Loading",
   loaded: "Loaded", suspending: "Waiting to unload", suspended: "Paused · unloaded", resuming: "Resuming saved turn", error: "Needs attention" };
 
 export function InstanceLifecycleControls({ brainId, name, api, onState, onEditSettings, reviewRequest = 0 }: {
@@ -100,7 +100,7 @@ export function InstanceLifecycleControls({ brainId, name, api, onState, onEditS
     finally { if (generation.current === currentGeneration) setBusy(false); }
   };
   return <div className="instance-lifecycle-controls">
-    <span role="status">{state ? state.phase === "unloaded" && state.learnedRuntimeResident ? "Not admitted · native work resident" : labels[state.phase] : api ? "Checking instance…" : "Design preview"}</span>
+    <span role="status">{state ? state.phase === "unloaded" && state.learnedRuntimeResident ? "Unload incomplete · work still active" : labels[state.phase] : api ? "Checking instance…" : "Design preview"}</span>
     <button type="button" className="button" disabled={!api || busy || Boolean(transition)} onClick={() => state?.phase === "loaded" || state?.phase === "suspending" ? void unload() : setOpen(true)}>
       {state?.phase === "loaded" ? "Unload" : state?.phase === "suspending" ? "Retry unload" : "Load / review fit"}
     </button>
@@ -108,11 +108,11 @@ export function InstanceLifecycleControls({ brainId, name, api, onState, onEditS
     {error && !open ? <small role="alert">{error}</small> : null}
     <dialog ref={dialog} className="instance-load-dialog" aria-labelledby={title} onCancel={(event) => { event.preventDefault(); close(); }}>
       <div className="instance-load-dialog__heading"><h2 id={title}>Load {name}</h2><button type="button" className="button" aria-label="Close load review" onClick={close}>Close</button></div>
-      <p>Opening an instance does not load its learned runtime. Load checks the saved shape against current resources.</p>
+      <p>Load this brain to start chatting. Its saved state and your memory settings are checked first.</p>
       {state?.resume ? <p className="instance-load-receipt">Saved turn <code>{state.resume.turnId}</code> · {state.resume.publishedTokens.toLocaleString()} published tokens. {state.resumeCompatibility?.compatible === false ? "This runtime cannot continue that exact checkpoint." : <>Supported execution resumes from checkpoint <code>{state.resume.checkpointId}</code>; completed effects are not replayed.</>}</p> : null}
       {state?.resumeCompatibility?.compatible === false ? <p role="alert">{state.resumeCompatibility.reason} Your saved state is preserved. Use its original compatible runtime or explicitly stop the saved turn.</p> : null}
       {state?.inheritedExecutions?.pending ? <p className="instance-load-receipt">{state.inheritedExecutions.pending.toLocaleString()} saved {state.inheritedExecutions.pending === 1 ? "turn" : "turns"} from the merged instances. Load continues them in order before new neural work; completed actions are not replayed.</p> : null}
-      <p role="status">{busy ? state?.waitingFor?.label ?? "Waiting for a native lifecycle receipt…" : waiting ? "Waiting for resources. Fit is checked again while this review stays open." : fit?.allowed ? "The selected settings currently fit." : "Review the current fit before loading."}</p>
+      <p role="status">{busy ? state?.waitingFor?.label ?? "Waiting for the brain to finish loading or unloading…" : waiting ? "Waiting for resources. This check updates while the review stays open." : fit?.allowed ? "Ready to load with these settings." : "Checking whether these settings fit your device."}</p>
       {fit ? <><p>Active execution needs at least {fit.minimumContextTokens.toLocaleString()} context tokens. Settings cannot reduce below that frontier.</p>
         {fit.blockers.length ? <ul>{fit.blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}</ul> : null}
         <small>Checked {new Date(fit.checkedAt).toLocaleTimeString()}. The native allocation check remains authoritative.</small></> : null}

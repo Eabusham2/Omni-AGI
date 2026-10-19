@@ -6995,6 +6995,7 @@ export class BrainService {
           list: { type: "object", properties: {}, additionalProperties: false },
           read: { type: "object", properties: {
             attachmentId: { type: "string", enum: taskAttachments.map(file => file.attachmentId) },
+            entryPath: { type: "string" },
             offset: { type: "integer", minimum: 0 }, maxBytes: { type: "integer", minimum: 1, maximum: 1024 * 1024 }
           }, required: ["attachmentId"], additionalProperties: false }
         } });

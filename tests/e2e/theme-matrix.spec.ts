@@ -161,7 +161,7 @@ async function installGraphCssSample(page: Page): Promise<void> {
       <g class="graph-node"><text x="500" y="325" text-anchor="middle" fill="var(--graph-label)" font-size="12">Synthetic label · CSS only</text></g>
     </svg>`;
     map.querySelector("[data-theme-graph-css-fixture]")?.remove();
-    map.append(sample);
+    map.querySelector(".whole-brain-map__canvas")?.append(sample);
   });
 }
 
@@ -477,12 +477,13 @@ test("appearance controls and explicit CSS-only state samples meet contrast at d
   ).toEqual([]);
 });
 
-test("actual imagination controls and recovery-origin badge remain readable across packs", async () => {
+test("actual chat recording controls and honest preview availability remain readable across packs", async () => {
   const application = await launchAppearanceApplication();
   const report: Record<string, ContrastResult[]> = {};
   const targets: ContrastTarget[] = [
-    { id: "selected-modality", selector: ".modality-switcher button.is-active", minimum: 4.5 },
-    { id: "selected-output-policy", selector: ".media-output-mode button.is-active", minimum: 4.5 }
+    { id: "chat-record-control", selector: ".chat-call-toolbar > button[aria-controls='chat-capture-panel']", minimum: 4.5 },
+    { id: "chat-call-control", selector: ".chat-call-toolbar > button[aria-controls='chat-call-panel']", minimum: 4.5 },
+    { id: "recording-preview-availability", selector: "#chat-capture-panel .imagination-capture__notice", minimum: 4.5 }
   ];
   try {
     const page = await application.firstWindow();
@@ -493,11 +494,13 @@ test("actual imagination controls and recovery-origin badge remain readable acro
         for (const pack of packs) {
           const matrix = `${viewport.id}/${mode}/${pack.id}`;
           await selectAppearance(page, mode, pack.palette, pack.layout);
-          await page.getByRole("button", { name: "Imagination", exact: true }).click();
-          const selected = page.locator(".modality-switcher button.is-active");
-          const policy = page.locator(".media-output-mode button.is-active");
-          await expect(selected).toBeVisible();
-          for (const [state, control] of [["modality-hover-focus", selected], ["output-hover-focus", policy]] as const) {
+          const record = page.getByRole("button", { name: "Record", exact: true });
+          const call = page.getByRole("button", { name: "Call", exact: true });
+          await record.click();
+          await expect(record).toHaveAttribute("aria-expanded", "true");
+          await expect(page.locator("#chat-capture-panel").getByText("Recording is available in the desktop app.", { exact: true })).toBeVisible();
+          await expect(page.locator(".chat-imagination-media")).toHaveCount(0);
+          for (const [state, control] of [["record-hover-focus", record], ["call-hover-focus", call]] as const) {
             await control.scrollIntoViewIfNeeded();
             await control.hover();
             await control.focus();
@@ -509,20 +512,16 @@ test("actual imagination controls and recovery-origin badge remain readable acro
                 .toBeGreaterThanOrEqual(result.minimum);
             }
           }
-          await page.getByRole("button", { name: "Forks & agents", exact: true }).click();
-          const badge = page.locator(".lineage-pill");
-          await badge.scrollIntoViewIfNeeded();
-          await expect(badge).toHaveText("Recovery origin");
-          const origin = await measureContrast(page, [{ id: "recovery-origin", selector: ".lineage-pill", minimum: 4.5 }]);
-          report[`${matrix}/recovery-origin`] = origin;
-          for (const result of origin) expect(result.ratio, `${matrix} ${result.id}`).toBeGreaterThanOrEqual(result.minimum);
+          await record.click();
+          await expect(record).toHaveAttribute("aria-expanded", "false");
+          await expect(page.locator("#chat-capture-panel")).toBeHidden();
         }
       }
     }
   } finally {
     await application.close();
   }
-  console.log(`IMAGINATION_CONTROL_CONTRAST_REPORT=${JSON.stringify(report)}`);
+  console.log(`CHAT_RECORDING_CONTROL_CONTRAST_REPORT=${JSON.stringify(report)}`);
 });
 
 test("whole-brain unavailable state and isolated graph-label CSS meet contrast in every pack", async () => {
@@ -538,34 +537,28 @@ test("whole-brain unavailable state and isolated graph-label CSS meet contrast i
       foregroundProperty: "fill"
     },
     {
-      id: "graph-legend",
-      selector: ".whole-brain-map__layers legend",
+      id: "graph-heading",
+      selector: ".whole-brain-map__header h1",
       minimum: 4.5,
       backgroundSelector: ".whole-brain-map"
     },
     {
-      id: "graph-inspector-title",
-      selector: ".whole-brain-map__details aside h2",
+      id: "graph-back-control",
+      selector: ".whole-brain-map__header > button:first-child",
       minimum: 4.5,
       backgroundSelector: ".whole-brain-map"
     },
     {
-      id: "graph-inspector-section",
-      selector: ".whole-brain-map__details section h2",
-      minimum: 4.5,
+      id: "graph-refresh-control",
+      selector: ".whole-brain-map__refresh",
+      minimum: 3,
       backgroundSelector: ".whole-brain-map"
     },
     {
       id: "graph-status",
-      selector: ".whole-brain-map > p[role='status']",
+      selector: ".whole-brain-map__status[role='status']",
       minimum: 4.5,
-      backgroundSelector: ".whole-brain-map"
-    },
-    {
-      id: "graph-controls",
-      selector: ".whole-brain-map__navigation > span",
-      minimum: 4.5,
-      backgroundSelector: ".whole-brain-map"
+      backgroundSelector: ".whole-brain-map__canvas"
     }
   ];
 
@@ -582,7 +575,9 @@ test("whole-brain unavailable state and isolated graph-label CSS meet contrast i
           const map = page.getByRole("region", { name: "Whole brain map", exact: true });
           await expect(map).toBeVisible();
           await expect(map.getByRole("heading", { name: "Brain Map", exact: true })).toBeVisible();
-          await expect(map.getByRole("button", { name: "Refresh whole brain", exact: true })).toBeDisabled();
+          await expect(map.getByRole("button", { name: "Refresh brain map", exact: true })).toBeDisabled();
+          await expect(map.getByRole("button", { name: "Back to chat", exact: true })).toBeVisible();
+          await expect(map.getByText("Brain Map is unavailable in this UI-only preview.", { exact: true })).toBeVisible();
           await expect(map.locator(".brain-map-graph")).toHaveCount(0);
           await installGraphCssSample(page);
           const results = await measureContrast(page, targets);

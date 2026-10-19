@@ -17,6 +17,18 @@ vi.mock("electron", () => ({
 import "../src/preload/index";
 
 describe("task attachment preload boundary", () => {
+  it("passes folder selection without a renderer path and subscribes only to stage progress metadata", async () => {
+    const api = bridge.expose.mock.calls.find(([name]) => name === "omni")?.[1] as OmniApi;
+    const request = { brainId: "folder-owner", requestId: "folder-stage", selection: "folder" as const };
+    await api.chat.attachments.stage(request);
+    expect(bridge.invoke).toHaveBeenCalledWith(IPC.chat.stageAttachments, request);
+    const listener = vi.fn(), dispose = api.chat.attachments.onStageProgress!(listener);
+    const wrapped = bridge.on.mock.calls.find(([channel]) => channel === IPC.chat.attachmentStageProgress)?.[1] as (event: unknown, value: unknown) => void;
+    const progress = { brainId: "folder-owner", requestId: "folder-stage", phase: "copying", traversal: { processedFiles: 2, copiedBytes: 8192 } };
+    wrapped({}, progress); expect(listener).toHaveBeenCalledExactlyOnceWith(progress);
+    dispose(); expect(bridge.off).toHaveBeenCalledWith(IPC.chat.attachmentStageProgress, wrapped);
+  });
+
   it("exposes handles and converts dropped File objects through Electron's trusted path API", async () => {
     const api = bridge.expose.mock.calls.find(([name]) => name === "omni")?.[1] as OmniApi;
     const request = { brainId: "brain-one", requestId: "stage-one", selection: "files" as const };

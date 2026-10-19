@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { LearningWorkspace } from "../../src/renderer/src/LearningWorkspace";
 import type { DatasetManifest, DatasetPreviewProgress } from "../../src/shared/types";
-import type { FactCheckClaim, FactCheckWorkspace, LearningApi, LearningTask, LearningTaskEvent } from "../../src/shared/learning";
+import type { FactCheckClaim, LearningApi, LearningTask, LearningTaskEvent } from "../../src/shared/learning";
 import type { UserQuestionEvent, UserQuestionRecord, UserQuestionsApi } from "../../src/shared/userQuestions";
 import "../../src/renderer/src/styles.css";
 
@@ -77,19 +77,18 @@ const data = {
   onPreviewProgress: (listener: (event: DatasetPreviewProgress) => void) => { previewListeners.add(listener); return () => { previewListeners.delete(listener); }; }
 };
 function Fixture() {
-  const [mode, setMode] = useState<"specific-learn" | "fact-check">("specific-learn");
   const [, refresh] = useState(0); notifyReceipts = () => refresh(value => value + 1);
   return <main style={{ maxWidth: 1100, margin: "0 auto", padding: 16, height: "100vh", overflow: "hidden", boxSizing: "border-box", display: "grid", gridTemplateRows: "auto auto auto minmax(0,1fr) auto", gap: 8 }}>
     <h1>Learning controls fixture</h1><p>Synthetic transport only. No brain, training or web request occurs here.</p>
     <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-      <button className="button" onClick={() => setMode("specific-learn")}>Show Learn</button><button className="button" onClick={() => setMode("fact-check")}>Show Fact Check</button>
+      <button className="button" onClick={() => void api.startFactCheck({ brainId: "fixture", claims: [{ text: "Synthetic saved claim", sources: ["https://docs.example.com/source"] }] })}>Seed saved claim-review task</button>
       <button className="button" onClick={() => { document.documentElement.dataset.colorScheme = document.documentElement.dataset.colorScheme === "dark" ? "light" : "dark"; }}>Switch appearance</button>
       <button className="button" onClick={() => { previewResolve?.({ schemaVersion: 1, id: "selected-manifest", brainId: "fixture", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), roots: ["/fixture"], entryFile: "/fixture/entries", discoveredFiles: 2001, discoveredBytes: 300_000_000, manifestHash: "fixture-only" }); previewResolve = undefined; activePreview = undefined; }}>Finish fixture preparation</button>
-      <button className="button" onClick={() => { const task = [...tasks.values()].findLast(value => value.kind === mode); if (task) update(task.id, { state: "running", progress: .99, currentSource: "source-0", phase: "learning" }); }}>Advance fixture source to 99%</button>
-      <button className="button" onClick={() => { const task = [...tasks.values()].findLast(value => value.kind === mode); if (task) update(task.id, { state: "complete", traversalComplete: true, currentSource: undefined, progress: 1, phase: "finalized" }); }}>Finish fixture task</button>
+      <button className="button" onClick={() => { const task = [...tasks.values()].at(-1); if (task) update(task.id, { state: "running", progress: .99, currentSource: "source-0", phase: "learning" }); }}>Advance fixture source to 99%</button>
+      <button className="button" onClick={() => { const task = [...tasks.values()].at(-1); if (task) update(task.id, { state: "complete", traversalComplete: true, currentSource: undefined, progress: 1, phase: "finalized" }); }}>Finish fixture task</button>
       <a className="button" href="./mcp-auth-fixture.html">MCP controls fixture</a>
     </div>
-    <LearningWorkspace brainId="fixture" mode={mode} api={api} questions={questions} data={data} />
+    <LearningWorkspace brainId="fixture" api={api} questions={questions} data={data} />
     <details><summary>Fixture transport receipts</summary><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{JSON.stringify(receipts, null, 2)}</pre></details>
   </main>;
 }

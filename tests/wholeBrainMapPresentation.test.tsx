@@ -1,7 +1,7 @@
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { expect, it } from "vitest";
-import { WholeBrainMap, wholeBrainDisplayGraph } from "../src/renderer/src/WholeBrainMap";
+import { WholeBrainMap, wholeBrainDisplayGraph, wholeBrainMapFocusQuery, wholeBrainMapNextQuery } from "../src/renderer/src/WholeBrainMap";
 import { graphEdgeTitle } from "../src/renderer/src/brainMapGraphPresentation";
 import type { WholeBrainGraphProjection } from "../src/shared/wholeBrainInspection";
 
@@ -31,8 +31,25 @@ it("retains actual ternary signs/strength and does not make up unknown stability
 });
 it("does not substitute a router/demo map or Load a brain when whole inspection is unavailable", () => {
   const html = renderToStaticMarkup(<WholeBrainMap brainId="fixture" onBack={() => {}} />);
-  expect(html).toContain("Whole-brain inspection is unavailable"); expect(html).toContain("Brain Map");
+  expect(html).toContain("Brain Map is unavailable in this UI-only preview."); expect(html).toContain("Brain Map");
   expect(html).not.toContain("Brain map domain"); expect(html).not.toContain("No token or semantic-neuron mapping");
+  for (const removed of ["Show together", "Source detail", "Activity inspection", "Paged brain records", "Snapshot details", "Parameter row"])
+    expect(html).not.toContain(removed);
+  expect(html).not.toContain('type="checkbox"');
+});
+it("uses exact graph identities for automatic connected-region and contact traversal", () => {
+  expect(wholeBrainMapFocusQuery(graph.nodes[0]!)).toEqual({ entity: "catalog", catalogFacet: "members", regionId: "whole", pageSize: 128 });
+  expect(wholeBrainMapFocusQuery(graph.nodes[1]!)).toEqual({ entity: "catalog", catalogFacet: "owner", ownerId: "owner", pageSize: 128 });
+  const actual = { ...graph.nodes[0]!, id: "layout:neuron", recordId: "exact-native-neuron", kind: "substrate-neuron" as const, scopeId: "parent-region" };
+  expect(wholeBrainMapFocusQuery(actual)).toMatchObject({ regionId: "parent-region", substrate: { entity: "synapses", connectedTo: "exact-native-neuron" } });
+  expect(wholeBrainMapFocusQuery({ ...actual, kind: "router-channel", source: "independent-live-router" })).toBeUndefined();
+});
+it("continues exact tensor rows after a contact page ends instead of limiting the map to row zero", () => {
+  const query = { entity: "cortex" as const, regionId: "parent-region", pageSize: 64, cortex: { entity: "links" as const, moduleId: "native-owner", row: 2 } };
+  const page = { hasMore: false, nextCursor: null, cortex: { entity: "links", selectedModule: { id: "native-owner", rows: 4 } } } as Parameters<typeof wholeBrainMapNextQuery>[0];
+  expect(wholeBrainMapNextQuery(page, query)).toMatchObject({ regionId: "parent-region", cortex: { moduleId: "native-owner", row: 3 } });
+  expect(wholeBrainMapNextQuery(page, { ...query, cortex: { ...query.cortex, row: 3 } })).toBeUndefined();
+  expect(wholeBrainMapNextQuery({ ...page!, hasMore: true, nextCursor: "exact-cursor" }, query)).toMatchObject({ cursor: "exact-cursor", cortex: { row: 2 } });
 });
 it("preserves actual repeated-contact and plasticity metadata in the unified canvas", () => {
   const view = wholeBrainDisplayGraph({ ...graph, edges: [{ id: "repeat", recordId: "repeat-record", kind: "substrate-synapse",

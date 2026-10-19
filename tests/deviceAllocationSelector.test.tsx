@@ -50,7 +50,12 @@ describe("per-device allocation review", () => {
     expect(app).toContain("deviceResources: effectiveDeviceResources");
     expect(app).toContain("brainId={brain.id} settings={effectiveDeviceResources}");
     expect(app).toContain("synchronizeDeviceRam(deviceResources, systemRamMode, systemRamSharePercent)");
-    expect(app.indexOf("<BestWorkSettings")).toBeLessThan(app.indexOf('id="active-mode-heading"'));
+    const chat = app.slice(app.indexOf("function ChatWorkspace("), app.indexOf("function MessageBubble("));
+    const settings = app.slice(app.indexOf("function DeviceRuntimeWorkspace("), app.indexOf("function TrainingTelemetryMetrics("));
+    expect(chat).toContain('aria-label="Chat modes"');
+    expect(chat.indexOf("<span>Best Work</span>")).toBeLessThan(chat.indexOf("<span>Active mode</span>"));
+    expect(settings).not.toContain("<BestWorkSettings");
+    expect(settings).not.toContain('id="active-mode-heading"');
   });
   it("uses the applied shared-volume quota instead of diagnostic free-space projections", () => {
     const settings = { ...DEFAULT_DEVICE_RESOURCE_SETTINGS, allocations: [], storageDirectories: ["/fixture/chosen"] };

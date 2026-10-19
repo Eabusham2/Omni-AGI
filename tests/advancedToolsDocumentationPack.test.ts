@@ -1,4 +1,4 @@
-/** Pack v23 declaration/equality review only. No plugin, tool, brain, learner, or provider executes. */
+/** Pack v24 declaration/equality review only. No plugin, tool, brain, learner, or provider executes. */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -11,10 +11,10 @@ const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(
   ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
     .map(([key, child]) => [key, canonical(child)])) : value;
 
-it("declares exact pack23 public sparse, native-candidate and runtime-parser manuals without executed outcomes", () => {
+it("declares exact pack24 public sparse, native-candidate and runtime-parser manuals without executed outcomes", () => {
   const pack = declaredDocumentationCurriculumPack();
-  expect(pack).toMatchObject({ format: "omni-ordinary-document-curriculum", version: 23,
-    id: "omni-v2-user-documentation-23", ordinaryNeuralLearning: true, hiddenPrompt: false,
+  expect(pack).toMatchObject({ format: "omni-ordinary-document-curriculum", version: 24,
+    id: "omni-v2-user-documentation-24", ordinaryNeuralLearning: true, hiddenPrompt: false,
     behavioralPersona: false, preferenceLabels: false, rewardModel: false, executedHostActions: false });
   expect(pack.records.map(record => record.id)).toEqual([
     "user-guide", "integrations", "plugins", "html-artifacts", "executable-training-parsers",
@@ -37,7 +37,7 @@ it("declares exact pack23 public sparse, native-candidate and runtime-parser man
   const parsers = records.find(record => record.id === "executable-training-parsers")!.content;
   for (const text of ["### Native sparse connections", "### Native improvement candidates", "native-status",
     "runtime-stream", "waits visibly for\nApprove or Deny", "zero-update result"]) expect(guide).toContain(text);
-  for (const text of ["Pack version 23", "window.omni.substrate", "stop(brainId, jobId)",
+  for (const text of ["Pack version 24", "window.omni.substrate", "stop(brainId, jobId)",
     "source.self-modify.native-status", "runtime-stream", "complete byte\ncoverage is not a claim"])
     expect(integrations).toContain(text);
   for (const text of ["runtime-stream", "globalThis.omniRuntime.registerParser", "media-assets",

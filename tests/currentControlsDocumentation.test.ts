@@ -2,18 +2,22 @@ import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 import { declaredDocumentationCurriculumPack } from "../src/main/documentationCurriculumPack";
 
-it("declares current attachment, teacher and replay controls as v23 ordinary manuals without simulated outcomes", () => {
+it("declares current attachment, teacher and replay controls as v24 ordinary manuals without simulated outcomes", () => {
   const pack = declaredDocumentationCurriculumPack();
-  expect(pack).toMatchObject({ version: 23, id: "omni-v2-user-documentation-23", executedHostActions: false, hiddenPrompt: false, rewardModel: false });
+  expect(pack).toMatchObject({ version: 24, id: "omni-v2-user-documentation-24", executedHostActions: false, hiddenPrompt: false, rewardModel: false });
   const guide = pack.records.find(row => row.id === "user-guide")!, integrations = pack.records.find(row => row.id === "integrations")!;
   expect(guide.content).toContain("attachments, not an automatic training job");
   expect(guide.content).toContain("no\n   blocking conversational tool quiz");
   expect(guide.content).toContain("Choose from provider models");
   expect(guide.content).toContain("Local GGUF teacher");
-  expect(guide.content).toContain("Prepare replay");
+  expect(guide.content).toContain("Record → Saved recordings");
+  expect(guide.content).toContain("one sealed, immutable container");
+  expect(guide.content).toContain("An explicit relative `entryPath`");
+  expect(guide.content).toContain("Training & Evolution");
+  expect(guide.content).not.toContain("Parser for the next file or folder");
   expect(guide.content).toContain("timer pauses while hovered or focused");
   expect(integrations.content).toContain("localTeacher");
-  expect(integrations.content).toContain("Pack version 23");
+  expect(integrations.content).toContain("Pack version 24");
   for (const row of pack.records) {
     expect(row.contentSha256).toBe(createHash("sha256").update(row.content).digest("hex"));
     expect(row.bytes).toBe(Buffer.byteLength(row.content));

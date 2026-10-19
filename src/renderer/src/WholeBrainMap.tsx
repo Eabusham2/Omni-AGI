@@ -1,13 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { WholeBrainGraphProjection, WholeBrainInspectionApi, WholeBrainInspectionPage, WholeBrainInspectionQuery } from "../../shared/wholeBrainInspection";
-import type { CortexModule } from "../../shared/cortexInspection";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { WholeBrainGraphNode, WholeBrainGraphProjection, WholeBrainInspectionApi, WholeBrainInspectionPage, WholeBrainInspectionQuery } from "../../shared/wholeBrainInspection";
 import { projectWholeBrainInspection } from "../../shared/wholeBrainProjection";
 import { BrainMapSubstrateGraph, type BrainMapGraphEdge, type BrainMapGraphNode } from "./BrainMapSubstrateGraph";
 import { routerActivityGraph } from "./RouterActivityBrainMap";
-import { RouterSpikeView } from "./RouterSpikeView";
+import { checkedRouterViewport, retainRouterObservation } from "./RouterSpikeView";
 import type { RouterSpikeActivity, RouterSpikeQuery } from "../../shared/routerActivity";
-import { hydrateWholeBrainViewport, retainWholeBrainWindow, sameWholeBrainSnapshot, wholeBrainWindowPages, type WholeBrainViewport } from "../../shared/wholeBrainViewport";
-import type { SubstrateCluster } from "../../shared/types";
+import { hydrateWholeBrainViewport, initialWholeBrainQueries, retainWholeBrainWindow, sameWholeBrainSnapshot, wholeBrainWindowPages, type WholeBrainViewport } from "../../shared/wholeBrainViewport";
 import "./wholeBrainMap.css";
 
 /** Only display coordinates are shared. Actual source identities stay intact. */
@@ -46,196 +44,196 @@ export function wholeBrainDisplayGraph(graph: WholeBrainGraphProjection, activit
       targetId: data && "targetId" in data ? data.targetId : edge.targetId } }; });
   return { nodes, edges };
 }
+/** Opening a real node changes only the viewport; it never creates a connection. */
+export function wholeBrainMapFocusQuery(node: WholeBrainGraphNode): WholeBrainInspectionQuery | undefined {
+  const regionId = node.scopeId === "root" ? undefined : node.scopeId;
+  if (node.kind === "region") return { entity: "catalog", catalogFacet: "members", regionId: node.recordId, pageSize: 128 };
+  if (node.kind === "registered-owner") return { entity: "catalog", catalogFacet: "owner", ownerId: node.recordId, pageSize: 128 };
+  if (node.kind === "cortical-storage") return { entity: "cortex", regionId, pageSize: 64, cortex: { entity: "links", moduleId: node.recordId, row: 0 } };
+  if (node.kind === "tensor-axis" && "moduleId" in node.data && "axis" in node.data)
+    return { entity: "cortex", regionId, pageSize: 64, cortex: { entity: "links", moduleId: node.data.moduleId,
+      row: node.data.axis === "tensor-row" || node.data.axis === "output-row" ? node.data.index : 0 } };
+  if (node.kind === "substrate-cluster" && "effectiveWeights" in node.data) {
+    const cluster = node.data;
+    if (cluster.kind === "activation-band" && !cluster.activationBand) return undefined;
+    return { entity: "substrate", regionId, pageSize: 64, substrate: cluster.kind === "pathway"
+      ? { entity: "synapses", zoom: 1, sourceRegion: cluster.sourceRegion, targetRegion: cluster.targetRegion }
+      : { entity: "neurons", zoom: 1, region: cluster.region,
+        ...(cluster.kind === "activation-band" ? { activationBand: cluster.activationBand } : {}) } };
+  }
+  if (node.kind === "substrate-assembly") return { entity: "substrate", regionId, pageSize: 64,
+    substrate: { entity: "assemblies", zoom: 1, membersOf: node.recordId } };
+  if (node.kind === "substrate-neuron") return { entity: "substrate", regionId, pageSize: 64,
+    substrate: { entity: "synapses", zoom: 1, connectedTo: node.recordId } };
+  return undefined;
+}
+export function wholeBrainMapNextQuery(page: WholeBrainInspectionPage | undefined, query: WholeBrainInspectionQuery): WholeBrainInspectionQuery | undefined {
+  if (!page) return undefined;
+  if (page.hasMore && page.nextCursor) return { ...query, cursor: page.nextCursor };
+  const module = page.cortex?.selectedModule, row = query.cortex?.row ?? 0;
+  if (page.cortex?.entity === "links" && module && row + 1 < module.rows)
+    return { ...query, cursor: undefined, cortex: { entity: "links", moduleId: module.id, row: row + 1 } };
+  return undefined;
+}
+const initialMapWindowQueries = () => ({ parameters: initialWholeBrainQueries[1]!, aggregates: initialWholeBrainQueries[2]!, ideas: initialWholeBrainQueries[3]! });
+
 export function WholeBrainMap(props: { brainId: string; api?: WholeBrainInspectionApi;
   observeActivity?(brainId: string, query: RouterSpikeQuery): Promise<RouterSpikeActivity>; onBack(): void }) {
   return <WholeBrainMapOwner key={props.brainId} {...props} />;
 }
 function WholeBrainMapOwner({ brainId, api, observeActivity, onBack }: Parameters<typeof WholeBrainMap>[0]) {
   const [activity, setActivity] = useState<RouterSpikeActivity>();
-  const [overview, setOverview] = useState<WholeBrainInspectionPage>(), [page, setPage] = useState<WholeBrainInspectionPage>();
-  const [regionContext, setRegionContext] = useState<WholeBrainInspectionPage>(), [ownerContext, setOwnerContext] = useState<WholeBrainInspectionPage>();
-  const [contextRegionId, setContextRegionId] = useState<string>();
+  const [overview, setOverview] = useState<WholeBrainInspectionPage>();
+  const [page, setPage] = useState<WholeBrainInspectionPage>();
   const [windows, setWindows] = useState<WholeBrainViewport>({});
-  const [layers, setLayers] = useState({ parameters: true, ideas: true, connections: true });
-  const [query, setQuery] = useState<WholeBrainInspectionQuery>({ entity: "catalog", pageSize: 128 });
-  const [selected, setSelected] = useState(""), [busy, setBusy] = useState(false), [error, setError] = useState("");
-  const [selectedEdgeId, setSelectedEdgeId] = useState("");
-  const [row, setRow] = useState("0");
+  const [anchors, setAnchors] = useState<{ region?: WholeBrainInspectionPage; owner?: WholeBrainInspectionPage }>({});
+  const [selected, setSelected] = useState(""), [selectedEdgeId, setSelectedEdgeId] = useState("");
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const [previousQueries, setPreviousQueries] = useState<WholeBrainInspectionQuery[]>([]);
-  const owner = useRef<object | null>(null), sequence = useRef(0), overviewRef = useRef<WholeBrainInspectionPage | undefined>(undefined);
-  const read = async (next: WholeBrainInspectionQuery, refresh = false, previous = false) => {
-    if (!api || !owner.current) return;
-    const scope = owner.current, ticket = ++sequence.current; setBusy(true); setError("");
+  const owner = useRef<object | null>(null), sequence = useRef(0);
+  const overviewRef = useRef<WholeBrainInspectionPage | undefined>(undefined);
+  const rootWindows = useRef<WholeBrainViewport>({});
+  const windowQueries = useRef<Partial<Record<keyof WholeBrainViewport, WholeBrainInspectionQuery>>>({});
+  const query = useRef<WholeBrainInspectionQuery>({ entity: "catalog", catalogFacet: "overview", pageSize: 128 });
+  const busyRef = useRef(false);
+
+  const read = useCallback(async (next: WholeBrainInspectionQuery, refresh = false, previous = false) => {
+    if (!api || !owner.current || busyRef.current) return;
+    const scope = owner.current, ticket = ++sequence.current;
+    busyRef.current = true; setBusy(true); setError("");
     try {
       if (refresh) {
         const fresh = await hydrateWholeBrainViewport(api, brainId, () => scope === owner.current && sequence.current === ticket);
         projectWholeBrainInspection({ pages: [fresh.overview, ...wholeBrainWindowPages(fresh.windows)] });
-        overviewRef.current = fresh.overview; setOverview(fresh.overview); setWindows(fresh.windows); setPage(fresh.active); setQuery(fresh.query);
-        setSelected(""); setSelectedEdgeId(""); setRegionContext(undefined); setOwnerContext(undefined); setContextRegionId(undefined); setPreviousQueries([]);
+        if (scope !== owner.current || sequence.current !== ticket) return;
+        overviewRef.current = fresh.overview; rootWindows.current = fresh.windows; query.current = fresh.query;
+        windowQueries.current = initialMapWindowQueries();
+        setOverview(fresh.overview); setWindows(fresh.windows); setPage(fresh.active); setAnchors({});
+        setSelected(""); setSelectedEdgeId(""); setPreviousQueries([]);
         return;
       }
       const value = await api.query(brainId, next);
       if (scope !== owner.current || sequence.current !== ticket) return;
-      if (value.brainId !== brainId) throw new Error("The map response belongs to another instance.");
+      if (value.brainId !== brainId || value.entity !== next.entity) throw new Error("The map response does not match this brain.");
       const anchor = overviewRef.current;
       if (anchor && !sameWholeBrainSnapshot(anchor, value))
-        throw new Error("The brain changed while browsing. Refresh the whole map to use one consistent snapshot.");
-      if (refresh || !anchor) { overviewRef.current = value; setOverview(value); setSelected(""); setSelectedEdgeId(""); setRegionContext(undefined); setOwnerContext(undefined); setContextRegionId(undefined); }
-      if (next.entity === "catalog" && next.catalogFacet === "members") { setRegionContext(value); setContextRegionId(next.regionId); setOwnerContext(undefined); }
-      if (next.entity === "catalog" && next.catalogFacet === "owner") setOwnerContext(value);
-      if (refresh) setPreviousQueries([]);
-      else if (previous) setPreviousQueries(values => values.slice(0, -1));
-      else setPreviousQueries(values => [...values, query]);
-      setPage(value); setQuery(next);
-      setWindows(current => retainWholeBrainWindow(current, value));
-    } catch (reason) { if (scope === owner.current && ticket === sequence.current) setError(reason instanceof Error ? reason.message : "Brain Map is unavailable."); }
-    finally { if (scope === owner.current && ticket === sequence.current) setBusy(false); }
-  };
+        throw new Error("The brain changed while viewing the map. Refresh to read its current connections.");
+      if (next.entity === "catalog" && next.catalogFacet === "members") setAnchors({ region: value });
+      if (next.entity === "catalog" && next.catalogFacet === "owner") setAnchors(current => ({ ...current, owner: value }));
+      for (const key of Object.keys(retainWholeBrainWindow({}, value)) as Array<keyof WholeBrainViewport>) windowQueries.current[key] = next;
+      const before = query.current;
+      setPreviousQueries(values => previous ? values.slice(0, -1) : [...values, before]);
+      query.current = next; setPage(value); setWindows(current => retainWholeBrainWindow(current, value));
+    } catch (reason) {
+      if (scope === owner.current && ticket === sequence.current)
+        setError(reason instanceof Error ? reason.message : "Brain Map is unavailable.");
+    } finally {
+      if (scope === owner.current && ticket === sequence.current) { busyRef.current = false; setBusy(false); }
+    }
+  }, [api, brainId]);
+
   useEffect(() => {
-    const scope = {}; owner.current = scope; overviewRef.current = undefined;
-    setOverview(undefined); setPage(undefined); setWindows({}); setRegionContext(undefined); setOwnerContext(undefined); setContextRegionId(undefined); setSelected(""); setSelectedEdgeId(""); setPreviousQueries([]); setBusy(false); setError("");
-    if (api) void read({ entity: "catalog", catalogFacet: "overview", pageSize: 128 }, true);
-    return () => { owner.current = null; sequence.current++; };
-  }, [brainId, api]);
+    owner.current = {}; overviewRef.current = undefined; rootWindows.current = {}; windowQueries.current = {}; busyRef.current = false;
+    setOverview(undefined); setPage(undefined); setWindows({}); setAnchors({});
+    setSelected(""); setSelectedEdgeId(""); setPreviousQueries([]); setBusy(false); setError("");
+    query.current = { entity: "catalog", catalogFacet: "overview", pageSize: 128 };
+    if (api) void read(query.current, true);
+    return () => { owner.current = null; sequence.current++; busyRef.current = false; };
+  }, [api, brainId, read]);
+
+  useEffect(() => {
+    setActivity(undefined);
+    if (!observeActivity || !globalThis.crypto?.randomUUID) return;
+    // The existing observer reads an already-loaded owner. It cannot Load a brain.
+    const capture = { id: crypto.randomUUID(), epoch: undefined as string | undefined, afterSequence: 0 };
+    let current = true, timer: ReturnType<typeof setTimeout> | undefined;
+    let transmissionEpoch: string | undefined, afterTransmissionSequence = 0;
+    const stop = async () => {
+      if (capture.epoch) await observeActivity(brainId, { enabled: false, captureId: capture.id,
+        epoch: capture.epoch, afterSequence: capture.afterSequence });
+    };
+    const poll = async () => {
+      try {
+        const value = checkedRouterViewport(await observeActivity(brainId, { enabled: true, captureId: capture.id,
+          start: 0, count: 64, pageSize: 32, contactOffset: 0, contactPageSize: 128,
+          ...(capture.epoch ? { epoch: capture.epoch, afterSequence: capture.afterSequence } : {}),
+          ...(transmissionEpoch ? { transmissionEpoch, afterTransmissionSequence } : {}), transmissionPageSize: 128 }), brainId, capture);
+        if (value.epoch) capture.epoch = value.epoch;
+        if (!current) { await stop(); return; }
+        setActivity(previous => retainRouterObservation(previous, value));
+        if (!value.available || !value.enabled || !value.epoch) return;
+        capture.afterSequence = value.nextSequence;
+        transmissionEpoch = value.transmissionPage?.epoch ?? undefined;
+        afterTransmissionSequence = value.transmissionPage?.nextSequence ?? 0;
+        timer = setTimeout(() => { void poll(); }, 400);
+      } catch {
+        // Missing measurements are not replaced with simulated firing.
+        if (current) setActivity(undefined);
+        void stop().catch(() => undefined);
+      }
+    };
+    void poll();
+    return () => { current = false; if (timer) clearTimeout(timer); void stop().catch(() => undefined); };
+  }, [brainId, observeActivity]);
+
   const projected = useMemo(() => {
     if (!overview) return { graph: undefined, error: "" };
-    // Retain the actual selected region/owner anchors during weight drill-down.
-    // Only current inspection pages live in RAM; traversal is not a model cap.
-    const pages = [...new Set([overview, regionContext, ownerContext, page, ...Object.values(windows)].filter((value): value is WholeBrainInspectionPage => Boolean(value)))];
+    const pages = [...new Set([overview, ...Object.values(anchors), page, ...wholeBrainWindowPages(windows)]
+      .filter((value): value is WholeBrainInspectionPage => Boolean(value)))];
     try { return { graph: projectWholeBrainInspection({ pages, router: activity }), error: "" }; }
-    catch (reason) { return { graph: undefined, error: reason instanceof Error ? reason.message : "Inconsistent map sources." }; }
-  }, [overview, regionContext, ownerContext, page, windows, activity]);
-  const graph = projected.graph;
-  const display = useMemo(() => {
-    if (!graph) return undefined;
-    const nodes = graph.nodes.filter(node => (layers.parameters || !["registered-owner", "cortical-storage", "tensor-axis"].includes(node.kind)) &&
-      (layers.ideas || !node.kind.startsWith("substrate-")));
-    const ids = new Set(nodes.map(node => node.id));
-    return wholeBrainDisplayGraph({ ...graph, nodes, edges: graph.edges.filter(edge => ids.has(edge.sourceId) && ids.has(edge.targetId) &&
-      (layers.connections || !edge.learnedConnection && edge.kind !== "substrate-pathway-aggregate")) }, activity);
-  }, [graph, activity, layers]);
-  const selectedNode = graph?.nodes.find(node => node.id === selected);
-  const selectedEdge = graph?.edges.find(edge => edge.id === selectedEdgeId);
-  const selectedRegion = selectedNode?.kind === "region" ? selectedNode.recordId : query.regionId ?? contextRegionId;
-  const bindings = graph?.inspectionBindings.filter(record => record.ownerId === selectedNode?.recordId) ?? [];
-  const catalogNodes = (page?.records ?? []).filter(record => record.kind === "region" || record.kind === "owner");
-  const modules = (page?.cortex?.records ?? []).filter((record): record is CortexModule => "module" in record && "field" in record);
-  const parameterInventory = (windows.parameters?.cortex?.records ?? []).filter((record): record is CortexModule => "module" in record && "field" in record);
-  const aggregate = selectedNode && "effectiveWeights" in selectedNode.data ? selectedNode.data
-    : selectedEdge?.kind === "substrate-pathway-aggregate" && selectedEdge.data && "effectiveWeights" in selectedEdge.data ? selectedEdge.data : undefined;
-  const sparseRegion = aggregate?.region ?? query.substrate?.region;
-  const sparseScope = windows.aggregates?.scope.nativeRegionPath.length ? windows.aggregates.scope.id : undefined;
-  const zoom = windows.aggregates?.substrate?.zoom ?? 0;
-  const inspectAggregate = (value: SubstrateCluster, scopeId: string) => {
-    if (value.kind === "activation-band" && !value.activationBand) { setError("This source omitted its exact activation-group field. Refresh the map."); return; }
-    void read({ entity: "substrate", regionId: scopeId === "root" ? undefined : scopeId, pageSize: 64,
-    substrate: value.kind === "pathway" ? { entity: "synapses", zoom: 1, sourceRegion: value.sourceRegion, targetRegion: value.targetRegion }
-      : { entity: "neurons", zoom: 1, region: value.region,
-        ...(value.kind === "activation-band" ? { activationBand: value.activationBand } : {}) } }); };
-  const changeFacet = (entity: "cortex" | "substrate") => void read({ entity, pageSize: 128,
-    ...(selectedRegion ? { regionId: selectedRegion } : {}),
-    ...(entity === "cortex" ? { cortex: { entity: "modules" } } : { substrate: { entity: "overview", zoom: 0 } }) });
-  const openModule = (moduleId: string) => { setRow("0"); void read({ entity: "cortex", regionId: selectedRegion,
-    pageSize: 64, cortex: { entity: "links", moduleId, row: 0 } }); };
-  const inspectRow = () => {
-    const module = page?.cortex?.selectedModule, value = Number(row);
-    if (!module || !/^\d+$/.test(row) || !Number.isSafeInteger(value) || value < 0 || value >= module.rows) {
-      setError("Choose a row inside the selected parameter matrix."); return;
-    }
-    void read({ entity: "cortex", regionId: query.regionId, pageSize: 64, cortex: { entity: "links", moduleId: module.id, row: value } });
+    catch (reason) { return { graph: undefined, error: reason instanceof Error ? reason.message : "The map sources changed." }; }
+  }, [overview, anchors, page, windows, activity]);
+  const display = useMemo(() => projected.graph ? wholeBrainDisplayGraph(projected.graph, activity) : undefined, [projected.graph, activity]);
+  const focus = (id: string) => {
+    setSelected(id); setSelectedEdgeId("");
+    const node = projected.graph?.nodes.find(value => value.id === id);
+    const next = node && wholeBrainMapFocusQuery(node);
+    if (next && !busyRef.current) void read(next);
   };
-  return <section className="whole-brain-map" aria-label="Whole brain map" tabIndex={0}>
-    <header className="whole-brain-map__header"><button type="button" className="button" onClick={onBack}>Back to chat</button>
-      <h1>Brain Map</h1><button type="button" className="button" disabled={!api || busy}
-        onClick={() => void read({ entity: "catalog", catalogFacet: "overview", pageSize: 128 }, true)}>Refresh whole brain</button></header>
-    <nav className="whole-brain-map__navigation" aria-label="Brain map location">
-      <button type="button" className="button" disabled={!overview || busy} onClick={() => { setPage(overview); setRegionContext(undefined); setOwnerContext(undefined); setContextRegionId(undefined); setQuery({ entity: "catalog", catalogFacet: "overview", pageSize: 128 }); setPreviousQueries([]); setSelected(""); setSelectedEdgeId(""); setError(""); }}>Whole brain</button>
-      <span>{page?.cortex?.entity === "modules" ? "Joint cortical inventory" : page?.scope.nativeRegionPath.length ? "Selected connected region" : query.regionId || contextRegionId ? "Selected region" : "All regions"}</span>
-    </nav>
-    <fieldset className="whole-brain-map__layers"><legend>Show together</legend>{(["parameters", "ideas", "connections"] as const).map(layer =>
-      <label key={layer}><input type="checkbox" checked={layers[layer]} onChange={event => setLayers(current => ({ ...current, [layer]: event.target.checked }))} />
-        {layer === "parameters" ? "Parameters and owners" : layer === "ideas" ? "Ideas and neurons" : "Connections"}</label>)}</fieldset>
-    <div className="whole-brain-map__navigation" role="group" aria-label="Brain map source zoom">
-      <span>Source detail</span>{([{ label: "Regions", value: 0 }, { label: "Activation groups", value: .5 }, { label: "Exact neurons", value: 1 }] as const).map(level =>
-        <button type="button" className="button" key={level.value} disabled={!api || busy} aria-pressed={page?.entity === "substrate" && page.substrate?.zoom === level.value}
-          onClick={() => void read({ entity: "substrate", regionId: sparseScope ?? selectedRegion, pageSize: 64,
-            substrate: { entity: level.value === 1 ? "neurons" : "overview", zoom: level.value, ...(sparseRegion ? { region: sparseRegion } : {}) } })}>{level.label}</button>)}
-      <span>{zoom < .35 ? "Region totals" : "Activation groups"} retained alongside parameters and ideas</span>
+  const wholeBrain = () => {
+    if (!overview || busyRef.current) return;
+    setPage(rootWindows.current.aggregates); setWindows(rootWindows.current); setAnchors({});
+    setSelected(""); setSelectedEdgeId(""); setPreviousQueries([]); setError("");
+    windowQueries.current = initialMapWindowQueries(); query.current = initialWholeBrainQueries[2]!;
+  };
+  const selectedLabel = projected.graph?.nodes.find(value => value.id === selected)?.label;
+  const previous = previousQueries.at(-1);
+  const nextArea = wholeBrainMapNextQuery(page, query.current) ?? (Object.entries(windows) as Array<[keyof WholeBrainViewport, WholeBrainInspectionPage]>)
+    .map(([key, value]) => value === page || !windowQueries.current[key] ? undefined : wholeBrainMapNextQuery(value, windowQueries.current[key]!)).find(Boolean);
+  const status = !api ? "Brain Map is unavailable in this UI-only preview."
+    : busy ? "Reading the brain…" : error || projected.error;
+
+  return <section className="whole-brain-map" aria-label="Whole brain map">
+    <header className="whole-brain-map__header">
+      <button type="button" className="button" onClick={onBack}>Back to chat</button>
+      <h1>Brain Map</h1>
+      {previousQueries.length ? <button type="button" className="button" disabled={busy} onClick={wholeBrain}>Whole brain</button> : null}
+      <button type="button" className="button whole-brain-map__refresh" title="Refresh brain map" aria-label="Refresh brain map"
+        disabled={!api || busy} onClick={() => void read({ entity: "catalog", catalogFacet: "overview", pageSize: 128 }, true)}>↻</button>
+    </header>
+    <div className="whole-brain-map__canvas" tabIndex={0} aria-label="Connected brain map"
+      onKeyDown={event => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Escape") { event.preventDefault(); wholeBrain(); }
+        if (event.key === "PageDown" && nextArea) { event.preventDefault(); void read(nextArea); }
+        if (event.key === "PageUp" && previous) { event.preventDefault(); void read(previous, false, true); }
+      }}>
+      {display ? <BrainMapSubstrateGraph nodes={display.nodes} edges={display.edges} selectedId={selected}
+        selectedEdgeId={selectedEdgeId} onSelectEdge={edge => {
+          setSelectedEdgeId(edge.id); setSelected("");
+          const actual = projected.graph?.edges.find(value => value.id === edge.id);
+          if (actual?.kind === "substrate-pathway-aggregate" && actual.data && "effectiveWeights" in actual.data)
+            void read({ entity: "substrate", regionId: actual.scopeId === "root" ? undefined : actual.scopeId, pageSize: 64,
+              substrate: { entity: "synapses", zoom: 1, sourceRegion: actual.data.sourceRegion, targetRegion: actual.data.targetRegion } });
+        }} onSelect={node => focus(node.id)} clustered /> : null}
+      {!display && !status ? <p className="whole-brain-map__empty" role="status">No neural records are available yet.</p> : null}
+      {status ? <p className="whole-brain-map__status" role={error || projected.error ? "alert" : "status"}>{status}</p> : null}
     </div>
-    {!api ? <p role="status">Whole-brain inspection is unavailable; no substitute map or model was created.</p> : null}
-    {busy ? <p role="status">Reading the selected neural records…</p> : null}
-    {error || projected.error ? <p role="alert">{error || projected.error}</p> : null}
-    {display ? <BrainMapSubstrateGraph nodes={display.nodes} edges={display.edges} selectedId={selected}
-      selectedEdgeId={selectedEdgeId} onSelectEdge={edge => { setSelectedEdgeId(edge.id); setSelected(""); }}
-      onSelect={node => { setSelected(node.id); setSelectedEdgeId(""); }} clustered /> : null}
-    {graph ? <><p className="whole-brain-map__evidence">One brain · {(display?.nodes.length ?? 0).toLocaleString()} displayed records · {(display?.edges.length ?? 0).toLocaleString()} visible recorded relationships</p>
-      <p>{windows.parameters?.cortex?.logicalInventoryComplete ? windows.parameters.cortex.logicalParameters.toLocaleString() : "Unverified total"} logical parameters · {windows.aggregates?.substrate?.totals.neurons.toLocaleString() ?? "—"} sparse neurons · {windows.ideas?.substrate?.totals.assemblies.toLocaleString() ?? "—"} idea assemblies. Counts describe different source kinds.</p>
-      <details><summary>Map legend</summary><p>Grey dashed links show source structure. Aggregate pathways show exact contact counts and sign distributions, not representative weights. Individual contacts retain their own signs and strengths. Positions are a layout, not anatomy.</p></details></> : null}
-    <div className="whole-brain-map__details">
-      <aside aria-label="Selected brain structure"><h2>{selectedNode?.label ?? (selectedEdge ? "Selected connection" : "Inspect the brain")}</h2>
-        {selectedEdge ? <><p>{selectedEdge.kind.replaceAll("-", " ")}</p>
-          {selectedEdge.learnedConnection && selectedEdge.effectiveWeight !== undefined ? <p>Ternary sign: {selectedEdge.effectiveWeight > 0 ? "+1" : selectedEdge.effectiveWeight} · Strength: {selectedEdge.strength ?? "unreported"}</p>
-            : <p>Registered relationship; not a measured synaptic weight.</p>}
-          <details><summary>Connection values and provenance</summary><pre>{JSON.stringify(selectedEdge, null, 2)}</pre></details></> : null}
-        {selectedNode ? <p>{selectedNode.kind.replaceAll("-", " ")}</p> : <p>Select a region, neural owner or neuron to inspect its connections.</p>}
-        {aggregate ? <><p>{aggregate.count.toLocaleString()} {aggregate.kind === "pathway" ? "actual contacts" : "neurons in this aggregate"}
-          {aggregate.kind === "pathway" ? ` · −1: ${aggregate.effectiveWeights.negative.toLocaleString()} · 0: ${aggregate.effectiveWeights.zero.toLocaleString()} · +1: ${aggregate.effectiveWeights.positive.toLocaleString()}` : ` · ${aggregate.activeCount.toLocaleString()} active; not a spike count`}</p>
-          <button type="button" className="button" disabled={busy} onClick={() => inspectAggregate(aggregate, selectedNode?.scopeId ?? selectedEdge?.scopeId ?? "root")}>{aggregate.kind === "pathway" ? "Inspect exact pathway contacts" : aggregate.kind === "activation-band" ? "Inspect exact activation group" : "Inspect this region’s neurons"}</button></> : null}
-        <div className="whole-brain-map__navigation">
-          <button type="button" className="button" disabled={!api || busy} onClick={() => changeFacet("cortex")}>Browse parameter groups</button>
-          <button type="button" className="button" disabled={!api || busy} onClick={() => changeFacet("substrate")}>Browse neuron groups</button>
-          {selectedNode?.kind === "region" ? <button type="button" className="button" disabled={busy}
-            onClick={() => void read({ entity: "catalog", catalogFacet: "members", regionId: selectedNode.recordId, pageSize: 128 })}>Open region</button> : null}
-          {selectedNode?.kind === "registered-owner" ? <button type="button" className="button" disabled={busy}
-            onClick={() => void read({ entity: "catalog", catalogFacet: "owner", ownerId: selectedNode.recordId, pageSize: 128 })}>Inspect selected owner</button> : null}
-        </div>
-        {bindings.map(binding => <button type="button" className="button" key={binding.id} disabled={busy}
-          onClick={() => openModule(binding.moduleId)}>Inspect {binding.field} connections</button>)}
-        {selectedNode?.kind === "cortical-storage" ? <button type="button" className="button" disabled={busy}
-          onClick={() => openModule(selectedNode.recordId)}>Inspect these parameter connections</button> : null}
-        {selectedNode?.kind === "substrate-assembly" ? <button type="button" className="button" disabled={busy}
-          onClick={() => void read({ entity: "substrate", regionId: selectedNode.scopeId === "root" ? undefined : selectedNode.scopeId, pageSize: 64,
-            substrate: { entity: "assemblies", zoom: 1, membersOf: selectedNode.recordId } })}>Members of this idea</button> : null}
-        {page?.substrate || windows.ideas ? <div className="whole-brain-map__navigation">{(["neurons", "assemblies", "synapses"] as const).map(entity =>
-          <button type="button" className="button" disabled={busy} key={entity}
-            onClick={() => void read({ entity: "substrate", regionId: selectedNode?.kind.startsWith("substrate-") ? (selectedNode.scopeId === "root" ? undefined : selectedNode.scopeId) : query.regionId, pageSize: 128,
-              substrate: { entity, zoom: 1, ...(entity === "synapses" && selectedNode && ["substrate-neuron", "substrate-assembly"].includes(selectedNode.kind)
-                ? { connectedTo: selectedNode.recordId } : {}) } })}>{entity === "assemblies" ? "Idea assemblies" : entity === "synapses" ? "Synapses" : "Neurons"}</button>)}</div> : null}
-        {selectedNode ? <details><summary>Exact source identity</summary><code>{selectedNode.recordId}</code><pre>{JSON.stringify(selectedNode.data, null, 2)}</pre></details> : null}
-      </aside>
-      <section aria-label="Paged brain records"><h2>Selected records</h2>
-        <details><summary>Parameter groups on this viewport</summary><ul className="whole-brain-map__record-list">{parameterInventory.map(module =>
-          <li key={module.id}><button type="button" className="button" disabled={busy} onClick={() => openModule(module.id)}>{module.module} · {module.field}
-            {module.logicalParameters !== null ? ` · ${module.logicalParameters.toLocaleString()} logical parameters` : " · logical count unavailable"}</button></li>)}</ul></details>
-        {page?.substrate?.clusters.length ? <ul className="whole-brain-map__record-list">{page.substrate.clusters.map(cluster => <li key={cluster.id}>
-          <button type="button" className="button" disabled={busy} onClick={() => inspectAggregate(cluster, page.scope.id)}>{cluster.label} · {cluster.count.toLocaleString()} {cluster.kind === "pathway" ? "contacts" : "neurons"}</button></li>)}</ul> : null}
-        {page?.substrate?.membershipPage ? <p>Exact idea memberships {(page.substrate.membershipPage.offset + (page.substrate.membershipPage.returned ? 1 : 0)).toLocaleString()}–{(page.substrate.membershipPage.offset + page.substrate.membershipPage.returned).toLocaleString()} of {page.substrate.membershipPage.total.toLocaleString()}. Original array ordinals are retained.</p> : null}
-        {page?.cortex?.entity === "modules" ? <p>Joint cortical inventory. Select an owner’s exact connections for a region-specific weight view.</p> : null}
-        {catalogNodes.length ? <ul className="whole-brain-map__record-list">{catalogNodes.map(record => <li key={record.id}><button type="button" className="button" aria-pressed={selected === record.id}
-          title={record.kind === "owner" ? record.canonicalAlias : record.label} onClick={() => { setSelected(record.id); setSelectedEdgeId(""); }}>
-            {record.kind === "owner" ? record.canonicalAlias : record.label}</button></li>)}</ul> : null}
-        {modules.length ? <ul>{modules.map(module => <li key={module.id}><button type="button" className="button" disabled={busy}
-          onClick={() => openModule(module.id)}>{module.module} · {module.field}</button></li>)}</ul> : null}
-        {page?.cortex?.selectedModule ? <><p>{page.cortex.selectedModule.rows.toLocaleString()} rows · {page.cortex.selectedModule.columns?.toLocaleString() ?? "unknown"} columns</p>
-          <div className="whole-brain-map__navigation"><label>Parameter row<input className="input" inputMode="numeric" aria-label="Parameter row" value={row} onChange={event => setRow(event.target.value)} /></label>
-            <button type="button" className="button" disabled={busy} onClick={inspectRow}>View row</button></div></> : null}
-        {graph?.edges.length ? <details><summary>Connections on this view</summary><ul className="whole-brain-map__record-list">{graph.edges.map((edge, index) => <li key={edge.id}>
-          <button type="button" className="button" aria-pressed={edge.id === selectedEdgeId}
-            onClick={() => { setSelectedEdgeId(edge.id); setSelected(""); }}>{edge.kind.replaceAll("-", " ")} {index + 1}</button></li>)}</ul></details> : null}
-        <details><summary>Record values and provenance</summary><pre>{JSON.stringify(page?.cortex?.records ?? page?.substrate ?? page?.records ?? [], null, 2)}</pre></details>
-        <div className="whole-brain-map__navigation">
-          {previousQueries.length ? <button type="button" className="button" disabled={busy}
-            onClick={() => void read(previousQueries.at(-1)!, false, true)}>Previous records</button> : null}
-          {page?.hasMore && page.nextCursor ? <button type="button" className="button" disabled={busy}
-            onClick={() => void read({ ...query, cursor: page.nextCursor! })}>Next records</button> : null}
-          {page?.entity === "catalog" ? <button type="button" className="button" disabled={busy}
-            onClick={() => void read({ entity: "catalog", catalogFacet: "all", pageSize: 128 })}>Browse all records</button> : null}
-        </div>
-      </section>
-    </div>
-    <details><summary>Activity inspection</summary><RouterSpikeView brainId={brainId} observe={observeActivity} showMap={false} onObservation={setActivity} />
-      <p>Recorded activity stays in this graph. Live and committed identities are not joined without a verified source mapping.</p></details>
-    {graph?.unavailable.length ? <details><summary>Unmapped or unavailable evidence</summary><ul>{graph.unavailable.map((reason, index) => <li key={`${index}:${reason}`}>{reason}</li>)}</ul></details> : null}
-    {page ? <details><summary>Snapshot details</summary><p>{page.catalog.records.toLocaleString()} catalog records · {page.catalog.shards.toLocaleString()} shards</p><pre>{JSON.stringify(page.snapshot, null, 2)}</pre></details> : null}
+    {selectedLabel || previous || nextArea ? <div className="whole-brain-map__navigation" aria-label="Map navigation">
+      {selectedLabel ? <span>{selectedLabel}</span> : null}
+      {previous ? <button type="button" className="button" disabled={busy} onClick={() => void read(previous, false, true)} aria-label="Previous map area">←</button> : null}
+      {nextArea ? <button type="button" className="button" disabled={busy}
+        onClick={() => void read(nextArea)} aria-label="Next map area">→</button> : null}
+    </div> : null}
   </section>;
 }

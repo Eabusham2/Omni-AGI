@@ -55,11 +55,11 @@ function text(value: unknown, label: string, empty = false): string {
 function sourceInput(value: unknown): LearningInput {
   const raw = object(value, "learning source");
   const allowed = raw.kind === "text" ? ["kind", "text", "name"] : raw.kind === "dataset" ? ["kind", "manifestId"] :
-    raw.kind === "web" ? ["kind", "url", "followLinks", "followExternalLinks", "respectRobots", "maxPages", "maxDepth"] : [];
+    raw.kind === "web" ? ["kind", "url", "followLinks", "followExternalLinks", "respectRobots", "quarantine", "maxPages", "maxDepth"] : [];
   if (!allowed.length || Object.keys(raw).some(key => !allowed.includes(key))) throw new Error("Learning sources are text, selected dataset manifests, or web URLs; raw file paths are not grants.");
   if (raw.kind === "text") return { kind: "text", text: text(raw.text, "text to learn"), ...(raw.name === undefined ? {} : { name: text(raw.name, "source name") }) };
   if (raw.kind === "dataset") return { kind: "dataset", manifestId: learningId(raw.manifestId, "selected dataset manifest") };
-  for (const field of ["followLinks", "followExternalLinks", "respectRobots"]) if (raw[field] !== undefined && typeof raw[field] !== "boolean") throw new Error("Invalid web learning switch.");
+  for (const field of ["followLinks", "followExternalLinks", "respectRobots", "quarantine"]) if (raw[field] !== undefined && typeof raw[field] !== "boolean") throw new Error("Invalid web learning switch.");
   for (const field of ["maxPages", "maxDepth"]) if (raw[field] !== undefined && (!Number.isSafeInteger(raw[field]) || Number(raw[field]) < (field === "maxDepth" ? 0 : 1))) throw new Error("Invalid optional web stop condition.");
   return { ...raw, kind: "web", url: normalizeLearningUrl(raw.url) } as Extract<LearningInput, { kind: "web" }>;
 }
@@ -195,7 +195,10 @@ export class LearningCoordinator {
     const brainId = learningId(raw.brainId); this.options.requireLoaded(brainId);
     await this.options.authorize?.(brainId, "specific-learn");
     if (!Array.isArray(raw.inputs) || !raw.inputs.length) throw new Error("Select text, files/folders, or a web source to learn.");
-    const inputs = raw.inputs.map(sourceInput);
+    if (raw.quarantine !== undefined && typeof raw.quarantine !== "boolean") throw new Error("Web quarantine must be a boolean.");
+    const inputs = raw.inputs.map(sourceInput).map(input => input.kind === "web" && input.quarantine === undefined && raw.quarantine !== undefined
+      ? { ...input, quarantine: raw.quarantine as boolean } : input);
+    if (raw.quarantine !== undefined && !inputs.some(input => input.kind === "web")) throw new Error("Quarantine applies to web sources only.");
     const instructions = text(raw.instructions ?? "", "learning instructions", true);
     const requestedConstraints = normalizeWebLearningConstraints(raw.constraints);
     let constraints = requestedConstraints;
@@ -317,7 +320,8 @@ export class LearningCoordinator {
         if (source.state === "complete") continue;
         this.options.requireLoaded(active.brainId);
         source = store.updateSource(active.taskId, source.id, { state: "running", error: undefined });
-        this.emit(store.update(active.taskId, { currentSource: source.id, label: `Learning ${source.label}`, progress: 0 }));
+        this.emit(store.update(active.taskId, { currentSource: source.id,
+          label: `${source.kind === "web" && source.spec.quarantine === true ? "Quarantining" : "Learning"} ${source.label}`, progress: 0 }));
         let lastUpdate = 0;
         const control: LearningSourceControl = { signal, jobId: learningHash({ taskId: active.taskId, sourceId: source.id }),
           cancelled: stopped, progress: (progress, label, coverage) => {
@@ -330,7 +334,9 @@ export class LearningCoordinator {
           if (source.kind === "web") {
             const spec = sourceInput(source.spec) as Extract<LearningInput, { kind: "web" }>;
             const result = await this.options.crawl({ brainId: active.brainId, url: spec.url, crawlId: source.crawlId,
-              policy: "encode", quarantine: false, resume: true, maxPages: spec.followLinks === true ? spec.maxPages : 1,
+              // The existing Specific Learn default remains direct learning;
+              // the separate direct-crawler API keeps its own quarantine default.
+              policy: "encode", quarantine: spec.quarantine ?? false, resume: true, maxPages: spec.followLinks === true ? spec.maxPages : 1,
               maxDepth: spec.followLinks === true ? spec.maxDepth : 0, followExternalLinks: spec.followExternalLinks,
               respectRobots: spec.respectRobots ?? true }, control, {
                 policy: async () => { await this.options.authorize?.(active.brainId, store.get(active.taskId).kind); return store.get(active.taskId).policy; },
@@ -338,6 +344,7 @@ export class LearningCoordinator {
                 onSource: async (provenance, result) => this.recordWebEvidence(store, active.taskId, provenance, result)
               });
             source = store.updateSource(active.taskId, source.id, { coverage: result.coverage,
+              ...(spec.quarantine === true ? { quarantined: true } : {}),
               state: result.coverage.complete && !result.stopped ? "complete" : "paused",
               result: { crawlId: result.crawlId, visited: result.visited, skipped: result.skipped, resultLog: result.resultLog, warnings: result.warnings } });
           } else {
@@ -471,6 +478,7 @@ export class LearningCoordinator {
   }
   private finish(store: LearningTaskStore, taskId: string): LearningTask {
     const task = store.get(taskId), claims = task.kind === "fact-check" ? store.claims(taskId) : [];
+    const quarantined = task.sources.some(source => source.quarantined === true);
     const failed = task.sources.some(source => source.state === "failed"), paused = task.sources.some(source => source.state === "paused");
     const pendingQuestions = claims.filter(claim => claim.state === "waiting-answer").flatMap(claim => claim.questionId ? [claim.questionId] : []);
     const awaiting = claims.some(claim => claim.state !== "reviewed");
@@ -479,6 +487,7 @@ export class LearningCoordinator {
     return this.emit(store.update(taskId, { state: complete ? "complete" : failed ? "failed" : paused ? "paused" : "waiting",
       pendingQuestions, traversalComplete: complete, progress: complete ? 1 : undefined, currentSource: undefined,
       phase: complete ? "complete" : "attention-needed", label: complete ? (task.kind === "fact-check" ? "Selected claims reviewed · findings remain evidence-based self-reports" :
+        quarantined ? "Traversal complete · quarantined web sources requested no new learning" :
         task.capabilityPack?.receipt?.candidateAccepted === false ? "Declared teaching examined · candidate declined to preserve current abilities" : "All selected source traversal committed") :
         failed ? "Some selected sources failed; completed receipts retained" : paused ? "Source progress paused" : "Evidence processed · selected claims still need review" }, "settled"));
   }

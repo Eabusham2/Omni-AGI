@@ -1,0 +1,24 @@
+{
+  "id": "verbatim-2-five-route-v1",
+  "routes": [
+    { "id": "chat", "label": "Conversation", "selector": ".chat-layout:not([hidden])" },
+    { "id": "data", "label": "Training & Evolution", "selector": ".training-evolution-page" },
+    { "id": "map", "label": "Brain map", "selector": "[aria-label=\"Whole brain map\"]" },
+    { "id": "tools", "label": "Tools & permissions", "selector": ".tools-page" },
+    { "id": "settings", "label": "Settings", "selector": ".resource-settings-page" }
+  ],
+  "designStates": [
+    "home-default", "home-selection", "home-selected-search", "home-export-menu", "home-delete-confirmation",
+    "build-identity", "build-initial-learning", "build-source-menu", "build-memory-storage", "build-access-review",
+    "training-expanded-form", "settings-custom-budgets"
+  ],
+  "compositionStates": [
+    "chat-idle", "chat-attach-menu", "chat-learn-menu",
+    "plugins-maker", "plugins-feature-source", "plugins-style-source", "plugins-training-parser",
+    "chat-streaming-before-ponder", "chat-ponder-tool-nesting", "chat-approval-during-ponder", "chat-continuation-chronology",
+    "chat-offpage-active", "chat-offpage-complete-return", "chat-restored-in-memory-ledger", "chat-failed-input-preserved",
+    "training-extracting", "appearance-over-training-extracting", "training-learning", "appearance-over-training-learning",
+    "training-saving", "appearance-over-training-saving", "training-finalizing", "appearance-over-training-finalizing",
+    "training-complete", "appearance-over-training-complete"
+  ]
+}

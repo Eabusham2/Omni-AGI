@@ -39,7 +39,7 @@ it("keeps package CI on fixed source contracts and health-only worker paths", as
   expect(rejected.stderr).toContain("fixed selection");
 });
 
-it("registers the new Ponder chronology cases once in reachable bounded selectors without discovery", async () => {
+it("registers focused chronology, source and surface cases once in reachable bounded selectors without discovery", async () => {
   const root = resolve("."), document = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
   const visited = new Set<string>(), pending = ["test:node:ci"];
   while (pending.length) {
@@ -53,7 +53,11 @@ it("registers the new Ponder chronology cases once in reachable bounded selector
   }
   expect(visited).toEqual(new Set(["test:node:ci", "test:node:v2:contracts", "test:node:v2:tasks", "test:node:v2:completion"]));
   const selected = [...visited].flatMap(name => document.scripts[name]!.match(/tests\/[A-Za-z0-9_./-]+\.test\.tsx?\b/g) ?? []);
-  for (const path of ["tests/ponderEpisodeProvenance.test.ts", "tests/chatPonderGroups.test.ts", "tests/chatReplyProjection.test.ts", "tests/conversationNoticePlacement.test.tsx", "tests/responsiveLayout.test.ts"]) {
+  for (const path of [
+    "tests/ponderEpisodeProvenance.test.ts", "tests/chatPonderGroups.test.ts", "tests/chatReplyProjection.test.ts", "tests/conversationNoticePlacement.test.tsx", "tests/responsiveLayout.test.ts",
+    "tests/intrinsicImprovementPolicy.test.ts", "tests/learningQuarantine.test.ts", "tests/librarySelection.test.ts", "tests/pluginModuleAuthoring.test.tsx",
+    "tests/taskFolderAttachments.test.ts", "tests/trainingEvolutionWorkspace.test.tsx", "tests/universalSourcePicker.test.tsx"
+  ]) {
     expect(selected.filter(value => value === path), `Focused case must be selected exactly once: ${path}`).toHaveLength(1);
     expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
   }

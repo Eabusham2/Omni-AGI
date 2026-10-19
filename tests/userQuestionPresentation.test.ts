@@ -20,7 +20,7 @@ export function fixtureQuestion(overrides: Partial<UserQuestionRecord> = {}): Us
 }
 
 describe("question panel choices and state reconciliation", () => {
-  it("keeps general conversation questions with their instance and leaves Learn/Fact Check questions task-scoped", () => {
+  it("keeps fact-check questions reachable in conversation and leaves Learn questions task-scoped", () => {
     const native = fixtureQuestion({ source: { kind: "brain", turnId: "turn-native", actionId: "action-native" } });
     expect(userQuestionInPanel(native, "one", undefined, "conversation")).toBe(true);
     expect(userQuestionInPanel(fixtureQuestion({ source: { kind: "host" } }), "one", undefined, "conversation")).toBe(true);
@@ -28,7 +28,8 @@ describe("question panel choices and state reconciliation", () => {
     expect(userQuestionInPanel(native, "another", undefined, "conversation")).toBe(false);
     for (const kind of ["learn", "fact-check"] as const) {
       const task = fixtureQuestion({ source: { kind } });
-      expect(userQuestionInPanel(task, "one", undefined, "conversation")).toBe(false);
+      expect(userQuestionInPanel(task, "one", undefined, "conversation")).toBe(kind === "fact-check");
+      expect(userQuestionInPanel(task, "another", undefined, "conversation")).toBe(false);
       expect(userQuestionInPanel(task, "one", [task.id])).toBe(true);
       expect(userQuestionInPanel(task, "one", ["another-task-question"])).toBe(false);
     }

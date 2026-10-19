@@ -11,8 +11,7 @@ const viewports = [
   { name: "ultrawide", width: 2_560, height: 1_080 }
 ] as const;
 const workspaceRoutes = [
-  "Conversation", "Data & training", "Learn", "Fact Check", "Time & schedules", "Brain map",
-  "Trace & journal", "Imagination", "Tools & permissions", "Device & runtime", "Forks & agents", "Evolution"
+  "Conversation", "Training & Evolution", "Brain map", "Tools & permissions", "Settings"
 ] as const;
 
 test("workspace remains reachable, overflow-safe, and keyboard-accessible at supported viewports", async () => {
@@ -144,9 +143,9 @@ test("workspace remains reachable, overflow-safe, and keyboard-accessible at sup
           expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height + 1);
         }
 
-        await page.getByLabel("Device & runtime").click();
+        await page.getByLabel("Settings", { exact: true }).click();
         await expect(
-          page.getByRole("heading", { name: "Memory & shared storage", level: 1 })
+          page.getByRole("heading", { name: "Memory & storage", level: 1 })
         ).toBeVisible();
         const ramPolicy = page.getByRole("group", { name: "Omni-wide RAM policy" });
         await expect(ramPolicy.getByRole("button", { name: /^Auto/ })).toBeVisible();

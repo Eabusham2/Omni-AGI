@@ -101,9 +101,9 @@
       }
     },
     {
-      "id": "data.learn", "label": "Specific Learn", "description": "Start or manage ordinary same-brain learning from explicit text, an already selected dataset manifest, or web URLs. Jobs return durable progress rather than claiming immediate learning.", "defaultGrant": "ask",
+      "id": "data.learn", "label": "Specific Learn", "description": "Start or manage ordinary same-brain learning from explicit text, an already selected dataset manifest, or web URLs. Optional quarantine=true archives web sources without learning them; omit it for ordinary learning. Individual web inputs may override that default with a boolean quarantine field. Jobs report durable traversal and distinguish quarantined sources from neural learning.", "defaultGrant": "ask",
       "actions": {
-        "start": { "input": { "inputs": "object[]", "instructions": "string?", "constraints": "object?", "epochs": "number?" }, "output": { "id": "string", "state": "string", "traversalComplete": "boolean" } },
+        "start": { "input": { "inputs": "object[]", "instructions": "string?", "constraints": "object?", "epochs": "number?", "quarantine": "boolean?" }, "output": { "id": "string", "state": "string", "traversalComplete": "boolean" } },
         "status": { "input": { "taskId": "string" }, "output": { "state": "string", "sources": "object[]" } },
         "pause": { "input": { "taskId": "string" }, "output": { "state": "string" } },
         "resume": { "input": { "taskId": "string" }, "output": { "state": "string" } },
@@ -142,7 +142,7 @@
     {
       "id": "task.attachments",
       "label": "Current task attachments",
-      "description": "List or read only the immutable files and media explicitly attached to this exact chat turn. Staging does not train the brain; visible read results follow ordinary experience learning.",
+      "description": "List or read only immutable files, media and saved folder containers explicitly attached to this exact chat turn. Folder reads without entryPath page the manifest using entry-ordinal offset; an exact relative entryPath reads retained member bytes using byte offset. No original host folder is reopened. Staging does not train the brain; visible read results follow ordinary experience learning.",
       "defaultGrant": "auto",
       "actions": {
         "list": {
@@ -150,8 +150,8 @@
           "output": { "attachments": "array" }
         },
         "read": {
-          "input": { "attachmentId": "string?", "offset": "number?", "maxBytes": "number?" },
-          "output": { "attachment": "object", "content": "string", "encoding": "utf8|base64", "nextOffset": "number?" }
+          "input": { "attachmentId": "string?", "offset": "number?", "maxBytes": "number?", "entryPath": "string?" },
+          "output": { "attachment": "object", "content": "string", "encoding": "utf8|base64", "nextOffset": "number?", "folder": "object?" }
         }
       }
     },

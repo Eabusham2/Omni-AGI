@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { DEFAULT_CONFIG, type BrainConfig, type BrainSummary, type HardwareTier, type OmniApi, type ToolPermissionLevel } from "../../shared/types";
 import type { FullMergeProgress, FullMergeStartRequest } from "../../shared/fullMerge";
 import { DEFAULT_DEVICE_RESOURCE_SETTINGS } from "../../shared/deviceResources";
+import { librarySelection } from "./librarySelection";
 import "./fullMerge.css";
+import "./libraryManagement.css";
 
 const TOOLS = [
   ["system.files", "System files"], ["system.shell", "System shell"], ["code.execute", "Code runner"],
@@ -17,6 +19,11 @@ const PHASE: Record<FullMergeProgress["state"], string> = {
 const bytes = (value: number): string => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(2)} GiB`
   : value >= 1024 ** 2 ? `${(value / 1024 ** 2).toFixed(1)} MiB` : `${value.toLocaleString()} bytes`;
 const serial = (config: BrainConfig): string => JSON.stringify(config, null, 2);
+
+export function fullMergeReviewKey(value: { parentIds: readonly string[]; config: BrainConfig; settingsText: string;
+  hardwareTier: HardwareTier; permissions: Record<string, ToolPermissionLevel>; spillSelectionId?: string; contextVersion: number }): string {
+  return JSON.stringify(value);
+}
 
 export function reviewedMergeConfig(value: unknown): BrainConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Settings must be a JSON object.");
@@ -71,12 +78,12 @@ export function FullMergeReceipt({ operation, pending, onCommand, onOpen }: {
   </article>;
 }
 
-export function FullMergePanel({ summaries, api, onPublished, onOpen, initialOperations = [] }: {
+export function FullMergePanel({ summaries, selectedParentIds = [], open = false, onClose, api, onPublished, onOpen, initialOperations = [] }: {
   summaries: BrainSummary[]; api?: OmniApi; onPublished?: () => void; onOpen?: (id: string) => void;
+  selectedParentIds?: readonly string[]; open?: boolean; onClose?: () => void;
   initialOperations?: FullMergeProgress[];
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const [parents, setParents] = useState<string[]>([]);
+  const parents = selectedParentIds;
   const [config, setConfig] = useState<BrainConfig>(() => ({ ...DEFAULT_CONFIG, name: "Merged instance", idleCognition: false }));
   const [json, setJson] = useState(() => serial({ ...DEFAULT_CONFIG, name: "Merged instance", idleCognition: false }));
   const [tier, setTier] = useState<HardwareTier>("personal");
@@ -85,12 +92,27 @@ export function FullMergePanel({ summaries, api, onPublished, onOpen, initialOpe
   const [creating, setCreating] = useState(false);
   const [loadingSettings, setLoadingSettings] = useState(false);
   const [commands, setCommands] = useState<Set<string>>(() => new Set());
-  const [reviewed, setReviewed] = useState(false);
+  const [acknowledgedReview, setAcknowledgedReview] = useState("");
   const [error, setError] = useState("");
   const [spillSelection, setSpillSelection] = useState<{ selectionId: string; directories: string[] }>();
   const alive = useRef(true), submitted = useRef(false), completed = useRef(new Set<string>()), resuming = useRef(new Set<string>());
   const callback = useRef(onPublished); callback.current = onPublished;
   const capable = Boolean(api?.brain.startFullMerge);
+  const selected = librarySelection(summaries, new Set(parents));
+  const selectionError = new Set(parents).size !== parents.length ? "Choose each parent only once."
+    : selected.selected.length !== parents.length ? "A selected parent is no longer available. Select the parents again."
+      : selected.mergeReason;
+  const canMerge = capable && !selectionError;
+  const parentKey = JSON.stringify(parents), currentParents = useRef(parentKey); currentParents.current = parentKey;
+  const reviewContext = useRef({ parentKey, open, api, version: 0 });
+  if (reviewContext.current.parentKey !== parentKey || reviewContext.current.open !== open || reviewContext.current.api !== api) {
+    // Leaving and returning to the same selection must not revive an earlier approval.
+    reviewContext.current = { parentKey, open, api, version: reviewContext.current.version + 1 };
+  }
+  const reviewKey = fullMergeReviewKey({ parentIds: parents, config, settingsText: json, hardwareTier: tier,
+    permissions, spillSelectionId: spillSelection?.selectionId, contextVersion: reviewContext.current.version });
+  const reviewed = canMerge && acknowledgedReview === reviewKey;
+  const setReviewed = (value: boolean): void => setAcknowledgedReview(value ? reviewKey : "");
   const upsert = useCallback((operation: FullMergeProgress): void => {
     if (!alive.current) return;
     setOperations((current) => [operation, ...current.filter((entry) => entry.operationId !== operation.operationId)]);
@@ -117,28 +139,30 @@ export function FullMergePanel({ summaries, api, onPublished, onOpen, initialOpe
   const loadParentSettings = async (): Promise<void> => {
     if (!api || !parents[0] || loadingSettings) return;
     setLoadingSettings(true); setError("");
+    const requestedParents = parentKey, requestedContext = reviewContext.current.version;
     try {
       const brain = await api.brain.get(parents[0]);
-      if (!alive.current) return;
+      if (!alive.current || currentParents.current !== requestedParents || reviewContext.current.version !== requestedContext) return;
       const { nativeArchitecture, deviceResources: _grants, ...base } = brain.config;
       setTier(nativeArchitecture?.hardwareTier ?? "personal"); setSpillSelection(undefined);
       update({ ...DEFAULT_CONFIG, ...base, name: config.name, idleCognition: false });
       // Labels may be imported; authority always starts Off for this new identity.
       setPermissions((current) => ({ ...Object.fromEntries((brain.toolPermissions ?? []).map((entry) => [entry.toolId, "off" as const])), ...current }));
-    } catch (reason) { if (alive.current) setError(reason instanceof Error ? reason.message : "Parent settings could not be loaded."); }
+    } catch (reason) { if (alive.current && reviewContext.current.version === requestedContext) setError(reason instanceof Error ? reason.message : "Parent settings could not be loaded."); }
     finally { if (alive.current) setLoadingSettings(false); }
   };
   const chooseDrives = async (): Promise<void> => {
     if (!api) return;
+    const requestedParents = parentKey, requestedContext = reviewContext.current.version;
     try {
       const chosen = await api.catalog.selectSpillPools();
-      if (!chosen || !alive.current) return;
+      if (!chosen || !alive.current || currentParents.current !== requestedParents || reviewContext.current.version !== requestedContext) return;
       setSpillSelection(chosen);
       update({ ...config, deviceResources: { ...(config.deviceResources ?? DEFAULT_DEVICE_RESOURCE_SETTINGS), storageDirectories: chosen.directories } });
-    } catch (reason) { if (alive.current) setError(reason instanceof Error ? reason.message : "Drive selection failed."); }
+    } catch (reason) { if (alive.current && reviewContext.current.version === requestedContext) setError(reason instanceof Error ? reason.message : "Drive selection failed."); }
   };
   const start = async (event: React.FormEvent): Promise<void> => {
-    event.preventDefault(); if (!api || submitted.current || parents.length < 2 || !reviewed) return;
+    event.preventDefault(); if (!api || submitted.current || !canMerge || !reviewed) return;
     setError("");
     let operationId: string | undefined;
     try {
@@ -150,7 +174,7 @@ export function FullMergePanel({ summaries, api, onPublished, onOpen, initialOpe
           toolPermissions: Object.entries(permissions).map(([toolId, level]) => ({ toolId, level })) },
         ...(spillSelection ? { spillPoolSelectionId: spillSelection.selectionId } : {}) };
       operationId = request.operationId;
-      submitted.current = true; setCreating(true); setExpanded(false);
+      submitted.current = true; setCreating(true); onClose?.();
       upsert(await api.brain.startFullMerge(request)); if (alive.current) setReviewed(false);
     } catch (reason) {
       const receipt = operationId ? await api.brain.fullMergeStatus(operationId).catch(() => undefined) : undefined;
@@ -172,21 +196,24 @@ export function FullMergePanel({ summaries, api, onPublished, onOpen, initialOpe
     }
     finally { resuming.current.delete(id); if (alive.current) setCommands((current) => { const next = new Set(current); next.delete(id); return next; }); }
   };
+  if (!open && !operations.length && !creating && !error) return null;
   return <section className="full-merge-panel surface" aria-labelledby="full-merge-heading">
-    <div className="full-merge-panel__heading"><div><h2 id="full-merge-heading">Merge native instances</h2><p>Create one connected instance from two or more parents. Originals stay in your library.</p></div>
-      <button type="button" className="button" aria-expanded={expanded} disabled={!capable || creating || summaries.length < 2} onClick={() => setExpanded((value) => !value)}>{expanded ? "Close review" : "Review a new merge"}</button>
+    <div className="full-merge-panel__heading"><div><h2 id="full-merge-heading">{open ? "Merge selected brains" : "Merge activity"}</h2>
+      {open ? <p>Create a new connected brain. Every selected parent stays in your library.</p> : null}</div>
+      {open && onClose ? <button type="button" className="button" onClick={() => { setReviewed(false); onClose(); }}>Cancel</button> : null}
     </div>
-    {!capable ? <p className="full-merge-muted">Full merging requires the desktop native runtime.</p> : summaries.length < 2 ? <p className="full-merge-muted">Select this after at least two native instances are available.</p> : null}
-    {expanded ? <form onSubmit={(event) => void start(event)}>
-      <fieldset disabled={creating || loadingSettings}><legend>Parent instances</legend><div className="full-merge-parent-list">
-        {summaries.map((brain) => <label key={brain.id}><input type="checkbox" checked={parents.includes(brain.id)} onChange={(event) => { setParents((current) => event.target.checked ? [...current, brain.id] : current.filter((id) => id !== brain.id)); setReviewed(false); }} /><span>{brain.name}</span></label>)}
-      </div><p>{parents.length} selected · at least two required</p>
+    {!capable ? <p className="full-merge-muted">Full merging requires the desktop native runtime.</p> : open && selectionError ? <p className="full-merge-error" role="alert">{selectionError}</p> : null}
+    {open && !creating ? <form onSubmit={(event) => void start(event)}>
+      <fieldset disabled={!canMerge || loadingSettings}><legend>Selected parents</legend><ul className="full-merge-selected-parents">
+        {selected.selected.map(brain => <li key={brain.id}>{brain.name}</li>)}
+      </ul>
         <button type="button" className="button" disabled={!parents[0] || loadingSettings} onClick={() => void loadParentSettings()}>{loadingSettings ? "Reading settings…" : "Use first selected parent's settings"}</button>
       </fieldset>
-      <fieldset disabled={creating || loadingSettings}><legend>New instance settings</legend><div className="full-merge-fields">
+      <fieldset disabled={!canMerge || loadingSettings}><legend>New brain settings</legend><div className="full-merge-fields">
         <label>Name<input required maxLength={120} value={config.name} onChange={(event) => update({ ...config, name: event.target.value })} /></label>
-        <label>Hardware policy<select value={tier} onChange={(event) => { setTier(event.target.value as HardwareTier); setReviewed(false); }}>{["micro", "personal", "gpu", "workstation"].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
         <label className="full-merge-wide">Description<textarea rows={2} value={config.description} onChange={(event) => update({ ...config, description: event.target.value })} /></label>
+      </div><details className="full-merge-advanced"><summary>Memory and storage settings</summary><div className="full-merge-fields">
+        <label>Hardware policy<select value={tier} onChange={(event) => { setTier(event.target.value as HardwareTier); setReviewed(false); }}>{["micro", "personal", "gpu", "workstation"].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
         <label>Context tokens<input type="number" min={8} step={1} value={config.contextWindowTokens} onChange={(event) => update({ ...config, contextWindowTokens: Number(event.target.value) })} /></label>
         <label>Working patterns<input type="number" min={1} step={1} value={config.workingMemorySlots} onChange={(event) => update({ ...config, workingMemorySlots: Number(event.target.value), memoryResidentItems: Math.min(config.memoryResidentItems, Number(event.target.value)) })} /></label>
         <label>Resident working patterns<input type="number" min={1} max={config.workingMemorySlots} step={1} value={config.memoryResidentItems} onChange={(event) => update({ ...config, memoryResidentItems: Number(event.target.value) })} /></label>
@@ -196,25 +223,24 @@ export function FullMergePanel({ summaries, api, onPublished, onOpen, initialOpe
         <label>Storage pool<select value={config.storagePoolMode} onChange={(event) => update({ ...config, storagePoolMode: event.target.value as BrainConfig["storagePoolMode"], storagePoolBytes: event.target.value === "manual" ? Math.max(1024 ** 3, config.storagePoolBytes) : config.storagePoolBytes })}><option value="auto">Auto</option><option value="manual">Manual</option></select></label>
         {config.storagePoolMode === "manual" ? <label>Storage reservation (GiB)<input type="number" min={0.01} step="any" value={config.storagePoolBytes / 1024 ** 3} onChange={(event) => update({ ...config, storagePoolBytes: Math.round(Number(event.target.value) * 1024 ** 3) })} /></label> : null}
         <label><input type="checkbox" checked={config.onlineLearning} onChange={(event) => update({ ...config, onlineLearning: event.target.checked })} /> Background parameter learning</label>
-        <label><input type="checkbox" checked={config.recursiveImprovement} onChange={(event) => update({ ...config, recursiveImprovement: event.target.checked })} /> Recursive improvement</label>
-        <label><input type="checkbox" checked={config.bestWorkEnabled === true} onChange={(event) => update({ ...config, bestWorkEnabled: event.target.checked })} /> Best Work inference</label>
-        <label>Maximum extra candidates<input type="number" min={1} max={16} value={config.bestWorkExplorationBranches ?? 16} onChange={(event) => update({ ...config, bestWorkExplorationBranches: Number(event.target.value) })} /></label>
       </div>
-      <p className="full-merge-muted">Native geometry comes from the parents. Stored parent windows must fit the reviewed capacity; actual native allocation is checked before publication. Active mode starts separately after loading.</p>
+      <p className="full-merge-muted">Parent architecture and saved windows are preserved. Capacity and exact parent checkpoints are validated before publication. Active mode starts separately after loading.</p>
       <button type="button" className="button" onClick={() => void chooseDrives()}>Choose destination spill drives…</button>
-      {spillSelection ? <p>{spillSelection.directories.join(" · ")}</p> : <p className="full-merge-muted">No external drive authority inherited.</p>}
-      <details><summary>All settings — complete JSON review</summary><p>Includes learning rate, history retention, trace detail, placement and stored performance settings. Changing future retention does not remove any parent's saved data.</p>
+      {spillSelection ? <p>{spillSelection.directories.join(" · ")}</p> : null}
+      </details><details><summary>Complete settings</summary><p>Changing future retention does not remove any parent's saved data.</p>
         <label>Destination configuration<textarea className="full-merge-json" spellCheck={false} rows={14} value={json} onChange={(event) => { setJson(event.target.value); setReviewed(false); }} /></label>
         <button type="button" className="button" onClick={() => { try { update(reviewedMergeConfig(JSON.parse(json))); } catch (reason) { setError(reason instanceof Error ? reason.message : "Invalid settings JSON."); } }}>Apply edited JSON</button>
       </details></fieldset>
-      <fieldset disabled={creating}><legend>Destination access policy</legend><p>MCP and credentials start disconnected. Each tool below defaults to Off; existing parent grants and approval receipts are not inherited.</p>
+      <fieldset disabled={!canMerge}><legend>Access for the new brain</legend><p>Tools start Off. MCP and credentials stay disconnected; parent grants and approvals are not inherited.</p>
+        <details><summary>Choose tool access</summary>
         <div className="full-merge-fields">{Object.entries(permissions).map(([id, level]) => <label key={id}>{TOOLS.find(([tool]) => tool === id)?.[1] ?? id}<select aria-label={TOOLS.find(([tool]) => tool === id)?.[1] ?? id} value={level} onChange={(event) => { setPermissions((current) => ({ ...current, [id]: event.target.value as ToolPermissionLevel })); setReviewed(false); }}><option value="off">Off</option><option value="ask">Ask every time</option><option value="auto">Automatic policy</option><option value="full">Full access</option></select></label>)}</div>
+        </details>
       </fieldset>
-      <label className="full-merge-review"><input type="checkbox" checked={reviewed} onChange={(event) => setReviewed(event.target.checked)} /> I reviewed the new instance's settings and access policy. The selected parents will be preserved.</label>
-      <button type="submit" className="button button--primary" disabled={creating || parents.length < 2 || !reviewed || json !== serial(config)}>Create merged instance</button>
+      <label className="full-merge-review"><input type="checkbox" required checked={reviewed} disabled={!canMerge || loadingSettings} onChange={(event) => setReviewed(event.target.checked)} /> I confirm these settings and access choices. The selected parents will be preserved.</label>
+      <button type="submit" className="button button--primary" disabled={!canMerge || loadingSettings || !reviewed || json !== serial(config)}>Create merged brain</button>
     </form> : null}
     {creating ? <p role="status">Merge running. Progress and safe-boundary controls are below; you can continue using the library.</p> : null}
     {error ? <p className="full-merge-error" role="alert">{error}</p> : null}
-    <div className="full-merge-receipts">{operations.map((operation) => <FullMergeReceipt key={operation.operationId} operation={operation} pending={commands.has(operation.operationId)} onCommand={(id, action) => void command(id, action)} onOpen={onOpen} />)}</div>
+    {operations.length ? <div className="full-merge-receipts">{operations.map((operation) => <FullMergeReceipt key={operation.operationId} operation={operation} pending={!capable || commands.has(operation.operationId)} onCommand={(id, action) => void command(id, action)} onOpen={onOpen} />)}</div> : null}
   </section>;
 }

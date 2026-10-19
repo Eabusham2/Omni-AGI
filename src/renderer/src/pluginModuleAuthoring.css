@@ -1,0 +1,17 @@
+.plugin-module-authoring{display:grid;gap:14px;min-width:0;padding-top:12px}
+.plugin-module-authoring__identity{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(90px,.6fr);gap:12px}
+.plugin-module-authoring label,.plugin-manager .plugin-module-authoring label{display:grid;align-items:start;gap:6px;min-width:0}
+.plugin-module-authoring input:not([type=checkbox]){box-sizing:border-box;width:100%;min-width:0;padding:9px 10px;border:1px solid var(--border);border-radius:8px;color:var(--text);background:var(--canvas);font:inherit}
+.plugin-module-authoring textarea,.plugin-manager__maker .plugin-module-authoring textarea{box-sizing:border-box;display:block;width:100%;min-height:220px;margin:0;padding:12px;resize:vertical;color:var(--text);background:var(--canvas);border:1px solid var(--border);border-radius:8px;font:12px/1.6 ui-monospace,monospace;tab-size:2}
+.plugin-module-authoring details>*:not(summary){margin-top:10px}
+.plugin-module-authoring__starters,.plugin-module-authoring__tabs,.plugin-module-authoring__heading,.plugin-module-authoring__kinds{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-width:0}
+.plugin-module-authoring__heading>label{flex:1;min-width:min(180px,100%)}
+.plugin-module-authoring__tabs .button[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent);color:var(--text)}
+.plugin-module-authoring__module{display:grid;gap:12px;min-width:0}
+.plugin-manager .plugin-module-authoring .plugin-module-authoring__check,.plugin-manager .plugin-module-authoring__kinds label{display:flex;flex-direction:row;align-items:center}
+.plugin-module-authoring__kinds input,.plugin-module-authoring__check input{margin:0;flex-shrink:0}
+.plugin-module-authoring dl{display:grid;grid-template-columns:minmax(100px,.3fr) minmax(0,1fr);gap:10px}
+.plugin-module-authoring dd{margin:0;overflow-wrap:anywhere;line-height:1.6}
+.plugin-manager .plugin-module-authoring code{display:inline;font-size:inherit;color:inherit}
+@media(max-width:700px){.plugin-module-authoring__identity{grid-template-columns:minmax(0,1fr)}.plugin-module-authoring dl{grid-template-columns:minmax(0,1fr)}.plugin-module-authoring dt{font-weight:600}.plugin-module-authoring__heading{align-items:stretch}}
+@container(max-width:600px){.plugin-module-authoring__identity{grid-template-columns:minmax(0,1fr)}.plugin-module-authoring dl{grid-template-columns:minmax(0,1fr)}}

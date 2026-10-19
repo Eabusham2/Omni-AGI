@@ -1,5 +1,50 @@
 # Current implementation continuation
 
+### Latest authority — Verbatim 2 integration, October18/19
+
+The newer exact request is appended to PLAN.md and REQUEST_VERBATIM.md.
+It supersedes the old standalone-page layout below. PRIMARY source now has
+Conversation, Training & Evolution, Brain Map, Tools & permissions and Settings.
+Home owns selected-brain duplicate/export/delete/merge; chat owns Attach/Learn,
+Best Work and Active mode. Removed page components do not delete their retained
+host/chat capabilities, evidence, artifacts or permissions. Source improvement
+remains permission-checked; intrinsic learning availability is not Full Authority.
+
+All five product implementation lanes are finished and frozen in PRIMARY.
+Folder attachment is one streamed immutable container, not automatic learning.
+Focused checks cover complete traversal, cancellation, changed-source rejection,
+saved member reads after source deletion, and warm/imported reviewed-file policy.
+The real full-merge workspace revealed that SQLite attachment blobs must be
+copied as sealed CAS bytes, not VACUUM-rewritten; the exact hash remains checked.
+Source-level checks are not learned recall or a new model qualification.
+
+Web/Node types pass for the integration. Root corrected stale tests for the
+removed pages, moved picker SSR to a TSX test, and stabilized parent callbacks
+so ordinary output/notice changes do not reset dataset progress subscriptions.
+The new full384 appearance matrix still must run against the final frozen
+source. Historical cohorts below remain incomplete and cannot close that gate.
+The separate user-owned preview is unmonitored and must not be automated,
+inspected, closed or restarted. No brain creation, Load, training or quiz.
+
+Main2188cda Windows run39193022117 failed in both architectures before worker
+build/probe/health: a source test accidentally included the new separate cleanup
+helper in a diagnostic-only slice. That assertion is corrected and its affected
+case passes; stdlib probe and real worker health remain remotely unqualified.
+GitHub/release work remains open, not complete. The next source commit needs
+its own required green jobs and package provenance. Do not rerun successful
+unchanged evidence or begin deferred full-folder training.
+
+The composed shell build exits0. Current no-engine chat draft/navigation,
+offline Record and compiled inline-media checks pass as separate affected
+runs. Original attempts are preserved: the first launch failed on local
+EADDRNOTAVAIL; a controlled explicit loopback bind restores the inspector
+handshake without changing OS/network settings. The HTTP fixture also exposed
+a missing Vite alias and browser loopback failure. Its owned compiled-file
+replacement passes with no security-disabling flags. These are renderer
+contracts, not engine or learned-media quality evidence. Documentation pack24
+now binds the eight current public manuals; the original six passing cases
+and corrected affected portable/plugin cases are recorded separately.
+
 ### First frozen full-matrix cohort stopped for a precise compact fix
 
 The first three-preview cohort is preserved under

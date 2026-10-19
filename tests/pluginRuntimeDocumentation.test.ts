@@ -11,9 +11,9 @@ const normalize = (text: string) => `${text.replace(/\r\n?/g, "\n").trim()}\n`;
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object"
   ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, child]) => [key, canonical(child)])) : value;
 
-it("includes the current plugin runtime/theme/parser contracts as exact pack23 ordinary public sources, not executed outcomes", () => {
+it("includes the current plugin runtime/theme/parser contracts as exact pack24 ordinary public sources, not executed outcomes", () => {
   const pack = declaredDocumentationCurriculumPack();
-  expect(pack).toMatchObject({ version: 23, id: "omni-v2-user-documentation-23", ordinaryNeuralLearning: true,
+  expect(pack).toMatchObject({ version: 24, id: "omni-v2-user-documentation-24", ordinaryNeuralLearning: true,
     hiddenPrompt: false, behavioralPersona: false, preferenceLabels: false, rewardModel: false, executedHostActions: false });
   expect(pack.records.map(record => record.id)).toEqual(["user-guide", "integrations", "plugins", "html-artifacts", "executable-training-parsers", "managed-environments", "clipboard", "api-teacher-model-discovery"]);
   const { records, sha256, ...declaration } = pack;
@@ -30,10 +30,12 @@ it("includes the current plugin runtime/theme/parser contracts as exact pack23 o
     expect(sdk).toContain(text);
   const section = sdk.slice(sdk.indexOf("## Feature-runtime modules")), jsonExample = section.match(/```json\n([\s\S]*?)\n```/)?.[1];
   expect(jsonExample).toBeDefined();
-  expect(normalizePluginRuntimeModule(JSON.parse(jsonExample!))).toMatchObject({ id: "text-helper", events: ["brain.lifecycle"], dynamicTools: false, ui: { kinds: ["panel"], slots: ["run.sidebar"] } });
-  for (const text of ["Feature runtime", "Activate", "Clear plugin theme", "Parser for the next file or folder", "MIME-only", "known built-in format", "Use reviewed source", "trained natural tool use"])
-    expect(guide).toContain(text);
-  for (const text of ["Pack version 23", "window.omni.pluginRuntime", "readHistoryEvent", "readSourceStateBytes", "selectSourceState", "Outer Full cannot bypass nested Off/Ask", "no implicit brain Load", "not real packaged renderer"])
+  expect(normalizePluginRuntimeModule(JSON.parse(jsonExample!))).toMatchObject({ id: "text-helper", events: ["brain.lifecycle"], dynamicTools: false, ui: { kinds: ["panel"], slots: ["chat.after"] } });
+  expect(sdk).toContain("Current mounted slots are `chat.toolbar`, `chat.before`, `chat.after` and `tools`");
+  for (const text of ["Feature runtime", "Activate", "Clear plugin theme", "detects built-in formats automatically", "MIME-only", "reviewed parser", "Use reviewed source", "trained natural tool use"])
+    expect(guide.includes(text), `Current manual must document ${text}`).toBe(true);
+  expect(guide).not.toContain("Parser for the next file or folder");
+  for (const text of ["Pack version 24", "window.omni.pluginRuntime", "readHistoryEvent", "readSourceStateBytes", "selectSourceState", "Outer Full cannot bypass nested Off/Ask", "no implicit brain Load", "not real packaged renderer"])
     expect(integrations).toContain(text);
   expect(sdk).not.toContain("arbitrary JavaScript/native transforms, runtime hooks, and direct main-process\naccess remain unsupported");
   expect(guide).not.toContain("Media-type selectors remain inspectable but are not yet routed");

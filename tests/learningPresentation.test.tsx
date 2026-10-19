@@ -1,4 +1,5 @@
 import React from "react";
+import { readFile } from "node:fs/promises";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { LearningTask } from "../src/shared/learning";
@@ -49,18 +50,32 @@ describe("learning workspace presentation", () => {
     expect(learningTaskStatus(task({ state: "complete" }))).toBe("Awaiting final coverage receipt");
     expect(learningSourcePercent(task({ state: "complete", traversalComplete: true, progress: 1 }))).toBe("100%");
   });
-  it("keeps the queue-aware learning and Fact Check surfaces available during a real foreground turn", () => {
+  it("keeps the queue-aware training surface available during a real foreground turn", () => {
     const active = { ...EMPTY_CHAT_WORKSPACE_ACTIVITY, turnActive: true, phase: "responding" as const };
-    expect(workspaceViewWaitsForForegroundTurn("learn", active)).toBe(false);
-    expect(workspaceViewWaitsForForegroundTurn("fact-check", active)).toBe(false);
+    expect(workspaceViewWaitsForForegroundTurn("data", active)).toBe(false);
   });
   it("shows actual source controls and a truthful disconnected preview, without fabricated jobs", () => {
-    const html = renderToStaticMarkup(<LearningWorkspace brainId="brain" mode="specific-learn" />);
-    expect(html).toContain("Add files"); expect(html).toContain("Add folder"); expect(html).toContain("Web sources");
+    const html = renderToStaticMarkup(<LearningWorkspace brainId="brain" />);
+    expect(html).toContain('aria-label="Add source"'); expect(html).toContain("Files &amp; media"); expect(html).toContain("Folder"); expect(html).toContain("Web sources");
     expect(html).toContain("Web scope and dates"); expect(html).toContain("No tasks yet");
     expect(html).toContain("available in the desktop app"); expect(html).not.toContain("100%");
-    const facts = renderToStaticMarkup(<LearningWorkspace brainId="brain" mode="fact-check" />);
-    expect(facts).toContain("Claims · one per line"); expect(facts).toContain("Start checking"); expect(facts).not.toContain("Add folder");
-    expect(facts).not.toContain("all knowledge verified");
+    expect(html).not.toContain("Claims · one per line"); expect(html).not.toContain("Start checking");
+    expect(html).not.toContain("all knowledge verified");
+  });
+  it("removes the standalone Fact Check route while retaining native chat tools and saved result inspection", async () => {
+    const app = await readFile("src/renderer/src/App.tsx", "utf8");
+    const navigation = app.slice(app.indexOf("const navItems:"), app.indexOf("const buildToolProtocolIds:"));
+    expect(navigation).not.toContain('"fact-check"');
+    expect(app).not.toContain('view === "fact-check"');
+    expect(app).toContain('navItems.some(item => item.id === workspaceView) ? workspaceView : "chat"');
+    const workspace = await readFile("src/renderer/src/LearningWorkspace.tsx", "utf8");
+    expect(workspace).not.toContain("api.startFactCheck(");
+    expect(workspace).toContain('task?.kind !== "fact-check"');
+    expect(workspace).toContain("api.factCheck(brainId, taskId)");
+    expect(workspace).toContain("<ClaimReview");
+    expect(workspace).not.toContain("value.kind === mode");
+    const catalog = JSON.parse(await readFile("tools/catalog.json", "utf8")) as { tools: Array<{ id: string; actions: Record<string, unknown> }> };
+    expect(catalog.tools.find(tool => tool.id === "data.fact-check")?.actions).toBeDefined();
+    expect(await readFile("src/preload/index.ts", "utf8")).toContain("startFactCheck: request => invoke(IPC.learning.startFactCheck, request)");
   });
 });

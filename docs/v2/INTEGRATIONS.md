@@ -9,6 +9,12 @@ This document describes interfaces present in current source. Source and
 focused tests are not universal service interoperability, trained competence,
 all-platform packaging, or release evidence.
 
+The current primary routes are **Conversation**, **Training & Evolution**,
+**Brain map**, **Tools & permissions** and **Settings**. Home owns brain
+selection/import/export/duplicate/merge management. Clock, schedules, operational
+history, fact checking and imagination keep their existing chat/tool/API paths;
+they are not separate primary pages. A UI destination is not an execution grant.
+
 ## Desktop bridge
 
 The authoritative public types are in `src/shared/types.ts` and the focused
@@ -57,7 +63,7 @@ display label or permission token.
 [`managed-environments.md`](managed-environments.md),
 [`clipboard.md`](clipboard.md), and
 [`api-teacher-model-discovery.md`](api-teacher-model-discovery.md) as raw build
-inputs. Pack version 23
+inputs. Pack version 24
 declares a separate ordinary-document corpus
 containing record names, paths, bytes, content hashes, provenance URLs,
 license, and a canonical pack hash.
@@ -98,6 +104,11 @@ research anchors are in
 
 `window.omni.portable` exposes the typed `PortableWorkspaceApi` from
 `src/shared/portableWorkspace.ts`:
+
+This retained API/packaging contract is not a separate current navigation panel.
+Home's brain-export menu creates `.omni` archives/local references, not a Windows
+application folder. Portable Windows delivery remains a distinct requirement
+whose current packaged behavior must be verified separately.
 
 ```ts
 create({ brainId, requestId, presentation })
@@ -231,7 +242,7 @@ policy hashes. Activation consumes that review; use Status after an uncertain
 acknowledgment rather than automatically activating again.
 
 `DeviceResourceSettings.regionalExecution` stores versioned manual preferences,
-not a live grant. In **Device & runtime**, **Prepare routes** exposes descriptors
+not a live grant. In the advanced resource controls in **Settings**, **Prepare routes** exposes descriptors
 for drafting multiple saved routes. Apply them with **Save memory & storage**,
 then obtain a fresh **Prepare routes** review and explicitly **Activate reviewed
 routes**. A descriptor page can remain visible after editing while its old
@@ -315,7 +326,22 @@ content path for verified sensory/tool reads, never an arbitrary renderer path.
 Queued receipts retain IDs but do not bind them until their awaited pending-send
 boundary, so queue removal cannot race a hidden consume/rebind.
 
-`task.attachments` has `list` and paged `read`. Its Auto default is limited to
+`stage` accepts the existing file/media selections and a native folder selection.
+A folder is sealed into one immutable main-owned container with its manifest,
+members, source hashes and traversal counts. It is one task attachment, not an
+automatic dataset or neural-learning operation. The original selected directory
+is not reopened by later task reads.
+
+`task.attachments` has `list` and paged
+`read({attachmentId, offset?, maxBytes?, entryPath?})`. Without `entryPath`, a
+folder read pages manifest entries using ordinal offsets, reported as
+`folder.cursorUnit: "entries"`. With an explicit safe relative `entryPath`, it
+reads that exact saved member in byte pages and returns `cursorUnit: "bytes"`
+with member hash/MIME metadata. `entryPath` is not a host pathname or a new grant;
+passing it for a non-folder attachment is refused. The container/member/owner
+checks and current-turn or exact reviewed-saved-copy fences still apply.
+
+Its Auto default is limited to
 the exact brain/turn binding; Off still wins, and a manual Tools-console call
 without the trusted chat-turn context fails. Staging itself never calls the
 dataset learner. Ordinary visible tool-result learning remains unchanged.
@@ -449,6 +475,11 @@ portability, decoder/platform limitations and exact scoped test evidence.
 
 ## Learn and Fact Check API
 
+Fact Check remains a native chat/tool capability, not a standalone navigation
+page. Saved fact-check tasks and their evidence/review controls remain available
+through the unified Training & Evolution task list; pending fact-check questions appear in
+Conversation. Removing the page does not remove this API or grant tool access.
+
 `src/shared/learning.ts` defines `LearningApi`:
 
 ```ts
@@ -484,6 +515,26 @@ interface LearningApi {
 A generated path is never a filesystem grant. Tasks, claims, sources, native
 turns, policy revisions, and evidence are bound to one instance. Reusing a
 request ID with different content fails rather than overwriting the saved task.
+
+The unified source-and-goal form is `LearningWorkspace` embedded in
+`DataWorkspace`; its same instructions draft supplies the adjacent
+`EvolutionWorkspace` objective. Real source tasks, runtime job events, dataset
+coverage, resume cursors and candidate results remain distinct receipts, not
+duplicate input forms. Visible source/resource ledgers and the next-file parser
+picker are removed; their storage/accounting/provenance APIs remain.
+
+`SpecificLearnRequest.quarantine?: boolean` is an optional web-source default;
+an individual web input may supply its own boolean `quarantine`. Omission keeps
+Specific Learn's existing direct-learning default. This is exposed as an
+optional boolean on `data.learn.start` under its unchanged Ask permission and
+the existing private typed-action schema. Strict host validation rejects a
+non-boolean flag or applying the request option to a request without any web input.
+The normalized flag is stored in the source specification and request hash, so
+changing it is not an idempotent retry. It reaches the existing `crawlWeb` path,
+not a second crawler. That direct crawler keeps its own quarantine-default-true
+contract. Pause/restart/resume retain the same source/crawl identity, scope and
+resource/permission checks. Quarantined traversal records `quarantined: true`
+and never serves as a new neural-learning receipt or an unlearning operation.
 
 ### Web scope and evidence
 
@@ -542,6 +593,14 @@ plan. This API covers declared native sparse assemblies/contacts, not a whole
 cortex, identity merge, or arbitrary tensor editor.
 
 ## Native improvement candidate tools
+
+Loaded-brain adaptive learning/improvement availability is normalized on; it is
+not a manual recursive-score or reassessment switch. This does not run an
+Unloaded owner or grant source access. The host still reads the current
+`source.self-modify` policy, exact approvals and immutable evaluation,
+regression/retention/resource checks before promotion. Its typed action paths
+remain available to permitted chat requests; the ordinary UI hides the obsolete
+tool/recipe controls rather than removing those boundaries.
 
 `source.self-modify.propose` routes `candidateKind: source` to the existing Git
 workflow. Explicit `neural`, `data`, `substrate`, or `architecture` kinds enter
@@ -1137,6 +1196,14 @@ dedicated scheme and actual main-owned security helpers. That is not full
 manager interaction, theme/accessibility, package, tool, model, network, or
 cross-platform acceptance.
 
+The existing manager's `PluginModuleAuthoring` edits package drafts with
+executable Feature & menu, App styling, Custom tool and Training format starters.
+JavaScript/CSS, module metadata and advanced declarations round-trip through
+complete package JSON. Save reuses `installPackage` or immutable `edit`; it adds
+no new execution IPC and performs no code evaluation. Explicit exact-version
+access/activation remains required. The draft editor is not an unrestricted
+Node/main-process editor or a permission bypass.
+
 Custom-format aliases are bound into the immutable dataset manifest and reuse
 the existing exhaustive parser/cursor over the original source bytes. A live
 catalog/access revision aborts the cooperative request and leaves the
@@ -1148,8 +1215,9 @@ already loaded enabled instance; only an exact returned neural source receipt
 marks it complete. The queue row is atomic with executable access/global Enable
 and restart reconciliation repairs installations from older builds.
 
-**Data → Parser for the next file or folder** exposes Automatic or an exact
-reviewed `{pluginId, contentSha256, formatId}`. Automatic preserves built-in
+Training & Evolution uses automatic detection without a next-file parser picker.
+The underlying typed parser selection can still name exact reviewed
+`{pluginId, contentSha256, formatId}` when required. Automatic preserves built-in
 detection and unique custom-extension routing. MIME-only declarations and
 known built-in overrides need an explicit choice and a matching extension or
 observed MIME; an HTTP header is evidence, not permission to execute a parser.
@@ -1182,7 +1250,7 @@ Deactivation is best-effort, not a durable final-write guarantee. Currently
 published `brain.lifecycle` and `chat.action` topics contain observed metadata,
 not private thought or ambient chat/file access. UI callbacks use `ui:<event>`.
 Styles, menus, buttons and inert panels are limited to their reviewed kinds
-and current mounted `studio`, `run.sidebar` or `run.toolbar` slots.
+and current mounted `chat.toolbar`, `chat.before`, `chat.after` or `tools` slots.
 
 Dynamic registrations have per-action JSON schemas and local handlers. The
 host gives each one a source-bound `extension.<sha256>` ID; missing policy

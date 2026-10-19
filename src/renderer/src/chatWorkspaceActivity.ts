@@ -120,7 +120,6 @@ export type BusyAwareWorkspaceView =
   | "chat"
   | "data"
   | "learn"
-  | "fact-check"
   | "schedule"
   | "map"
   | "trace"

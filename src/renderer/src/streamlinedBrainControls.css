@@ -1,0 +1,128 @@
+.chat-call-toolbar {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chat-work-preferences {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px 14px;
+  min-width: 0;
+  margin-inline-end: auto;
+  color: var(--text);
+}
+
+.chat-work-preferences label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-work-preferences input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--teal);
+}
+
+.chat-work-preferences label:has(input:disabled) {
+  color: var(--text-2);
+  cursor: not-allowed;
+}
+
+.chat-preference-status {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0 14px 6px;
+  color: var(--text-2);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.chat-activity-details {
+  padding: 12px 16px;
+  color: var(--text);
+}
+
+.chat-activity-details summary,
+.brain-settings-disclosure > summary {
+  padding-block: 5px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.chat-activity-details ol {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0 0;
+  padding-inline-start: 20px;
+}
+
+.chat-activity-details li > :is(strong, span, small) {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.chat-activity-details li > :is(span, small) {
+  margin-block-start: 4px;
+  color: var(--text-2);
+}
+
+.resource-settings-page .resource-settings-layout {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 1040px;
+}
+
+.resource-settings-page .resource-settings-sidebar {
+  min-width: 0;
+}
+
+.brain-settings-disclosure {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+
+.brain-settings-disclosure[open] > summary {
+  margin-block-end: 14px;
+}
+
+.brain-settings-disclosure > summary:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.resource-settings-page :is(button, input, select):disabled,
+.simple-builder :is(button, input, select):disabled {
+  opacity: 1;
+  color: var(--text-2);
+  -webkit-text-fill-color: var(--text-2);
+  cursor: not-allowed;
+}
+
+.resource-settings-page .resource-settings-mode-picker button:hover:not(:disabled),
+.resource-settings-page .resource-settings-mode-picker button:focus-visible {
+  color: var(--text);
+  background: var(--surface-solid);
+  border-color: var(--teal);
+}
+
+.resource-settings-page .resource-settings-mode-picker button:hover:not(:disabled) :is(strong, small) {
+  color: inherit;
+}
+
+@media (max-width: 520px) {
+  .chat-call-toolbar { padding-inline: 10px; }
+  .chat-work-preferences { flex-basis: 100%; }
+  .resource-settings-page .resource-settings-mode-picker--three { grid-template-columns: minmax(0, 1fr); }
+}

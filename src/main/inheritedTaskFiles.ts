@@ -11,6 +11,7 @@ import { InheritedTaskFileReviewStore, inheritedTaskReviewFingerprint } from "./
 import { assertInheritedTaskFileGuards, inheritedTaskFileClosure, inheritedTaskFileHash, inheritedTaskManagedFilePath,
   type InheritedTaskFileClosure, type InheritedTaskFileNativeContext, type InheritedTaskFilePrivate } from "./inheritedTaskFileClosure";
 import { sqliteFilename } from "./sqliteFilename";
+import { readTaskFolderAttachment, TASK_FOLDER_MIME } from "./taskFolderContainer";
 
 export class InheritedTaskFileAdoptionRequired extends Error {
   readonly code = "INHERITED_TASK_FILE_ADOPTION_REQUIRED";
@@ -197,12 +198,24 @@ export class InheritedTaskFiles {
     return { ...message, taskAttachmentIds, ...(message.inputReceipt ? { inputReceipt: { ...message.inputReceipt, taskAttachmentIds } } : {}) };
   }
 
-  async read(brainId: string, turnId: string, attachmentId: string, offset = 0, maxBytes = 64 * 1024, signal?: AbortSignal): Promise<InheritedTaskFileReadResult> {
+  async read(brainId: string, turnId: string, attachmentId: string, offset = 0, maxBytes = 64 * 1024, signal?: AbortSignal, entryPath?: string): Promise<InheritedTaskFileReadResult> {
     const lease = this.leases.get(key(brainId, turnId)), file = lease?.closure.files.find(file => file.row.id === attachmentId);
     if (!lease || !file) throw new Error("This retired file is not disclosed and adopted for the actual current inherited task.");
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > file.row.bytes || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024) throw new Error("Inherited task file page range is invalid.");
     await this.recheck(lease, file, signal);
     const root = this.options.root(brainId), path = join(root, "attachments", "blobs", `${file.row.content_sha256}.data`);
+    if (file.row.mime_type === TASK_FOLDER_MIME) {
+      this.verifier.reserveMemory(maxBytes * 8 + 4 * 1024 * 1024, "Inherited saved folder page and SQLite cache");
+      const result = await this.verifier.withVerifiedFile({ path, contentSha256: file.row.content_sha256, bytes: file.row.bytes,
+        authorityKey: inheritedTaskFileHash({ brainId, executionId: lease.context.executionId, reviewSha256: lease.receipt.reviewSha256,
+          inputSha256: lease.context.inputSha256, manifestSha256: file.row.manifest_sha256, sourceSha256: file.row.source_sha256 }) },
+      () => this.recheck(lease, file, signal), opened => readTaskFolderAttachment(publicHandle(file.row), path, opened,
+        offset, maxBytes, entryPath, signal), signal);
+      await this.recheck(lease, file, signal);
+      return { ...result, inheritedTask: { executionId: lease.context.executionId, reviewSha256: lease.receipt.reviewSha256,
+        originalBinding: file.disclosure.originalBinding, custody: "retired" } };
+    }
+    if (entryPath !== undefined) throw new Error("Entry paths are available only inside a saved folder attachment.");
     const buffer = await this.verifier.withVerifiedFile({ path, contentSha256: file.row.content_sha256, bytes: file.row.bytes,
       authorityKey: inheritedTaskFileHash({ brainId, executionId: lease.context.executionId, reviewSha256: lease.receipt.reviewSha256,
         inputSha256: lease.context.inputSha256, manifestSha256: file.row.manifest_sha256, sourceSha256: file.row.source_sha256 }) },

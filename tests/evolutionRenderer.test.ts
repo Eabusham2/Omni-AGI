@@ -127,7 +127,7 @@ describe("evolution renderer model", () => {
     expect(canRollbackEvolution("rolled-back")).toBe(false);
   });
 
-  it("wires every existing evolution preload action into the Run surface", () => {
+  it("wires every existing evolution preload action into the unified training surface", () => {
     const root = resolve(import.meta.dirname, "..");
     const app = readFileSync(
       resolve(root, "src/renderer/src/App.tsx"),
@@ -138,7 +138,8 @@ describe("evolution renderer model", () => {
       "utf8"
     );
 
-    expect(app).toContain('"evolution"');
+    expect(app).toContain("Training &amp; Evolution");
+    expect(app).toContain("renderImprovement={objective =>");
     expect(app).toContain("<EvolutionWorkspace");
     expect(workspace).toContain("window.omni.evolution.start");
     expect(workspace).toContain("window.omni.evolution.stop");

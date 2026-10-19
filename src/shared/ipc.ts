@@ -136,6 +136,7 @@ export const IPC = {
     stageAttachments: "omni:chat:stage-attachments",
     stageDroppedAttachments: "omni:chat:stage-dropped-attachments",
     cancelAttachmentStage: "omni:chat:cancel-attachment-stage",
+    attachmentStageProgress: "omni:chat:attachment-stage-progress",
     listAttachments: "omni:chat:list-attachments",
     attachmentsForTurn: "omni:chat:attachments-for-turn",
     attachmentsByIds: "omni:chat:attachments-by-ids",

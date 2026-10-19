@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ChatTaskAttachmentHandle, ChatTaskAttachmentsApi } from "../../shared/taskAttachments";
-import type { ExperienceUploadKind } from "../../shared/uploadSupport";
+import type { ChatTaskAttachmentHandle, ChatTaskAttachmentsApi, ChatTaskAttachmentSelection } from "../../shared/taskAttachments";
 
 export function mergeTaskAttachments(current: ChatTaskAttachmentHandle[], added: ChatTaskAttachmentHandle[]): ChatTaskAttachmentHandle[] {
   const byId = new Map(current.map(value => [value.id, value]));
@@ -31,7 +30,15 @@ export function useTaskAttachmentDraft(brainId: string, api?: ChatTaskAttachment
     };
   }, [api, brainId]);
 
-  const stage = async (selection: ExperienceUploadKind = "files", files?: File[]): Promise<void> => {
+  useEffect(() => api?.onStageProgress?.(event => {
+    const request = operation.current;
+    if (!request || request.brainId !== brainId || event.brainId !== brainId || event.requestId !== request.requestId) return;
+    const files = new Intl.NumberFormat().format(event.traversal.processedFiles);
+    const bytes = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(event.traversal.copiedBytes);
+    setStatus(`${event.phase === "sealing" ? "Securing folder copy" : "Preparing folder"} · ${files} files · ${bytes} bytes`);
+  }), [api, brainId]);
+
+  const stage = async (selection: ChatTaskAttachmentSelection = "files", files?: File[]): Promise<void> => {
     if (!api) { setStatus("Task attachments require the desktop runtime."); return; }
     if (operation.current) return;
     const owner = scope.current;

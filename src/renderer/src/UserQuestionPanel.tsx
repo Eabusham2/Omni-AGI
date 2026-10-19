@@ -26,7 +26,7 @@ export interface UserQuestionPanelProps {
   onResolved?: (question: UserQuestionRecord) => void;
   /** Optional task-local view; the durable question service remains shared. */
   questionIds?: string[];
-  /** Conversation reuses the cards without duplicating Learn/Fact Check trays. */
+  /** Conversation includes fact-check questions; Learn questions stay task-local. */
   presentation?: "task" | "conversation";
 }
 

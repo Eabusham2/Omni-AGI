@@ -94,3 +94,62 @@ to original host paths, unrelated history, staged/unsent files, another task,
 or inherited device credentials. Current execution/frontier, file hashes,
 permission revision and review revocation remain rechecked. The ordinary
 attachment and system-files policies are not changed globally.
+
+## October18 — remove standalone Fact Check clutter; private UI preview
+
+```text
+bro things like that remove fact check it adds clutter for somethign u could just ask the ai, also make a 4th eindow for me to see hands on with myself so u dont monitor it but for mee and ill colse wjhen done
+```
+
+Remove the standalone page/navigation and its creation form, not the native
+fact-check capability. Ordinary chat can request checking; retained task
+evidence and review remain accessible, and fact-check questions remain visible
+in Conversation. Do not infer removal of other workspaces from this example.
+The user owns a separate, isolated UI preview with no engine, real tools or
+automation attached. Do not inspect their interactions or close their window.
+The previous three-preview cohort is historical, not acceptance of changed
+navigation. That intermediate interface had11 core routes; the later Verbatim2
+decision below supersedes it with five.
+
+## October18 later — Verbatim2 interface and workflow
+
+The exact user message remains at the bottom of [PLAN.md](PLAN.md#verbatim-2)
+and [REQUEST_VERBATIM.md](REQUEST_VERBATIM.md#verbatim-2); neither raw appendix
+is rewritten by this implementation record. Later instructions override only
+conflicting presentation/workflow requirements, not retained native capability.
+
+- Current routes are Conversation, Training & Evolution, Brain map, Tools &
+  permissions and Settings. Home owns selection/import/export/duplicate/delete
+  and multi-parent merge management. Separate Learn/Evolution/Agents, Fact Check,
+  Schedules, Trace/journal and Imagination navigation is superseded; their
+  surviving chat/action/history capabilities are not cancelled or erased.
+- Training & Evolution has one source-and-goal form with universal file/media/
+  folder selection, real tasks/progress/cursors and adjacent improvement results.
+  Visible encoded-source/resource ledgers, next-file parser selection, candidate
+  kinds, maximum candidates and manual recursive-reassessment controls are removed.
+  Backend provenance, parser detection, accounting and full traversal remain.
+- Adaptive improvement availability is normalized on for a loaded brain. This
+  is not a new permission, forced activity on every turn or background work while
+  Unloaded. The user's choice to keep existing permissions preserves source
+  approvals, immutable evaluation, regression/retention/resource checks and rollback.
+- Best Work/Active mode are in Conversation; visual input belongs in Attach/Call.
+  Brain Map presents the actual connected graph in2D/3D without source/router
+  dashboard checkboxes. All supported Build modalities are enabled, not a camera
+  or microphone grant.
+- Home uses one Select flow. Current/origin/reference export modes remain
+  distinct; parent brains and exact destructive confirmations remain. Separate
+  portable-identity panels are removed, not the required portable Windows format.
+- Plugin maker now edits real executable feature/CSS/tool/parser drafts and
+  complete package JSON; saving remains inert until reviewed activation.
+- A selected folder is one immutable, no-auto-learning task container. Manifest
+  reads use entry ordinals; explicit saved-member reads use byte pages. No
+  original host path is reopened or granted; exact Off saved-copy review remains.
+- Optional chat web quarantine uses the existing learning/crawl path. Specific
+  Learn's omitted default stays direct learning; the direct crawler keeps its
+  quarantine default. Quarantined traversal is not a new neural-learning receipt.
+
+These changes have source and focused non-neural contracts, not a completed
+current visual/platform acceptance. Required384 appearance combinations now span
+five primary routes (1,920 core route visits). The updated composed-state set,
+visual review, CI, packages and release must be qualified on this changed source;
+old11/12-route metrics or screenshots do not close those gates.

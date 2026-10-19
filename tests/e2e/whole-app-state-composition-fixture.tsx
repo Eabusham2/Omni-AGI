@@ -8,6 +8,7 @@ import { createPresetConfig, type ActionEvent, type ActionReplyAnchor, type Brai
   type ThoughtTrace, type LiveObservationEvent } from "../../src/shared/types";
 import type { PonderSelfReport, PonderSelfReportDelta } from "../../src/shared/ponderSelfReport";
 import type { WholeAppCompositionControl } from "./whole-app-audit-contract";
+import type { PluginEvent, PluginsApi } from "../../src/shared/plugins";
 import "../../src/renderer/src/styles.css";
 
 /**
@@ -29,6 +30,7 @@ const stream = subscribers<ChatStreamEvent>(), actions = subscribers<ActionEvent
 const storage = subscribers<BrainStorageOperationEvent>(), imports = subscribers<BrainDocument>(), importFailures = subscribers<BrainImportFailure>();
 const jobs = subscribers<RuntimeJobEvent>(), previews = subscribers<DatasetPreviewProgress>();
 const observations = subscribers<LiveObservationEvent>();
+const pluginEvents = subscribers<PluginEvent>();
 const denied: string[] = [], receipts: Array<{ operation: string; turnId?: string; detail?: string }> = [];
 const unsupported = (operation: string) => async (): Promise<never> => { denied.push(operation); throw new Error(`${operation} is unavailable: synthetic UI transport has no host authority.`); };
 let sequence = 0, epoch = 0;
@@ -118,8 +120,25 @@ const traceApi: Pick<OmniApi["trace"], "list"> = { list: async () => [] };
 const catalog: Pick<OmniApi["catalog"], "hardwareProfile" | "resourcePlan"> = {
   hardwareProfile: unsupported("catalog.hardwareProfile"), resourcePlan: unsupported("catalog.resourcePlan")
 };
+// Read-only synthetic presentation metadata lets the actual Tools workspace
+// mount its real package maker. No module is installed, activated or executed.
+const tool: OmniApi["tool"] = {
+  descriptions: async id => { if (id !== ID) throw new Error("Foreign fixture tool metadata."); return { brainId: ID, tools: [] }; },
+  listPermissions: async id => { if (id !== ID) throw new Error("Foreign fixture permission metadata."); return structuredClone(documentValue.toolPermissions ?? []); },
+  preferences: async () => ({ approvalTimeoutSeconds: 30 }), setPreferences: unsupported("tool.setPreferences"),
+  setPermission: unsupported("tool.setPermission"), execute: unsupported("tool.execute"), cancel: unsupported("tool.cancel"), declineApproval: unsupported("tool.declineApproval")
+};
+const mcp: Pick<OmniApi["mcp"], "registry"> = {
+  registry: async id => { if (id !== ID) throw new Error("Foreign fixture MCP metadata."); return { enabled: false, instanceEnabled: false, servers: [] }; }
+};
+const plugins: Pick<PluginsApi, "list" | "onEvent" | "installFile" | "installPackage" | "edit" | "activate" | "setEnabled" | "exportFile" | "setInstanceAccess"> = {
+  list: async () => [], onEvent: pluginEvents.subscribe,
+  installFile: unsupported("plugins.installFile"), installPackage: unsupported("plugins.installPackage"), edit: unsupported("plugins.edit"),
+  activate: unsupported("plugins.activate"), setEnabled: unsupported("plugins.setEnabled"), exportFile: unsupported("plugins.exportFile"),
+  setInstanceAccess: unsupported("plugins.setInstanceAccess")
+};
 const bridge = { brain, chat, train, data, window: windowApi, trace: traceApi,
-  catalog, modality: { capabilities: unsupported("modality.capabilities"), onObservation: observations.subscribe } };
+  catalog, tool, mcp, plugins, modality: { capabilities: unsupported("modality.capabilities"), onObservation: observations.subscribe } };
 Object.defineProperty(window, "omni", { value: bridge as unknown as OmniApi, configurable: false });
 
 const controls: WholeAppCompositionControl = {

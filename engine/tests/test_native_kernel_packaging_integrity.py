@@ -159,7 +159,9 @@ class NativeKernelPackagingIntegrityCases(unittest.TestCase):
     def test_windows_worker_closed_stdout_diagnostic_is_owned_bounded_and_preserves_failure(self):
         smoke = (ROOT / "scripts/smoke-engine.ps1").read_text()
         self.assertLess(smoke.index("$Worker.StandardError.ReadToEndAsync()"), smoke.index("function Invoke-WorkerRpc"))
-        diagnostic = smoke.split("function Get-WorkerExitDiagnostic {", 1)[1].split("function Invoke-WorkerRpc", 1)[0]
+        # Inspect only this diagnostic function; the next independent function
+        # owns failure cleanup and may correctly terminate the exact child.
+        diagnostic = smoke.split("function Get-WorkerExitDiagnostic {", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn("$Worker.HasExited", diagnostic)
         self.assertIn("$Worker.WaitForExit(5000)", diagnostic)
         self.assertIn("$WorkerErrorReadTask.Wait(1000)", diagnostic)

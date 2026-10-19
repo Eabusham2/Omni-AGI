@@ -3,6 +3,7 @@ import type {
   PluginRuntimeApi,
   PluginRuntimeMountedContribution
 } from "../../shared/pluginRuntime";
+import "./pluginRuntimeContributions.css";
 
 export const PLUGIN_RUNTIME_STUDIO_SLOTS = ["chat.toolbar", "chat.before", "chat.after", "tools"] as const;
 export type PluginRuntimeStudioSlot = typeof PLUGIN_RUNTIME_STUDIO_SLOTS[number];
@@ -157,10 +158,16 @@ export function PluginRuntimeContributionItems({ slot, values, pending, visibleE
       ? <button type="button" className="button" key={`${value.sessionId}/${value.id}/${value.revision}`}
           disabled={Boolean(pending)} onClick={() => onInvoke(value)}>{value.title ?? value.id}</button>
       : <span key={`${value.sessionId}/${value.id}/${value.revision}`}>{value.title ?? value.id}</span>)}
-    {menus.length ? <div role="group" aria-label="Plugin runtime actions">{menus.map(value => value.event
+    {menus.length ? <details className="plugin-runtime-menu"><summary>Plugin actions</summary>
+      <div role="group" aria-label="Plugin runtime actions">{menus.map(value => value.event
       ? <button type="button" className="button" key={`${value.sessionId}/${value.id}/${value.revision}`}
-          disabled={Boolean(pending)} onClick={() => onInvoke(value)}>{value.title ?? value.id}</button>
-      : <span key={`${value.sessionId}/${value.id}/${value.revision}`}>{value.title ?? value.id}</span>)}</div> : null}
+          disabled={Boolean(pending)} onClick={event => {
+            onInvoke(value);
+            const menu = event.currentTarget.closest("details");
+            if (menu) { menu.open = false; menu.querySelector("summary")?.focus(); }
+          }}>{value.title ?? value.id}</button>
+      : <span key={`${value.sessionId}/${value.id}/${value.revision}`}>{value.title ?? value.id}</span>)}</div>
+    </details> : null}
     {panels.map(value => <article className="plugin-runtime-panel" key={`${value.sessionId}/${value.id}/${value.revision}`}>
       <PluginRuntimePanelFrame contribution={value} />
       {value.event ? <button type="button" className="button" disabled={Boolean(pending)} onClick={() => onInvoke(value)}>

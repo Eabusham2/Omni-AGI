@@ -33,8 +33,8 @@ describe("versioned ordinary documentation curriculum", () => {
     const pack = declaredDocumentationCurriculumPack();
     expect(pack).toMatchObject({
       format: "omni-ordinary-document-curriculum",
-      version: 23,
-      id: "omni-v2-user-documentation-23",
+      version: 24,
+      id: "omni-v2-user-documentation-24",
       ordinaryNeuralLearning: true,
       hiddenPrompt: false,
       behavioralPersona: false,

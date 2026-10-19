@@ -14,7 +14,7 @@ export function userQuestionInPanel(
   presentation: "task" | "conversation" = "task"
 ): boolean {
   return question.brainId === brainId && (!questionIds || questionIds.includes(question.id)) &&
-    (presentation !== "conversation" || question.source?.kind !== "learn" && question.source?.kind !== "fact-check");
+    (presentation !== "conversation" || question.source?.kind !== "learn");
 }
 
 export function mergeUserQuestionRecords(

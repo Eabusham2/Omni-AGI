@@ -17,42 +17,16 @@ import {
   canApproveEvolution,
   canRollbackEvolution,
   canStopEvolution,
-  groupEvolutionRuns,
-  type EvolutionCandidateKind
+  groupEvolutionRuns
 } from "./evolutionView";
 
 interface EvolutionWorkspaceProps {
   brain: BrainDocument;
+  objective: string;
+  embedded?: boolean;
   onOpenPermissions: () => void;
   onToast: (message: string) => void;
 }
-
-const candidateKinds: Array<{
-  id: EvolutionCandidateKind;
-  label: string;
-  description: string;
-}> = [
-  {
-    id: "substrate",
-    label: "Connections and memory",
-    description: "Neural memory, learned pathways, and memory rehearsal"
-  },
-  {
-    id: "neural",
-    label: "Learned connections",
-    description: "Test a safe isolated copy and check that important knowledge remains"
-  },
-  {
-    id: "data",
-    label: "Learned sources",
-    description: "Re-evaluate retained training sources in an isolated overlay"
-  },
-  {
-    id: "architecture",
-    label: "Brain growth",
-    description: "Add capacity without replacing the existing mind"
-  }
-];
 
 function shortId(value?: string): string {
   return value ? `${value.slice(0, 8)}…` : "origin";
@@ -89,7 +63,7 @@ function policyCopy(permission: ToolPermissionLevel): string {
   if (permission === "full") {
     return "Passing candidates may promote under the immutable evaluator, with exact rollback retained.";
   }
-  return "Recursive improvement is disabled. Enable its tool permission to start a candidate.";
+  return "Source changes are off. Existing learning and saved results stay available.";
 }
 
 function EvolutionCandidateCard({
@@ -206,19 +180,11 @@ function EvolutionCandidateCard({
 
 export function EvolutionWorkspace({
   brain,
+  objective,
+  embedded = false,
   onOpenPermissions,
   onToast
 }: EvolutionWorkspaceProps) {
-  const savedWidth = brain.config.nativeArchitecture?.shape.dModel ?? 0;
-  const savedHeads = brain.config.nativeArchitecture?.shape.nHeads ?? 0;
-  const savedFeedForward = brain.config.nativeArchitecture?.shape.feedForward ?? 0;
-  const [objective, setObjective] = useState("");
-  const [kind, setKind] = useState<EvolutionCandidateKind>("substrate");
-  const [recursive, setRecursive] = useState(true);
-  const [architectureOperation, setArchitectureOperation] = useState<"grow-experts" | "resize-width" | "repartition-heads">("grow-experts");
-  const [width, setWidth] = useState(savedWidth);
-  const [heads, setHeads] = useState(savedHeads);
-  const [feedForward, setFeedForward] = useState(savedFeedForward);
   const [holdoutJson, setHoldoutJson] = useState("");
   const [candidates, setCandidates] = useState<EvolutionCandidate[]>([]);
   const [knownRuns, setKnownRuns] = useState<EvolutionRun[]>([]);
@@ -231,22 +197,11 @@ export function EvolutionWorkspace({
     brain.toolPermissions?.find(
       (entry) => entry.toolId === "source.self-modify"
     )?.level ?? "off";
-  const configured = brain.config.recursiveImprovement !== false;
-  const enabled = configured && permission !== "off";
-  const dataAvailable =
-    (brain.activity?.trainingSourceCount ?? brain.trainingSources.length) > 0;
+  const enabled = permission !== "off";
   const runs = useMemo(
     () => groupEvolutionRuns(candidates, knownRuns),
     [candidates, knownRuns]
   );
-
-  useEffect(() => {
-    // Candidate controls start at this identity's actual saved geometry,
-    // never a tiny hard-coded replacement or another brain's stale draft.
-    setWidth(savedWidth);
-    setHeads(savedHeads);
-    setFeedForward(savedFeedForward);
-  }, [brain.id, savedWidth, savedHeads, savedFeedForward]);
 
   const reload = useCallback(async (quiet = false) => {
     if (!window.omni) {
@@ -279,10 +234,6 @@ export function EvolutionWorkspace({
 
   const start = async () => {
     if (!objective.trim() || starting || !enabled) return;
-    if (kind === "data" && !dataAvailable) {
-      onToast("This brain has no retained training-source identifiers for a data candidate.");
-      return;
-    }
     if (!window.omni) {
       onToast("Evolution requires the packaged local desktop runtime.");
       return;
@@ -293,16 +244,9 @@ export function EvolutionWorkspace({
         buildEvolutionStartRequest({
           brainId: brain.id,
           objective,
-          recursive,
-          candidateKind: kind,
-          // Keep the Run view bounded. An empty explicit selection routes the
-          // data candidate through worker-owned memory rehearsal.
+          recursive: true,
+          candidateKind: "substrate",
           sourceIds: [],
-          architectureChange: kind !== "architecture" ? undefined : architectureOperation === "grow-experts"
-            ? { mutation: "grow-experts", addExperts: 1 }
-            : architectureOperation === "resize-width"
-              ? { mutation: "resize-width", dModel: width, nHeads: heads, feedForward }
-              : { mutation: "repartition-heads", nHeads: heads },
           geometryHoldouts: holdoutJson.trim()
             ? JSON.parse(holdoutJson) as NonNullable<EvolutionStartRequest["geometryHoldouts"]> : undefined
         })
@@ -311,12 +255,11 @@ export function EvolutionWorkspace({
         run,
         ...current.filter((entry) => entry.id !== run.id)
       ]);
-      setObjective("");
       await reload(true);
       onToast(
         run.state === "failed"
           ? run.error ?? "The improvement run failed to start."
-          : `Started ${kind} improvement run ${shortId(run.id)} in an isolated overlay.`
+          : "Improvement queued in an isolated copy."
       );
     } catch (error) {
       onToast(
@@ -389,15 +332,10 @@ export function EvolutionWorkspace({
   };
 
   return (
-    <div className="content-page evolution-page">
+    <section className={embedded ? "evolution-workspace--embedded" : "content-page evolution-page"} aria-label="Evolution">
       <div className="content-page__title">
         <div>
-          <span className="eyebrow-text">RECURSIVE IMPROVEMENT</span>
-          <h1>Evolution lab</h1>
-          <p>
-            Isolate, evaluate, promote, and roll back neural or source changes
-            without exposing the immutable evaluator to candidates.
-          </p>
+          <h2>Evolution</h2>
         </div>
         <div className="evolution-policy">
           <span className={`evolution-policy__badge evolution-policy__badge--${permission}`}>
@@ -414,103 +352,28 @@ export function EvolutionWorkspace({
         <aside className="surface evolution-compose">
           <div className="surface-title">
             <div>
-              <h2>New isolated candidate</h2>
-              <p>No running state changes until a passing candidate is promoted.</p>
+              <h3>Improve from your goal</h3>
+              <p>{objective.trim() || "Add an improvement goal in the shared input."}</p>
             </div>
             <Icon name="pulse" size={19} />
           </div>
-          <label>
-            <span>Improvement objective</span>
-            <textarea
-              rows={4}
-              maxLength={20_000}
-              value={objective}
-              onChange={(event) => setObjective(event.target.value)}
-              placeholder="Describe a measured limitation or capability to improve…"
-            />
-          </label>
-          <fieldset className="evolution-routes">
-            <legend>What may change</legend>
-            {candidateKinds.map((candidate) => {
-              const unavailable = candidate.id === "data" && !dataAvailable;
-              return (
-                <label
-                  key={candidate.id}
-                  className={kind === candidate.id ? "is-selected" : ""}
-                >
-                  <input
-                    type="radio"
-                    name="evolution-candidate-kind"
-                    value={candidate.id}
-                    checked={kind === candidate.id}
-                    disabled={unavailable}
-                    onChange={() => setKind(candidate.id)}
-                  />
-                  <span>
-                    <strong>{candidate.label}</strong>
-                    <small>
-                      {unavailable
-                        ? "Requires at least one retained training source"
-                        : candidate.description}
-                    </small>
-                  </span>
-                </label>
-              );
-            })}
-          </fieldset>
-          {kind === "architecture" ? <fieldset className="evolution-geometry">
-            <legend>Isolated architecture operation</legend>
-            <label><span>Operation</span><select value={architectureOperation}
-              onChange={(event) => setArchitectureOperation(event.target.value as typeof architectureOperation)}>
-              <option value="grow-experts">Compatible expert growth</option>
-              <option value="resize-width">Candidate width / feed-forward resize</option>
-              <option value="repartition-heads">Candidate attention-head repartition</option>
-            </select></label>
-            {architectureOperation !== "grow-experts" ? <>
-              {architectureOperation === "resize-width" ? <>
-                <label><span>Width</span><input type="number" min={1} value={width || ""} onChange={(event) => setWidth(Number(event.target.value))} /></label>
-                <label><span>Feed-forward width</span><input type="number" min={1} value={feedForward || ""} onChange={(event) => setFeedForward(Number(event.target.value))} /></label>
-              </> : null}
-              <label><span>Attention heads</span><input type="number" min={1} value={heads || ""} onChange={(event) => setHeads(Number(event.target.value))} /></label>
-            </> : null}
-          </fieldset> : null}
+          <details className="evolution-evaluation-options"><summary>Evaluation data</summary>
           <fieldset className="evolution-geometry">
             <legend>Protected native improvement evaluation</legend>
             <label><span>Real held-out files (JSON declarations)</span><textarea rows={8} value={holdoutJson}
                 onChange={(event) => setHoldoutJson(event.target.value)}
                 placeholder={'{"token":[{"path":"/absolute/text.jsonl","records":20}],"modality":[{"path":"/absolute/heldout.wav","kind":"audio","conditionText":"literal recorded utterance"}],"tool":[{"path":"/absolute/tools.jsonl","records":20}]}'} /></label>
-            <small>Leave blank to reuse this brain's protected registered holdouts; otherwise use absolute selected paths and actual record counts. Token JSONL: {"{text:string}"}. Tool JSONL: {"{context,schemas,expectedIndex,arguments}"}. Every native candidate stays isolated and requires statistically supported benefit in an agreed objective plus preserved other domains/resources. Missing or insufficient observations cannot authorize promotion. Width/head changes also require Ask or Full Authority.</small>
+            <small>Leave blank to reuse protected evaluation data. Missing evidence cannot authorize promotion.</small>
           </fieldset>
-          <p className="evolution-route-note">
-            Source candidates enter through exact hash-bound typed edit actions
-            in chat; an objective alone is never treated as source code.
-          </p>
-          <label className="evolution-recursive">
-            <input
-              type="checkbox"
-              checked={recursive}
-              onChange={(event) => setRecursive(event.target.checked)}
-            />
-            <span>
-              <strong>Reassess recursively</strong>
-              <small>
-                After verified promotion, test whether the improved brain can
-                improve its own improvement process.
-              </small>
-            </span>
-          </label>
+          </details>
           <div className={`evolution-permission-note evolution-permission-note--${permission}`}>
             <Icon name={enabled ? "info" : "warning"} size={15} />
             <span>
               <strong>
-                {!configured
-                  ? "Recursive improvement is disabled for this brain"
-                  : `${permission.toUpperCase()} promotion policy`}
+                {`${permission.toUpperCase()} program-change policy`}
               </strong>
               <small>
-                {configured
-                  ? policyCopy(permission)
-                  : "The brain configuration must allow recursive improvement before a candidate can start."}
+                {policyCopy(permission)}
               </small>
             </span>
           </div>
@@ -572,8 +435,7 @@ export function EvolutionWorkspace({
                       <small>RUN {shortId(run.id)} · GENERATION {run.generation}</small>
                       <strong>{run.objective}</strong>
                       <em>
-                        {run.recursive ? "recursive lineage" : "single run"} ·{" "}
-                        updated {relativeTime(run.updatedAt)}
+                        Updated {relativeTime(run.updatedAt)}
                       </em>
                     </span>
                     <span>
@@ -628,6 +490,6 @@ export function EvolutionWorkspace({
           )}
         </section>
       </div>
-    </div>
+    </section>
   );
 }

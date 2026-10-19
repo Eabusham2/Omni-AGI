@@ -2,9 +2,10 @@ import type { BrainRepository } from "./brainRepository";
 import type {
   ChatTaskAttachmentHandle,
   ChatTaskAttachmentReadResult,
-  ChatTaskAttachmentResolved
+  ChatTaskAttachmentResolved,
+  ChatTaskAttachmentSelection,
+  TaskFolderTraversal
 } from "../shared/taskAttachments";
-import type { ExperienceUploadKind } from "../shared/uploadSupport";
 import {
   TaskAttachmentStore,
   type TaskAttachmentPrivateSource,
@@ -65,8 +66,9 @@ export class TaskAttachmentService {
     brainId: string,
     requestId: string,
     paths: readonly TaskAttachmentStagePath[],
-    selection: ExperienceUploadKind,
-    signal?: AbortSignal
+    selection: ChatTaskAttachmentSelection,
+    signal?: AbortSignal,
+    onProgress?: (progress: Readonly<TaskFolderTraversal>) => void
   ): Promise<ChatTaskAttachmentHandle[]> {
     signal?.throwIfAborted();
     const existing = await this.requestHandles(brainId, requestId);
@@ -74,7 +76,7 @@ export class TaskAttachmentService {
     return this.stagedOperation(brainId, requestId, async (store, stageSignal) => {
       const abort = (): void => { this.activeStages.get(this.stageKey(brainId, requestId))?.abort(signal?.reason); };
       signal?.addEventListener("abort", abort, { once: true }); if (signal?.aborted) abort();
-      try { return await store.stagePaths(requestId, paths, selection, stageSignal); }
+      try { return await store.stagePaths(requestId, paths, selection, stageSignal, onProgress); }
       finally { signal?.removeEventListener("abort", abort); }
     });
   }
@@ -146,12 +148,13 @@ export class TaskAttachmentService {
     attachmentId: string,
     offset?: number,
     maxBytes?: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    entryPath?: string
   ): Promise<ChatTaskAttachmentReadResult> {
     signal?.throwIfAborted();
     return (await this.store(brainId)).readForTurn(
       requireId(turnId, "attachment turn id"), requireId(attachmentId, "attachment id"),
-      numberArgument(offset, 0), numberArgument(maxBytes, 64 * 1024), signal
+      numberArgument(offset, 0), numberArgument(maxBytes, 64 * 1024), signal, entryPath
     );
   }
 
@@ -175,7 +178,8 @@ export class TaskAttachmentService {
     const result = await this.readForTurn(
       brainId, turnId, attachmentId,
       args.offset === undefined ? undefined : numberArgument(args.offset, 0),
-      args.maxBytes === undefined ? undefined : numberArgument(args.maxBytes, 64 * 1024), signal
+      args.maxBytes === undefined ? undefined : numberArgument(args.maxBytes, 64 * 1024), signal,
+      args.entryPath === undefined ? undefined : typeof args.entryPath === "string" ? args.entryPath : (() => { throw new Error("Folder entryPath must be a string."); })()
     );
     signal.throwIfAborted();
     return result;

@@ -43,7 +43,7 @@ export interface WebSourceProvenance {
 export type LearningInput =
   | { kind: "text"; text: string; name?: string }
   | { kind: "dataset"; manifestId: string }
-  | { kind: "web"; url: string; followLinks?: boolean; followExternalLinks?: boolean; respectRobots?: boolean; maxPages?: number; maxDepth?: number };
+  | { kind: "web"; url: string; followLinks?: boolean; followExternalLinks?: boolean; respectRobots?: boolean; quarantine?: boolean; maxPages?: number; maxDepth?: number };
 
 export interface SpecificLearnRequest {
   brainId: string;
@@ -52,6 +52,8 @@ export interface SpecificLearnRequest {
   instructions?: string;
   constraints?: WebLearningConstraints;
   epochs?: number;
+  /** Optional default for web inputs only; per-source selection wins. Omission preserves ordinary learning. */
+  quarantine?: boolean;
 }
 export type LearningTaskState = "queued" | "running" | "paused" | "stopped" | "waiting" | "complete" | "failed";
 export interface LearningSourceProgress {
@@ -62,6 +64,8 @@ export interface LearningSourceProgress {
   manifestId?: string;
   crawlId?: string;
   coverage?: TrainingCoverage;
+  /** Traversed with the existing web archive path, not a neural learning receipt. */
+  quarantined?: boolean;
   result?: unknown;
   error?: string;
 }

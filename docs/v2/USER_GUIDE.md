@@ -4,6 +4,24 @@ Omni AGI Studio creates and runs persistent local OmniCortex instances. Each
 instance has one continuous conversation, native learned state, working memory,
 saved media, learning records, settings, and lineage.
 
+## Find your way around
+
+Home is the brain library. An open brain has five primary destinations:
+
+| Destination | Use it for |
+| --- | --- |
+| **Conversation** | Chat, Attach, Learn, Best Work, Active mode, Call, Record, questions, tools and generated artifacts |
+| **Training & Evolution** | One source-and-goal form, saved learning tasks, dataset progress and reviewed improvement results |
+| **Brain map** | The connected brain in 2D or 3D when real records are available |
+| **Tools & permissions** | Access policies, integrations, MCP, plugins and manual tool inspection |
+| **Settings** | Instance configuration, memory/storage fit and supported recovery controls |
+
+Schedules, fact checking, imagination and operational-history requests are
+available through Conversation when the brain can use their permitted actions;
+they do not require separate navigation pages. Removing a page does not erase
+its saved artifacts, schedules, evidence or operational records. A disconnected
+preview has no running brain and cannot demonstrate these capabilities.
+
 This guide describes controls that exist in the current source. Focused tests
 and small native fixtures establish mechanisms; they do not prove that a newly
 trained instance is fluent, factual, generally intelligent, biologically human,
@@ -41,7 +59,7 @@ or use an invented biological capacity comparison. See
 
 ## Create or import an instance
 
-1. Open the brain library and choose **Create**.
+1. Open Home and choose **Build a new brain**, or **Import brain** for a saved export.
 2. Name the instance and review its hardware and memory plan.
 3. Select any files, folders, media, datasets, or web sources to learn before
    first chat.
@@ -74,7 +92,17 @@ scripts or load executable pickle payloads.
 
 ## Library, copies, and deletion
 
-The library lists saved instances and their current state.
+Home lists saved brains and their current state. Choose **Select**, select the
+exact cards, then use **Duplicate**, **Export brain**, **Merge** or **Delete**.
+**Select all** selects visible cards; with a search it says **Select all results**.
+The selection count also identifies selected brains outside the current search.
+**Clear** clears the selection and **Done** leaves selection mode.
+
+**Export brain** offers **Current brain** (complete saved state), **Original
+origin** (the original recovery state) and **Local reference** (dependent on local
+saved blobs). Each export uses its own destination selection. Merge requires
+at least two eligible parents; it creates a new brain without replacing them.
+Deletion still uses the existing exact-target destructive confirmations.
 
 - **Duplicate** creates an independent mutable copy while sharing eligible
   immutable storage.
@@ -87,51 +115,24 @@ Large duplicate, export, import, recovery, and merge operations report their
 own file/byte progress. That progress is storage work, not a measure of model
 intelligence.
 
-## Portable Windows folder
+## Portable Windows packages
 
-**Portable Windows workspace** creates a self-contained Windows application
-folder for one selected saved instance. It is separate from an ordinary
-`.omni` export and does not change the normal installer when no portable marker
-is present.
+A self-contained Windows application folder is separate from a Home `.omni`
+brain export. Home's export menu creates brain archives or local references; it
+does not show a separate portable-instance/portable-identity panel.
 
-1. **Unload** the selected ready instance. In the Library's portable workspace
-   controls, open **Create a portable copy**, choose the instance, then select
-   **Create portable folder**.
-2. In the native dialogs, select a clean Windows application folder from a build
-   that supports this feature, then a new output folder. Do not select an old
-   portable data directory or mix files from different builds. An existing
-   output folder is never overwritten.
-3. Wait for copying and publication to finish. Storage-operation progress
-   provides Pause, Resume, and Stop. Move or copy the **entire** completed folder,
-   not just its EXE.
-4. On the destination PC, run the included EXE and choose **Prepare saved files**.
-   This preserves the saved instance without loading a model. Then select
-   **Review destination**; use **Edit resource settings** if the saved plan does
-   not fit, and review again.
-5. **Approve this resource fit** approves only that destination's resource plan.
-   Check access separately in **Tools & permissions**, then explicitly **Load**
-   the instance when ready.
+The underlying portable-folder protocol and Windows delivery requirement remain.
+A compatible folder carries its selected unsanitized saved brain and ordinary
+settings, not operational credentials or live tool/device grants. It uses a
+destination-local logical shared storage reservation, not a padded empty20 GB
+file. Moving an already-used folder must preserve its newer state; destination
+resource review and explicit Load remain required.
 
-The folder includes a full **unsanitized private archive** with the selected
-instance's saved learned state, history, working continuity, sources, artifacts,
-and supported pending progress. Treat it as private data. Ordinary copied app
-settings include appearance, workspace profiles/arrangement, notifications, the
-selected theme dependency, and tool approval timeout. Instance settings follow
-the archive; this is not a raw browser-storage or keychain copy.
-
-Device credentials, live sessions, tool/plugin approvals, Auto-load authority,
-and source-drive leases do not transfer as usable grants. Saved work stays
-retained but copied external authority is dormant; reconnect or approve access
-on the destination as needed. Preparation and fit approval do not train a new
-brain or authorize external actions.
-
-An already-used folder keeps its newer chats/state when moved; Studio does not
-automatically replace them with the original archive. A new destination needs
-its own resource review. Storage reservation is a destination-local **logical
-shared pool**, with normal free-space safeguards—not an empty padded 20 GB
-file shipped with the EXE. Windows packaging, hardware compatibility, and exact
-cross-platform neural continuation still need their own validation; the folder
-format alone does not prove those capabilities.
+Removing extra portable controls does not establish a released portable package.
+Use only a compatible published package and follow its destination preparation
+instructions. Clean-Windows startup, relocation, resource-fit behavior and exact
+native continuation require their own package evidence. The technical API remains
+documented in [Integrations](INTEGRATIONS.md#portable-windows-workspace-api).
 
 ## Load, unload, and continuation
 
@@ -183,7 +184,7 @@ every device or external handle resumes identically.
 
 ### Active Mode
 
-In **Device & runtime**, Active Mode selects the one instance allowed to work
+In **Conversation**, **Active mode** selects the one instance allowed to work
 during idle time. The scheduler does not add duration-proportional rest after
 a completed cycle by default. Its regular interval, worker-requested cooldown,
 resource admission, startup recovery and foreground/training priority still
@@ -239,14 +240,16 @@ Notifications wrap and provide keyboard-accessible **Dismiss**. Their reading
 timer pauses while hovered or focused, then resumes with its remaining time.
 This does not pause the brain or cancel the operation being reported.
 
-## Learn workspace
+## Training & Evolution
 
-Open **Learn** when you want a durable, steerable learning task.
+Open **Training & Evolution** for durable learning and improvement work. One
+shared source-and-goal form accepts text, supported documents/media, folders and
+web URLs; there are no separate Learn/Evolution pages or duplicate upload forms.
 
 ### Start a learning task
 
-1. Add text, **Add files**, **Add folder**, or one URL per line.
-2. Optionally add task instructions.
+1. Paste text or URLs, or use **Add source** and choose **Files & media** or **Folder**.
+2. Optionally fill **Instructions or improvement goal**.
 3. Open **Web scope and dates** to configure allowed sites, excluded sites,
    earliest/latest declared publication dates, and per-site date overrides.
 4. For web sources, choose whether to follow links, follow external links, and
@@ -272,16 +275,40 @@ organic calls additionally pass the ordinary approval pipeline. Completion
 means selected sources settled; it does not establish comprehension, future
 recall, or answer quality.
 
-## Fact Check workspace
+### Improvement from the same goal
 
-Open **Fact Check** to inspect selected claims—not to scan every belief in an
-instance.
+The shared goal also feeds the adjacent Evolution controls. **Start improvement
+run** requests the existing isolated native-improvement workflow; its queue,
+candidate results, evaluations, permitted promotion and rollback remain visible.
+**Evaluation data** is collapsed unless you open it. There is no manual
+candidate-kind or recursive-reassessment selector.
 
-1. Enter one claim per line.
-2. Optionally add source URLs, instructions, domain scope, and date bounds.
-3. Choose **Start checking**.
-4. Review captured evidence, publication-date declarations, conflicts, and the
-   model's finding for each claim.
+Adaptive learning and improvement are intrinsically available to a loaded brain;
+this does not force an improvement experiment on every turn or run work while
+Unloaded. Source/binary changes still use the current source-evolution permission,
+exact approvals and immutable evaluator/regression/retention/resource checks.
+Availability is not Full Authority, automatic approval or proof of improvement.
+
+### Optional web quarantine in chat
+
+Ask for web sources to be collected in quarantine before learning. The existing
+`data.learn` action accepts optional `quarantine: true`, with an optional boolean
+override on individual web inputs. Its ordinary default still learns directly;
+the separate direct-crawler API retains its quarantine default. Quarantined
+completion means source traversal, not new neural source learning. Saved scope,
+attribution, progress and pause/resume cursors stay attached. This does not erase
+knowledge learned from an earlier encounter with the same source.
+
+## Checking facts in chat
+
+Ask the instance to check selected claims in Conversation. Include any source
+URLs, instructions, domain scope or date bounds in your request. There is no
+separate Fact Check navigation page. The same instance can use its existing
+fact-check capability when permitted; a request alone does not prove that it
+has used the tool or checked every belief.
+
+Captured evidence, conflicts and findings remain attached to the saved task.
+Review an existing fact-check task from **Training & Evolution → Tasks** when needed.
 
 A search result is discovery evidence; a fetched or learned source has its own
 URL, hash, date declaration, and tool receipt. Unknown dates remain unknown.
@@ -296,7 +323,7 @@ independent claims continue.
 If a finding proposes a correction, choose **Learn correction** only after
 reviewing it. That explicit action creates an ordinary Learn task. A proposed
 correction is never written into neural state merely because the model emitted
-it. Direct UI starts obey the instance's `data.fact-check` permission.
+it. Fact-check actions obey the instance's `data.fact-check` permission.
 
 ## Questions from the instance
 
@@ -304,9 +331,10 @@ The instance can show single-choice, multiple-choice, or written questions
 directly in Conversation. New open questions expand the compact Questions
 section above the message box; an empty conversation has no extra question
 row. Past questions and question settings remain available when that section
-has content. Recommended choices appear first. Learn and Fact Check keep their
-dependent questions in their own task workspace rather than duplicating them
-in Conversation. Answers belong to the instance and survive restart.
+has content. Recommended choices appear first. Learn keeps dependent questions
+in its task workspace. Fact-check questions are available in Conversation, so
+removing the separate page does not hide them. Answers belong to the instance
+and survive restart.
 
 An answer is retained as ordinary action evidence for the instance's learning
 path. It does not inject a hidden prompt, automatically start a second chat
@@ -356,7 +384,7 @@ SQLite/index metadata, caches, temporary activity, liquid state, and eligibility
 all consume additional memory. Float activations and transient derivatives are
 runtime computation; they are not a hidden second learned weight model.
 
-The Runtime Card and Brain Map distinguish:
+The underlying accounting and inspection APIs distinguish:
 
 - base contacts, repeated contacts, and combined logical contacts;
 - learned bytes, structural bytes, and allocated payload bytes;
@@ -367,9 +395,19 @@ Strength does not imply current activation. Useful memory, perfect recall, and
 no-forgetting behavior require trained evidence; they do not follow from the
 storage representation alone.
 
+### Brain map
+
+Open **Brain map** for the connected graph. When real records are available,
+choose **2D** or **3D**; 3D also supports rotation. Selecting recorded nodes or
+paths navigates the same underlying identities. The primary view is the map,
+not a source/router dashboard or a row of inspection checkboxes. Back and
+next-area controls page actual records; an unavailable source is reported rather
+than replaced with a plausible invented graph. Layout coordinates are not brain
+anatomy, and stored weights are not evidence that a connection just fired.
+
 ## Device resources and storage
 
-Open **Device & runtime** to review context, RAM, accelerator, and storage
+Open **Settings** to review context, RAM, accelerator, and storage
 choices. **Auto** uses the observed device and saved architecture. Manual values
 must pass the same current fit checks; saving them does not replace the learned
 model with a smaller one.
@@ -400,7 +438,7 @@ or physical multi-drive performance on every OS.
 ### Manual regional execution
 
 The collapsed **Advanced · manual regional execution** section in
-**Device & runtime** lets you route selected existing decoder blocks for
+The advanced resource controls in **Settings** let you route selected existing decoder blocks for
 inference. This is an optional manual control, not whole-brain Auto placement.
 The normal single-device path remains the default.
 
@@ -443,7 +481,7 @@ qualification remain separate.
 ### Automatic operation placement
 
 The collapsed **Advanced · automatic operation placement** control in
-**Device & runtime** compares supported operations during their next normal
+The advanced resource controls in **Settings** compare supported operations during their next normal
 use. It does not run a benchmark, create data or generate a reply just because
 you open the panel.
 
@@ -653,7 +691,8 @@ inspect hidden intentions or guarantee safety.
 
 ### Local GGUF teacher
 
-The optional local teacher section is in **Learn**. Select an installed supported
+The optional **Learn with a local teacher** section is collapsed in
+**Training & Evolution**. Select an installed supported
 runtime and GGUF, review their provenance and license declarations, and prepare
 the resource-fit plan. File hash preparation has progress and its own Stop.
 Unknown or insufficient fit does not enable Start. The teacher remains external;
@@ -673,11 +712,23 @@ optional timeout is zero.
 ### Attach to one task without learning it first
 
 **Attach** and **Learn** are separate operations. Attaching files, images,
-audio, or video streams the selected bytes into a main-owned content-addressed
+audio, video, or a folder streams the selected bytes into a main-owned content-addressed
 task store. The returned chip says `Attached, not learned`; it reports
 `ingestionStarted: false` and `parametersChanged: false`. No dataset manifest,
 pretraining job, parameter update, hidden prompt, or invented caption is
 created merely by attaching.
+
+Both actions use one compact source picker with **Files & media** and **Folder**,
+not separate per-media buttons. A folder becomes one sealed, immutable container
+attachment with its manifest, saved members and traversal counts. Selecting it
+does not learn its contents. Later reads use those saved bytes, never reopen the
+original computer folder. Changing the original folder does not change the copy.
+
+For a folder, `task.attachments.read` without `entryPath` pages its manifest by
+entry ordinal. An explicit relative `entryPath` selects a saved member and uses
+byte offsets for that member's pages. Neither an entry name nor a manifest is
+permission to access an original or unrelated host path. Current owner/turn,
+hashes and any exact saved-copy review are checked on reads.
 
 When you send, Studio binds the exact handle set to that turn before neural
 dispatch. The same turn/set can recover a lost acknowledgement; another turn
@@ -815,6 +866,16 @@ start globally off. Enable/disable is bound to the hash and revision currently
 shown, so a stale click cannot enable a different concurrently activated
 version.
 
+Open **Plugin maker** in **Tools & permissions → Plugins** to author executable
+features as well as declarations. The **Feature & menu**, **App styling**,
+**Custom tool** and **Training format** starters add editable module drafts.
+Edit JavaScript or the recognized App CSS field; advanced events, placements,
+tool declarations and the complete package JSON remain available. **Add package**
+or **Save new version** uses the existing immutable host validation. Editing or
+saving never runs the code. Enable the reviewed package/instance access and
+explicitly activate a runtime module before it can execute. Removing a module
+from a draft does not stop a previously installed active version.
+
 For each brain, review the exact package hash, enable or disable every declared
 nested capability, and choose Off, Ask, Auto, or Full for every custom tool.
 That custom-tool level never replaces the nested tool's own setting: nested Off
@@ -888,21 +949,16 @@ learning cursor or silently repeating an uncertain host effect. Before using
 either executable form, explicitly enable that format's **Data training
 parser** capability. See
 [Executable training-format parsers](executable-training-parsers.md).
-In **Data**, **Parser for the next file or folder** starts at **Automatic**:
-known built-in formats keep their normal parser, while a unique enabled custom
-extension can use its reviewed parser. MIME-only matches do not execute a
-plugin automatically. Choose an exact plugin/format entry to use a matching
-MIME declaration or override a known built-in format. The selected package
-hash, format and observed source evidence are checked again when learning
-starts or resumes; a stale/unavailable choice is not silently used. The
-picker chooses the next file/folder manifest's parser, not a permission to
-read arbitrary paths or a promise that the brain understood the data.
-The selected package/version is recorded in the dataset manifest, the original
-file hash and full-coverage cursor remain authoritative, ambiguous matches are
-rejected, and disabling access pauses an active source without claiming its
-remainder was learned. Duplicate checks include the parser binding: identical
-bytes remapped to another parser are actually revisited, while an exact
-same-parser completed source can be reused.
+Training & Evolution detects built-in formats automatically. A uniquely matched,
+enabled custom extension can use its reviewed parser. There is no next-file
+parser picker in this page. MIME-only declarations and explicit overrides do not
+silently execute plugin code: the underlying typed parser selection still needs
+an exact reviewed package/format binding and matching source evidence.
+
+Manifests retain the selected package/hash, parser, original source hash and
+full-coverage cursor. Ambiguous matches are rejected; changed access pauses the
+uncommitted suffix. Duplicate checks include parser identity, so identical bytes
+remapped to another parser do not borrow a different parser's receipt.
 
 Enabling a plugin also queues its documentation and typed action schemas as
 ordinary attributable neural learning. This does not block the access edit or
@@ -1094,10 +1150,13 @@ rollback, portability, and selected source continuation. Useful merged fluency,
 large-scale integration quality, cross-device continuation, and the newest
 production inherited-Worker full path remain open.
 
-## Imagination, voice, and perception
+## Media and calls in Conversation
 
-The **Imagination** workspace generates image, audio, and video through native
-modality regions. Progressive previews are real decoder outputs, but useful
+Request images, audio or video in **Conversation**. The same brain can also
+select imagination organically through its native modality regions; there is no
+separate Imagination navigation page or Vision generation mode. Attach an image
+or use permitted Call input for visual understanding. Progressive previews are
+actual delivered decoder outputs, but useful
 quality depends on training and hardware. A decoder/codec being available does
 not mean the instance learned useful visual, audio, or speech capability.
 
@@ -1108,13 +1167,14 @@ video file. Temporary spontaneous output is marked as temporary; **Record**
 preserves delivered fragments from the available rolling window. User-requested
 and unclassified outputs retain their declared save policy.
 
-Saved recording details offer **Prepare replay** followed by **Make replay**.
-Review the recorded timeline and optional overrides before assembly. Audio-only
-recordings produce an audio replay, not an invented video canvas. Preparation
-and encoding have separate Stop controls, and stopping them keeps saved source
-fragments. Available completed replay files expose playback controls and a
-receipt. A copied dormant replay requires an explicit Resume. Replay assembly
-organizes already delivered media; it does not generate new imagined content.
+**Record → Saved recordings** retains recording history and fragment inspection.
+Replay preparation/assembly remain supported through the existing permitted
+capture tools/API rather than a separate source-ledger panel. Review the exact
+recorded timeline and overrides before requesting assembly. Audio-only sources
+produce an audio replay, not an invented video canvas. Stopping assembly keeps
+saved fragments; completed output needs its actual file/receipt before it can
+be treated as playable. A copied dormant replay requires explicit Resume.
+Replay assembly organizes delivered media; it does not imagine new content.
 
 Voice can use system recognition/playback where the platform exposes it. Native
 audio input/output remains dependent on learned audio capability. Camera,
@@ -1129,6 +1189,10 @@ not establish useful speech. The exact persistence and capability boundaries
 are documented in [voice routing](voice-routing.md).
 
 ## Export, recovery, and privacy
+
+Use **Home → Select → Export brain** for current state, original origin or a
+local reference. Import is also on Home. Recovery controls stay in Settings;
+there is no separate portable-identity management panel inside the brain.
 
 `.omni` exports include declared native state and lineage. Current, origin,
 private-archive, and referenced-local modes have different privacy and
@@ -1148,6 +1212,18 @@ sessions, Auto-load authority, and local spill-drive grants are not portable
 brain state. Declarative plugin packages and their non-authorizing provenance
 are portable, but external import and full merge do not restore plugin grants.
 
+### Windows portable package
+
+The portable Windows package is a self-contained folder with its EXE and
+application resources. Keep the folder together. Brain exports on Home are a
+separate operation, not a substitute for that application package. Removing the
+extra portable-identity panel does not remove the shipping format or the
+permission-checked [portable workspace API](INTEGRATIONS.md#portable-windows-workspace-api).
+That API prepares selected saved files and reviews destination resources before
+establishing its logical shared pool. Empty reserved space is allocated on the
+destination, not shipped as a padded download. Private archives are unsanitized;
+credentials and device permissions do not transfer as usable grants.
+
 ## Current limitations
 
 - The narrow local curriculum and documentation pack do not prove fluent or
@@ -1164,6 +1240,10 @@ are portable, but external import and full merge do not restore plugin grants.
   decay are not yet established.
 - Component and focused native tests are not a final all-platform build, CI,
   signing, release, or long-corpus qualification.
+- The current five-route interface needs its own complete384-combination visual
+  and interaction audit. Older11/12-route captures and package results do not
+  verify this changed navigation; current CI, packages and release remain
+  separately unverified until their own checks finish.
 - OmniCortex is software. No result here establishes consciousness, a human
   brain replica, human equivalence, AGI, perfect memory, or guaranteed truth.
 

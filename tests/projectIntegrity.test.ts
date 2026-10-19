@@ -193,8 +193,11 @@ describe("project integrity", () => {
     expect(renderer).toContain("Remove only changes this build list");
     expect(renderer).toContain("window.omni?.data.discardBuildResource");
     expect(renderer).toContain("window.omni.brain.duplicate");
-    expect(renderer).toContain("Your instances");
-    expect(renderer).toContain("STORED RECOVERY ORIGIN · NOT A RUNNING BRAIN");
+    expect(renderer.includes("Your brains")).toBe(true);
+    expect(renderer.includes('aria-label="Manage selected brains"')).toBe(true);
+    expect(renderer.includes('manage("export", "origin")')).toBe(true);
+    expect(renderer.includes('manage("export", "current")')).toBe(true);
+    expect(renderer.includes("pendingDeleteTargets.current.shift() ?? null")).toBe(true);
     expect(renderer).toContain("Confirmation {stage} of 3");
     expect(renderer).toContain("PERMANENTLY DELETE ${target.name}");
     expect(renderer).toContain("Duplicate instance");
@@ -289,9 +292,13 @@ describe("project integrity", () => {
     expect(renderer).toMatch(/chatQueue\s*\?\s*"Queued"/);
     expect(renderer).toMatch(/pondering\s*\?\s*"Pondering"/);
     expect(renderer).toContain(': "Forming a response…"');
-    expect(renderer).toContain("Encoded source ledger");
-    expect(renderer).toContain("incomplete/resumable");
-    expect(renderer).toContain("Progressive imagination");
+    expect(renderer).not.toContain("Encoded source ledger");
+    expect(renderer.includes('" · resumable"')).toBe(true);
+    expect(renderer.includes("runtimeJobScopedDatasetCoverage")).toBe(true);
+    expect(renderer.includes("<ChatImaginationMedia")).toBe(true);
+    const media = read("src/renderer/src/ChatImaginationMedia.tsx");
+    expect(media.includes("data-imagination-state=")).toBe(true);
+    expect(media.includes('presentation.isFinal ? "final" : "live"')).toBe(true);
     expect(readme).toContain(
       "A verified imported native OmniCortex retains its recorded context/model shape"
     );

@@ -1,6 +1,6 @@
 # Omni AGI Studio plugin and custom-tool SDK
 
-Updated 2026-10-15. Omni plugins combine immutable declarations with optional
+Updated 2026-10-18. Omni plugins combine immutable declarations with optional
 isolated panels, feature-runtime modules, themes, tools and source parsers.
 This SDK describes supported interfaces in current source. It does not grant
 arbitrary main-process/native execution or certify third-party packages,
@@ -35,6 +35,33 @@ an explicitly confirmed replacement uses a private staged file and rollback.
 Credential-like immutable argument keys are rejected during package
 normalization; secrets belong to separately reviewed installation credential
 stores/integrations and are never embedded in a plugin package.
+
+## Author an executable module in the app
+
+Open **Tools & permissions → Plugins → Plugin maker**. Its draft editor offers:
+
+- **Feature & menu**: editable JavaScript with lifecycle/event callbacks and
+  declared buttons, menus and panels;
+- **App styling**: a recognized CSS draft plus its complete JavaScript envelope;
+- **Custom tool**: an editable typed runtime-tool implementation;
+- **Training format**: a streaming UTF-8-to-JSONL example and a bound format
+  declaration, not a pre-authorized parser.
+
+You can add multiple modules, select one to edit, change package/module metadata,
+and expand **Events, placements & tools** or **Complete package JSON**. Host
+capabilities, parser bindings and unrelated package sections remain in that JSON.
+The CSS field edits only a recognized data envelope without evaluating its
+JavaScript. Other module bodies remain editable as JavaScript.
+
+**Add package** and **Save new version** use the existing host canonical
+validation, immutable version/hash and edit-lineage rules. Editing, adding a
+starter or saving does not run it. Removing a module from the draft does not
+stop an installed active version. Review package/instance access and explicitly
+activate the exact runtime module before execution; **Stop** retires that
+session. The maker does not supply raw Node, filesystem, network or credentials.
+Module host calls still require declared capabilities and current nested
+permissions. An editable example is not a tested third-party feature or proof
+of hostile-code security on every packaged platform.
 
 ## Custom tools and nested permissions
 
@@ -159,17 +186,19 @@ receives an approval token and cannot approve itself. Host call identities are t
 so a restart cannot silently repeat an uncertain dispatched effect. Parser
 preparation itself does not require or implicitly Load the neural worker.
 
-In **Data**, **Parser for the next file or folder** defaults to **Automatic**.
-Automatic preserves built-in detection for known formats; otherwise it may
+**Training & Evolution** uses automatic format detection; it has no next-file
+parser picker. Automatic preserves built-in detection for known formats; otherwise it may
 use one uniquely matched enabled custom extension. A MIME-only declaration
 does not automatically opt a source into plugin execution. To use a MIME-only
-format or override a known built-in format, select the exact plugin/parser
-entry. The selection binds `{pluginId, contentSha256, formatId}`; it is not a
+format or override a known built-in format, an explicit typed request must name
+the exact reviewed plugin/parser entry. That selection binds
+`{pluginId, contentSha256, formatId}`; it is not a
 free-form parser name. Extension or observed MIME must still match that
 declaration. Local signature evidence and HTTP Content-Type retain their
 actual provenance, and source bytes/MIME/access are rechecked at start/resume.
-The parser picker applies to the next file/folder manifest; typed web/crawl
-requests also support an explicit parser selection. Ambiguity, a stale hash,
+The manifest and typed web/crawl contracts still support that explicit parser
+selection where required; removing its UI picker does not grant parser access.
+Ambiguity, a stale hash,
 missing access or a mismatched MIME fails rather than choosing a different
 parser. No parser choice itself starts learning.
 
@@ -293,9 +322,9 @@ For example, this entry adds an inert panel after explicit activation:
   "id": "text-helper",
   "title": "Text helper",
   "description": "A local text utility.",
-  "script": "globalThis.omniRuntime.onActivate(() => globalThis.omniRuntime.ui.put({id:'status',kind:'panel',slot:'run.sidebar',title:'Text helper',html:'<p>Text helper is active.</p>'}));",
+  "script": "globalThis.omniRuntime.onActivate(() => globalThis.omniRuntime.ui.put({id:'status',kind:'panel',slot:'chat.after',title:'Text helper',html:'<p>Text helper is active.</p>'}));",
   "events": ["brain.lifecycle"],
-  "ui": { "kinds": ["panel"], "slots": ["run.sidebar"] },
+  "ui": { "kinds": ["panel"], "slots": ["chat.after"] },
   "dynamicTools": false
 }
 ```
@@ -325,7 +354,7 @@ transaction—save needed state while active. Current host topics are
 `brain.lifecycle` and `chat.action`; their data is observed lifecycle/action
 metadata, not conversation contents or an invented view of private thoughts.
 A UI contribution's `event` is delivered as `ui:<event>` to its own module.
-Current Studio slots are `studio`, `run.sidebar` and `run.toolbar`; declaring
+Current mounted slots are `chat.toolbar`, `chat.before`, `chat.after` and `tools`; declaring
 an unknown slot does not create a new placement. Panel HTML remains inert and
 style contributions cannot load resources or execute code.
 

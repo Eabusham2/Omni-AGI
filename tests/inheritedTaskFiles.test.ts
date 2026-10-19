@@ -18,18 +18,28 @@ import { BrainService } from "../src/main/brainService";
 import { chatTurnKey } from "../src/shared/chatTurnKey";
 import { ToolExecutor } from "../src/main/toolExecutor";
 import type { RuntimeJobManager } from "../src/main/brainService";
+import type { BrainRepository } from "../src/main/brainRepository";
+import { TaskAttachmentService } from "../src/main/taskAttachmentService";
+import { TaskContinuationAttachments } from "../src/main/taskContinuationAttachments";
 
 const roots: string[] = [], time = "2026-10-13T00:00:00.000Z";
 const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 afterEach(async () => { vi.restoreAllMocks(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
-async function fixture(warm = false, permissionLevel: ToolPermissionRecord["level"] = "ask") {
+async function fixture(warm = false, permissionLevel: ToolPermissionRecord["level"] = "ask", folder = false) {
   const temporary = await mkdtemp(join(tmpdir(), "omni-inherited-file-review-")); roots.push(temporary);
   const sourceBrainId = "source-parent", brainId = "destination-owner";
   const source = join(temporary, "source"), root = join(temporary, brainId);
   await Promise.all([mkdir(join(source, "engine"), { recursive: true }), mkdir(join(root, "engine"), { recursive: true })]);
   const sourceStore = new TaskAttachmentStore(source, sourceBrainId);
   const stage = async (name: string, turnId?: string) => {
+    if (folder && name === "task") {
+      const selected = join(temporary, "task-input-folder"); await mkdir(join(selected, "nested"), { recursive: true });
+      await writeFile(join(selected, "nested", "note.txt"), "original task folder bytes");
+      const [handle] = await sourceStore.stagePaths(`source-${name}`, [{ path: selected }], "folder");
+      if (turnId) await sourceStore.bindToTurn(turnId, [handle!.id]);
+      return handle!;
+    }
     const handle = await sourceStore.stageBytes(`source-${name}`, { data: Buffer.from(`original ${name} bytes`), displayName: `${name}.txt`, kind: "file", mimeType: "text/plain",
       source: { kind: "local-file", originalPath: `/private/original/${name}.txt`, selectedAt: time } });
     if (turnId) await sourceStore.bindToTurn(turnId, [handle.id]); return handle;
@@ -87,6 +97,37 @@ async function fixture(warm = false, permissionLevel: ToolPermissionRecord["leve
 }
 
 describe("reviewed inherited task file adoption and retired custody reads", () => {
+  it("reads only approved imported folder members through continuation and Off-policy fences", async () => {
+    const f = await fixture(false, "off", true);
+    const repository = { get: async () => ({ id: f.brainId }), brainDirectory: () => f.root } as unknown as BrainRepository;
+    const facade = new TaskContinuationAttachments(repository, new TaskAttachmentService(repository), f.options.rootEpoch);
+    facade.setInheritedTaskFiles(f.files);
+    const service = { repository, listToolPermissions: f.options.permissions,
+      authorizeInlineImagination: vi.fn(async () => undefined), queueCompletedToolExecution: vi.fn(async () => undefined) } as unknown as BrainService;
+    const tools = new ToolExecutor(service, {} as RuntimeJobManager, undefined, { execute: vi.fn() });
+    vi.spyOn(tools as unknown as { audit(): Promise<void> }, "audit").mockResolvedValue(undefined);
+    tools.setTaskAttachmentService(facade);
+    const invocation = { brainId: f.brainId, toolId: "task.attachments", action: "read",
+      arguments: { attachmentId: f.alias(f.file.id), entryPath: "nested/note.txt" } };
+    const context = { actionEventId: "saved-folder-read", chatTurnId: "root-task" };
+    try {
+      expect((await tools.execute(invocation, undefined, "folder-before-review", undefined, context)).state).toBe("failed");
+      const { review } = await f.approve();
+      expect(review.permission.level).toBe("off");
+      await rm(join(f.temporary, "task-input-folder"), { recursive: true });
+      expect(await tools.execute(invocation, undefined, "folder-after-review", undefined, context))
+        .toMatchObject({ state: "complete", output: { content: "original task folder bytes",
+          folder: { cursorUnit: "bytes", entryPath: "nested/note.txt" }, inheritedTask: { custody: "retired" } } });
+      expect((await tools.execute({ ...invocation, arguments: { ...invocation.arguments, entryPath: "../outside" } },
+        undefined, "folder-escape", undefined, context)).state).toBe("failed");
+      expect((await tools.execute({ ...invocation, toolId: "system.files", arguments: { path: "/private/unselected" } },
+        undefined, "folder-no-host-grant", undefined, context)).state).toBe("failed");
+      await f.files.revoke({ brainId: f.brainId, reviewId: review.reviewId, reviewSha256: review.reviewSha256 });
+      expect((await tools.execute(invocation, undefined, "folder-revoked", undefined, context)).state).toBe("failed");
+      expect(await validateTaskAttachmentWorkspace(f.root, f.brainId)).toBe(true);
+    } finally { tools.cancel(f.brainId); }
+  });
+
   it("dispatches Off-only saved-file exceptions through real ToolExecutor fences, not an argument token", async () => {
     const f = await fixture(false, "off"), execute = vi.fn(async (brainId, turnId, action, args, signal) => {
       if (action !== "read") throw new Error("Fixture supports the actual saved read only");

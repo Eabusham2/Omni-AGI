@@ -1328,28 +1328,33 @@ export function registerIpcHandlers(dependencies: IpcDependencies): () => void {
     );
   });
   handle(IPC.chat.stageAttachments, async (event, request: ChatTaskAttachmentStageRequest) => {
-    if (!isRecord(request) || !isExperienceUploadKind(request.selection)) {
+    if (!isRecord(request) || request.selection !== "folder" && !isExperienceUploadKind(request.selection)) {
       throw new Error("Invalid task attachment selection.");
     }
     const brainId = requireId(request.brainId);
     const requestId = requireId(request.requestId, "attachment request id");
     const prior = await taskAttachments.requestHandles(brainId, requestId);
     if (prior) return prior;
-    const descriptor = EXPERIENCE_UPLOADS[request.selection];
+    const descriptor = request.selection === "folder" ? undefined : EXPERIENCE_UPLOADS[request.selection];
     const choice = await dialog.showOpenDialog(senderWindow(event), {
-      title: `Attach ${descriptor.shortLabel} to this task`,
-      properties: ["openFile", "multiSelections"],
-      filters: [
+      title: `Attach ${descriptor?.shortLabel ?? "folder"} to this task`,
+      properties: request.selection === "folder" ? ["openDirectory"] : ["openFile", "multiSelections"],
+      ...(descriptor ? { filters: [
         { name: descriptor.filterName, extensions: [...descriptor.extensions] },
         { name: "All files", extensions: ["*"] }
-      ]
+      ] } : {})
     });
     if (choice.canceled || choice.filePaths.length === 0) return null;
     return taskAttachments.stagePaths(
       brainId,
       requestId,
       choice.filePaths.map((path) => ({ path: resolve(path) })),
-      request.selection
+      request.selection,
+      undefined,
+      traversal => {
+        if (!event.sender.isDestroyed()) event.sender.send(IPC.chat.attachmentStageProgress,
+          { brainId, requestId, phase: traversal.complete ? "sealing" : "copying", traversal });
+      }
     );
   });
   handle(IPC.chat.stageDroppedAttachments, async (

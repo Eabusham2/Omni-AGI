@@ -2342,6 +2342,9 @@ function normalizeConfig(value: unknown): BrainConfig {
   ] as const) {
     if (typeof merged[key] !== "boolean") merged[key] = DEFAULT_CONFIG[key];
   }
+  // Intrinsic adaptation is a native capability, not a user tool switch.
+  // This does not grant host access, start work while Unloaded, or skip promotion checks.
+  merged.recursiveImprovement = true;
   // This desktop field controls only optional prompt-free scheduling. The
   // engine keeps recurrent Ponder available regardless of this preference.
   merged.name =

@@ -2,6 +2,7 @@ const { app, BrowserWindow } = require("electron");
 const path = require("node:path");
 
 const isolatedUserDataDirectory = process.env.OMNI_RESPONSIVE_USER_DATA_DIR;
+const backgroundAudit = process.env.OMNI_RESPONSIVE_BACKGROUND === "1";
 if (isolatedUserDataDirectory) {
   app.setPath("userData", path.resolve(isolatedUserDataDirectory));
 }
@@ -24,14 +25,16 @@ app.whenReady().then(async () => {
     webPreferences: {
       contextIsolation: true,
       sandbox: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      ...(backgroundAudit ? { backgroundThrottling: false } : {})
     }
   });
   // This no-preload helper is explicitly a design preview, never a native app.
   await window.loadFile(path.join(repository, "out", "renderer", "index.html"), {
     query: { "omni-preview": "1" }
   });
-  window.show();
+  if (backgroundAudit) window.showInactive();
+  else window.show();
 });
 
 app.on("window-all-closed", () => app.quit());

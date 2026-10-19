@@ -5,6 +5,13 @@ application. It does not replace Studio with a website or substitute static
 panels for programmable features. Old packages without `runtimeModules` keep
 their previous canonical bytes and hashes. Import/install alone runs no module.
 
+The existing **Tools & permissions → Plugins → Plugin maker** now exposes editable
+Feature & menu, App styling, Custom tool and Training format drafts. It preserves
+complete package JSON and uses the same immutable install/edit workflow. Source
+editing never evaluates the module; explicit exact-version access/activation,
+normal host permissions and the lifetime boundary below still govern execution.
+See the [in-app authoring guide](plugins.md#author-an-executable-module-in-the-app).
+
 ## Activation and execution boundary
 
 `runtimeModules` declares immutable JavaScript, subscription topics, allowed

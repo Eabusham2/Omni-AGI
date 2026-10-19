@@ -297,6 +297,11 @@ const api: OmniApi = {
       },
       cancelStage: (brainId, requestId) =>
         invoke(IPC.chat.cancelAttachmentStage, brainId, requestId),
+      onStageProgress: listener => {
+        const wrapped = (_event: Electron.IpcRendererEvent, value: import("../shared/taskAttachments").ChatTaskAttachmentStageProgress): void => listener(value);
+        ipcRenderer.on(IPC.chat.attachmentStageProgress, wrapped);
+        return () => { ipcRenderer.removeListener(IPC.chat.attachmentStageProgress, wrapped); };
+      },
       list: (brainId, state) => state === undefined
         ? invoke(IPC.chat.listAttachments, brainId)
         : invoke(IPC.chat.listAttachments, brainId, state),

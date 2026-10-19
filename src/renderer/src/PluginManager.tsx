@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  OMNI_PLUGIN_FORMAT,
-  OMNI_PLUGIN_FORMAT_VERSION,
   pluginToolId,
   type OmniPluginPackage,
   type PluginCatalogEntry,
@@ -15,28 +13,9 @@ import { PluginInteractivePanel } from "./PluginInteractivePanel";
 import { PluginPanelHistory } from "./PluginPanelHistory";
 import { PluginThemeChooser } from "./PluginThemes";
 import { PluginRuntimeControls } from "./PluginRuntimeControls";
+import { PluginModuleAuthoring } from "./PluginModuleAuthoring";
+import { newPluginAuthoringPackage } from "./pluginModuleDraft";
 import "./pluginManager.css";
-
-const EMPTY_PACKAGE: OmniPluginPackage = {
-  format: OMNI_PLUGIN_FORMAT,
-  formatVersion: OMNI_PLUGIN_FORMAT_VERSION,
-  manifest: {
-    id: "my.plugin",
-    version: "1.0.0",
-    name: "My plugin",
-    description: "Describe this version.",
-    author: "Local author",
-    license: "All rights reserved",
-    documentation: "# My plugin\n\nDocument what this package adds and every capability it needs.",
-    capabilities: [],
-    tools: [],
-    panels: [{ id: "about", title: "About", html: "<section><h2>My plugin</h2><p>Static package panel.</p></section>",
-      css: "section { padding: 1rem; }" }],
-    interactivePanels: [],
-    themes: [],
-    trainingFormats: []
-  }
-};
 
 function currentApi(): PluginsApi | undefined {
   return typeof window === "undefined" ? undefined : window.omni?.plugins;
@@ -81,7 +60,7 @@ export function PluginManager({ brainId, api = currentApi(), onNotice, onCapabil
   const [loadedPackage, setPackageValue] = useState<OmniPluginPackage>();
   const [loadedAccess, setAccess] = useState<PluginInstanceAccess>();
   const [loadedScope, setLoadedScope] = useState("");
-  const [editor, setEditor] = useState(JSON.stringify(EMPTY_PACKAGE, null, 2));
+  const [editor, setEditor] = useState(() => JSON.stringify(newPluginAuthoringPackage(), null, 2));
   const [editBase, setEditBase] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -265,8 +244,7 @@ export function PluginManager({ brainId, api = currentApi(), onNotice, onCapabil
       </div>
     </div>
     <details className="plugin-manager__maker" open={!entries.length || Boolean(editBase)}><summary>{editBase ? "Edit package as a new immutable version" : "Plugin maker"}</summary>
-      <p>JSON only. Setup scripts, recursive plugin calls, unsandboxed HTML, and undeclared capabilities are rejected.</p>
-      <textarea aria-label="Plugin package JSON" value={editor} onChange={(event) => setEditor(event.currentTarget.value)} spellCheck={false} />
+      <PluginModuleAuthoring value={editor} onChange={setEditor} disabled={busy} />
       <div className="plugin-manager__actions"><button type="button" className="button button--primary" disabled={busy}
         onClick={() => void run(async () => {
           const result = editBase && selectedId

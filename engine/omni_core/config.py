@@ -544,9 +544,9 @@ class OmniConfig:
             "learn_from_own_messages": True,
             "retain_source_text": bool(raw.get("retainSourceText", False)),
             "extended_working_memory": extended_working,
-            "recursive_improvement": bool(
-                raw.get("recursiveImprovement", True)
-            ),
+            # Availability is intrinsic; actual work remains selected by neural
+            # state and constrained by runtime resources and host permissions.
+            "recursive_improvement": True,
             # Stable v1 always has the recurrent Ponder capability. Neural
             # state may select zero passes; config cannot remove the pathway.
             "idle_cognition": True,

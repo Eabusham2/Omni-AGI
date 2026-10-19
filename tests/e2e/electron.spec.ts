@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import type { OmniApi } from "../../src/shared/types";
 import {
   _electron as electron,
   expect,
@@ -185,8 +186,8 @@ async function sendNaturalMessage(
   await expect(optimisticMessage).toBeVisible({ timeout: 1_500 });
   await expect(page.getByLabel("Stop current turn")).toBeVisible();
   if (navigateWhilePending) {
-    await page.getByRole("button", { name: "Data & training", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Data & training" })).toBeVisible();
+    await page.getByRole("button", { name: "Training & Evolution", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Training & Evolution" })).toBeVisible();
     await page.getByRole("button", { name: "Conversation", exact: true }).click();
     await expect(optimisticMessage).toBeVisible();
     await expect(page.getByLabel("Stop current turn")).toBeVisible();
@@ -204,7 +205,22 @@ async function sendNaturalMessage(
   await expect(optimisticMessage).toHaveCount(0);
 }
 
-test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicates, and restarts", async () => {
+async function loadReviewedInstance(page: Page, name: string): Promise<void> {
+  const state = page.locator(".instance-lifecycle-controls > span");
+  await expect(state).toBeVisible();
+  await expect(state).not.toHaveText("Checking instance…");
+  const dialog = page.getByRole("dialog", { name: `Load ${name}`, exact: true });
+  if (await dialog.isVisible()) {
+    const load = dialog.getByRole("button", { name: "Load instance", exact: true });
+    await expect(load).toBeEnabled();
+    await load.click();
+    await expect(dialog).toBeHidden({ timeout: 240_000 });
+  }
+  await expect(page.getByLabel(`Message ${name}`)).toBeEditable({ timeout: 240_000 });
+}
+
+// Deferred full native qualification, not part of the fixed no-brain CI selection.
+test("native desktop learns, retains chat across the five workspaces, preserves artifacts, and restarts", async () => {
   test.setTimeout(900_000);
   const dataDirectory = await mkdtemp(join(tmpdir(), "omni-electron-e2e-"));
   let application: RunningApplication | undefined;
@@ -236,35 +252,20 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
 
     await expect(page.getByText("Step 2 of 4", { exact: true })).toBeVisible();
     await expect(
-      page.getByRole("heading", { name: "What can it experience first?" })
+      page.getByRole("heading", { name: "Initial learning" })
     ).toBeVisible();
-    for (const label of [
-      "Vision",
-      "Image imagination",
-      "Audio",
-      "Video"
-    ]) {
-      await expect(
-        page.locator(".modality-card").filter({ hasText: label })
-      ).toHaveClass(/is-selected/);
-    }
-    for (const label of [
-      "Files & datasets",
-      "Images",
-      "Audio",
-      "Video",
-      "Whole folder"
-    ]) {
-      await expect(
-        page.getByRole("button", { name: label, exact: true })
-      ).toBeVisible();
-    }
+    await expect(page.getByText(/Text, vision, audio, and video are included/)).toBeVisible();
+    await expect(page.locator(".modality-card")).toHaveCount(0);
+    await page.getByRole("button", { name: "Add source", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Files & media", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Folder", exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "Continue" }).click();
 
     await expect(page.getByText("Step 3 of 4", { exact: true })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Memory & storage" })).toBeVisible();
     await expect(
-      page.getByText(/Each whole experience changes what is active now/)
+      page.getByText("Working memory holds current activity. Learning updates neural state over time.", { exact: true })
     ).toBeVisible();
     await page.getByText("Research diagnostics", { exact: true }).click();
     await expect(page.getByText("Locally initialized native core")).toBeVisible();
@@ -285,23 +286,22 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
       timeout: 120_000
     });
 
-    for (const label of [
-      "Upload files and datasets to learn",
-      "Upload images to learn",
-      "Upload audio to learn",
-      "Upload video to learn",
-      "Upload a folder to learn"
-    ]) {
-      await expect(page.getByLabel(label)).toBeVisible();
-      await expect(page.getByLabel(label)).toBeEnabled();
+    await loadReviewedInstance(page, "E2E Cortex");
+    for (const label of ["Attach", "Learn"]) {
+      const picker = page.getByRole("button", { name: label, exact: true });
+      await expect(picker).toBeVisible();
+      await expect(picker).toBeEnabled();
+      await picker.click();
+      const choices = page.locator(".universal-source-picker__menu:popover-open");
+      await expect(choices.getByRole("button", { name: "Files & media", exact: true })).toBeVisible();
+      await expect(choices.getByRole("button", { name: "Folder", exact: true })).toBeVisible();
+      await page.keyboard.press("Escape");
     }
+    await page.getByRole("button", { name: "Call", exact: true }).click();
     await expect(page.getByLabel("Start live voice")).toBeVisible();
     await expect(page.getByLabel("Start live voice")).toBeEnabled();
-    await expect(page.getByLabel("Start live voice")).toHaveAttribute(
-      "aria-pressed",
-      "false"
-    );
-    await expect(page.getByLabel("Live voice settings")).toHaveCount(0);
+    await page.getByRole("button", { name: "Call", exact: true }).click();
+    await expect(page.getByLabel("Start live voice")).toBeHidden();
 
     await page.getByRole("button", { name: "Runtime card" }).click();
     const runtimeCard = page.locator(".runtime-card");
@@ -310,9 +310,9 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await expect(runtimeCard.getByText("Long-term source injection", { exact: true })).toBeVisible();
     await expect(runtimeCard.getByText("Reward model / RLHF", { exact: true })).toBeVisible();
     await expect(runtimeCard.getByText("Mandatory · −1 / 0 / +1", { exact: true })).toBeVisible();
-    await expect(runtimeCard.getByText("Active context", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Temporary context", { exact: true })).toBeVisible();
     await expect(
-      runtimeCard.getByText("Python neural memory", { exact: true })
+      runtimeCard.getByText("Recorded learning counters", { exact: true })
     ).toBeVisible();
     await expect(runtimeCard.getByText("Made lasting", { exact: true })).toHaveCount(0);
     await expect(runtimeCard.getByText("Working thoughts", { exact: true })).toHaveCount(0);
@@ -329,22 +329,17 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await composer.fill(queuedDirection);
     await expect(page.getByLabel("Queue message")).toBeVisible();
     await composer.press("Enter");
-    const queuedReceipt = page
-      .locator('.message--human[data-turn-state="queued"]')
-      .getByText(queuedDirection, { exact: true });
+    const queuedReceipt = page.getByRole("region", { name: "Queued messages", exact: true })
+      .getByRole("button", { name: "Edit queued message 1", exact: true });
     await expect(queuedReceipt).toBeVisible({ timeout: 2_500 });
+    await expect(queuedReceipt).toHaveText(queuedDirection);
     await composer.fill(steeringDirection);
-    await expect(page.getByLabel("Steer current turn")).toBeVisible();
-    await page.getByLabel("Steer current turn").click();
-    const optimisticSteer = page
-      .locator('.message--human[data-turn-state="pending"]')
-      .getByText(steeringDirection, { exact: true });
-    const committedSteer = page
-      .locator('.message--human[data-turn-state="committed"]')
-      .getByText(steeringDirection, { exact: true });
-    await expect(optimisticSteer).toBeVisible({ timeout: 2_500 });
-    await expect(committedSteer).toBeVisible({ timeout: 240_000 });
-    await expect(optimisticSteer).toHaveCount(0);
+    await composer.press(process.platform === "darwin" ? "Meta+Enter" : "Control+Enter");
+    const direction = page.getByRole("region", { name: "Steering directions", exact: true })
+      .locator("li").filter({ hasText: steeringDirection });
+    await expect(direction).toBeVisible({ timeout: 2_500 });
+    await expect(direction.getByText("Completed", { exact: true })).toBeVisible({ timeout: 240_000 });
+    await expect(page.locator(".message--human").getByText(steeringDirection, { exact: true })).toHaveCount(0);
     // Queue is a local delivery receipt until the active send settles. Do not
     // assume an ordering relative to Steer; require both actual persisted turns.
     await expect(
@@ -372,68 +367,56 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
 
     // A newly random-initialized action head is not expected to route an
     // English request to a particular tool before it has learned that skill.
-    // Exercise the explicit, deterministic modality path instead of treating
-    // an untrained semantic choice as an image-decoder regression.
-    await page.getByRole("button", { name: "Imagination", exact: true }).click();
-    await expect(
-      page.getByRole("heading", { name: "Imagination", exact: true })
-    ).toBeVisible();
-    await page.locator(".imagination-prompt textarea").fill(
-      "An internal scene with luminous memory pathways"
-    );
-    await page.getByRole("button", { name: "Imagine image", exact: true }).click();
-    await expect(page.getByText("FINAL ARTIFACT", { exact: true })).toBeVisible({
-      timeout: 240_000
+    // Exercise the real explicit decoder API without resurrecting the removed
+    // generator/gallery page. Inline ChatImaginationMedia visibility is covered
+    // separately by its actual React fixture, not fabricated native events.
+    const mediaJob = await page.evaluate(async () => {
+      const api = (window as unknown as { omni: OmniApi }).omni;
+      const owner = (await api.brain.list()).find(brain => brain.name === "E2E Cortex");
+      if (!owner) throw new Error("The actual created brain is missing.");
+      const before = await api.modality.artifacts(owner.id);
+      const job = await api.modality.generate({ brainId: owner.id, modality: "image",
+        prompt: "An internal scene with luminous memory pathways" });
+      return { brainId: owner.id, jobId: job.id, priorArtifactIds: before.artifacts.map(artifact => artifact.id) };
     });
-    await expect(page.getByAltText("Locally generated image artifact")).toBeVisible();
+    await expect.poll(() => page.evaluate(async ({ brainId, jobId }) => {
+      const api = (window as unknown as { omni: OmniApi }).omni;
+      const job = (await api.train.list(brainId)).find(value => value.id === jobId);
+      return job?.state === "failed" ? `failed: ${job.error}` : job?.state;
+    }, mediaJob), { timeout: 240_000 }).toBe("complete");
+    const savedArtifact = await page.evaluate(async ({ brainId, priorArtifactIds }) => {
+      const api = (window as unknown as { omni: OmniApi }).omni;
+      return (await api.modality.artifacts(brainId)).artifacts.find(artifact =>
+        artifact.modality === "image" && !priorArtifactIds.includes(artifact.id));
+    }, mediaJob);
+    expect(savedArtifact).toMatchObject({ brainId: mediaJob.brainId, modality: "image", available: true });
+    expect(savedArtifact?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(savedArtifact?.bytes).toBeGreaterThan(0);
 
-    await page.getByRole("button", { name: "Data & training", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Data & training" })).toBeVisible();
-    for (const label of ["Files & datasets", "Images", "Audio", "Video", "Whole folder"]) {
-      await expect(
-        page.getByRole("button", { name: label, exact: true })
-      ).toBeVisible();
-    }
+    await page.getByRole("button", { name: "Training & Evolution", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Training & Evolution", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Add source", exact: true }).click();
+    const learningChoices = page.locator(".universal-source-picker__menu:popover-open");
+    await expect(learningChoices.getByRole("button", { name: "Files & media", exact: true })).toBeVisible();
+    await expect(learningChoices.getByRole("button", { name: "Folder", exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
 
     await page.getByRole("button", { name: "Brain map", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Brain map" })).toBeVisible();
-    await expect(page.getByText(/no display ceiling/i)).toBeVisible({
-      timeout: 120_000
-    });
-
-    await page.getByRole("button", { name: "Trace & journal", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Trace & journal" })).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Operational trace", exact: true })
-    ).toBeVisible();
+    const map = page.getByRole("region", { name: "Whole brain map", exact: true });
+    await expect(map.getByRole("heading", { name: "Brain Map", exact: true })).toBeVisible();
+    await expect(map.getByRole("button", { name: "Refresh brain map", exact: true })).toBeEnabled({ timeout: 120_000 });
+    await expect(map.locator(".brain-map-graph")).toBeVisible({ timeout: 120_000 });
 
     await page.getByRole("button", { name: "Tools & permissions", exact: true }).click();
     await expect(page.getByRole("heading", { name: "Tools & permissions" })).toBeVisible();
     await expect(page.getByText("Source evolution", { exact: true })).toBeVisible();
 
-    await page.getByRole("button", { name: "Forks & agents", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Forks & agents" })).toBeVisible();
-    // Create a deterministic lineage fork here. Permissioned neural agent
-    // proposals are covered at the controller/executor boundary; they must not
-    // make this native shell gate depend on an untrained action-head choice.
-    await page.getByRole("button", { name: "Fork this mind", exact: true }).click();
-    await expect(page.getByRole("button", { name: "Review merge" }).first()).toBeVisible({
-      timeout: 120_000
-    });
-
-    await page.getByRole("button", { name: "Imagination", exact: true }).click();
+    await page.getByRole("button", { name: "Training & Evolution", exact: true }).click();
+    const evolution = page.getByRole("region", { name: "Evolution", exact: true });
+    await expect(evolution.getByRole("heading", { name: "Evolution", exact: true })).toBeVisible();
+    await expect(evolution.getByText("Improve from your goal", { exact: true })).toBeVisible();
     await expect(
-      page.getByRole("heading", { name: "Imagination", exact: true })
-    ).toBeVisible();
-    await expect(page.getByRole("button", { name: "Imagine image" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Audio", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Video", exact: true })).toBeVisible();
-
-    await page.getByRole("button", { name: "Evolution", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Evolution lab" })).toBeVisible();
-    await expect(page.getByText("New isolated candidate", { exact: true })).toBeVisible();
-    await expect(
-      page.locator(".evolution-policy").getByText("ask permission", { exact: false })
+      evolution.locator(".evolution-policy").getByText("ask permission", { exact: false })
     ).toBeVisible();
     const evolutionArchive = page.locator(".evolution-archive");
     await expect(evolutionArchive).toBeVisible();
@@ -446,28 +429,32 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
 
     for (const label of [
       "Conversation",
-      "Data & training",
+      "Training & Evolution",
       "Brain map",
-      "Trace & journal",
-      "Imagination",
       "Tools & permissions",
-      "Forks & agents",
-      "Evolution"
+      "Settings"
     ]) {
       await expect(
         page.getByRole("button", { name: label, exact: true })
       ).toHaveAttribute("aria-label", label);
     }
+    await expect(page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button")).toHaveCount(5);
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Memory & storage", exact: true })).toBeVisible();
 
     await page.getByRole("button", { name: "Conversation", exact: true }).click();
-    await page.getByRole("button", { name: "Duplicate instance E2E Cortex" }).click();
-    await expect(
-      page.getByText(/E2E Cortex copy created with copy-on-write neural storage/)
-    ).toBeVisible({ timeout: 180_000 });
+    // Copy-on-write remains a native operation; there is no header Duplicate
+    // control in the requested five-section interface.
+    const duplicateName = await page.evaluate(async brainId => {
+      const api = (window as unknown as { omni: OmniApi }).omni;
+      return (await api.brain.duplicate(brainId)).name;
+    }, mediaJob.brainId);
+    expect(duplicateName).toBe("E2E Cortex copy");
 
     await page
       .getByRole("button", { name: "Brain library", exact: true })
       .click();
+    await page.reload();
     await expect(
       page.getByRole("heading", { name: "E2E Cortex", exact: true })
     ).toBeVisible();
@@ -497,19 +484,21 @@ test("stable v1 builds, runs, acts naturally, exposes every workspace, duplicate
     await expect(page.getByLabel("Message E2E Cortex")).toBeVisible({
       timeout: 120_000
     });
+    await loadReviewedInstance(page, "E2E Cortex");
     await expect(
       page.getByText("hello, tell me what you notice", { exact: true })
     ).toBeVisible();
     await page.getByRole("button", { name: "Runtime card" }).click();
     await expect(page.getByText("Transparent runtime", { exact: true })).toBeVisible();
-    await expect(page.getByText("Active context", { exact: true })).toBeVisible();
+    await expect(page.getByText("Temporary context", { exact: true })).toBeVisible();
     await expect(
-      page.getByText("Python neural memory", { exact: true })
+      page.getByText("Recorded learning counters", { exact: true })
     ).toBeVisible();
-    await page.getByRole("button", { name: "Imagination", exact: true }).click();
-    await expect(page.getByAltText("Saved image imagination").first()).toBeVisible({
-      timeout: 120_000
-    });
+    const retainedArtifact = await page.evaluate(async ({ brainId, artifactId }) => {
+      const api = (window as unknown as { omni: OmniApi }).omni;
+      return (await api.modality.artifacts(brainId)).artifacts.find(artifact => artifact.id === artifactId);
+    }, { brainId: mediaJob.brainId, artifactId: savedArtifact!.id });
+    expect(retainedArtifact).toMatchObject({ id: savedArtifact!.id, sha256: savedArtifact!.sha256, available: true });
   } finally {
     await application?.close().catch(() => undefined);
     await rm(dataDirectory, {

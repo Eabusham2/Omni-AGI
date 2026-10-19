@@ -128,7 +128,7 @@ export async function snapshotLearningWorkspace(sourceRoot: string, packageRoot:
       const reader = await open(file.path, "r"); const header = Buffer.alloc(16);
       try { await reader.read(header, 0, 16, 0); } finally { await reader.close(); }
       const sealedReplayPlan = /^imagination-assemblies\/plans\/[a-f0-9]{64}\/(?:manifest|source)\.sqlite3$/.test(file.name);
-      const sealed = sealedReplayPlan || /^(?:learning\/(?:archives|source-blobs)\/[a-f0-9]{64}\.(?:sqlite3|data)|(?:directions|imagination|imagination-assemblies|local-teachers|api-teachers|plugin-runtime|plugin-panels)\/archives\/[a-f0-9]{64}\.sqlite3)$/.test(file.name);
+      const sealed = sealedReplayPlan || /^(?:attachments\/blobs\/[a-f0-9]{64}\.data|learning\/(?:archives|source-blobs)\/[a-f0-9]{64}\.(?:sqlite3|data)|(?:directions|imagination|imagination-assemblies|local-teachers|api-teachers|plugin-runtime|plugin-panels)\/archives\/[a-f0-9]{64}\.sqlite3)$/.test(file.name);
       if (sealed && !sealedReplayPlan && await fileHash(file.path) !== basename(file.name).split(".")[0]) throw new Error("Sealed learning archive bytes changed.");
       // Bundle/plan and lineage SQLite bytes are hash-sealed payloads, not
       // mutable databases to rewrite through SQLite backup/VACUUM semantics.

@@ -151,14 +151,14 @@ export class TaskContinuationAttachments {
   }
 
   async readForTask(brainId: string, turnId: string, attachmentId: string, offset?: number, maxBytes?: number,
-    signal?: AbortSignal): Promise<ChatTaskAttachmentReadResult> {
-    if (this.inheritedFiles?.has(brainId, turnId)) return this.inheritedFiles.read(brainId, turnId, attachmentId, offset, maxBytes, signal);
+    signal?: AbortSignal, entryPath?: string): Promise<ChatTaskAttachmentReadResult> {
+    if (this.inheritedFiles?.has(brainId, turnId)) return this.inheritedFiles.read(brainId, turnId, attachmentId, offset, maxBytes, signal, entryPath);
     const { store, snapshot } = await this.scope(brainId, turnId, signal);
     const own = (await this.base.handlesForTurn(brainId, turnId)).find(file => file.id === attachmentId);
     const alias = snapshot?.aliases.find(file => file.attachmentId === attachmentId);
     if (!own && !alias?.owningTurnId) throw new Error("This attachment is outside the actual continued task; unrelated history and unsent files are unavailable.");
     await this.recheck(brainId, snapshot, store, signal);
-    const result = await this.base.readForTurn(brainId, own ? turnId : alias!.owningTurnId!, attachmentId, offset, maxBytes, signal);
+    const result = await this.base.readForTurn(brainId, own ? turnId : alias!.owningTurnId!, attachmentId, offset, maxBytes, signal, entryPath);
     await this.recheck(brainId, snapshot, store, signal);
     return result;
   }
@@ -166,6 +166,7 @@ export class TaskContinuationAttachments {
   async execute(brainId: string, turnId: string | undefined, action: string, args: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
     if (!turnId) throw new Error("Task attachments require the actual owning chat turn.");
     if (action !== "list" && action !== "read") throw new Error("Unknown task attachment action.");
+    if (args.entryPath !== undefined && typeof args.entryPath !== "string") throw new Error("Folder entryPath must be a string.");
     if (this.inheritedFiles?.has(brainId, turnId)) {
       const references = await this.inheritedFiles.references(brainId, turnId, signal);
       if (action === "list") {
@@ -176,7 +177,7 @@ export class TaskContinuationAttachments {
       const attachmentId = typeof args.attachmentId === "string" ? args.attachmentId : references.length === 1 ? references[0]!.attachmentId : undefined;
       if (!attachmentId) throw new Error("Choose one exact reviewed inherited task attachment.");
       if (args.offset !== undefined && typeof args.offset !== "number" || args.maxBytes !== undefined && typeof args.maxBytes !== "number") throw new Error("Attachment read range must use safe integers.");
-      return this.inheritedFiles.read(brainId, turnId, attachmentId, args.offset as number | undefined, args.maxBytes as number | undefined, signal);
+      return this.inheritedFiles.read(brainId, turnId, attachmentId, args.offset as number | undefined, args.maxBytes as number | undefined, signal, args.entryPath as string | undefined);
     }
     const { store, snapshot } = await this.scope(brainId, turnId, signal);
     const attachments = await this.handlesForTurn(brainId, turnId);
@@ -186,6 +187,6 @@ export class TaskContinuationAttachments {
     if (!attachmentId) throw new Error("Choose one attachmentId from the current continued task before reading.");
     if (args.offset !== undefined && (typeof args.offset !== "number" || !Number.isSafeInteger(args.offset)) ||
         args.maxBytes !== undefined && (typeof args.maxBytes !== "number" || !Number.isSafeInteger(args.maxBytes))) throw new Error("Attachment read range must use safe integers.");
-    return this.readForTask(brainId, turnId, attachmentId, args.offset as number | undefined, args.maxBytes as number | undefined, signal);
+    return this.readForTask(brainId, turnId, attachmentId, args.offset as number | undefined, args.maxBytes as number | undefined, signal, args.entryPath as string | undefined);
   }
 }
