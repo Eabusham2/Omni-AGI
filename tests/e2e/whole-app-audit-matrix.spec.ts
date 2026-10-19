@@ -456,7 +456,7 @@ async function prepareDesignState(page: Page, state: string): Promise<void> {
     await page.getByRole("textbox", { name: "Search brains" }).fill("Aster");
     await expect(page.locator(".library-selection-count")).toContainText("outside this search");
   } else if (state === "home-export-menu") {
-    await page.locator(".library-export-menu > summary").click();
+    if (await page.locator(".library-export-menu").getAttribute("open") === null) await page.locator(".library-export-menu > summary").click();
     await expect(page.getByRole("group", { name: "Brain export options" })).toBeVisible();
   } else if (state === "home-delete-confirmation") {
     await page.keyboard.press("Escape");
