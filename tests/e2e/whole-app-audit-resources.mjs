@@ -6,6 +6,11 @@ import { join } from "node:path";
 export class AuditResourcePauseError extends Error {
   constructor(snapshot) { super("UI audit paused at its existing disk reserve or OS memory-pressure boundary."); this.name = "AuditResourcePauseError"; this.snapshot = snapshot; }
 }
+/** Latest user policy admits normal and warning pressure (swap may be used),
+ * but never critical/unknown pressure or the existing free-disk boundary. */
+export function permitsAuditResources(availableDiskBytes, osMemoryPressureLevel) {
+  return Number.isFinite(availableDiskBytes) && availableDiskBytes >= 20 * 1024 ** 3 && [1, 2].includes(osMemoryPressureLevel);
+}
 export function auditResourceSnapshot(repository) {
   const capturedAt = new Date().toISOString(), diskReserveBytes = 20 * 1024 ** 3;
   try {
@@ -15,7 +20,9 @@ export function auditResourceSnapshot(repository) {
     const osMemoryPressureLevel = Number(execFileSync("sysctl", ["-n", "kern.memorystatus_vm_pressure_level"], { encoding: "utf8", timeout: 5000 }).trim());
     const swapUsageRaw = execFileSync("sysctl", ["vm.swapusage"], { encoding: "utf8", timeout: 5000 }).trim();
     return { capturedAt, diskReserveBytes, availableDiskBytes, platform: process.platform, osMemoryPressureLevel, swapUsageRaw,
-      canContinue: availableDiskBytes >= diskReserveBytes && osMemoryPressureLevel === 1 };
+      allowedMemoryPressureLevels: [1, 2], memoryPressureWarning: osMemoryPressureLevel === 2, criticalMemoryPressure: osMemoryPressureLevel === 4,
+      admissionPolicy: "warning-pressure-and-swap-permitted; critical-or-unknown-pressure-pauses",
+      canContinue: permitsAuditResources(availableDiskBytes, osMemoryPressureLevel) };
   } catch (error) { return { capturedAt, diskReserveBytes, platform: process.platform, canContinue: false,
     reason: error instanceof Error ? error.message : String(error) }; }
 }
