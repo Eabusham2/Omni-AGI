@@ -119,7 +119,7 @@ describe("fresh attention service boundary", () => {
     ).rejects.toThrow("invalid fresh-attention receipt");
   });
 
-  it("keeps the confirmed operation inside collapsed Research diagnostics", async () => {
+  it("keeps the confirmed operation inside a concise collapsed Fresh attention action", async () => {
     const source = await readFile(
       join(process.cwd(), "src/renderer/src/App.tsx"),
       "utf8"
@@ -132,16 +132,21 @@ describe("fresh attention service boundary", () => {
     const outside = source.slice(0, start) + source.slice(end);
 
     expect(workspace).toContain(
-      '<details className="research-diagnostics resource-settings-diagnostics">'
+      '<details className="brain-settings-disclosure resource-settings-attention">'
     );
     expect(workspace).not.toContain(
-      '<details open className="research-diagnostics resource-settings-diagnostics">'
+      '<details open className="brain-settings-disclosure resource-settings-attention">'
     );
+    expect(workspace).toContain("Clear current attention without deleting learned memory or conversation.");
+    expect(workspace).not.toContain("<small>Next response</small>");
+    expect(workspace).not.toContain("research-diagnostics__grid");
     expect(workspace).toContain("Start fresh attention?\\n\\n");
     expect(workspace).toContain("keeps visible chat history");
     expect(workspace).toContain("learned weights and connections");
     expect(workspace).toContain("can re-enter only when you explicitly use the brain.history tool");
     expect(workspace).toContain("window.omni.brain.freshAttention(brain.id)");
+    expect(workspace).toContain("if (!window.omni || freshAttentionBusy || foregroundTurnActive) return;");
+    expect(workspace).toContain('instanceState?.phase !== "loaded" || instanceState.resume');
     expect(outside).not.toContain("Start fresh attention?");
   });
 });

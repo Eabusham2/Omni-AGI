@@ -56,7 +56,7 @@ export function BrainMapSubstrateGraph({ nodes, edges, selectedId, onSelect, sel
           pitch: Math.max(-Math.PI / 2, Math.min(Math.PI / 2, initial.pitch + (event.clientY - initial.y) * 0.008)) });
       }}
       onPointerUp={() => { dragging.current = null; }} onPointerCancel={() => { dragging.current = null; }}>
-      <desc>{nodes.length} inspected nodes and {contacts.length} visible recorded pathways. {edges.length - contacts.length} pathways have off-page or invalid endpoints. No spike is inferred from connection strength or confidence.</desc>
+      <desc>{nodes.length} inspected nodes and {contacts.length} visible recorded pathways. {edges.length - contacts.length} pathways have off-page or invalid endpoints. Positions are a visualization layout, not anatomy. Activation is not a recorded spike; no spike is inferred from connection strength or confidence.{dimension === "3d" ? " Drag or use arrow keys to rotate." : ""}</desc>
       <defs><marker id={markerId} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" /></marker></defs>
       {contacts.map(({ edge, path }) => {
         const firing = recordedFiring(edge.firingEvent);
@@ -96,6 +96,5 @@ export function BrainMapSubstrateGraph({ nodes, edges, selectedId, onSelect, sel
         </g>;
       })}
     </svg>
-    <small className="brain-map-graph__scope">Current paged records · {dimension === "3d" ? "drag or use arrow keys to rotate · " : ""}layout, not anatomy · activation is not a recorded spike</small>
   </div>;
 }

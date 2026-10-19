@@ -153,3 +153,36 @@ current visual/platform acceptance. Required384 appearance combinations now span
 five primary routes (1,920 core route visits). The updated composed-state set,
 visual review, CI, packages and release must be qualified on this changed source;
 old11/12-route metrics or screenshots do not close those gates.
+
+## October19 — implicit capabilities, no forced-setting displays
+
+Latest exact user instructions, in order:
+
+```text
+it still has senses and data insrtead of just senses comon u gotta work on the vewrbatum fo in parallel, so do in parralel when done redo checks but dont cancel prev checks, so many stuff not done 😡
+```
+
+```text
+it still has the ticks for the stuff u want to show like the vision or audio or vid i said all should be on forced and no option
+```
+
+The user answered **Keep the current preview only** when offered a new updated
+no-engine preview, then added:
+
+```text
+and no displaying something thats forced
+```
+
+The Build label is **Senses**. All supported modality flags remain true in the
+architecture; the product must not replace capability choices with disabled
+checkboxes or fixed capability summaries. Remove fixed architecture/policy
+review rows and static panels rather than presenting mandatory behavior as a
+setting. Preserve measured resource/parameter counters, editable RAM/VRAM/disk
+and context settings, tool/OS permissions, actual speech-route options and
+actionable warnings. This is presentation cleanup, not permission removal or
+a change to native learning and modality computation.
+
+Keep the existing frozen audit and hosted CI running. Source changes belong in
+the primary checkout; do not mutate that cohort's source or assets. Afterward,
+verify coverage affected by the new UI on its exact source. The personal preview
+remains the user's older, unmonitored snapshot, without reload or replacement.

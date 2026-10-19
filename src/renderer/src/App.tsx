@@ -1524,7 +1524,7 @@ function Toggle({
 
 const simpleBuildSteps = [
   ["Identity", "Name this persistent mind"],
-  ["Senses & data", "Add its first experiences"],
+  ["Senses", "Add its first experiences"],
   ["Memory & storage", "Size from this device and data"],
   ["Access", "Choose what it may use"]
 ] as const;
@@ -1888,6 +1888,7 @@ function SimpleBuildWizard({
               ? `${memoryPlan.resources.systemRamSharePercent}% of the safe Omni pool`
               : "Device benchmark pending"}
           </span>
+          {detectedHardware ? <span>{detectedHardware.recommendedTier} · {detectedHardware.logicalCpus} CPU threads</span> : null}
         </div>
         <div>
           <small>Shared drive spill pool</small>
@@ -2292,27 +2293,6 @@ function SimpleBuildWizard({
           </div>
         </div>
       </section>
-      <details className="research-diagnostics">
-        <summary>
-          <span><Icon name="pulse" size={16} /> Research diagnostics</span>
-          <span>Measured internals <Icon name="chevron" size={14} /></span>
-        </summary>
-        <div className="research-diagnostics__grid">
-          <span><small>Forward synapses</small><strong>Exact −1 · 0 · +1</strong></span>
-          <span><small>Working activity</small><strong>Whole-experience recurrent integration</strong></span>
-          <span><small>Fast temporal memory</small><strong>LIF + episodic STDP synapses</strong></span>
-          <span><small>Spreading recall</small><strong>Distributed assemblies + signed pathways</strong></span>
-          <span><small>Slow learning</small><strong>Replay into learned weights</strong></span>
-          <span><small>Retention dynamics</small><strong>Salience + interference + stability + decay</strong></span>
-          <span><small>Raw-source retention</small><strong>Off · no routine prompt retrieval</strong></span>
-          <span><small>Initialization</small><strong>Locally initialized native core</strong></span>
-          <span><small>Growth</small><strong>Resource-governed, no model cap</strong></span>
-          <span>
-            <small>Hardware profile</small>
-            <strong>{detectedHardware ? `${detectedHardware.recommendedTier} · ${detectedHardware.logicalCpus} threads` : "Detected at build time"}</strong>
-          </span>
-        </div>
-      </details>
     </div>
   );
 
@@ -2322,7 +2302,7 @@ function SimpleBuildWizard({
         <span className="stage-number">02</span>
         <div>
           <h2 tabIndex={-1}>Initial learning</h2>
-          <p>Add files, media, folders, or a website. Text, vision, audio, and video are included.</p>
+          <p>Add files, media, folders, or a website.</p>
         </div>
       </div>
       <div className="build-resource-actions">
@@ -2395,14 +2375,6 @@ function SimpleBuildWizard({
           <p>No data selected. Build learns tool basics, but language starts primitive. Add text data for useful conversation.</p>
         ) : null}
       </div>
-      <small className="build-resource-note">
-        Remove only changes this build list; it never deletes or modifies the original files.
-        Every selected document, dataset, image, audio clip, video, or folder is queued for
-        neural encoding and training. Web sources crawl same-site in parallel, including linked
-        image, audio, and video resources. Each web source contributes a 1 GiB initial rolling
-        scratch reserve to sizing; an indefinite crawl expands the shared pool transactionally
-        or pauses before its free-space boundary instead of pretending its final size is zero.
-      </small>
     </div>
   );
 
@@ -2455,18 +2427,13 @@ function SimpleBuildWizard({
           <span><small>READY TO CREATE</small><strong>{name || "Unnamed mind"}</strong></span>
         </div>
         <dl>
-          <div><dt>Identity</dt><dd>One continuous adaptive mind</dd></div>
-          <div><dt>Learning</dt><dd>Continuous · whole-experience adaptation</dd></div>
           <div><dt>Working memory</dt><dd>{memoryPlan ? `${memoryPlan.context.selectedTokens.toLocaleString()} tokens` : "Hardware-sized automatically"}</dd></div>
           <div><dt>RAM budget</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.resources.systemRamBudgetBytes)} · ${memoryPlan.resources.systemRamSharePercent}% after system reserve` : "Measuring device"}</dd></div>
           <div><dt>Shared storage</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.resources.sharedStoragePoolBytes)} · ${storagePoolMode === "auto" ? "Auto" : "Custom"}` : "Measuring device"}</dd></div>
           <div><dt>Disk space left</dt><dd>{memoryPlan ? `${formatBytes(memoryPlan.diskSpace.projectedRemainingBytes)} · ${formatBytes(memoryPlan.diskSpace.projectedAboveReserveBytes)} above reserve` : "Measuring device"}</dd></div>
           <div><dt>Native core</dt><dd>{memoryPlan?.architecture ? `${memoryPlan.architecture.exactLogicalParameterCount.toLocaleString()} logical neural parameters · locally initialized` : "Calculating exact architecture"}</dd></div>
           <div><dt>System access</dt><dd>{!systemAccessEnabled ? "Off" : fullAuthorityEnabled ? "Full Authority" : "On · risky actions ask"}</dd></div>
-          <div><dt>Self-improvement</dt><dd>Available under chosen access</dd></div>
           <div><dt>First learning</dt><dd>{extras.initialResources.length ? `Tool basics + ${extras.initialResources.length} queued source${extras.initialResources.length === 1 ? "" : "s"} · ${formatBytes(selectedTrainingBytes)} sizing input` : "Tool basics only · language starts primitive"}</dd></div>
-          <div><dt>Inputs &amp; imagination</dt><dd>Text, vision, audio, video</dd></div>
-          <div><dt>Behavioral prompt / RLHF</dt><dd>None</dd></div>
         </dl>
       </div>
     </div>
@@ -5959,13 +5926,11 @@ function ChatWorkspace({
                   <small>Total neural parameters</small>
                   <NeuralParameterCount accounting={chatParameterAccounting} />
                 </span>
-                <em>authoritative count</em>
               </div>
             ) : null}
             <div className="panel-section">
               <div className="panel-section__head">
                 <span>Organic signals</span>
-                <em>measured, not configured</em>
               </div>
               <div className="drive-grid">
                 {(recentTrace ? [
@@ -6474,9 +6439,6 @@ function RuntimeCard({
   const rows = [
     ["Behavioral system prompt", workspace ? (workspace.hiddenBehavioralPrompt ? "Present" : "None") : "Pending measurement"],
     ["Long-term source injection", workspace ? (workspace.rawLongTermTextInjected ? "Present" : "None") : "Pending measurement"],
-    ["Reward model / RLHF", "None"],
-    ["Ternary forward paths", "Mandatory · −1 / 0 / +1"],
-    ["Runtime", brain.config.runtime],
     [
       "Temporary context",
       telemetry?.contextText ?? "Measuring committed neural state…"
@@ -6554,10 +6516,6 @@ function RuntimeCard({
           </div>
         ))}
       </dl>
-      <div className="runtime-card__note">
-        <Icon name="info" size={15} />
-        Immediate connection changes and deferred weight updates belong to the same brain. Core weights are shown as changed only after their own checksum verifies an update. Temporary context remains available until natural decay, capacity eviction, or Fresh attention. Tool schemas describe available actions, not a personality.
-      </div>
     </div>
   );
 }
@@ -7385,30 +7343,12 @@ function DeviceRuntimeWorkspace({
           </p>
         </details>
 
-        <details className="research-diagnostics resource-settings-diagnostics">
+        <details className="brain-settings-disclosure resource-settings-attention">
           <summary>
-            <span><Icon name="pulse" size={16} /> Research diagnostics</span>
-            <span>Attention boundary <Icon name="chevron" size={14} /></span>
+            <span><Icon name="pulse" size={16} /> Fresh attention</span>
           </summary>
-          <div className="research-diagnostics__grid">
-            <span>
-              <small>Fresh attention</small>
-              <strong>Transient state only</strong>
-            </span>
-            <span>
-              <small>Preserved</small>
-              <strong>History + learned neural memory</strong>
-            </span>
-            <span>
-              <small>Next response</small>
-              <strong>No automatic prior chat text</strong>
-            </span>
-          </div>
           <p className="resource-settings-note">
-            Start a new attention epoch without deleting visible conversation,
-            weights, connections, replay, training receipts, tools, provenance,
-            or origin. Earlier messages can re-enter only through an explicit
-            brain.history tool action.
+            Clear current attention without deleting learned memory or conversation.
           </p>
           <div className="resource-settings-actions">
             <Button

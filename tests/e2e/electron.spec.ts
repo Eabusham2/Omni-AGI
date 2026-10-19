@@ -254,7 +254,7 @@ test("native desktop learns, retains chat across the five workspaces, preserves 
     await expect(
       page.getByRole("heading", { name: "Initial learning" })
     ).toBeVisible();
-    await expect(page.getByText(/Text, vision, audio, and video are included/)).toBeVisible();
+    await expect(page.getByText(/Text, vision, audio, and video are included/)).toHaveCount(0);
     await expect(page.locator(".modality-card")).toHaveCount(0);
     await page.getByRole("button", { name: "Add source", exact: true }).click();
     await expect(page.getByRole("button", { name: "Files & media", exact: true })).toBeVisible();
@@ -267,15 +267,14 @@ test("native desktop learns, retains chat across the five workspaces, preserves 
     await expect(
       page.getByText("Working memory holds current activity. Learning updates neural state over time.", { exact: true })
     ).toBeVisible();
-    await page.getByText("Research diagnostics", { exact: true }).click();
-    await expect(page.getByText("Locally initialized native core")).toBeVisible();
+    await expect(page.getByText("Research diagnostics", { exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "Continue" }).click();
 
     await expect(page.getByText("Step 4 of 4", { exact: true })).toBeVisible();
     await expect(
       page.getByRole("heading", { name: "Choose system access." })
     ).toBeVisible();
-    await expect(page.getByText("Behavioral prompt / RLHF")).toBeVisible();
+    await expect(page.getByText("Behavioral prompt / RLHF")).toHaveCount(0);
     await expect(page.getByRole("checkbox", { name: "System access" })).toBeChecked();
     await expect(page.getByRole("checkbox", { name: "Full Authority" })).not.toBeChecked();
     await page.getByRole("button", { name: "Create E2E Cortex" }).click();
@@ -308,8 +307,8 @@ test("native desktop learns, retains chat across the five workspaces, preserves 
     await expect(runtimeCard.getByRole("heading", { name: "Transparent runtime" })).toBeVisible();
     await expect(runtimeCard.getByText("Behavioral system prompt", { exact: true })).toBeVisible();
     await expect(runtimeCard.getByText("Long-term source injection", { exact: true })).toBeVisible();
-    await expect(runtimeCard.getByText("Reward model / RLHF", { exact: true })).toBeVisible();
-    await expect(runtimeCard.getByText("Mandatory · −1 / 0 / +1", { exact: true })).toBeVisible();
+    await expect(runtimeCard.getByText("Reward model / RLHF", { exact: true })).toHaveCount(0);
+    await expect(runtimeCard.getByText("Mandatory · −1 / 0 / +1", { exact: true })).toHaveCount(0);
     await expect(runtimeCard.getByText("Temporary context", { exact: true })).toBeVisible();
     await expect(
       runtimeCard.getByText("Recorded learning counters", { exact: true })

@@ -48,6 +48,82 @@ def dylib(*, signed=False, relocated=False, cpu=0x100000C):
 
 
 class NativeKernelPackagingIntegrityCases(unittest.TestCase):
+    def quota_ledger_module(self):
+        spec = importlib.util.spec_from_file_location("owned_windows_quota_liveness", ROOT / "engine/omni_core/shared_resource_ledger.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_windows_quota_liveness_never_signals_and_closes_read_only_process_handles(self):
+        from ctypes import wintypes
+        ledger = self.quota_ledger_module()
+        forbidden_signal = Mock(side_effect=AssertionError("A liveness check must never signal a Windows process"))
+        platform = SimpleNamespace(name="nt", getpid=lambda: 71, kill=forbidden_signal)
+        handle = 0x100000007  # Preserve a pointer-sized handle, not a DWORD.
+        for outcome, expected in ((258, True), (0, False), (0xFFFFFFFF, True), (OSError("owned wait failure"), True)):
+            with self.subTest(wait=type(outcome).__name__ if isinstance(outcome, Exception) else outcome):
+                kernel = SimpleNamespace(OpenProcess=Mock(return_value=handle), CloseHandle=Mock(return_value=True),
+                    WaitForSingleObject=Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(return_value=outcome))
+                with patch.object(ledger, "os", platform), patch.object(ctypes, "WinDLL", return_value=kernel, create=True) as library:
+                    self.assertEqual(ledger.SharedResourceLedger._process_alive(83), expected)
+                library.assert_called_once_with("kernel32", use_last_error=True)
+                kernel.OpenProcess.assert_called_once_with(0x00100000, False, 83)
+                kernel.WaitForSingleObject.assert_called_once_with(handle, 0)
+                kernel.CloseHandle.assert_called_once_with(handle)
+                self.assertEqual(kernel.OpenProcess.argtypes, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD])
+                self.assertIs(kernel.OpenProcess.restype, wintypes.HANDLE)
+                self.assertEqual(kernel.WaitForSingleObject.argtypes, [wintypes.HANDLE, wintypes.DWORD])
+                self.assertIs(kernel.WaitForSingleObject.restype, wintypes.DWORD)
+                self.assertEqual(kernel.CloseHandle.argtypes, [wintypes.HANDLE])
+        for code, expected in ((87, False), (5, True), (1314, True), (0, True)):
+            with self.subTest(open_error=code):
+                kernel = SimpleNamespace(OpenProcess=Mock(return_value=None), CloseHandle=Mock(), WaitForSingleObject=Mock())
+                with patch.object(ledger, "os", platform), patch.object(ctypes, "WinDLL", return_value=kernel, create=True), \
+                     patch.object(ctypes, "get_last_error", return_value=code, create=True):
+                    self.assertEqual(ledger.SharedResourceLedger._process_alive(83), expected)
+                kernel.WaitForSingleObject.assert_not_called(); kernel.CloseHandle.assert_not_called()
+        with patch.object(ledger, "os", platform), patch.object(ctypes, "WinDLL", side_effect=OSError("owned unavailable API"), create=True):
+            self.assertTrue(ledger.SharedResourceLedger._process_alive(83))
+        kernel = SimpleNamespace(OpenProcess=Mock(return_value=handle), WaitForSingleObject=Mock(return_value=0),
+            CloseHandle=Mock(side_effect=OSError("owned handle-close failure")))
+        with patch.object(ledger, "os", platform), patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+            self.assertTrue(ledger.SharedResourceLedger._process_alive(83))
+        kernel.CloseHandle.assert_called_once_with(handle)
+        with patch.object(ledger, "os", platform), patch.object(ctypes, "WinDLL", create=True) as library:
+            for pid in (71, 0, -1, True, None, 1 << 40):
+                self.assertTrue(ledger.SharedResourceLedger._process_alive(pid))
+            library.assert_not_called()
+        forbidden_signal.assert_not_called()
+        for failure, expected in ((None, True), (ProcessLookupError(), False), (PermissionError(), True)):
+            signal_probe = Mock(side_effect=failure)
+            with patch.object(ledger, "os", SimpleNamespace(name="posix", getpid=lambda: 71, kill=signal_probe)):
+                self.assertEqual(ledger.SharedResourceLedger._process_alive(83), expected)
+            signal_probe.assert_called_once_with(83, 0)
+
+    def test_windows_startup_control_lease_survives_actual_sqlite_reconciliation(self):
+        ledger_module = self.quota_ledger_module()
+        forbidden_signal = Mock(side_effect=AssertionError("Startup reconciliation must not terminate a lease owner"))
+        kernel = SimpleNamespace(OpenProcess=Mock(return_value=123), WaitForSingleObject=Mock(return_value=258), CloseHandle=Mock(return_value=True))
+        with TemporaryDirectory() as directory, patch.object(ledger_module, "os", SimpleNamespace(name="nt", getpid=lambda: 5151, kill=forbidden_signal)), \
+             patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+            path = Path(directory) / "quota.sqlite3"
+            own = ledger_module.SharedResourceLedger(path)
+            peer = ledger_module.SharedResourceLedger(path, pid=8282)
+            own.register_owner("stdio", 0); peer.register_owner("peer", 0)
+            control = own.reserve("stdio", "ram", 65536, observed_ram_bytes=0, ram_budget_bytes=131072, verified=True)
+            other = peer.reserve("peer", "ram", 16384, observed_ram_bytes=0, ram_budget_bytes=131072, verified=True)
+            self.assertEqual(own.status()["ramEscrowBytes"], 81920)
+            with self.assertRaises(ledger_module.SharedQuotaPause):
+                own.reserve("stdio", "ram", 65536, observed_ram_bytes=0, ram_budget_bytes=131072, verified=True)
+            self.assertEqual(own.status()["ramEscrowBytes"], 81920)
+            # Only an actual signalled process object can retire the peer's
+            # lease. The current worker's control reserve remains held.
+            kernel.WaitForSingleObject.return_value = 0
+            self.assertEqual(own.status()["ramEscrowBytes"], 65536)
+            control.release(); other.release()
+            self.assertEqual(own.status()["ramEscrowBytes"], 0)
+        forbidden_signal.assert_not_called()
+
     def native_builder(self):
         spec = importlib.util.spec_from_file_location("owned_native_kernel_builder", ROOT / "scripts/build-native-kernels.py")
         module = importlib.util.module_from_spec(spec)

@@ -1,5 +1,39 @@
 # Current implementation continuation
 
+### October19 — implicit capabilities and exact Windows startup correction
+
+Latest user authority: **Senses**, not **Senses & data**; all supported modalities
+stay enabled internally, without capability checkboxes, disabled substitutes or
+fixed summaries. Build's static architecture/policy panel and review rows are
+removed. Runtime Card's fixed architecture rows and repeated cortex footnotes
+are removed; measured counters, errors, resource planning and permissions remain.
+Fresh attention is a concise collapsed action with the same confirmation and
+transient-only safeguards. Graph context moves to its accessible description;
+actual recorded/unobserved activity and exact links remain. The user's current
+private preview stays unchanged and unmonitored.
+
+The affected source checks pass (one new Build case, three memory/Fresh-attention
+cases, and thirteen runtime/graph cases). Current renderer TypeScript exits0.
+Changed GUI assertions are reconciled, not yet accepted by these inert checks.
+The existing frozen full384 cohort at55b8116 remains running unchanged; its
+first twelve cells completed both core/composition batches. Changed UI needs
+genuinely affected follow-up coverage on its own exact source afterward, not
+retroactive acceptance from this older cohort. Preserve all earlier failures.
+
+Hosted1dd3c77: both macOS, both Linux, Android and iOS jobs are green. Both
+Windows jobs failed worker health with exit0, after all imports and the stdlib
+transport probe. The actual cause is the RAM ledger's unconditional Python
+`os.kill(pid, 0)`: Windows uses TerminateProcess for that signal, unlike POSIX.
+Its own control-lease reconciliation therefore terminated the worker before
+reading health. The helper now checks Windows process handles read-only, closes
+them, preserves leases on uncertain/denied checks, and never signals Windows.
+Two new stdlib-only inert cases pass, including actual SQLite quota preservation.
+Real hosted Windows health on the correction remains pending; no smoke gate is
+weakened and no brain is created, loaded, trained or quizzed for this correction.
+
+The following pilot/integration entries are retained historical evidence; the
+corrected1dd pilot subsequently passed, and the full cohort above is active.
+
 ### Verbatim2 pilot — incomplete, precise corrections only
 
 See [the October19 pilot report](ui-verbatim2-pilot-2026-10-19.md). All17 core

@@ -1340,7 +1340,7 @@ test("all themes keep Library, every Build step, and chat usable at every suppor
             await expect(page.getByText("Step 3 of 4", { exact: true })).toBeVisible();
             await page.evaluate(() => {
               document.querySelectorAll<HTMLDetailsElement>(
-                ".system-ram-budget, .research-diagnostics"
+                ".simple-builder .system-ram-budget, .simple-builder .brain-settings-disclosure"
               ).forEach((details) => {
                 details.open = true;
               });
@@ -1348,7 +1348,12 @@ test("all themes keep Library, every Build step, and chat usable at every suppor
             });
             await expect(page.locator(".system-ram-budget")).toHaveCount(2);
             await expect(page.locator(".system-ram-budget").first()).toHaveAttribute("open", "");
-            await expect(page.locator(".research-diagnostics")).toHaveAttribute("open", "");
+            await expect(page.locator(".simple-builder .brain-settings-disclosure").first()).toHaveAttribute("open", "");
+            await expect(page.locator(".simple-builder .research-diagnostics")).toHaveCount(0);
+            await expect(page.locator(".memory-storage-inputs")).toContainText("RAM allocation");
+            await expect(page.locator(".memory-storage-inputs")).toContainText("Native core");
+            await expect(page.locator(".memory-storage-inputs")).toContainText("Disk free now");
+            await expect(page.locator(".memory-storage-inputs")).toContainText("Space left after plan");
             await auditScrollableJourney(
               page,
               `${matrix}/build-memory-storage`,

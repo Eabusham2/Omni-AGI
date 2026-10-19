@@ -16,6 +16,39 @@ const app = readFileSync(resolve(root, "src/renderer/src/App.tsx"), "utf8");
 const css = readFileSync(resolve(root, "src/renderer/src/styles.css"), "utf8");
 
 describe("stable Build wizard resource flow", () => {
+  it("keeps mandatory modalities internal instead of presenting forced capabilities as choices or summaries", () => {
+    const build = app.slice(app.indexOf("function SimpleBuildWizard("), app.indexOf("function WorkspaceShell("));
+    const settings = app.slice(app.indexOf("function DeviceRuntimeWorkspace("), app.indexOf("function TrainingTelemetryMetrics("));
+    // Defaults and final submission both retain all senses, not just a label.
+    expect(build.match(/modalities: \{ vision: true, image: true, audio: true, video: true \}/g)).toHaveLength(2);
+    expect(build).not.toContain("setModalities");
+    expect(build).not.toContain("modality-card");
+    expect(build).not.toContain("What can it experience first?");
+    expect(build).not.toContain("Text, vision, audio, and video are included");
+    expect(build).not.toContain("Inputs &amp; imagination");
+    expect(build).not.toContain("Behavioral prompt / RLHF");
+    expect(build).not.toContain("<dt>Identity</dt>");
+    expect(build).not.toContain("<dt>Learning</dt>");
+    expect(build).not.toContain("<dt>Self-improvement</dt>");
+    expect(build).not.toContain("build-resource-note");
+    expect(build).not.toContain("Raw-source retention");
+    expect(settings).not.toContain("setModalities");
+    expect(settings).not.toContain("modality-card");
+    expect(settings).not.toContain("Inputs &amp; imagination");
+    // Keep selected access, measured state and resource rejection visible.
+    expect(build).toContain('label="System access"');
+    expect(build).toContain('label="Full Authority"');
+    expect(build).toContain("exactLogicalParameterCount");
+    expect(build).toContain("detectedHardware.logicalCpus");
+    expect(build).toContain("memoryPlan.blockers.join");
+    expect(build).toContain('title="Remove from this build; original files are not deleted"');
+    expect(build).toContain("trainingSourceBytes: selectedTrainingBytes");
+    expect(settings).toContain("resourcePlan?.warnings.length");
+    expect(settings).toContain("!resourcePlan?.allowed");
+    expect(settings).toContain("<DeviceAllocationSelector");
+    expect(settings).toContain("checked={mobileLan}");
+  });
+
   it("accounts for every selected local byte and gives unknown web crawls a nonzero reserve", () => {
     expect(INITIAL_WEB_CRAWL_RESERVE_BYTES).toBe(GIB_BYTES);
     expect(plannedTrainingSourceBytes([

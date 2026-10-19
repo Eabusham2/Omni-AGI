@@ -128,8 +128,39 @@ class SharedResourceLedger:
 
     @staticmethod
     def _process_alive(pid):
+        if type(pid) is not int or not 0 < pid <= 0xFFFFFFFF:
+            return True  # Invalid/unverified identity cannot retire a lease.
+        if pid == os.getpid():
+            return True
+        if os.name == "nt":
+            # Python os.kill(pid, 0) calls TerminateProcess(..., 0) on Windows;
+            # it is NOT the POSIX existence check. Open only a synchronizable
+            # process handle, observe it without waiting, and always close it.
+            # https://docs.python.org/3/library/os.html#os.kill
+            # https://learn.microsoft.com/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+                kernel.OpenProcess.restype = wintypes.HANDLE
+                kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                kernel.WaitForSingleObject.restype = wintypes.DWORD
+                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel.CloseHandle.restype = wintypes.BOOL
+                handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE, never terminate/write access.
+                if not handle:
+                    # A valid nonzero PID with no process object is absent.
+                    # Permission/API failures are uncertain: keep its leases.
+                    return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER
+                try:
+                    return kernel.WaitForSingleObject(handle, 0) != 0  # Only WAIT_OBJECT_0 proves exit.
+                finally:
+                    kernel.CloseHandle(handle)
+            except (AttributeError, OSError, OverflowError, ValueError):
+                return True
         try:
-            os.kill(pid, 0)  # Existence check only, never a termination signal.
+            os.kill(pid, 0)  # POSIX existence check only.
             return True
         except ProcessLookupError:
             return False

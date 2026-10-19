@@ -127,6 +127,16 @@ These are new implementation requirements, not completed-work claims.
     record and implement genuine missing feature paths without claiming
     unrestricted access to OS-protected resources.
 
+October19 presentation clarification: name the Build stage **Senses**, not
+**Senses & data**. Supported modalities remain enabled internally, with no
+capability checkboxes, disabled replacements, fixed review rows or “always on”
+summaries. Do not display forced configuration as if it were a choice. Preserve
+real camera/microphone consent, editable speech routes, actual measured counters,
+resource/access settings and actionable errors. Keep the user's current private
+preview unchanged; do not open another. Continue the existing frozen audit and
+CI without cancellation while applying these changes in the primary checkout;
+qualify genuinely affected UI coverage afterward on the changed source.
+
 Keep the user's separate preview unmonitored and unchanged until they close it
 or request another. Do not start a new brain or the deferred full training run.
 Freeze the new UI before restarting the full appearance/interaction matrix;

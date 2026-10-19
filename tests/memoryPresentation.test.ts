@@ -141,8 +141,10 @@ describe("memory presentation", () => {
       "1 active vectors"
     ]);
     expect(rendererApp).not.toContain("Ideas activated");
-    expect(rendererApp).toContain("Recalled idea previews");
-    expect(rendererApp).toContain("Neural signal measures");
+    // Signal and recall metadata stay available without restoring the removed
+    // standalone Trace page or its old inspection counters.
+    expect(rendererApp).not.toContain('view === "trace"');
+    expect(rendererApp).toContain("recentTrace.steps.map");
   });
 
   it("keeps fixed memory stages and unexplained jargon out of ordinary surfaces", () => {
@@ -184,7 +186,7 @@ describe("memory presentation", () => {
     expect(app).not.toContain("BACKGROUND NEURAL LEARNING");
     expect(app).not.toContain('memoryRecipe: "human-consolidation"');
     expect(app).toContain("LEARNING FROM DATA");
-    expect(app).toContain("Unordered evidence from this event; it is not a fixed memory sequence.");
+    expect(app).not.toContain('view === "trace"');
     expect(evolution).not.toContain("latent replay");
     expect(evolution.toLocaleLowerCase()).not.toContain("connected patterns");
     expect(demo).not.toContain('stage: "Plasticity"');
@@ -199,32 +201,31 @@ describe("memory presentation", () => {
     expect(architectureCopy).toContain("spreading activation, rehearsal, stability, interference, decay");
     expect(catalogCopy).toContain("not a menu of fixed memory stages or manual consolidation controls");
 
-    // Technical vocabulary remains available only in the deliberately opened
-    // research-details disclosure rather than as a personality/memory control.
-    const memoryStoryStart = app.indexOf(
+    // Build exposes measured resources and editable choices, not a static
+    // architecture/policy disclosure for capabilities that are always present.
+    const buildStart = app.indexOf("function SimpleBuildWizard(");
+    const build = app.slice(buildStart, app.indexOf("function WorkspaceShell(", buildStart));
+    const memoryStoryStart = build.indexOf(
       '<section className="working-memory-explainer memory-story-card"'
     );
-    const diagnosticsStart = app.indexOf(
-      '<details className="research-diagnostics">',
-      memoryStoryStart
-    );
-    const ordinaryMemoryStory = app.slice(memoryStoryStart, diagnosticsStart);
+    const ordinaryMemoryStory = build.slice(memoryStoryStart, build.indexOf("const dataStage", memoryStoryStart));
     expect(memoryStoryStart).toBeGreaterThan(-1);
-    expect(diagnosticsStart).toBeGreaterThan(memoryStoryStart);
-    expect(ordinaryMemoryStory).toContain("Each whole experience changes what is active now");
+    expect(ordinaryMemoryStory).toContain("Working memory holds current activity. Learning updates neural state over time.");
     expect(ordinaryMemoryStory).not.toMatch(/\b(?:LIF|STDP|assembl(?:y|ies)|slow weights)\b/);
-    expect(app).toContain('<details className="research-diagnostics">');
-    expect(app).toContain("Each whole experience changes what is active now");
-    expect(app).toContain("there is no manual memory step");
-    expect(app).toContain("<small>Working activity</small>");
-    expect(app).toContain("<small>Fast temporal memory</small>");
-    expect(app).toContain("<small>Spreading recall</small>");
-    expect(app).toContain("<small>Slow learning</small>");
-    expect(app).toContain("<small>Retention dynamics</small>");
-    expect(app).toContain("LIF + episodic STDP synapses");
-    expect(app).toContain("Replay into learned weights");
-    expect(app).toContain("Salience + interference + stability + decay");
+    expect(build).not.toContain('<details className="research-diagnostics">');
+    expect(build).not.toContain("<small>Working activity</small>");
+    expect(build).not.toContain("<small>Retention dynamics</small>");
+    expect(build).toContain("memoryPlan.resources.systemRamBudgetBytes");
+    expect(build).toContain("memoryPlan.resources.sharedStoragePoolBytes");
+    expect(build).toContain("memoryPlan.diskSpace.projectedRemainingBytes");
+    expect(build).toContain("memoryPlan.architecture.exactLogicalParameterCount");
+    expect(build).toContain("memoryPlan.blockers.join");
+    const settingsStart = app.indexOf("function DeviceRuntimeWorkspace(");
+    const settings = app.slice(settingsStart, app.indexOf("function TrainingTelemetryMetrics(", settingsStart));
+    expect(settings).toContain('<details className="surface resource-settings-benchmarks brain-settings-disclosure">');
+    expect(settings).toContain("resourcePlan.offload.benchmark.memoryBytesPerSecond");
+    expect(settings).toContain("resourcePlan.offload.benchmark.storageBytesPerSecond");
     expect(app).toContain("function BrainMapWorkspace(");
-    expect(app).toContain('entity: clustered ? "overview" : zoom >= 1.8 ? "neurons" : "assemblies"');
+    expect(app).toContain("<WholeBrainMap brainId={brain.id}");
   });
 });

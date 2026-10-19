@@ -5,7 +5,6 @@
 .brain-map-graph__dimensions{position:absolute;right:12px;top:12px;z-index:1;max-width:calc(100% - 24px);flex-wrap:wrap}
 .brain-map-graph__dimensions button{color:var(--text);border:1px solid var(--border);background:var(--surface-2,var(--surface-solid));min-height:32px}
 .brain-map-graph__dimensions button:focus-visible,.brain-map-graph>svg:focus-visible{outline:2px solid var(--graph-node-stroke-selected);outline-offset:3px}
-.brain-map-graph__scope{display:block;position:static;margin:8px 12px 4px;max-width:calc(100% - 24px);color:var(--text-2);font-size:12px;overflow-wrap:anywhere}
 .brain-map-graph .graph-node:focus-visible{outline:none}
 .brain-map-graph .graph-node:focus-visible>circle{stroke:var(--graph-node-stroke-selected);stroke-width:3px}
 .brain-map-graph [data-contact-id][data-firing="observed"]{stroke:var(--graph-node-ink)}

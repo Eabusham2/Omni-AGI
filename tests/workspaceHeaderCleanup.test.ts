@@ -61,4 +61,26 @@ describe("requested workspace header cleanup", () => {
     expect(build).not.toContain("What can it experience first?");
     expect(build).not.toContain("modality-card");
   });
+  it("omits fixed architecture rows and captions while retaining measured runtime and access state", () => {
+    const chat = source.slice(source.indexOf("function ChatWorkspace("), source.indexOf("function MessageBubble("));
+    const runtime = source.slice(source.indexOf("function RuntimeCard("), source.indexOf("function DeviceRuntimeWorkspace("));
+    expect(runtime).not.toContain("Reward model / RLHF");
+    expect(runtime).not.toContain("Ternary forward paths");
+    expect(runtime).not.toContain('["Runtime", brain.config.runtime]');
+    expect(runtime).not.toContain("runtime-card__note");
+    expect(chat).not.toContain("authoritative count</em>");
+    expect(chat).not.toContain("measured, not configured");
+    expect(runtime).toContain("workspace.hiddenBehavioralPrompt");
+    expect(runtime).toContain("workspace.rawLongTermTextInjected");
+    expect(runtime).toContain("telemetry?.corticalWeightsText");
+    expect(runtime).toContain("telemetry?.backgroundErrorText");
+    expect(runtime).toContain("neuralResourceRuntimeRows(workspace?.runtimeCard)");
+    expect(runtime).toContain("workspace.learning.fastNeuralMemory.connectionUpdatesTotal");
+    expect(runtime).toContain("evolutionPermission");
+    expect(runtime).toContain("enabledTools.length");
+    expect(chat).toContain("<NeuralParameterCount accounting={chatParameterAccounting}");
+    expect(chat).toContain("recentTrace.driveScores.curiosity");
+    expect(chat).toContain("<VoiceRoutingControls");
+    expect(chat).toContain("<LivePerceptionPanel");
+  });
 });

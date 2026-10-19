@@ -7,7 +7,6 @@
 .whole-brain-map__canvas .brain-map-graph{border:0;min-width:0;margin:0;padding:12px}
 .whole-brain-map__canvas .brain-map-graph svg{display:block;width:100%;height:auto;max-height:max(280px,calc(100dvh - 250px));min-height:240px}
 .whole-brain-map .brain-map-graph__dimensions{justify-content:flex-end;flex-wrap:wrap}
-.whole-brain-map .brain-map-graph__scope{display:none}
 .whole-brain-map .graph-edge--aggregate{stroke:var(--graph-node-stroke);stroke-dasharray:none}
 .whole-brain-map__status,.whole-brain-map__empty{margin:12px 16px;color:var(--text-2);overflow-wrap:anywhere}
 .whole-brain-map__status[role=alert]{color:var(--danger,var(--text));padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
