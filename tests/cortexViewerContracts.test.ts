@@ -19,6 +19,12 @@ describe("BrainMap cortical viewer source contracts (no UI/brain run)", () => {
     expect(app).toContain('import { WholeBrainMap } from "./WholeBrainMap"');
     expect(app).toContain("return <WholeBrainMap brainId={brain.id}");
     expect(app).not.toContain("activation: assembly.confidence");
-    expect(app).toContain("assembly.activationObserved === true");
+    const map = source("../src/renderer/src/WholeBrainMap.tsx");
+    const graph = source("../src/renderer/src/BrainMapSubstrateGraph.tsx");
+    const activity = source("../src/renderer/src/brainMapGraphPresentation.ts");
+    expect(map).toContain("activation: 0, activationObserved: false");
+    expect(map).not.toContain("activation: assembly.confidence");
+    expect(graph).toContain("const activation = observedActivation(node)");
+    expect(activity).toContain("node.activationObserved === true && !node.activityOnly && Number.isFinite(node.activation)");
   });
 });

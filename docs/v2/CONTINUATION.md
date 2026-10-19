@@ -1,5 +1,14 @@
 # Current implementation continuation
 
+### Verbatim2 pilot — incomplete, precise corrections only
+
+See [the October19 pilot report](ui-verbatim2-pilot-2026-10-19.md). All17 core
+and25 composed states were visited, but two Home menu-preparation failures and
+the recorded bootstrap-file race keep acceptance open. Direct screenshot review
+also found the real light-theme Delete contrast defect. Preserve this attempt;
+fix source in PRIMARY and refreeze only after the pilot children are terminal.
+No full384 cohort or model qualification is claimed.
+
 ### Latest authority — Verbatim 2 integration, October18/19
 
 The newer exact request is appended to PLAN.md and REQUEST_VERBATIM.md.

@@ -19,17 +19,23 @@ describe("UI visual integrity", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("uses theme tokens for graph ink and separate in-flow pathway pagination", () => {
+  it("uses theme tokens for graph ink and separate in-flow map-area pagination", () => {
     expect(styles).toContain("--graph-node-ink:");
     expect(styles).toContain("--graph-label:");
     expect(styles).toContain("--graph-edge-positive:");
-    expect(styles).toMatch(/\.pathway-pagination\s*\{[^}]*position:\s*static;/s);
-    expect(styles).toMatch(/@media \(max-width: 760px\)[\s\S]*?\.map-viewport-controls button\s*\{[^}]*min-height:\s*36px;/);
+    expect(styles).toMatch(/\.button\s*\{[^}]*min-height:\s*36px;/);
+    const map = readFileSync(resolve(process.cwd(), "src/renderer/src/WholeBrainMap.tsx"), "utf8");
+    const mapStyles = readFileSync(resolve(process.cwd(), "src/renderer/src/wholeBrainMap.css"), "utf8");
+    expect(mapStyles).toMatch(/\.whole-brain-map__navigation\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;/);
+    expect(mapStyles.match(/\.whole-brain-map__navigation\s*\{([^}]+)\}/)?.[1]).not.toMatch(/position:\s*(?:absolute|fixed)/);
     const graph = readFileSync(resolve(process.cwd(), "src/renderer/src/BrainMapSubstrateGraph.tsx"), "utf8");
     expect(graph).toContain('className={`graph-edge ${');
     expect(graph).toContain('"graph-edge--negative"');
     expect(graph).toContain('"graph-edge--positive"');
-    expect(app).toContain('className="map-viewport-controls pathway-pagination"');
+    expect(map).toContain('className="whole-brain-map__navigation"');
+    expect(map).toContain('aria-label="Previous map area"');
+    expect(map).toContain('aria-label="Next map area"');
+    expect(map).toContain("if (page.hasMore && page.nextCursor)");
   });
 
   it("anchors jump-to-latest inside the message viewport instead of the composer", () => {
@@ -61,9 +67,11 @@ describe("UI visual integrity", () => {
     }
   });
 
-  it("shows the actual connection total in a responsive text badge, not a broken gauge", () => {
-    expect(app).toContain('className="memory-connection-count"');
-    expect(styles).toMatch(/\.memory-connection-count\s*\{[^}]*font-variant-numeric:\s*tabular-nums;/s);
+  it("shows authoritative neural parameter totals in a responsive text badge, not a broken gauge", () => {
+    expect(app).toContain('className="neural-parameter-count"');
+    expect(app).toContain("<NeuralParameterCount accounting={chatParameterAccounting}");
+    expect(app).toContain("accounting.totalNeuralParameters.toLocaleString");
+    expect(styles).toMatch(/\.neural-parameter-count\s*\{[^}]*max-width:\s*100%;[^}]*font-variant-numeric:\s*tabular-nums;/s);
     expect(styles).not.toContain("--health-score");
   });
 

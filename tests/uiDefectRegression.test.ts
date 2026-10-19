@@ -7,6 +7,9 @@ const app = readFileSync(resolve(root, "src/renderer/src/App.tsx"), "utf8");
 const styles = readFileSync(resolve(root, "src/renderer/src/styles.css"), "utf8");
 const responseCounter = readFileSync(resolve(root, "src/renderer/src/ResponseOutputCounter.tsx"), "utf8");
 const submitControl = readFileSync(resolve(root, "src/renderer/src/ComposerSubmitControl.tsx"), "utf8");
+const map = readFileSync(resolve(root, "src/renderer/src/WholeBrainMap.tsx"), "utf8");
+const mapViewport = readFileSync(resolve(root, "src/shared/wholeBrainViewport.ts"), "utf8");
+const learning = readFileSync(resolve(root, "src/renderer/src/LearningWorkspace.tsx"), "utf8");
 const chatWorkspaceActivity = readFileSync(
   resolve(root, "src/renderer/src/chatWorkspaceActivity.ts"),
   "utf8"
@@ -28,21 +31,33 @@ describe("screenshot defect regressions", () => {
     expect(styles).toContain("overflow-wrap: anywhere");
   });
 
-  it("keeps Data and Brain Map navigable, and the map populated during live update lag", () => {
+  it("keeps Training and Brain Map navigable, retaining the previous consistent map during refresh", () => {
     expect(app).toContain('onBack={() => onView("chat")}');
     expect(app).toContain('aria-label="Back to conversation"');
     expect(app).toContain('<BrainMapWorkspace brain={brain} onBack={() => onView("chat")} />');
-    expect(app).toContain('id: "substrate-overview"');
-    expect(app).toContain('aria-label="Search neural assemblies"');
-    expect(app).toContain('aria-busy={substrateLoading || undefined}');
+    expect(map).toContain('<button type="button" className="button" onClick={onBack}>Back to chat</button>');
+    expect(map).toContain("hydrateWholeBrainViewport(api, brainId");
+    expect(map).toContain('aria-label="Connected brain map"');
+    expect(map).toContain("disabled={!api || busy}");
+    const verifySnapshot = map.indexOf("projectWholeBrainInspection({ pages: [fresh.overview");
+    const publishSnapshot = map.indexOf("setOverview(fresh.overview)");
+    expect(verifySnapshot).toBeGreaterThan(-1);
+    expect(publishSnapshot).toBeGreaterThan(verifySnapshot);
+    expect(mapViewport).toContain("The brain changed while refreshing. The previous consistent map was kept.");
+    expect(map).not.toContain('id: "substrate-overview"');
   });
 
   it("uses durable topology totals without calling cumulative updates live connections", () => {
     expect(app).toContain("persistedConnections: brain.substrateTotals?.synapses");
-    expect(app).toContain("persistedOverview.totals.synapses");
+    expect(app).toContain("cumulativeUpdates: brain.neuralUpdates");
+    expect(app).toContain("connections.topologyPending");
     expect(app).toContain("unique live connections");
-    expect(app).toContain("cumulative connection updates");
-    expect(app).toContain("activity total · not unique connections");
+    expect(app).toContain("cumulative updates");
+    expect(app).toContain("compactNumber(connections.uniqueConnections)");
+    expect(app).toContain("compactNumber(connections.cumulativeUpdates)");
+    const counts = readFileSync(resolve(root, "src/renderer/src/uiPresentation.ts"), "utf8");
+    expect(counts).toContain("const uniqueConnections = queried ?? persisted ?? mirrored");
+    expect(counts).toContain("const cumulativeUpdates = uiCount(input.cumulativeUpdates) ?? 0");
     expect(app).not.toContain("Graph indexing connection updates…");
   });
 
@@ -136,15 +151,19 @@ describe("screenshot defect regressions", () => {
     expect(app).toContain("learningJobs.map((job, order)");
     expect(app).toContain('stopDatasetActivity("pause", entry.job!.id)');
     expect(app).toContain('stopDatasetActivity("cancel", entry.job?.id)');
-    expect(app).toContain('dataActionAvailableDuringTurn("immediate-write", foregroundTurnActive)');
-    expect(app).toContain("Uploads, training, and crawls started here join the visible queue");
+    expect(app).toContain("Current reply continues. New learning joins the shared queue.");
+    expect(learning).toContain("const saved = await api.start({ ...common, inputs, requestId })");
+    expect(learning).not.toContain("chat.cancel(");
+    expect(learning).toContain('...manifests.map(manifest => ({ kind: "dataset" as const, manifestId: manifest.id }))');
     expect(app).toContain('className="workspace-view-host__waiting"');
     expect(app).not.toMatch(/onView\([^)]*\)[\s\S]{0,160}chat\.cancel/);
   });
 
   it("shows concrete web searches and human neural-memory labels", () => {
     expect(app).toContain("chatActionSearchActivity(event.action, event.state)");
-    expect(app).toContain('"Neural memory + source" : "Neural memory"');
+    expect(app).toContain('"Temporary context"');
+    expect(app).toContain('"Immediate neural changes"');
+    expect(app).toContain('"Recorded learning counters"');
     expect(app).not.toContain('"Parameters only"');
     expect(app).not.toContain('"active patterns"');
     expect(app.toLocaleLowerCase()).not.toContain("connected memory");
@@ -159,17 +178,17 @@ describe("screenshot defect regressions", () => {
     expect(app).toContain('setHealth("Python engine reconnecting…")');
   });
 
-  it("shows complete source-ledger neural changes instead of one assembly", () => {
-    expect(app).toContain('className="source-neural-change"');
-    expect(app).toContain("compactParameterCount(source.learnedConcepts)");
-    expect(app).toContain("compactParameterCount(source.learnedSynapses)");
-    expect(app).toContain("compactParameterCount(source.learnedParameterSteps)");
-    expect(app).toContain('source.learnedParameterSteps === undefined');
-    expect(app).toContain('"Optimizer steps unknown"');
-    expect(app).toContain('"composite neural checksum changed"');
-    expect(app).toContain('dense model weight change is not separately verified.');
+  it("keeps full source coverage and measured neural counters without restoring training-change clutter", () => {
+    expect(learning).toContain("task.sources.map(source =>");
+    expect(learning).toContain("source.coverage.processedRecords.toLocaleString()");
+    expect(learning).toContain("source.coverage.rejectedRecords.toLocaleString()");
+    expect(learning).toContain("source.coverage.processedBytes.toLocaleString()");
+    expect(app).toContain("workspace.learning.fastNeuralMemory.connectionUpdatesTotal.toLocaleString()");
+    expect(app).toContain("workspace.learning.fastNeuralMemory.parameterStepsTotal.toLocaleString()");
+    expect(app).toContain('"Core weight verification"');
+    expect(app).toContain('telemetry?.corticalWeightsText ?? "Not independently verified"');
+    expect(app).not.toContain('className="source-neural-change"');
     expect(app).not.toContain("assembly deltas");
-    expect(styles).toContain(".source-row > span.source-neural-change");
   });
 
   it("contains focus rings for clipped edge controls in every theme", () => {

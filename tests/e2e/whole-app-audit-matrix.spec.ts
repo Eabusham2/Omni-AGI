@@ -71,8 +71,10 @@ type ControlSample = {
   width: number; height: number; clippedX: number; initialClippedX?: number; visible: boolean;
   color: string; background: string; opacity: string;
   contrast: number | null; contrastScope: "estimated-solid-composite" | "unmeasured-image-or-filter";
+  basePaint?: ControlPaint; hoverPaint?: ControlPaint; focusPaint?: ControlPaint;
   focused: boolean; hovered: boolean; invocation: "not-invoked-no-host-authority";
 };
+type ControlPaint = Pick<ControlSample, "color" | "background" | "opacity" | "contrast" | "contrastScope">;
 type Visit = {
   key: string; cellIndex: number; route: string; state: string; status: "visited" | "failed";
   startedAt: string; elapsedMs: number; controls: ControlSample[];
@@ -192,6 +194,13 @@ async function sampleControls(root: Locator, onlyId?: string): Promise<ControlSa
 }
 
 async function inspectPresentControls(root: Locator, page: Page, record: Visit, seen: Set<string>): Promise<void> {
+  const paintOf = (value: ControlSample): ControlPaint => ({ color: value.color, background: value.background,
+    opacity: value.opacity, contrast: value.contrast, contrastScope: value.contrastScope });
+  const checkPaint = (sample: ControlSample, phase: string, paint: ControlPaint) => {
+    if (!sample.disabled && !sample.inert && paint.contrast !== null && paint.contrast < 4.5)
+      record.issues.push({ kind: `contrast-${phase}`, control: sample.name || sample.id,
+        detail: `${phase}: ${paint.contrast.toFixed(3)}:1 below 4.5:1; ${paint.color} on ${paint.background}. Solid-composite estimate only.` });
+  };
   const samples = await sampleControls(root);
   for (const sample of samples) {
     if (!sample.visible || seen.has(sample.id)) continue;
@@ -200,6 +209,14 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
     sample.initialClippedX = sample.clippedX;
     if (!sample.name && !["input", "select", "textarea"].includes(sample.tag)) record.issues.push({ kind: "unnamed-control", control: sample.id, detail: `Visible ${sample.tag} has no inspected name` });
     try {
+      // Preserve real unhovered/unfocused ink. A later readable hover must not
+      // overwrite evidence of a low-contrast resting state (e.g. Delete).
+      await page.mouse.move(1, 1);
+      await control.evaluate(node => { (node.ownerDocument.activeElement as HTMLElement | null)?.blur?.(); });
+      await settledFrame(page);
+      const [base] = await sampleControls(root, sample.id);
+      if (!base) throw new Error("The control disappeared before its base paint was recorded.");
+      sample.basePaint = paintOf(base); checkPaint(sample, "base", sample.basePaint);
       if (sample.disabled || sample.inert) {
         // Pointer movement can inspect disabled :hover paint without waiting
         // for an intentionally non-actionable/inert control to become enabled.
@@ -207,13 +224,20 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
         if (bounds) await page.mouse.move(Math.max(0, Math.min((await page.viewportSize())!.width - 1, bounds.x + bounds.width / 2)), Math.max(0, Math.min((await page.viewportSize())!.height - 1, bounds.y + bounds.height / 2)));
       } else await control.hover({ timeout: 1500 });
       sample.hovered = await control.evaluate(node => node.matches(":hover"));
+      await settledFrame(page);
+      const [hovered] = await sampleControls(root, sample.id);
+      if (!hovered) throw new Error("The control disappeared before its hover paint was recorded.");
+      sample.hoverPaint = paintOf(hovered); checkPaint(sample, "hover", sample.hoverPaint);
       if (!sample.disabled && !sample.inert) {
+        await page.mouse.move(1, 1);
         await control.focus({ timeout: 1500 });
         sample.focused = await control.evaluate(node => document.activeElement === node);
         if (!sample.focused) record.issues.push({ kind: "focus-not-received", control: sample.name || sample.id, detail: "Programmatic focus was not received; keyboard order is a separate check" });
+        await settledFrame(page);
       }
       const [after] = await sampleControls(root, sample.id);
       if (after) {
+        if (!sample.disabled && !sample.inert) { sample.focusPaint = paintOf(after); checkPaint(sample, "focus", sample.focusPaint); }
         sample.clippedX = after.clippedX;
         sample.color = after.color; sample.background = after.background; sample.contrast = after.contrast; sample.contrastScope = after.contrastScope;
         if (after.clippedX > 2) record.issues.push({ kind: "hover-focus-clipping", control: sample.name || sample.id, detail: `${after.clippedX.toFixed(2)} px clipped after hover/focus` });
@@ -232,7 +256,12 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
 async function walkContent(page: Page, root: Locator, record: Visit): Promise<void> {
   await root.evaluate(element => {
     // Opening local disclosures inspects existing content only, not effects.
-    for (const detail of element.querySelectorAll<HTMLDetailsElement>("details")) detail.open = true;
+    for (const detail of element.querySelectorAll<HTMLDetailsElement>("details")) {
+      // Absolute action menus are transient, not document disclosures. Leave
+      // their state to the explicit menu scenario so they cannot cover cards
+      // while the ordinary Home selection state is inspected.
+      if (!detail.matches(".library-export-menu,.plugin-runtime-menu")) detail.open = true;
+    }
   });
   await settledFrame(page);
   const owners = await root.evaluate(element => {
@@ -753,12 +782,18 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
       if (url.protocol === "http:" && requested.origin === url.origin && staticArtifact.manifest.files.some(file => `/${file.path}` === requested.pathname) && !requested.search) await request.continue();
       else { externalRequests.push(request.request().url()); await request.abort("blockedbyclient"); }
     });
+    const page = await application.firstWindow();
+    // responsive-main's authorized no-preload bootstrap is a distinct frozen
+    // product file, not a fixture asset. Let that exact load finish before
+    // applying fixture-only file routing; keep HTTP blocked from the start.
+    const bootstrapUrl = new URL(pathToFileURL(resolve(repository, "out/renderer/index.html")));
+    bootstrapUrl.searchParams.set("omni-preview", "1");
+    await page.waitForURL(bootstrapUrl.href); await page.waitForLoadState("load");
     if (url.protocol === "file:") await application.context().route(/^file:\/\//, async request => {
       const requested = new URL(request.request().url());
       if (!requested.search && !requested.hash && staticArtifact.manifest.files.some(file => pathToFileURL(resolve(staticArtifact.site, file.path)).href === requested.href)) await request.continue();
       else { externalRequests.push(request.request().url()); await request.abort("blockedbyclient"); }
     });
-    const page = await application.firstWindow();
     page.on("pageerror", error => runtimeErrors.push(error.message));
     page.on("request", request => { if (request.isNavigationRequest()) navigationEvents.push({ event: "request", url: request.url(), at: new Date().toISOString() }); });
     page.on("requestfailed", request => { if (request.isNavigationRequest()) navigationEvents.push({ event: "requestfailed", url: request.url(), at: new Date().toISOString(), error: request.failure()?.errorText }); });

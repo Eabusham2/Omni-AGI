@@ -2929,9 +2929,9 @@ textarea:focus-visible,
 }
 
 .button--danger {
-  color: #ffb9c1;
-  border-color: rgba(236, 107, 122, 0.2);
-  background: rgba(236, 107, 122, 0.08);
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 24%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface-solid));
 }
 
 .icon-button {

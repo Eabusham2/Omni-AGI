@@ -38,10 +38,10 @@ describe("native brain provenance presentation", () => {
     expect(brainProvenancePresentation({})).toBeUndefined();
   });
 
-  it("wires native provenance into Library, Data, and Runtime", () => {
+  it("wires native provenance into Library and Runtime without restoring the removed Data banner", () => {
     const app = readFileSync(resolve(import.meta.dirname, "../src/renderer/src/App.tsx"), "utf8");
     expect(app).toContain('className="brain-card__provenance"');
-    expect(app).toContain('className="data-provenance-note"');
+    expect(app).not.toContain('className="data-provenance-note"');
     expect(app).toContain('className="runtime-card__provenance"');
     expect(app).toContain("brainProvenancePresentation({");
   });
