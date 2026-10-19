@@ -6,6 +6,7 @@ import type {
   ToolPermissionLevel,
   ToolPermissionRecord
 } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_BRAIN_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const SAFE_REQUEST_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
@@ -125,7 +126,7 @@ export class ToolPermissionStore {
   }
 
   private withDatabase<T>(operation: (database: DatabaseSync) => T): T {
-    const database = new DatabaseSync(this.path);
+    const database = new DatabaseSync(sqliteFilename(this.path));
     try {
       database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
       database.exec(`

@@ -11,6 +11,7 @@ import type {
   TrainingSourceLedgerEntry
 } from "../shared/types";
 import { normalizeSourceMediaType } from "../shared/sourceMediaType";
+import { sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-brain-activity-ledger";
 const FORMAT_VERSION = 1;
@@ -529,7 +530,7 @@ const INITIAL_META: Array<[string, string]> = [
 ];
 
 function createDatabase(path: string, brainId: string): DatabaseSync {
-  const database = new DatabaseSync(path);
+  const database = new DatabaseSync(sqliteFilename(path));
   configure(database);
   database.exec(`
     CREATE TABLE meta (
@@ -681,7 +682,7 @@ function summary(database: DatabaseSync, brainId: string): BrainActivityLedgerSu
 function openDatabase(path: string, brainId: string): DatabaseSync {
   let database: DatabaseSync | undefined;
   try {
-    database = new DatabaseSync(path);
+    database = new DatabaseSync(sqliteFilename(path));
     configure(database);
     migrateDerivedProjection(database);
     summary(database, brainId);

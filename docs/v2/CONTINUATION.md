@@ -1,5 +1,38 @@
 # Current implementation continuation
 
+### Windows reader follow-through afterd0e1486
+
+The actual Windows x64 job117824575115 passed the original long-path snapshot
+regressions, including the native >1200-character fixture. Full merge advanced
+past that snapshot and exposed an unadapted metadata reader at
+`apiTeacherMedia.ts:62`. The correction now centralizes SQLite filesystem-name
+handling in the dependency-light `sqliteFilename.ts`: all109 constructor
+expressions across62 existing main-process files, both backup destinations and
+both `VACUUM INTO` targets use it. The local AST comparison preserved every
+original filesystem argument and constructor option set; stored custody paths,
+schemas, permissions and learned bytes are unchanged. Special in-memory/temp
+names remain special, caller URI options are rejected, and the prior catalog
+and snapshot helpers delegate to the same locking path adapter. A committed
+AST coverage test prevents leaving the next reader on the old path handling.
+
+Thirty bounded filesystem cases pass locally across isolation, media
+composition, sparse portability and catalog portability. Deep historical
+teacher capture/adoption verifies exact archive bytes, normal metadata
+admission and dormant copied authority. This is not patched native Windows
+reader qualification; that remains the next hosted gate.
+
+The same hosted job recorded a separate three-second teacher fixture deadline
+expiring with state `running`, not a failed terminal state. Only that test now
+subscribes before Start, awaits its exact brain/job's committed completion
+event, rejects held/failed/cancelled states and reads the durable result before
+snapshotting. One affected case passes183ms locally; its unchanged outer
+30-second budget remains. No production teaching timeout was changed or later
+completion invented from the failed run.
+
+macOS ARM64 job117824575490 on this source point is green, including the
+packaged smoke's real clean exit. Root still owns the remaining exact-commit
+platform/package/release gates. No brain construction or training is authorized.
+
 ### Current hosted boundary —51ce41a completed; two distinct corrections composed
 
 All eight jobs on `51ce41a164fcc35cf2d0d77665cd8aef9770332f` are terminal.

@@ -9,6 +9,7 @@ import type { ImaginationAssemblyManifest, ImaginationAssemblyManifestSummary, I
 import { nativeMediaTimeline, imaginationDeliveryAnchor } from "../shared/nativeMediaTimeline";
 import { checkedAssemblyOptions, deliveredReplayState } from "./imaginationAssemblyPlan";
 import { replayFileHash, type InspectedReplaySource } from "./imaginationReplayCodec";
+import { sqliteFilename } from "./sqliteFilename";
 
 type Fragment = Omit<ImaginationCapturedFragment, "mediaUrl" | "available">;
 export interface ReplaySpoolSeal { jsonSha256: string; sqliteSha256: string; sourceSha256: string }
@@ -37,7 +38,7 @@ export async function buildReplaySpool(input: {
   admit(bytes: number): Promise<void>; reserve(bytes: number): Promise<void>; signal: AbortSignal;
   progress?(state:"sources"|"spooling",completed:number,total:number):void;
 }): Promise<{ summary: ImaginationAssemblyManifestSummary; seal: ReplaySpoolSeal; estimatedPeakBytes: number; timingIssueCount: number }> {
-  const sourcePath = join(input.directory, "source.sqlite3"), source = new DatabaseSync(sourcePath, { readOnly: true }), path = join(input.directory, "manifest.sqlite3"), db = new DatabaseSync(path);
+  const sourcePath = join(input.directory, "source.sqlite3"), source = new DatabaseSync(sqliteFilename(sourcePath), { readOnly: true }), path = join(input.directory, "manifest.sqlite3"), db = new DatabaseSync(sqliteFilename(path));
   db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-256; PRAGMA temp_store=FILE; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE fragments(idx INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,stream_id TEXT NOT NULL,offset REAL NOT NULL,frame INTEGER,body TEXT NOT NULL); CREATE TABLE sources(sha TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE tracks(slot INTEGER PRIMARY KEY,stream_id TEXT UNIQUE NOT NULL,body TEXT NOT NULL); CREATE TABLE events(frame INTEGER NOT NULL,stream_id TEXT NOT NULL,idx INTEGER NOT NULL,PRIMARY KEY(frame,stream_id)); CREATE INDEX event_stream ON events(stream_id,frame); CREATE TABLE spans(idx INTEGER PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE intervals(value REAL NOT NULL);");
   db.exec("BEGIN IMMEDIATE");
   let count = 0, maxWidth = 2, maxHeight = 2, sourceFps = 1, audioOnly = true, last = 0, timingIssueCount = 0;
@@ -113,7 +114,7 @@ export async function buildReplaySpool(input: {
 export class ReplaySpool {
   readonly db: DatabaseSync;
   constructor(readonly directory: string, readonly summary: ImaginationAssemblyManifestSummary) {
-    this.db = new DatabaseSync(join(directory, "manifest.sqlite3"), { readOnly: true }); this.db.exec("PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA temp_store=FILE;");
+    this.db = new DatabaseSync(sqliteFilename(join(directory, "manifest.sqlite3")), { readOnly: true }); this.db.exec("PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA temp_store=FILE;");
     const objects = this.db.prepare("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").all();
     if (objects.length !== 8 || objects.some(row => row.type !== "table" && row.name !== "event_stream") || this.db.prepare("SELECT value FROM meta WHERE key='format'").get()?.value !== "omni-replay-spool-1" || this.db.prepare("SELECT value FROM meta WHERE key='summary'").get()?.value !== JSON.stringify(summary)) { this.db.close(); throw new Error("Replay spool schema or bound summary changed."); }
   }

@@ -3,6 +3,7 @@ import { lstat, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProcessMemoryReceipt } from "../shared/processMemory";
 import { memoryId, processMemoryCanonical } from "./processMemoryFormat";
+import { sqliteFilename } from "./sqliteFilename";
 
 /** Installation-local host authority. Never placed in a brain/portable archive. */
 export class ProcessMemoryStore {
@@ -16,7 +17,7 @@ export class ProcessMemoryStore {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; if (!create) return undefined; }
     const parent = await lstat(root);
     if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error("Host-memory settings require a real installation directory.");
-    const db = new DatabaseSync(path, { readOnly: !create });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create });
     try {
       db.exec("PRAGMA cache_size=-64; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       if (create) db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; " +

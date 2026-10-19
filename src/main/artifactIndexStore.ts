@@ -3,6 +3,7 @@ import { open as openFile } from "node:fs/promises";
 import { access, mkdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ARTIFACT_INDEX_FORMAT = "omni-generated-artifact-index";
 const ARTIFACT_LEDGER_FORMAT = "omni-generated-artifact-ledger";
@@ -197,7 +198,7 @@ function configure(database: DatabaseSync): void {
 }
 
 function createDatabase(path: string, brainId: string): DatabaseSync {
-  const database = new DatabaseSync(path);
+  const database = new DatabaseSync(sqliteFilename(path));
   configure(database);
   database.exec(`
     CREATE TABLE meta (
@@ -236,7 +237,7 @@ function readMeta(database: DatabaseSync): Map<string, string> {
 function openDatabase(path: string, brainId: string): DatabaseSync {
   let database: DatabaseSync;
   try {
-    database = new DatabaseSync(path);
+    database = new DatabaseSync(sqliteFilename(path));
     configure(database);
     const meta = readMeta(database);
     if (

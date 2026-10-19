@@ -3,6 +3,8 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rename, stat, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
+import * as ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   copyMutableFileIsolated,
@@ -145,6 +147,85 @@ describe("mutable file isolation", () => {
     expect(query).toBe("vfs=win32-longpath");
     expect(filename).not.toContain("#");
     expect(privateSqliteFilename(path, "darwin")).toBe(path);
+  });
+
+  it.each([":memory:", ""])("preserves SQLite's special %j database name", path => {
+    expect(privateSqliteFilename(path, "win32")).toBe(path);
+    expect(privateSqliteFilename(path, "darwin")).toBe(path);
+    const database = new DatabaseSync(privateSqliteFilename(path));
+    try {
+      database.exec("CREATE TABLE private_state(value TEXT); INSERT INTO private_state VALUES ('not a filesystem path');");
+      expect(database.prepare("SELECT value FROM private_state").get()?.value).toBe("not a filesystem path");
+    } finally { database.close(); }
+  });
+
+  it.each(["file:owned.sqlite3?immutable=1", "file::memory:?cache=shared", "file:///owned.sqlite3?vfs=win32-none"])(
+    "does not accept caller-provided SQLite URI options: %s", path => {
+      expect(() => privateSqliteFilename(path, "win32")).toThrow(/filesystem path, not a URI/);
+      expect(() => privateSqliteFilename(path, "darwin")).toThrow(/filesystem path, not a URI/);
+    }
+  );
+
+  it("routes every main-process SQLite open, backup, and VACUUM target through the standalone filename boundary", async () => {
+    const root = fileURLToPath(new URL("../src/main/", import.meta.url));
+    const unchecked: string[] = []; let constructors = 0, backups = 0, vacuums = 0;
+    async function visitDirectory(directory: string): Promise<void> {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) { await visitDirectory(path); continue; }
+        if (!entry.name.endsWith(".ts")) continue;
+        const source = ts.createSourceFile(path, await readFile(path, "utf8"), ts.ScriptTarget.Latest, true);
+        const adapters = new Set<string>(), nativeConstructors = new Set(["DatabaseSync"]), nativeBackups = new Set<string>(), nativeNamespaces = new Set<string>();
+        const aliases = new Map<string, ts.Expression>();
+        for (const statement of source.statements) if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+          const bindings = statement.importClause?.namedBindings;
+          if (bindings && ts.isNamespaceImport(bindings) && statement.moduleSpecifier.text === "node:sqlite") nativeNamespaces.add(bindings.name.text);
+          if (!bindings || !ts.isNamedImports(bindings)) continue;
+          for (const item of bindings.elements) {
+            const imported = item.propertyName?.text ?? item.name.text;
+            if (statement.moduleSpecifier.text === "./sqliteFilename" && imported === "sqliteFilename") adapters.add(item.name.text);
+            if (statement.moduleSpecifier.text === "node:sqlite" && imported === "DatabaseSync") nativeConstructors.add(item.name.text);
+            if (statement.moduleSpecifier.text === "node:sqlite" && imported === "backup") nativeBackups.add(item.name.text);
+          }
+        }
+        function collectAliases(node: ts.Node): void {
+          if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) aliases.set(node.name.text, node.initializer);
+          ts.forEachChild(node, collectAliases);
+        }
+        collectAliases(source);
+        function usesAdapter(node: ts.Node, seen = new Set<string>()): boolean {
+          if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && adapters.has(node.expression.text)) return true;
+          if (ts.isIdentifier(node) && aliases.has(node.text) && !seen.has(node.text)) {
+            const next = new Set(seen); next.add(node.text); return usesAdapter(aliases.get(node.text)!, next);
+          }
+          return ts.forEachChild(node, child => usesAdapter(child, seen) || undefined) === true;
+        }
+        function inspect(node: ts.Node): void {
+          let argument: ts.Node | undefined, kind = "";
+          const isNative = (expression: ts.Expression, names: Set<string>, name: string): boolean =>
+            ts.isIdentifier(expression) && names.has(expression.text) || ts.isPropertyAccessExpression(expression) &&
+            ts.isIdentifier(expression.expression) && nativeNamespaces.has(expression.expression.text) && expression.name.text === name;
+          if (ts.isNewExpression(node) && isNative(node.expression, nativeConstructors, "DatabaseSync")) {
+            constructors++; argument = node.arguments?.[0]; kind = "constructor";
+          } else if (ts.isCallExpression(node) && isNative(node.expression, nativeBackups, "backup")) {
+            backups++; argument = node.arguments[1]; kind = "backup destination";
+          } else if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "exec") {
+            const sql = node.arguments[0];
+            if (sql && ts.isTemplateExpression(sql) && /^VACUUM\s+INTO\b/i.test(sql.head.text)) {
+              vacuums++; argument = sql; kind = "VACUUM destination";
+            }
+          }
+          const routed = argument && (kind === "VACUUM destination" ? usesAdapter(argument) : ts.isCallExpression(argument) &&
+            ts.isIdentifier(argument.expression) && adapters.has(argument.expression.text));
+          if (kind && !routed) unchecked.push(`${entry.name}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1} ${kind}`);
+          ts.forEachChild(node, inspect);
+        }
+        inspect(source);
+      }
+    }
+    await visitDirectory(root);
+    expect(constructors).toBeGreaterThan(0); expect(backups).toBeGreaterThan(0); expect(vacuums).toBeGreaterThan(0);
+    expect(unchecked).toEqual([]);
   });
 
   it("snapshots deep managed paths beyond default Windows limits without changing the source or sharing its inode", async () => {

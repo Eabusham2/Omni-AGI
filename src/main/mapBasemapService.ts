@@ -10,6 +10,7 @@ import { checkedMapBounds, mercatorLatitude, mercatorY, type MapBasemapProfile, 
   type MapRasterAuthentication, type MapRasterImage, type MapRasterRequest, type MapRasterResult, type MapRasterRights, type MapRasterSource } from "../shared/mapBasemaps";
 import { mapRasterImageInfo } from "./mapRasterImage";
 import packageMetadata from "../../package.json";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const hash = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
@@ -90,7 +91,7 @@ export class MapBasemapService {
   private database(): DatabaseSync {
     try { const info = lstatSync(this.databasePath); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Map basemap storage must be an owned regular file, not a link."); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const db = new DatabaseSync(this.databasePath); db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-512"); return db;
+    const db = new DatabaseSync(sqliteFilename(this.databasePath)); db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-512"); return db;
   }
   private now(): number { return this.options.now?.() ?? Date.now(); }
   private async admit(bytes: number, purpose: string): Promise<void> {

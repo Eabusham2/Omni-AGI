@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { getHeapStatistics } from "node:v8";
 import type { ImaginationAssembly } from "../shared/imaginationAssembly";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface ReplayJobSegment { index: number; path: string; sha256: string; bytes: number }
 export interface ReplayJobHead { sequence: number; sha256: string; revision: number; segmentCount: number; segmentsSha256: string }
@@ -149,7 +150,7 @@ export class ReplayJobStore {
       const info = await lstat(path + suffix).catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
       if (info) { owned(info, false); if (suffix !== "-journal") throw new Error("Replay state requires a committed standalone SQLite snapshot, not detached WAL state."); }
     }
-    const db = new DatabaseSync(path, { readOnly: options.readOnly ?? false, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: options.readOnly ?? false, allowExtension: false });
     const store = new ReplayJobStore(db, path, directories, { dev: present!.dev, ino: present!.ino }, pathId, savedId, brainId, options);
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA busy_timeout=5000;");

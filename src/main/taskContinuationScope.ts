@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { ChatTaskAttachmentKind } from "../shared/taskAttachments";
 import { canonicalTaskAttachmentValue, taskAttachmentManifestSha256, validatedTaskAttachmentSource,
   type PersistedTaskAttachmentRow } from "./taskAttachmentStore";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA = /^[a-f0-9]{64}$/;
@@ -258,7 +259,7 @@ export class TaskContinuationScopeStore {
       const info = lstatSync(path);
       if (info.isSymbolicLink() || path === this.path && !info.isFile() || path !== this.path && !info.isDirectory()) throw new Error("Task continuation registry path is unsafe.");
     }
-    const database = new DatabaseSync(this.path);
+    const database = new DatabaseSync(sqliteFilename(this.path));
     try {
       database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000; PRAGMA synchronous=FULL");
       if (database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== this.brainId ||

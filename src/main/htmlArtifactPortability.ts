@@ -12,6 +12,7 @@ import {
   type PersistedHtmlArtifactRow
 } from "./htmlArtifactStore";
 import { canonicalHtmlArtifactValue, htmlArtifactContentSha256, validateHtmlArtifactContent } from "./htmlArtifactFormat";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -103,7 +104,7 @@ export async function validateHtmlArtifactWorkspace(brainRoot: string, brainId: 
       throw new Error("HTML artifact workspace contains an unsupported payload.");
     }
   }
-  const database = new DatabaseSync(databasePath, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(databasePath), { readOnly: true });
   let rows: PersistedHtmlArtifactRow[];
   try {
     validateSchema(database);
@@ -145,7 +146,7 @@ export async function rekeyHtmlArtifactWorkspace(
 ): Promise<void> {
   if (!await validateHtmlArtifactWorkspace(brainRoot, sourceBrainId)) return;
   if (!SAFE_ID.test(targetBrainId)) throw new Error("Invalid HTML artifact target owner.");
-  const database = new DatabaseSync(HtmlArtifactStore.databasePath(brainRoot));
+  const database = new DatabaseSync(sqliteFilename(HtmlArtifactStore.databasePath(brainRoot)));
   try {
     database.exec("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE");
     try {
@@ -182,8 +183,8 @@ export async function mergeHtmlArtifactWorkspace(
   if (!await validateHtmlArtifactWorkspace(sourceRoot, targetBrainId)) return;
   const target = new HtmlArtifactStore(targetRoot, targetBrainId);
   await target.initialize();
-  const sourceDb = new DatabaseSync(HtmlArtifactStore.databasePath(sourceRoot), { readOnly: true });
-  const targetDb = new DatabaseSync(HtmlArtifactStore.databasePath(targetRoot));
+  const sourceDb = new DatabaseSync(sqliteFilename(HtmlArtifactStore.databasePath(sourceRoot)), { readOnly: true });
+  const targetDb = new DatabaseSync(sqliteFilename(HtmlArtifactStore.databasePath(targetRoot)));
   const copied: string[] = [];
   try {
     const rows = sourceDb.prepare("SELECT * FROM artifacts ORDER BY local_id").all() as unknown as PersistedHtmlArtifactRow[];

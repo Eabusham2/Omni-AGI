@@ -10,6 +10,7 @@ import { apiTeacherLessonModalities, type ApiTeacherMediaLesson, type ApiTeacher
   type ApiTeacherMediaKind, type ApiTeacherMediaCoverage, type ApiTeacherLessonModality } from "../shared/apiTeacherMedia";
 import type { ApiTeacherResponseEnvelope } from "../shared/apiTeacherMedia";
 import type { ApiTeacherProviderPart } from "./apiTeacherMediaProviders";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const API_TEACHER_MEDIA_REQUIRED_FEATURE = "api-teacher-typed-media-v1";
 const SHA = /^[a-f0-9]{64}$/, ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;
@@ -59,7 +60,7 @@ export async function admitApiTeacherDatabase(path: string, io: ApiTeacherMediaI
   await admitApiTeacherMedia(256 * 1024, "teacher custody SQLite cache", io);
   const info = await lstat(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Teacher metadata database is not an owned regular file.");
-  const database = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
   let largest = 0;
   try {
     database.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA mmap_size=0;");

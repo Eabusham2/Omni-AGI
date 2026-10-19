@@ -11,6 +11,7 @@ import { writeMutableFileIsolated } from "./mutableFileIsolation";
 import { captureMcpTaskCustody } from "./mcpTaskCustody";
 import { MCP_TASK_DIRECTORY } from "./mcpTaskStore";
 import { mcpTaskEnginePath } from "./mcpTaskArchive";
+import { sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-full-brain-merge";
 const VERSION = 1;
@@ -148,12 +149,12 @@ async function copyBlob(source: string, destination: string, expected: string, s
 export { copyBlob as copyFullMergeBlob };
 
 async function snapshotSqlite(source: string, target: string, signal: AbortSignal): Promise<void> {
-  const database = new DatabaseSync(source, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(source), { readOnly: true });
   try {
     database.exec("PRAGMA busy_timeout=1000; PRAGMA cache_size=-1024");
     // The asynchronous incremental API yields between pages, allowing Pause
     // while a large history/replay database is being captured.
-    await backup(database, target, { rate: 128, progress: () => signal.throwIfAborted() });
+    await backup(database, sqliteFilename(target), { rate: 128, progress: () => signal.throwIfAborted() });
     signal.throwIfAborted();
   } finally { database.close(); }
   const handle = await open(target, "r+");
@@ -196,7 +197,7 @@ export class FullBrainMergeCoordinator {
   }
 
   private database(directory: string): DatabaseSync {
-    const db = new DatabaseSync(join(directory, "files.sqlite3"));
+    const db = new DatabaseSync(sqliteFilename(join(directory, "files.sqlite3")));
     db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA cache_size=-1024");
     db.exec(`CREATE TABLE IF NOT EXISTS files (
       parent_id TEXT NOT NULL, path TEXT NOT NULL, source_bytes INTEGER NOT NULL, mode INTEGER NOT NULL,

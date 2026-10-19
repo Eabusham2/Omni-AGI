@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { FullMergeAssemblyInput } from "./fullBrainMerge";
 import { mergeMcpAppArtifacts, validateMcpAppArtifactStore } from "./mcpAppArtifacts";
 import { copyMutableFileIsolated } from "./mutableFileIsolation";
+import { sqliteFilename } from "./sqliteFilename";
 
 /** Extract only Apps from the writer-independent, lease-consistent archive.
  * The general parent tree can have been visited before this archive was sealed.
@@ -11,7 +12,7 @@ import { copyMutableFileIsolated } from "./mutableFileIsolation";
 async function materializeAppClosure(input: FullMergeAssemblyInput, parentRoot: string, brainId: string, target: string): Promise<void> {
   const archive = join(parentRoot, "portable-learning-workspace"), indexPath = join(archive, "inventory.sqlite3"), info = await lstat(indexPath);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Merge parent has no regular sealed workspace inventory.");
-  const db = new DatabaseSync(indexPath, { readOnly: true });
+  const db = new DatabaseSync(sqliteFilename(indexPath), { readOnly: true });
   try {
     db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512");
     if (db.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||

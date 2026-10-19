@@ -17,6 +17,7 @@ import {
 } from "./apiTeacherStore";
 import { copyMutableFileIsolated, snapshotMutableSqliteIsolated } from "./mutableFileIsolation";
 import { admitApiTeacherDatabase, apiTeacherMediaFiles, safeApiTeacherMediaPath, verifyApiTeacherMediaFile, type ApiTeacherMediaIo } from "./apiTeacherMedia";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface ApiTeacherPortabilityHooks {
   signal?: AbortSignal;
@@ -78,7 +79,7 @@ export async function apiTeacherMediaReferenceFiles(root: string, owner: string,
       // workspace merely to inspect their original immutable references.
       await admitApiTeacherDatabase(path, hooks);
       await validateApiTeacherDatabaseFile(path, lineage.sourceBrainId);
-      const database = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+      const database = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
       try {
         database.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA mmap_size=0;");
         for (const table of ["items", "history"] as const) for (const row of database.prepare(`SELECT payload,payload_sha FROM ${table}`).iterate()) {
@@ -268,7 +269,7 @@ async function copyKnownArchives(sourceRoot: string, targetRoot: string, records
 }
 
 async function checkpointBeforeReplacement(path: string): Promise<void> {
-  const database = new DatabaseSync(path, { allowExtension: false });
+  const database = new DatabaseSync(sqliteFilename(path), { allowExtension: false });
   try {
     database.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=30000; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
   } finally { database.close(); }

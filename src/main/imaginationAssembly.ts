@@ -12,6 +12,7 @@ import { buildReplaySpool, ReplaySpool, verifyReplaySpool, type ReplaySpoolSeal 
 import { readReplay, registerReplayWorkspaceBoundary, replayHash, replayId, replayJobIds, REPLAY_ROOT, writeReplayState, type ReplayIntent, type ReplayStoredState } from "./imaginationAssemblyWorkspace";
 import { ReplayJobStore } from "./imaginationReplayJobStore";
 import { readReplayPlanRequest, saveReplayPlanRequest, type ReplayPlanRequestReceipt } from "./imaginationPlanRequests";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface ImaginationAssemblyDependencies {
   brainDirectory(id: string): string;
@@ -81,7 +82,7 @@ export class ImaginationAssemblyService {
       progress({state:"snapshotting"});
       const recording = await this.deps.snapshotDatabase(request.brainId, positiveId(request.recordingId), request.expectedRevision, join(stage, "source.sqlite3"));
       signal.throwIfAborted();
-      const sourceCopy = new DatabaseSync(join(stage, "source.sqlite3")); try { sourceCopy.exec("PRAGMA journal_mode=DELETE"); } finally { sourceCopy.close(); }
+      const sourceCopy = new DatabaseSync(sqliteFilename(join(stage, "source.sqlite3"))); try { sourceCopy.exec("PRAGMA journal_mode=DELETE"); } finally { sourceCopy.close(); }
       progress({state:"runtime"}); const runtime = await this.deps.prepareRuntime(signal, value => progress({state:"runtime",runtime:value})), run = await (this.deps.runner ?? createReplayRunner)({ runtime, estimatedPeakBytes: 65536, checkResources: (bytes, pids) => this.deps.checkResources(request.brainId, bytes, pids), reserve: bytes => this.deps.reserve(root, bytes) });
       const built = await buildReplaySpool({ directory: stage, recording, options: request.options, refreshHz: this.deps.presentationRefreshHz?.(), signal, progress: (state,completed,total)=>progress({state,completedFragments:completed,totalFragments:total}),
         inspect: async fragment => { await this.deps.checkResources(request.brainId, (fragment.width ?? 2) * (fragment.height ?? 2) * 32 + 65536, []); return inspectReplaySource(run, await this.checkedSource(root, fragment), fragment.mimeType, fragment.mediaTimeline, stage, signal); },

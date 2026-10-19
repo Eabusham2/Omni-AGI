@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_INSTANCE_VOICE_SETTINGS, instanceVoiceSettingsFromLegacy, validateInstanceVoiceSettings,
   type InstanceVoicePreferences, type InstanceVoiceSettings } from "../shared/voiceRouting";
 import type { LiveVoicePreferences } from "../shared/liveVoice";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const VOICE_PREFERENCES_RELATIVE_PATH = "voice/workspace.sqlite3";
 const FORMAT = "omni-instance-voice-preferences-1";
@@ -51,7 +52,7 @@ export class VoicePreferencesStore {
     if (create) await mkdir(parent, { recursive: true, mode: 0o700 });
     const info = await lstat(parent);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Voice preference directory is not owned.");
-    const db = new DatabaseSync(path, { readOnly: !create });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create });
     try {
       db.exec("PRAGMA cache_size=-64; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       if (create) {

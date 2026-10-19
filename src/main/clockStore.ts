@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { validateScheduledAutomationReference } from "./automationFormat";
 import type { ClockPage, ClockPageQuery, ScheduleRecord, ScheduledOccurrence, StopwatchLap, StopwatchRecord } from "../shared/clock";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const CLOCK_RELATIVE_PATH = "clock/workspace.sqlite3";
 export const clockHash = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -78,7 +79,7 @@ export class ClockStore {
     if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error("Clock workspace must be an owned directory.");
     const file = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (file && (!file.isFile() || file.isSymbolicLink())) throw new Error("Clock database must be a regular owned file.");
-    const db = new DatabaseSync(path, { readOnly });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly });
     try {
       if (!readOnly) {
         // These short-lived metadata connections must not recreate WAL/SHM

@@ -33,6 +33,7 @@ import { ExternalAdviceClient, externalAdviceLoopbackEndpoint, type ExternalAdvi
 import { apiTeacherProvider, ollamaLoopbackEndpoint, ollamaLocalModelId } from "./apiTeacherProviders";
 import { ApiTeacherModelDiscoveryService } from "./apiTeacherModelDiscovery";
 import type { ApiTeacherModelDiscoveryRequest } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const EXTERNAL_ADVICE_RELATIVE_PATH = "external-advice/workspace.sqlite3";
 export const EXTERNAL_ADVICE_FORMAT = "omni-external-advice-workspace-1";
@@ -491,7 +492,7 @@ class ExternalAdviceWorkspace {
     const directoryInfo = await lstat(directory); if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error("External-advice workspace must be a private directory.");
     const file = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (file && (!file.isFile() || file.isSymbolicLink())) throw new Error("External-advice workspace database must be a regular file.");
-    const db = new DatabaseSync(path, { readOnly, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly, allowExtension: false });
     try {
       if (file) {
         admitExternalAdviceDatabase(db, owner, false);
@@ -503,7 +504,7 @@ class ExternalAdviceWorkspace {
   static async openDatabaseFile(path: string, owner: string): Promise<ExternalAdviceWorkspace> {
     brainId(owner); const file = await lstat(path);
     if (!file.isFile() || file.isSymbolicLink()) throw new Error("External-advice captured database must be a regular file.");
-    const db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
     try { admitExternalAdviceDatabase(db, owner, false); return new ExternalAdviceWorkspace(dirname(path), owner, db); }
     catch (error) { db.close(); throw error; }
   }

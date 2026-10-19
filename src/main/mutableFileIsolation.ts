@@ -11,21 +11,15 @@ import {
   stat,
   writeFile
 } from "node:fs/promises";
-import { dirname, win32 } from "node:path";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { sqliteFilename } from "./sqliteFilename";
+
+export { sqliteFilename as privateSqliteFilename } from "./sqliteFilename";
 
 export interface IsolatedFileCopyOptions {
   expectedSha256?: string;
   mode?: number;
-}
-
-/** Keep SQLite's path limit and Win32's MAX_PATH separate from owned file custody. */
-export function privateSqliteFilename(path: string, platform: NodeJS.Platform = process.platform): string {
-  if (platform !== "win32") return path;
-  // The longpath VFS retains normal locking but raises SQLite's pathname buffer
-  // limit. The extended-length prefix also bypasses Win32 MAX_PATH. Percent-
-  // encode the entire path so #, %, ? and UNC separators cannot become URI options.
-  return `file:${encodeURIComponent(win32.toNamespacedPath(path))}?vfs=win32-longpath`;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -211,17 +205,17 @@ export async function snapshotMutableSqliteIsolated(
   await mkdir(dirname(destination), { recursive: true });
   const temporary = `${destination}.${randomUUID()}.sqlite-next`;
   try {
-    const database = new DatabaseSync(privateSqliteFilename(source), { readOnly: true });
+    const database = new DatabaseSync(sqliteFilename(source), { readOnly: true });
     try {
       // The source handle is read-only. Do not also enable query_only: SQLite
       // classifies VACUUM INTO as a write statement even though it writes only
       // the separate destination database.
       database.exec("PRAGMA busy_timeout=30000;");
-      database.exec(`VACUUM INTO '${privateSqliteFilename(temporary).replaceAll("'", "''")}'`);
+      database.exec(`VACUUM INTO '${sqliteFilename(temporary).replaceAll("'", "''")}'`);
     } finally {
       database.close();
     }
-    const snapshot = new DatabaseSync(privateSqliteFilename(temporary));
+    const snapshot = new DatabaseSync(sqliteFilename(temporary));
     try {
       const checked = snapshot.prepare("PRAGMA quick_check").get() as
         | { quick_check?: string }

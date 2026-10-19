@@ -7,6 +7,7 @@ import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import { DatabaseSync } from "node:sqlite";
 import type { ActionEvent, ToolExecutionResult, ToolInvocation } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface CompletedActionEvidenceReceipt {
   brainId: string; evidenceId: string; executionId: string; evidenceSha256: string;
@@ -222,7 +223,7 @@ export class CompletedActionEvidenceStore {
     const prior = await lstat(indexPath).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (prior && (!prior.isFile() || prior.isSymbolicLink())) throw new Error("Retained effect index is not an owned regular cache.");
     await this.admit(131072, this.directory, true);
-    const database = new DatabaseSync(indexPath);
+    const database = new DatabaseSync(sqliteFilename(indexPath));
     try {
       database.exec("PRAGMA cache_size=-256; PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS effects(evidence_id TEXT PRIMARY KEY,sha256 TEXT NOT NULL,turn_id TEXT,native_id TEXT,tool_id TEXT,action TEXT,args_sha256 TEXT) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS by_native ON effects(turn_id,native_id)");
       const epoch = [info.dev, info.ino, info.mtimeNs, info.ctimeNs].join(":"), indexed = database.prepare("SELECT value FROM state WHERE key='evidence-mtime'").get();

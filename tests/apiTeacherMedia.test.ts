@@ -1,5 +1,6 @@
 /** Tiny file/SQLite/fake-provider contracts only. No account, worker, model, decoder or training. */
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { on } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +14,7 @@ import { snapshotLearningWorkspace } from "../src/main/learningWorkspacePortabil
 import { validateApiTeacherMediaArchiveSources } from "../src/main/apiTeacherMediaArchive";
 import { BrainService } from "../src/main/brainService";
 import type { ApiTeacherMediaLesson, ApiTeacherMediaKind, ApiTeacherMediaCoverage } from "../src/shared/apiTeacherMedia";
+import type { RuntimeJobEvent } from "../src/shared/types";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
@@ -147,7 +149,25 @@ describe("typed API-teacher media custody", () => {
     for (const part of original.items[0]!.mediaLesson!.parts) if (part.type !== "text") expect(await readFile(join(merged, part.relativePath))).toEqual(bytes[part.type]);
   });
   it("validates exact portable inventory media closure before adoption and refuses a missing declared asset", async () => {
-    const f = await fixture(); await f.service.start(f.request); await waitState(f, "complete"); await f.service.close();
+    const f = await fixture(), jobEvents = on(f.service, "event");
+    try {
+      // Subscribe before start so even immediate completion is retained. The
+      // owner publishes this event only after committing its terminal state;
+      // repeated SQLite reads and a second, shorter I/O deadline are unnecessary.
+      const job = await f.service.start(f.request);
+      for await (const [received] of jobEvents) {
+        const current = (received as RuntimeJobEvent).job;
+        if (current.brainId !== f.request.brainId || current.id !== job.id) continue;
+        if (current.state === "complete") break;
+        // Paused/review/stopped durable states project to runtime cancelled.
+        if (current.state === "failed" || current.state === "cancelled")
+          throw new Error(`Media fixture ended ${current.state}: ${current.error ?? current.label}`);
+      }
+      const committed = await f.service.details(f.request.brainId, job.id);
+      expect(committed).toMatchObject({ brainId: f.request.brainId, jobId: job.id,
+        state: "complete", learned: 1, failed: 0, items: [{ state: "complete" }] });
+      expect(f.fetcher).toHaveBeenCalledOnce(); expect(f.learn).toHaveBeenCalledOnce();
+    } finally { await jobEvents.return?.(); await f.service.close(); }
     const stage = await temporary(), workspace = await snapshotLearningWorkspace(f.root, join(stage, "workspace"), "brain-a");
     expect(workspace).toBeDefined();
     const entries = new Map([...workspace!.files].map(([name, path]) => [`learning-workspace/${name}`, { name, sourcePath: path }]));

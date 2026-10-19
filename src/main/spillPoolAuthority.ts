@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AuthorizedSpillStorageSnapshot, DeviceResourceSettings, DeviceResourceTopology } from "../shared/deviceResources";
 import { spillSelectionSignature } from "./spillSelectionSignature";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface SpillPoolSelection { selectionId: string; directories: string[]; }
 interface PoolRow { pool_id: string; path: string; backing_path: string; device: string; inode: string;
@@ -14,7 +15,7 @@ const identifier = (value: string) => typeof value === "string" && /^[A-Za-z0-9]
 export class SpillPoolAuthority {
   private readonly database: DatabaseSync;
   constructor(ledgerPath: string) {
-    this.database = new DatabaseSync(ledgerPath);
+    this.database = new DatabaseSync(sqliteFilename(ledgerPath));
     this.database.exec(`PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS drive_pools(pool_id TEXT PRIMARY KEY,path TEXT UNIQUE NOT NULL,backing_path TEXT NOT NULL,device TEXT NOT NULL,inode TEXT NOT NULL,backing_device TEXT NOT NULL,backing_inode TEXT NOT NULL,physical_group TEXT NOT NULL,rate INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS drive_access(owner TEXT NOT NULL,pool_id TEXT NOT NULL,PRIMARY KEY(owner,pool_id));

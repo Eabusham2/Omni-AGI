@@ -3,6 +3,7 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { DatasetManifestEntry } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface LearningSourceRelocation {
   originalPath: string;
@@ -32,7 +33,7 @@ export async function openLearningRelocations(root: string, brainId: string, wri
   if (!info && !write) return undefined;
   if (info && (!info.isFile() || info.isSymbolicLink())) throw new Error("Unsafe saved source-relocation index.");
   if (write) await mkdir(join(root, "learning"), { recursive: true, mode: 0o700 });
-  const database = new DatabaseSync(path, { readOnly: !write });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: !write });
   try {
     if (write) database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(manifest_id TEXT NOT NULL,entry_index INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(manifest_id,entry_index)); CREATE TABLE IF NOT EXISTS paths(relative_path TEXT PRIMARY KEY,body TEXT NOT NULL);");
     const owner = database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value;

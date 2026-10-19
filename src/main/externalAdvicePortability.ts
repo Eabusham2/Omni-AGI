@@ -8,6 +8,7 @@ import {
   externalAdviceRequestId, externalAdviceSha256, validateExternalAdviceDatabaseFile, validateExternalAdviceRequest, validateExternalAdviceWorkspace
 } from "./externalAdviceService";
 import { copyMutableFileIsolated, snapshotMutableSqliteIsolated } from "./mutableFileIsolation";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface ExternalAdvicePortabilityHooks {
   signal?: AbortSignal;
@@ -49,7 +50,7 @@ export async function validateExternalAdvicePortabilityWorkspace(root: string, o
 }
 
 function openDatabase(path: string, readOnly = false): DatabaseSync {
-  const database = new DatabaseSync(path, { readOnly, allowExtension: false });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly, allowExtension: false });
   database.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=2500; PRAGMA cache_size=-256; PRAGMA temp_store=FILE;");
   if (!readOnly) database.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
   return database;

@@ -14,6 +14,7 @@ import type { BrainStorageOperationHooks } from "./brainStorageOperations";
 import { assertSafeArchivePath, streamFileSha256, type StreamingZipSource } from "./streamingZip";
 import { copyMutableFileIsolated, snapshotMutableSqliteIsolated, writeMutableFileIsolated } from "./mutableFileIsolation";
 import { collectConnectedExecutionInputs, validateConnectedExecutionArchive } from "./connectedExecutionPortability";
+import { sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-connected-dependency-archive";
 const HASH = /^[a-f0-9]{64}$/;
@@ -317,7 +318,7 @@ export async function collectConnectedArchive(options: {
   for (const [path, source] of archive.files) {
     if (/^merge\/parents\/.+\/(?:brain|origin)\.json$/.test(path)) collectReferences(JSON.parse((await sourceBytes(source)).toString("utf8")));
     if (/^merge\/parents\/.+\/activity\/ledger\.sqlite3$/.test(path)) {
-      const db = new DatabaseSync(source.sourcePath!, { readOnly: true });
+      const db = new DatabaseSync(sqliteFilename(source.sourcePath!), { readOnly: true });
       try {
         for (const row of db.prepare("SELECT payload_json FROM training_source_versions ORDER BY sequence").iterate()) {
           collectReferences(JSON.parse(String(row.payload_json)));
@@ -557,7 +558,7 @@ export async function validateConnectedArchive(archive: ConnectedArchive | undef
   const sqlite = (path: string): void => {
     const source = requireFile(path);
     if (!source.sourcePath) throw new Error("Connected SQLite state has no saved file.");
-    const db = new DatabaseSync(source.sourcePath, { readOnly: true });
+    const db = new DatabaseSync(sqliteFilename(source.sourcePath), { readOnly: true });
     try {
       if (db.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") throw new Error("Connected SQLite state failed integrity verification.");
     } finally { db.close(); }

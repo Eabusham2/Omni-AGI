@@ -10,6 +10,7 @@ import { TaskAttachmentReadVerifier } from "./taskAttachmentReadVerifier";
 import { InheritedTaskFileReviewStore, inheritedTaskReviewFingerprint } from "./inheritedTaskFileReviewStore";
 import { assertInheritedTaskFileGuards, inheritedTaskFileClosure, inheritedTaskFileHash, inheritedTaskManagedFilePath,
   type InheritedTaskFileClosure, type InheritedTaskFileNativeContext, type InheritedTaskFilePrivate } from "./inheritedTaskFileClosure";
+import { sqliteFilename } from "./sqliteFilename";
 
 export class InheritedTaskFileAdoptionRequired extends Error {
   readonly code = "INHERITED_TASK_FILE_ADOPTION_REQUIRED";
@@ -130,7 +131,7 @@ export class InheritedTaskFiles {
   /** Trusted-user metadata lookup only. Never exposed as a model tool, file-byte read, binding or adoption. */
   async historicalFileHandlesForUser(brainId: string, attachmentIds: readonly string[]): Promise<ChatTaskAttachmentHandle[]> {
     if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.some(id => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id))) throw new Error("Invalid historical task file identities.");
-    const path = await inheritedTaskManagedFilePath(this.options.root(brainId), "attachments/registry.sqlite3"), db = new DatabaseSync(path, { readOnly: true });
+    const path = await inheritedTaskManagedFilePath(this.options.root(brainId), "attachments/registry.sqlite3"), db = new DatabaseSync(sqliteFilename(path), { readOnly: true });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512");
       if (db.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== brainId ||
@@ -162,7 +163,7 @@ export class InheritedTaskFiles {
     if (file) {
       const databasePath = await inheritedTaskManagedFilePath(this.options.root(lease.context.brainId), "attachments/registry.sqlite3");
       await inheritedTaskManagedFilePath(this.options.root(lease.context.brainId), `attachments/blobs/${file.row.content_sha256}.data`);
-      const db = new DatabaseSync(databasePath, { readOnly: true });
+      const db = new DatabaseSync(sqliteFilename(databasePath), { readOnly: true });
       try {
         const row = db.prepare("SELECT * FROM attachments WHERE id=?").get(file.row.id);
         if (!row || db.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== lease.context.brainId ||

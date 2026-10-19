@@ -20,6 +20,7 @@ import {
   environmentRequestId,
   environmentSha
 } from "./environmentFormat";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const ENVIRONMENT_WORKSPACE_PATH = "environments/workspace.sqlite3";
 export const ENVIRONMENT_WORKSPACE_FORMAT = "omni-managed-environments-1";
@@ -139,7 +140,7 @@ export class EnvironmentStore {
     await requireDirectory(root, "Brain root"); await requireDirectory(base, "Environment workspace", true); await requireDirectory(instances, "Environment instance directory", true);
     const file = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (file && (!file.isFile() || file.isSymbolicLink())) throw new Error("Environment database must be a private regular file.");
-    const db = new DatabaseSync(path, { readOnly, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF;");
       for (const row of db.prepare("SELECT type,name,sql FROM sqlite_master").iterate()) {

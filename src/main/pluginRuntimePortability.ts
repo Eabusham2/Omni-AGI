@@ -6,12 +6,13 @@ import { DatabaseSync } from "node:sqlite";
 import { copyMutableFileIsolated, snapshotMutableSqliteIsolated } from "./mutableFileIsolation";
 import { PLUGIN_RUNTIME_WORKSPACE, PluginRuntimeStore } from "./pluginRuntimeStore";
 import { RUNTIME_SHA, runtimeId } from "./pluginRuntimeValidation";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface PluginRuntimeCustodyHooks { signal?: AbortSignal; checkDisk?(bytes: number): Promise<void>; mode?: "merge" | "history-only" }
 export const safePluginRuntimeWorkspacePath = (value: string): boolean => value === PLUGIN_RUNTIME_WORKSPACE || /^plugin-runtime\/archives\/[a-f0-9]{64}\.sqlite3$/.test(value);
 const exists = async (path: string) => lstat(path).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
 async function digest(path: string, signal?: AbortSignal): Promise<string> { const hash = createHash("sha256"); for await (const block of createReadStream(path)) { signal?.throwIfAborted(); hash.update(block); } return hash.digest("hex"); }
-async function ownerOf(path: string): Promise<string> { const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Unsafe inherited runtime database."); const db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+async function ownerOf(path: string): Promise<string> { const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Unsafe inherited runtime database."); const db = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
   try { db.exec("PRAGMA trusted_schema=OFF;"); return runtimeId(db.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value); } finally { db.close(); } }
 
 export async function validateCapturedPluginRuntimeWorkspace(path: string, expectedOwner?: string): Promise<void> { const store = await PluginRuntimeStore.openFile(path, expectedOwner ?? await ownerOf(path)); try { store.validate(); } finally { store.close(); } }

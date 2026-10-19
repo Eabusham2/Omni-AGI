@@ -17,6 +17,7 @@ import { rekeySavedUserQuestions } from "./userQuestionPortability";
 import { rebindMcpAppArtifactOwner } from "./mcpAppArtifacts";
 import { portableExists, portableFiles } from "./portableWorkspaceFiles";
 import type { LearningTask } from "../shared/learning";
+import { sqliteFilename } from "./sqliteFilename";
 
 /** The destination is still unpublished to schedulers; no neural files are rewritten. */
 export async function retirePortableWorkspaceAuthority(root: string, brainId: string,
@@ -29,7 +30,7 @@ export async function retirePortableWorkspaceAuthority(root: string, brainId: st
   const steps: Array<[string, () => Promise<unknown>]> = [
     ["learning-tasks", async () => {
       const path = join(root, "learning", "tasks.sqlite3"); if (!await portableExists(path)) return;
-      const database = new DatabaseSync(path);
+      const database = new DatabaseSync(sqliteFilename(path));
       try {
         if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" || database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== brainId) throw new Error("Portable learning tasks lost their source identity.");
         database.exec("BEGIN IMMEDIATE");

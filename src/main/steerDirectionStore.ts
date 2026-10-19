@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { SteerDirectionPage, SteerDirectionPageQuery, SteerDirectionRecord, SteerDirectionSource, SteerDirectionState } from "../shared/steerDirections";
 import { checkedNativeAudioInfo } from "../shared/nativeAudioChat";
 import { checkedChatInputProvenance } from "../shared/chatInputProvenance";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const STEER_DIRECTIONS_PATH = "directions/workspace.sqlite3";
 const FORMAT = "omni-steer-directions-1", SHA = /^[a-f0-9]{64}$/, ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
@@ -94,7 +95,7 @@ export class SteerDirectionStore {
     const parent = join(root, "directions"); if (create) await mkdir(parent, { recursive: true, mode: 0o700 });
     for (const directory of [root, parent]) { const info = await lstat(directory); if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Direction workspace requires owned directories."); }
     if (present) { const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Direction workspace requires an owned regular database."); }
-    const db = new DatabaseSync(path, { readOnly: !create });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create });
     try {
       db.exec("PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       if (!present) {

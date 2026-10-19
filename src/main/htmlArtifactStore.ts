@@ -16,6 +16,7 @@ import {
   normalizeHtmlArtifactContent,
   validateHtmlArtifactContent
 } from "./htmlArtifactFormat";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const HEX32 = /^[a-f0-9]{32}$/;
@@ -193,7 +194,7 @@ export class HtmlArtifactStore {
   }
 
   private database<T>(operation: (database: DatabaseSync) => T): T {
-    const database = new DatabaseSync(this.databasePath);
+    const database = new DatabaseSync(sqliteFilename(this.databasePath));
     try {
       database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) STRICT;

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import type { ImaginationCaptureSettings, ImaginationCapturedFragment, ImaginationRecording } from "../shared/imaginationCapture";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const IMAGINATION_WORKSPACE = "imagination/workspace.sqlite3";
 export const captureHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -25,7 +26,7 @@ export class ImaginationCaptureStore {
     if (create) await mkdir(join(root, "imagination"), { recursive: true, mode: 0o700 });
     for (const directory of [root, join(root, "imagination")]) { const info = await lstat(directory); if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Capture workspace must be an owned real directory."); }
     if (present && (!present.isFile() || present.isSymbolicLink())) throw new Error("Unsafe imagination database.");
-    const db = new DatabaseSync(path, { readOnly: !create });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create });
     try {
       db.exec("PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       if (!present) {

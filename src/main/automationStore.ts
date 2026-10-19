@@ -7,6 +7,7 @@ import { getHeapStatistics } from "node:v8";
 import type { AutomationDefinition, AutomationPage, AutomationPageQuery, AutomationProgram, AutomationRun, AutomationStepReceipt } from "../shared/automation";
 import { automationCanonical, automationHash, automationId, automationObject, automationSha, validateAutomationProgram } from "./automationFormat";
 import { writeMutableFileIsolated } from "./mutableFileIsolation";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const AUTOMATION_RELATIVE_PATH = "automation/workspace.sqlite3";
 export const AUTOMATION_FORMAT = "omni-host-automation-workspace-1";
@@ -77,7 +78,7 @@ export class AutomationStore {
     }
     const file = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (file && (!file.isFile() || file.isSymbolicLink())) throw new Error("Action workspace database must be a regular private file.");
-    const db = new DatabaseSync(path, { readOnly, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF;");
       for (const row of db.prepare("SELECT type,name,sql FROM sqlite_master").iterate()) {

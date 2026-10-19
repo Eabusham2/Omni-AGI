@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { CLIPBOARD_FORMAT, type ClipboardMutationAction, type ClipboardMutationReceipt, type ClipboardProvenance, type ClipboardVersionSummary } from "../shared/clipboard";
 import { clipboardCanonical, clipboardHash, clipboardId, clipboardMutationReceipt, clipboardProvenance, clipboardSha } from "./clipboardFormat";
 import { writeMutableFileIsolated } from "./mutableFileIsolation";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const CLIPBOARD_WORKSPACE_PATH = "clipboard/workspace.sqlite3";
 const WORKSPACE_FORMAT = "omni-clipboard-workspace-1";
@@ -63,7 +64,7 @@ export class ClipboardStore {
     if (!readOnly) { await privateDirectory(base); await privateDirectory(blobs); }
     else { await existingDirectory(base, "Clipboard workspace"); await existingDirectory(blobs, "Clipboard blob directory");
       const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Clipboard workspace database is unsafe."); }
-    const db = new DatabaseSync(path, { readOnly, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       for (const row of db.prepare("SELECT type,name,sql FROM sqlite_master").iterate()) {

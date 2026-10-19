@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { InheritedTaskFileReviewBody, InheritedTaskFileAdoptionReceipt } from "../shared/inheritedTaskFiles";
 import { canonicalTaskAttachmentValue } from "./taskAttachmentStore";
 import { inheritedTaskFileHash } from "./inheritedTaskFileClosure";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/, SHA = /^[a-f0-9]{64}$/;
 interface ReviewRow { id: string; owner_brain_id: string; review_sha256: string; body_json: string;
@@ -67,7 +68,7 @@ export class InheritedTaskFileReviewStore {
     for (const path of [dirname(this.path), this.path]) {
       const info = lstatSync(path); if (info.isSymbolicLink() || path === this.path && !info.isFile()) throw new Error("Inherited review registry path is unsafe.");
     }
-    const database = new DatabaseSync(this.path, { readOnly: !write });
+    const database = new DatabaseSync(sqliteFilename(this.path), { readOnly: !write });
     try {
       database.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512; PRAGMA busy_timeout=30000");
       if (database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== this.brainId) throw new Error("Inherited review lost its current registry owner.");

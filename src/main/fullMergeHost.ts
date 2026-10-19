@@ -12,6 +12,7 @@ import { ArtifactIndexStore, parseArtifactIndex, type PersistedGeneratedArtifact
 import { captureMcpTaskCustody } from "./mcpTaskCustody";
 import { MCP_TASK_DIRECTORY } from "./mcpTaskStore";
 import { adoptFullMergeMcpTasks } from "./fullMergeMcpTasks";
+import { sqliteFilename } from "./sqliteFilename";
 
 export function mergeCanonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(mergeCanonical).join(",")}]`;
@@ -145,11 +146,11 @@ export async function sealFullMergeParent(root: string, brain: BrainDocument, si
         const wal = await lstat(`${path}-wal`).catch(() => undefined);
         await reserve?.(bytes + (wal?.size ?? 0));
         const temporary = await mkdtemp(join(dirname(root), ".full-merge-seal-"));
-        const database = new DatabaseSync(path, { readOnly: true });
+        const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
         try {
           database.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;");
           const snapshot = join(temporary, "snapshot.sqlite3");
-          await backup(database, snapshot, { rate: 128, progress: () => signal?.throwIfAborted() });
+          await backup(database, sqliteFilename(snapshot), { rate: 128, progress: () => signal?.throwIfAborted() });
           bytes = (await lstat(snapshot)).size;
           sha = await fullMergeFileHash(snapshot, signal);
         } finally { database.close(); await rm(temporary, { recursive: true, force: true }); }
@@ -170,7 +171,7 @@ export async function sealFullMergeParent(root: string, brain: BrainDocument, si
 }
 
 function hostDatabase(root: string, readOnly = false): DatabaseSync {
-  const db = new DatabaseSync(join(root, "merge", "host-history.sqlite3"), { readOnly });
+  const db = new DatabaseSync(sqliteFilename(join(root, "merge", "host-history.sqlite3")), { readOnly });
   if (!readOnly) db.exec(`PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA cache_size=-1024;
     CREATE TABLE IF NOT EXISTS records(sequence INTEGER PRIMARY KEY, parent_id TEXT NOT NULL, path TEXT NOT NULL,
       source_id TEXT NOT NULL, kind TEXT NOT NULL, payload_sha256 TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -201,7 +202,7 @@ export async function adoptFullMergeHostState(input: FullMergeAssemblyInput, sha
   const activity = await BrainActivityLedger.open(input.targetDirectory, input.targetBrainId);
   const artifacts = await ArtifactIndexStore.open(join(input.targetDirectory, "engine", "artifacts"), input.targetBrainId);
   const nativeIndexPath = join(input.targetDirectory, "engine", "connected-runtime.sqlite3");
-  const nativeIndex = await lstat(nativeIndexPath).then(() => new DatabaseSync(nativeIndexPath, { readOnly: true })).catch((error: NodeJS.ErrnoException) => {
+  const nativeIndex = await lstat(nativeIndexPath).then(() => new DatabaseSync(sqliteFilename(nativeIndexPath), { readOnly: true })).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
     throw error;
   });
@@ -233,7 +234,7 @@ export async function adoptFullMergeHostState(input: FullMergeAssemblyInput, sha
           snapshotPath: `merge/parents/${parent.brainId}/${file.path}`, historicalOnly: true });
         if (["engine/artifacts/index.sqlite3", "engine/artifacts/index.json"].includes(file.path)) artifactIndexes.add(file.path);
         if (!["conversation/ledger.sqlite3", "activity/ledger.sqlite3"].includes(file.path)) continue;
-        const source = new DatabaseSync(join(root, ...file.path.split("/")), { readOnly: true });
+        const source = new DatabaseSync(sqliteFilename(join(root, ...file.path.split("/"))), { readOnly: true });
         try {
           const owner = source.prepare("SELECT value FROM meta WHERE key='brainId'").get();
           if (owner?.value !== parent.brainId) throw new Error("Parent host ledger has the wrong identity.");
@@ -277,7 +278,7 @@ export async function adoptFullMergeHostState(input: FullMergeAssemblyInput, sha
       if (!indexed && artifactIndexes.has("engine/artifacts/index.json")) {
         legacy = parseArtifactIndex(JSON.parse(await readFile(join(sourceArtifacts, "index.json"), "utf8")), parent.brainId).artifacts;
       }
-      const source = indexed ? new DatabaseSync(join(sourceArtifacts, "index.sqlite3"), { readOnly: true }) : undefined;
+      const source = indexed ? new DatabaseSync(sqliteFilename(join(sourceArtifacts, "index.sqlite3")), { readOnly: true }) : undefined;
       try {
         if (source && source.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== parent.brainId) throw new Error("Parent artifact ledger has the wrong identity.");
         let sequence = 0, previous = "0".repeat(64);

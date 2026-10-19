@@ -3,6 +3,7 @@ import { lstat, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SparseSubstrateBundle, SparseSubstrateJob, SparseSubstratePlan } from "../shared/sparseSubstrateTransfer";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const SPARSE_TRANSFER_DIRECTORY = "substrate-transfers";
 const FORMAT = "omni-sparse-substrate-workspace-1";
@@ -56,7 +57,7 @@ export class SparseSubstrateTransferStore {
     const path = join(directory, "workspace.sqlite3");
     const present = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (present && (!present.isFile() || present.isSymbolicLink())) throw new Error("Sparse transfer workspace is unsafe.");
-    const db = new DatabaseSync(path, { allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
       for (const row of db.prepare("SELECT type,name,sql FROM sqlite_master").iterate()) {
@@ -107,7 +108,7 @@ export class SparseSubstrateTransferStore {
   static async openFile(path: string, expectedBrainId: string): Promise<SparseSubstrateTransferStore> {
     sparseId(expectedBrainId); const info = await lstat(path);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error("Captured sparse workspace is not a regular immutable file.");
-    const db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
     try { db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-128; PRAGMA mmap_size=0;");
       const value = new SparseSubstrateTransferStore("", expectedBrainId, db); value.validate(); return value;
     } catch (error) { db.close(); throw error; }

@@ -146,6 +146,7 @@ import { captureMcpTaskArchive, validateMcpTaskArchive, hasMcpTaskArchivePayload
   validateEmbeddedMcpTaskSources, MCP_TASK_CUSTODY_REQUIRED_FEATURE } from "./mcpTaskArchive";
 import { API_TEACHER_MEDIA_REQUIRED_FEATURE, type ApiTeacherMediaIo } from "./apiTeacherMedia";
 import { validateApiTeacherMediaArchiveSources } from "./apiTeacherMediaArchive";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const BUNDLE_FORMAT = "omni-brain";
@@ -310,7 +311,7 @@ async function snapshotComponentHashes(base: string, summary: SavedSnapshotSumma
       let artifacts: PersistedArtifactIndex["artifacts"] | undefined;
       const ledgerPath = ArtifactIndexStore.databasePath(artifactDirectory);
       if (await pathExists(ledgerPath)) {
-        const database = new DatabaseSync(ledgerPath, { readOnly: true });
+        const database = new DatabaseSync(sqliteFilename(ledgerPath), { readOnly: true });
         try {
           if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||
             database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== summary.brainId) {
@@ -403,7 +404,7 @@ async function snapshotComponentHashes(base: string, summary: SavedSnapshotSumma
   }
   if (summary.durableState) {
     for (const path of [join(base, "conversation", "ledger.sqlite3"), BrainActivityLedger.databasePath(base)]) {
-      const database = new DatabaseSync(path, { readOnly: true });
+      const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
       try {
         if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||
           database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== summary.brainId) {
@@ -543,7 +544,7 @@ async function rekeySavedSnapshot(base: string, brainId: string, missingPayloads
   ] as const) {
     const path = join(base, ...relative.split("/"));
     if (!await pathExists(path)) continue;
-    const database = new DatabaseSync(path);
+    const database = new DatabaseSync(sqliteFilename(path));
     try {
       if (database.prepare("SELECT value FROM meta WHERE key=?").get(key)?.value !== priorId) {
         throw new Error("Imported recovery-point ledger identity failed.");
@@ -749,7 +750,7 @@ function validateNeuralConversationLedger(
   if (committedSequence !== undefined && (!Number.isSafeInteger(committedSequence) || committedSequence < 0)) {
     throw new Error("Neural conversation committed head is invalid.");
   }
-  const database = new DatabaseSync(path, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
   try {
     const quick = database.prepare("PRAGMA quick_check").get() as
       { quick_check?: string } | undefined;
@@ -871,7 +872,7 @@ function validateSavedWorkingPages(path: string | undefined, state: unknown): vo
     }
     return;
   }
-  const database = new DatabaseSync(path, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
   try {
     const quick = database.prepare("PRAGMA quick_check").get();
     const table = database.prepare("SELECT type FROM sqlite_master WHERE name='working_pages'").get();
@@ -929,7 +930,7 @@ function validateSavedWorkingPages(path: string | undefined, state: unknown): vo
 }
 
 function rekeyNeuralConversationLedger(path: string, brainId: string): void {
-  const database = new DatabaseSync(path);
+  const database = new DatabaseSync(sqliteFilename(path));
   try {
     database.prepare("UPDATE meta SET value=? WHERE key='brain_id'").run(brainId);
   } finally {
@@ -2207,7 +2208,7 @@ async function savedJointGenerationFiles(
       await streamFileSha256(path) !== snapshot.sha256) {
       throw new Error("Saved ingestion joint SQLite checksum failed.");
     }
-    const database = new DatabaseSync(path, { readOnly: true });
+    const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
     try {
       if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") {
         throw new Error("Saved ingestion joint SQLite integrity failed.");
@@ -7205,7 +7206,7 @@ export class BrainRepository {
     }
     {
       const portableActivity = new DatabaseSync(
-        BrainActivityLedger.databasePath(activityExportBrainDirectory), { readOnly: true }
+        sqliteFilename(BrainActivityLedger.databasePath(activityExportBrainDirectory)), { readOnly: true }
       );
       try {
         // Historical source versions are saved state too, not merely the
@@ -7407,7 +7408,7 @@ export class BrainRepository {
             }
           }
           if (relative === "activity/ledger.sqlite3") {
-            const database = new DatabaseSync(stagedPath, { readOnly: true });
+            const database = new DatabaseSync(sqliteFilename(stagedPath), { readOnly: true });
             try {
               for (const row of database.prepare("SELECT payload_json FROM training_source_versions ORDER BY sequence").iterate()) {
                 await includeSavedSourceBlob(JSON.parse(String(row.payload_json)) as TrainingSource);
@@ -8653,7 +8654,7 @@ export class BrainRepository {
         if (names.has(`${prefix}/index.sqlite3`)) {
           const ledgerPath = ArtifactIndexStore.databasePath(artifactDirectory);
           await materializeFile(entryPath(`${prefix}/index.sqlite3`), ledgerPath, false);
-          const database = new DatabaseSync(ledgerPath);
+          const database = new DatabaseSync(sqliteFilename(ledgerPath));
           try { database.prepare("UPDATE meta SET value=? WHERE key='brainId'").run(artifactBrainId); }
           finally { database.close(); }
           const ledger = await ArtifactIndexStore.open(artifactDirectory, artifactBrainId);

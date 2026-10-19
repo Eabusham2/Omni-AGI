@@ -45,6 +45,7 @@ import type {
   TrainingCoverage,
   TrainingCoverageError,
 } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const STREAM_TEXT_CHARS = 256 * 1024;
@@ -635,9 +636,9 @@ async function snapshotSqliteDatabase(
   await mkdir(snapshots, { recursive: true });
   const temporary = join(snapshots, `.sqlite-${randomUUID()}.next`);
   try {
-    const database = new DatabaseSync(sourcePath, { readOnly: true });
+    const database = new DatabaseSync(sqliteFilename(sourcePath), { readOnly: true });
     try {
-      const escaped = temporary.replace(/'/g, "''");
+      const escaped = sqliteFilename(temporary).replace(/'/g, "''");
       // VACUUM INTO reads one consistent SQLite transaction, including committed
       // WAL pages, while the source handle remains strictly read-only.
       database.exec(`VACUUM INTO '${escaped}'`);
@@ -1941,7 +1942,7 @@ export class CrawlFrontierStore {
             .digest("hex")
             .slice(0, 32);
     const directory = join(brainDirectory, "datasets", "crawls");
-    this.database = new DatabaseSync(join(directory, `${this.id}.sqlite3`), {
+    this.database = new DatabaseSync(sqliteFilename(join(directory, `${this.id}.sqlite3`)), {
       open: false,
     });
     // DatabaseSync cannot create a missing parent directory itself.

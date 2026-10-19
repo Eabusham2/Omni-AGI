@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { getHeapStatistics } from "node:v8";
 import type { WebImageDownload, WebImageReference, WebImageSelection } from "../shared/webImages";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SHA = /^[a-f0-9]{64}$/, ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TABLE = "CREATE TABLE web_image_references(id TEXT PRIMARY KEY,brain_id TEXT NOT NULL,turn_id TEXT NOT NULL,body TEXT NOT NULL,sha256 TEXT NOT NULL,active INTEGER NOT NULL CHECK(active IN (0,1)))";
@@ -103,7 +104,7 @@ export class WebImageReferenceStore {
     for (const path of [root, join(root, "attachments"), join(root, "attachments", "registry.sqlite3")]) {
       const info = await lstat(path); if (info.isSymbolicLink() || !(path.endsWith(".sqlite3") ? info.isFile() : info.isDirectory())) throw new Error("Web image reference custody is unsafe.");
     }
-    const db = new DatabaseSync(join(root, "attachments", "registry.sqlite3"), { readOnly, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(join(root, "attachments", "registry.sqlite3")), { readOnly, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000");
       if (db.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== brainId) throw new Error("Web image registry has another current owner.");

@@ -18,6 +18,7 @@ import { ensureDiskReserve } from "./streamingZip";
 import { TaskAttachmentReadVerifier, taskAttachmentFileIdentity } from "./taskAttachmentReadVerifier";
 import type { WebImageDownload } from "../shared/webImages";
 import { checkedWebImageDownload } from "./webImageReferences";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const MIME = /^[a-z0-9][a-z0-9.+-]{0,80}\/[a-z0-9][a-z0-9.+-]{0,80}$/;
@@ -251,7 +252,7 @@ export class TaskAttachmentStore {
   }
 
   private database<T>(operation: (database: DatabaseSync) => T): T {
-    const database = new DatabaseSync(this.databasePath);
+    const database = new DatabaseSync(sqliteFilename(this.databasePath));
     try {
       database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;");
       database.exec(`

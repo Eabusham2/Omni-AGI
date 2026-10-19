@@ -8,6 +8,7 @@ import { API_TEACHER_DATABASE, ApiTeacherStore } from "./apiTeacherStore";
 import { safeApiTeacherWorkspacePath, apiTeacherMediaReferenceFiles, validateApiTeacherWorkspace,
   type ApiTeacherPortabilityHooks } from "./apiTeacherPortability";
 import { safeApiTeacherMediaPath, admitApiTeacherMedia } from "./apiTeacherMedia";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SHA = /^[a-f0-9]{64}$/;
 /** Exact teacher closure inside any current/origin/history/opaque-parent learning inventory.
@@ -34,7 +35,7 @@ export async function validateApiTeacherMediaArchiveSources(sources: Iterable<[s
     await mkdir(root, { recursive: false, mode: 0o700 });
     const inventory = join(root, "inventory.sqlite3"); await materialize(source, inventory);
     await admitApiTeacherMedia(256 * 1024, "teacher archive SQLite inventory cache", options);
-    const database = new DatabaseSync(inventory, { readOnly: true, allowExtension: false });
+    const database = new DatabaseSync(sqliteFilename(inventory), { readOnly: true, allowExtension: false });
     let owner = ""; const declared = new Set<string>();
     try {
       database.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA mmap_size=0;");

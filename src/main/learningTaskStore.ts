@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FactCheckClaim, FactCheckEvidence, FactCheckFinding, FactCheckWorkspace, LearningSourceProgress, LearningTask, LearningTaskState, WebLearningPolicy } from "../shared/learning";
 import { validateWebLearningPolicy } from "./webLearningPolicy";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export function learningId(value: unknown, label = "learning identity"): string {
@@ -34,7 +35,7 @@ export class LearningTaskStore {
     const path = join(directory, "tasks.sqlite3");
     const info = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (info && (!info.isFile() || info.isSymbolicLink())) throw new Error("Unsafe learning workspace database.");
-    const database = new DatabaseSync(path);
+    const database = new DatabaseSync(sqliteFilename(path));
     try {
       database.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-512;
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);

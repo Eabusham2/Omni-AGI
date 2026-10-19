@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { LocalTeacherItem, LocalTeacherJob, LocalTeacherSelection } from "../shared/localTeacher";
 import type { LocalTeacherSelectedFile } from "./localTeacherFiles";
 import { localTeacherCanonical, localTeacherGeneration, localTeacherHash, localTeacherId, localTeacherSha } from "./localTeacherFormat";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const LOCAL_TEACHER_WORKSPACE = "local-teachers";
 export interface StoredLocalTeacherSelection {
@@ -42,7 +43,7 @@ export class LocalTeacherStore {
     if (!present && !create) return undefined;
     const folder = await lstat(directory);
     if (!folder.isDirectory() || folder.isSymbolicLink() || present && (!present.isFile() || present.isSymbolicLink())) throw new Error("Local-teacher custody requires real owned files/directories.");
-    const db = new DatabaseSync(path, { readOnly: !create });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create });
     try {
       db.exec("PRAGMA cache_size=-128; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       if (create) {

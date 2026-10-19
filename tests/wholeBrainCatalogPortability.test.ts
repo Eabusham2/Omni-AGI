@@ -53,9 +53,9 @@ describe("whole-brain catalog exact portability closure", () => {
     const drive = win32.join("C:\\Users\\runneradmin\\AppData\\Local\\Temp\\omni-whole-catalog-long-fixture", suffix);
     const unc = win32.join("\\\\server\\share\\saved-catalog", suffix);
     expect(drive.length).toBeGreaterThan(260);
-    expect(wholeBrainCatalogSqlitePath(drive, "win32")).toBe(`\\\\?\\${drive}`);
-    expect(wholeBrainCatalogSqlitePath(unc, "win32")).toBe(`\\\\?\\UNC\\${unc.slice(2)}`);
-    expect(wholeBrainCatalogSqlitePath(`\\\\?\\${drive}`, "win32")).toBe(`\\\\?\\${drive}`);
+    expect(wholeBrainCatalogSqlitePath(drive, "win32")).toBe(`file:${encodeURIComponent(`\\\\?\\${drive}`)}?vfs=win32-longpath`);
+    expect(wholeBrainCatalogSqlitePath(unc, "win32")).toBe(`file:${encodeURIComponent(`\\\\?\\UNC\\${unc.slice(2)}`)}?vfs=win32-longpath`);
+    expect(wholeBrainCatalogSqlitePath(`\\\\?\\${drive}`, "win32")).toBe(`file:${encodeURIComponent(`\\\\?\\${drive}`)}?vfs=win32-longpath`);
     expect(wholeBrainCatalogSqlitePath("/owned/catalog/index.sqlite3", "darwin")).toBe("/owned/catalog/index.sqlite3");
   });
   it("visits only the pointer-referenced JSON chain and immutable location index", async () => {

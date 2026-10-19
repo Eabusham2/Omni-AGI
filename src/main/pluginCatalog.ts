@@ -31,6 +31,7 @@ import {
 import type { PluginTrainingParserFormat, ToolPermissionLevel } from "../shared/types";
 import { inspectPluginWasmModule } from "./pluginWasmModule";
 import { normalizePluginRuntimeModule } from "./pluginRuntimeValidation";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const PLUGIN_ID = /^[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$/;
@@ -600,7 +601,7 @@ export class PluginCatalog {
   }
 
   private database<T>(operation: (database: DatabaseSync) => T): T {
-    const database = new DatabaseSync(this.databasePath);
+    const database = new DatabaseSync(sqliteFilename(this.databasePath));
     try {
       database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
       database.exec(`

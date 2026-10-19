@@ -27,6 +27,7 @@ import { mergeApiTeacherWorkspace } from "./apiTeacherPortability";
 import { mergePluginRuntimeWorkspace } from "./pluginRuntimePortability";
 import { mergePanelReceiptWorkspace } from "./pluginPanelReceiptPortability";
 import { mergeSparseSubstrateTransferWorkspace } from "./sparseSubstrateTransferPortability";
+import { sqliteFilename } from "./sqliteFilename";
 
 const alias = (parent: string, kind: string, id: string): string => learningHash({ parent, kind, id });
 
@@ -83,11 +84,11 @@ export async function adoptFullMergeLearningWorkspace(input: FullMergeAssemblyIn
           "merged-history", bytes => input.reserve(bytes, "retained steering presentation history"));
         const sourceStore = await LearningTaskStore.open(stage, owner), sourceDatasets = new DatasetManifestStore(() => stage);
         const sourceRelocations = await openLearningRelocations(stage, owner);
-        const raw = new DatabaseSync(join(stage, "learning", "tasks.sqlite3"), { readOnly: true });
+        const raw = new DatabaseSync(sqliteFilename(join(stage, "learning", "tasks.sqlite3")), { readOnly: true });
         try {
           const manifestAliases = new Map<string, string>(), questionAliases = new Map<string, string>();
           const taskAliases = new Map(sourceStore.list().map(task => [task.id, alias(parent.brainId, "task", task.id)]));
-          const index = new DatabaseSync(join(archive.root, "inventory.sqlite3"), { readOnly: true });
+          const index = new DatabaseSync(sqliteFilename(join(archive.root, "inventory.sqlite3")), { readOnly: true });
           try {
             for (const row of index.prepare("SELECT path FROM files WHERE path GLOB 'datasets/*/manifest.json'").iterate()) {
               const match = /^datasets\/([^/]+)\/manifest.json$/.exec(String(row.path)); if (!match) continue;
@@ -159,7 +160,7 @@ export async function adoptFullMergeLearningWorkspace(input: FullMergeAssemblyIn
             for (const source of sourceStore.sources(old.id)) if (source.crawlId) {
               const newId = alias(parent.brainId, "crawl", source.crawlId), destination = join(root, "datasets", "crawls", `${newId}.sqlite3`);
               await copyMutableFileIsolated(join(stage, "datasets", "crawls", `${source.crawlId}.sqlite3`), destination);
-              const index = new DatabaseSync(join(archive.root, "inventory.sqlite3"), { readOnly: true });
+              const index = new DatabaseSync(sqliteFilename(join(archive.root, "inventory.sqlite3")), { readOnly: true });
               try {
                 for (const row of index.prepare("SELECT path,body FROM generic_sources").iterate()) {
                   const binding = JSON.parse(String(row.body)), oldPath = String(row.path);

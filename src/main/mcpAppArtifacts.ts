@@ -16,6 +16,7 @@ import { checkedAppObservationResult } from "./mcpAppObservationReceipt";
 import { checkedChatInputProvenance } from "../shared/chatInputProvenance";
 import type { ChatMessage } from "../shared/types";
 import { checkedAppObservationContent, verifyAppObservationAudit } from "./mcpAppObservationAudit";
+import { sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-mcp-app-artifacts-1", SHA = /^[a-f0-9]{64}$/, ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
@@ -103,7 +104,7 @@ export function validateMcpAppArtifact(value: unknown): McpAppArtifactRecord {
   return row as unknown as McpAppArtifactRecord;
 }
 function openDatabase(path: string, brainId: string, create = false): DatabaseSync {
-  const db = new DatabaseSync(path, { readOnly: !create });
+  const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create });
   try {
     db.exec("PRAGMA busy_timeout=1000; PRAGMA cache_size=-512; PRAGMA trusted_schema=OFF");
     if (create) db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS records(record_sha TEXT PRIMARY KEY,artifact_id TEXT NOT NULL,kind TEXT NOT NULL,payload_json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS record_owner ON records(artifact_id,kind); CREATE TABLE IF NOT EXISTS bindings(artifact_id TEXT PRIMARY KEY,capture_sha TEXT,resource_sha TEXT,reviewed_at TEXT); CREATE TABLE IF NOT EXISTS ancestry(parent_id TEXT NOT NULL,artifact_id TEXT NOT NULL,record_sha TEXT NOT NULL,PRIMARY KEY(parent_id,artifact_id,record_sha)); CREATE TABLE IF NOT EXISTS observation_state(record_sha TEXT PRIMARY KEY,stream_id TEXT NOT NULL,ordinal INTEGER NOT NULL,state TEXT NOT NULL,content_bytes INTEGER NOT NULL,review_id TEXT NOT NULL); CREATE INDEX IF NOT EXISTS observation_stream ON observation_state(stream_id,ordinal); CREATE TABLE IF NOT EXISTS observation_claims(record_sha TEXT PRIMARY KEY,disposition TEXT NOT NULL,base_frontier_sha TEXT); CREATE TABLE IF NOT EXISTS observation_receipts(record_sha TEXT PRIMARY KEY,receipt_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS observation_followups(record_sha TEXT PRIMARY KEY,turn_id TEXT NOT NULL,input_sha TEXT NOT NULL,state TEXT NOT NULL,error TEXT);");

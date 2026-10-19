@@ -36,6 +36,7 @@ import { rekeyPanelReceiptWorkspace, safePanelReceiptWorkspacePath, validateCapt
 import { safeSparseSubstrateTransferPath, validateSparseSubstrateTransferWorkspace, adoptSparseSubstrateTransferWorkspace } from "./sparseSubstrateTransferPortability";
 import { safeApiTeacherWorkspacePath, validateApiTeacherWorkspace, validateCapturedApiTeacherWorkspace, rekeyApiTeacherWorkspace, captureApiTeacherWorkspace } from "./apiTeacherPortability";
 import type { ApiTeacherMediaIo } from "./apiTeacherMedia";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SHA = /^[a-f0-9]{64}$/;
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -97,7 +98,7 @@ export async function snapshotLearningWorkspace(sourceRoot: string, packageRoot:
   hooks: LearningWorkspaceHooks = {}): Promise<LearningWorkspaceArchive | undefined> {
   learningId(brainId);
   await mkdir(join(packageRoot, "blobs"), { recursive: true, mode: 0o700 });
-  const indexPath = join(packageRoot, "inventory.sqlite3"), index = new DatabaseSync(indexPath);
+  const indexPath = join(packageRoot, "inventory.sqlite3"), index = new DatabaseSync(sqliteFilename(indexPath));
   index.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE files(path TEXT PRIMARY KEY,sha256 TEXT NOT NULL,bytes INTEGER NOT NULL); CREATE TABLE sources(manifest_id TEXT NOT NULL,entry_index INTEGER NOT NULL,body TEXT NOT NULL,blob_sha256 TEXT,error TEXT,PRIMARY KEY(manifest_id,entry_index)); CREATE TABLE generic_sources(path TEXT PRIMARY KEY,body TEXT NOT NULL,blob_sha256 TEXT NOT NULL);");
   index.prepare("INSERT INTO meta VALUES('format','omni-learning-workspace-archive-1')").run();
   index.prepare("INSERT INTO meta VALUES('brainId',?)").run(brainId);
@@ -245,7 +246,7 @@ export async function learningWorkspaceArchive(root: string, expectedBrainId?: s
   }
   const files = new Map<string, string>(), inventoryPath = join(root, "inventory.sqlite3"), info = await lstat(inventoryPath);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Unsafe portable learning inventory.");
-  const index = new DatabaseSync(inventoryPath, { readOnly: true });
+  const index = new DatabaseSync(sqliteFilename(inventoryPath), { readOnly: true });
   try {
     if (index.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" || index.prepare("SELECT value FROM meta WHERE key='format'").get()?.value !== "omni-learning-workspace-archive-1") throw new Error("Portable learning inventory failed integrity validation.");
     if (index.prepare("SELECT value FROM meta WHERE key='complete'").get()?.value !== "1") throw new IncompleteLearningWorkspaceError();
@@ -283,7 +284,7 @@ export async function learningWorkspaceArchive(root: string, expectedBrainId?: s
 export async function adoptLearningWorkspace(archive: LearningWorkspaceArchive, targetRoot: string, targetBrainId: string,
   hooks: LearningWorkspaceHooks = {}): Promise<void> {
   learningId(targetBrainId);
-  const index = new DatabaseSync(join(archive.root, "inventory.sqlite3"), { readOnly: true });
+  const index = new DatabaseSync(sqliteFilename(join(archive.root, "inventory.sqlite3")), { readOnly: true });
   const copiedAt = new Date().toISOString();
   try {
     for (const row of index.prepare("SELECT path,sha256,bytes FROM files ORDER BY path").iterate()) {
@@ -297,7 +298,7 @@ export async function adoptLearningWorkspace(archive: LearningWorkspaceArchive, 
     const nativeMatches = !archive.nativeCoreSha256 || await exists(targetCore) && await fileHash(targetCore) === archive.nativeCoreSha256 &&
       (!archive.nativeBindingSha256 || await neuralBinding(dirname(targetCore), hooks.targetMetadataPath) === archive.nativeBindingSha256);
     if (await exists(taskPath)) {
-      const tasks = new DatabaseSync(taskPath);
+      const tasks = new DatabaseSync(sqliteFilename(taskPath));
       try {
         if (tasks.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== archive.brainId) throw new Error("Copied learning tasks lost their source owner.");
         tasks.exec("BEGIN IMMEDIATE");
@@ -330,7 +331,7 @@ export async function adoptLearningWorkspace(archive: LearningWorkspaceArchive, 
     }
     const oldRelocations = join(targetRoot, "learning", "source-relocations.sqlite3");
     if (await exists(oldRelocations)) {
-      const database = new DatabaseSync(oldRelocations);
+      const database = new DatabaseSync(sqliteFilename(oldRelocations));
       try { if (database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== archive.brainId) throw new Error("Retained source bindings have the wrong owner."); database.prepare("UPDATE meta SET value=? WHERE key='brainId'").run(targetBrainId); }
       finally { database.close(); }
     }
@@ -353,7 +354,7 @@ export async function adoptLearningWorkspace(archive: LearningWorkspaceArchive, 
       }
     } finally { relocations?.close(); }
     for await (const file of filesIn(join(targetRoot, "datasets", "crawls"))) if (file.name.endsWith(".sqlite3")) {
-      const crawl = new DatabaseSync(file.path);
+      const crawl = new DatabaseSync(sqliteFilename(file.path));
       try {
         const owner = crawl.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value;
         if (owner !== archive.brainId) throw new Error("Copied web frontier has the wrong owner.");

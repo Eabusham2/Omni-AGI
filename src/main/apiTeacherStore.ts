@@ -7,6 +7,7 @@ import { API_TEACHER_PROVIDERS } from "./apiTeacherProviders";
 import type { ApiTeacherLessonModality, ApiTeacherMediaLesson, ApiTeacherMediaCoverage, ApiTeacherResponseEnvelope } from "../shared/apiTeacherMedia";
 import { apiTeacherLessonModalities } from "../shared/apiTeacherMedia";
 import { checkedApiTeacherMediaCoverage, checkedApiTeacherResponseEnvelope, validateApiTeacherMediaLesson } from "./apiTeacherMedia";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const API_TEACHER_DIRECTORY = "api-teachers";
 export const API_TEACHER_DATABASE = `${API_TEACHER_DIRECTORY}/workspace.sqlite3`;
@@ -171,7 +172,7 @@ export class ApiTeacherStore {
     if (info && (!info.isFile() || info.isSymbolicLink())) throw new Error("API teacher workspace is not an owned regular file.");
     if (!info) await admitWrite(brainId, 128 * 1024, options.signal);
     options.signal?.throwIfAborted();
-    const db = new DatabaseSync(path, { readOnly: !create, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !create, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       if (create) db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; " +
@@ -193,7 +194,7 @@ export class ApiTeacherStore {
     apiTeacherId(brainId, "API teacher brain ID");
     const info = await lstat(path);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error("API teacher snapshot is not an owned regular file.");
-    const db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA mmap_size=0; PRAGMA busy_timeout=5000;");
       const store = new ApiTeacherStore(db, join(path, ".."), brainId,

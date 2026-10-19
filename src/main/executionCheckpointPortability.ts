@@ -13,6 +13,7 @@ import { copyMutableFileIsolated, writeMutableFileIsolated } from "./mutableFile
 import { streamFileSha256 } from "./streamingZip";
 import { rewriteNativeJsonValues } from "./nativeJsonValues";
 import { nativeCheckpointMemory } from "./nativeCheckpointMemory";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const CHECKPOINT = /^[a-f0-9]{32}$/;
@@ -69,7 +70,7 @@ async function checkedPayload(path: string, descriptor: unknown, logicalName = p
     });
   }
   if (/\.sqlite3?$/.test(logicalName)) {
-    const database = new DatabaseSync(path, { readOnly: true });
+    const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
     try {
       database.exec("PRAGMA query_only=ON");
       if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") throw new Error("Native execution SQLite integrity failed.");

@@ -6,6 +6,7 @@ import type { SparseSubstrateBundle, SparseSubstrateJob, SparseSubstratePlan } f
 import { copyMutableFileIsolated, snapshotMutableSqliteIsolated, writeMutableFileIsolated } from "./mutableFileIsolation";
 import { SPARSE_TRANSFER_DIRECTORY, SparseSubstrateTransferStore, sparseHash, sparseId,
   validateSparseTransferDatabaseFile } from "./sparseSubstrateTransferStore";
+import { sqliteFilename } from "./sqliteFilename";
 
 const WORKSPACE = `${SPARSE_TRANSFER_DIRECTORY}/workspace.sqlite3`;
 const LINEAGE_FORMAT = "omni-sparse-substrate-lineage-1" as const;
@@ -92,7 +93,7 @@ async function databaseOwner(path: string): Promise<string> {
   const { DatabaseSync } = await import("node:sqlite");
   const info = await lstat(path);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Sparse portability database is unsafe.");
-  const database = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
   try { database.exec("PRAGMA trusted_schema=OFF;"); return sparseId(database.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value); }
   finally { database.close(); }
 }

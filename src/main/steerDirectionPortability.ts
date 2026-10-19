@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { SteerDirectionRecord } from "../shared/steerDirections";
 import { STEER_DIRECTIONS_PATH, SteerDirectionStore } from "./steerDirectionStore";
 import { copyMutableFileIsolated, snapshotMutableSqliteIsolated } from "./mutableFileIsolation";
+import { sqliteFilename } from "./sqliteFilename";
 
 export function safeSteerDirectionWorkspacePath(value: string): boolean { return value === STEER_DIRECTIONS_PATH || /^directions\/archives\/[a-f0-9]{64}\.sqlite3$/.test(value); }
 async function fileHash(path: string): Promise<string> { const hash = createHash("sha256"); for await (const chunk of createReadStream(path)) hash.update(chunk); return hash.digest("hex"); }
@@ -36,8 +37,8 @@ type Projection = Pick<SteerDirectionRecord, "turnId" | "predecessorTurnId" | "h
 export async function mergedSteerDirectionProjection(root: string, owner: string, parentId: string,
   source: SteerDirectionRecord, nativeTurns: ReadonlyMap<string, string>): Promise<Projection> {
   const historyPath = join(root, "merge", "host-history.sqlite3"), ledgerPath = join(root, "conversation", "ledger.sqlite3");
-  const history = await exists(historyPath) ? new DatabaseSync(historyPath, { readOnly: true }) : undefined;
-  const ledger = await exists(ledgerPath) ? new DatabaseSync(ledgerPath, { readOnly: true }) : undefined;
+  const history = await exists(historyPath) ? new DatabaseSync(sqliteFilename(historyPath), { readOnly: true }) : undefined;
+  const ledger = await exists(ledgerPath) ? new DatabaseSync(sqliteFilename(ledgerPath), { readOnly: true }) : undefined;
   const alias = (id: string | undefined): string | undefined => id === undefined ? undefined : history?.prepare("SELECT destination_id FROM identities WHERE parent_id=? AND source_id=?").get(parentId, id)?.destination_id as string | undefined;
   try {
     if (ledger && ledger.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== owner) throw new Error("Merged steering projection has the wrong history owner.");

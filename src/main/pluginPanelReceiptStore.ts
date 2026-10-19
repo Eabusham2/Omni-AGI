@@ -6,6 +6,7 @@ import type { PluginInteractivePanelLaunch, PluginInteractiveToolReceipt } from 
 import type { ToolInvocation } from "../shared/types";
 import { runtimeHash, runtimeId, runtimeJson } from "./pluginRuntimeValidation";
 import { configurePluginCustodyJournal } from "./pluginCustodyJournal";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const PANEL_RECEIPT_PATH = "plugin-panels/workspace.sqlite3";
 export const PANEL_RECEIPT_FORMAT = "omni-plugin-panel-receipts-1";
@@ -35,14 +36,14 @@ export class PluginPanelReceiptStore {
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Unsafe panel receipt directory.");
     const file = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; }); if (!file && !create) throw new Error("Panel receipt database is missing.");
     if (file && (!file.isFile() || file.isSymbolicLink() || hooks && file.nlink !== 1)) throw new Error("Panel receipt file must be independently mutable.");
-    const db = new DatabaseSync(path, { readOnly: !hooks, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: !hooks, allowExtension: false });
     try { db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=2500; PRAGMA cache_size=-256; PRAGMA temp_store=FILE;");
       if (hooks) configurePluginCustodyJournal(db);
       if (!file && create) { for (const sql of schema) db.exec(sql); db.prepare("INSERT INTO meta VALUES('format',?)").run(PANEL_RECEIPT_FORMAT); db.prepare("INSERT INTO meta VALUES('brainId',?)").run(owner); }
       regularSchema(db, owner); return new PluginPanelReceiptStore(db, owner, !hooks, hooks);
     } catch (error) { db.close(); throw error; }
   }
-  static async captured(path: string, owner?: string): Promise<PluginPanelReceiptStore> { const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Unsafe captured panel receipts."); const db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+  static async captured(path: string, owner?: string): Promise<PluginPanelReceiptStore> { const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Unsafe captured panel receipts."); const db = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
     try { db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA temp_store=FILE;"); const actual = runtimeId(db.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value); regularSchema(db, owner ?? actual); return new PluginPanelReceiptStore(db, actual, true); } catch (error) { db.close(); throw error; } }
   close(): void { this.db.close(); }
   private async admit(bytes: number, signal?: AbortSignal): Promise<void> { if (!this.hooks || this.readOnly) throw new Error("Panel receipt source is read-only."); this.hooks.signal?.throwIfAborted(); signal?.throwIfAborted();

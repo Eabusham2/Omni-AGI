@@ -4,6 +4,7 @@ import { access, mkdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { TrainingSource } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-merge-evidence-plan";
 const FORMAT_VERSION = 1;
@@ -187,7 +188,7 @@ function configure(database: DatabaseSync): void {
 }
 
 function createDatabase(path: string, identity: MergeEvidencePlanIdentity): DatabaseSync {
-  const database = new DatabaseSync(path);
+  const database = new DatabaseSync(sqliteFilename(path));
   configure(database);
   database.exec(`
     CREATE TABLE meta (
@@ -304,7 +305,7 @@ function readSummary(database: DatabaseSync): MergeEvidencePlanSummary {
 }
 
 function openDatabase(path: string): DatabaseSync {
-  const database = new DatabaseSync(path);
+  const database = new DatabaseSync(sqliteFilename(path));
   try {
     configure(database);
     readSummary(database);

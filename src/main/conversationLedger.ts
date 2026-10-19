@@ -10,6 +10,7 @@ import type {
   ConversationLedgerSummary,
   ThoughtTrace
 } from "../shared/types";
+import { sqliteFilename } from "./sqliteFilename";
 
 const FORMAT = "omni-conversation-ledger";
 const ZERO_HASH = "0".repeat(64);
@@ -182,7 +183,7 @@ export class ConversationLedger {
     const directory = join(brainDirectory, "conversation");
     await mkdir(directory, { recursive: true });
     const path = join(directory, "ledger.sqlite3");
-    const database = new DatabaseSync(path);
+    const database = new DatabaseSync(sqliteFilename(path));
     database.exec(`
       PRAGMA journal_mode=DELETE;
       PRAGMA synchronous=FULL;
@@ -237,7 +238,7 @@ export class ConversationLedger {
     await mkdir(targetDirectory, { recursive: true });
     const targetPath = join(targetDirectory, "ledger.sqlite3");
     await copyFile(join(sourceBrainDirectory, "conversation", "ledger.sqlite3"), targetPath);
-    const database = new DatabaseSync(targetPath);
+    const database = new DatabaseSync(sqliteFilename(targetPath));
     try {
       const stored = database.prepare("SELECT value FROM meta WHERE key='brainId'").get() as
         { value?: string } | undefined;

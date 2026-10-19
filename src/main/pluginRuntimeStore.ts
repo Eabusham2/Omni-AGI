@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { PluginRuntimeRpcReply, PluginRuntimeSession, PluginRuntimeSchemaLearning, PluginRuntimeSessionPage, PluginRuntimeHistoryPage, PluginRuntimeStateSourcePage, PluginRuntimeStateConflictPage } from "../shared/pluginRuntime";
 import { RUNTIME_SHA, runtimeHash, runtimeId, runtimeJson } from "./pluginRuntimeValidation";
 import { configurePluginCustodyJournal } from "./pluginCustodyJournal";
+import { sqliteFilename } from "./sqliteFilename";
 
 export const PLUGIN_RUNTIME_WORKSPACE = "plugin-runtime/workspace.sqlite3";
 export const PLUGIN_RUNTIME_STORE_FORMAT = "omni-plugin-runtime-workspace-1";
@@ -54,7 +55,7 @@ export class PluginRuntimeStore {
     const info = await lstat(path).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
     if (!info && !options.create) throw new Error("Runtime workspace is missing its database.");
     if (info && (!info.isFile() || info.isSymbolicLink() || !options.readOnly && info.nlink !== 1)) throw new Error("Runtime writable state must not share a parent inode.");
-    const db = new DatabaseSync(path, { readOnly: options.readOnly ?? false, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: options.readOnly ?? false, allowExtension: false });
     try {
       db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=2500; PRAGMA cache_size=-256; PRAGMA temp_store=FILE;");
       const allowed = new Set(schema.map(normalizedSql));
@@ -74,7 +75,7 @@ export class PluginRuntimeStore {
   }
   static async openFile(path: string, owner: string): Promise<PluginRuntimeStore> {
     runtimeId(owner); const info = await lstat(path); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Unsafe captured runtime database.");
-    const db = new DatabaseSync(path, { readOnly: true, allowExtension: false });
+    const db = new DatabaseSync(sqliteFilename(path), { readOnly: true, allowExtension: false });
     try { db.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-256; PRAGMA temp_store=FILE;"); validateSchema(db, owner); return new PluginRuntimeStore(db, path, owner, true, {}); }
     catch (error) { db.close(); throw error; }
   }

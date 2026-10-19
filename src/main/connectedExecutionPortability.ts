@@ -7,6 +7,7 @@ import { assertSafeArchivePath, streamFileSha256, type StreamingZipSource } from
 import { nativeExecutionFiles } from "./executionCheckpointPortability";
 import { DatabaseSync } from "node:sqlite";
 import { validateConceptIdViewFile } from "./conceptIdViewFiles";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SHA = /^[a-f0-9]{64}$/, ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/, CHECKPOINT = /^[a-f0-9]{32}$/;
 const RUNTIME_FILES = ["brain.json", "core.safetensors", "plasticity.safetensors", "conversation.sqlite3", "state/replay.sqlite3", "state/working-memory.sqlite3"] as const;
@@ -224,7 +225,7 @@ export async function validateConnectedExecutionArchive(metadata: unknown, engin
       };
       await validateViews(nativeManifest.worker); await validateViews(nativeManifest.payload);
       for (const name of ["conversation.sqlite3", "state/replay.sqlite3", "state/working-memory.sqlite3"]) {
-        const db = new DatabaseSync(physical(prefix + name), { readOnly: true });
+        const db = new DatabaseSync(sqliteFilename(physical(prefix + name)), { readOnly: true });
         try { if (db.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") throw new Error("Inherited runtime SQLite failed integrity verification."); }
         finally { db.close(); }
       }

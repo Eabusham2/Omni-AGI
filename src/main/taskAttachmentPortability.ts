@@ -16,6 +16,7 @@ import {
   type PersistedTaskAttachmentRow,
   type TaskAttachmentPrivateSource
 } from "./taskAttachmentStore";
+import { sqliteFilename } from "./sqliteFilename";
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -68,7 +69,7 @@ export async function validateTaskAttachmentWorkspace(brainRoot: string, brainId
   }
   const info = await lstat(databasePath);
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Task attachment registry is unsafe.");
-  const database = new DatabaseSync(databasePath, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(databasePath), { readOnly: true });
   const referenced = new Map<string, number>();
   try {
     if (database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||
@@ -128,7 +129,7 @@ export async function validateTaskAttachmentWorkspace(brainRoot: string, brainId
 export async function rekeyTaskAttachmentWorkspace(brainRoot: string, sourceBrainId: string, targetBrainId: string): Promise<void> {
   if (!await validateTaskAttachmentWorkspace(brainRoot, sourceBrainId)) return;
   if (!SAFE_ID.test(targetBrainId)) throw new Error("Invalid task attachment target owner.");
-  const path = TaskAttachmentStore.databasePath(brainRoot), database = new DatabaseSync(path);
+  const path = TaskAttachmentStore.databasePath(brainRoot), database = new DatabaseSync(sqliteFilename(path));
   try {
     database.exec("BEGIN IMMEDIATE");
     try {
@@ -162,8 +163,8 @@ export async function mergeTaskAttachmentWorkspace(
 ): Promise<void> {
   if (!await validateTaskAttachmentWorkspace(sourceRoot, targetBrainId)) return;
   const target = new TaskAttachmentStore(targetRoot, targetBrainId); await target.initialize();
-  const sourceDatabase = new DatabaseSync(TaskAttachmentStore.databasePath(sourceRoot), { readOnly: true });
-  const targetDatabase = new DatabaseSync(TaskAttachmentStore.databasePath(targetRoot));
+  const sourceDatabase = new DatabaseSync(sqliteFilename(TaskAttachmentStore.databasePath(sourceRoot)), { readOnly: true });
+  const targetDatabase = new DatabaseSync(sqliteFilename(TaskAttachmentStore.databasePath(targetRoot)));
   const copied: string[] = [];
   try {
     const rows = sourceDatabase.prepare("SELECT * FROM attachments ORDER BY request_id,request_index").all() as unknown as PersistedTaskAttachmentRow[];

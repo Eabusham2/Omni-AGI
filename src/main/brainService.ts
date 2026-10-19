@@ -210,6 +210,7 @@ import {
   type TrainingResourceReadings,
   type TrainingTelemetry
 } from "../shared/trainingTelemetry";
+import { sqliteFilename } from "./sqliteFilename";
 
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const MAX_MERGE_FILES = 512;
@@ -3314,7 +3315,7 @@ function committedLedgerPayload(
   if (!existsSync(path)) return undefined;
   let database: DatabaseSync;
   try {
-    database = new DatabaseSync(path, { readOnly: true });
+    database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -3366,7 +3367,7 @@ function metadataPayloadById(
 function committedTurnHuman(brainDirectory: string, brainId: string, turnId: string): Record<string, unknown> | undefined {
   const path = join(brainDirectory, "engine", "conversation.sqlite3");
   if (!existsSync(path)) throw new Error("Native turn history is unavailable; absence is unverifiable.");
-  const database = new DatabaseSync(path, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
   let identifier: string | undefined;
   try {
     database.exec("PRAGMA query_only=ON; PRAGMA cache_size=-256");

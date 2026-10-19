@@ -6,7 +6,7 @@ import { afterEach, expect, it } from "vitest";
 import { pausedTeacherMediaFixture } from "./fixtures/apiTeacherMedia";
 import { snapshotLearningWorkspace } from "../src/main/learningWorkspacePortability";
 import { validateApiTeacherMediaArchiveSources } from "../src/main/apiTeacherMediaArchive";
-import { rekeyApiTeacherWorkspace, validateApiTeacherWorkspace } from "../src/main/apiTeacherPortability";
+import { captureApiTeacherWorkspace, rekeyApiTeacherWorkspace, validateApiTeacherWorkspace } from "../src/main/apiTeacherPortability";
 import { ApiTeacherStore } from "../src/main/apiTeacherStore";
 import { FullBrainMergeCoordinator, type FullMergeHooks } from "../src/main/fullBrainMerge";
 import { adoptFullMergeLearningWorkspace } from "../src/main/fullMergeLearningWorkspace";
@@ -32,6 +32,35 @@ it("validates typed teacher origin/history/opaque connected inventories and reje
   const brokenStage = join(root, "broken"); await mkdir(brokenStage);
   await expect(validateApiTeacherMediaArchiveSources(files.filter(([name]) => name !== `merge/parents/parent/portable-learning-workspace/blobs/${f.imageSha256}.data`), brokenStage))
     .rejects.toThrow(/missing.*teacher custody blob/);
+});
+
+it("reads, copies, and adopts exact historical teacher custody through deep managed paths without reviving source authority", async () => {
+  const root = await temporary(), sourceRoot = join(root, "source"); await mkdir(sourceRoot);
+  await pausedTeacherMediaFixture(sourceRoot, "original", "deep");
+  await rekeyApiTeacherWorkspace(sourceRoot, "original", "source");
+  const original = await ApiTeacherStore.open(sourceRoot, "source", async () => undefined, { create: false });
+  const archive = original!.lineages()[0]!; original!.close();
+  const exactArchive = await readFile(join(sourceRoot, archive.relativePath));
+  let targetRoot = root;
+  const minimumLength = process.platform === "win32" ? 1200 : 300;
+  for (let i = 0; targetRoot.length < minimumLength; i++) targetRoot = join(targetRoot, `owned-${i}-${"x".repeat(48)}`);
+  await mkdir(targetRoot, { recursive: true });
+  const admissions: string[] = [];
+  const admitMetadata = async (_bytes: number, purpose: string) => { admissions.push(purpose); };
+  const copied = await captureApiTeacherWorkspace(sourceRoot, targetRoot, "source", { admitMetadata });
+  expect(copied.has(archive.relativePath)).toBe(true);
+  expect(await readFile(join(targetRoot, archive.relativePath))).toEqual(exactArchive);
+  await rekeyApiTeacherWorkspace(targetRoot, "source", "copy", { admitMetadata, retireCopiedTeacherAuthority: true });
+  await validateApiTeacherWorkspace(targetRoot, "copy", undefined, admitMetadata);
+  const current = await ApiTeacherStore.open(targetRoot, "copy", async () => { throw new Error("Read-only check cannot admit writes."); }, { create: false });
+  try {
+    expect(current!.jobs().length).toBeGreaterThan(0);
+    expect(current!.jobs().every(job => job.state === "dormant")).toBe(true);
+  } finally { current?.close(); }
+  expect(admissions).toContain("teacher custody SQLite cache");
+  expect(admissions).toContain("teacher authenticated JSON-row parsing");
+  expect(await readFile(join(targetRoot, archive.relativePath))).toEqual(exactArchive);
+  expect(await readFile(join(sourceRoot, archive.relativePath))).toEqual(exactArchive);
 });
 
 it("threads selected metadata admission through actual full-merge snapshot/adopt/media merge and keeps sealed teacher bytes exact", async () => {

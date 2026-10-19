@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { sqliteFilename } from "./sqliteFilename";
 
 interface OwnerMutation {
   kind: "saved" | "removed";
@@ -61,7 +62,7 @@ export class SharedResourceRegistry {
     if (existsSync(this.ledgerPath) && lstatSync(this.ledgerPath).isSymbolicLink()) {
       throw new Error("Shared resource ledger cannot be a symbolic link.");
     }
-    this.database = new DatabaseSync(this.ledgerPath);
+    this.database = new DatabaseSync(sqliteFilename(this.ledgerPath));
     chmodSync(this.ledgerPath, 0o600);
     // Declaration observers must not add a multi-second stall to a committed
     // reply. Contention is queued/reported, then admission retries fail closed.

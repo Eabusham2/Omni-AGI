@@ -9,6 +9,7 @@ import type { MapConnection, MapConnectionSave, MapDisplayResult, MapSearchResul
 import type { SecureSecretStore } from "./secureSecretStore";
 import { checkedMapGeoJson } from "../shared/mapGeoJson";
 import packageMetadata from "../../package.json";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, SHA = /^[a-f0-9]{64}$/;
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
@@ -55,7 +56,7 @@ export class MapsService {
   private database(): DatabaseSync {
     try { const info = lstatSync(this.databasePath); if (!info.isFile() || info.isSymbolicLink()) throw new Error("Map configuration must be an owned regular database, not a filesystem link."); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const db = new DatabaseSync(this.databasePath); db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-512"); return db;
+    const db = new DatabaseSync(sqliteFilename(this.databasePath)); db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-512"); return db;
   }
   private now(): number { return this.options.now?.() ?? Date.now(); }
   private async admit(bytes: number): Promise<void> { if (this.options.admit) return this.options.admit(bytes); if (!Number.isSafeInteger(bytes) || bytes > freemem() || bytes > getHeapStatistics().heap_size_limit - process.memoryUsage().heapUsed) throw new Error("Map transfer awaits physical RAM."); }

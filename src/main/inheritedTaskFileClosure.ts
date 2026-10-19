@@ -12,6 +12,7 @@ import { canonicalTaskAttachmentValue, taskAttachmentManifestSha256, validatedTa
   TaskAttachmentStore, type PersistedTaskAttachmentRow } from "./taskAttachmentStore";
 import { readTaskContinuationScope } from "./taskContinuationScope";
 import { TaskAttachmentReadVerifier } from "./taskAttachmentReadVerifier";
+import { sqliteFilename } from "./sqliteFilename";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA = /^[a-f0-9]{64}$/;
@@ -136,7 +137,7 @@ export async function inheritedTaskFileClosure(root: string, context: InheritedT
   }
   if (chain.at(-1) !== context.sourceBrainId || metadata.brain_id !== context.sourceBrainId) throw new Error("Inherited task host closure belongs to a different original native source.");
   const archive = join(storage, "portable-learning-workspace"), inventoryPath = await inside(storage, "portable-learning-workspace/inventory.sqlite3");
-  const inventory = new DatabaseSync(inventoryPath, { readOnly: true }); let sourceDatabase: DatabaseSync | undefined;
+  const inventory = new DatabaseSync(sqliteFilename(inventoryPath), { readOnly: true }); let sourceDatabase: DatabaseSync | undefined;
   try {
     inventory.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512");
     if (inventory.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" || inventory.prepare("SELECT value FROM meta WHERE key='format'").get()?.value !== "omni-learning-workspace-archive-1" ||
@@ -146,7 +147,7 @@ export async function inheritedTaskFileClosure(root: string, context: InheritedT
     if (!SHA.test(String(registry.sha256)) || !Number.isSafeInteger(registry.bytes) || Number(registry.bytes) < 1) throw new Error("Inherited task attachment registry seal is invalid.");
     const registryPath = await inside(archive, `blobs/${registry.sha256}.data`), measured = await sealed(registryPath, String(registry.sha256), guards, signal);
     if (measured.bytes !== registry.bytes) throw new Error("Inherited task attachment registry length changed.");
-    sourceDatabase = new DatabaseSync(registryPath, { readOnly: true }); sourceDatabase.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512");
+    sourceDatabase = new DatabaseSync(sqliteFilename(registryPath), { readOnly: true }); sourceDatabase.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512");
     if (sourceDatabase.prepare("PRAGMA quick_check").get()?.quick_check !== "ok" ||
         sourceDatabase.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== context.sourceBrainId ||
         sourceDatabase.prepare("SELECT value FROM meta WHERE key='format'").get()?.value !== "omni-chat-task-attachments-1") throw new Error("Inherited task original attachment owner is invalid.");
@@ -163,7 +164,7 @@ export async function inheritedTaskFileClosure(root: string, context: InheritedT
     const scope = readTaskContinuationScope(sourceDatabase, context.sourceBrainId, context.sourceTurnId);
     if (scope && scope.record.attentionEpoch !== context.sourceAttentionEpoch) throw new Error("Inherited task file scope belongs to another source attention epoch.");
     const sourceIds = [...new Set([...ownIds, ...(scope?.aliases.map(alias => alias.attachmentId) ?? [])])]; reserve(sourceIds.length * 4096 + 65536);
-    const current = new DatabaseSync(TaskAttachmentStore.databasePath(root), { readOnly: true });
+    const current = new DatabaseSync(sqliteFilename(TaskAttachmentStore.databasePath(root)), { readOnly: true });
     try {
       current.exec("PRAGMA trusted_schema=OFF; PRAGMA cache_size=-512");
       if (current.prepare("SELECT value FROM meta WHERE key='brainId'").get()?.value !== context.brainId) throw new Error("Inherited task custody registry has another current owner.");

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { sqliteFilename } from "./sqliteFilename";
 
 export interface PortableReplayCheckpoint {
   format: string;
@@ -77,7 +78,7 @@ export function verifyPortableReplaySqlite(
   checkpoint: unknown
 ): { committedExamples: number; durableExamples: number; pendingExamples: number } {
   checkpointShape(checkpoint);
-  const database = new DatabaseSync(path, { readOnly: true });
+  const database = new DatabaseSync(sqliteFilename(path), { readOnly: true });
   let transactionOpen = false;
   try {
     database.exec("BEGIN");
