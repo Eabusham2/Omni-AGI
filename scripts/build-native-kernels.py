@@ -33,6 +33,16 @@ def runtime_architecture():
     raise RuntimeError("The native worker requires an x64 or ARM64 runtime.")
 
 
+def windows_developer_command(command_processor, target):
+    if target not in {"x64", "arm64"}:
+        raise ValueError("Unsupported native Windows compiler target.")
+    # cmd.exe parses the /c remainder itself. Passing this program as an argv
+    # item applies CRT backslash-quote escaping, which cmd does not understand.
+    # /s strips only these outer quotes and preserves the quoted batch path.
+    return (subprocess.list2cmdline([command_processor]) + ' /d /u /s /c "call '
+        '"%OMNI_KERNEL_VSDEVCMD%" -no_logo -arch=' + target + ' >nul && set"')
+
+
 def windows_msvc_environment(architecture):
     target = "x64" if architecture == "x86_64" else "arm64"
     environment = {name.upper(): value for name, value in os.environ.items()}
@@ -43,7 +53,8 @@ def windows_msvc_environment(architecture):
     locator = str(installed) if installed.is_file() else shutil.which("vswhere")
     if not locator:
         raise RuntimeError("The Windows worker build needs Visual Studio C++ Build Tools (vswhere and VsDevCmd.bat).")
-    discovery = subprocess.run([locator, "-latest", "-products", "*", "-property", "installationPath", "-utf8"],
+    component = "Microsoft.VisualStudio.Component.VC.Tools." + ("x86.x64" if target == "x64" else "ARM64")
+    discovery = subprocess.run([locator, "-latest", "-products", "*", "-requires", component, "-property", "installationPath", "-utf8"],
         check=True, capture_output=True, encoding="utf-8", timeout=30)
     installation = discovery.stdout.strip()
     developer_command = Path(installation) / "Common7/Tools/VsDevCmd.bat"
@@ -54,9 +65,15 @@ def windows_msvc_environment(architecture):
     # Capture the developer environment privately; never print its contents,
     # which also contain the caller's signing variables. Select the Python
     # process target explicitly instead of trusting the runner's default PATH.
-    initialized = subprocess.run([environment.get("COMSPEC", "cmd.exe"), "/d", "/u", "/c",
-        'call "%OMNI_KERNEL_VSDEVCMD%" -no_logo -arch=' + target + ' >nul && set'],
-        env=environment, check=True, capture_output=True, encoding="utf-16-le", errors="replace", timeout=60)
+    command_processor = environment.get("COMSPEC", "cmd.exe")
+    try:
+        initialized = subprocess.run(windows_developer_command(command_processor, target), executable=command_processor,
+            env=environment, check=True, capture_output=True, encoding="utf-16-le", errors="replace", timeout=60)
+    except subprocess.CalledProcessError as error:
+        # VsDevCmd's captured environment can contain signing credentials.
+        # Keep diagnostics stage/target-specific without printing its streams.
+        raise RuntimeError("Visual Studio developer environment initialization failed for " + target
+            + " (exit " + str(error.returncode) + "); check the requested C++ toolchain installation.") from None
     environment = {}
     for line in initialized.stdout.splitlines():
         if "=" in line and not line.startswith("="):

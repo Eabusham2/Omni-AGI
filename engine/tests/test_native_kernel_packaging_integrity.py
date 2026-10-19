@@ -45,6 +45,62 @@ def dylib(*, signed=False, relocated=False, cpu=0x100000C):
 
 
 class NativeKernelPackagingIntegrityCases(unittest.TestCase):
+    def native_builder(self):
+        spec = importlib.util.spec_from_file_location("owned_native_kernel_builder", ROOT / "scripts/build-native-kernels.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_windows_developer_setup_preserves_cmd_quotes_and_selects_actual_target_tools_without_building(self):
+        builder = self.native_builder()
+        for architecture, target, component in (("x86_64", "x64", "x86.x64"), ("arm64", "arm64", "ARM64")):
+            with self.subTest(target=target):
+                calls = []
+                processor = r"C:\Windows\System32\cmd.exe"
+                environment = {"ComSpec": processor, "ProgramFiles(x86)": r"C:\Program Files (x86)", "Path": "original"}
+                def run(command, **options):
+                    calls.append((command, options))
+                    if isinstance(command, list):
+                        self.assertIn("Microsoft.VisualStudio.Component.VC.Tools." + component, command)
+                        self.assertIn("-requires", command)
+                        return SimpleNamespace(stdout=r"C:\Program Files\Microsoft Visual Studio\18\Enterprise" + "\n")
+                    # Model cmd's documented /s outer-quote removal, not CRT
+                    # argv decoding. No actual cmd/compiler/device is started.
+                    self.assertIsInstance(command, str)
+                    shell_program = command.split(" /s /c ", 1)[1]
+                    self.assertEqual(shell_program[1:-1], 'call "%OMNI_KERNEL_VSDEVCMD%" -no_logo -arch=' + target + ' >nul && set')
+                    self.assertTrue(shell_program.startswith('"') and shell_program.endswith('"'))
+                    self.assertNotIn('\\"', shell_program)
+                    self.assertEqual(options["executable"], processor)
+                    self.assertEqual(options["encoding"], "utf-16-le")
+                    self.assertTrue(options["capture_output"] and options["check"])
+                    self.assertEqual(options["timeout"], 60)
+                    return SimpleNamespace(stdout="Path=owned-msvc-path\r\nVSCMD_ARG_TGT_ARCH=" + target
+                        + "\r\nOMNI_KERNEL_VSDEVCMD=owned-private-helper\r\n")
+                with patch.dict(builder.os.environ, environment, clear=True), patch.object(builder.Path, "is_file", return_value=True), \
+                     patch.object(builder.shutil, "which", side_effect=lambda name, path=None: "owned-cl.exe" if name == "cl" and path == "owned-msvc-path" else None), \
+                     patch.object(builder.subprocess, "run", side_effect=run):
+                    configured = builder.windows_msvc_environment(architecture)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(configured["VSCMD_ARG_TGT_ARCH"], target)
+                self.assertEqual(configured["PATH"], "owned-msvc-path")
+                self.assertNotIn("OMNI_KERNEL_VSDEVCMD", configured)
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            builder.windows_developer_command("cmd.exe", "unreviewed-target")
+
+    def test_windows_failed_developer_setup_does_not_publish_private_environment_or_continue_to_compile(self):
+        builder = self.native_builder()
+        discovery = SimpleNamespace(stdout="owned-installed-visual-studio\n")
+        failure = builder.subprocess.CalledProcessError(1, "owned-cmd", output="PRIVATE_SIGNING=OWNED_TEST_SECRET", stderr="OWNED_TEST_SECRET")
+        with patch.dict(builder.os.environ, {"ComSpec": "cmd.exe", "Path": "original"}, clear=True), \
+             patch.object(builder.Path, "is_file", return_value=True), patch.object(builder.shutil, "which", return_value=None), \
+             patch.object(builder.subprocess, "run", side_effect=[discovery, failure]) as run:
+            with self.assertRaisesRegex(RuntimeError, "initialization failed for x64.*exit 1") as raised:
+                builder.windows_msvc_environment("x86_64")
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("OWNED_TEST_SECRET", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+
     def fixture(self):
         temporary = TemporaryDirectory(prefix="omni-native-packaging-contract-")
         self.addCleanup(temporary.cleanup)
