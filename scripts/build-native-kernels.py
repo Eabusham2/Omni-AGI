@@ -13,6 +13,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 
 
 def runtime_architecture():
@@ -100,6 +101,20 @@ def verify_library(path, environment):
     subprocess.run([sys.executable, "-I", "-c", probe, str(path)], env=environment, check=True, timeout=30)
 
 
+def cleanup_owned_kernel_directory(temporary):
+    # Windows scanners can retain the just-linked/verified DLL briefly after
+    # its exact child process exits. Retry only this owned TemporaryDirectory,
+    # never ignore failure, delete another directory or bypass verification.
+    for attempt in range(21):
+        try:
+            temporary.cleanup()
+            return
+        except PermissionError as error:
+            if sys.platform != "win32" or getattr(error, "winerror", None) not in {5, 32} or attempt == 20:
+                raise
+            time.sleep(min(0.1 * (attempt + 1), 0.5))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-directory", type=Path)
@@ -120,7 +135,9 @@ def main():
         compiler = explicit_compiler or next((shutil.which(item) for item in ("clang++", "g++") if shutil.which(item)), None)
     if not compiler:
         raise RuntimeError("A C++17 compiler is required when building the native worker package.")
-    with tempfile.TemporaryDirectory(prefix="omni-kernel-build-") as temporary:
+    owned_temporary = tempfile.TemporaryDirectory(prefix="omni-kernel-build-")
+    try:
+        temporary = owned_temporary.name
         output = Path(temporary) / name
         if Path(compiler).name.lower() in {"cl", "cl.exe", "clang-cl", "clang-cl.exe"}:
             command = [compiler, "/nologo", "/O2", "/std:c++17", "/EHsc", "/MT", "/LD", str(source), "/link", "/OUT:" + str(output)]
@@ -135,6 +152,8 @@ def main():
         staged = destination / (name + ".next")
         shutil.copy2(output, staged)
         staged.replace(destination / name)
+    finally:
+        cleanup_owned_kernel_directory(owned_temporary)
     manifest = {"abi": 1, "platform": sys.platform, "architecture": architecture,
         "sourceSha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "sha256": hashlib.sha256((destination / name).read_bytes()).hexdigest(), "file": name}

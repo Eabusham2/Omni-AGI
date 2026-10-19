@@ -12,7 +12,7 @@ import struct
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("owned_build_native_integrity", ROOT / "scripts/native_kernel_integrity.py")
@@ -100,6 +100,79 @@ class NativeKernelPackagingIntegrityCases(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertNotIn("OWNED_TEST_SECRET", str(raised.exception))
         self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_windows_owned_kernel_cleanup_retries_only_transient_locks_after_child_verification(self):
+        builder = self.native_builder()
+        locked = PermissionError("owned DLL is temporarily locked"); locked.winerror = 5
+        cleanup = Mock(side_effect=[locked, locked, None])
+        temporary = SimpleNamespace(cleanup=cleanup)
+        with patch.object(builder, "sys", SimpleNamespace(platform="win32")), patch.object(builder.time, "sleep") as sleep:
+            builder.cleanup_owned_kernel_directory(temporary)
+        self.assertEqual(cleanup.call_count, 3)
+        self.assertEqual([row.args[0] for row in sleep.call_args_list], [0.1, 0.2])
+        source = (ROOT / "scripts/build-native-kernels.py").read_text()
+        body = ast.parse(source)
+        main = next(node for node in body.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        guarded = next(node for node in main.body if isinstance(node, ast.Try))
+        self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "verify_library" for node in ast.walk(guarded)))
+        self.assertEqual(guarded.finalbody[0].value.func.id, "cleanup_owned_kernel_directory")
+
+    def test_owned_kernel_cleanup_expiry_and_non_windows_permission_failures_remain_fatal(self):
+        builder = self.native_builder()
+        for platform_name, code, attempts in (("win32", 5, 21), ("win32", 32, 21), ("win32", 999, 1), ("darwin", 5, 1)):
+            with self.subTest(platform=platform_name, code=code):
+                locked = PermissionError("owned lock must not be ignored"); locked.winerror = code
+                cleanup = Mock(side_effect=locked)
+                with patch.object(builder, "sys", SimpleNamespace(platform=platform_name)), patch.object(builder.time, "sleep") as sleep:
+                    with self.assertRaises(PermissionError) as raised:
+                        builder.cleanup_owned_kernel_directory(SimpleNamespace(cleanup=cleanup))
+                self.assertIs(raised.exception, locked)
+                self.assertEqual(cleanup.call_count, attempts)
+                self.assertEqual(sleep.call_count, attempts - 1)
+                self.assertLessEqual(sum(row.args[0] for row in sleep.call_args_list), 10)
+
+    def test_windows_worker_runtime_fault_hook_is_early_stdlib_only_and_diagnostic(self):
+        hook = ROOT / "scripts/pyinstaller-worker-fault-hook.py"
+        source = hook.read_text()
+        body = ast.parse(source)
+        self.assertEqual([node.names[0].name for node in body.body if isinstance(node, ast.Import)], ["faulthandler", "sys"])
+        self.assertFalse(any(isinstance(node, ast.ImportFrom) for node in ast.walk(body)))
+        for stderr, failure in ((object(), None), (None, None), (object(), OSError("owned closed stderr"))):
+            with self.subTest(stderr_present=stderr is not None, diagnostic_failure=failure is not None):
+                enable = Mock(side_effect=failure)
+                def owned_import(name, *args, **kwargs):
+                    if name == "faulthandler": return SimpleNamespace(enable=enable)
+                    if name == "sys": return SimpleNamespace(stderr=stderr)
+                    self.fail("Unexpected worker hook dependency: " + name)
+                exec(compile(body, str(hook), "exec"), {"__builtins__": {"__import__": owned_import,
+                    "AttributeError": AttributeError, "OSError": OSError, "RuntimeError": RuntimeError, "ValueError": ValueError}})
+                if stderr is None: enable.assert_not_called()
+                else: enable.assert_called_once_with(file=stderr, all_threads=False)
+        build = (ROOT / "scripts/build-engine.ps1").read_text()
+        runtime_hook = '--runtime-hook (Join-Path $RepoRoot "scripts\\pyinstaller-worker-fault-hook.py")'
+        self.assertLess(build.index("-m PyInstaller"), build.index(runtime_hook))
+        self.assertLess(build.index(runtime_hook), build.index("--paths"))
+
+    def test_windows_worker_closed_stdout_diagnostic_is_owned_bounded_and_preserves_failure(self):
+        smoke = (ROOT / "scripts/smoke-engine.ps1").read_text()
+        self.assertLess(smoke.index("$Worker.StandardError.ReadToEndAsync()"), smoke.index("function Invoke-WorkerRpc"))
+        diagnostic = smoke.split("function Get-WorkerExitDiagnostic {", 1)[1].split("function Invoke-WorkerRpc", 1)[0]
+        self.assertIn("$Worker.HasExited", diagnostic)
+        self.assertIn("$Worker.WaitForExit(5000)", diagnostic)
+        self.assertIn("$WorkerErrorReadTask.Wait(1000)", diagnostic)
+        self.assertIn(".Substring($DiagnosticError.Length - 12000)", diagnostic)
+        self.assertIn("[string]$Worker.ExitCode", diagnostic)
+        self.assertIn("[Convert]::ToString([int]$Worker.ExitCode, 16)", diagnostic)
+        self.assertIn(".PadLeft(8, '0')", diagnostic)
+        for field in ("workerExited=", "exitCode=", "exitHex=", "stderrComplete="):
+            self.assertIn(field, diagnostic)
+        self.assertNotIn("Environment", diagnostic)
+        self.assertNotIn("Get-Process", diagnostic)
+        self.assertNotIn("Kill", diagnostic)
+        self.assertIn('throw "Packaged worker closed stdout during $Method. $(Get-WorkerExitDiagnostic)"', smoke)
+        self.assertIn('throw "Packaged worker did not exit cleanly. $(Get-WorkerExitDiagnostic)"', smoke)
+        self.assertIn('$Health.worker -ne "python"', smoke)
+        self.assertIn('$Health.protocolVersion -ne 1', smoke)
 
     def fixture(self):
         temporary = TemporaryDirectory(prefix="omni-native-packaging-contract-")

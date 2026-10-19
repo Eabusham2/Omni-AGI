@@ -36,6 +36,28 @@ $Worker.StartInfo = $StartInfo
 if (-not $Worker.Start()) {
   throw "Failed to start packaged OmniCortex worker at $Executable"
 }
+$WorkerErrorReadTask = $Worker.StandardError.ReadToEndAsync()
+
+function Get-WorkerExitDiagnostic {
+  # Observe only the exact launched child. Never emit its environment, command
+  # credentials or unrelated processes, and never turn a crash into success.
+  $Exited = $Worker.HasExited
+  if (-not $Exited) { $Exited = $Worker.WaitForExit(5000) }
+  $Code = "unavailable"
+  $Hex = "unavailable"
+  if ($Exited) {
+    $Code = [string]$Worker.ExitCode
+    $Hex = "0x" + [Convert]::ToString([int]$Worker.ExitCode, 16).ToUpperInvariant().PadLeft(8, '0')
+  }
+  $StderrComplete = $WorkerErrorReadTask.IsCompleted
+  if (-not $StderrComplete -and $Exited) { $StderrComplete = $WorkerErrorReadTask.Wait(1000) }
+  $DiagnosticError = ""
+  if ($StderrComplete) {
+    $DiagnosticError = $WorkerErrorReadTask.GetAwaiter().GetResult()
+    if ($DiagnosticError.Length -gt 12000) { $DiagnosticError = $DiagnosticError.Substring($DiagnosticError.Length - 12000) }
+  }
+  return "workerExited=$Exited; exitCode=$Code; exitHex=$Hex; stderrComplete=$StderrComplete`n$DiagnosticError"
+}
 
 function Invoke-WorkerRpc {
   param(
@@ -63,7 +85,7 @@ function Invoke-WorkerRpc {
     }
     $Line = $ReadTask.Result
     if ($null -eq $Line) {
-      throw "Packaged worker closed stdout during $Method. $($Worker.StandardError.ReadToEnd())"
+      throw "Packaged worker closed stdout during $Method. $(Get-WorkerExitDiagnostic)"
     }
     $Message = $Line | ConvertFrom-Json
     if ($Message.id -ne $Id) {
@@ -253,7 +275,7 @@ try {
     throw "Packaged worker did not exit after shutdown."
   }
   if ($Worker.ExitCode -ne 0) {
-    throw "Packaged worker exited with code $($Worker.ExitCode)."
+    throw "Packaged worker did not exit cleanly. $(Get-WorkerExitDiagnostic)"
   }
 
   @{

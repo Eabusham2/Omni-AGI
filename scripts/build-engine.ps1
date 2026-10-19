@@ -48,6 +48,7 @@ if (Test-Path $WorkRoot) {
   --distpath $DistRoot `
   --workpath $WorkRoot `
   --specpath $WorkRoot `
+  --runtime-hook (Join-Path $RepoRoot "scripts\pyinstaller-worker-fault-hook.py") `
   --paths (Join-Path $RepoRoot "engine") `
   --add-data "$(Join-Path $RepoRoot 'engine\omni_core\native');omni_core/native" `
   --add-data "$(Join-Path $RepoRoot 'engine\omni_core\kernels');omni_core/kernels" `
