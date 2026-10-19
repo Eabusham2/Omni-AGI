@@ -5,10 +5,13 @@ import ctypes
 import functools
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import struct
+import sys
+import threading
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -173,6 +176,103 @@ class NativeKernelPackagingIntegrityCases(unittest.TestCase):
         self.assertIn('throw "Packaged worker did not exit cleanly. $(Get-WorkerExitDiagnostic)"', smoke)
         self.assertIn('$Health.worker -ne "python"', smoke)
         self.assertIn('$Health.protocolVersion -ne 1', smoke)
+
+    def test_opt_in_startup_hook_logs_only_bounded_labels_and_keeps_normal_exit_slot(self):
+        hook = ROOT / "scripts/pyinstaller-worker-startup-hook.py"
+        source = compile(hook.read_text(), str(hook), "exec")
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                locks, audit_hooks, traces, exits = [], [], [], []
+                def owned_lock():
+                    lock = threading.Lock()
+                    locks.append(lock)
+                    return lock
+                class LockedOutput(io.StringIO):
+                    def write(_output, text):
+                        self.assertTrue(locks and locks[0].locked())
+                        return super().write(text)
+                    def flush(_output):
+                        self.assertTrue(locks and locks[0].locked())
+                        return super().flush()
+                output = LockedOutput()
+                fake_sys = SimpleNamespace(stderr=output, addaudithook=audit_hooks.append, settrace=traces.append)
+                modules = {"os": SimpleNamespace(environ={"OMNI_WORKER_STARTUP_DIAGNOSTICS": "1"} if enabled else {}),
+                    "sys": fake_sys, "atexit": SimpleNamespace(register=lambda *args: exits.append(args)),
+                    "threading": SimpleNamespace(settrace=traces.append, Lock=owned_lock)}
+                def owned_import(name, *args, **kwargs):
+                    self.assertIn(name, modules)
+                    return modules[name]
+                namespace = {"__builtins__": {"__import__": owned_import, "AttributeError": AttributeError,
+                    "OSError": OSError, "RuntimeError": RuntimeError, "ValueError": ValueError}}
+                exec(source, namespace)
+                if not enabled:
+                    self.assertEqual((output.getvalue(), locks, audit_hooks, traces, exits), ("", [], [], [], []))
+                    continue
+                self.assertEqual(len(locks), 1)
+                self.assertEqual(len(audit_hooks), 1)
+                self.assertEqual(len(traces), 2)
+                frame = lambda path, name: SimpleNamespace(f_code=SimpleNamespace(co_filename=path, co_name=name))
+                audit_hooks[0]("import", ("torch", "OWNED_PRIVATE_PATH"))
+                audit_hooks[0]("import", ("OWNED_PRIVATE_MODULE", "OWNED_PRIVATE_PATH"))
+                trace = traces[0]
+                trace(frame(r"C:\owned\worker.py", "main"), "call", None)
+                trace(frame(r"C:\owned\worker_transport.py", "readline"), "return", b"")
+                trace(frame("worker.py", "health"), "exception", (SystemExit, SystemExit("OWNED_PRIVATE_ERROR"), None))
+                self.assertIsNone(trace(frame("private.py", "OWNED_PRIVATE_FUNCTION"), "call", None))
+                writers = [threading.Thread(target=lambda: [audit_hooks[0]("import", ("torch",)) for _ in range(25)]) for _ in range(4)]
+                for writer in writers: writer.start()
+                for writer in writers: writer.join()
+                callback, *arguments = exits[0]
+                callback(*arguments)
+                lines = output.getvalue().splitlines()
+                self.assertEqual(len(lines), 64)
+                self.assertLessEqual(max(map(len, lines)), 134)
+                self.assertEqual(lines[-1], "omni-startup: python-exit")
+                self.assertIn("omni-startup: main-call", lines)
+                self.assertIn("omni-startup: stdio-eof", lines)
+                self.assertIn("omni-startup: health-exception-SystemExit", lines)
+                self.assertNotIn("OWNED_PRIVATE", output.getvalue())
+
+    def test_windows_stdio_probe_uses_real_transport_seam_but_no_neural_import_or_execution(self):
+        path = ROOT / "scripts/windows-stdio-probe.py"
+        body = ast.parse(path.read_text())
+        imports = [node.names[0].name if isinstance(node, ast.Import) else node.module
+            for node in body.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+        self.assertEqual(imports, ["json", "sys", "worker_transport"])
+        reader, serve = Mock(return_value="owned-raw-fd-reader"), Mock()
+        with patch.dict(sys.modules, {"worker_transport": SimpleNamespace(ProtocolLineReader=reader, serve_worker_stdio=serve)}):
+            spec = importlib.util.spec_from_file_location("owned_windows_stdio_probe", path)
+            probe = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(probe)
+        with patch.object(probe, "sys", SimpleNamespace(stdin=SimpleNamespace(buffer=SimpleNamespace(fileno=lambda: 73)))):
+            self.assertEqual(probe.main(), 0)
+        reader.assert_called_once_with(73)
+        worker, stream, send, available, fault = serve.call_args.args
+        self.assertEqual(stream, "owned-raw-fd-reader")
+        self.assertIs(send, probe._send)
+        self.assertIsNone(available())
+        self.assertIs(fault, probe.ProbeFault)
+        reply = worker.dispatch({"jsonrpc": "2.0", "id": "health", "method": "health", "params": {}})
+        self.assertEqual(reply["result"], {"ready": True, "worker": "windows-stdio-probe", "protocolVersion": 1, "loadedBrains": 0})
+        with self.assertRaises(probe.ProbeFault):
+            worker.dispatch({"jsonrpc": "2.0", "id": "create", "method": "create", "params": {}})
+        self.assertTrue(worker.running)
+        self.assertEqual(worker.dispatch({"jsonrpc": "2.0", "id": "shutdown", "method": "shutdown", "params": {}})["result"], {"stopping": True})
+        self.assertFalse(worker.running)
+
+    def test_windows_probe_precedes_heavy_freeze_without_substituting_actual_health(self):
+        build = (ROOT / "scripts/build-engine.ps1").read_text()
+        smoke = (ROOT / "scripts/smoke-engine.ps1").read_text()
+        self.assertLess(build.index("--name omni-stdio-probe"), build.index("--name omni-engine"))
+        self.assertLess(build.index("-HealthOnly -StdioProbe"), build.index("--name omni-engine"))
+        self.assertNotIn("--collect-all torch", build[:build.index("--name omni-engine")])
+        self.assertIn('if ($StdioProbe -and -not $HealthOnly)', smoke)
+        self.assertIn('$Health.worker -ne "windows-stdio-probe"', smoke)
+        self.assertIn('$Health.worker -ne "python"', smoke)
+        self.assertIn('$Health.operatingSystem -ne "win32"', smoke)
+        self.assertIn('transportProbeOnly = $StdioProbe.IsPresent', smoke)
+        self.assertEqual(build.count('--runtime-hook (Join-Path $RepoRoot "scripts\\pyinstaller-worker-startup-hook.py")'), 2)
+        self.assertIn('if ($HealthOnly) {\n  $StartInfo.Environment["OMNI_WORKER_STARTUP_DIAGNOSTICS"] = "1"', smoke)
 
     def fixture(self):
         temporary = TemporaryDirectory(prefix="omni-native-packaging-contract-")

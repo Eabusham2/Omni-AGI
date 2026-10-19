@@ -3,12 +3,16 @@ param(
   [string]$Executable,
   [string]$BrainRoot = "",
   [switch]$HealthOnly,
-  [switch]$Comprehensive
+  [switch]$Comprehensive,
+  [switch]$StdioProbe
 )
 
 $ErrorActionPreference = "Stop"
 if ($HealthOnly -and $Comprehensive) {
   throw "-HealthOnly and -Comprehensive cannot be used together."
+}
+if ($StdioProbe -and -not $HealthOnly) {
+  throw "-StdioProbe requires -HealthOnly and never creates a brain."
 }
 $Executable = (Resolve-Path $Executable).Path
 if (-not $HealthOnly) {
@@ -30,6 +34,9 @@ $StartInfo.RedirectStandardOutput = $true
 $StartInfo.RedirectStandardError = $true
 $StartInfo.Environment["PYTHONUNBUFFERED"] = "1"
 $StartInfo.Environment["OMNI_PROTOCOL_VERSION"] = "1"
+if ($HealthOnly) {
+  $StartInfo.Environment["OMNI_WORKER_STARTUP_DIAGNOSTICS"] = "1"
+}
 
 $Worker = [System.Diagnostics.Process]::new()
 $Worker.StartInfo = $StartInfo
@@ -100,7 +107,13 @@ function Invoke-WorkerRpc {
 
 try {
   $Health = Invoke-WorkerRpc -Id "health" -Method "health" -Params @{}
-  if (
+  if ($StdioProbe) {
+    if (-not $Health.ready -or $Health.worker -ne "windows-stdio-probe" -or
+        $Health.protocolVersion -ne 1 -or $Health.loadedBrains -ne 0) {
+      throw "Frozen Windows stdio probe did not return its distinct no-brain identity."
+    }
+  }
+  elseif (
     -not $Health.ready -or
     $Health.worker -ne "python" -or
     $Health.protocolVersion -ne 1 -or
@@ -287,6 +300,7 @@ try {
     platform = $Health.platform
     operatingSystem = $Health.operatingSystem
     healthOnly = $HealthOnly.IsPresent
+    transportProbeOnly = $StdioProbe.IsPresent
     persistedBrain = (-not $HealthOnly.IsPresent)
     safeTensorCheckpoint = (-not $HealthOnly.IsPresent)
     sqliteEventLog = (-not $HealthOnly.IsPresent)

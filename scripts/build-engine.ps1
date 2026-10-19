@@ -40,6 +40,29 @@ if (Test-Path $WorkRoot) {
   Remove-Item -Recurse -Force $WorkRoot
 }
 
+# Classify the actual Windows frozen stdio boundary before the large neural
+# freeze. This distinct, stdlib-only probe cannot satisfy real worker health.
+$ProbeRoot = Join-Path $WorkRoot "stdio-probe"
+& $Python -m PyInstaller `
+  --noconfirm `
+  --clean `
+  --onedir `
+  --name omni-stdio-probe `
+  --distpath (Join-Path $ProbeRoot "dist") `
+  --workpath (Join-Path $ProbeRoot "work") `
+  --specpath $ProbeRoot `
+  --runtime-hook (Join-Path $RepoRoot "scripts\pyinstaller-worker-fault-hook.py") `
+  --runtime-hook (Join-Path $RepoRoot "scripts\pyinstaller-worker-startup-hook.py") `
+  --paths (Join-Path $RepoRoot "engine") `
+  (Join-Path $RepoRoot "scripts\windows-stdio-probe.py")
+if ($LASTEXITCODE -ne 0) {
+  throw "The stdlib-only Windows stdio probe build failed with exit code $LASTEXITCODE"
+}
+Write-Host "Checking frozen Windows stdio transport (no neural runtime)."
+& (Join-Path $RepoRoot "scripts\smoke-engine.ps1") `
+  -Executable (Join-Path $ProbeRoot "dist\omni-stdio-probe\omni-stdio-probe.exe") `
+  -HealthOnly -StdioProbe
+
 & $Python -m PyInstaller `
   --noconfirm `
   --clean `
@@ -49,6 +72,7 @@ if (Test-Path $WorkRoot) {
   --workpath $WorkRoot `
   --specpath $WorkRoot `
   --runtime-hook (Join-Path $RepoRoot "scripts\pyinstaller-worker-fault-hook.py") `
+  --runtime-hook (Join-Path $RepoRoot "scripts\pyinstaller-worker-startup-hook.py") `
   --paths (Join-Path $RepoRoot "engine") `
   --add-data "$(Join-Path $RepoRoot 'engine\omni_core\native');omni_core/native" `
   --add-data "$(Join-Path $RepoRoot 'engine\omni_core\kernels');omni_core/kernels" `
