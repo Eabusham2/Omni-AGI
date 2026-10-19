@@ -7,7 +7,12 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { _electron as electron, expect, test, type ElectronApplication, type Locator, type Page } from "@playwright/test";
 import type { WholeAppCompositionControl } from "./whole-app-audit-contract";
-import auditScope from "./whole-app-audit-scope.json";
+// The Playwright ESM loader does not transform JSON imports. Read the exact
+// manifest-bound source instead of relying on runtime import attributes.
+const auditScope = JSON.parse(readFileSync(new URL("./whole-app-audit-scope.json", import.meta.url), "utf8")) as {
+  id: string; routes: Array<{ id: string; label: string; selector: string }>;
+  designStates: string[]; compositionStates: string[];
+};
 import { assertAuditResources, AuditResourcePauseError, type AuditResourceSnapshot } from "./whole-app-audit-resources.mjs";
 
 /**
