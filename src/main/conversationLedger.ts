@@ -139,12 +139,14 @@ function idempotentProjectionDrift(
       seed: stored.seed,
       turnId: semanticValue(stored, "turnId", "turn_id"),
       ponderSelfReports: semanticValue(stored, "ponderSelfReports", "ponder_self_reports"),
+      publicReplyTextBinding: semanticValue(stored, "publicTextBinding", "public_reply_text_binding"),
       binding: stableTraceBinding(stored)
     }) === JSON.stringify({
       input: incoming.input,
       seed: incoming.seed,
       turnId: semanticValue(incoming, "turnId", "turn_id"),
       ponderSelfReports: semanticValue(incoming, "ponderSelfReports", "ponder_self_reports"),
+      publicReplyTextBinding: semanticValue(incoming, "publicTextBinding", "public_reply_text_binding"),
       binding: stableTraceBinding(incoming)
     });
   }
@@ -157,6 +159,10 @@ function idempotentProjectionDrift(
   const immutableAction = (value: Record<string, unknown>): Record<string, unknown> => ({
     id: value.id,
     brainId: value.brainId,
+    neuralActionId: value.neuralActionId,
+    chatTurnId: value.chatTurnId,
+    parentPonderActionEventId: value.parentPonderActionEventId,
+    replyAnchor: value.replyAnchor,
     state: value.state,
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
@@ -165,6 +171,10 @@ function idempotentProjectionDrift(
       source: (value.action as Record<string, unknown>).source,
       toolId: (value.action as Record<string, unknown>).toolId,
       action: (value.action as Record<string, unknown>).action,
+      actionId: (value.action as Record<string, unknown>).actionId,
+      parentPonderActionId: (value.action as Record<string, unknown>).parentPonderActionId,
+      selectionPhase: (value.action as Record<string, unknown>).selectionPhase,
+      selectionStep: (value.action as Record<string, unknown>).selectionStep,
       arguments: (value.action as Record<string, unknown>).arguments
     }
   });
@@ -362,6 +372,13 @@ export class ConversationLedger {
     const existing = this.database.prepare(
       "SELECT kind,payload_json,payload_sha256 FROM entries WHERE entry_key=?"
     );
+    const anchorOffsets = new Map<string, Set<number>>();
+    const anchorDigests = new Map<string, { message: ChatMessage; prefixes: Map<number, string> }>();
+    for (const entry of entries) if (entry.kind === "action" && entry.value.replyAnchor?.messageId) {
+      const anchor = entry.value.replyAnchor;
+      const offsets = anchorOffsets.get(anchor.messageId!) ?? new Set<number>();
+      offsets.add(anchor.utf16Offset); anchorOffsets.set(anchor.messageId!, offsets);
+    }
     const insert = this.database.prepare(`
       INSERT INTO entries(
         sequence,entry_key,kind,created_at,attention_epoch,payload_json,
@@ -371,6 +388,30 @@ export class ConversationLedger {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       for (const entry of entries) {
+        if (entry.kind === "action" && entry.value.replyAnchor) {
+          const anchor = entry.value.replyAnchor;
+          if (!anchor.messageId || anchor.turnId !== entry.value.chatTurnId ||
+              !Number.isSafeInteger(anchor.utf16Offset) || anchor.utf16Offset < 0 || !/^[a-f0-9]{64}$/.test(anchor.prefixSha256))
+            throw new Error("Conversation action anchor is not canonically bound.");
+          let cached = anchorDigests.get(anchor.messageId);
+          if (!cached) {
+            const messageRow = existing.get(`message:${anchor.messageId}`) as { payload_json?: string } | undefined;
+            const message = messageRow?.payload_json ? JSON.parse(messageRow.payload_json) as ChatMessage : undefined;
+            if (message?.role === "brain" && typeof message.content === "string") {
+              const prefixes = new Map<number, string>(), digest = createHash("sha256"); let prior = 0;
+              for (const offset of [...(anchorOffsets.get(anchor.messageId) ?? [])].sort((left, right) => left - right)) {
+                if (!Number.isSafeInteger(offset) || offset < prior || offset > message.content.length) continue;
+                digest.update(message.content.slice(prior, offset)); prior = offset;
+                prefixes.set(offset, digest.copy().digest("hex"));
+              }
+              cached = { message, prefixes }; anchorDigests.set(anchor.messageId, cached);
+            }
+          }
+          const message = cached?.message;
+          if (!message || message.role !== "brain" || message.turnId !== anchor.turnId ||
+              cached?.prefixes.get(anchor.utf16Offset) !== anchor.prefixSha256)
+            throw new Error("Conversation action anchor differs from its canonical reply prefix.");
+        }
         const key = entryKey(entry);
         const payload = cleanOperationalPayload(entry.value);
         const payloadJson = JSON.stringify(payload);

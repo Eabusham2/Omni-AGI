@@ -221,6 +221,13 @@ the brain and reply delivery continue normally. Stop or leaving the chat view
 shows all already accepted text rather than discarding a display buffer.
 Silent Ponder does not create explanatory prose.
 
+Actions selected during Ponder appear inside that Ponder disclosure. Its
+summary shows when a child action is still active or needs your approval;
+expanding it exposes the same exact-action approval controls. Images, audio
+and video remain visible without opening the Ponder audit. Reply text retains
+its position around these events, and **Copy response** copies the complete
+public reply rather than only one displayed segment.
+
 Files dropped into or attached from the chat composer become current-task
 attachments, not an automatic training job. Use **Learn** when you want explicit
 source learning. Ordinary reviewed experience follows its normal learning path;

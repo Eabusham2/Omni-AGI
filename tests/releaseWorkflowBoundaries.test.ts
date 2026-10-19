@@ -19,7 +19,8 @@ it("keeps package CI on fixed source contracts and health-only worker paths", as
     "engine/tests/test_mixed_region_schedule.py",
     "engine/tests/test_outer_learning_pipeline.py",
     "engine/tests/test_native_kernel_packaging_integrity.py",
-    "engine/tests/test_retained_context_capacity.py"
+    "engine/tests/test_retained_context_capacity.py",
+    "engine/tests/test_ponder_episode_provenance.py"
   ]);
   expect(manifest.files.every(value => /^[a-f0-9]{64}$/.test(value.sha256))).toBe(true);
   for (const name of ["windows", "macos", "linux", "release"]) {
@@ -35,6 +36,37 @@ it("keeps package CI on fixed source contracts and health-only worker paths", as
   const rejected = spawnSync(process.execPath, [script, "engine/tests/test_chat_single_pass.py"], { cwd: root, encoding: "utf8", shell: false, timeout: 15_000 });
   expect(rejected.status).not.toBe(0);
   expect(rejected.stderr).toContain("fixed selection");
+});
+
+it("registers the new Ponder chronology cases once in reachable bounded selectors without discovery", async () => {
+  const root = resolve("."), document = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
+  const visited = new Set<string>(), pending = ["test:node:ci"];
+  while (pending.length) {
+    const name = pending.shift()!;
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const command = document.scripts[name];
+    expect(command, `Missing fixed CI selector ${name}`).toBeTypeOf("string");
+    if (typeof command !== "string") throw new Error(`Missing fixed CI selector ${name}`);
+    for (const match of command.matchAll(/\bnpm run (test:node[^\s;&]*)/g)) pending.push(match[1]!);
+  }
+  expect(visited).toEqual(new Set(["test:node:ci", "test:node:v2:contracts", "test:node:v2:tasks", "test:node:v2:completion"]));
+  const selected = [...visited].flatMap(name => document.scripts[name]!.match(/tests\/[A-Za-z0-9_./-]+\.test\.tsx?\b/g) ?? []);
+  for (const path of ["tests/ponderEpisodeProvenance.test.ts", "tests/chatPonderGroups.test.ts", "tests/chatReplyProjection.test.ts", "tests/conversationNoticePlacement.test.tsx"]) {
+    expect(selected.filter(value => value === path), `Focused case must be selected exactly once: ${path}`).toHaveLength(1);
+    expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
+  }
+  for (const name of visited) {
+    const command = document.scripts[name]!;
+    expect(command).toContain("--maxWorkers=");
+    expect(command).not.toMatch(/\bvitest run(?:\s*(?:&&|$))/);
+    expect(command).not.toMatch(/(?:test:python:portable|unittest discover|engine\/tests)/);
+  }
+  const python = await readFile(join(root, "scripts/run-python-contracts.py"), "utf8");
+  expect(python).toContain('sys.meta_path.insert(0, NoNeuralImports())');
+  expect(python).toContain('"torch", "tensorflow", "jax", "mlx", "transformers", "safetensors", "omni_core"');
+  expect(python).not.toMatch(/unittest\.defaultTestLoader\.discover\(/);
+  expect(await readFile(join(root, "scripts/run-python-contracts.mjs"), "utf8")).toContain('["-I",');
 });
 
 it("does not persist the release write credential and retains exact repository/tag binding", async () => {

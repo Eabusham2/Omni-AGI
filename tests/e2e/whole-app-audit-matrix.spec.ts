@@ -1,0 +1,686 @@
+import { appendFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createInterface } from "node:readline";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { _electron as electron, expect, test, type ElectronApplication, type Locator, type Page } from "@playwright/test";
+import type { WholeAppCompositionControl } from "./whole-app-audit-contract";
+
+/**
+ * Missing U1 composition coverage, not a replacement for the closed 11 UI tests.
+ * This mounts the production App through its explicit, no-preload preview seam.
+ * Design-preview identities/trace/counters are synthetic. No brain, worker,
+ * Load, training, provider, capture, permission or external effect is started.
+ *
+ * Default traversal is the full Cartesian product, not only the four paired
+ * appearance packs: 4 palettes * 4 surfaces * 2 schemes * 4 arrangements *
+ * 3 sizes = 384 cells, and 12 actual workspace routes = 4,608 route visits.
+ * A shard/range is useful for bounded runs but never reports full coverage.
+ *
+ * Opt in with OMNI_WHOLE_APP_AUDIT=1; it is not added to existing CI here.
+ * OMNI_WHOLE_APP_AUDIT_RANGE=0:48 (zero-based, end-exclusive cell range), or
+ * OMNI_WHOLE_APP_AUDIT_SHARD=1/8 (one-based shard), optionally combined.
+ * OMNI_WHOLE_APP_AUDIT_TIMEOUT_MS sets a finite execution budget, default 90m.
+ * JSONL is flushed after each visit. An interrupted/failed/sharded traversal
+ * remains incomplete. Screenshots are captures awaiting human inspection,
+ * never automatically labelled accepted visual or accessibility evidence.
+ */
+
+const repository = resolve(process.cwd());
+const palettes = ["violet", "graphite", "spectrum", "aqua"] as const;
+const surfaces = ["standard", "classic", "expressive", "glass"] as const;
+const schemes = ["light", "dark"] as const;
+const arrangements = ["split", "focus", "stacked", "mixed"] as const;
+const sizes = [
+  { id: "compact", width: 390, height: 844 },
+  { id: "normal", width: 1280, height: 800 },
+  { id: "large", width: 1920, height: 1080 }
+] as const;
+const routes = [
+  { id: "chat", label: "Conversation", selector: ".chat-layout:not([hidden])" },
+  { id: "data", label: "Data & training", selector: ".data-page" },
+  { id: "learn", label: "Learn", selector: ".learning-workspace" },
+  { id: "fact-check", label: "Fact Check", selector: ".learning-workspace" },
+  { id: "schedule", label: "Time & schedules", selector: ".time-workspace" },
+  { id: "map", label: "Brain map", selector: '[aria-label="Whole brain map"]' },
+  { id: "trace", label: "Trace & journal", selector: ".trace-page" },
+  { id: "imagine", label: "Imagination", selector: ".imagine-page" },
+  { id: "tools", label: "Tools & permissions", selector: ".tools-page" },
+  { id: "settings", label: "Device & runtime", selector: ".resource-settings-page" },
+  { id: "agents", label: "Forks & agents", selector: ".agents-page" },
+  { id: "evolution", label: "Evolution", selector: ".evolution-page" }
+] as const;
+type Cell = { index: number; key: string; palette: typeof palettes[number]; surface: typeof surfaces[number]; scheme: typeof schemes[number]; arrangement: typeof arrangements[number]; size: typeof sizes[number] };
+type Issue = { kind: string; control?: string; detail: string };
+type Capture = { path: string; purpose: string; visualReview: "not-yet-reviewed" };
+type NoticeGeometry = {
+  notice: { left: number; right: number; top: number; bottom: number };
+  conversation: { left: number; right: number; top: number; bottom: number };
+  composer: { left: number; right: number; top: number; bottom: number; scrollTop: number; scrollHeight: number; clientHeight: number; marginBottom: string; paddingBottom: string };
+  reservation: string | null; measuredSpace: string;
+};
+type ControlSample = {
+  id: string; name: string; tag: string; disabled: boolean; inert: boolean;
+  width: number; height: number; clippedX: number; initialClippedX?: number; visible: boolean;
+  color: string; background: string; opacity: string;
+  contrast: number | null; contrastScope: "estimated-solid-composite" | "unmeasured-image-or-filter";
+  focused: boolean; hovered: boolean; invocation: "not-invoked-no-host-authority";
+};
+type Visit = {
+  key: string; cellIndex: number; route: string; state: string; status: "visited" | "failed";
+  startedAt: string; elapsedMs: number; controls: ControlSample[];
+  scroll: Array<{ owner: string; top: number; bottom: number; maximum: number; sampledOffsets: number[]; reachedBottom: boolean }>;
+  captures: Capture[]; issues: Issue[];
+  noticeGeometry?: { before?: NoticeGeometry; after?: NoticeGeometry };
+};
+
+const cells: Cell[] = [];
+for (const palette of palettes) for (const surface of surfaces) for (const scheme of schemes)
+  for (const arrangement of arrangements) for (const size of sizes) cells.push({
+    index: cells.length, key: `${palette}-${surface}-${scheme}-${arrangement}-${size.id}`,
+    palette, surface, scheme, arrangement, size
+  });
+
+function boundedInteger(value: string | undefined, fallback: number, label: string): number {
+  if (value === undefined || value === "") return fallback;
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error(`Invalid ${label}: ${value}`);
+  return Number(value);
+}
+
+function selectedCells(): Cell[] {
+  const rawRange = process.env.OMNI_WHOLE_APP_AUDIT_RANGE;
+  const range = rawRange?.match(/^(\d+):(\d+)$/);
+  if (rawRange && !range) throw new Error("OMNI_WHOLE_APP_AUDIT_RANGE must be start:end (end-exclusive).");
+  const start = range ? Number(range[1]) : 0, end = range ? Number(range[2]) : cells.length;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= end || end > cells.length) throw new Error("Invalid whole-App audit range.");
+  const rawShard = process.env.OMNI_WHOLE_APP_AUDIT_SHARD, shard = rawShard?.match(/^(\d+)\/(\d+)$/);
+  if (rawShard && !shard) throw new Error("OMNI_WHOLE_APP_AUDIT_SHARD must be one-based index/total.");
+  const index = shard ? Number(shard[1]) : 1, count = shard ? Number(shard[2]) : 1;
+  if (![index, count].every(Number.isSafeInteger) || index < 1 || count < index || count > cells.length) throw new Error("Invalid whole-App audit shard.");
+  const selected = cells.filter(cell => cell.index >= start && cell.index < end && cell.index % count === index - 1);
+  if (!selected.length) throw new Error("The requested whole-App audit selection is empty.");
+  return selected;
+}
+
+async function settledFrame(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(() => resolveFrame()))));
+}
+
+async function configureCell(page: Page, cell: Cell): Promise<void> {
+  await page.setViewportSize({ width: cell.size.width, height: cell.size.height });
+  await expect.poll(() => page.evaluate(() => ({ width: innerWidth, height: innerHeight }))).toEqual({ width: cell.size.width, height: cell.size.height });
+  await page.evaluate(value => {
+    localStorage.setItem("omni.appearance.v1", JSON.stringify({ schemaVersion: 1, mode: value.scheme, palette: value.palette, layout: value.surface }));
+    localStorage.setItem("omni.appearance.workspace.v1", JSON.stringify({ schemaVersion: 1, arrangement: value.arrangement, notificationsEnabled: false, profiles: [] }));
+  }, cell);
+  await page.reload();
+  await expect(page.locator(".app-shell")).toBeVisible();
+  for (const [attribute, value] of Object.entries({ "data-color-scheme": cell.scheme, "data-palette": cell.palette, "data-layout": cell.surface, "data-workspace-arrangement": cell.arrangement })) {
+    await expect(page.locator("html")).toHaveAttribute(attribute, value);
+  }
+  expect(await page.evaluate(() => typeof (window as Window & { readonly omni?: unknown }).omni)).toBe("undefined");
+  await page.locator("article.brain-card").filter({ has: page.getByRole("heading", { name: "Aster", exact: true }) }).click();
+  await expect(page.getByLabel("Message Aster")).toBeVisible();
+}
+
+/** Real computed styles, not inserted look-alike controls. No CSS is changed. */
+async function sampleControls(root: Locator, onlyId?: string): Promise<ControlSample[]> {
+  return root.evaluate((element, selectedId) => {
+    const query = 'button, input:not([type="hidden"]), select, textarea, summary, a[href], [role="button"], [role="switch"], [role="tab"]';
+    const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const rgba = (color: string): number[] => {
+      if (!context) return [0, 0, 0, 0];
+      context.clearRect(0, 0, 1, 1); context.fillStyle = color; context.fillRect(0, 0, 1, 1);
+      return [...context.getImageData(0, 0, 1, 1).data].map((value, index) => index === 3 ? value / 255 : value);
+    };
+    const over = (front: number[], back: number[]): number[] => {
+      const alpha = front[3]! + back[3]! * (1 - front[3]!);
+      return [0, 1, 2].map(index => alpha === 0 ? 0 : (front[index]! * front[3]! + back[index]! * back[3]! * (1 - front[3]!)) / alpha).concat(alpha);
+    };
+    const luminance = (rgb: number[]): number => rgb.slice(0, 3).map(value => {
+      const unit = value / 255; return unit <= .04045 ? unit / 12.92 : ((unit + .055) / 1.055) ** 2.4;
+    }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index]!, 0);
+    const nodes = [...element.querySelectorAll<HTMLElement>(query)].map(node => {
+      node.dataset.wholeAppAuditControl ??= crypto.randomUUID(); return node;
+    }).filter(node => selectedId === undefined || node.dataset.wholeAppAuditControl === selectedId);
+    return nodes.map(node => {
+      const bounds = node.getBoundingClientRect(), style = getComputedStyle(node);
+      const ancestors: HTMLElement[] = []; let current: HTMLElement | null = node;
+      while (current) { ancestors.unshift(current); current = current.parentElement; }
+      let background = [255, 255, 255, 1], opacity = 1, uncertainPaint = false, uncertainEffect = false, hiddenByDisclosure = false;
+      let left = 0, right = innerWidth, top = 0, bottom = innerHeight;
+      for (const ancestor of ancestors) {
+        const ancestorStyle = getComputedStyle(ancestor), box = ancestor.getBoundingClientRect();
+        if (ancestor instanceof HTMLDetailsElement && !ancestor.open && !ancestor.querySelector(":scope > summary")?.contains(node)) hiddenByDisclosure = true;
+        if (ancestorStyle.contentVisibility === "hidden") hiddenByDisclosure = true;
+        const paint = rgba(ancestorStyle.backgroundColor);
+        // An opaque solid child actually covers a background image behind it.
+        // Filters/backdrop effects remain explicitly unmeasured.
+        if (paint[3] === 1 && ancestorStyle.backgroundImage === "none") uncertainPaint = false;
+        background = over(paint, background);
+        opacity *= Number(ancestorStyle.opacity);
+        uncertainPaint ||= ancestorStyle.backgroundImage !== "none";
+        uncertainEffect ||= ancestorStyle.backdropFilter !== "none" || ancestorStyle.filter !== "none" || Number(ancestorStyle.opacity) !== 1;
+        if (ancestor !== node) {
+          if (/hidden|clip|auto|scroll/.test(ancestorStyle.overflowX)) { left = Math.max(left, box.left); right = Math.min(right, box.right); }
+          if (/hidden|clip|auto|scroll/.test(ancestorStyle.overflowY)) { top = Math.max(top, box.top); bottom = Math.min(bottom, box.bottom); }
+        }
+      }
+      const ink = rgba(style.color); ink[3] = ink[3]! * opacity;
+      const foreground = over(ink, background), fg = luminance(foreground), bg = luminance(background);
+      const labels = "labels" in node ? [...((node as HTMLInputElement).labels ?? [])].map(label => label.textContent ?? "").join(" ") : "";
+      const labelledBy = node.getAttribute("aria-labelledby")?.split(/\s+/).map(id => document.getElementById(id)?.textContent ?? "").join(" ");
+      const name = (node.getAttribute("aria-label") || labelledBy || labels || node.getAttribute("title") || node.textContent || "").replace(/\s+/g, " ").trim();
+      const visible = !hiddenByDisclosure && bounds.width > 0 && bounds.height > 0 && style.visibility !== "hidden" && style.display !== "none" && opacity > 0 && bounds.right > left && bounds.left < right && bounds.bottom > top && bounds.top < bottom;
+      return { id: node.dataset.wholeAppAuditControl!, name, tag: node.tagName.toLowerCase(), disabled: node.matches(":disabled") || node.getAttribute("aria-disabled") === "true",
+        inert: Boolean(node.closest("[inert]")), width: bounds.width, height: bounds.height,
+        clippedX: Math.max(0, left - bounds.left) + Math.max(0, bounds.right - right), visible,
+        color: style.color, background: `rgba(${background.join(",")})`, opacity: String(opacity),
+        contrast: uncertainPaint || uncertainEffect ? null : Math.round(((Math.max(fg, bg) + .05) / (Math.min(fg, bg) + .05)) * 1000) / 1000,
+        contrastScope: uncertainPaint || uncertainEffect ? "unmeasured-image-or-filter" as const : "estimated-solid-composite" as const,
+        focused: document.activeElement === node, hovered: node.matches(":hover"), invocation: "not-invoked-no-host-authority" as const };
+    });
+  }, onlyId);
+}
+
+async function inspectPresentControls(root: Locator, page: Page, record: Visit, seen: Set<string>): Promise<void> {
+  const samples = await sampleControls(root);
+  for (const sample of samples) {
+    if (!sample.visible || seen.has(sample.id)) continue;
+    seen.add(sample.id);
+    const control = root.locator(`[data-whole-app-audit-control="${sample.id}"]`);
+    sample.initialClippedX = sample.clippedX;
+    if (!sample.name && !["input", "select", "textarea"].includes(sample.tag)) record.issues.push({ kind: "unnamed-control", control: sample.id, detail: `Visible ${sample.tag} has no inspected name` });
+    try {
+      if (sample.disabled || sample.inert) {
+        // Pointer movement can inspect disabled :hover paint without waiting
+        // for an intentionally non-actionable/inert control to become enabled.
+        const bounds = await control.boundingBox();
+        if (bounds) await page.mouse.move(Math.max(0, Math.min((await page.viewportSize())!.width - 1, bounds.x + bounds.width / 2)), Math.max(0, Math.min((await page.viewportSize())!.height - 1, bounds.y + bounds.height / 2)));
+      } else await control.hover({ timeout: 1500 });
+      sample.hovered = await control.evaluate(node => node.matches(":hover"));
+      if (!sample.disabled && !sample.inert) {
+        await control.focus({ timeout: 1500 });
+        sample.focused = await control.evaluate(node => document.activeElement === node);
+        if (!sample.focused) record.issues.push({ kind: "focus-not-received", control: sample.name || sample.id, detail: "Programmatic focus was not received; keyboard order is a separate check" });
+      }
+      const [after] = await sampleControls(root, sample.id);
+      if (after) {
+        sample.clippedX = after.clippedX;
+        sample.color = after.color; sample.background = after.background; sample.contrast = after.contrast; sample.contrastScope = after.contrastScope;
+        if (after.clippedX > 2) record.issues.push({ kind: "hover-focus-clipping", control: sample.name || sample.id, detail: `${after.clippedX.toFixed(2)} px clipped after hover/focus` });
+      }
+    } catch (error) {
+      // Inert/disabled controls have no pointer/focus promise. Their actual
+      // geometry/ink remains in the journal; don't pretend they were invoked.
+      if (!sample.disabled && !sample.inert) record.issues.push({ kind: "hover-focus-unreachable", control: sample.name || sample.id, detail: error instanceof Error ? error.message.split("\n")[0]! : String(error) });
+    }
+    record.controls.push(sample);
+  }
+  // Do not call tool/form handlers to make a preview look operational.
+  await page.mouse.move(1, 1);
+}
+
+async function walkContent(page: Page, root: Locator, record: Visit): Promise<void> {
+  await root.evaluate(element => {
+    // Opening local disclosures inspects existing content only, not effects.
+    for (const detail of element.querySelectorAll<HTMLDetailsElement>("details")) detail.open = true;
+  });
+  await settledFrame(page);
+  const owners = await root.evaluate(element => {
+    for (const previous of document.querySelectorAll<HTMLElement>("[data-whole-app-audit-scroll]")) delete previous.dataset.wholeAppAuditScroll;
+    const all = [element, ...element.querySelectorAll<HTMLElement>("*"), document.scrollingElement].filter((value): value is HTMLElement => value instanceof HTMLElement);
+    const unique = [...new Set(all)].filter(node => node.scrollHeight > node.clientHeight + 2 && node.clientHeight > 0 && (node === document.scrollingElement || /auto|scroll/.test(getComputedStyle(node).overflowY)));
+    // Include scrollable ancestors of the route, not unrelated hidden pages.
+    let ancestor = element.parentElement;
+    while (ancestor) { if (ancestor.clientHeight > 0 && ancestor.scrollHeight > ancestor.clientHeight + 2 && /auto|scroll/.test(getComputedStyle(ancestor).overflowY) && !unique.includes(ancestor)) unique.push(ancestor); ancestor = ancestor.parentElement; }
+    return unique.map((node, index) => { node.dataset.wholeAppAuditScroll = String(index); node.scrollTop = 0; return String(index); });
+  });
+  const seen = new Set<string>();
+  await inspectPresentControls(root, page, record, seen);
+  for (const owner of owners) {
+    const locator = page.locator(`[data-whole-app-audit-scroll="${owner}"]`);
+    await locator.evaluate(node => { node.scrollIntoView({ block: "nearest", inline: "nearest" }); node.scrollTop = 0; });
+    const offsets: number[] = []; let previous = -1;
+    for (;;) {
+      const point = await locator.evaluate(node => ({ top: node.scrollTop, max: Math.max(0, node.scrollHeight - node.clientHeight), step: Math.max(1, Math.floor(node.clientHeight * .8)) }));
+      offsets.push(point.top);
+      await inspectPresentControls(root, page, record, seen);
+      if (point.top >= point.max - 2 || point.top === previous) break;
+      previous = point.top;
+      await locator.evaluate((node, next) => { node.scrollTop = next; }, Math.min(point.max, point.top + point.step));
+      await settledFrame(page);
+    }
+    const final = await locator.evaluate(node => ({ top: node.scrollTop, max: Math.max(0, node.scrollHeight - node.clientHeight) }));
+    const reachedBottom = final.top >= final.max - 2;
+    record.scroll.push({ owner, top: offsets[0] ?? 0, bottom: final.top, maximum: final.max, sampledOffsets: offsets, reachedBottom });
+    if (!reachedBottom) record.issues.push({ kind: "scroll-bottom-unreached", detail: `Owner ${owner}: ${final.top} of ${final.max}` });
+  }
+  await page.keyboard.press("Tab");
+  const keyboard = await page.evaluate(() => ({ tag: document.activeElement?.tagName, name: document.activeElement?.getAttribute("aria-label"), body: document.activeElement === document.body }));
+  if (keyboard.body) record.issues.push({ kind: "keyboard-focus-lost", detail: "Tab left focus on document.body" });
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  if (overflow > 1) record.issues.push({ kind: "document-horizontal-overflow", detail: `${overflow} px` });
+}
+
+async function capture(page: Page, directory: string, record: Visit, suffix: string): Promise<void> {
+  const path = join(directory, `${record.key}-${suffix}.jpg`);
+  await page.screenshot({ path, type: "jpeg", quality: 78, animations: "disabled" });
+  record.captures.push({ path, purpose: suffix, visualReview: "not-yet-reviewed" });
+}
+
+function representative(cell: Cell): boolean {
+  // Every independent palette/surface/mode/arrangement at normal size, plus
+  // compact/large paired-pack references. These remain unreviewed captures;
+  // the other metric visits are not silently called visually accepted.
+  return cell.size.id === "normal" || cell.arrangement === "split" && surfaces[palettes.indexOf(cell.palette)] === cell.surface;
+}
+
+function atomicJson(path: string, value: unknown): void {
+  const temporary = `${path}.pending`;
+  writeFileSync(temporary, JSON.stringify(value, null, 2)); renameSync(temporary, path);
+}
+
+function fileInventory(sourceDirectories: string[]): Array<{ path: string; bytes: number; sha256: string }> {
+  const files: Array<{ path: string; bytes: number; sha256: string }> = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) { const bytes = readFileSync(path); files.push({ path: path.slice(repository.length + 1), bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") }); }
+      else throw new Error(`Audit source inventory refuses an unsupported filesystem entry: ${path}`);
+    }
+  };
+  for (const directory of sourceDirectories) visit(directory);
+  return files;
+}
+
+function rendererFingerprint(sourceDirectories = [join(repository, "out", "renderer")]): string {
+  return createHash("sha256").update(JSON.stringify(fileInventory(sourceDirectories))).digest("hex");
+}
+
+function dirtyFileInventory(): Array<{ status: string; path: string; previousPath?: string; sha256?: string; removed?: true; symlinkTarget?: string }> {
+  const raw = execFileSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], { cwd: repository, encoding: "utf8" }).split("\0").filter(Boolean);
+  const result: ReturnType<typeof dirtyFileInventory> = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const entry = raw[index]!, status = entry.slice(0, 2), path = entry.slice(3), absolute = resolve(repository, path);
+    const previousPath = /R|C/.test(status) ? raw[++index] : undefined;
+    const within = relative(repository, absolute);
+    if (!within || isAbsolute(within) || within === ".." || within.startsWith(`..${sep}`)) throw new Error("Dirty source path escaped the audited checkout.");
+    if (!existsSync(absolute)) { result.push({ status, path, previousPath, removed: true }); continue; }
+    if (lstatSync(absolute).isSymbolicLink()) { result.push({ status, path, previousPath, symlinkTarget: readlinkSync(absolute) }); continue; }
+    if (lstatSync(absolute).isFile()) result.push({ status, path, previousPath, sha256: createHash("sha256").update(readFileSync(absolute)).digest("hex") });
+    else result.push({ status, path, previousPath });
+  }
+  return result;
+}
+
+async function journalRows(path: string, requiredKeys: Set<string>): Promise<Map<string, Visit>> {
+  const rows = new Map<string, Visit>();
+  if (!existsSync(path)) return rows;
+  const input = createReadStream(path, { encoding: "utf8" }), lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line) continue;
+      const value = JSON.parse(line) as Visit;
+      if (!requiredKeys.has(value.key) || !Number.isInteger(value.cellIndex) || !Array.isArray(value.issues)) throw new Error("Invalid existing whole-App audit journal; preserve it and choose a new output directory.");
+      // Last exact attempt wins; older failed rows remain in append-only data.
+      rows.set(value.key, value);
+    }
+  } finally { lines.close(); input.destroy(); }
+  return rows;
+}
+
+test("U1 full whole-App stock appearance/workspace matrix records exact no-engine coverage", async ({}, testInfo) => {
+  test.skip(process.env.OMNI_WHOLE_APP_AUDIT !== "1", "Explicit opt-in required for the full serial 4,608-visit U1 audit.");
+  const timeout = boundedInteger(process.env.OMNI_WHOLE_APP_AUDIT_TIMEOUT_MS, 90 * 60_000, "whole-App audit timeout");
+  if (timeout < 30_000 || timeout > 12 * 60 * 60_000) throw new Error("Whole-App audit timeout must be 30 seconds to 12 hours.");
+  test.setTimeout(timeout);
+  const selected = selectedCells();
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }).trim();
+  const renderedBytesSha256 = rendererFingerprint();
+  const renderedFiles = fileInventory([join(repository, "out", "renderer")]), dirtyFiles = dirtyFileInventory();
+  const auditSpecSha256 = createHash("sha256").update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex");
+  // This serial journal is outside Playwright's auto-cleared output directory.
+  // Completed exact-byte visits can resume; new renderer bytes never inherit
+  // prior coverage. Do not run parallel writers against the same output path.
+  const directory = process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR
+    ? resolve(process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR)
+    : join(repository, ".runtime", "whole-app-ui-audit", sourceCommit, renderedBytesSha256, auditSpecSha256);
+  const screenshots = join(directory, "captures");
+  mkdirSync(screenshots, { recursive: true });
+  const profile = mkdtempSync(join(tmpdir(), "omni-whole-app-audit-"));
+  const journal = join(directory, "visits.jsonl"), metadata = join(directory, "coverage.json");
+  const visits: Array<Pick<Visit, "key" | "status" | "route" | "cellIndex">> = [];
+  const failures: Array<{ key: string; issues: Issue[] }> = [];
+  const prohibitedRequests: string[] = [];
+  let application: ElectronApplication | undefined;
+  let child: ReturnType<ElectronApplication["process"]> | undefined;
+  let terminal: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  const startedAt = new Date().toISOString();
+  const started = performance.now(); let newlyVisited = 0;
+  const requiredKeys = new Set(cells.flatMap(cell => routes.map(route => `${String(cell.index).padStart(3, "0")}-${cell.key}-${route.id}`)));
+  if (existsSync(metadata)) {
+    const previous = JSON.parse(readFileSync(metadata, "utf8")) as { format?: string; sourceCommit?: string; renderedBytesSha256?: string; auditSpecSha256?: string };
+    if (previous.format !== "omni-whole-app-ui-audit" || previous.sourceCommit !== sourceCommit || previous.renderedBytesSha256 !== renderedBytesSha256 || previous.auditSpecSha256 !== auditSpecSha256) {
+      throw new Error("Existing audit output has different source/rendered bytes; choose a new output directory.");
+    }
+    if (existsSync(journal)) {
+      const prior = await journalRows(journal, requiredKeys);
+      for (const value of prior.values()) if (value.status === "visited" && value.issues.length === 0) visits.push({ key: value.key, status: value.status, route: value.route, cellIndex: value.cellIndex });
+    }
+  }
+  const writeCoverage = (state: "running" | "complete" | "incomplete"): void => atomicJson(metadata, {
+    format: "omni-whole-app-ui-audit", version: 1, state, sourceCommit, dirtyFiles, renderedFiles, renderedBytesSha256, auditSpecSha256, startedAt,
+    updatedAt: new Date().toISOString(), dimensions: { palettes, surfaces, schemes, arrangements, sizes, routes },
+    requiredCells: cells.length, requiredRouteVisits: cells.length * routes.length,
+    selectedCellIndexes: selected.map(cell => cell.index), expectedSelectedRouteVisits: selected.length * routes.length,
+    visitedRouteCount: visits.length, visited: visits, failures, prohibitedRequests,
+    progress: { completedRouteVisits: visits.length, totalRouteVisits: cells.length * routes.length,
+      elapsedMs: Math.round(performance.now() - started), newVisitsThisAttempt: newlyVisited,
+      ...(newlyVisited > 0 ? { averageVisitsPerSecond: newlyVisited / ((performance.now() - started) / 1000),
+        estimatedRemainingMs: Math.round((cells.length * routes.length - visits.length) * (performance.now() - started) / newlyVisited) } : {}) },
+    fullTraversal: visits.length === cells.length * routes.length && new Set(visits.map(visit => visit.key)).size === cells.length * routes.length,
+    visualAcceptance: "not-established-by-metrics-or-unreviewed-captures",
+    boundaries: { preview: true, preload: false, modelsCreated: 0, modelsLoaded: 0, training: 0, providers: 0, permissions: 0, externalEffects: 0 },
+    profile, childTerminal: terminal ?? null,
+    exclusions: ["real host/neural transitions", "real account/device/platform interoperability", "unbounded user-authored CSS", "screen-reader conformance"]
+  });
+  writeCoverage("running");
+  try {
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[0] !== "ELECTRON_RUN_AS_NODE"));
+    application = await electron.launch({ args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
+      env: { ...env, NODE_ENV: "test", OMNI_RESPONSIVE_REPOSITORY: repository, OMNI_RESPONSIVE_USER_DATA_DIR: profile } });
+    child = application.process();
+    child.once("exit", (code, signal) => { terminal = { code, signal }; });
+    await application.context().route(/^https?:\/\//, async request => { prohibitedRequests.push(request.request().url()); await request.abort("blockedbyclient"); });
+    const page = await application.firstWindow();
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await expect(page.locator(".app-shell")).toBeVisible();
+    for (const cell of selected) {
+      if (routes.every(route => visits.some(value => value.key === `${String(cell.index).padStart(3, "0")}-${cell.key}-${route.id}`))) continue;
+      await configureCell(page, cell);
+      for (const route of routes) {
+        const begin = performance.now();
+        const record: Visit = { key: `${String(cell.index).padStart(3, "0")}-${cell.key}-${route.id}`, cellIndex: cell.index,
+          route: route.id, state: "actual-production-preview/no-host-connection", status: "visited", startedAt: new Date().toISOString(), elapsedMs: 0, controls: [], scroll: [], captures: [], issues: [] };
+        if (visits.some(value => value.key === record.key)) continue;
+        try {
+          await page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button", { name: route.label, exact: true }).click();
+          await expect(page.locator(".workspace-header__view")).toHaveText(route.label);
+          const root = page.locator(route.selector);
+          await expect(root).toBeVisible();
+          // Inspect shared titlebar/rail/header controls once in every cell,
+          // not only each route's inner form. Hidden routes remain hidden.
+          const auditRoot = route.id === "chat" ? page.locator(".app-shell") : root;
+          await settledFrame(page);
+          if (representative(cell)) await capture(page, screenshots, record, "entry");
+          await walkContent(page, auditRoot, record);
+          if (representative(cell)) await capture(page, screenshots, record, "lower-content");
+          if (record.issues.length) { record.status = "failed"; await capture(page, screenshots, record, "failure"); }
+        } catch (error) {
+          record.status = "failed";
+          record.issues.push({ kind: "visit-error", detail: error instanceof Error ? error.message : String(error) });
+          await capture(page, screenshots, record, "exception").catch(() => undefined);
+        }
+        record.elapsedMs = Math.round(performance.now() - begin);
+        appendFileSync(journal, `${JSON.stringify(record)}\n`, { flush: true });
+        visits.push({ key: record.key, status: record.status, route: record.route, cellIndex: cell.index });
+        newlyVisited += 1;
+        if (record.issues.length) failures.push({ key: record.key, issues: record.issues });
+      }
+      writeCoverage("running");
+    }
+    expect(prohibitedRequests, "No provider or external HTTP request is authorized by this audit").toEqual([]);
+    expect(visits.filter(value => selected.some(cell => cell.index === value.cellIndex)).length).toBe(selected.length * routes.length);
+    expect(new Set(visits.map(visit => visit.key)).size).toBe(visits.length);
+    expect(failures, `Read ${journal} and inspect captures before changing UI; captures are not automatically accepted`).toEqual([]);
+  } finally {
+    let closeFailure: unknown;
+    if (application && child) {
+      const deadline = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("The owned whole-App audit child did not close within 15 seconds.")), 15_000);
+        timer.unref();
+        child!.once("exit", () => clearTimeout(timer));
+      });
+      try { await Promise.race([application.close(), deadline]); }
+      catch (error) { closeFailure = error; if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }
+      if (child.exitCode !== null || child.signalCode !== null) terminal ??= { code: child.exitCode, signal: child.signalCode };
+      if (!terminal || terminal.code !== 0 || terminal.signal !== null) closeFailure ??= new Error("Whole-App audit did not observe a clean exit of its exact owned child.");
+    }
+    const complete = visits.length === cells.length * routes.length && failures.length === 0 && prohibitedRequests.length === 0 && !closeFailure;
+    writeCoverage(complete ? "complete" : "incomplete");
+    if (terminal && existsSync(profile)) rmSync(profile, { recursive: true, force: false });
+    await testInfo.attach("whole-app-coverage", { path: metadata, contentType: "application/json" });
+    if (existsSync(journal)) await testInfo.attach("whole-app-visits", { path: journal, contentType: "application/x-ndjson" });
+    if (closeFailure) throw closeFailure;
+  }
+});
+
+const compositionStates = [
+  "chat-idle", "chat-streaming-before-ponder", "chat-ponder-tool-nesting", "chat-approval-during-ponder", "chat-continuation-chronology",
+  "chat-offpage-active", "chat-offpage-complete-return", "chat-restored-in-memory-ledger", "chat-failed-input-preserved",
+  ...["extracting", "learning", "saving", "finalizing", "complete"].flatMap(phase => [`training-${phase}`, `appearance-over-training-${phase}`])
+] as const;
+
+async function composition(page: Page, method: Exclude<keyof WholeAppCompositionControl, "status" | "training" | "storage" | "finish">): Promise<void> {
+  await page.evaluate(name => { if (!window.omniWholeAppComposition) throw new Error("Synthetic composition control is missing."); return window.omniWholeAppComposition[name](); }, method);
+}
+
+async function compositionStatus(page: Page) {
+  return page.evaluate(() => { if (!window.omniWholeAppComposition) throw new Error("Synthetic composition control is missing."); return window.omniWholeAppComposition.status(); });
+}
+
+async function noticeGeometry(page: Page): Promise<NoticeGeometry | undefined> {
+  return page.evaluate(() => {
+    const notice = document.querySelector<HTMLElement>(".toast");
+    const conversation = document.querySelector<HTMLElement>(".chat-layout:not([hidden]) .conversation");
+    const composer = conversation?.querySelector<HTMLElement>(":scope > .call-layout > .call-layout__conversation > .composer-wrap");
+    if (!notice || !conversation || !composer) return;
+    const box = (node: HTMLElement) => { const value = node.getBoundingClientRect(); return { left: value.left, right: value.right, top: value.top, bottom: value.bottom }; };
+    const style = getComputedStyle(composer);
+    return { notice: box(notice), conversation: box(conversation), composer: { ...box(composer), scrollTop: composer.scrollTop,
+      scrollHeight: composer.scrollHeight, clientHeight: composer.clientHeight, marginBottom: style.marginBottom, paddingBottom: style.paddingBottom },
+      reservation: conversation.getAttribute("data-notice-reservation"), measuredSpace: conversation.style.getPropertyValue("--conversation-notice-space") };
+  });
+}
+
+test("U1 whole-App active chronology, off-page completion and overlay composition use typed inert events", async ({}, testInfo) => {
+  test.skip(process.env.OMNI_WHOLE_APP_AUDIT !== "1", "Explicit opt-in required for the serial U1 audit.");
+  const fixtureUrl = process.env.OMNI_WHOLE_APP_STATE_URL;
+  test.skip(!fixtureUrl, "Set OMNI_WHOLE_APP_STATE_URL to the owned local Vite fixture; absence is not a passed composition gate.");
+  const url = new URL(fixtureUrl!);
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.pathname !== "/tests/e2e/whole-app-state-composition-fixture.html") throw new Error("Only the explicit owned loopback composition fixture is allowed.");
+  const timeout = boundedInteger(process.env.OMNI_WHOLE_APP_AUDIT_TIMEOUT_MS, 90 * 60_000, "whole-App composition timeout");
+  if (timeout < 30_000 || timeout > 12 * 60 * 60_000) throw new Error("Whole-App composition timeout must be 30 seconds to 12 hours.");
+  test.setTimeout(timeout);
+  const selected = selectedCells();
+  const records: Array<{ key: string; cellIndex: number; state: string; issues: Issue[] }> = [], failures: Array<{ key: string; issues: Issue[] }> = [];
+  const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" }).trim();
+  const sourceFingerprint = rendererFingerprint([join(repository, "src", "renderer"), join(repository, "src", "shared")]);
+  const sourceFiles = fileInventory([join(repository, "src", "renderer"), join(repository, "src", "shared")]), dirtyFiles = dirtyFileInventory();
+  const fixtureSha256 = createHash("sha256").update(sourceFingerprint)
+    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-state-composition-fixture.tsx")))
+    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-contract.ts")))
+    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex");
+  const directory = process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR
+    ? join(resolve(process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR), "composition")
+    : join(repository, ".runtime", "whole-app-ui-composition", sourceCommit, fixtureSha256);
+  const screenshots = join(directory, "captures"); mkdirSync(screenshots, { recursive: true });
+  const profile = mkdtempSync(join(tmpdir(), "omni-whole-app-composition-"));
+  const journal = join(directory, "states.jsonl"), metadata = join(directory, "coverage.json");
+  const stateKeys = new Set(cells.flatMap(cell => compositionStates.map(state => `${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`)));
+  const resumedCells = new Set<number>();
+  if (existsSync(metadata)) {
+    const previous = JSON.parse(readFileSync(metadata, "utf8")) as { format?: string; sourceCommit?: string; fixtureSha256?: string };
+    if (previous.format !== "omni-whole-app-composition" || previous.sourceCommit !== sourceCommit || previous.fixtureSha256 !== fixtureSha256) throw new Error("Existing composition output belongs to different fixture/source bytes; choose a new output directory.");
+    const prior = await journalRows(journal, stateKeys);
+    for (const cell of cells) {
+      const values = compositionStates.map(state => prior.get(`${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`));
+      if (values.every(value => value?.status === "visited" && value.issues.length === 0)) {
+        resumedCells.add(cell.index);
+        for (const value of values) records.push({ key: value!.key, cellIndex: value!.cellIndex, state: value!.state, issues: [] });
+      }
+    }
+  }
+  const started = performance.now();
+  const resumedCount = records.length; let lastSummary = started;
+  const externalRequests: string[] = [], runtimeErrors: string[] = [];
+  let application: ElectronApplication | undefined, child: ReturnType<ElectronApplication["process"]> | undefined;
+  let terminal: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  const write = (state: "running" | "complete" | "incomplete"): void => atomicJson(metadata, {
+    format: "omni-whole-app-composition", version: 1, state, sourceCommit, dirtyFiles, sourceFiles, sourceFingerprint, fixtureSha256,
+    requiredCells: cells.length, selectedCellIndexes: selected.map(cell => cell.index), states: compositionStates,
+    expectedFullStateVisits: cells.length * compositionStates.length, visited: records, failures, externalRequests, runtimeErrors,
+    elapsedMs: Math.round(performance.now() - started),
+    resumedExactStateCount: resumedCount,
+    ...(records.length > resumedCount ? { measuredStatesPerSecond: (records.length - resumedCount) / ((performance.now() - started) / 1000),
+      estimatedRemainingMs: Math.round((cells.length * compositionStates.length - records.length) * (performance.now() - started) / (records.length - resumedCount)) } : {}),
+    fullTraversal: records.length === cells.length * compositionStates.length && new Set(records.map(record => record.key)).size === records.length,
+    visualAcceptance: "not-established-by-metrics-or-unreviewed-captures",
+    transport: "typed synthetic in-memory events through actual App controller",
+    boundaries: { ipc: false, preload: false, models: 0, weights: 0, create: 0, load: 0, training: 0, tools: 0, providers: 0, devices: 0, externalEffects: 0 },
+    exclusions: ["real neural/host sequencing", "persisted filesystem restart", "same-brain inference", "provider/device/platform qualification"],
+    childTerminal: terminal ?? null
+  });
+  write("running");
+  try {
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[0] !== "ELECTRON_RUN_AS_NODE"));
+    application = await electron.launch({ args: [resolve(repository, "tests/e2e/responsive-main.cjs")],
+      env: { ...env, NODE_ENV: "test", OMNI_RESPONSIVE_REPOSITORY: repository, OMNI_RESPONSIVE_USER_DATA_DIR: profile } });
+    child = application.process(); child.once("exit", (code, signal) => { terminal = { code, signal }; });
+    await application.context().route(/^https?:\/\//, async request => {
+      if (new URL(request.request().url()).origin === url.origin) await request.continue();
+      else { externalRequests.push(request.request().url()); await request.abort("blockedbyclient"); }
+    });
+    const page = await application.firstWindow();
+    page.on("pageerror", error => runtimeErrors.push(error.message));
+    await page.goto(url.href); await page.emulateMedia({ reducedMotion: "reduce" });
+    for (const cell of selected) {
+      if (resumedCells.has(cell.index)) continue;
+      await page.setViewportSize({ width: cell.size.width, height: cell.size.height });
+      await expect.poll(() => page.evaluate(() => ({ width: innerWidth, height: innerHeight }))).toEqual({ width: cell.size.width, height: cell.size.height });
+      await page.evaluate(value => {
+        localStorage.setItem("omni.appearance.v1", JSON.stringify({ schemaVersion: 1, mode: value.scheme, palette: value.palette, layout: value.surface }));
+        localStorage.setItem("omni.appearance.workspace.v1", JSON.stringify({ schemaVersion: 1, arrangement: value.arrangement, notificationsEnabled: false, profiles: [] }));
+      }, cell);
+      await page.reload();
+      await page.getByRole("heading", { name: "UI Fixture — no model", exact: true }).click();
+      await expect(page.getByLabel("Message UI Fixture — no model")).toBeVisible();
+      await expect.poll(async () => (await compositionStatus(page)).streamSubscribers).toBeGreaterThan(0);
+      const inspect = async (state: string, selector: string, checks?: () => Promise<Issue[]>): Promise<void> => {
+        const begin = performance.now(), record: Visit = { key: `${String(cell.index).padStart(3, "0")}-${cell.key}-${state}`, cellIndex: cell.index,
+          route: "whole-app-composition", state, status: "visited", startedAt: new Date().toISOString(), elapsedMs: 0, controls: [], scroll: [], captures: [], issues: [] };
+        try {
+          const root = page.locator(selector); await expect(root).toBeVisible(); await settledFrame(page);
+          if (checks) record.issues.push(...await checks());
+          if (state === "chat-failed-input-preserved") record.noticeGeometry = { before: await noticeGeometry(page) };
+          if (representative(cell)) await capture(page, screenshots, record, "entry");
+          await walkContent(page, root, record);
+          if (state === "chat-failed-input-preserved") record.noticeGeometry = { ...record.noticeGeometry, after: await noticeGeometry(page) };
+          if (representative(cell)) await capture(page, screenshots, record, "lower-content");
+        } catch (error) { record.issues.push({ kind: "composition-error", detail: error instanceof Error ? error.message : String(error) }); }
+        if (record.issues.length) { record.status = "failed"; failures.push({ key: record.key, issues: record.issues }); await capture(page, screenshots, record, "failure").catch(() => undefined); }
+        record.elapsedMs = Math.round(performance.now() - begin);
+        appendFileSync(journal, `${JSON.stringify(record)}\n`, { flush: true });
+        records.push({ key: record.key, cellIndex: cell.index, state, issues: record.issues });
+        // Flush exact state data above, but do not rewrite a growing complete
+        // summary on every hover/state and needlessly amplify SSD writes.
+        if (performance.now() - lastSummary >= 10_000) { write("running"); lastSummary = performance.now(); }
+      };
+      await inspect("chat-idle", ".chat-layout:not([hidden])");
+      const input = page.getByLabel("Message UI Fixture — no model");
+      await input.fill("Synthetic composition request. Do not run a tool, model or host action.");
+      await page.getByRole("button", { name: "Send message", exact: true }).click();
+      await expect.poll(async () => (await compositionStatus(page)).pendingTurns.length).toBe(1);
+      await composition(page, "start"); await composition(page, "openingText");
+      await inspect("chat-streaming-before-ponder", ".chat-layout:not([hidden])");
+      await composition(page, "ponder"); await composition(page, "toolDuringPonder"); await composition(page, "phaseOnlyUnboundAction");
+      await inspect("chat-ponder-tool-nesting", ".chat-layout:not([hidden])", async () => page.locator(".message-stream").evaluate(element => {
+        const ponder = [...element.querySelectorAll(".chat-action-card")].find(card => /^Ponder(?:ing)?$/.test(card.querySelector(":scope > summary strong")?.textContent?.trim() ?? ""));
+        const tool = [...element.querySelectorAll(".chat-action-card")].find(card => card.querySelector(":scope > .chat-action-card__body > code")?.textContent?.includes("fixture.inspect"));
+        const unbound = [...element.querySelectorAll(".chat-action-card")].find(card => card.querySelector(":scope > .chat-action-card__body > code")?.textContent?.includes("fixture.unbound"));
+        const issues: Issue[] = [];
+        if (!ponder || !tool || ponder === tool || !ponder.contains(tool)) issues.push({ kind: "ponder-tool-not-nested", detail: "Same-turn tool with explicit native parent provenance is not inside its actual Ponder disclosure." });
+        if (!unbound || unbound.parentElement?.closest(".chat-action-card")) issues.push({ kind: "unbound-phase-guessed-as-parent", detail: "A phase-only history action must remain visibly flat; selectionPhase is not ancestry." });
+        return issues;
+      }));
+      await composition(page, "requestToolApproval");
+      await inspect("chat-approval-during-ponder", ".chat-layout:not([hidden])");
+      await composition(page, "resumeText");
+      await inspect("chat-continuation-chronology", ".chat-layout:not([hidden])", async () => page.locator(".message-stream").evaluate(element => {
+        const rangeFor = (needle: string): Range | undefined => {
+          const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT); let current: Node | null;
+          while ((current = walker.nextNode())) { const position = current.textContent?.indexOf(needle) ?? -1; if (position >= 0) { const range = document.createRange(); range.setStart(current, position); range.setEnd(current, position + needle.length); return range; } }
+          return;
+        };
+        const opening = rangeFor("Synthetic opening before Ponder."), ponder = rangeFor("Synthetic Ponder publication for layout inspection"), resumed = rangeFor("Synthetic continuation after Ponder.");
+        return opening && ponder && resumed && opening.compareBoundaryPoints(Range.START_TO_START, ponder) < 0 && ponder.compareBoundaryPoints(Range.START_TO_START, resumed) < 0
+          ? [] : [{ kind: "reply-ponder-order", detail: "Opening text, emitted Ponder and resumed ordinary text are not in their actual stream order." }];
+      }));
+      await page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button", { name: "Trace & journal", exact: true }).click();
+      await inspect("chat-offpage-active", ".workspace-body");
+      await page.evaluate(() => window.omniWholeAppComposition!.finish());
+      await expect.poll(async () => (await compositionStatus(page)).pendingTurns.length).toBe(0);
+      await page.getByRole("navigation", { name: "Workspace", exact: true }).getByRole("button", { name: "Conversation", exact: true }).click();
+      await inspect("chat-offpage-complete-return", ".chat-layout:not([hidden])", async () => {
+        const issues: Issue[] = [];
+        if (await page.getByRole("button", { name: "Queue message", exact: true }).count()) issues.push({ kind: "terminal-queue-remains", detail: "The actual controller retains Queue after the synthetic terminal receipt." });
+        if (await page.locator(".pondering-label").count()) issues.push({ kind: "terminal-indicator-remains", detail: "A response indicator remains after the exact terminal receipt." });
+        return issues;
+      });
+      await page.getByRole("button", { name: "Brain library", exact: true }).click();
+      await page.getByRole("heading", { name: "UI Fixture — no model", exact: true }).click();
+      await inspect("chat-restored-in-memory-ledger", ".chat-layout:not([hidden])", async () => {
+        const status = await compositionStatus(page);
+        return status.receipts.filter(value => value.operation === "synthetic-send-registered").length === 1 && await page.locator(".message--brain").count() === 1
+          ? [] : [{ kind: "restored-duplicate-or-missing-reply", detail: "Remounting actual App chat duplicated submission or lost the synthetic saved reply." }];
+      });
+      await input.fill("Synthetic failing UI request; preserve its visible input and useful error.");
+      await page.getByRole("button", { name: "Send message", exact: true }).click();
+      await expect.poll(async () => (await compositionStatus(page)).pendingTurns.length).toBe(1);
+      await composition(page, "start"); await composition(page, "fail");
+      await inspect("chat-failed-input-preserved", ".chat-layout:not([hidden])", async () => {
+        const visible = await page.locator(".message--human").allTextContents();
+        return visible.some(value => value.includes("Synthetic failing UI request")) ? [] : [{ kind: "failed-input-disappeared", detail: "The actual App discarded the synthetic accepted input on a failed reply." }];
+      });
+      // Actual App onBuild/onStorageOperation/onImportFailed subscriptions;
+      // these are layout event fixtures, not simulated successful training.
+      for (const phase of ["extracting", "learning", "saving", "finalizing", "complete"] as const) {
+        await page.evaluate(value => window.omniWholeAppComposition!.training(value), phase);
+        if (phase === "finalizing") { await composition(page, "notification"); await page.evaluate(() => window.omniWholeAppComposition!.storage("paused")); }
+        await inspect(`training-${phase}`, ".build-readiness-overlay");
+        await page.getByRole("button", { name: "Appearance settings", exact: true }).click();
+        await inspect(`appearance-over-training-${phase}`, '.appearance-panel[role="dialog"]', async () => page.locator('.appearance-panel[role="dialog"]').evaluate(element => {
+          const bounds = element.getBoundingClientRect(), point = { x: Math.max(0, Math.min(innerWidth - 1, bounds.left + bounds.width / 2)), y: Math.max(0, Math.min(innerHeight - 1, bounds.top + Math.min(40, bounds.height / 2))) };
+          const top = document.elementFromPoint(point.x, point.y);
+          return top && element.contains(top) ? [] : [{ kind: "appearance-covered", detail: "Appearance is obscured by another actual App layer." }];
+        }));
+        await page.getByRole("button", { name: "Close appearance settings", exact: true }).click();
+      }
+      expect((await compositionStatus(page)).denied.filter(value => /brain\.(?:create|load)|train\.|chat\.(?:approve|decline|cancel)/.test(value))).toEqual([]);
+      write("running"); lastSummary = performance.now();
+    }
+    expect(records.filter(value => selected.some(cell => cell.index === value.cellIndex)).length).toBe(selected.length * compositionStates.length);
+    expect(new Set(records.map(record => record.key)).size).toBe(records.length);
+    expect(rendererFingerprint([join(repository, "src", "renderer"), join(repository, "src", "shared")]), "Source changed during live Vite inspection; do not combine different runtime bytes").toBe(sourceFingerprint);
+    expect(externalRequests).toEqual([]); expect(runtimeErrors).toEqual([]);
+    expect(failures, `Inspect ${journal}; typed fixture transitions do not prove real runtime behavior`).toEqual([]);
+  } finally {
+    let closeFailure: unknown;
+    if (application && child) {
+      const timerDeadline = new Promise<never>((_, reject) => { const timer = setTimeout(() => reject(new Error("Owned composition child close timed out.")), 15_000); timer.unref(); child!.once("exit", () => clearTimeout(timer)); });
+      try { await Promise.race([application.close(), timerDeadline]); }
+      catch (error) { closeFailure = error; if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }
+      if (child.exitCode !== null || child.signalCode !== null) terminal ??= { code: child.exitCode, signal: child.signalCode };
+      if (!terminal || terminal.code !== 0 || terminal.signal !== null) closeFailure ??= new Error("Exact composition child did not exit cleanly.");
+    }
+    write(records.length === cells.length * compositionStates.length && !failures.length && !externalRequests.length && !runtimeErrors.length && !closeFailure ? "complete" : "incomplete");
+    if (terminal && existsSync(profile)) rmSync(profile, { recursive: true, force: false });
+    await testInfo.attach("whole-app-composition-coverage", { path: metadata, contentType: "application/json" });
+    if (existsSync(journal)) await testInfo.attach("whole-app-composition-states", { path: journal, contentType: "application/x-ndjson" });
+    if (closeFailure) throw closeFailure;
+  }
+});

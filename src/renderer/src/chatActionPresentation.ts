@@ -94,6 +94,16 @@ export function chatActionStateLabel(state: ActionEvent["state"]): string {
   return stateLabels[state] ?? "Updated";
 }
 
+/** A pending permission belongs to its action, not the last unrelated status. */
+export function chatApprovalStatus(label: string, expiresAt: string | undefined, nowMs: number): string {
+  const heading = `${label.replace(/ proposed in chat$/, "")} · needs approval`;
+  const deadline = expiresAt ? Date.parse(expiresAt) : NaN;
+  if (!Number.isFinite(deadline) || !Number.isFinite(nowMs)) return heading;
+  const seconds = Math.max(0, Math.ceil((deadline - nowMs) / 1_000));
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds % 3600 / 60);
+  return `${heading} · ${hours ? `${hours}h ` : ""}${minutes || hours ? `${minutes}m ` : ""}${seconds % 60}s remaining`;
+}
+
 /** Keep the concrete web request visible in the collapsed timeline card so a
  * person can see what the brain is searching without opening raw JSON. */
 export function chatActionSearchActivity(

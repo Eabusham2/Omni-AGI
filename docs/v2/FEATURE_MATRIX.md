@@ -15,6 +15,22 @@ qualification or conditional research; it is not evidence that its already
 implemented runtime path must be rebuilt. No row is blanket-promoted to full
 live/model/platform acceptance by this reconciliation.
 
+- Latest U1 correction is composed into the actual App: explicit native Ponder
+  start/finish and selected-child provenance, exact canonical public-prefix
+  anchoring, nested action audits and reversible reply segments. Focused
+  mechanisms pass37 cases plus the new exterior-margin case; the composed
+  guarded Python lane passes113. Full types and
+  shell-only bundling pass. The affected compact pilot now traverses12/12
+  routes without issues and all19 composed states without runtime/external
+  errors. The final affected retry has no failures and clean child exit;
+  notice separation is measured and its three saved captures are inspected.
+  Full U1 matrix and direct visual acceptance remain open. See
+  ponder-episode-provenance.md and u1-current-app-audit-2026-10-18.md.
+- Current public documentation is pack23/8 manuals; its two affected cases pass.
+  On037f3c6, six non-Windows package jobs passed. Both Windows jobs failed at
+  later worker cleanup/health boundaries; reviewed narrow corrections and
+  startup diagnostics are pushed ased00e7b. Its new hosted jobs are running,
+  not green by assumption. No v2 release exists yet.
 - Supported source composition now includes actual retained RAM/VRAM/storage
   K/V ownership/capacity, primary snapshot plus extra-drive-spill accounting,
   real request/reply/outer-learning consumers and exact archive custody. The

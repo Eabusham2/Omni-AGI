@@ -1,4 +1,24 @@
 """Typed warm-steer completion; no model, prompt or fabricated response text."""
+import hashlib
+
+
+def public_reply_text_binding(raw, canonical, *, interrupted=False):
+    """Exact presentation normalization measured at its canonical boundary."""
+    prefix = 0 if interrupted else len(raw) - len(raw.lstrip())
+    suffix = 0 if interrupted else len(raw) - len(raw.rstrip())
+    # An all-whitespace completion is entirely prefix, not two overlapping
+    # removals. Nonprintable no-reply output has no canonical text to anchor.
+    prefix = min(prefix, len(raw))
+    suffix = min(suffix, len(raw) - prefix)
+    if raw[prefix:len(raw) - suffix if suffix else len(raw)] != canonical:
+        return None
+    utf16 = lambda value: len(value.encode("utf-16-le")) // 2
+    return {"format": "omni-public-reply-text-binding", "version": 1,
+        "normalization": "identity" if interrupted else "strip",
+        "rawSha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "canonicalSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "rawUtf16Length": utf16(raw), "canonicalUtf16Length": utf16(canonical),
+        "removedPrefixUtf16": utf16(raw[:prefix]), "removedSuffixUtf16": utf16(raw[len(raw) - suffix:]) if suffix else 0}
 
 
 def generation_completion(token_ids, decode, stopped_by_steer=False, private_steered=False, native_stopped=False):
@@ -21,6 +41,8 @@ def generation_completion(token_ids, decode, stopped_by_steer=False, private_ste
             "no-printable-text" if text else
             "no-decoded-text" if len(token_ids) else "no-generated-tokens"
         )
+    binding = public_reply_text_binding(text, result["text"], interrupted=interrupted)
+    if binding is not None: result["publicTextBinding"] = binding
     return result
 
 

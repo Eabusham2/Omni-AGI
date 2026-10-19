@@ -14801,6 +14801,7 @@ class AdaptiveBrain:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         self_activity_observer: Optional[Callable[[torch.Tensor, Mapping[str, Any]], None]] = None,
         continuation_state: Optional[Mapping[str, Any]] = None,
+        suspension_check: Optional[Callable[[], bool]] = None,
     ) -> Callable[[torch.Tensor, int, float], Dict[str, Any]]:
         """Reevaluate native action heads from every actual prefix state.
 
@@ -14816,6 +14817,8 @@ class AdaptiveBrain:
             nonlocal cue
             if cancel_check is not None and cancel_check():
                 raise ChatGenerationCancelled("chat generation was cancelled")
+            if ledger.stop_selected:
+                return {"stop": True}
             with torch.no_grad():
                 state = torch.tanh(hidden + 0.5 * cue)
                 language = self.decoder.action_policy(hidden)
@@ -14836,11 +14839,15 @@ class AdaptiveBrain:
                         stop = stop or action.get("kind") == "stop"
                         continue
                     if action.get("kind") == "ponder":
-                        cue, ponder_trace = self._native_pre_speech_ponder(
-                            state, state, seed=int(seed) + int(step),
+                        cue, ponder_trace = self._selected_native_ponder(
+                            state, state, registered=registered, ledger=ledger, emit=emit,
+                            schemas=schemas, input_text=input_text, assembly_ids=assembly_ids,
+                            organic_state=live_organic, step=step, phase="mid-generation" if step else "pre-speech",
+                            seed=int(seed) + int(step),
                             confidence=float(action.get("confidence", 0.0)),
                             noise=float(live_organic.get("organicNoise", 0.0)),
                             cancel_check=cancel_check, steer_check=steer_check,
+                            suspension_check=suspension_check,
                             progress_callback=progress_callback or ((lambda progress: emit("cognition-progress", progress)) if emit is not None else None),
                         )
                         ponder_trace["phase"] = "mid-generation" if step else "pre-speech"
@@ -14864,10 +14871,50 @@ class AdaptiveBrain:
                     if emit is not None:
                         emit_registered_action(emit, registered)
                     stop = stop or action.get("kind") == "stop"
-                return {"stop": stop, **({"memoryBias": refined_memory} if refined_memory is not None else {})}
+                return {"stop": stop or ledger.stop_selected, **({"memoryBias": refined_memory} if refined_memory is not None else {})}
 
         callback.suspension_state = lambda: {"cue": cue.detach()}
         return callback
+
+    def _selected_native_ponder(self, combined_memory, internal_memory, *, registered, ledger,
+            emit, schemas, input_text, assembly_ids, organic_state, step, phase, **options):
+        """Own one real invocation; only its learned transition can emit children.
+
+        An unselected private branch has no emitter. Neither its proposals nor
+        a later neighboring action acquire visible Ponder ancestry.
+        """
+        with ledger.ponder_episode(registered, emit) as episode:
+            def transition(logits, refined):
+                cancelled, steered = options.get("cancel_check"), options.get("steer_check")
+                if cancelled is not None and cancelled():
+                    raise ChatGenerationCancelled("chat generation was cancelled")
+                if steered is not None and steered():
+                    return
+                suspended = options.get("suspension_check")
+                if suspended is not None and suspended():
+                    return
+                readings = self.resource_policy.status()
+                if any(readings.get(key) for key in ("diskPressure", "memoryPressure")):
+                    return
+                _scores, actions = self._select_structured_actions(logits, schemas=schemas,
+                    input_text=input_text, assembly_ids=assembly_ids, organic_state=organic_state,
+                    supporting_action_logits=(logits,), neural_state=refined)
+                for action in actions:
+                    if cancelled is not None and cancelled():
+                        raise ChatGenerationCancelled("chat generation was cancelled")
+                    if steered is not None and steered():
+                        return
+                    if suspended is not None and suspended():
+                        return
+                    if action.get("kind") != "ponder":
+                        episode.select(action, step=step, phase=phase)
+
+            def finished(trace):
+                trace["phase"] = phase
+                episode.finish(trace)
+
+            return self._native_pre_speech_ponder(combined_memory, internal_memory,
+                transition_callback=transition, completion_callback=finished, **options)
 
     @torch.no_grad()
     def _native_pre_speech_ponder(
@@ -14881,6 +14928,9 @@ class AdaptiveBrain:
         cancel_check: Optional[Callable[[], bool]] = None,
         steer_check: Optional[Callable[[], bool]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        transition_callback: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+        completion_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        suspension_check: Optional[Callable[[], bool]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Refine this turn's latent memory after a learned Ponder proposal.
 
@@ -14913,17 +14963,19 @@ class AdaptiveBrain:
         scheduler_yields = 0
         last_yield = started
 
-        def boundary() -> bool:
+        def boundary():
             if cancel_check is not None and cancel_check():
                 raise ChatGenerationCancelled("chat generation was cancelled")
-            return bool(steer_check is not None and steer_check())
+            if steer_check is not None and steer_check(): return "steered"
+            if suspension_check is not None and suspension_check(): return "suspended"
+            return None
 
         try:
             if progress_callback is not None:
                 progress_callback({"phase": "ponder", "active": True, "passes": 0, "elapsedMs": 0.})
             while True:
-                if boundary():
-                    stop_reason = "steered"
+                if (reason := boundary()) is not None:
+                    stop_reason = reason
                     break
                 readings = self.resource_policy.status()
                 if readings.get("diskPressure") or readings.get("memoryPressure"):
@@ -14938,8 +14990,8 @@ class AdaptiveBrain:
                 else:
                     driven = 0.65 * anchor + 0.35 * current
                     threshold = 0.0
-                if boundary():
-                    stop_reason = "steered"
+                if (reason := boundary()) is not None:
+                    stop_reason = reason
                     break
                 if self.config.spiking_dynamics:
                     updated, _metrics = self.router.route(
@@ -14948,8 +15000,8 @@ class AdaptiveBrain:
                     router_steps += 2
                 else:
                     updated = driven
-                if boundary():
-                    stop_reason = "steered"
+                if (reason := boundary()) is not None:
+                    stop_reason = reason
                     break
                 next_refined = self.idea_adapter(updated)
                 if not bool(torch.isfinite(next_refined).all()):
@@ -14961,14 +15013,17 @@ class AdaptiveBrain:
                 current = updated
                 refined = next_refined
                 passes += 1
-                if boundary():
-                    stop_reason = "steered"
+                if (reason := boundary()) is not None:
+                    stop_reason = reason
                     break
-                probabilities = F.softmax(self.decoder.internal_action_policy(refined).detach().float(), dim=-1).reshape(-1, len(ACTION_KINDS)).mean(dim=0)
+                continuation_logits = self.decoder.internal_action_policy(refined)
+                probabilities = F.softmax(continuation_logits.detach().float(), dim=-1).reshape(-1, len(ACTION_KINDS)).mean(dim=0)
                 last_kind = ACTION_KINDS[int(probabilities.argmax().item())]
                 last_scores = {kind: float(probabilities[index]) for index, kind in enumerate(ACTION_KINDS)}
                 if last_kind != "ponder":
                     stop_reason = "learned-action-transition"
+                    if transition_callback is not None:
+                        transition_callback(continuation_logits, refined)
                     break
                 scale = float(refined.float().square().mean().sqrt().item())
                 if final_delta <= 1e-4 * (1.0 + scale):
@@ -14994,35 +15049,23 @@ class AdaptiveBrain:
         finally:
             self.router.population.membrane.copy_(membrane)
             self.router.population.spike_count.copy_(spike_count)
+            trace = {
+                "activated": True, "activated_by": "learned-action-head", "passes": passes,
+                "converged": converged, "completed": stop_reason in {"converged", "learned-action-transition"},
+                "stop_reason": stop_reason, "continuationAction": last_kind, "continuationScores": last_scores,
+                "schedulerYields": scheduler_yields, "fixedPassLimit": None, "fixedTimeLimitMs": None,
+                "initial_score": float(confidence), "final_delta": final_delta,
+                "elapsed_ms": (time.perf_counter() - started) * 1000., "seed": int(seed), "router_steps": router_steps,
+                "memory_bias_delta": float((refined.float() - internal_memory.detach().float()).square().mean().sqrt().item()),
+                "phase": "pre-speech", "private": True, "visibleMagicTags": False,
+            }
+            if completion_callback is not None:
+                completion_callback(trace)
             if progress_callback is not None:
                 progress_callback({"phase": "ponder", "active": False, "passes": passes,
                     "elapsedMs": (time.perf_counter() - started) * 1000., "delta": final_delta,
                     "selectedAction": last_kind, "stopReason": stop_reason})
-        return refined, {
-            "activated": True,
-            "activated_by": "learned-action-head",
-            "passes": passes,
-            "converged": converged,
-            "completed": stop_reason in {"converged", "learned-action-transition"},
-            "stop_reason": stop_reason,
-            "continuationAction": last_kind,
-            "continuationScores": last_scores,
-            "schedulerYields": scheduler_yields,
-            "fixedPassLimit": None,
-            "fixedTimeLimitMs": None,
-            "initial_score": float(confidence),
-            "final_delta": final_delta,
-            "elapsed_ms": (time.perf_counter() - started) * 1000.0,
-            "seed": int(seed),
-            "router_steps": router_steps,
-            "memory_bias_delta": float(
-                (refined.float() - internal_memory.detach().float())
-                .square().mean().sqrt().item()
-            ),
-            "phase": "pre-speech",
-            "private": True,
-            "visibleMagicTags": False,
-        }
+        return refined, trace
 
     @torch.no_grad()
     def _candidate_nll(
@@ -15424,6 +15467,7 @@ class AdaptiveBrain:
             "text": str(brain_message.get("content", "")),
             "response": str(brain_message.get("content", "")),
             "content": str(brain_message.get("content", "")),
+            "publicTextBinding": trace.get("public_reply_text_binding"),
             "humanMessage": human_message,
             "message": brain_message,
             "trace": trace,
@@ -15926,9 +15970,10 @@ class AdaptiveBrain:
             "visibleMagicTags": False,
         }
         ponder_steps = 0
-
-
-
+        # Canonical pre-speech work is real, before any private Best Work
+        # candidates. Reuse this ledger in the visible decode/replay so its
+        # parent and selected children cannot dispatch again after search.
+        canonical_action_ledger = NativeActionEmissionLedger(turn_id)
         native_ponder_action = next(
             (action for action in proposed_actions if action.get("kind") == "ponder"),
             None,
@@ -15936,15 +15981,21 @@ class AdaptiveBrain:
         if native_ponder_action is not None and not any(
             action.get("kind") == "stop" for action in proposed_actions
         ):
+            native_ponder_action = canonical_action_ledger.register(native_ponder_action, step=-1, phase="pre-speech")
+            proposed_actions = [native_ponder_action if action.get("kind") == "ponder" else action for action in proposed_actions]
             try:
                 with reply_stage(self, "voluntary-ponder"):
-                    internal_memory, native_ponder_trace = self._native_pre_speech_ponder(
+                    internal_memory, native_ponder_trace = self._selected_native_ponder(
                         combined_memory,
                         internal_memory,
+                        registered=native_ponder_action, ledger=canonical_action_ledger, emit=stream_callback,
+                        schemas=normalized_tools, input_text=clean, assembly_ids=active_assemblies,
+                        organic_state=action_state, step=-1, phase="pre-speech",
                         seed=int(seed),
                         confidence=float(native_ponder_action.get("confidence", 0.0)),
                         noise=organic_noise,
                         cancel_check=cancel_check, steer_check=steer_check,
+                        suspension_check=suspension_check,
                         progress_callback=(lambda progress: stream_callback("cognition-progress", progress)) if stream_callback is not None else None,
                     )
                 observe_self_activity(internal_memory, native_ponder_trace)
@@ -15965,10 +16016,12 @@ class AdaptiveBrain:
                     )
                 if report is not None:
                     arguments[PONDER_REPORT_CANDIDATE] = report
+            if stream_callback is not None:
+                emit_registered_action(stream_callback, native_ponder_action)
         # Voluntary latent Ponder is independent from optional multi-candidate
         # search. With Best Work off, the first ordinary decode always streams.
         initial_search_entropy = 0.
-        search_wanted = self.config.best_work_enabled
+        search_wanted = self.config.best_work_enabled and not canonical_action_ledger.stop_selected
         if search_wanted:
             from .best_work import exploration_target
             probabilities = F.softmax(routing_output["logits"][:, -1].detach().float(), dim=-1)
@@ -16026,7 +16079,7 @@ class AdaptiveBrain:
         if single_pass_generation:
             cancellation_boundary()
             branch_seed = int(seed)
-            branch_ledger = NativeActionEmissionLedger(turn_id)
+            branch_ledger = canonical_action_ledger
             initial_actions = copy.deepcopy(proposed_actions)
             branch_organic = dict(action_state)
             for action in initial_actions:
@@ -16039,6 +16092,7 @@ class AdaptiveBrain:
                 action_cue=action_cue, ledger=branch_ledger,
                 seed=branch_seed, cancel_check=cancel_check, steer_check=steer_check,
                 emit=stream_callback, self_activity_observer=observe_self_activity,
+                suspension_check=suspension_check,
             )
             try:
                 candidate, branch_entropies = self.decoder.generate(
@@ -16102,7 +16156,8 @@ class AdaptiveBrain:
                         raise
                     return None
                 try:
-                    ledger = NativeActionEmissionLedger(turn_id)
+                    ledger = NativeActionEmissionLedger.from_suspension_state(
+                        copy.deepcopy(canonical_action_ledger.suspension_state()), turn_id)
                     initial = copy.deepcopy(proposed_actions)
                     organic = dict(action_state)
                     for action in initial:
@@ -16111,6 +16166,7 @@ class AdaptiveBrain:
                         schemas=normalized_tools, input_text=clean, assembly_ids=active_assemblies,
                         organic_state=organic, action_cue=action_cue, ledger=ledger,
                         seed=specification.seed, cancel_check=cancel_check, steer_check=steer_check,
+                        suspension_check=suspension_check,
                         progress_callback=(lambda progress: stream_callback("cognition-progress", {
                             "phase": "best-work", "active": True, "branch": specification.index,
                             "ordinary": specification.ordinary, "passes": progress.get("passes", 0),
@@ -16192,8 +16248,8 @@ class AdaptiveBrain:
         entropies = selected["entropies"]
         if not single_pass_generation and not private_generation_steered:
             self.decoder.last_generation_stop_reason = selected.get("nativeStopReason", "unknown")
-        emission_ledger = live_generation_ledger or NativeActionEmissionLedger(turn_id)
-        proposed_actions = [] if private_generation_steered else list(selected["activityActions"])
+        emission_ledger = live_generation_ledger or canonical_action_ledger
+        proposed_actions = list(emission_ledger.actions.values()) if private_generation_steered else list(selected["activityActions"])
 
         if stream_callback is not None and not private_generation_steered and not single_pass_generation:
             for action in selected["initialActions"]:
@@ -16218,6 +16274,7 @@ class AdaptiveBrain:
                 seed=int(selected["seed"]), emit=stream_callback,
                 cancel_check=cancel_check, steer_check=steer_check,
                 self_activity_observer=observe_self_activity,
+                suspension_check=suspension_check,
             )
             try:
                 replayed, replay_entropies = (prompt_ids, []) if private_generation_steered else self.decoder.generate(
@@ -16299,7 +16356,8 @@ class AdaptiveBrain:
         activity = self._generation_activity_callback(schemas=context["normalized_tools"], input_text=context["clean"],
             assembly_ids=assemblies, organic_state=continuation["organic"], action_cue=continuation["actionCue"], ledger=ledger,
             seed=cursor.options["seed"], cancel_check=cancel_check, steer_check=steer_check,
-            emit=stream_callback, self_activity_observer=observe, continuation_state=continuation["activity"])
+            emit=stream_callback, self_activity_observer=observe, continuation_state=continuation["activity"],
+            suspension_check=suspension_check)
         started = time.perf_counter()
         context["generation_started_at"] = started - continuation["generationElapsedSeconds"]
         streamed = continuation["streamedTokens"]
@@ -17010,6 +17068,7 @@ class AdaptiveBrain:
             "generation_stop_reason": generation_stop_reason,
             "generation_decoder_stop_reason": decoder_stop_reason,
             "generation_no_reply_reason": completion.get("noReplyReason"),
+            "public_reply_text_binding": completion.get("publicTextBinding"),
             "generation_printable_text_characters": sum(
                 character.isprintable() and not character.isspace()
                 for character in response
@@ -17234,6 +17293,7 @@ class AdaptiveBrain:
             "text": response,
             "response": response,
             "content": response,
+            "publicTextBinding": completion.get("publicTextBinding"),
             "humanMessage": user_message,
             "message": assistant_message,
             "trace": trace,

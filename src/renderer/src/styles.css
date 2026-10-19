@@ -2265,6 +2265,17 @@ textarea:focus-visible,
   border-bottom: 1px solid var(--border);
 }
 
+/* A panel, not the whole titlebar, may sit above build progress. Native
+   top-layer painting escapes the titlebar's backdrop/stacking context. */
+.appearance-panel[popover] {
+  position: fixed;
+  inset: auto;
+  top: calc(var(--titlebar-total-h) + 6px);
+  right: calc(11px + var(--safe-right));
+  margin: 0;
+  -webkit-app-region: no-drag;
+}
+
 .appearance-panel > header > span {
   display: grid;
   gap: 3px;
@@ -5337,6 +5348,17 @@ textarea:focus-visible,
   grid-area: 1 / 1;
 }
 
+/* The unified map replaced an older content-page wrapper. Its own viewport
+   must remain scrollable inside the existing bounded grid, including above
+   the compact fixed rail; standalone map inspectors keep their own sizing. */
+.workspace-view-host__content > .whole-brain-map {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
 .workspace-view-host.is-waiting .workspace-view-host__content > * {
   opacity: 0.42;
   filter: saturate(0.65);
@@ -6517,6 +6539,11 @@ textarea:focus-visible,
   white-space: pre-wrap;
   user-select: text;
 }
+
+.message__text-segment { white-space: pre-wrap; }
+.message__reply-action { margin: 10px 0; white-space: normal; }
+.chat-ponder-actions { display: grid; min-width: 0; gap: 8px; margin: 10px 0; }
+.chat-ponder-actions > .chat-action-card { min-width: 0; margin: 0; }
 
 .message--human .message__content {
   display: inline-block;
@@ -11719,7 +11746,7 @@ textarea:focus-visible,
 
 .toast {
   position: fixed;
-  z-index: 300;
+  z-index: 415;
   right: 22px;
   bottom: 20px;
   display: flex;
@@ -13104,6 +13131,12 @@ textarea:focus-visible,
 
 .toast > .toast__icon { color:var(--text-2); background:var(--surface-2); }
 .toast > button { flex:0 0 25px; }
+
+/* ToastNotice measures only a genuinely overlapping conversation notice.
+   Reserve that actual space instead of covering upload/Send/Queue controls. */
+.conversation[data-notice-reservation] > .call-layout > .call-layout__conversation > .composer-wrap {
+  margin-bottom: calc(var(--notice-composer-base-margin, 0px) + var(--conversation-notice-space, 0px));
+}
 .api-model-picker { display:flex; flex-direction:column; align-items:stretch; min-width:0; gap:6px; }
 .api-model-picker > .button { align-self:flex-start; white-space:normal; text-align:start; }
 .api-model-picker > small { color:var(--text-3); font-size:12px; line-height:1.4; overflow-wrap:anywhere; }
@@ -13342,6 +13375,23 @@ textarea:focus-visible,
     max-width: 34vw;
     margin-left: 6px;
     padding-inline: 7px;
+  }
+
+  /* A long off-page activity pill must not force Load/actions and the whole
+     page outside a compact viewport. Its existing full accessible name and
+     title remain available; only the redundant visual words collapse. */
+  .workspace-header:has(> .workspace-header__chat-status) > .workspace-header__chat-status {
+    flex: 0 0 32px;
+    width: 32px;
+    min-width: 32px;
+    max-width: 32px;
+    justify-content: center;
+    margin-left: 4px;
+    padding-inline: 0;
+  }
+
+  .workspace-header:has(> .workspace-header__chat-status) > .workspace-header__chat-status > span {
+    display: none;
   }
 
   .workspace-header__chat-status + .workspace-header__activity {

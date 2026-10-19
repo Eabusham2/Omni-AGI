@@ -11,9 +11,9 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 | 3/8 | Learning, research, self-review, fact checking, teachers | Source implemented at the supported boundary: durable learning/teacher custody, ordinary experience, self-review and outer owner orchestration. Research dispositions are recorded; real provider interoperability and learned quality are separate qualification |
 | 4/8 | MCP, integrations, plugins, tools, automations, oversight | Source implemented for the advertised supported transports/capabilities and host boundaries; focused contracts and bounded renderer evidence are recorded. Optional unsupported methods, real accounts/devices and packaged integrations are not claimed passed |
 | 5/8 | Load/unload, resource planner, devices, media lifecycle | Actual RAM/VRAM/storage retained-context ownership and capacity are implemented, including primary snapshot plus extra-drive spill accounting. Existing Gloo/NCCL training, thirteen complete-operation kinds and six-text-kind sequential mixed routes are preserved. Active's fixed12%/50% duty restrictions are removed while actual admission/preemption remains; broader hardware/concurrent/direct-accelerator qualification stays distinct |
-| 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | Source implemented with scoped component/control evidence. The actual compiled main now opens a real empty Library and Build form and quits normally without creating a brain. Full native learned sequencing and universal theme/accessibility/device acceptance are not inferred |
-| 7/8 | Focused fixtures, visual audit, complete feature audit and documentation | Current non-neural runner93/93, affected desktop20/20, Node/Web types and shell bundle pass; public curriculum22 preserves8 manuals. Residual no-engine walkthrough has31 numbered captures,30 in its accepted index and one rejected scroll capture. These are bounded results, not full U1/live-engine proof |
-| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | Not complete: current85b5f93 Android/both macOS architectures passed; Windows2/Linux x64/iOS failed and Linux ARM64 was still running at the last observation. Backup and plugin corrections pass locally; iOS now retains its exact receipt assertion after bounded conversation reveal and forwards the configured gateway. Native requalification, green composed packages and v2 release remain pending |
+| 6/8 | Chat, queue/steer, questions, telemetry, themes and brain map | Source correction composed: genuine native Ponder episodes, host-validated same-turn child ancestry and canonical public-prefix anchors now feed the actual chat view. Canonical messages/copy/voice remain intact; unknown old events stay flat. Private/visible selectors perform equivalent computation, but only visible execution emits host actions. Focused mechanisms pass; affected UI proof is next. No new model is authorized |
+| 7/8 | Focused fixtures, visual audit, complete feature audit and documentation | In progress: six native captures and three affected compact captures are accepted separately. The compact core12/12 and final composition19/19 now pass with no runtime/external errors and clean exit. Genuine map, notification/composer, Appearance/build, header and label fixes are preserved. Full4608 route/7296 composition visits remain planned, not passed |
+| 8/8 | GitHub main, cross-platform green CI, v2 packages and release verification | Not complete: on037f3c6, Android/iOS, both macOS and both Linux architectures passed. Both Windows jobs failed at later worker packaging/health boundaries; compiler setup itself now succeeds. Next corrections are isolated, no failed run is relabeled green. Composed-source requalification and v2 release remain pending |
 
 ## Settled scope changes
 
@@ -26,6 +26,26 @@ starting point, not proof of v2 completion. Full-folder training is deferred.
 - New v2 goal authorizes GitHub CI and package release after audits.
 
 ## Evidence
+
+### U1 correction composition — October18, after037f3c6
+
+- Native Ponder producer/host provenance has14 new stdlib/AST/inert Python
+  cases. The composed fixed guarded Python selector now passes113 cases across10 files;
+  no brain, neural runtime or training is imported. The four affected Node
+  files pass37 cases:16 host/SQLite,10 exact public-prefix projection,8 explicit
+  parent grouping and3 measured notice geometry. The new cases are registered
+  once in the existing fixed CI selectors; no full neural discovery is added.
+- Both complete TypeScript projects and the main/preload/renderer shell-only
+  bundle exit0 after App composition. The public documentation is now pack23
+  with8 manuals; its two affected cases pass. These results are not packaged or learned
+  behavior. The affected compact composition retry passes19/19, with actual
+  measured8-pixel notice separation before/after content scrolling. Full U1
+  traversal remains open; this is only1/384 cells.
+- The unchanged exact human receipt and configured gateway actually passed in
+  native iOS CI; this is deterministic gateway/client interoperability, not a
+  neural answer.037f3c6's six non-Windows package jobs are green. Windows x64
+  reaches worker smoke; ARM64 reaches post-compile temporary-directory cleanup.
+  Their new failures are recorded, not hidden or replaced by older green jobs.
 
 Latest hosted results and exact corrections are recorded at the top of
 CONTINUATION.md. The prior local/historical evidence below remains scoped to

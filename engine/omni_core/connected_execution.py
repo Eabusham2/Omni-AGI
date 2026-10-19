@@ -822,7 +822,7 @@ class ConnectedExecutionSession:
         for key in ('brainId', 'brain_id'):
             if key in result:
                 result[key] = self.root.brain_id
-        for key in ('actionId', 'nativeActionId', 'neuralActionId'):
+        for key in ('actionId', 'nativeActionId', 'neuralActionId', 'parentPonderActionId'):
             if isinstance(result.get(key), str) and result[key] not in self.prior_action_ids:
                 result[key] = self.action_id(result[key])
         if result.get('format') == 'omni-ponder-self-report-delta' and isinstance(result.get('reportId'), str):
@@ -852,7 +852,7 @@ class ConnectedExecutionSession:
         return result
 
     def outward_event(self, kind, value):
-        if 'action' in str(kind) and isinstance(value, dict):
+        if ('action' in str(kind) or kind == 'ponder-episode') and isinstance(value, dict):
             action = value.get('action', value)
             if isinstance(action, dict) and isinstance(action.get('actionId', action.get('id')), str):
                 identifier = action.get('actionId', action.get('id'))

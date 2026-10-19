@@ -58,6 +58,8 @@ export function normalizeStructuredAction(
     ...(typeof candidate.selectionPhase === "string" ? { selectionPhase: candidate.selectionPhase } : {}),
     ...(typeof candidate.selectionStep === "number" && Number.isInteger(candidate.selectionStep)
       ? { selectionStep: candidate.selectionStep } : {}),
+    ...(source === "brain" && typeof candidate.parentPonderActionId === "string" && /^[a-f0-9]{32}$/.test(candidate.parentPonderActionId)
+      ? { parentPonderActionId: candidate.parentPonderActionId } : {}),
   };
 
   if (["talk", "ponder", "learn", "stop"].includes(kind)) {

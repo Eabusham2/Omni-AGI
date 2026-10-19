@@ -14,6 +14,7 @@ from typing import Any, Dict, Mapping, Optional
 
 
 from .schema_validation import structural_schema_document, validate_schema_value
+from .ponder_episode import NativePonderEpisode
 
 
 def structural_schema(raw: Any, *, max_depth: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -43,8 +44,16 @@ class NativeActionEmissionLedger:
         self.turn_id = str(turn_id)
         self.actions: Dict[str, Dict[str, Any]] = {}
         self.effect_fingerprints = set()
+        self.active_ponder_action_id = None
+        self.stop_selected = False
 
-    def register(self, action: Mapping[str, Any], *, step: int, phase: str) -> Optional[Dict[str, Any]]:
+    def register(self, action: Mapping[str, Any], *, step: int, phase: str,
+                 parent_ponder_action_id=None) -> Optional[Dict[str, Any]]:
+        if parent_ponder_action_id is not None:
+            if (parent_ponder_action_id != self.active_ponder_action_id or action.get("kind") == "ponder"
+                    or not any(value.get("actionId") == parent_ponder_action_id and value.get("kind") == "ponder"
+                               for value in self.actions.values())):
+                raise ValueError("selected action has no active Ponder invocation")
         fingerprint = action_fingerprint(action)
         if action.get("kind") == "ponder":
             # Repeated external effects remain exactly-once, but an internal
@@ -56,16 +65,25 @@ class NativeActionEmissionLedger:
         if fingerprint in self.actions or action.get("kind") != "ponder" and fingerprint in self.effect_fingerprints:
             return None
         result = dict(action)
+        result.pop("parentPonderActionId", None)
         result.update({
             "actionId": hashlib.sha256((self.turn_id + ":" + fingerprint).encode()).hexdigest()[:32],
             "selectionStep": int(step),
             "selectionPhase": str(phase),
         })
+        if parent_ponder_action_id is not None:
+            result["parentPonderActionId"] = parent_ponder_action_id
         self.actions[fingerprint] = result
+        if action.get("kind") == "stop": self.stop_selected = True
         if action.get("kind") != "ponder": self.effect_fingerprints.add(fingerprint)
         return result
 
+    def ponder_episode(self, action, emit=None):
+        return NativePonderEpisode(self, action, emit)
+
     def suspension_state(self):
+        if self.active_ponder_action_id is not None:
+            raise ValueError("active Ponder invocation is not a token suspension frontier")
         return {"turnId": self.turn_id, "actions": dict(self.actions)}
 
     @classmethod
@@ -80,7 +98,13 @@ class NativeActionEmissionLedger:
             if action.get("actionId") != expected:
                 raise ValueError("native action continuation lost its original effect identity")
             result.actions[fingerprint] = dict(action)
+            if action.get("kind") == "stop": result.stop_selected = True
             if action.get("kind") != "ponder": result.effect_fingerprints.add(action_fingerprint(action))
+        for action in result.actions.values():
+            parent = action.get("parentPonderActionId")
+            if parent is not None and (action.get("kind") == "ponder" or not any(
+                    value.get("actionId") == parent and value.get("kind") == "ponder" for value in result.actions.values())):
+                raise ValueError("native action continuation lost its Ponder parent")
         return result
 
 

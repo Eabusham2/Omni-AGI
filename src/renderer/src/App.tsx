@@ -6,7 +6,8 @@ import {
   useMemo,
   useRef,
   useState,
-  type KeyboardEvent
+  type KeyboardEvent,
+  type ReactNode
 } from "react";
 import {
   createPresetConfig,
@@ -133,6 +134,8 @@ import { DecoderExecutionControls } from "./DecoderExecutionControls";
 import { CachedDecoderExecutionControls } from "./CachedDecoderExecutionControls";
 import { NativeOperationAutoControls } from "./NativeOperationAutoControls";
 import { PonderPresentationLedger, reconcilePonderPresentation, type PonderPresentation } from "./ponderSelfReportPresentation";
+import { groupPonderActions } from "./chatPonderGroups";
+import { splitPublicReplyAtActions, verifyReplyActionLocations, type PublicReplySource, type VerifiedReplyLocation } from "./chatReplyProjection";
 import { PonderSelfReportView } from "./PonderSelfReportView";
 import { McpHostServicesPanel } from "./McpHostServicesPanel";
 import { McpTasksPanel } from "./McpTasksPanel";
@@ -263,6 +266,7 @@ import {
   chatActionMcpAppViewId,
   chatActionStateLabel,
   chatActionTitle,
+  chatApprovalStatus,
   cleanChatActionStatus
 } from "./chatActionPresentation";
 import {
@@ -689,6 +693,7 @@ function AppearanceMenu({
   const [selectedProfileId, setSelectedProfileId] = useState("");
   const [notificationBusy, setNotificationBusy] = useState(false);
   const container = useRef<HTMLDivElement>(null);
+  const panel = useRef<HTMLElement>(null);
   const activePack = activeAppearancePack(preferences);
   const activePackName = activePack === "custom"
     ? "Custom mix"
@@ -741,6 +746,15 @@ function AppearanceMenu({
     onWorkspaceChange({ ...workspacePreferences, arrangement: next.arrangement });
   };
 
+  useLayoutEffect(() => {
+    const popup = panel.current;
+    if (!open || !popup || typeof popup.showPopover !== "function") return;
+    // Only this non-modal panel enters the native top layer. The titlebar and
+    // its other controls stay below actual confirmation/permission dialogs.
+    popup.showPopover();
+    return () => { if (popup.matches(":popover-open")) popup.hidePopover(); };
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     const closeOnPointer = (event: globalThis.PointerEvent): void => {
@@ -749,14 +763,38 @@ function AppearanceMenu({
     const closeOnEscape = (event: globalThis.KeyboardEvent): void => {
       if (event.key === "Escape") {
         setOpen(false);
-        container.current?.querySelector<HTMLButtonElement>(".appearance-trigger")?.focus();
+        // Never pull focus out of another modal that opened while this menu
+        // was visible. Ordinary Appearance Escape returns to its own trigger.
+        if (!document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) {
+          container.current?.querySelector<HTMLButtonElement>(".appearance-trigger")?.focus();
+        }
       }
     };
+    const closeForModalFocus = (event: FocusEvent): void => {
+      const modal = event.target instanceof Element
+        ? event.target.closest('dialog[open], [role="dialog"][aria-modal="true"]')
+        : null;
+      if (modal && !panel.current?.contains(modal)) setOpen(false);
+    };
+    const closeForVisibleModal = (): void => {
+      if ([...document.querySelectorAll<HTMLElement>('dialog[open], [role="dialog"][aria-modal="true"]')]
+        .some(modal => !panel.current?.contains(modal) && modal.getClientRects().length > 0)) setOpen(false);
+    };
+    const modalAttributes = new MutationObserver(closeForVisibleModal);
+    const modalChildren = new MutationObserver(closeForVisibleModal);
+    modalAttributes.observe(document.body, { attributes: true, subtree: true, attributeFilter: ["open", "aria-modal"] });
+    const shell = container.current?.closest(".app-shell");
+    if (shell) modalChildren.observe(shell, { childList: true });
+    closeForVisibleModal();
     document.addEventListener("pointerdown", closeOnPointer);
     document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("focusin", closeForModalFocus);
     return () => {
       document.removeEventListener("pointerdown", closeOnPointer);
       document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("focusin", closeForModalFocus);
+      modalAttributes.disconnect();
+      modalChildren.disconnect();
     };
   }, [open]);
 
@@ -775,7 +813,7 @@ function AppearanceMenu({
         <i className="appearance-trigger__swatch" aria-hidden="true" />
       </button>
       {open ? (
-        <section className="appearance-panel" role="dialog" aria-label="Appearance settings">
+        <section ref={panel} popover="manual" className="appearance-panel" role="dialog" aria-label="Appearance settings">
           <header>
             <span>
               <strong>Appearance</strong>
@@ -785,7 +823,10 @@ function AppearanceMenu({
             <button
               className="icon-button"
               aria-label="Close appearance settings"
-              onClick={() => setOpen(false)}
+              onClick={() => {
+                setOpen(false);
+                container.current?.querySelector<HTMLButtonElement>(".appearance-trigger")?.focus();
+              }}
             >
               <Icon name="close" size={14} />
             </button>
@@ -2881,7 +2922,8 @@ function valueRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, readablePonder = false, onReadablePonder, flushPonder }: {
+function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, readablePonder = false, onReadablePonder, flushPonder,
+  children, childStatus, inlineMedia = true }: {
   event: ActionEvent;
   onCancel?: () => Promise<void>;
   onApprove?: () => Promise<void>;
@@ -2890,6 +2932,9 @@ function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, 
   readablePonder?: boolean;
   onReadablePonder?: (value: boolean) => void;
   flushPonder?: boolean;
+  children?: ReactNode;
+  childStatus?: string;
+  inlineMedia?: boolean;
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [approving, setApproving] = useState(false);
@@ -2918,13 +2963,13 @@ function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, 
 
   return (
     <>
-      <ChatImaginationMedia event={event} />
+      {inlineMedia ? <ChatImaginationMedia event={event} /> : null}
       <details className={cx("chat-action-card", `chat-action-card--${event.state}`)}>
-      <summary aria-label={`${title}: ${stateLabel}. Expand action details`}>
+      <summary aria-label={`${title}: ${stateLabel}${childStatus ? `. ${childStatus}` : ""}. Expand action details`}>
         <span className="chat-action-card__icon"><Icon name={iconByKind[event.action.kind]} size={15} /></span>
         <span className="chat-action-card__summary-copy">
           <strong>{title}</strong>
-          <small>{searchActivity ? `${stateLabel} · ${searchActivity}` : stateLabel}</small>
+          <small>{searchActivity ? `${stateLabel} · ${searchActivity}` : stateLabel}{childStatus ? ` · ${childStatus}` : ""}</small>
         </span>
         <Icon name="chevron" size={13} />
       </summary>
@@ -2945,6 +2990,7 @@ function ChatActionCard({ event, onCancel, onApprove, onDecline, ponderReports, 
         {event.error ? <p>{cleanChatActionStatus(event.error, event.action)}</p> : null}
         {event.action.kind === "ponder" && onReadablePonder ? ponderReports?.map(row => <PonderSelfReportView key={row.report.id}
           row={row} readable={readablePonder} onReadableChange={onReadablePonder} flush={flushPonder} />) : null}
+        {children}
         {event.state === "running" && event.progress !== undefined ? (
           <span
             className="chat-action-card__progress"
@@ -4970,6 +5016,59 @@ function ChatWorkspace({
   const ponderPresentation = useMemo(() => reconcilePonderPresentation(ponderLedger.snapshot(), displayedMessages, displayedActions),
     [ponderLedger, ponderRevision, displayedMessages, displayedActions]);
   const displayedActionIds = useMemo(() => new Set(displayedActions.map(event => event.neuralActionId).filter(Boolean)), [displayedActions]);
+  const ponderActionGroups = useMemo(() => groupPonderActions(displayedActions), [displayedActions]);
+  const publicReplySources = useMemo<PublicReplySource[]>(() => [
+    ...displayedMessages.flatMap(message => message.role === "brain" && message.turnId
+      ? [{ key: `message-${message.id}`, turnId: message.turnId, messageId: message.id, content: message.content, live: false }] : []),
+    ...(activeTurnId ? [{ key: `live-${activeTurnId}`, turnId: activeTurnId, content: partialText, live: true }] : [])
+  ], [displayedMessages, activeTurnId, partialText]);
+  const [replyLocationProof, setReplyLocationProof] = useState<{
+    brainId: string; sources: PublicReplySource[]; events: ActionEvent[]; locations: Map<string, VerifiedReplyLocation>;
+  }>();
+  useEffect(() => {
+    if (!displayedActions.some(event => event.replyAnchor)) {
+      setReplyLocationProof(current => current === undefined ? current : undefined);
+      return;
+    }
+    let current = true;
+    void verifyReplyActionLocations(brain.id, publicReplySources, displayedActions).then(locations => {
+      if (current) setReplyLocationProof({ brainId: brain.id, sources: publicReplySources, events: displayedActions, locations });
+    }).catch(() => {
+      // A missing digest never authorizes rearranging history. Older/unbound
+      // events remain visible in their ordinary flat timeline instead.
+      if (current) setReplyLocationProof(undefined);
+    });
+    return () => { current = false; };
+  }, [brain.id, publicReplySources, displayedActions]);
+  const replyActionLocations = useMemo(() => {
+    const result = new Map<string, VerifiedReplyLocation>();
+    if (replyLocationProof?.brainId !== brain.id) return result;
+    const priorEvents = new Map(replyLocationProof.events.map(event => [event.id, event]));
+    const priorSources = new Map(replyLocationProof.sources.map(source => [source.key, source]));
+    const sources = new Map(publicReplySources.map(source => [source.key, source]));
+    for (const event of displayedActions) {
+      const location = replyLocationProof.locations.get(event.id), priorEvent = priorEvents.get(event.id);
+      if (!location || !priorEvent || JSON.stringify(event.replyAnchor) !== JSON.stringify(priorEvent.replyAnchor) ||
+          event.chatTurnId !== priorEvent.chatTurnId || event.brainId !== priorEvent.brainId) continue;
+      const source = sources.get(location.sourceKey), prior = priorSources.get(location.sourceKey);
+      // New output may append while hashing is in flight. Reuse a verified
+      // position only while its exact public prefix and ownership are intact.
+      if (source && prior && source.turnId === prior.turnId && source.messageId === prior.messageId && source.live === prior.live &&
+          source.content.length >= location.utf16Offset &&
+          source.content.slice(0, location.utf16Offset) === prior.content.slice(0, location.utf16Offset)) result.set(event.id, location);
+    }
+    return result;
+  }, [brain.id, replyLocationProof, displayedActions, publicReplySources]);
+  const replyActionsBySource = useMemo(() => {
+    const result = new Map<string, ActionEvent[]>();
+    for (const event of ponderActionGroups.roots) {
+      const location = replyActionLocations.get(event.id);
+      if (!location) continue;
+      const events = result.get(location.sourceKey) ?? [];
+      events.push(event); result.set(location.sourceKey, events);
+    }
+    return result;
+  }, [ponderActionGroups, replyActionLocations]);
   const timelineEntries = useMemo(() => [
       ...displayedMessages.map((message, order) => ({
         kind: "message" as const,
@@ -4978,7 +5077,7 @@ function ChatWorkspace({
         order,
         message
       })),
-      ...displayedActions.map((event, order) => ({
+      ...ponderActionGroups.roots.filter(event => !replyActionLocations.has(event.id)).map((event, order) => ({
         kind: "action" as const,
         id: `action-${event.id}`,
         createdAt: event.createdAt,
@@ -5020,6 +5119,8 @@ function ChatWorkspace({
       datasetPreview,
       displayedActions,
       displayedMessages,
+      ponderActionGroups,
+      replyActionLocations,
       learningJobs
     ]);
   useLayoutEffect(() => {
@@ -5081,10 +5182,14 @@ function ChatWorkspace({
     timelineWindow.end >= timelineEntries.length;
   const visibleTimelineEntries = useMemo(() => {
     if (timelineAtLatest) return windowedTimelineEntries;
+    const parentByChild = new Map([...ponderActionGroups.childrenByParent].flatMap(([parentId, children]) => children.map(child => [child.id, parentId] as const)));
     const pinnedIds = new Set([
       ...optimisticHumans.slice(-20).map((message) => `message-${message.id}`),
       ...sessionCommittedMessages.slice(-20).map((message) => `message-${message.id}`),
-      ...actionEvents.slice(-20).map((event) => `action-${event.id}`),
+      ...actionEvents.slice(-20).map((event) => {
+        const rootId = parentByChild.get(event.id) ?? event.id;
+        return replyActionLocations.get(rootId)?.sourceKey ?? `action-${rootId}`;
+      }),
       ...attachmentReceipts.slice(-10).map((receipt) => `attachment-${receipt.id}`),
       ...(datasetPreview ? [`dataset-preview-${datasetPreview.requestId}`] : []),
       ...learningJobs.slice(-10).map((job) => `dataset-job-${job.id}`)
@@ -5106,6 +5211,8 @@ function ChatWorkspace({
     sessionCommittedMessages,
     timelineAtLatest,
     timelineEntries,
+    ponderActionGroups,
+    replyActionLocations,
     windowedTimelineEntries
   ]);
   const moveTimelineWindow = (direction: "older" | "newer"): void => {
@@ -5356,6 +5463,41 @@ function ChatWorkspace({
     messagesEnd.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   };
 
+  const renderChatAction = (event: ActionEvent, inlineMedia = true): ReactNode => {
+    const children = ponderActionGroups.childrenByParent.get(event.id) ?? [];
+    const waiting = children.filter(child => pendingChatToolFromAction(child)).length;
+    const running = children.filter(child => child.state === "running" || child.state === "proposed").length;
+    const childStatus = waiting ? `${waiting} awaiting approval` : running ? `${running} active action${running === 1 ? "" : "s"}` : undefined;
+    return <Fragment key={event.id}>
+      <ChatActionCard event={event} inlineMedia={inlineMedia} childStatus={childStatus}
+        ponderReports={ponderPresentation.byAction.get(event.id)} readablePonder={readablePonder}
+        onReadablePonder={setReadablePonder} flushPonder={Boolean(hidden)}
+        onDecline={pendingChatToolFromAction(event) ? instruction => declinePendingTool(event, instruction) : undefined}
+        onCancel={chatActionCancellationTarget(event, actionTurnIdsRef.current.get(event.id)) ? () => cancelActionJob(event) : undefined}
+        onApprove={pendingChatToolFromAction(event) ? () => approvePendingTool(pendingChatToolFromAction(event)) : undefined}>
+        {children.length ? <div className="chat-ponder-actions" aria-label="Actions selected during this Ponder">
+          {children.map(child => renderChatAction(child, false))}
+        </div> : null}
+      </ChatActionCard>
+      {/* Generated output stays visible even while the Ponder audit is closed. */}
+      {children.map(child => <ChatImaginationMedia key={`media-${child.id}`} event={child} />)}
+    </Fragment>;
+  };
+  const renderPublicReply = (sourceKey: string, content: string): ReactNode | undefined => {
+    const events = replyActionsBySource.get(sourceKey);
+    if (!events?.length) return undefined;
+    const offsets = new Map(events.flatMap(event => {
+      const location = replyActionLocations.get(event.id);
+      return location ? [[event.id, location.utf16Offset] as const] : [];
+    }));
+    const { pieces } = splitPublicReplyAtActions(content, events, offsets);
+    return pieces.map(piece => piece.kind === "text"
+      ? <span className="message__text-segment" key={`text-${piece.start}`}>{piece.text}</span>
+      : <div className="message__reply-action" key={`action-${piece.event.id}`}>{renderChatAction(piece.event)}</div>);
+  };
+  const liveReplyKey = activeTurnId ? `live-${activeTurnId}` : "";
+  const liveReplyHasActions = Boolean(replyActionsBySource.get(liveReplyKey)?.length);
+
   return (
     <div className="chat-layout" hidden={hidden}>
       <section
@@ -5513,7 +5655,7 @@ function ChatWorkspace({
                 <Icon name="arrow" size={12} /> Load older
               </button>
               <span aria-live="polite">
-                Showing {visibleTimelineEntries.length.toLocaleString()} of {conversationTotal.toLocaleString()} persisted entries
+                Showing {visibleTimelineEntries.length.toLocaleString()} conversation rows · {conversationTotal.toLocaleString()} persisted records
                 <small>All turns remain persisted · Conversation history search reaches entries outside this window</small>
               </span>
               <button
@@ -5541,6 +5683,7 @@ function ChatWorkspace({
                   readable={readablePonder} onReadableChange={setReadablePonder} flush /></details>)}
               <MessageBubble
                 message={entry.message}
+                contentProjection={renderPublicReply(entry.id, entry.message.content)}
                 brainId={brain.id}
                 brainName={brain.name}
                 onToast={onToast}
@@ -5555,15 +5698,7 @@ function ChatWorkspace({
               </>
             ) : entry.kind === "action" ? (
               <div className="chat-action-stream" aria-label="Visible chat action">
-                <ChatActionCard event={entry.event}
-                  ponderReports={ponderPresentation.byAction.get(entry.event.id)} readablePonder={readablePonder}
-                  onReadablePonder={setReadablePonder} flushPonder={Boolean(hidden)}
-                  onDecline={pendingChatToolFromAction(entry.event) ? instruction => declinePendingTool(entry.event, instruction) : undefined}
-                  onCancel={chatActionCancellationTarget(entry.event,
-                    actionTurnIdsRef.current.get(entry.event.id))
-                    ? () => cancelActionJob(entry.event) : undefined}
-                  onApprove={pendingChatToolFromAction(entry.event)
-                    ? () => approvePendingTool(pendingChatToolFromAction(entry.event)) : undefined} />
+                {renderChatAction(entry.event)}
               </div>
             ) : entry.kind === "attachment" ? (
               <div className="chat-action-stream" aria-label="Learned chat attachment">
@@ -5614,13 +5749,13 @@ function ChatWorkspace({
                   </span>
                   <ResponseOutputCounter presentation={responseOutputPresentation} cognitionWithoutOutput={cognitionProgress?.active} />
                 </div>
-                {partialText ? (
-                  <p
+                {partialText || liveReplyHasActions ? (
+                  <div
                     className="message__streaming-text"
                     aria-live="polite"
                   >
-                    {partialText}
-                  </p>
+                    {renderPublicReply(liveReplyKey, partialText) ?? partialText}
+                  </div>
                 ) : (
                   <div className="pondering">
                     <span />
@@ -5737,7 +5872,7 @@ function ChatWorkspace({
           {toolStatus && (pendingTool || toolRunning || attaching) ? (
             <div className={cx("chat-tool-status", pendingTool && "chat-tool-status--approval")}>
               <span><Icon name={pendingTool ? "warning" : "activity"} size={15} /></span>
-              <p>{toolStatus}{pendingTool?.approvalExpiresAt ? ` · ${Math.max(0, Math.ceil((Date.parse(pendingTool.approvalExpiresAt) - approvalClock) / 1_000))}s` : ""}</p>
+              <p>{pendingTool ? chatApprovalStatus(pendingTool.label, pendingTool.approvalExpiresAt, approvalClock) : toolStatus}</p>
               {pendingTool ? (
                 <Button kind="primary" icon="check" disabled={cancellingTurn} onClick={() => void approvePendingTool()}>
                   Approve exact action
@@ -5884,6 +6019,7 @@ function ChatWorkspace({
 
 function MessageBubble({
   message,
+  contentProjection,
   brainId,
   brainName,
   onToast,
@@ -5895,6 +6031,8 @@ function MessageBubble({
   uncommittedOutputState
 }: {
   message: ChatMessage;
+  /** View-only segments; copying, voice and persistence retain the full message. */
+  contentProjection?: ReactNode;
   brainId: string;
   brainName: string;
   onToast: (message: string) => void;
@@ -5996,7 +6134,7 @@ function MessageBubble({
           {paused ? <span className="message-queue-label">{paused}</span> : null}
           {isBrain && message.runtime ? <span className="runtime-label">{message.runtime.replace("-", " ")}</span> : null}
         </div>
-        {noReply ? null : <div className="message__content">{message.content}</div>}
+        {noReply ? null : <div className="message__content">{contentProjection ?? message.content}</div>}
         {!isBrain && message.nativeAudioInput ? <NativeAudioInputSummary input={message.nativeAudioInput} /> : null}
         {!isBrain && message.turnId && message.taskAttachmentIds?.length ? <MessageTaskAttachments
           brainId={brainId} turnId={message.turnId} attachmentIds={message.taskAttachmentIds} received={message.inputReceipt?.committed === true} /> : null}
@@ -11360,9 +11498,9 @@ function AgentsWorkspace({
             <span>
               <strong>Import a portable instance</strong>
               <small>Creates one editable local identity from a verified .omni bundle; repository scripts never run</small>
-              <input value={catalogUrl} onChange={(event) => setCatalogUrl(event.target.value)} placeholder="https://github.com/…/brain.omni" />
+              <input aria-label="Portable instance URL" value={catalogUrl} onChange={(event) => setCatalogUrl(event.target.value)} placeholder="https://github.com/…/brain.omni" />
             </span>
-            <button className="icon-button" disabled={!catalogUrl.trim()} onClick={() => void installCatalogBrain()}><Icon name="arrow" size={14} /></button>
+            <button className="icon-button" aria-label="Import portable instance from URL" title="Import .omni from this URL" disabled={!catalogUrl.trim()} onClick={() => void installCatalogBrain()}><Icon name="arrow" size={14} /></button>
           </div>
         </aside>
       </div>

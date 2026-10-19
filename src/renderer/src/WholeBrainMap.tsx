@@ -144,7 +144,7 @@ function WholeBrainMapOwner({ brainId, api, observeActivity, onBack }: Parameter
     }
     void read({ entity: "cortex", regionId: query.regionId, pageSize: 64, cortex: { entity: "links", moduleId: module.id, row: value } });
   };
-  return <section className="whole-brain-map" aria-label="Whole brain map">
+  return <section className="whole-brain-map" aria-label="Whole brain map" tabIndex={0}>
     <header className="whole-brain-map__header"><button type="button" className="button" onClick={onBack}>Back to chat</button>
       <h1>Brain Map</h1><button type="button" className="button" disabled={!api || busy}
         onClick={() => void read({ entity: "catalog", catalogFacet: "overview", pageSize: 128 }, true)}>Refresh whole brain</button></header>

@@ -4,6 +4,7 @@ import {
   chatActionMcpAppViewId,
   chatActionStateLabel,
   chatActionTitle,
+  chatApprovalStatus,
   cleanChatActionStatus
 } from "../src/renderer/src/chatActionPresentation";
 import type { ActionEvent, StructuredAction } from "../src/shared/types";
@@ -17,6 +18,16 @@ const ponder: StructuredAction = {
 };
 
 describe("plain chat action presentation", () => {
+  it("labels a pending approval with its own action and live readable expiry", () => {
+    expect(chatApprovalStatus("Web access proposed in chat", new Date(3598_000).toISOString(), 0))
+      .toBe("Web access · needs approval · 59m 58s remaining");
+    expect(chatApprovalStatus("Web access", new Date(3598_000).toISOString(), 1_000))
+      .toBe("Web access · needs approval · 59m 57s remaining");
+    expect(chatApprovalStatus("File access", new Date(3601_000).toISOString(), 0))
+      .toBe("File access · needs approval · 1h 0m 1s remaining");
+    expect(chatApprovalStatus("File access", undefined, 0)).toBe("File access · needs approval");
+    expect(chatApprovalStatus("File access", "invalid", 0)).toBe("File access · needs approval");
+  });
   const connectedApp = (): ActionEvent => ({ id: "action", brainId: "brain", state: "complete", createdAt: "2026-10-11T00:00:00Z", updatedAt: "2026-10-11T00:00:00Z",
     action: { kind: "tool", source: "brain", toolId: "mcp.server.fixture.hash", action: "call", arguments: {} },
     execution: { id: "execution", toolId: "mcp.server.fixture.hash", action: "call", state: "complete", startedAt: "2026-10-11T00:00:00Z",

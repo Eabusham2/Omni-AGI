@@ -7,6 +7,8 @@ import { completedInheritedTurn, type InheritedInputAlias } from "./inheritedCha
 import { chatInputCapacity, cleanChatInput } from "../shared/chatInput";
 import { checkedChatInputProvenance, type ChatInputProvenance, type NativeAppChatInput } from "../shared/chatInputProvenance";
 import { normalizeCognitionProgress } from "../shared/cognition";
+import { measuredPonderTrace, type NativePonderEpisodeFrame } from "../shared/ponderEpisode";
+import { normalizePublicReplyTextBinding } from "./publicReplyAnchors";
 import { normalizePonderSelfReportDelta, validatePonderSelfReport,
   type PonderSelfReport } from "../shared/ponderSelfReport";
 import { nativeMediaTimeline } from "../shared/nativeMediaTimeline";
@@ -452,6 +454,7 @@ function enabledToolSchemas(
 }
 
 interface WorkerChatResult {
+  publicTextBinding?: unknown;
   suspended?: boolean;
   brainId?: string;
   turnId?: string;
@@ -485,6 +488,7 @@ interface WorkerChatResult {
     generation_stop_reason?: string;
     generation_decoder_stop_reason?: string;
     generation_no_reply_reason?: string | null;
+    public_reply_text_binding?: unknown;
     generated_token_count?: number;
     generation_printable_text_characters?: number;
     input_accepted_before_reply?: boolean;
@@ -559,6 +563,7 @@ interface ValidatedWorkerChatPresentation {
 export type NeuralChatStreamEvent =
   | { type: "chat-cognition"; sequence: number; progress: import("../shared/cognition").CognitionProgress }
   | { type: "chat-ponder-self-report"; sequence: number; report: import("../shared/ponderSelfReport").PonderSelfReportDelta }
+  | ({ type: "chat-ponder-episode"; sequence: number } & NativePonderEpisodeFrame)
   | { type: "chat-input-accepted"; sequence: number; inputReceipt: import("../shared/types").ChatInputAcceptedReceipt; humanMessage: ChatMessage }
   | {
       type: "runtime-activity";
@@ -1463,6 +1468,17 @@ export function normalizeChatEngineEvent(
     return undefined;
   }
   const data = objectRecord(event.data);
+  if (event.type === "chat-ponder-episode") {
+    const action = normalizeStructuredAction(data?.action, "brain");
+    const actionId = data?.actionId;
+    if ((data?.state !== "started" && data?.state !== "finished") || !action || action.kind !== "ponder" ||
+        typeof actionId !== "string" || !/^[a-f0-9]{32}$/.test(actionId) || event.actionId !== actionId ||
+        action.actionId !== actionId || action.parentPonderActionId !== undefined ||
+        !["pre-speech", "mid-generation"].includes(action.selectionPhase ?? "") ||
+        !Number.isSafeInteger(action.selectionStep) ||
+        (data.state === "finished" && !measuredPonderTrace(action))) return undefined;
+    return { type: "chat-ponder-episode", sequence, state: data.state, actionId, action };
+  }
   if (event.type === "chat-cognition") {
     const progress = normalizeCognitionProgress(data);
     return progress ? { type: "chat-cognition", sequence, progress } : undefined;
@@ -2922,6 +2938,7 @@ function validateCommittedChatReceipt(
       generation_stop_reason: typeof rawTrace.generation_stop_reason === "string" ? rawTrace.generation_stop_reason : undefined,
       generation_decoder_stop_reason: typeof rawTrace.generation_decoder_stop_reason === "string" ? rawTrace.generation_decoder_stop_reason : undefined,
       generation_no_reply_reason: typeof rawTrace.generation_no_reply_reason === "string" ? rawTrace.generation_no_reply_reason : undefined,
+      public_reply_text_binding: normalizePublicReplyTextBinding(rawTrace.public_reply_text_binding),
       generated_token_count: finiteOptional("generated_token_count"),
       ponder_self_reports: ponderSelfReports,
       generation_printable_text_characters: finiteOptional("generation_printable_text_characters")
@@ -5404,7 +5421,16 @@ export class BrainService {
   }
 
   recordConversationActions(brainId: string, actions: ActionEvent[]): Promise<void> {
-    return this.repository.appendConversationActions(brainId, actions);
+    // Approval, decline, artifact cancellation and task progress can settle
+    // before the containing public reply commits. Snapshot synchronously so
+    // asynchronous storage cannot observe later mutation of this live event.
+    // An unfinished live prefix is not durable canonical-message custody.
+    const snapshot = actions.map(event => {
+      const value = structuredClone(event);
+      if (value.replyAnchor && value.replyAnchor.messageId === undefined) delete value.replyAnchor;
+      return value;
+    });
+    return this.repository.appendConversationActions(brainId, snapshot);
   }
 
   private actionEvidenceStore(brainId: string): CompletedActionEvidenceStore {
@@ -6845,6 +6871,7 @@ export class BrainService {
         receipt.trace
       );
       if (receipt.brainMessage.generationEnd) result.generationEnd = receipt.brainMessage.generationEnd;
+      result.publicTextBinding = normalizePublicReplyTextBinding(receipt.trace.public_reply_text_binding);
       result.brain.counters.inferenceCount = Math.max(
         result.brain.counters.inferenceCount,
         receipt.inferenceCount
@@ -7105,6 +7132,7 @@ export class BrainService {
       );
     }
     result.proposedActions = parseModelActions("", workerResult?.actions);
+    result.publicTextBinding = normalizePublicReplyTextBinding(workerResult.publicTextBinding ?? workerResult.trace?.public_reply_text_binding);
     if (workerResult.steered === true) result.generationEnd = "steered";
     if (workerResult.nativeStopped === true) result.generationEnd = "native-stop";
     if (noReply) result.generationEnd = "no-reply";

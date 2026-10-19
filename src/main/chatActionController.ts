@@ -46,6 +46,8 @@ import { cleanChatInput } from "../shared/chatInput";
 import { chatHostSuspensionForDetach, type ChatSuspensionSource } from "./chatSuspension";
 import type { ChatHostSuspensionReceipt } from "../shared/chatSuspension";
 import { validatePonderSelfReport, type PonderSelfReport, type PonderSelfReportDelta } from "../shared/ponderSelfReport";
+import { measuredPonderTrace, type NativePonderEpisodeFrame } from "../shared/ponderEpisode";
+import { PublicReplyAnchors } from "./publicReplyAnchors";
 
 export interface ActionChatService {
   prioritizeAdmittedExperience?(brainId: string, turnId: string): Promise<AdmittedExperienceLearningReceipt>;
@@ -1117,9 +1119,15 @@ export class ChatActionController extends EventEmitter {
     // A newer Steer must find this pending predecessor, and Stop must own its
     // actual controller rather than missing it until dispatch preparation ends.
     this.activeTurns.set(turnKey, turn);
-    const seen = new Set<string>((continuation?.priorActions ?? []).map(actionFingerprint));
+    const seen = new Set<string>((continuation?.priorActions ?? []).map(action =>
+      action.kind === "ponder" && neuralActionCorrelation(action.actionId) ? `native-ponder:${action.actionId}` : actionFingerprint(action)));
     const events: ActionEvent[] = [];
     const workerActions = new Map<string, ActionEvent>();
+    const activePonderEpisodes = new Set<string>();
+    const finishedPonderEpisodes = new Map<string, string>();
+    // Incremental UTF-8 digest plus UTF-16 display offset: no copied plaintext
+    // per action and no inference from token indexes or private self-reports.
+    const publicReplyAnchors = new PublicReplyAnchors(turnId, continuation?.publishedText);
     const ponderReports = new Map<string, PonderReportAccumulator>();
     const previewRevisions = new Map<string, number>();
     const executions: Array<() => Promise<ActionOutcome>> = [];
@@ -1142,13 +1150,25 @@ export class ChatActionController extends EventEmitter {
     };
     const queueAction = (
       action: StructuredAction,
-      workerActionId?: string
+      workerActionId?: string,
+      operationalPonder = false,
+      measureReplyPrefix = false
     ): ActionEvent | undefined => {
       workerActionId ??= action.actionId;
       if (workerActionId && workerActions.has(workerActionId)) return workerActions.get(workerActionId);
-      const fingerprint = actionFingerprint(action);
+      const fingerprint = action.kind === "ponder" && neuralActionCorrelation(workerActionId)
+        ? `native-ponder:${workerActionId}` : actionFingerprint(action);
       if (seen.has(fingerprint)) {
         return workerActionId ? workerActions.get(workerActionId) : undefined;
+      }
+      let parentPonder: ActionEvent | undefined;
+      if (action.parentPonderActionId !== undefined) {
+        parentPonder = workerActions.get(action.parentPonderActionId);
+        if (action.source !== "brain" || action.kind === "ponder" || !neuralActionCorrelation(workerActionId) ||
+            !activePonderEpisodes.has(action.parentPonderActionId) || !parentPonder ||
+            parentPonder.brainId !== brainId || parentPonder.chatTurnId !== turnId ||
+            parentPonder.action.kind !== "ponder" || parentPonder.action.source !== "brain" || parentPonder.state !== "running")
+          throw new Error("Native child action has no active same-turn Ponder invocation.");
       }
       seen.add(fingerprint);
       const event = eventFor(
@@ -1156,6 +1176,9 @@ export class ChatActionController extends EventEmitter {
         action,
         neuralActionCorrelation(workerActionId)
       );
+      event.chatTurnId = turn.turnId;
+      if (parentPonder) event.parentPonderActionEventId = parentPonder.id;
+      if (measureReplyPrefix) publicReplyAnchors.measure(event);
       events.push(event);
       this.actionChatTurns.set(event, turn.turnId);
       turn.actions.set(event.id, event);
@@ -1163,6 +1186,7 @@ export class ChatActionController extends EventEmitter {
       if (workerActionId) workerActions.set(workerActionId, event);
       if (action.kind === "imagine") latestImagination = event;
       this.publishAction(turn, event);
+      if (operationalPonder) return event;
       const perform = async (): Promise<ActionOutcome> => {
         // An inline cancellation must not be restarted as the later trusted
         // host action after the containing text turn commits.
@@ -1202,6 +1226,57 @@ export class ChatActionController extends EventEmitter {
       // Imagination retains its worker-owned progressive preview lifecycle.
       if (workerActionId && (action.kind === "tool" || action.kind === "imagine")) void execute();
       return event;
+    };
+    const consumePonderEpisode = (frame: NativePonderEpisodeFrame): void => {
+      if (frame.action.source !== "brain" || frame.action.kind !== "ponder" ||
+          neuralActionCorrelation(frame.actionId) !== frame.actionId || frame.action.actionId !== frame.actionId ||
+          frame.action.parentPonderActionId !== undefined)
+        throw new Error("Ponder episode has no native selected owner.");
+      const existing = workerActions.get(frame.actionId);
+      if (frame.state === "started") {
+        if (finishedPonderEpisodes.has(frame.actionId) || (activePonderEpisodes.size && !activePonderEpisodes.has(frame.actionId)))
+          throw new Error("Ponder episode overlaps or reopens a completed invocation.");
+        if (existing) {
+          if (!activePonderEpisodes.has(frame.actionId) || existing.action.kind !== "ponder" ||
+              existing.chatTurnId !== turnId || existing.brainId !== brainId)
+            throw new Error("Ponder start reuses another action owner.");
+          return;
+        }
+        const event = queueAction(frame.action, frame.actionId, true, true);
+        if (!event) throw new Error("Ponder start lost its unique action identity.");
+        activePonderEpisodes.add(frame.actionId);
+        event.state = "running"; event.statusLabel = "Pondering"; event.updatedAt = new Date().toISOString();
+        this.publishAction(turn, event);
+        return;
+      }
+      const measured = measuredPonderTrace(frame.action);
+      const digest = createHash("sha256").update(JSON.stringify(frame.action)).digest("hex");
+      if (finishedPonderEpisodes.get(frame.actionId) === digest) return;
+      if (!measured || !existing || !activePonderEpisodes.has(frame.actionId) || existing.action.kind !== "ponder" ||
+          existing.chatTurnId !== turnId || existing.brainId !== brainId ||
+          existing.action.selectionPhase !== frame.action.selectionPhase || existing.action.selectionStep !== frame.action.selectionStep)
+        throw new Error("Ponder completion has no matching measured active invocation.");
+      existing.action = frame.action;
+      existing.state = measured.completed === true ? "complete" : measured.stop_reason === "failed" ? "failed" : "stopped";
+      existing.statusLabel = existing.state === "complete" ? "Ponder complete" : existing.state === "failed" ? "Ponder failed" : "Ponder stopped";
+      existing.updatedAt = new Date().toISOString();
+      activePonderEpisodes.delete(frame.actionId); finishedPonderEpisodes.set(frame.actionId, digest);
+      this.publishAction(turn, existing);
+    };
+    const discardUnboundReplyAnchors = (): void => {
+      for (const event of events) {
+        if (event.replyAnchor && !event.replyAnchor.messageId) delete event.replyAnchor;
+      }
+    };
+    const recordActions = async (): Promise<void> => {
+      discardUnboundReplyAnchors();
+      await this.service.recordConversationActions?.(brainId, events);
+    };
+    const bindReplyAnchors = (result: ChatResult): void => {
+      publicReplyAnchors.bind(events, result.brainMessage, result.publicTextBinding);
+      for (const event of events) {
+        this.publishAction(turn, event);
+      }
     };
     const reportValue = (value: PonderReportAccumulator, state: "complete" | "partial", textSha256?: string): PonderSelfReport =>
       validatePonderSelfReport({ format: "omni-ponder-self-report", version: 1, id: value.reportId,
@@ -1298,6 +1373,12 @@ export class ChatActionController extends EventEmitter {
         this.publishStream(turn, { type: "chat-input-accepted", ...accepted });
         return; // durable input stays valid even when its reply was just cancelled
       }
+      // A cooperative Stop still delivers the measured finally frame. This
+      // cannot authorize another action, even after output ownership closes.
+      if (neural.type === "chat-ponder-episode") {
+        if (neural.state === "finished" || !controller.signal.aborted) consumePonderEpisode(neural);
+        return;
+      }
       if (controller.signal.aborted) return;
       if (neural.type === "chat-cognition") {
         if (!turn.outputClosed) this.publishStream(turn, { type: "chat-cognition", progress: neural.progress });
@@ -1308,6 +1389,7 @@ export class ChatActionController extends EventEmitter {
         return;
       }
       if (neural.type === "chat-token") {
+        publicReplyAnchors.append(neural.delta);
         this.publishStream(turn, { type: "chat-token", delta: neural.delta,
           ...(neural.outputTokens !== undefined ? { outputTokens: neural.outputTokens } : {}),
           ...(neural.outputElapsedMs !== undefined ? { outputElapsedMs: neural.outputElapsedMs } : {}),
@@ -1327,7 +1409,7 @@ export class ChatActionController extends EventEmitter {
         return;
       }
       if (neural.type === "chat-action") {
-        queueAction(neural.action, neural.actionId);
+        queueAction(neural.action, neural.actionId, false, true);
         return;
       }
       if (neural.type === "inline-imagination-started") {
@@ -1460,6 +1542,8 @@ export class ChatActionController extends EventEmitter {
       );
       if (capabilityWarnings.length) result.capabilityWarnings = [...capabilityWarnings];
       for (const action of result.proposedActions ?? []) queueAction(action);
+      if (activePonderEpisodes.size) throw new Error("Native reply ended with an unfinished Ponder invocation.");
+      bindReplyAnchors(result);
 
       // service.chat has returned only after its atomic neural/host turn save
       // (or exact durable receipt reconciliation). Optional artifacts and their
@@ -1557,7 +1641,7 @@ export class ChatActionController extends EventEmitter {
       }
       retainPartialPonderReports();
       result.actionEvents = events;
-      await this.service.recordConversationActions?.(brainId, events);
+      await recordActions();
       result.turnMetadata = turnMetadata;
       this.publishStream(turn, { type: "chat-state", state: result.generationEnd === "steered" ? "steered" :
         result.generationEnd === "native-stop" ? "stopped" : result.generationEnd === "no-reply" ? "no-reply" : "complete" });
@@ -1586,7 +1670,7 @@ export class ChatActionController extends EventEmitter {
             const { event, output } = await execution();
             if (actualTerminalToolOutcome(event.execution)) await this.retainCompletedEvidence(event, output, input, turn.turnId);
           }
-          await this.service.recordConversationActions?.(brainId, events);
+          await recordActions();
         })().catch(() => undefined).finally(() => { this.activeTurns.delete(turnKey); turn.resolveSettled(); });
         this.publishStream(turn, { type: "chat-state", state: suspension.state, suspension,
           ...(historyNotice ? { notices: [historyNotice] } : {}) });
@@ -1629,7 +1713,7 @@ export class ChatActionController extends EventEmitter {
               });
             }
           }
-          await this.service.recordConversationActions?.(brainId, events);
+          await recordActions();
         })().catch(() => undefined).finally(() => {
           this.activeTurns.delete(turnKey);
           turn.resolveSettled();
@@ -1650,7 +1734,7 @@ export class ChatActionController extends EventEmitter {
             this.publishAction(undefined, event);
           }
         }
-        await this.service.recordConversationActions?.(brainId, events);
+        await recordActions();
       })().catch(() => undefined).finally(() => {
         this.activeTurns.delete(turnKey); turn.resolveSettled();
       });

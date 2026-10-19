@@ -6,6 +6,8 @@ app.setName("Omni current interface audit");
 app.whenReady().then(async () => {
   const window = new BrowserWindow({ width: 1180, height: 850, minWidth: 360, minHeight: 480,
     title: "Omni current interface · no engine", webPreferences: { contextIsolation: true, sandbox: true, nodeIntegration: false } });
-  await window.loadURL("http://127.0.0.1:5189/tests/e2e/desktop-current-fixture.html");
+  // The no-preload audit is an explicit design preview, never a silent fallback
+  // for a missing production bridge. Keep RendererStartupGate fail-closed.
+  await window.loadURL("http://127.0.0.1:5189/tests/e2e/desktop-current-fixture.html?omni-preview=1");
 });
 app.on("window-all-closed", () => app.quit());

@@ -3139,7 +3139,7 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
 
         def stream(kind: str, payload: Dict[str, Any]) -> None:
             nonlocal sequence, published_text
-            if self._cooperative_cancel.is_set():
+            if self._cooperative_cancel.is_set() and not (kind == "ponder-episode" and payload.get("state") == "finished"):
                 raise ChatGenerationCancelled("chat generation was cancelled")
             if not stream_id:
                 return
@@ -3173,7 +3173,9 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
                     action_id = str(payload.get("actionId", ""))
                     visible_action, visible_action_id = visible.get("action"), str(visible.get("actionId", ""))
                     if action is not None:
-                        published_actions.append(copy.deepcopy(action))
+                        prior = next((index for index, value in enumerate(published_actions) if value.get("actionId") == action_id), None)
+                        if prior is None: published_actions.append(copy.deepcopy(action))
+                        else: published_actions[prior] = copy.deepcopy(action)
                     if action is not None and action.get("kind") == "imagine":
                         with self._steering_lock:
                             session = self._chat_steering.get(control_key)
@@ -3193,6 +3195,16 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
                         action_id=visible_action_id,
                         data={"action": visible_action},
                     )
+                elif kind == "ponder-episode":
+                    from omni_core.ponder_episode import validate_ponder_episode_frame
+                    validate_ponder_episode_frame(payload)
+                    validate_ponder_episode_frame(visible)
+                    raw_action = copy.deepcopy(payload["action"])
+                    prior = next((index for index, value in enumerate(published_actions) if value.get("actionId") == payload["actionId"]), None)
+                    if prior is None: published_actions.append(raw_action)
+                    else: published_actions[prior] = raw_action
+                    self.notify("chat-ponder-episode", brain_id=authority_brain.brain_id, stream_id=stream_id,
+                        sequence=sequence, action_id=visible["actionId"], data=visible)
                 elif kind == "preview":
                     preview_value = visible.get("preview")
                     if not isinstance(preview_value, dict):

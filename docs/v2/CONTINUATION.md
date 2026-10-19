@@ -1,5 +1,71 @@
 # Current implementation continuation
 
+### Composed U1/Ponder corrections and latest hosted boundary —037f3c6
+
+The actual first compact no-engine matrix pilot reached12/12 core routes and
+11/19 composed states before the genuine Appearance/build overlay interception.
+It exposed genuine map lower-control scrolling, toast/composer collision,
+Appearance stacking, compact off-chat header width, missing Agents URL labels,
+and flat Ponder/tool/public-text ordering. Original captures remain saved;
+planned full4608/7296 visits are not a completed audit.
+
+Native Ponder now has explicit start/measured-finish invocation frames and
+same-turn host-derived child ancestry. Public token prefixes are measured by
+Main and bound only through an exact canonical text receipt. The actual App
+groups only explicit native children and interleaves verified public-text
+positions without editing canonical messages, copied text or voice content.
+Generated child media stays visible outside a closed Ponder disclosure.
+Unknown/unbound/ambiguous old entries stay flat. Private and visible selector
+computation/local Stop bookkeeping remain equivalent; only the latter emits
+host-action frames. No behavior prompt, model creation or training is added.
+
+The composed fixed guarded Python lane passes113 cases (10 files). The latest
+two affected Node files pass22 cases, complementing the unchanged8 explicit
+parent and10 public-prefix cases; one new approval-label case also passes.
+Approval/decline before public-message commit saves an unbound-free snapshot
+without mutating its live event. Canonical binding appends a new immutable
+revision rather than altering that earlier row; tiny real SQLite cases prove
+both paths. Existing copy/merge/import projection preserves/maps the new fields
+by source inspection, not a new model portability proof.
+
+Both complete TypeScript projects and the final shell-only bundle exit0. The
+final affected compact composition retry passes19/19 states, without runtime
+errors/external requests and with clean exit0. Measured notice separation is
+8 pixels before/after content scrolling; Add files remains hoverable/focusable.
+Root inspected the saved corrected shots. Pending approval now names its own
+action with readable live expiry instead of an unrelated Ponder-done label;
+the final affected19-state retry also passes. Only1/384 cells is covered. Full
+U1 traversal and explicitly deferred learned-quality qualification are distinct.
+
+On current main037f3c6, Android/iOS, both Linux and both macOS jobs are green.
+Windows run39182450794 has two terminal failures: x64job117837896718 in worker
+health smoke (empty stderr, cause unproven), and ARM64job117837896847 after
+successful compiler/link verification while deleting its owned temporary DLL
+(WinError5). The compiler quoting correction worked on both. A narrow cleanup
+retry and bounded child-exit/fault diagnostics are pushed ased00e7b. On its
+run39184660713, x64job117844420658 again fails health, now proving a clean exit0
+with drained empty stderr rather than a native crash. Packaged bootstrap/stdin
+is being diagnosed; no dependency cause is asserted. No v2 tag, all-platform
+green or release is claimed. Root owns reviewed commit/main push
+and the eventual exact-commit package/release gates.
+
+### U1 closure audit follow-through — actual remainder retained
+
+The final read-only scope check found one genuine non-neural audit blocker:
+U1's whole-App theme/layout/size/state matrix is not closed by the eleven CI
+UI contracts or earlier residual captures. The older ui-audit.spec.ts misses
+Learn, Fact Check and Time and retains superseded assumptions; do not run it
+unchanged or call it a complete audit. No new mandatory architecture or
+advertised MCP source gap was found by this scoped check.
+
+Root has now inspected actual native no-engine renderer Learn, Fact Check,
+Time lower content and independent Aqua/Blocky/Mixed light Appearance, with
+six accepted exact saved screenshots. See u1-current-app-audit-2026-10-18.md.
+The full no-engine matrix and whole-App chronological/overlay composition are
+being authored separately; no planned count is a passed result. No new brain,
+Load, model training, world effect or hidden production-preview fallback is
+authorized. The full goal remains active, including U1, green CI and release.
+
 ### Exact current boundary —85b5f93; backup API and deterministic completion corrections
 
 The latest hosted state is mixed, not full-plan completion: Android and both

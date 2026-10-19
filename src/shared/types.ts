@@ -981,6 +981,8 @@ export interface ChatResult {
   generationEnd?: ChatGenerationEnd;
   /** Host capability-learning diagnostics; never added to neural prompt text. */
   capabilityWarnings?: string[];
+  /** Exact native public-text normalization receipt; presentation only. */
+  publicTextBinding?: PublicReplyTextBinding;
 }
 
 export type ChatTurnMetadata = {
@@ -2620,6 +2622,28 @@ export interface StructuredAction {
   inputSchema?: Record<string, unknown>;
   selectionPhase?: string;
   selectionStep?: number;
+  /** Native invocation provenance, never supplied as a tool argument. */
+  parentPonderActionId?: string;
+}
+
+export interface ActionReplyAnchor {
+  turnId: string;
+  /** Bound only after the canonical brain message matches the public stream. */
+  messageId?: string;
+  utf16Offset: number;
+  prefixSha256: string;
+}
+
+export interface PublicReplyTextBinding {
+  format: "omni-public-reply-text-binding";
+  version: 1;
+  normalization: "identity" | "strip";
+  rawSha256: string;
+  canonicalSha256: string;
+  rawUtf16Length: number;
+  canonicalUtf16Length: number;
+  removedPrefixUtf16: number;
+  removedSuffixUtf16: number;
 }
 
 export interface ActionEvent {
@@ -2627,6 +2651,12 @@ export interface ActionEvent {
   brainId: string;
   /** Opaque worker correlation; never part of the model-facing arguments. */
   neuralActionId?: string;
+  /** Main-owned exact chat invocation, not model/tool argument authority. */
+  chatTurnId?: string;
+  /** A native action selected inside this same-turn Ponder invocation. */
+  parentPonderActionEventId?: string;
+  /** Measured public reply prefix; self-report/private text is excluded. */
+  replyAnchor?: ActionReplyAnchor;
   action: StructuredAction;
   state:
     | "proposed"

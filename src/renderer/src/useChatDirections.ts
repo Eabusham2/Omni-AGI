@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SteerDirectionRecord, SteerDirectionsApi } from "../../shared/steerDirections";
 import { mergeChatDirections } from "./chatDirectionPresentation";
 import { visitChatDirectionTurns } from "./chatDirectionQueries";
@@ -70,5 +70,9 @@ export function useChatDirections(brainId: string, visibleTurnIds: string[], api
     const saved = await api.dismiss({ brainId, id, expectedRevision: current.revision, dismissed: true });
     if (scope.current === owner) merge([saved]);
   };
-  return { records: records.filter(value => value.brainId === brainId), total, busy, error, hasOlder: before !== undefined, older, dismiss };
+  // Keep the same owner's projection stable between actual record changes.
+  // Consumers derive persisted messages and asynchronous prefix verification
+  // from this list; allocating it every render can retrigger those effects.
+  const visibleRecords = useMemo(() => records.filter(value => value.brainId === brainId), [records, brainId]);
+  return { records: visibleRecords, total, busy, error, hasOlder: before !== undefined, older, dismiss };
 }

@@ -20,6 +20,7 @@ FILES = (
     "engine/tests/test_outer_learning_pipeline.py",
     "engine/tests/test_native_kernel_packaging_integrity.py",
     "engine/tests/test_retained_context_capacity.py",
+    "engine/tests/test_ponder_episode_provenance.py",
 )
 FORBIDDEN = ("torch", "tensorflow", "jax", "mlx", "transformers", "safetensors", "omni_core")
 
