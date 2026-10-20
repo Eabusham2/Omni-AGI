@@ -3428,8 +3428,10 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
                 )
             raise
         finally:
-            self.close_live_sensory(control_key, live_sensory)
-            retire_reply_controls(brain, reply_controls)
+            try:
+                self.close_live_sensory(control_key, live_sensory)
+            finally:
+                retire_reply_controls(brain, reply_controls)
 
         if result.get("suspended") is True:
             return result

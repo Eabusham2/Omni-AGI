@@ -13015,7 +13015,16 @@ textarea:focus-visible,
     padding-right: 112px;
   }
 
-  .titlebar__status {
+  .titlebar__status--preview {
+    display: flex;
+    flex-shrink: 0;
+    gap: 5px;
+    padding: 0 6px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .titlebar__status--preview .titlebar__preview-detail {
     display: none;
   }
 

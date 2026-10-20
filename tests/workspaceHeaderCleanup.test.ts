@@ -85,7 +85,7 @@ describe("requested workspace header cleanup", () => {
   });
   it("uses one disconnected preview header without inferring a live engine from the bridge", () => {
     const titlebar = source.slice(source.indexOf("function Titlebar("), source.indexOf("function EmptyVisual("));
-    expect(titlebar).toMatch(/\{demo \? \([\s\S]*className="titlebar__status" role="status"[\s\S]*Preview · no engine[\s\S]*\) : <span aria-hidden="true" style=\{\{ marginLeft: "auto" \}\} \/>\}/);
+    expect(titlebar).toMatch(/\{demo \? \([\s\S]*className="titlebar__status titlebar__status--preview" role="status"[\s\S]*Preview · no engine[\s\S]*\) : <span aria-hidden="true" style=\{\{ marginLeft: "auto" \}\} \/>\}/);
     expect(titlebar.match(/Preview · no engine/g)).toHaveLength(1);
     expect(titlebar).not.toContain("Local engine");
     expect(titlebar).not.toContain("Private");
@@ -101,5 +101,24 @@ describe("requested workspace header cleanup", () => {
     expect(shell).toContain("api={window.omni.brain} onState={setInstanceState}");
     expect(shell).toContain("{window.omni?.advice ? <button");
     expect(shell).toContain("{adviceVisited && window.omni?.advice ? <ExternalAdvicePanel");
+  });
+  it("keeps the sole preview indicator visible at compact widths without changing native chrome space", () => {
+    const titlebar = source.slice(source.indexOf("function Titlebar("), source.indexOf("function EmptyVisual("));
+    const styles = readFileSync(new URL("../src/renderer/src/styles.css", import.meta.url), "utf8");
+    const compact = styles.slice(styles.lastIndexOf("@media (max-width: 650px)"));
+    const indicator = compact.match(/\.titlebar__status--preview \{([^}]+)\}/)?.[1];
+    const detail = compact.match(/\.titlebar__status--preview \.titlebar__preview-detail \{([^}]+)\}/)?.[1];
+    expect(indicator).toContain("display: flex");
+    expect(indicator).toContain("flex-shrink: 0");
+    expect(indicator).toContain("white-space: nowrap");
+    expect(detail).toContain("display: none");
+    expect(styles).not.toMatch(/\.titlebar__status\s*\{[^}]*display:\s*none/);
+    expect(titlebar).toContain('aria-label="Preview · no engine"');
+    expect(titlebar).toContain('title="UI preview only — no engine is connected."');
+    expect(titlebar).toContain('<span aria-hidden="true">Preview<span className="titlebar__preview-detail"> · no engine</span></span>');
+    expect(compact).toMatch(/\.titlebar__drag \{\s*padding-right: 112px;/);
+    expect(compact).toMatch(/\.appearance-control \{\s*margin-left: auto;/);
+    expect(styles).toContain(':root[data-platform="macos"] .titlebar__drag');
+    expect(styles).toContain("padding-left: 84px");
   });
 });

@@ -256,6 +256,36 @@ class HandoffTests(unittest.TestCase):
             factory(object(), Provider(), "episode")(3, 0)
         self.assertEqual(released, [True])
 
+    def test_reply_controls_retire_once_when_actual_capture_cleanup_delivery_raises(self):
+        host, inbox = self.host(); lease = Lease()
+        inbox.offer(self.request(), lease, self.binding)
+        def broken_delivery(_): raise BrokenPipeError("inert disconnected cleanup writer")
+        inbox.send = broken_delivery
+        controls = types.SimpleNamespace(active=True)
+        brain = types.SimpleNamespace(_native_reply_private_flags=controls)
+        actual_retire = extracted("omni_core/reply_execution_planner.py", "retire_reply_controls", {})
+        retirements = []
+        def retire(owner, value):
+            retirements.append((owner, value))
+            actual_retire(owner, value)
+        tree = ast.parse((ENGINE / "worker.py").read_text())
+        chat = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_chat")
+        actual_finally = next(node.finalbody for node in ast.walk(chat) if isinstance(node, ast.Try) and
+            any(isinstance(child, ast.Call) and ast.unparse(child.func) == "self.close_live_sensory"
+                for statement in node.finalbody for child in ast.walk(statement)))
+        function = ast.parse("def cleanup(self, control_key, live_sensory, brain, reply_controls):\n    pass").body[0]
+        function.body = actual_finally
+        namespace = {"retire_reply_controls": retire}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "extracted-worker-cleanup", "exec"), namespace)
+        with self.assertRaisesRegex(BrokenPipeError, "disconnected cleanup"):
+            namespace["cleanup"](host, ("brain", "turn"), inbox, brain, controls)
+        self.assertTrue(inbox.closed)
+        self.assertNotIn(("brain", "turn"), host._live_sensory)
+        self.assertEqual(lease.releases, 1)
+        self.assertEqual(retirements, [(brain, controls)])
+        self.assertFalse(controls.active)
+        self.assertFalse(hasattr(brain, "_native_reply_private_flags"))
+
     def test_changed_revision_or_hash_is_rejected_before_conditioning(self):
         for change in ("revision", "hash"):
             host, inbox = self.host(); lease = Lease()

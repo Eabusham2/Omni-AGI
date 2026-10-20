@@ -1025,9 +1025,10 @@ function Titlebar({
           ) : null}
         </div>
         {demo ? (
-          <div className="titlebar__status" role="status">
+          <div className="titlebar__status titlebar__status--preview" role="status"
+            aria-label="Preview · no engine" title="UI preview only — no engine is connected.">
             <span className="status-dot status-dot--demo" aria-hidden="true" />
-            <span>Preview · no engine</span>
+            <span aria-hidden="true">Preview<span className="titlebar__preview-detail"> · no engine</span></span>
           </div>
         ) : <span aria-hidden="true" style={{ marginLeft: "auto" }} />}
         <AppearanceMenu

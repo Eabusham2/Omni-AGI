@@ -416,9 +416,21 @@ class ReplyPlannerCases(unittest.TestCase):
         self.assertEqual(sum(ast.unparse(node.func) == "dispatch_reply_sample" for node in calls), 1)
         self.assertEqual(sum(ast.unparse(node.func) == "sample_native_token" for node in calls), 2)
         self.assertFalse(any(isinstance(node, ast.Name) and node.id == "PRIVATE_OPERATION" for node in ast.walk(generate)))
-        worker = (ROOT / "worker.py").read_text()
-        self.assertIn("bind_reply_controls(brain, request_id, control_turn_id", worker)
-        self.assertIn("finally:\n            retire_reply_controls(brain, reply_controls)", worker)
+        worker = ast.parse((ROOT / "worker.py").read_text())
+        owned_chat = next(node for node in ast.walk(worker) if isinstance(node, ast.FunctionDef) and node.name == "_chat")
+        def calls(nodes, name):
+            return [node for item in nodes for node in ast.walk(item) if isinstance(node, ast.Call) and ast.unparse(node.func) == name]
+        self.assertEqual(len(calls(owned_chat.body, "bind_reply_controls")), 1)
+        self.assertEqual(len(calls(owned_chat.body, "self.close_live_sensory")), 1)
+        self.assertEqual(len(calls(owned_chat.body, "retire_reply_controls")), 1)
+        cleanup = [node for node in ast.walk(owned_chat) if isinstance(node, ast.Try) and
+            calls(node.body, "self.close_live_sensory") and calls(node.finalbody, "retire_reply_controls")]
+        self.assertEqual(len(cleanup), 1)
+        self.assertEqual(ast.unparse(calls(cleanup[0].body, "self.close_live_sensory")[0]),
+            "self.close_live_sensory(control_key, live_sensory)")
+        self.assertEqual(ast.unparse(calls(cleanup[0].finalbody, "retire_reply_controls")[0]),
+            "retire_reply_controls(brain, reply_controls)")
+        self.assertTrue(any(isinstance(node, ast.Try) and cleanup[0] in node.finalbody for node in ast.walk(owned_chat)))
         for name in ("operation_auto_policy", "cached_whole_operation_auto", "prefill_whole_operation_auto", "forward_whole_operation_auto"):
             source = (ROOT / "omni_core" / (name + ".py")).read_text()
             self.assertIn("qualification_allowed()", source)
