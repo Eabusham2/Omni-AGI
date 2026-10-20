@@ -88,6 +88,19 @@ describe("UI visual integrity", () => {
     }
   });
 
+  it("keeps the conditional Full Authority warning on theme-aware warning ink", () => {
+    const warning = styles.match(/\.builder-note--warning\s*\{([^}]+)\}/)?.[1];
+    const icon = styles.match(/\.builder-note--warning svg\s*\{([^}]+)\}/)?.[1];
+    expect(warning).toContain("color: var(--warning);");
+    expect(icon).toContain("color: var(--warning);");
+    expect(warning).toContain("background: rgba(216, 137, 80, 0.055);");
+    expect(warning).toContain("border-color: rgba(216, 137, 80, 0.14);");
+    const conditional = app.match(/\{fullAuthorityEnabled \? \(([\s\S]*?)\) : null\}/)?.[1];
+    expect(conditional).toContain('className="builder-note builder-note--warning"');
+    expect(conditional).toContain('<Icon name="warning" size={17} />');
+    expect(conditional).toContain("<span>Full authority can act without confirmation. Actions stay traceable and cancellable, and source promotion keeps rollback points.</span>");
+  });
+
   it("shows authoritative neural parameter totals in a responsive text badge, not a broken gauge", () => {
     expect(app).toContain('className="neural-parameter-count"');
     expect(app).toContain("<NeuralParameterCount accounting={chatParameterAccounting}");

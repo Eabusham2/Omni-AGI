@@ -51,3 +51,29 @@ The three breakpoint samples qualify this narrow late header delta, not every
 theme/state/platform or full accessibility compliance. The full384-key audit
 and final exact-source CI/package/release gates remain open. No brain was
 created, loaded, trained or quizzed; synthetic history is not real model output.
+
+## Full Authority warning ink
+
+Two independent12-image reviews of the unchanged d948 cohort found the same
+faint consequence warning on Violet/Standard/light and Graphite/Classic/light
+Build access captures. Root inspected the exact Graphite image and confirmed
+the readability problem. The source used fixed pale `#b7a89b` ink on a pale
+strip. Only `.builder-note--warning` text and SVG now consume the existing
+theme-aware `--warning` token; global tokens, background, border, layout, copy,
+and actual permission policy are unchanged. The existing builder-restore
+warning shares this class and therefore gets the same semantic ink.
+
+One new focused source case passed2ms with11 old cases skipped. A bounded
+no-preload Electron check then visited only this warning state across32 stock
+palette/surface/light-dark combinations at1280x800, never Create/Load/training.
+All32 had matching text/icon/token colors, no clipped warning rectangle,
+no renderer/external errors and clean child exit0. Estimated solid-overlay
+contrast over the theme canvas ranged5.1032:1–10.5989:1. This is not exact
+pixel/gradient/filter measurement or a full accessibility-conformance claim.
+
+The PRIMARY record is `.runtime/authority-warning-delta-9BxUtw/result.json`
+with actual paint values, exact source hashes and saved PNGs. Root directly
+inspected the Graphite/Classic light and dark images; six further representative
+images have separate independent review. That finite review is distinct from
+the32 measured views and the still-running full384 matrix. Do not rerun the
+other unchanged41 states per cell for this color-only consumer change.

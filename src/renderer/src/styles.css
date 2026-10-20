@@ -4162,13 +4162,13 @@ textarea:focus-visible,
 }
 
 .builder-note--warning {
-  color: #b7a89b;
+  color: var(--warning);
   background: rgba(216, 137, 80, 0.055);
   border-color: rgba(216, 137, 80, 0.14);
 }
 
 .builder-note--warning svg {
-  color: var(--orange);
+  color: var(--warning);
 }
 
 .detected-hardware {
