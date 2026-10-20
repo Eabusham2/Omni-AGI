@@ -60,7 +60,7 @@ it("registers focused chronology, source and surface cases once in reachable bou
     "tests/taskFolderAttachments.test.ts", "tests/trainingEvolutionWorkspace.test.tsx", "tests/universalSourcePicker.test.tsx",
     "tests/appearanceAuditObservation.test.ts", "tests/teacherStatsTools.test.ts", "tests/apiTeacherToolAuthority.test.ts",
     "tests/systemStatsService.test.ts", "tests/systemTemperatureReader.test.ts", "tests/automationResidencySample.test.ts",
-    "tests/demoChatTruth.test.ts", "tests/liveObservationBackend.test.ts", "tests/livePerceptionController.test.ts"
+    "tests/demoChatTruth.test.tsx", "tests/liveObservationBackend.test.ts", "tests/livePerceptionController.test.ts"
   ]) {
     expect(selected.filter(value => value === path), `Focused case must be selected exactly once: ${path}`).toHaveLength(1);
     expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
