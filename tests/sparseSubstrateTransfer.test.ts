@@ -79,13 +79,22 @@ describe("native sparse transfer detached host contracts (synthetic native bridg
 
   it("rejects concurrent same request ID with changed action/operands", async () => {
     const f = await fixture(); let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
-    const original = f.native.export; let entered = false;
-    f.native.export = async (...args) => { entered = true; await gate; return original(...args); };
+    const original = f.native.export; let markEntered!: () => void;
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
+    f.native.export = async (...args) => { markEntered(); await gate; return original(...args); };
     const first = f.execute("export", { selection: { all: true } }, "same-request");
-    await vi.waitFor(() => expect(entered).toBe(true));
-    await expect(f.execute("export", { selection: { neurons: ["different"] } }, "same-request")).rejects.toThrow(/changed reviewed operands/);
-    await expect(f.execute("prepare-import", { bundleId: "different", mode: "append" }, "same-request")).rejects.toThrow(/changed reviewed operands/);
-    release(); await first; expect(f.exports()).toBe(1);
+    const settled = first.then(() => ({ kind: "complete" as const }), error => ({ kind: "failed" as const, error }));
+    try {
+      const boundary = await Promise.race([entered.then(() => ({ kind: "entered" as const })), settled]);
+      if (boundary.kind === "failed") throw boundary.error;
+      if (boundary.kind !== "entered") throw new Error("The first export completed before reaching its held native entry.");
+      await expect(f.execute("export", { selection: { neurons: ["different"] } }, "same-request")).rejects.toThrow(/changed reviewed operands/);
+      await expect(f.execute("prepare-import", { bundleId: "different", mode: "append" }, "same-request")).rejects.toThrow(/changed reviewed operands/);
+    } finally {
+      release();
+      await first;
+    }
+    expect(f.exports()).toBe(1);
   });
 
   it("revokes a queued origin before dispatch without a permission grant or import", async () => {
