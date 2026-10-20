@@ -261,11 +261,13 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
         const bounds = await control.boundingBox();
         if (bounds) await page.mouse.move(Math.max(0, Math.min((await page.viewportSize())!.width - 1, bounds.x + bounds.width / 2)), Math.max(0, Math.min((await page.viewportSize())!.height - 1, bounds.y + bounds.height / 2)));
       } else await control.hover({ timeout: 1500 });
-      sample.hovered = await control.evaluate(node => node.matches(":hover"));
       await settledFrame(page);
       await requireInspectedAppearance(page, record, "control hover paint");
       const [hovered] = await sampleControls(root, sample.id);
       if (!hovered) throw new Error("The control disappeared before its hover paint was recorded.");
+      sample.hovered = hovered.hovered;
+      if (!sample.disabled && !sample.inert && !sample.hovered) record.issues.push({ kind: "hover-not-received", control: sample.name || sample.id,
+        detail: "The pointer action completed, but the control did not retain :hover when its paint was sampled" });
       sample.hoverPaint = paintOf(hovered); checkPaint(sample, "hover", sample.hoverPaint);
       if (!sample.disabled && !sample.inert) {
         await page.mouse.move(1, 1);

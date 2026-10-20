@@ -51,6 +51,27 @@
   color: var(--text);
 }
 
+/* Popup choices are rows, not the compact icon buttons in the composer bar. */
+.universal-source-picker__menu > button,
+.composer__bottom .universal-source-picker__menu > button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 36px;
+  padding: 9px;
+  color: var(--text);
+  text-align: left;
+  white-space: normal;
+}
+
+.universal-source-picker__menu > button > svg {
+  flex: 0 0 auto;
+}
+
 .composer__bottom .composer__source-actions {
   display: flex;
   flex: 0 0 auto;

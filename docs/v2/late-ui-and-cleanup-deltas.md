@@ -117,3 +117,52 @@ the180complete cells and164clean records inside the failed four-cell batch
 must not be rerun or rewritten. New static manifests explicitly bind the
 additional audit-helper bytes. Runtime App/CSS, real engine behavior, package
 and neural-quality claims are unchanged by this tests-only correction.
+
+## Attach/Learn popup rows and recorded hover gaps
+
+The missing-only continuation at `15c7237` finished all200 remaining cells,
+with50 zero-exit batch seals. That did **not** establish combined acceptance:
+the stricter final-union validator rejected an enabled Folder control whose
+retained record says `hovered:false`, despite its batch reporting no issue.
+The failed validation is retained separately; original journals stay unchanged.
+
+A bounded read-only scan of192 journals/16,128 state records found710 such
+hover gaps:704 Folder observations across352 Attach and352 Learn states, plus
+six individual controls (Import, Call, Pair phone, imagination recording, Best
+Work and Done). Focus and control geometry were recorded, but a completed
+pointer action is not proof that the target actually retained `:hover`.
+The producer now samples that boolean alongside settled hover paint and records
+an explicit failure when an enabled control does not receive it.
+
+Direct inspection of the old cell000 Attach entry/lower captures also found
+a real layout defect: broad composer icon-button rules forced popup choices
+to27/40-pixel grid buttons. Their Files & media/Folder labels wrapped and
+overlapped. The fix is scoped to universal-source-picker popup rows: full-width
+flex layout, automatic height, readable existing theme ink and nonshrinking
+icons. It does not redesign the composer or change file permissions.
+
+The two focused source-picker tests and renderer type check passed. A fresh
+isolated cell000 no-engine pilot recorded ten Attach/Learn entry, settled-hover
+and keyboard-focus captures. Both choices measured198 pixels wide,38.296875
+pixels high with16-pixel icons; all four targeted hover states and four Tab
+focus states were actually received, labels fit, and row centers hit the
+intended buttons. Root directly inspected all ten saved captures. Exact
+source/input/artifact hashes were separately rechecked after the owned preview
+exited0, with no changed files or external requests.
+
+The pilot command itself remains **failed**: its final assertion incorrectly
+expected no denied fixture calls, while App boot requested the deliberately
+unsupported hardware-profile, modality-capability and resource-plan metadata.
+Those fixture methods throw without host authority. The preceding zero-model
+and zero-host-effect assertions passed; later receipt/source assertions were
+not reached and are not claimed as command-level proof. A separate read-only
+qualification may accept the already-recorded popup observations and post-run
+hashes, not rewrite the failed command. Evidence is PRIMARY
+`.runtime/popup-row-delta-wqTZiN/`, including the original error and screenshots.
+
+Combined acceptance and publication remain open. The affected Attach/Learn
+states need fresh coverage across all384 combinations, and the six other
+controls need finite corrective hover evidence. Unchanged states must not be
+rerun to hide the gaps. The CSS change requires a new committed CI/package
+source; the already-green `15c7237` packages cannot be relabelled as containing
+this fix. No brain creation, loading, training, quiz or provider action occurred.
