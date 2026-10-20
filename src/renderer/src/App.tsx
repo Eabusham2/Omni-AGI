@@ -421,6 +421,8 @@ const navItems: Array<{ id: WorkspaceView; label: string; icon: IconName }> = [
 ];
 
 const buildToolProtocolIds: Record<string, string[]> = {
+  stats: ["system.stats"],
+  teacher: ["data.distill-api"],
   files: ["system.files"],
   shell: ["system.shell"],
   code: ["code.execute"],
@@ -433,6 +435,8 @@ const buildToolProtocolIds: Record<string, string[]> = {
 };
 
 const standardBuildAccess: Record<string, PermissionLevel> = {
+  stats: "ask",
+  teacher: "ask",
   files: "ask",
   shell: "ask",
   code: "ask",
@@ -1020,11 +1024,12 @@ function Titlebar({
             </>
           ) : null}
         </div>
-        <div className="titlebar__status">
-          <span className={cx("status-dot", demo ? "status-dot--demo" : "status-dot--live")} />
-          <span>{demo ? "Design preview" : "Local engine"}</span>
-          <span className="titlebar__status-detail">{demo ? "No engine connected" : "Private"}</span>
-        </div>
+        {demo ? (
+          <div className="titlebar__status" role="status">
+            <span className="status-dot status-dot--demo" aria-hidden="true" />
+            <span>Preview · no engine</span>
+          </div>
+        ) : <span aria-hidden="true" style={{ marginLeft: "auto" }} />}
         <AppearanceMenu
           preferences={appearance}
           workspacePreferences={appearanceWorkspace}
@@ -2569,6 +2574,7 @@ function WorkspaceShell({
   useEffect(() => {
     let active = true;
     let refreshTimer: number | undefined;
+    setHealth("Checking runtime…");
     if (window.omni) {
       const refreshHealth = async (): Promise<void> => {
         try {
@@ -2591,8 +2597,6 @@ function WorkspaceShell({
         }
       };
       void refreshHealth();
-    } else {
-      setHealth("Demo preview · engine disconnected");
     }
     return () => {
       active = false;
@@ -2678,18 +2682,18 @@ function WorkspaceShell({
             </button>
           ) : null}
           <div className="workspace-header__activity">
-            <span>
+            {window.omni ? <span>
               <small>Runtime</small>
               <strong>{health}</strong>
-            </span>
+            </span> : null}
           </div>
           <div className="workspace-header__actions">
             {view === "chat" ? <PluginRuntimeSlot slot="chat.toolbar" /> : null}
-            <button type="button" className="button button--ghost" aria-controls="external-advice-panel" aria-expanded={adviceOpen}
-              title="Separate optional assistant and pre-action reviewer" onClick={() => { setAdviceVisited(true); setAdviceOpen(open => !open); }}>Assistant</button>
-            <InstanceLifecycleControls key={brain.id} brainId={brain.id} name={brain.name}
-              api={window.omni?.brain.lifecycle ? window.omni.brain : undefined} onState={setInstanceState}
-              reviewRequest={loadReviewRequest} onEditSettings={() => onView("settings")} />
+            {window.omni?.advice ? <button type="button" className="button button--ghost" aria-controls="external-advice-panel" aria-expanded={adviceOpen}
+              title="Separate optional assistant and pre-action reviewer" onClick={() => { setAdviceVisited(true); setAdviceOpen(open => !open); }}>Assistant</button> : null}
+            {window.omni?.brain.lifecycle ? <InstanceLifecycleControls key={brain.id} brainId={brain.id} name={brain.name}
+              api={window.omni.brain} onState={setInstanceState}
+              reviewRequest={loadReviewRequest} onEditSettings={() => onView("settings")} /> : null}
             {view === "chat" ? (
               <button
                 className="icon-button workspace-inspector-toggle"
@@ -2705,7 +2709,7 @@ function WorkspaceShell({
           </div>
         </header>
         <McpInteractionPanel brainId={brain.id} />
-        {adviceVisited ? <ExternalAdvicePanel brainId={brain.id} api={window.omni?.advice} hidden={!adviceOpen} onClose={() => setAdviceOpen(false)} /> : null}
+        {adviceVisited && window.omni?.advice ? <ExternalAdvicePanel brainId={brain.id} api={window.omni.advice} hidden={!adviceOpen} onClose={() => setAdviceOpen(false)} /> : null}
         <button
           className="workspace-inspector-backdrop"
           aria-label="Close cortex inspector"

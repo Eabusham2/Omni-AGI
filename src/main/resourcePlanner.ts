@@ -201,7 +201,7 @@ export function parseMacMemoryPressure(
   );
 }
 
-async function measuredSystemMemory(): Promise<{
+export async function measuredSystemMemory(): Promise<{
   totalMemoryBytes: number;
   availableMemoryBytes: number;
 }> {

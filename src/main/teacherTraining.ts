@@ -14,6 +14,7 @@ import type {
 } from "../shared/types";
 import type { BrainService } from "./brainService";
 import type { SecureSecretStore } from "./secureSecretStore";
+import type { HostActionOriginAuthority } from "../shared/hostActionAuthority";
 import { ApiTeacherModelDiscoveryService } from "./apiTeacherModelDiscovery";
 import { apiTeacherLessonModalities, type ApiTeacherMediaLesson, type ApiTeacherMediaCoverage } from "../shared/apiTeacherMedia";
 import { ApiTeacherMediaResourcePause, checkedApiTeacherMediaCoverage, readApiTeacherResponseEnvelope,
@@ -100,6 +101,9 @@ interface ActiveTeacherJob {
   controller: AbortController;
   requested?: "paused" | "stopped";
   settled?: Promise<void>;
+  /** Runtime-only tool ownership; never part of the stored request or export. */
+  authority?: HostActionOriginAuthority;
+  releaseAuthority?(): void;
 }
 
 async function readBoundedBody(response: Response): Promise<Uint8Array> {
@@ -304,14 +308,41 @@ export class ApiTeacherTrainingService extends EventEmitter {
     await Promise.all(work.flatMap(([, value]) => value.settled ? [value.settled] : []));
   }
 
-  private launch(jobId: string, brainId: string, provider: ApiTeacherProvider): void {
-    const controller = new AbortController(), active: ActiveTeacherJob = { brainId, provider, controller };
+  /** Tool-policy retirement pauses only tool-owned jobs, not explicit panel work. */
+  invalidateToolAuthority(brainId: string): void {
+    for (const active of this.active.values()) if (active.brainId === brainId && active.authority) {
+      active.requested ??= "paused";
+      active.controller.abort(new Error("API teacher tool authority changed; review before resuming."));
+    }
+  }
+
+  private async requireToolAuthority(active: ActiveTeacherJob | undefined, controller: AbortController): Promise<void> {
+    controller.signal.throwIfAborted();
+    if (!active?.authority) return;
+    try {
+      await active.authority.assertCurrent(); controller.signal.throwIfAborted();
+      await this.brain.preflightStart(active.brainId);
+      await active.authority.assertCurrent(); controller.signal.throwIfAborted();
+    } catch (error) {
+      active.requested ??= "paused"; controller.abort(error); throw error;
+    }
+  }
+
+  private launch(jobId: string, brainId: string, provider: ApiTeacherProvider, authority?: HostActionOriginAuthority): void {
+    const controller = new AbortController(), active: ActiveTeacherJob = { brainId, provider, controller, ...(authority ? { authority } : {}) };
+    if (authority) {
+      const abort = (): void => { active.requested ??= "paused"; controller.abort(authority.signal.reason); };
+      authority.signal.addEventListener("abort", abort, { once: true });
+      active.releaseAuthority = () => authority.signal.removeEventListener("abort", abort);
+      if (authority.signal.aborted) abort();
+    }
     this.active.set(jobId, active);
     active.settled = this.run(jobId, brainId, controller);
     void active.settled;
   }
 
-  async resume(brainId: string, jobId: string): Promise<RuntimeJob> {
+  async resume(brainId: string, jobId: string, authority?: HostActionOriginAuthority): Promise<RuntimeJob> {
+    authority?.signal.throwIfAborted(); await authority?.assertCurrent();
     if (this.active.has(jobId)) throw new Error("This API teacher job is already active.");
     const store = await this.store(brainId);
     let projected: RuntimeJob, provider!: ApiTeacherProvider;
@@ -320,10 +351,11 @@ export class ApiTeacherTrainingService extends EventEmitter {
       if (store.items(job.id).some(item => ["uncertain-review", "response-review", "learning-uncertain-review", "dispatching", "learning"].includes(item.state)))
         throw new Error("Resolve the uncertain provider or neural-learning item before resuming; it was not automatically repeated.");
       if (["complete", "stopped"].includes(job.state)) throw new Error("This API teacher job is terminal.");
+      authority?.signal.throwIfAborted(); await authority?.assertCurrent();
       const updated = await store.updateJob(job.id, { state: "queued", error: undefined }, "explicit-resume");
       provider = job.provider; projected = store.toRuntimeJob(updated); this.publish(projected);
     } finally { store.close(); }
-    this.launch(jobId, brainId, provider); return projected;
+    this.launch(jobId, brainId, provider, authority); return projected;
   }
 
   async resolveUncertain(brainId: string, jobId: string, index: number, decision: "retry" | "skip"): Promise<RuntimeJob> {
@@ -349,7 +381,8 @@ export class ApiTeacherTrainingService extends EventEmitter {
     } finally { store.close(); }
   }
 
-  async start(request: ApiTeacherTrainingRequest): Promise<RuntimeJob> {
+  async start(request: ApiTeacherTrainingRequest, authority?: HostActionOriginAuthority): Promise<RuntimeJob> {
+    authority?.signal.throwIfAborted(); await authority?.assertCurrent();
     const provider = requireProvider(request?.provider);
     const model = provider === "ollama" ? ollamaLocalModelId(request?.model) : requireModel(request?.model);
     if (typeof request.brainId !== "string" || !request.brainId) {
@@ -388,12 +421,13 @@ export class ApiTeacherTrainingService extends EventEmitter {
       const previous = store.jobByRequest(requestId);
       if (!previous && store.jobs().some(value => ["queued", "running"].includes(value.state)))
         throw new Error("This brain already has an active API teacher job.");
+      authority?.signal.throwIfAborted(); await authority?.assertCurrent();
       result = await store.createJob(job, items);
       this.knownOwners.set(result.job.id, request.brainId);
       const projected = store.toRuntimeJob(result.job); this.publish(projected);
       if (!result.created) return projected;
     } finally { store.close(); }
-    this.launch(result.job.id, request.brainId, provider);
+    this.launch(result.job.id, request.brainId, provider, authority);
     return { id: result.job.id, brainId: result.job.brainId, kind: "teacher", state: "queued", progress: 0,
       label: `Preparing ${provider} teacher training`, createdAt: result.job.createdAt, updatedAt: result.job.updatedAt };
   }
@@ -447,7 +481,8 @@ export class ApiTeacherTrainingService extends EventEmitter {
       store = await this.store(brainId, controller.signal);
       let job = store.job(jobId);
       if (job.state === "dormant") throw new Error("Copied API teacher history cannot execute without an explicit new job.");
-      await this.brain.preflightStart(brainId);
+      if (active?.authority) await this.requireToolAuthority(active, controller);
+      else await this.brain.preflightStart(brainId);
       secrets = await this.knownSecrets(); controller.signal.throwIfAborted();
       apiKey = apiTeacherCredentialRequired(job.provider) ? await this.secrets.get(credentialId(job.provider)) ?? "" : "";
       if (!job.responseModalities?.some(kind => kind !== "text") && apiTeacherCredentialRequired(job.provider) && !apiKey)
@@ -471,9 +506,13 @@ export class ApiTeacherTrainingService extends EventEmitter {
             maxOutputTokens: job.maxOutputTokens, ...(apiTeacherCredentialRequired(job.provider) ? { credential: apiKey } : {}) },
             request = media ? apiTeacherMediaRequest(job.provider, input, job.responseModalities!) : apiTeacherHttpRequest(job.provider, input);
           const requestSha256 = credentialFreeRequestHash(request, attemptId, item.deliveryId);
+          await this.requireToolAuthority(active, controller);
           item = await store.updateItem(job.id, index, { state: "dispatching", attemptId, requestSha256, error: undefined },
             "provider-dispatch-started", controller.signal);
+          let providerStarted = false;
           try {
+            await this.requireToolAuthority(active, controller);
+            providerStarted = true;
             if (media) {
               const responseEnvelope = await this.requestTeacherMedia(brainId, request, secrets, controller.signal);
               item = await store.updateItem(job.id, index, { state: "response-staged", rawResponseSha256: responseEnvelope.sha256,
@@ -486,6 +525,13 @@ export class ApiTeacherTrainingService extends EventEmitter {
                 learnedResponseSha256: sha256(response), response, error: undefined }, "provider-response-committed", controller.signal);
             }
           } catch (error) {
+            if (!providerStarted) {
+              // The current authority/resource guard refused before the call.
+              // Preserve the pending lesson, not a fictional unknown remote effect.
+              await store.updateItem(job.id, index, { state: "pending", attemptId: undefined,
+                requestSha256: undefined, error: undefined }, "provider-not-dispatched");
+              throw error;
+            }
             const requested = active?.requested;
             if (error instanceof UncertainTeacherDispatchError || controller.signal.aborted) {
               item = await store.updateItem(job.id, index, { state: "uncertain-review",
@@ -531,6 +577,7 @@ export class ApiTeacherTrainingService extends EventEmitter {
         const experienceSha256 = media ? item.mediaLesson!.manifestSha256 : sha256(trajectory);
         if (item.experienceSha256 && item.experienceSha256 !== experienceSha256)
           throw new Error("API teacher committed learning payload changed after response custody.");
+        await this.requireToolAuthority(active, controller);
         item = await store.updateItem(job.id, index, { state: "learning", experienceSha256, error: undefined },
           "learning-started", controller.signal);
         let learned: Awaited<ReturnType<BrainService["learnStructuredExperience"]>>, mediaCoverage: ApiTeacherMediaCoverage | undefined;
@@ -579,6 +626,7 @@ export class ApiTeacherTrainingService extends EventEmitter {
         this.publish(store.toRuntimeJob(next));
       } catch { /* Preserve the first durable/storage failure; no provider request is replayed. */ }
     } finally {
+      active?.releaseAuthority?.();
       store?.close(); if (this.active.get(jobId) === active) this.active.delete(jobId);
     }
   }

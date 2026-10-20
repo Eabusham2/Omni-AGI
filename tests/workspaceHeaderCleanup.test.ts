@@ -83,4 +83,23 @@ describe("requested workspace header cleanup", () => {
     expect(chat).toContain("<VoiceRoutingControls");
     expect(chat).toContain("<LivePerceptionPanel");
   });
+  it("uses one disconnected preview header without inferring a live engine from the bridge", () => {
+    const titlebar = source.slice(source.indexOf("function Titlebar("), source.indexOf("function EmptyVisual("));
+    expect(titlebar).toMatch(/\{demo \? \([\s\S]*className="titlebar__status" role="status"[\s\S]*Preview · no engine[\s\S]*\) : <span aria-hidden="true" style=\{\{ marginLeft: "auto" \}\} \/>\}/);
+    expect(titlebar.match(/Preview · no engine/g)).toHaveLength(1);
+    expect(titlebar).not.toContain("Local engine");
+    expect(titlebar).not.toContain("Private");
+    expect(titlebar).not.toContain("status-dot--live");
+    expect(shell).not.toContain("Demo preview");
+    expect(shell).not.toContain("Design preview");
+    expect(shell).toContain('{window.omni ? <span>');
+    expect(shell).toContain("window.omni!.brain.health(brain.id)");
+    expect(shell).toContain("result.ready");
+    expect(shell).toContain("result.detail");
+    expect(shell).toContain('setHealth("Python engine reconnecting…")');
+    expect(shell).toContain("{window.omni?.brain.lifecycle ? <InstanceLifecycleControls");
+    expect(shell).toContain("api={window.omni.brain} onState={setInstanceState}");
+    expect(shell).toContain("{window.omni?.advice ? <button");
+    expect(shell).toContain("{adviceVisited && window.omni?.advice ? <ExternalAdvicePanel");
+  });
 });

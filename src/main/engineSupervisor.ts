@@ -1460,7 +1460,8 @@ export class EngineSupervisor extends EventEmitter {
 
   private async prepareRequestedVideoRuntime(
     reservation: RequestReservation,
-    signal: AbortSignal
+    signal: AbortSignal,
+    configure?: (params: Record<string, unknown>) => Promise<unknown>
   ): Promise<void> {
     if (!this.options.prepareVideoRuntime) return;
     const onProgress = (progress: VideoRuntimeProgress): void => {
@@ -1492,13 +1493,15 @@ export class EngineSupervisor extends EventEmitter {
     }
     // Serialize this tiny RPC with the media request. It selects the verified
     // executable in an already-warm worker without restarting or loading it.
-    await this.rawRequest("configure_video_runtime", {
+    const configuration = {
       executablePath: prepared.executablePath,
       artifactSha256: prepared.artifactSha256,
       binarySha256: prepared.binarySha256,
       binarySizeBytes: prepared.binarySizeBytes,
       target: prepared.target
-    }, ENGINE_REQUEST_NO_DEADLINE, signal);
+    };
+    if (configure) await configure(configuration);
+    else await this.rawRequest("configure_video_runtime", configuration, ENGINE_REQUEST_NO_DEADLINE, signal);
   }
 
   /**
@@ -1840,6 +1843,40 @@ export class EngineSupervisor extends EventEmitter {
       brainId: observation.brainId, streamId: observation.turnId, observation
     }, 10_000, undefined, true);
     return observationReceipt(receipt, observation);
+  }
+
+  /** An existing reply's owner consumes capture only at its safe boundary. */
+  async requestLiveObservation<T>(method: string, params: Record<string, unknown>, timeoutMs = 120_000): Promise<T> {
+    if (!["start_observation", "observe_packet", "resolve_observation_control", "stop_observation", "cancel_observation"].includes(method))
+      throw new Error("Unsupported live observation operation.");
+    const child = this.child;
+    if (this.workerRole !== "neural" || !child || child.killed || child.exitCode !== null ||
+        !child.stdin.writable || this.starting || this.stopping || this.terminating)
+      throw new Error("Live capture requires its existing loaded neural worker.");
+    const active = this.activeRequest;
+    if (!active || !["chat", "resume_chat", "resume_inherited_chat"].includes(active.method))
+      return this.request<T>(method, params, timeoutMs);
+    const current = (): void => {
+      if (this.workerRole !== "neural" || this.activeRequest !== active || active.brainId !== params.brainId ||
+          !active.turnId || active.cancelled || active.controller.signal.aborted || !child || this.child !== child ||
+          child.killed || child.exitCode !== null || !child.stdin.writable || this.starting || this.stopping || this.terminating)
+        throw new Error("Live capture no longer owns this exact loaded reply worker.");
+    };
+    current();
+    let videoRuntime: Record<string, unknown> | undefined;
+    if (requestNeedsVideoRuntime(method, params)) {
+      // Prepare verified bytes off the neural writer, then configure that same
+      // runtime at the capture boundary instead of queuing behind its reply.
+      await this.prepareRequestedVideoRuntime(active, active.controller.signal, async configuration => { videoRuntime = configuration; });
+      current();
+    }
+    const result = await this.rawRequest("enqueue_live_observation", {
+      brainId: active.brainId, streamId: active.turnId, operation: method,
+      payload: { ...params, ...(videoRuntime ? { videoRuntime } : {}) }
+    }, timeoutMs, undefined, true) as T;
+    // A control timeout/failure never kills or reloads the generation owner.
+    if (this.child !== child) throw new Error("The live observation worker changed before its receipt.");
+    return result;
   }
 
   async authorizeInlineImagination(params: Record<string, unknown>): Promise<{ accepted: boolean }> {

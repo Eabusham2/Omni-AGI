@@ -7,7 +7,7 @@ including repetitions and the explanatory brain analogy. Repetition does not
 create a second implementation: it remains visible and points to the same
 acceptance requirement.
 
-## Current source and delivery reconciliation — October18
+## Current source and remaining gates — October20 / 40bed3f plus pending integration
 
 The latest Verbatim2 decision is implemented in PRIMARY source as five routes:
 Conversation, Training & Evolution, Brain map, Tools & permissions and Settings.
@@ -27,21 +27,53 @@ See [latest amendments](AMENDMENTS.md#october18-later--verbatim2-interface-and-w
 | Attach versus Learn, including folders | `UniversalSourcePicker`, task folder container/readers, learning coordinator | Folder is one immutable no-auto-learning container; manifest ordinals and saved-member bytes have distinct cursors |
 | Optional chat web quarantine | `shared/learning`, `LearningCoordinator`, `data.learn` catalog |5 new inert coordinator/schema/cursor/permission cases; no second crawler or neural-mutation claim |
 | Executable plugin maker | `PluginModuleAuthoring`, `pluginModuleDraft`, existing canonical install/runtime APIs | Editable feature/CSS/tool/parser drafts; save is inert, reviewed activation/permissions remain |
+| Senses and implicit capabilities | Build, Runtime Card, Fresh attention and map descriptions | Latest mandatory-capability checkboxes/summaries are removed; one Build, three memory/Fresh and thirteen runtime/graph focused cases plus renderer types pass. Actual changed-UI coverage remains separate. |
+| API teacher and system-statistics chat parity | `apiTeacherTool`, existing teacher service, `systemStatsService`, ToolExecutor/catalog and declared supplementary pack | Two subsequently confirmed missing chat routes now have typed source and focused inert dispatch/policy/custody evidence; see [the parity record](chat-tool-parity.md). No live provider/model/sensor or learned tool-choice proof. |
+| Within-turn live sensory input | `requestLiveObservation`, owned native inbox, actual Ponder/search/decoder boundaries and native cursor | Reviewed source plus sixteen distinct constructor-free cases and narrow host/controller checks; see [handoff and failure custody](live-sensory-handoff.md). No live device, neural-quality or throughput proof. |
 
-The current full appearance gate is still384 combinations and five core routes
-(1,920 core route visits), plus the newly reviewed composed/interaction states.
-No complete run or direct visual sign-off on this changed source is recorded
-here. Old11/12-route cohorts, their captures and their partial geometry remain
-historical only. CI, packaged launch/worker health, signing and release require
-their own exact-source evidence. On2188cda both Windows architectures failed a
-static source assertion before worker build/probe/health; its local correction
-does not make hosted worker health green. No current release acceptance follows.
+This is a dated gate snapshot, not a new all-feature test or completion claim.
+Published main is at `40bed3f245b88cb51b97767a47d8675c886fdc51`.
+The reviewed API-teacher/statistics routes, live-sensory handoff, duplicate-header
+cleanup and future-audit observations are still pending in PRIMARY; they are
+not contained in that published commit or its hosted results.
+The current [continuation](CONTINUATION.md) and linked dated evidence supersede
+older incremental notes. No app, model, provider, hardware or CI job was run for
+this reconciliation.
 
-Later exact evidence supersedes the initial-baseline wording in individual rows
-and the historical source index below. An old `open` label can describe
-qualification or conditional research; it is not evidence that its already
-implemented runtime path must be rebuilt. No row is blanket-promoted to full
-live/model/platform acceptance by this reconciliation.
+| Gate / disposition | What genuinely remains | Existing evidence and limits |
+| --- | --- | --- |
+| **G1 — current U1 appearance/interaction acceptance** | Complete the required 384-key appearance matrix, including five routes, twelve design states and twenty-five composition states, with lower-scroll, hover/focus/disabled and overlays. Freeze coherent new inputs after pending source work; run missing and genuinely affected coverage with explicit provenance/applicability, never relabel old hashes. Review saved captures and observed failures. | The frozen 55b8116 cohort is terminal: 29 sealed zero-exit batches / 116 cells, not 384. Cell292 lost its Appearance panel over Saving; failed trace/captures and STOP are preserved. One bounded exact-artifact reproduction passed24 controls but did not explain the original disappearance: cause remains unproven. New read-only lifecycle observations and fail-fast failure capture have five focused cases; no new matrix has begun. Later global CSS, Senses/Fresh/map and header changes require their genuinely affected current-source qualification. No-engine evidence is not model/device/provider proof. |
+| **G2 — required exact-source CI** | Preserve40bed3f's successful jobs without rerunning them. After pending integration is reviewed and published, qualify that exact final source rather than inheriting another commit's green. | All six desktop jobs on262915f failed one stale removed-paragraph assertion before worker health; its actual Remove-button/handler/custody contract is corrected in40bed3f. All eight40bed3f platform jobs are now green: Windows ARM/x64, Linux ARM/x64, macOS ARM/Intel and Android/iOS. This includes the hosted Windows worker-health and package-smoke boundaries, with native ARM app/x64-emulated worker as declared. It is not proof of the later dirty integrations, new UI matrix, trained capabilities, signing or release. |
+| **G3 — packages and release** | Bind required desktop/companion package and worker-health/ordinary launch-close results to the reviewed commit; qualify the Windows portable layout/relocation as declared. Then verify the exact tag, checksums, artifact provenance/downloads and published release. Sign/notarize when credentials exist; otherwise label unsigned artifacts truthfully. | Version 2.0.0, package definitions, portable receipts and pack 24 source preparation are implemented. Earlier platform passes and local shell/fixture checks are useful evidence, not final current-commit package, selected-brain continuation, signing or release proof. No all-platform green/tag/release is recorded here. |
+| **D1 — explicitly user-deferred native qualification** | The new-brain current-format merged-resume proof, full `Downloads/ai train` training, broad learned memory/skill/semantic-merge and multimodal-quality qualification belong to the later user-authorized task. Give the agreed full-folder / rented-GPU-if-over-one-week reminder at handoff. | Keep existing tiny native and host portability results; do not repeat them or create/train another brain to close this goal. Deferred is not passed, cancelled, or evidence of missing source. |
+| **Q1 — real service/device/hardware qualification** | Keep actual account/provider/local-teacher/MCP interoperability, real microphone/camera/native speech, OS-permitted process access/Touch Bar, representative GPU/drive pressure, multidevice and distributed measurements explicitly unqualified where the linked reports lack them. | Host, transport, SQLite, synthetic and no-engine UI evidence validates only its recorded boundary. Actual macOS process-memory denial is retained, not a success. These checks require the relevant permitted account/device/hardware; do not infer trained capability or a universal compatibility/speed claim. |
+| **C1 — conditional research / unsupported optimizations** | Retain the explicit adopted/adapted/redundant/deferred/rejected decisions. A positive new backend or optimization still requires compatibility and whole-operation benefit evidence before adoption. | [Execution dispositions](final-execution-dispositions.md) and [backend decisions](backend-research-dispositions.md) distinguish working native collectives and sequential six-text-kind mixed consumers from unsupported cross-rank Auto, concurrent streams, arbitrary live-cache migration, direct CUDA/XPU/NPU packed kernels, mixed non-text consumers and MLX/vLLM/DeepSpeed adapters. These are not silently adopted, a promise of every framework, or a reason to rebuild completed paths. |
+
+**Current source-gap boundary:** the subsequent independent review found three
+real connection omissions: API teaching was panel-only, actual host statistics
+were IPC-only, and live sensory packets waited behind generation. The first two
+now have reviewed typed chat paths and focused inert boundaries; the within-turn
+sensory implementation also has reviewed owner/retirement/recovery/resume source
+and scoped inert evidence. See the complete mapping in
+[the independent audit](PLAN_VERBATIM_COMPLETENESS_AUDIT.md). The duplicate-preview
+header fix is source-checked but not visually qualified. None is published in
+40bed3f; this is not a fresh universal source certification. Retained-context physical
+RAM/VRAM/storage ownership and resource-derived capacity, reply/outer-learning
+consumers, native full merging, connected format2 catalog custody and the
+Verbatim2 workflow paths have implementation/focused evidence. See
+[retained context](retained-context-storage.md), [execution dispositions](final-execution-dispositions.md),
+[catalog archives](whole-brain-catalog-archives.md) and the source reconciliation
+above. Their broader hardware, learned-quality and current UI/package acceptance
+must not be mistaken for absent code. A newly reproduced audit/CI defect may
+reopen its exact source path; an old `open` label alone may not.
+
+The R-row ledger and source index below preserve the initial baseline plus
+scoped later updates; their statuses have not all been normalized to 262915f.
+They are traceability/history, **not an independent current to-do list**.
+An old `open` label can describe qualification or conditional research, or be
+superseded by linked later implementation evidence. Resolve it against G1–G3,
+D1, Q1 and C1 above before proposing work. No row is blanket-promoted to full
+live/model/platform acceptance, and no cancelled standalone page is reintroduced.
 
 ### Historical source evidence — not current Verbatim2 acceptance
 
@@ -97,8 +129,9 @@ live/model/platform acceptance by this reconciliation.
 
 ## Authority and evidence
 
-- Baseline inspected: commit `17fe555`. In-progress edits by other implementation
-  lanes are not treated as completed features by this initial documentation pass.
+- Initial row/index baseline: commit `17fe555`. That is not the current
+  implementation commit. The current gate snapshot above and later linked
+  evidence take precedence over its missing-source statements.
 - Latest settled answers in `PLAN.md` take precedence. Personal-memory removal,
   JEV, RLCD, externally rewarded RLVR, preference training, and reward-model
   loops are excluded. Full native merging creates a new instance; parent
@@ -116,7 +149,7 @@ States used throughout:
 
 | State | Meaning |
 | --- | --- |
-| `open` | New/expanded behavior, research decision, fix, or acceptance evidence remains. |
+| `open` | At that entry's recorded baseline, behavior, research, a fix or acceptance evidence remained. Check later evidence/current gates before treating it as unfinished source. |
 | `existing-needs-verification` | Relevant source behavior was inspected; confirm the exact requested behavior and current tests/UI before closing it. |
 | `source-tested` | The linked implementation passed focused mechanism tests; stated UI, integration, or trained-capability acceptance remains open. |
 | `research-disposition-recorded` | The approved research suggestion has an explicit source-backed adopted/adapted/redundant/deferred/rejected decision. This does not assert literal paper implementation, a new default, or trained-quality acceptance; remaining candidate gates are stated. |
@@ -127,10 +160,12 @@ only after linking changed source, an actual result, and any remaining physical
 or trained-capability limitation. A green narrow test does not close a broader
 row by itself.
 
-## Source evidence index
+## Historical baseline source evidence index
 
-References are relative to the repository root. These are the baseline paths
-inspected for this matrix, with their observed scope.
+References are relative to the repository root. These are initial baseline
+pointers with scoped later additions, not a fresh inventory of 262915f. Their
+older negative statements (for example no full merge, no overseer or unfinished
+portable format) do not override the current source/evidence linked above.
 
 | Key | Source and observed scope |
 | --- | --- |
@@ -538,16 +573,19 @@ this does not close item 6 or the broader research/backend decisions.
 
 ### U1 — UI and telemetry acceptance
 
-Current Verbatim2 acceptance is **unverified**. The384-combination matrix must
-use the five current primary routes and their retained chat, Home selection,
-unified input, plugin-maker, approval, hover/focus, compact and lower-scroll
-states. Prior11/12-route matrix journals and screenshots are historical, not
-blanket failures of retained mechanisms or passes for the new layout. A saved
-image named lower-content is not bottom evidence unless its visible state and
-scroll/focus measurements support that conclusion. No new matrix, preview or
-package check was run for this documentation reconciliation.
+Current Verbatim2 acceptance is **in progress, not complete**; see G1 above.
+The frozen 55b8116 cohort has started the required 384 combinations across the
+five current primary routes and retained chat, Home selection, unified input,
+plugin-maker, approval, hover/focus, compact and lower-scroll states. Later
+262915f presentation changes need their own genuinely affected coverage and
+source binding. Preserve the cohort rather than restarting unchanged states
+or treating its older source as blanket acceptance of changed UI. Prior11/12-
+route journals remain historical, not blanket failures of retained mechanisms
+or passes for the new layout. A saved image named lower-content is not bottom
+evidence unless its visible state and scroll/focus measurements support it.
+No matrix, preview or package check was launched by this documentation pass.
 
-October18 adds bounded Data/runtime and actual same-frame MCP presentation
+Historical October18 evidence adds bounded Data/runtime and actual same-frame MCP presentation
 checks, plus the finite residual existing-App walkthrough:31 numbered captures,
 30 accepted indexed captures and08 rejected as bottom proof. The five CI UI
 specs match current Call,12 workspace routes, unified map/no-API and composer/
@@ -602,18 +640,20 @@ not a full workspace/theme/platform or live-backend completion claim.
 | A07 | 200B speech threshold with independent manual overrides | `open` | Backend/shared exact threshold, measured-count provenance, CAS/manual choices, fresh Auto/eligible legacy migration and portable settings passed21 focused cases. Capability-aware Call UI is integrated with four new controls cases and bounded synthetic Electron checks. Direct native-input and packaged voice proof remain open; voice-routing.md records boundaries. |
 | A08 | Portable folder and destination-local empty reservation | `open` | Clean-machine portable start, data/settings continuity and real fit accounting. |
 | A09 | Short temporary fixtures and thorough UI allowed; long training deferred | `existing-needs-verification` | Fixture budgets visible, no supplied-corpus training accidentally launched. |
-| A10 | Comprehensive user/plugin/API docs and curriculum | `existing-needs-verification` | Current public manuals are reconciled to five routes, unified learning/evolution, immutable folder attachment reads and executable plugin authoring. Source declares ordinary documentation pack24/eight manuals; final-byte hash/pin checks and current visual/package qualification are separate. Internal transcripts/audits remain excluded; learning these bytes does not prove comprehension. |
-| A11 | v2 GitHub commit/push, all required green CI and packages released | `open` | Latest2188cda Windows jobs failed a static assertion before worker build/probe/health; its affected local fix is not hosted requalification. The changed Verbatim2 source still needs required green jobs, package/worker smokes, exact tag and checksummed/provenanced release assets. No current all-platform/signing/release acceptance is recorded. |
+| A10 | Comprehensive user/plugin/API docs and curriculum | `source-tested` | Current public manuals are reconciled to five routes, unified learning/evolution, immutable folder attachment reads and executable plugin authoring. Pack24 binds eight manuals; CONTINUATION records the six passing manual cases and separately corrected affected portable/plugin cases. New source UI wording has focused contracts; actual current visual/package acceptance remains G1/G3. Internal transcripts/audits remain excluded; learning these bytes does not prove comprehension. |
+| A11 | v2 GitHub commit/push, all required green CI and packages released | `open` | Current candidate262915f includes the Windows read-only-liveness correction after1dd3c77 reached worker health; a new desktop CI failure is coordinator-reported and owned by the release lane. Resolve G2 with its actual logs/result, then G3 exact-commit packages, tag, checksums/provenance, signing status and release verification. Older2188/fdd failures and green jobs on another source are retained history, not the current boundary or final acceptance. |
 | A12 | Full original message remains verbatim | `existing-needs-verification` | Text equality against source message; 239 nonempty source-body lines all mapped here. |
 | A13 | End reminder for full-folder qualification and GPU estimate | `open` | Delivered with final result; no premature claim that broad capability was proved. |
 | A14 | Complete format2 exports over older-app compatibility | wholeBrainCatalogArchive/Portability + BrainRepository; [evidence](whole-brain-catalog-archives.md) | `source-tested` | New format2 requires exact current/origin/catalog-lineage closure and supported required features. Copied re-export uses verified archive-only projection, never an invented registry/Load.11 new archive and51 selected affected repository host cases passed across scoped runs, including portable import/collision/re-export/import. Current app-family/physical/heap admission is wired; root memory helper3 cases pass. Fixed optional-root recovery, historical continuation fabrication and distinct teacher-history projection collisions; preserved originals/unsanitized history and strict validation. Real large-state, native and packaged-platform qualification remains open. |
 
 ## Closing records
 
-No new runtime, model, UI or CI test was run for this initial documentation pass.
-The baseline source reads establish where implementation exists and where the
-requested v2 behavior extends it. Fill this section with actual dated results as
-implementation proceeds; preserve failures and deferred learned outcomes.
+No new runtime, model, UI or CI test was run for this documentation
+reconciliation. The current G1–G3/D1/Q1/C1 gate ledger separates delivery,
+explicit deferral and conditional qualification from historical missing-source
+notes. Update it only with actual dated results; preserve failures and deferred
+learned outcomes. It is not permission to repeat closed tests or quietly narrow
+the agreed plan.
 
 The six blank body lines in the preserved request are 8, 10, 70, 77, 81 and 85.
 All other body lines from 6 through 250 have exactly one `Rnnn` row above.

@@ -14,6 +14,7 @@ const auditScope = JSON.parse(readFileSync(new URL("./whole-app-audit-scope.json
   designStates: string[]; compositionStates: string[];
 };
 import { assertAuditResources, AuditResourcePauseError, type AuditResourceSnapshot } from "./whole-app-audit-resources.mjs";
+import { appearanceAuditFailureMessage, createAppearanceAuditObservation, type AppearanceAuditObservations, type AppearanceAuditSnapshot } from "./appearance-audit-observation.mjs";
 
 /**
  * Missing U1 composition coverage, not a replacement for the closed 11 UI tests.
@@ -82,6 +83,7 @@ type Visit = {
     postKeyboardTop?: number; captureTop?: number; captureMaximum?: number; captureReachedBottom?: boolean }>;
   captures: Capture[]; issues: Issue[];
   noticeGeometry?: { before?: NoticeGeometry; after?: NoticeGeometry };
+  appearanceLifecycle?: AppearanceAuditObservations;
 };
 
 const cells: Cell[] = [];
@@ -114,6 +116,22 @@ function selectedCells(): Cell[] {
 
 async function settledFrame(page: Page): Promise<void> {
   await page.evaluate(() => new Promise<void>(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(() => resolveFrame()))));
+}
+
+async function appearanceObservations(page: Page): Promise<AppearanceAuditObservations | undefined> {
+  return page.evaluate(() => (window as Window & { __omniAppearanceAuditObservation?: { read(): AppearanceAuditObservations } })
+    .__omniAppearanceAuditObservation?.read());
+}
+
+async function requireInspectedAppearance(page: Page, record: Visit, phase: string): Promise<void> {
+  if (!record.state.startsWith("appearance-over-training-")) return;
+  // Read only current geometry during each control step; serialize the full
+  // bounded ring once at the end or failure, not on every paint/scroll sample.
+  const snapshot = await page.evaluate(() => (window as Window & { __omniAppearanceAuditObservation?: { snapshot(): AppearanceAuditSnapshot | null } })
+    .__omniAppearanceAuditObservation?.snapshot());
+  if (!snapshot) throw new Error(`Appearance lifecycle observer is missing during ${phase}; this state cannot be qualified.`);
+  const failure = appearanceAuditFailureMessage(snapshot, phase);
+  if (failure) { record.appearanceLifecycle = await appearanceObservations(page); throw new Error(failure); }
 }
 
 async function configureCell(page: Page, cell: Cell): Promise<void> {
@@ -194,6 +212,7 @@ async function sampleControls(root: Locator, onlyId?: string): Promise<ControlSa
 }
 
 async function inspectPresentControls(root: Locator, page: Page, record: Visit, seen: Set<string>): Promise<void> {
+  await requireInspectedAppearance(page, record, "control scan");
   const paintOf = (value: ControlSample): ControlPaint => ({ color: value.color, background: value.background,
     opacity: value.opacity, contrast: value.contrast, contrastScope: value.contrastScope });
   const checkPaint = (sample: ControlSample, phase: string, paint: ControlPaint) => {
@@ -212,8 +231,10 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
       // Preserve real unhovered/unfocused ink. A later readable hover must not
       // overwrite evidence of a low-contrast resting state (e.g. Delete).
       await page.mouse.move(1, 1);
+      await requireInspectedAppearance(page, record, "before control base paint");
       await control.evaluate(node => { (node.ownerDocument.activeElement as HTMLElement | null)?.blur?.(); });
       await settledFrame(page);
+      await requireInspectedAppearance(page, record, "control base paint");
       const [base] = await sampleControls(root, sample.id);
       if (!base) throw new Error("The control disappeared before its base paint was recorded.");
       sample.basePaint = paintOf(base); checkPaint(sample, "base", sample.basePaint);
@@ -225,6 +246,7 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
       } else await control.hover({ timeout: 1500 });
       sample.hovered = await control.evaluate(node => node.matches(":hover"));
       await settledFrame(page);
+      await requireInspectedAppearance(page, record, "control hover paint");
       const [hovered] = await sampleControls(root, sample.id);
       if (!hovered) throw new Error("The control disappeared before its hover paint was recorded.");
       sample.hoverPaint = paintOf(hovered); checkPaint(sample, "hover", sample.hoverPaint);
@@ -234,6 +256,7 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
         sample.focused = await control.evaluate(node => document.activeElement === node);
         if (!sample.focused) record.issues.push({ kind: "focus-not-received", control: sample.name || sample.id, detail: "Programmatic focus was not received; keyboard order is a separate check" });
         await settledFrame(page);
+        await requireInspectedAppearance(page, record, "control focus paint");
       }
       const [after] = await sampleControls(root, sample.id);
       if (after) {
@@ -243,6 +266,10 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
         if (after.clippedX > 2) record.issues.push({ kind: "hover-focus-clipping", control: sample.name || sample.id, detail: `${after.clippedX.toFixed(2)} px clipped after hover/focus` });
       }
     } catch (error) {
+      // A disappeared popup is a failed state, not a missing control to skip.
+      // Stop this walk immediately; the caller persists its lifecycle record
+      // and failure capture. Never reopen/retry to turn it into a green row.
+      await requireInspectedAppearance(page, record, "control interaction failure");
       // Inert/disabled controls have no pointer/focus promise. Their actual
       // geometry/ink remains in the journal; don't pretend they were invoked.
       if (!sample.disabled && !sample.inert) record.issues.push({ kind: "hover-focus-unreachable", control: sample.name || sample.id, detail: error instanceof Error ? error.message.split("\n")[0]! : String(error) });
@@ -254,6 +281,7 @@ async function inspectPresentControls(root: Locator, page: Page, record: Visit, 
 }
 
 async function walkContent(page: Page, root: Locator, record: Visit): Promise<void> {
+  await requireInspectedAppearance(page, record, "content walk start");
   await root.evaluate(element => {
     // Opening local disclosures inspects existing content only, not effects.
     for (const detail of element.querySelectorAll<HTMLDetailsElement>("details")) {
@@ -276,10 +304,12 @@ async function walkContent(page: Page, root: Locator, record: Visit): Promise<vo
   const seen = new Set<string>();
   await inspectPresentControls(root, page, record, seen);
   for (const owner of owners) {
+    await requireInspectedAppearance(page, record, "scroll owner admission");
     const locator = page.locator(`[data-whole-app-audit-scroll="${owner}"]`);
     await locator.evaluate(node => { node.scrollIntoView({ block: "nearest", inline: "nearest" }); node.scrollTop = 0; });
     const offsets: number[] = []; let previous = -1;
     for (;;) {
+      await requireInspectedAppearance(page, record, "scroll step");
       const point = await locator.evaluate(node => ({ top: node.scrollTop, max: Math.max(0, node.scrollHeight - node.clientHeight), step: Math.max(1, Math.floor(node.clientHeight * .8)) }));
       offsets.push(point.top);
       await inspectPresentControls(root, page, record, seen);
@@ -294,6 +324,7 @@ async function walkContent(page: Page, root: Locator, record: Visit): Promise<vo
     if (!reachedBottom) record.issues.push({ kind: "scroll-bottom-unreached", detail: `Owner ${owner}: ${final.top} of ${final.max}` });
   }
   await page.keyboard.press("Tab");
+  await requireInspectedAppearance(page, record, "keyboard traversal");
   const keyboard = await page.evaluate(() => ({ tag: document.activeElement?.tagName, name: document.activeElement?.getAttribute("aria-label"), body: document.activeElement === document.body }));
   if (keyboard.body) record.issues.push({ kind: "keyboard-focus-lost", detail: "Tab left focus on document.body" });
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
@@ -392,6 +423,7 @@ async function verifyStaticFixture(url: URL, expected: { sourceCommit: string; s
   expect(manifest.sourceFiles).toEqual(fileInventory([join(repository, "src/renderer"), join(repository, "src/shared")]));
   expect(manifest.buildInputs).toEqual(["tests/e2e/whole-app-state-composition-fixture.html", "tests/e2e/whole-app-state-composition-fixture.tsx",
     "tests/e2e/whole-app-audit-contract.ts", "tests/e2e/whole-app-audit-scope.json", "tests/e2e/whole-app-audit-resources.mjs", "tests/e2e/whole-app-audit-resources.d.mts",
+    "tests/e2e/appearance-audit-observation.mjs", "tests/e2e/appearance-audit-observation.d.mts",
     "tests/e2e/whole-app-audit-matrix.spec.ts", "tests/e2e/responsive-main.cjs", "package.json", "package-lock.json", "work/u1-static-fixture.mjs"]
     .map(path => { const bytes = readFileSync(resolve(repository, path)); return { path, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") }; }));
   expect(manifest.auditSpecSha256).toBe(createHash("sha256").update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex"));
@@ -721,6 +753,7 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-contract.ts")))
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-scope.json")))
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-resources.mjs")))
+    .update(readFileSync(resolve(repository, "tests/e2e/appearance-audit-observation.mjs")))
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex");
   const staticArtifact = await verifyStaticFixture(url, { sourceCommit, sourceFingerprint, fixtureSha256 });
   const loopbackPreload = loopbackPreloadInventory();
@@ -783,6 +816,7 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
       else { externalRequests.push(request.request().url()); await request.abort("blockedbyclient"); }
     });
     const page = await application.firstWindow();
+    await page.addInitScript(createAppearanceAuditObservation, { capacity: 256, install: true });
     // responsive-main's authorized no-preload bootstrap is a distinct frozen
     // product file, not a fixture asset. Let that exact load finish before
     // applying fixture-only file routing; keep HTTP blocked from the start.
@@ -839,6 +873,7 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
           if (state === "chat-failed-input-preserved") record.noticeGeometry = { ...record.noticeGeometry, after: await noticeGeometry(page) };
           if (representative(cell)) await capture(page, screenshots, record, "lower-content");
         } catch (error) { record.issues.push({ kind: "composition-error", detail: error instanceof Error ? error.message : String(error) }); }
+        if (state.startsWith("appearance-over-training-")) record.appearanceLifecycle = await appearanceObservations(page);
         if (record.issues.length) { record.status = "failed"; failures.push({ key: record.key, issues: record.issues }); await capture(page, screenshots, record, "failure").catch(() => undefined); }
         record.elapsedMs = Math.round(performance.now() - begin);
         appendFileSync(journal, `${JSON.stringify(record)}\n`, { flush: true });
@@ -931,6 +966,13 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
           const top = document.elementFromPoint(point.x, point.y);
           return top && element.contains(top) ? [] : [{ kind: "appearance-covered", detail: "Appearance is obscured by another actual App layer." }];
         }));
+        // inspect() above already sealed the failed row and screenshot. Do
+        // not add a second 30s locator wait, reopen it, or advance as a pass.
+        const appearanceEnd = await appearanceObservations(page);
+        if (await page.locator('.appearance-panel[role="dialog"]').count() !== 1 ||
+            appearanceAuditFailureMessage(appearanceEnd?.current, `completion of ${phase} overlay inspection`)) {
+          throw new Error(`Appearance panel disappeared while inspecting the ${phase} overlay; failure and lifecycle evidence were preserved.`);
+        }
         await page.getByRole("button", { name: "Close appearance settings", exact: true }).click();
       }
       expect((await compositionStatus(page)).denied.filter(value => /brain\.(?:create|load)|train\.|chat\.(?:approve|decline|cancel)/.test(value))).toEqual([]);

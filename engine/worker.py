@@ -42,6 +42,8 @@ from worker_transport import ProtocolLineReader, serve_worker_stdio
 from worker_lifecycle import WorkerLifecycle
 from worker_mcp_sampling import WorkerMcpSampling, MCP_SAMPLING_CONTROLS
 from worker_app_observation import WorkerAppObservation
+from worker_live_sensory import WorkerLiveSensory, LiveSensoryIntegrationFailed
+from live_sensory_queue import LIVE_SENSORY_CONTROL, capture_permission_hash
 from worker_sparse_transfer import WorkerSparseTransfer, SPARSE_READ_METHODS
 from spontaneous_output import SpontaneousOutputLeases
 
@@ -331,13 +333,17 @@ class LiveObservationSessionState:
     capabilities: Dict[str, bool]
     created_at: str
     max_packet_bytes: int
+    max_in_flight: int = 1
+    capture_revision: int = 0
+    episode_assembly_id: str = ""
+    retired: threading.Event = field(default_factory=threading.Event)
     packets_accepted: int = 0
     bytes_accepted: int = 0
     last_sequence: int = -1
     last_timestamp_ms: float = -1.0
 
 
-class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSparseTransfer):
+class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSparseTransfer, WorkerLiveSensory):
     def __init__(self):
         self.worker_role = str(
             os.environ.get("OMNI_WORKER_ROLE", "neural")
@@ -367,6 +373,7 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
         self._inline_executor_closed = False
         self._observation_lock = threading.RLock()
         self._observation_sessions: Dict[str, LiveObservationSessionState] = {}
+        self.initialize_live_sensory()
         self._spontaneous_output_leases = SpontaneousOutputLeases()
         self.methods: Dict[str, Callable[[Dict[str, Any], Optional[str]], Any]] = {
             "health": self.health,
@@ -617,10 +624,15 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
 
     def dispatch_control(self, request: Any) -> Dict[str, Any]:
         if self.worker_role != "neural" or not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or \
-                request.get("method") not in {"cancel_inline_generation", "steer_chat", "suspend_chat", "instance_status", "inherited_execution_presentation", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status", "router_activity_control", "decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop", *MCP_SAMPLING_CONTROLS} or \
+                request.get("method") not in {"cancel_inline_generation", "steer_chat", "suspend_chat", "instance_status", "inherited_execution_presentation", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status", "router_activity_control", "decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop", LIVE_SENSORY_CONTROL, *MCP_SAMPLING_CONTROLS} or \
                 not isinstance(request.get("id"), (str, int)) or not isinstance(request.get("params"), dict):
             raise RpcFault(-32600, "invalid flags-only worker control request")
         params = request["params"]
+        if request["method"] == LIVE_SENSORY_CONTROL:
+            try:
+                return self.live_sensory_control(request)
+            except (ValueError, UnicodeError) as error:
+                raise RpcFault(-32602, str(error)) from error
         if request["method"] in {"decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop"}:
             result = getattr(self, request["method"])(params, request["id"])
             return {"jsonrpc": "2.0", "id": request["id"], "result": result}
@@ -3019,7 +3031,7 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
     def chat(self, params: Dict[str, Any], request_id: Optional[str]) -> Dict[str, Any]:
         brain_id = self._brain_id(params)
         stream_id = str(params.get("streamId", "")).strip() or str(request_id or uuid.uuid4().hex)
-        session = ChatSteeringState(brain_id, stream_id)
+        session = ChatSteeringState(brain_id, stream_id, request_id=str(request_id or ""))
         key = (brain_id, stream_id)
         with self._steering_lock:
             reserved = self._chat_steering.get(key)
@@ -3353,6 +3365,10 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
             reply_controls = bind_reply_controls(brain, request_id, control_turn_id,
                 sessions=self._chat_steering, key=control_key, session=self._chat_steering.get(control_key),
                 cancellation=self._cooperative_cancel) if execution_session is None and resume_payload is None else None
+        live_sensory = self.open_live_sensory(control_key, request_id)
+        observation_inbox.live_sensory_conditioning = lambda current, step, episode: self.drain_live_sensory(
+            live_sensory, brain, authority_brain, current, step, episode)
+        observation_inbox.live_sensory_pending = live_sensory.has_pending
         try:
             result = brain.resume_chat(resume_payload, stream_callback=stream if stream_id else None,
                 cancel_check=self._cooperative_cancel.is_set, steer_check=steer_check,
@@ -3397,15 +3413,22 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
                 str(error),
                 {"cancelled": True, "safeBoundary": True},
             ) from error
-        except Exception:
-            if execution_session is None: self._restore_committed_brain_after_failed_chat(
-                brain,
-                prior_ledger_head=prior_ledger_head,
-                turn_id=turn_id,
-                input_sha256=input_sha256,
-            )
+        except Exception as error:
+            if execution_session is not None and isinstance(error, LiveSensoryIntegrationFailed):
+                # An inherited view borrows actual regional memory/packed
+                # owners. Closing the view only restores scratch/RNG: it is
+                # NOT rollback. Fence the root until explicit verified Load.
+                authority_brain._connected_recovery_required = True
+            elif execution_session is None:
+                self._restore_committed_brain_after_failed_chat(
+                    brain,
+                    prior_ledger_head=prior_ledger_head,
+                    turn_id=turn_id,
+                    input_sha256=input_sha256,
+                )
             raise
         finally:
+            self.close_live_sensory(control_key, live_sensory)
             retire_reply_controls(brain, reply_controls)
 
         if result.get("suspended") is True:
@@ -4249,6 +4272,11 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
                 "live neural path is not trained for: %s" % ", ".join(unavailable),
                 {"capabilities": capabilities, "unavailableModalities": unavailable},
             )
+        max_in_flight = params.get("maxInFlight", 1)
+        capture = params.get("capture", {})
+        capture_revision = capture.get("revision", 0) if isinstance(capture, dict) else None
+        if type(max_in_flight) is not int or max_in_flight < 1 or type(capture_revision) is not int or capture_revision < 0:
+            raise RpcFault(-32602, "invalid capture revision or transport capacity")
         session = LiveObservationSessionState(
             session_id=session_id,
             brain_id=brain.brain_id,
@@ -4265,6 +4293,8 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
             capabilities=capabilities,
             created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             max_packet_bytes=max_packet_bytes,
+            max_in_flight=max_in_flight,
+            capture_revision=capture_revision,
         )
         with self._observation_lock:
             if session_id in self._observation_sessions:
@@ -4272,15 +4302,8 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
             self._observation_sessions[session_id] = session
         return self._observation_session_payload(session)
 
-    def observe_packet(
-        self, params: Dict[str, Any], request_id: Optional[str]
-    ) -> Dict[str, Any]:
-        del request_id
-        session_id = str(params.get("sessionId", "")).strip()
-        with self._observation_lock:
-            session = self._observation_sessions.get(session_id)
-        if session is None:
-            raise RpcFault(-32004, "live observation session was not found")
+    def _decode_observation_packet(self, session, params):
+        session_id = session.session_id
         modality = str(params.get("modality", "")).strip().lower()
         if modality not in session.modalities:
             raise RpcFault(-32602, "packet modality is not enabled for this session")
@@ -4316,15 +4339,31 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
             raise RpcFault(-32602, "packet settings must be an object")
         with self._observation_lock:
             current = self._observation_sessions.get(session_id)
-            if current is None:
+            if current is None or current is not session or current.retired.is_set():
                 raise RpcFault(-32004, "live observation session was stopped")
+            if (params.get("brainId") != session.brain_id or
+                    params.get("captureRevision") != session.capture_revision or
+                    params.get("permissionSha256") != capture_permission_hash(session.permission)):
+                raise RpcFault(-32602, "live capture owner, revision or permission changed")
             if sequence <= current.last_sequence:
                 raise RpcFault(-32602, "packet sequence must increase monotonically")
             if timestamp_ms < current.last_timestamp_ms:
                 raise RpcFault(-32602, "packet timestamp must not move backwards")
-        brain = self.brains.get(session.brain_id)
-        if brain is None:
-            raise RpcFault(-32004, "live observation brain is no longer loaded")
+        return modality, mime_type, payload, settings, sequence, timestamp_ms
+
+    def observe_packet(
+        self, params: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        del request_id
+        session_id = str(params.get("sessionId", "")).strip()
+        with self._observation_lock:
+            session = self._observation_sessions.get(session_id)
+        if session is None or session.retired.is_set():
+            raise RpcFault(-32004, "live observation session was not found")
+        modality, mime_type, payload, settings, sequence, timestamp_ms = self._decode_observation_packet(session, params)
+        if params.get("packetSha256") is not None and hashlib.sha256(payload).hexdigest() != params["packetSha256"]:
+            raise RpcFault(-32602, "live capture byte checksum changed")
+        brain = self._get({"brainId": session.brain_id, "storagePath": params.get("storagePath")})
         try:
             observation = brain.observe_live_packet(
                 modality=modality,
@@ -4336,17 +4375,13 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
                 retention=session.retention,
                 settings=settings,
                 permission_source=str(session.permission["source"]),
+                episode_assembly_id=session.episode_assembly_id,
+                cancelled=session.retired.is_set,
             )
-            organic = (
-                brain.idle_cycle(
-                    tool_schemas=session.tool_schemas,
-                    minimum_idle_seconds=0.0,
-                )
-                if session.retention == "neural"
-                else {"ran": False, "actions": []}
-            )
-            if session.retention == "neural" and not bool(organic.get("ran")):
+            if session.retention == "neural":
+                session.episode_assembly_id = str(observation.get("assemblyId") or "")
                 brain.save()
+            organic = {"ran": False, "actions": []}
         except Exception as error:
             if getattr(brain, "_native_execution_restore_required", False):
                 # Exact placement restoration failed, not ordinary Stop or
@@ -4418,16 +4453,25 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
         del request_id
+        if params.get("retireOnly") is True:
+            with self._observation_lock:
+                session = self._observation_sessions.get(params.get("sessionId"))
+                if session is None or session.brain_id != params.get("brainId"):
+                    raise RpcFault(-32004, "capture retirement has no matching session")
+                session.retired.set()
+                return {**self._observation_session_payload(session), "state": "stopping"}
         return self._finish_observation(params, cancelled=False)
 
     def cancel_observation(
         self, params: Dict[str, Any], request_id: Optional[str]
     ) -> Dict[str, Any]:
         del request_id
+        if params.get("retireOnly") is True:
+            return self.stop_observation(params, None)
         return self._finish_observation(params, cancelled=True)
 
     def resolve_observation_control(
-        self, params: Dict[str, Any], request_id: Optional[str]
+        self, params: Dict[str, Any], request_id: Optional[str], *, persist=True
     ) -> Dict[str, Any]:
         del request_id
         session_id = str(params.get("sessionId", "")).strip()
@@ -4442,10 +4486,16 @@ class Worker(WorkerLifecycle, WorkerMcpSampling, WorkerAppObservation, WorkerSpa
         if not isinstance(control, dict):
             raise RpcFault(-32602, "params.control is required")
         try:
-            result = brain.record_live_observation_control(
-                session_id=session_id, control=control
-            )
-            brain.save()
+            actual = control.get("actual")
+            if control.get("state") in {"applied", "reverted"} and isinstance(actual, dict):
+                revision = actual.get("revision")
+                if type(revision) is not int or revision != session.capture_revision + 1:
+                    raise ValueError("live capture control revision does not follow the registered session")
+            result = brain.record_live_observation_control(session_id=session_id, control=control)
+            if control.get("state") in {"applied", "reverted"} and isinstance(actual, dict):
+                with self._observation_lock:
+                    session.capture_revision = revision
+            if persist: brain.save()
             return result
         except ValueError as error:
             raise RpcFault(-32602, str(error)) from error

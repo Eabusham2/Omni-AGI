@@ -4,13 +4,21 @@ import { promisify } from "node:util";
 import { getHeapStatistics } from "node:v8";
 
 const execute = promisify(execFile);
+export interface AutomationResidencySample {
+  residentBytes: number;
+  requestedProcessCount: number;
+  sampledProcessCount: number;
+}
 /** Main-owned PIDs only; no user string is interpolated into a host command. */
-export async function automationResidentBytes(pids: readonly number[], platform: NodeJS.Platform = process.platform): Promise<number> {
+export async function automationResidencySample(pids: readonly number[], platform: NodeJS.Platform = process.platform, signal?: AbortSignal): Promise<AutomationResidencySample> {
+  const check = (): void => { if (signal?.aborted) throw new DOMException("Owned process residency read cancelled.", "AbortError"); };
+  check();
   const ids = [...new Set(pids)];
   if (!ids.length || ids.some(id => !Number.isSafeInteger(id) || id < 1)) throw new Error("Host residency requires actual owned process IDs.");
   const { stdout } = platform === "win32" ? await execute("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-    `$ids=@(${ids.join(",")}); Get-Process -Id $ids -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}' -f $_.Id,$_.WorkingSet64 }`], { timeout: 3000, maxBuffer: 65536 })
-    : await execute("ps", ["-o", "pid=,rss=", "-p", ids.join(",")], { timeout: 3000, maxBuffer: 65536 });
+    `$ids=@(${ids.join(",")}); Get-Process -Id $ids -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}' -f $_.Id,$_.WorkingSet64 }`], { timeout: 3000, maxBuffer: 65536, ...(signal ? { signal } : {}) })
+    : await execute("ps", ["-o", "pid=,rss=", "-p", ids.join(",")], { timeout: 3000, maxBuffer: 65536, ...(signal ? { signal } : {}) });
+  check();
   const observed = new Map<number, number>();
   for (const line of stdout.trim().split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -19,10 +27,15 @@ export async function automationResidentBytes(pids: readonly number[], platform:
     if (!ids.includes(id) || !Number.isSafeInteger(bytes) || bytes < 0 || observed.has(id)) throw new Error("Host RSS measurement lost its owner."); observed.set(id, bytes);
   }
   for (const id of ids) if (!observed.has(id)) {
+    check();
     try { process.kill(id, 0); throw new Error("A live owned process has no residency measurement."); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
   }
-  return [...observed.values()].reduce((sum, value) => sum + value, 0);
+  return { residentBytes: [...observed.values()].reduce((sum, value) => sum + value, 0),
+    requestedProcessCount: ids.length, sampledProcessCount: observed.size };
+}
+export async function automationResidentBytes(pids: readonly number[], platform: NodeJS.Platform = process.platform): Promise<number> {
+  return (await automationResidencySample(pids, platform)).residentBytes;
 }
 /** Cooperative measured admission, not a claim of an OS hard RSS sandbox. */
 export function requireAutomationHeadroom(bytes: number, readings: { residentBytes: number; ceilingBytes: number; freeBytes?: number; heapAvailableBytes?: number }): void {

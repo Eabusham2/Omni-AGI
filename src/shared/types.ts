@@ -2222,6 +2222,8 @@ export interface LiveObservationSessionStartRequest {
 
 export interface LiveObservationPacket {
   sessionId: string;
+  /** Negotiated host revision at the actual capture handoff. */
+  captureRevision?: number;
   modality: LiveObservationModality;
   sequence: number;
   /** Monotonic capture timestamp supplied by the trusted controller. */

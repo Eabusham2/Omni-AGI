@@ -13,7 +13,8 @@ import torch
 
 _ABSENT = object()
 _FIELDS = ("last_generation_cache_mode", "last_generation_stop_reason",
-           "last_generation_tool_observations", "last_generation_neural_state")
+           "last_generation_tool_observations", "last_generation_sensory_observations",
+           "last_generation_observations", "last_generation_neural_state")
 
 
 class CooperativeNativeGeneration:
@@ -38,7 +39,8 @@ class CooperativeNativeGeneration:
         self.cache_owner = [None]
         self.iterator = decoder._generate_scoped_iter(input_ids, **self.options, _cache_owner=self.cache_owner)
         self.metadata = {"last_generation_cache_mode": "not-started", "last_generation_stop_reason": "not-started",
-                         "last_generation_tool_observations": []}
+                         "last_generation_tool_observations": [], "last_generation_sensory_observations": [],
+                         "last_generation_observations": []}
         self.metadata_owners = [owner for owner in decoder.modules()
                                 if owner is decoder or any(hasattr(owner, name) for name in _FIELDS)]
         self.regional_metadata = {id(owner): ({name: getattr(owner, name) for name in _FIELDS if hasattr(owner, name)}

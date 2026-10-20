@@ -2,6 +2,28 @@
   "schemaVersion": 1,
   "tools": [
     {
+      "id": "system.stats", "label": "System statistics", "defaultGrant": "ask",
+      "description": "Read an on-demand bounded snapshot of actual host hardware, memory, process and drive readings through existing permitted readers. Each reading reports observation time, source/scope and availability. No model Load, benchmark, continuous polling, shell execution or grant to protected sensors; unavailable temperatures are not invented.",
+      "actions": {
+        "snapshot": { "input": {}, "output": { "format": "string", "observedAt": "string", "scope": "object", "host": "object", "memory": "object", "loadAverage": "object", "process": "object", "managedFamily": "object", "storage": "object", "devices": "object", "sensors": "object" } }
+      }
+    },
+    {
+      "id": "data.distill-api", "label": "Configured API teacher", "defaultGrant": "ask",
+      "description": "Start or inspect attributable lesson jobs using an explicitly selected configured provider/model and the existing API teacher service. Credentials are entered only in secure app settings, never tool arguments. Provider responses are ordinary native training sources, not a replacement brain or a hidden behavior prompt. Queued is not learned. Pause/Stop preserve committed responses; uncertain provider or learning acknowledgements require exact human review before Retry/Skip and separate Resume, never automatic resend.",
+      "actions": {
+        "providers": { "input": {}, "output": { "providers": "object[]" } },
+        "discover-models": { "input": { "provider": "openai|anthropic|gemini|openrouter|ollama" }, "output": { "provider": "string", "models": "object[]", "generationCompatibilityVerified": "boolean" } },
+        "start": { "input": { "provider": "openai|anthropic|gemini|openrouter|ollama", "model": "string", "prompts": "string[]", "maxOutputTokens": "number?", "responseModalities": "text|image|audio|video[]?" }, "output": { "id": "string", "kind": "string", "state": "string" } },
+        "list": { "input": {}, "output": { "jobs": "object[]" } },
+        "status": { "input": { "jobId": "string" }, "output": { "jobId": "string", "state": "string", "nextIndex": "number", "items": "object[]" } },
+        "pause": { "input": { "jobId": "string" }, "output": { "id": "string", "state": "string" } },
+        "resume": { "input": { "jobId": "string" }, "output": { "id": "string", "state": "string" } },
+        "stop": { "input": { "jobId": "string" }, "output": { "id": "string", "state": "string" } },
+        "resolve-uncertain": { "input": { "jobId": "string", "itemIndex": "number", "decision": "retry|skip" }, "output": { "id": "string", "state": "string" } }
+      }
+    },
+    {
       "id": "brain.substrate", "label": "Native sparse connections", "defaultGrant": "ask",
       "description": "Inspect/export exact committed native sparse neurons, assemblies and ternary contacts with their strengths and learning controls. Prepare append or explicit replace-exact plans and apply the reviewed selected-row preimages at the next loaded writer boundary. Returns a tracked job; queued is not applied. No hidden Load, prompt-text memory, foreign cortex conversion, whole-brain merge, evaluator/origin replacement or inherited authority. Selected task attachments can supply compatible bundles; external provenance stays unverified.",
       "actions": {

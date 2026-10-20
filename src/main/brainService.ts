@@ -156,6 +156,7 @@ import { declaredEnvironmentCapabilityPack } from "./environmentCapabilityPack";
 import { declaredClipboardCapabilityPack } from "./clipboardCapabilityPack";
 import { declaredWebImageCapabilityPack } from "./webImageCapabilityPack";
 import { declaredFileCapabilityPack } from "./fileCapabilityPack";
+import { declaredTeacherStatsCapabilityPack } from "./teacherStatsCapabilityPack";
 import {
   declaredDocumentationCurriculumPack,
   type DocumentationCurriculumPack,
@@ -242,10 +243,12 @@ const CRAWL_DIAGNOSTIC_WINDOW = 32;
 const CRAWL_USER_AGENT = "OmniAGIStudio/1.0 (+local research crawler)";
 const TOOL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
   "system.time": ["now"],
+  "system.stats": ["snapshot"],
   "studio.stopwatch": ["start", "status", "list", "laps", "lap", "pause", "resume", "reset", "performance"],
   "studio.schedule": ["create", "status", "list", "occurrences", "occurrence", "edit", "pause", "resume", "resume-occurrence", "cancel", "signal"],
   "studio.automation": ["list", "status", "export", "runs", "steps", "current-step", "save", "activate", "disable", "run", "pause", "resume", "stop", "approve", "review"],
   "data.learn": ["start", "status", "pause", "resume", "stop", "steer"],
+  "data.distill-api": ["providers", "discover-models", "start", "list", "status", "pause", "resume", "stop", "resolve-uncertain"],
   "data.distill-local": ["selections", "plan", "start", "list", "status", "items", "pause", "resume", "stop"],
   "data.fact-check": ["start", "status", "record", "pause", "resume", "stop", "steer"],
   "system.files": ["list", "read", "write"],
@@ -5019,6 +5022,7 @@ export class BrainService {
     await this.commitSupplementaryCapabilities(brainId, declaredClipboardCapabilityPack(), signal, authorize);
     await this.commitSupplementaryCapabilities(brainId, declaredWebImageCapabilityPack(), signal, authorize);
     await this.commitSupplementaryCapabilities(brainId, declaredFileCapabilityPack(), signal, authorize);
+    await this.commitSupplementaryCapabilities(brainId, declaredTeacherStatsCapabilityPack(), signal, authorize);
     return receipt;
   }
 
@@ -11135,7 +11139,7 @@ export class RuntimeJobManager extends EventEmitter {
         grant: "auto" as const
       }
     ];
-    const worker = await this.engine.request<Record<string, unknown>>(
+    const worker = await this.engine.requestLiveObservation<Record<string, unknown>>(
       "start_observation",
       {
         sessionId,
@@ -11152,6 +11156,7 @@ export class RuntimeJobManager extends EventEmitter {
         retention,
         capture,
         maxPacketBytes: transport.maxPacketBytes,
+        maxInFlight,
         toolSchemas: sessionToolSchemas
       },
       60_000
@@ -11254,6 +11259,9 @@ export class RuntimeJobManager extends EventEmitter {
     }
     if (!record.session.modalities.includes(packet.modality)) {
       throw new Error("The packet modality is not enabled for this session.");
+    }
+    if (packet.captureRevision !== undefined && packet.captureRevision !== record.session.capture.revision) {
+      throw new Error("The live packet belongs to a retired capture revision.");
     }
     if (
       !Number.isSafeInteger(packet.sequence) ||
@@ -11397,7 +11405,7 @@ export class RuntimeJobManager extends EventEmitter {
       "human"
     )[0];
     if (!control) throw new Error("Invalid live observation control request.");
-    await this.engine.request(
+    await this.engine.requestLiveObservation(
       "resolve_observation_control",
       {
         brainId: record.session.brainId,
@@ -11539,7 +11547,7 @@ export class RuntimeJobManager extends EventEmitter {
     control.reason = boundedWorkerText(resolution.reason, 500);
     control.updatedAt = now;
     record.session.updatedAt = now;
-    await this.engine.request(
+    await this.engine.requestLiveObservation(
       "resolve_observation_control",
       {
         brainId: record.session.brainId,
@@ -11671,7 +11679,11 @@ export class RuntimeJobManager extends EventEmitter {
     mimeType: string,
     settings: Record<string, unknown>
   ): Promise<LiveObservationPacketResult> {
-    const worker = await this.engine.request<WorkerObservationResult>(
+    if (record.workerPid !== this.engine.pid || record.session.state !== "active") {
+      return { session: cloneObservationSession(record.session), accepted: false, reason: "session-stopped" };
+    }
+    const expectedHash = createHash("sha256").update(bytes).digest("hex");
+    const worker = await this.engine.requestLiveObservation<WorkerObservationResult>(
       "observe_packet",
       {
         sessionId: record.session.id,
@@ -11682,12 +11694,15 @@ export class RuntimeJobManager extends EventEmitter {
         timestampMs: packet.timestampMs,
         mimeType,
         dataBase64: bytes.toString("base64"),
+        packetSha256: expectedHash,
+        captureRevision: record.session.capture.revision,
+        permissionSha256: sha256(JSON.stringify(["omni-live-permission-v1", record.session.permission.source,
+          record.session.permission.scope, record.session.permission.grantedAt, record.session.permission.deviceIdHash ?? ""])),
         settings
       },
       120_000
     );
     const rawObservation = objectRecord(worker.observation);
-    const expectedHash = createHash("sha256").update(bytes).digest("hex");
     if (
       !rawObservation ||
       rawObservation.packetSha256 !== expectedHash ||
@@ -11703,7 +11718,7 @@ export class RuntimeJobManager extends EventEmitter {
     );
     const controls = this.controlsFromObservationActions(record, actions);
     for (const control of controls) {
-      await this.engine.request(
+      await this.engine.requestLiveObservation(
         "resolve_observation_control",
         {
           brainId: record.session.brainId,
@@ -11925,14 +11940,22 @@ export class RuntimeJobManager extends EventEmitter {
     record.session.state = "stopping";
     record.nativeAudioClaims?.clear();
     record.session.updatedAt = new Date().toISOString();
+    // Retire the native session before awaiting packets: the control lane can
+    // release queued bytes even while the exact reply is still generating.
+    const ownsWorker = (): boolean => record.workerPid !== undefined && record.workerPid === this.engine.pid;
+    if (ownsWorker()) await this.engine.requestLiveObservation(cancelled ? "cancel_observation" : "stop_observation", {
+      sessionId, brainId: record.session.brainId,
+      retireOnly: true,
+      storagePath: this.service.repository.brainDirectory(record.session.brainId)
+    }, 30_000).catch(() => undefined);
     await Promise.allSettled([...record.pending]);
     for (const control of record.controls.values()) {
       if (!["requested", "applied"].includes(control.state)) continue;
       control.state = "cancelled";
       control.reason = "Live observation session ended.";
       control.updatedAt = new Date().toISOString();
-      await this.engine
-        .request(
+      if (ownsWorker()) await this.engine
+        .requestLiveObservation(
           "resolve_observation_control",
           {
             brainId: record.session.brainId,
@@ -11954,7 +11977,7 @@ export class RuntimeJobManager extends EventEmitter {
       });
     }
     try {
-      await this.engine.request(
+      if (ownsWorker()) await this.engine.requestLiveObservation(
         cancelled ? "cancel_observation" : "stop_observation",
         {
           sessionId,

@@ -21,7 +21,8 @@ it("keeps package CI on fixed source contracts and health-only worker paths", as
     "engine/tests/test_native_kernel_packaging_integrity.py",
     "engine/tests/test_retained_context_capacity.py",
     "engine/tests/test_ponder_episode_provenance.py",
-    "engine/tests/test_stdio_shutdown_reserve.py"
+    "engine/tests/test_stdio_shutdown_reserve.py",
+    "engine/tests/test_live_sensory_handoff.py"
   ]);
   expect(manifest.files.every(value => /^[a-f0-9]{64}$/.test(value.sha256))).toBe(true);
   for (const name of ["windows", "macos", "linux", "release"]) {
@@ -51,12 +52,15 @@ it("registers focused chronology, source and surface cases once in reachable bou
     if (typeof command !== "string") throw new Error(`Missing fixed CI selector ${name}`);
     for (const match of command.matchAll(/\bnpm run (test:node[^\s;&]*)/g)) pending.push(match[1]!);
   }
-  expect(visited).toEqual(new Set(["test:node:ci", "test:node:v2:contracts", "test:node:v2:tasks", "test:node:v2:completion"]));
+  expect(visited).toEqual(new Set(["test:node:ci", "test:node:v2:contracts", "test:node:v2:tasks", "test:node:v2:completion", "test:node:v2:integration-gaps"]));
   const selected = [...visited].flatMap(name => document.scripts[name]!.match(/tests\/[A-Za-z0-9_./-]+\.test\.tsx?\b/g) ?? []);
   for (const path of [
     "tests/ponderEpisodeProvenance.test.ts", "tests/chatPonderGroups.test.ts", "tests/chatReplyProjection.test.ts", "tests/conversationNoticePlacement.test.tsx", "tests/responsiveLayout.test.ts",
     "tests/intrinsicImprovementPolicy.test.ts", "tests/learningQuarantine.test.ts", "tests/librarySelection.test.ts", "tests/pluginModuleAuthoring.test.tsx",
-    "tests/taskFolderAttachments.test.ts", "tests/trainingEvolutionWorkspace.test.tsx", "tests/universalSourcePicker.test.tsx"
+    "tests/taskFolderAttachments.test.ts", "tests/trainingEvolutionWorkspace.test.tsx", "tests/universalSourcePicker.test.tsx",
+    "tests/appearanceAuditObservation.test.ts", "tests/teacherStatsTools.test.ts", "tests/apiTeacherToolAuthority.test.ts",
+    "tests/systemStatsService.test.ts", "tests/systemTemperatureReader.test.ts", "tests/automationResidencySample.test.ts",
+    "tests/demoChatTruth.test.ts", "tests/liveObservationBackend.test.ts", "tests/livePerceptionController.test.ts"
   ]) {
     expect(selected.filter(value => value === path), `Focused case must be selected exactly once: ${path}`).toHaveLength(1);
     expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);

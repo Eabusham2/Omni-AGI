@@ -78,13 +78,15 @@ import { declaredClipboardCapabilityPack } from "./clipboardCapabilityPack";
 import type { ClockService } from "./clockService";
 import { createAutomationRuntime } from "./automationRuntime";
 import type { AutomationService } from "./automationService";
-import { automationResidentBytes, requireAutomationHeadroom } from "./automationResources";
+import { automationResidentBytes, automationResidencySample, requireAutomationHeadroom } from "./automationResources";
 import { requireCatalogMemoryHeadroom } from "./catalogMemoryAdmission";
 import { UserQuestionService } from "./userQuestions";
 import { UserQuestionDelivery } from "./userQuestionDelivery";
 import { LearningCoordinator } from "./learningCoordinator";
 import { LocalTeacherService } from "./localTeacherService";
 import { declaredLocalTeacherCapabilityPack } from "./localTeacherCapabilityPack";
+import { declaredTeacherStatsCapabilityPack } from "./teacherStatsCapabilityPack";
+import { readSystemStatsSnapshot } from "./systemStatsService";
 import { localTeacherChildPids } from "./localTeacherRunner";
 import { checkpointLearningBeforeQuit } from "./learningShutdown";
 import { committedNativeLearningTask, factCheckNativeTask, specificLearnNativeTask } from "./learningNativeTask";
@@ -1070,6 +1072,18 @@ async function bootstrap(): Promise<void> {
     plugins
   );
   tools.setRuntimeAdmissionGuard(() => portableWorkspace.assertRuntimeAllowed());
+  tools.setApiTeacherService(teacher);
+  tools.setSystemStatsService({ snapshot: async (id, signal, requireCurrent) => {
+    await requireCurrent(); signal.throwIfAborted();
+    await repository.get(id, false);
+    await catalogAdmission(512 * 1024);
+    await requireCurrent(); signal.throwIfAborted();
+    return readSystemStatsSnapshot({ dataDirectory: repository.brainDirectory(id), signal, requireCurrent,
+      cachedDeviceTelemetry: () => deviceResources.cachedTopologyForDirectory(repository.root),
+      managedFamilyMeasurement: checkedSignal => automationResidencySample(
+        [...app.getAppMetrics().map(metric => metric.pid), process.pid, ...(engine?.managedProcessIds ?? []), ...localTeacherChildPids()],
+        process.platform, checkedSignal) });
+  } });
   tools.setActionReviewer(actionReviewer);
   const runtimeMemory = new PluginRuntimeResources(async id => {
     const brain = await repository.get(id, false), envelope = await resourcePlanner.reviewedRamEnvelope(brain.config);
@@ -1636,6 +1650,7 @@ async function bootstrap(): Promise<void> {
     try {
       const supplement = await learning.installCapabilities(brainId);
       await service.teachSupplementaryCapabilities(brainId, declaredLocalTeacherCapabilityPack(), signal);
+      await service.teachSupplementaryCapabilities(brainId, declaredTeacherStatsCapabilityPack(), signal);
       const clockTeaching = await service.teachSupplementaryCapabilities(brainId, declaredClockCapabilityPack(), signal);
       const actionTeaching = await service.teachSupplementaryCapabilities(brainId, declaredAutomationCapabilityPack(), signal);
       const mapTeaching = await service.teachSupplementaryCapabilities(brainId, declaredMapCapabilityPack(), signal);

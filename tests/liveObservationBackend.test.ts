@@ -45,10 +45,11 @@ function managerWith(
       grant: "auto"
     }
   ]
-): { manager: RuntimeJobManager; request: ReturnType<typeof vi.fn> } {
+): { manager: RuntimeJobManager; request: ReturnType<typeof vi.fn>; liveRequest: ReturnType<typeof vi.fn> } {
   const events = new EventEmitter();
   const request = vi.fn(implementation);
-  const engine = Object.assign(events, { request }) as unknown as EngineSupervisor;
+  const liveRequest = vi.fn(implementation);
+  const engine = Object.assign(events, { request, requestLiveObservation: liveRequest, pid: 4242 }) as unknown as EngineSupervisor;
   const brain = fixtureBrain();
   const service = {
     repository: {
@@ -58,7 +59,7 @@ function managerWith(
     preflightStart: vi.fn(async () => undefined),
     neuralToolSchemas: vi.fn(() => schemas)
   } as unknown as BrainService;
-  return { manager: new RuntimeJobManager(service, engine), request };
+  return { manager: new RuntimeJobManager(service, engine), request, liveRequest };
 }
 
 function startRequest(
@@ -89,6 +90,35 @@ function startRequest(
 }
 
 describe("live observation backend", () => {
+  it("keeps observation control routing separate and retires before waiting on a held packet", async () => {
+    let finishPacket: (() => void) | undefined;
+    const held = new Promise<void>(resolve => { finishPacket = resolve; });
+    const { manager, request, liveRequest } = managerWith(async (method, params) => {
+      if (method === "start_observation") return { capabilities: { imageNeural: true, audioNeural: true, videoNeural: true } };
+      if (method === "observe_packet") {
+        await held;
+        return { observation: { packetSha256: params.packetSha256, rawPacketStored: false,
+          datasetCoverageCommitted: false, sameBrainSharedIdeaSpace: true, hiddenBehavioralPrompt: false } };
+      }
+      if (method === "stop_observation" && params.retireOnly) finishPacket?.();
+      return {};
+    });
+    const session = await manager.startObservation(startRequest());
+    const packet = manager.pushObservation({ sessionId: session.id, modality: "image", sequence: 1,
+      timestampMs: 1, mimeType: "image/png", data: Buffer.from("abc"), captureRevision: session.capture.revision });
+    await vi.waitFor(() => expect(liveRequest).toHaveBeenCalledWith("observe_packet", expect.objectContaining({
+      packetSha256: createHash("sha256").update("abc").digest("hex"), captureRevision: session.capture.revision,
+      permissionSha256: expect.stringMatching(/^[a-f0-9]{64}$/)
+    }), 120_000));
+    await expect(manager.stopObservation(session.id)).resolves.toMatchObject({ state: "stopped" });
+    await packet;
+    expect(liveRequest.mock.calls.map(([method]) => method)).toEqual([
+      "start_observation", "observe_packet", "stop_observation", "stop_observation"
+    ]);
+    expect(liveRequest.mock.calls[2]?.[1]).toMatchObject({ retireOnly: true });
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("derives omitted concurrency from the live envelope but still rejects an unsafe explicit override", async () => {
     const implementation = async (method: string) => method === "start_observation"
       ? { capabilities: { imageNeural: true, audioNeural: true, videoNeural: true } }

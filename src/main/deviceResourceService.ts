@@ -5,6 +5,7 @@ import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import type { EngineRequestContext, EngineSupervisor } from "./engineSupervisor";
 import type { DeviceResourceSettings, DeviceResourceTopology } from "../shared/deviceResources";
+import type { CachedSystemDeviceTelemetry } from "../shared/systemStats";
 import { validateDeviceResourceTopology } from "./deviceResourcePlan";
 import type { SpillPoolAuthority, SpillPoolSelection } from "./spillPoolAuthority";
 
@@ -65,6 +66,23 @@ export class DeviceResourceService {
 
   async topology(request: DeviceTopologyRequest = {}): Promise<DeviceResourceTopology> {
     return this.collectTopology(request);
+  }
+
+  /** Exact existing pool-owner cache only. Never discover, refresh or start a worker. */
+  cachedTopologyForDirectory(directory: string): CachedSystemDeviceTelemetry | undefined {
+    if (!isAbsolute(directory) || directory.includes("\0")) return undefined;
+    let latest: DeviceResourceTopology | undefined;
+    for (const [key, snapshot] of this.snapshots) {
+      const directories = JSON.parse(key) as string[];
+      if (directories[0] !== directory) continue;
+      if (!latest || Date.parse(snapshot.measuredAt) > Date.parse(latest.measuredAt)) latest = snapshot;
+    }
+    if (!latest) return undefined;
+    return { measuredAt: latest.measuredAt, devices: latest.devices.flatMap(device => device.kind === "storage" ? [] : [{
+      id: device.id, label: device.label, kind: device.kind, backend: device.backend, memoryGroupId: device.memoryGroupId,
+      totalBytes: device.totalBytes, availableBytes: device.availableBytes, allocatedBytes: device.allocatedBytes,
+      reservedBytes: device.reservedBytes, unifiedMemory: device.unifiedMemory
+    }]) };
   }
 
   /** Same loaded pipe and serial guard, not the general worker-starting discovery path. */

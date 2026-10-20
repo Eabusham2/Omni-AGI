@@ -1,4 +1,4 @@
-"""Serial neural stdio dispatch with one narrow, flags-only control lane."""
+"""Serial neural dispatch with a narrow metadata/flags-only control lane."""
 import json
 import os
 import queue
@@ -257,7 +257,7 @@ def serve_worker_stdio(worker, stream, send, available_memory, rpc_fault_type,
                     continue
                 receipt = RequestAllocationReceipt([raw_lease, decode_lease])
                 if isinstance(request, dict): request = AdmittedRequest(request, receipt)
-                if isinstance(request, dict) and request.get("method") in {"cancel_inline_generation", "steer_chat", "suspend_chat", "instance_status", "inherited_execution_presentation", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status", "router_activity_control", "decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop", "mcp_sampling_enqueue", "mcp_sampling_status", "mcp_sampling_cancel", "mcp_sampling_consume"}:
+                if isinstance(request, dict) and request.get("method") in {"cancel_inline_generation", "steer_chat", "suspend_chat", "instance_status", "inherited_execution_presentation", "resolve_codec_runtime", "cancel_artifact_request", "observe_chat_action", "authorize_inline_imagination", "inline_generation_status", "router_activity_control", "decoder_execution_status", "decoder_execution_stop", "cached_decoder_execution_status", "cached_decoder_execution_stop", "native_operation_auto_status", "native_operation_auto_plans", "native_operation_auto_stop", "mcp_sampling_enqueue", "mcp_sampling_status", "mcp_sampling_cancel", "mcp_sampling_consume", "enqueue_live_observation"}:
                     # dispatch_control validates the exact ownership tuple and
                     # cannot execute/load/save a brain or alter chat cancellation.
                     dispatch(request, receipt, control=True)

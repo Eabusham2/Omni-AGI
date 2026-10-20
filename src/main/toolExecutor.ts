@@ -90,6 +90,8 @@ import { htmlImageCandidates, searchImageCandidates } from "./webImageReferences
 import { ActionReviewer, actionReviewerProposalSha256, type ActionReviewerProposal } from "./actionReviewer";
 import type { ActionReviewerApprovalReview } from "../shared/actionReviewer";
 import type { HostActionOriginAuthority } from "../shared/hostActionAuthority";
+import { checkedApiTeacherToolCommand, executeApiTeacherTool, type ApiTeacherToolService } from "./apiTeacherTool";
+import type { SystemStatsSnapshot } from "../shared/systemStats";
 
 export interface ExternalToolBridge {
   hasTool(toolId: string): boolean;
@@ -374,6 +376,7 @@ function riskyInvocation(toolId: string, action: string): boolean {
     ["system.shell", "windows.powershell"].includes(toolId) ||
     toolId === "code.execute" ||
     (toolId === "data.distill-local" && ["start", "resume"].includes(action)) ||
+    (toolId === "data.distill-api" && ["start", "resume", "discover-models"].includes(action)) ||
     (toolId === "brain.substrate" && action === "apply") ||
     (toolId === "system.clipboard" && ["read", "write", "clear"].includes(action)) ||
     (toolId === "system.memory" && ["attach", "regions", "read", "write"].includes(action)) ||
@@ -719,6 +722,10 @@ export class ToolExecutor {
   setClockService(clock: import("./clockService").ClockService): void { this.clockService = clock; }
   private learningCoordinator?: LearningCoordinator;
   private localTeacherService?: import("./localTeacherService").LocalTeacherToolService;
+  private apiTeacherService?: ApiTeacherToolService;
+  private systemStatsService?: { snapshot(brainId: string, signal: AbortSignal, requireCurrent: () => Promise<void>): Promise<SystemStatsSnapshot> };
+  setApiTeacherService(service: ApiTeacherToolService): void { this.apiTeacherService = service; }
+  setSystemStatsService(service: NonNullable<ToolExecutor["systemStatsService"]>): void { this.systemStatsService = service; }
   private sparseSubstrateService?: Pick<import("./sparseSubstrateTransferService").SparseSubstrateTransferService, "execute"> &
     Partial<Pick<import("./sparseSubstrateTransferService").SparseSubstrateTransferService, "authorityChanged">>;
   setSparseSubstrateService(service: NonNullable<ToolExecutor["sparseSubstrateService"]>): void { this.sparseSubstrateService = service; }
@@ -769,6 +776,7 @@ export class ToolExecutor {
   /** Registration retirement is not a permission preference change. */
   retireToolProtocols(brainId: string, toolIds: readonly string[]): void {
     const retired = new Set(toolIds);
+    if (retired.has("data.distill-api")) this.apiTeacherService?.invalidateToolAuthority(brainId);
     for (const toolId of retired) this.revokeApprovals(brainId, toolId);
     for (const execution of this.activeExecutions.values()) {
       if (execution.brainId === brainId && [...execution.permissionToolIds].some(id => retired.has(id))) {
@@ -801,6 +809,7 @@ export class ToolExecutor {
     private readonly customTools?: CustomToolResolver
   ) {
     this.service.onToolPermissionChanged?.(({ brainId, toolId }) => {
+      if (toolId === "data.distill-api") this.apiTeacherService?.invalidateToolAuthority(brainId);
       // Approval tokens are host authority, not neural state. Invalidate them
       // immediately on every policy revision; Off -> Ask can never resurrect
       // a token minted before the revocation.
@@ -839,6 +848,7 @@ export class ToolExecutor {
     // Imported brains can still emit historical protocol IDs. Canonicalize
     // once before permission, approval, execution, result, and learning audit
     // so aliases cannot leak back into new visible/deep experience.
+    if (invocation.toolId === "data.distill-api") checkedApiTeacherToolCommand(invocation.action, invocation.arguments);
     invocation = structuredClone(canonicalSystemInvocation(invocation));
     const id = randomUUID();
     const startedAt = new Date().toISOString();
@@ -996,8 +1006,9 @@ export class ToolExecutor {
       // Require the exact one-use ToolExecutor approval even when the current
       // outer (or plugin-nested) policy is Auto or Full.
       const requiresExplicitHumanReview =
-        effectiveInvocation.toolId === "studio.automation" &&
-        ["review", "approve"].includes(effectiveInvocation.action);
+        (effectiveInvocation.toolId === "studio.automation" &&
+          ["review", "approve"].includes(effectiveInvocation.action)) ||
+        (effectiveInvocation.toolId === "data.distill-api" && effectiveInvocation.action === "resolve-uncertain");
       const policyNeedsApproval =
         requiresExplicitHumanReview ||
         (permission === "ask" && !autonomousEvolutionExperiment) ||
@@ -1356,6 +1367,15 @@ export class ToolExecutor {
         if (!this.clockService) throw new Error("Host clocks and schedules are unavailable.");
         return this.clockService.execute(invocation.brainId, invocation.toolId, invocation.action,
           invocation.arguments, policyDecisionId ?? randomUUID(), signal);
+      case "system.stats":
+        if (!this.systemStatsService || !requireCurrentPermission) throw new Error("Read-only system statistics are unavailable.");
+        if (invocation.action !== "snapshot" || Object.keys(invocation.arguments).length)
+          throw new Error("System statistics accepts only a snapshot with no paths, shell commands or device grants.");
+        return this.systemStatsService.snapshot(invocation.brainId, signal, requireCurrentPermission);
+      case "data.distill-api":
+        if (!this.apiTeacherService || !detachedAuthority) throw new Error("API teacher jobs are unavailable.");
+        return executeApiTeacherTool(this.apiTeacherService, invocation.brainId,
+          checkedApiTeacherToolCommand(invocation.action, invocation.arguments), policyDecisionId ?? requestId, signal, detachedAuthority);
       case "data.distill-local": {
         const teacher = this.localTeacherService; if (!teacher) throw new Error("Local GGUF teacher jobs are unavailable.");
         const args = invocation.arguments, brainId = invocation.brainId; signal.throwIfAborted();

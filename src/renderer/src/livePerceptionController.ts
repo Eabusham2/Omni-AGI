@@ -310,6 +310,8 @@ export function planLivePerception(input: LivePerceptionPlanInput): LivePercepti
 
 export interface LivePerceptionCapturePacket {
   modality: LiveObservationModality;
+  /** Source revision when encoding began; stale continuous frames are retired. */
+  captureRevision?: number;
   timestampMs: number;
   mimeType: string;
   data: Uint8Array;
@@ -953,6 +955,7 @@ export class LivePerceptionController {
       if (!session || session.state !== "active") throw abortError();
       const result = await this.options.modality.pushObservation({
         sessionId: session.id,
+        captureRevision: session.capture.revision,
         modality: captured.modality,
         sequence: ++this.sequence,
         timestampMs: captured.timestampMs,
@@ -978,12 +981,17 @@ export class LivePerceptionController {
     ) {
       return;
     }
+    if (captured.captureRevision !== undefined && captured.captureRevision !== this.state.negotiatedCapture?.revision) {
+      this.patch({ localPacketsDropped: this.state.localPacketsDropped + 1 });
+      return;
+    }
     if (this.localInFlight >= session.maxInFlight) {
       this.patch({ localPacketsDropped: this.state.localPacketsDropped + 1 });
       return;
     }
     const packet: LiveObservationPacket = {
       sessionId: session.id,
+      captureRevision: session.capture.revision,
       modality: captured.modality,
       sequence: ++this.sequence,
       timestampMs: captured.timestampMs,
@@ -1467,6 +1475,7 @@ export function createBrowserLivePerceptionCapture(
             modality: "video",
             timestampMs: now(),
             mimeType: blob.type || "image/jpeg",
+            captureRevision: capture.revision,
             data: new Uint8Array(await blob.arrayBuffer()),
             settings: { width: capture.width, height: capture.height }
           };
@@ -1548,6 +1557,7 @@ export function createBrowserLivePerceptionCapture(
               const recordClip = (): void => {
                 if (stopped) return;
                 const chunks: Blob[] = [];
+                const capturedRevision = activeCapture.revision;
                 const recorder = audioMimeType
                   ? new Recorder(audioStream, { mimeType: audioMimeType })
                   : new Recorder(audioStream);
@@ -1566,6 +1576,7 @@ export function createBrowserLivePerceptionCapture(
                       const settings = audioTracks[0]?.getSettings();
                       listener({
                         modality: "audio",
+                        captureRevision: capturedRevision,
                         timestampMs: now(),
                         mimeType: blob.type,
                         data: new Uint8Array(buffer),

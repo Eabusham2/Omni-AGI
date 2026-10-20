@@ -87,7 +87,8 @@ def select_candidate(candidates: list[dict]) -> tuple[int, dict]:
 def run_best_work(*, seed: int, ordinary_temperature: float, normalized_entropy: float,
                   exploration_budget: int, start: Callable, finish: Callable,
                   cancelled: Callable[[], bool], steered: Callable[[], bool],
-                  progress: Callable[[dict], None] | None = None) -> dict:
+                  progress: Callable[[dict], None] | None = None,
+                  world_boundary: Callable[[], None] | None = None) -> dict:
     """Run resource-admitted branches with one safe advance per round.
 
     ``start`` owns admission and returns (private session, branch metadata,
@@ -139,6 +140,8 @@ def run_best_work(*, seed: int, ordinary_temperature: float, normalized_entropy:
         if reason:
             terminal_reason = reason
             return {"interrupted": reason, "candidates": [], "selection": None, "admittedBranches": 0}
+        if world_boundary is not None:
+            world_boundary()
         admit(ordinary_temperature, True)
         expand(desired)
         while active:
@@ -148,6 +151,11 @@ def run_best_work(*, seed: int, ordinary_temperature: float, normalized_entropy:
                 if reason:
                     terminal_reason = reason
                     return {"interrupted": reason, "candidates": completed, "selection": None, "admittedBranches": next_index}
+                # No private cache/pager/context is entered here. The actual
+                # world owner may admit new input even during a long search;
+                # candidates never receive this callback or its inbox.
+                if world_boundary is not None:
+                    world_boundary()
                 try:
                     event = session.advance()
                 except Exception as error:

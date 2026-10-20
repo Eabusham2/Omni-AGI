@@ -344,6 +344,20 @@ describe("LivePerceptionController", () => {
     expect(live.controller.getState().error).not.toMatch(/IPC|remote method|maxInFlight/);
   });
 
+  it("drops a frame from an obsolete capture revision before host delivery", async () => {
+    const live = harness();
+    await start(live);
+    const revision = live.controller.getState().session!.capture.revision;
+    const packet = { modality: "video" as const, timestampMs: 42, mimeType: "image/jpeg", data: new Uint8Array([1]) };
+    live.emitPacket({ ...packet, captureRevision: revision + 1 });
+    expect(live.modality.pushObservation).not.toHaveBeenCalled();
+    expect(live.controller.getState().localPacketsDropped).toBe(1);
+    live.emitPacket({ ...packet, captureRevision: revision });
+    await vi.waitFor(() => expect(live.modality.pushObservation).toHaveBeenCalledOnce());
+    expect(live.modality.pushObservation.mock.calls[0]![0]).toMatchObject({ captureRevision: revision, sequence: 1 });
+    await live.controller.stop();
+  });
+
   it("pushes ordinary packets with bounded local pressure and surfaces organic actions", async () => {
     const live = harness();
     await start(live);

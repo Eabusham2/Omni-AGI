@@ -48,7 +48,8 @@ class NativeGenerationCursor:
             int(last_text_boundary), int(emission_start), int(token_budget), dict(options),
             {name: getattr(decoder, name) for name in (
                 "last_generation_cache_mode", "last_generation_stop_reason",
-                "last_generation_tool_observations", "last_generation_neural_state") if hasattr(decoder, name)},
+                "last_generation_tool_observations", "last_generation_sensory_observations",
+                "last_generation_observations", "last_generation_neural_state") if hasattr(decoder, name)},
             resumed_conditioning, int(window_start))
 
     def restore_boundaries(self):

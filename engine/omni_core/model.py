@@ -5188,6 +5188,8 @@ class OmniDecoder(nn.Module):
         emission_start = last_text_boundary
         token_budget = max(1, int(max_new_tokens))
         self.last_generation_tool_observations = []
+        self.last_generation_sensory_observations = []
+        self.last_generation_observations = []
         resumed_conditioning = None
         window_start = 0
 
@@ -5212,11 +5214,18 @@ class OmniDecoder(nn.Module):
         while generated.shape[1] - input_ids.shape[1] < token_budget:
             step = int(generated.shape[1] - input_ids.shape[1])
             if suspension_check is not None and suspension_check():
+                # Ponder/search may already have admitted sensory input
+                # before any real forward. Persist its exact bias+proof, not
+                # a process-local consumer or a callback to replay a frame.
+                retained_conditioning = resumed_conditioning
+                take_pending = getattr(conditioning_callback, "suspension_conditioning", None)
+                if retained_conditioning is None and callable(take_pending):
+                    retained_conditioning = take_pending(memory_bias) or None
                 raise NativeGenerationSuspended(NativeGenerationCursor.capture(generated=generated,
                     input_length=input_ids.shape[1], memory_bias=memory_bias, cache=inference_cache,
                     entropies=entropies, generator=generator, text_boundaries=text_boundaries,
                     last_text_boundary=last_text_boundary, emission_start=emission_start, token_budget=token_budget,
-                    options=sampling_options, decoder=self, resumed_conditioning=resumed_conditioning, window_start=window_start))
+                    options=sampling_options, decoder=self, resumed_conditioning=retained_conditioning, window_start=window_start))
             if steer_check is not None and steer_check():
                 self.last_generation_stop_reason = "steered"
                 break
@@ -5257,8 +5266,10 @@ class OmniDecoder(nn.Module):
                                       else "incremental-v1" if cache is not None else "full-prefix-fallback")
                 # Genuine caller boundary ONCE, never in private trials.
                 for binding in pending_observation_bindings:
-                    self.last_generation_tool_observations.append({**dict(binding),
-                        "generationStep": int(step), "tokenOffset": int(step), "nativeDecodingUsed": True})
+                    observed = {**dict(binding), "generationStep": int(step), "tokenOffset": int(step), "nativeDecodingUsed": True}
+                    self.last_generation_observations.append(observed)
+                    target = self.last_generation_sensory_observations if binding.get("observationKind") == "live-sensory" else self.last_generation_tool_observations
+                    target.append(observed)
                 if self.last_generation_cache_mode == "not-started": self.last_generation_cache_mode = cache_mode
                 elif self.last_generation_cache_mode != cache_mode: self.last_generation_cache_mode = "mixed"
                 if cancelled():

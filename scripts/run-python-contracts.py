@@ -22,6 +22,7 @@ FILES = (
     "engine/tests/test_retained_context_capacity.py",
     "engine/tests/test_ponder_episode_provenance.py",
     "engine/tests/test_stdio_shutdown_reserve.py",
+    "engine/tests/test_live_sensory_handoff.py",
 )
 FORBIDDEN = ("torch", "tensorflow", "jax", "mlx", "transformers", "safetensors", "omni_core")
 

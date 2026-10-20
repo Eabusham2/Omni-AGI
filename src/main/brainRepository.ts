@@ -598,11 +598,13 @@ export interface ImmutableOriginStorageReport {
 
 export const DEFAULT_TOOL_PERMISSIONS: ToolPermissionRecord[] = [
   "system.time",
+  "system.stats",
   "studio.stopwatch",
   "studio.schedule",
   "studio.automation",
   "studio.artifact",
   "data.learn",
+  "data.distill-api",
   "data.fact-check",
   "system.files",
   "studio.clipboard",

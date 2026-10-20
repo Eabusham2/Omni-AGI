@@ -80,6 +80,81 @@ function inspectionSupervisorWith(worker: FakeWorker): EngineSupervisor {
 }
 
 describe("EngineSupervisor interruption", () => {
+  it("delivers live capture on the exact held reply owner without early completion or a replacement worker", async () => {
+    const worker = new FakeWorker(), supervisor = supervisorWith(worker);
+    const consume = (result: unknown, index: number): void => {
+      const request = JSON.parse(String(worker.stdin.write.mock.calls[index]?.[0])) as { id: string };
+      (supervisor as unknown as { consumeLine(line: string): void }).consumeLine(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+    };
+    let chatSettled = false, packetSettled = false;
+    const chat = supervisor.request("chat", { brainId: "live-brain", streamId: "live-turn" }, ENGINE_REQUEST_NO_DEADLINE, undefined, "foreground", { requestId: "live-turn", owner: "chat", label: "Live capture fixture", turnId: "live-turn" })
+      .then(result => { chatSettled = true; return result; });
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledOnce());
+    const packet = supervisor.requestLiveObservation("observe_packet", {
+      brainId: "live-brain", sessionId: "live-session", sequence: 2, mimeType: "image/png", dataBase64: "YWJj"
+    }).then(result => { packetSettled = true; return result; });
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(String(worker.stdin.write.mock.calls[1]?.[0]))).toMatchObject({ method: "enqueue_live_observation", params: {
+      brainId: "live-brain", streamId: "live-turn", operation: "observe_packet", payload: { sessionId: "live-session", sequence: 2 }
+    } });
+    expect(packetSettled).toBe(false); expect(chatSettled).toBe(false);
+    const stop = supervisor.requestLiveObservation("stop_observation", { brainId: "live-brain", sessionId: "live-session", retireOnly: true });
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledTimes(3));
+    consume({ state: "stopping" }, 2);
+    await expect(stop).resolves.toMatchObject({ state: "stopping" });
+    expect(packetSettled).toBe(false); expect(chatSettled).toBe(false);
+    consume({ error: "inert retired packet" }, 1); await packet;
+    consume({ committed: true }, 0); await chat;
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it("rejects live capture for stale or absent worker custody without starting or killing a worker", async () => {
+    const worker = new FakeWorker(), supervisor = supervisorWith(worker);
+    const chat = supervisor.request("chat", { brainId: "live-brain", streamId: "live-turn" }, ENGINE_REQUEST_NO_DEADLINE, undefined, "foreground", { requestId: "live-turn", owner: "chat", label: "Live capture fixture", turnId: "live-turn" });
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledOnce());
+    await expect(supervisor.requestLiveObservation("observe_packet", { brainId: "another-brain" }))
+      .rejects.toThrow("exact loaded reply worker");
+    expect(worker.stdin.write).toHaveBeenCalledOnce();
+    const request = JSON.parse(String(worker.stdin.write.mock.calls[0]?.[0])) as { id: string };
+    (supervisor as unknown as { consumeLine(line: string): void }).consumeLine(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }));
+    await chat;
+    const internals = supervisor as unknown as { child: unknown };
+    internals.child = undefined;
+    const normalRequest = vi.spyOn(supervisor, "request");
+    await expect(supervisor.requestLiveObservation("stop_observation", { brainId: "live-brain" })).rejects.toThrow("existing loaded neural worker");
+    expect(normalRequest).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it("revalidates live capture ownership after preparing verified compressed-media runtime", async () => {
+    const worker = new FakeWorker(), supervisor = supervisorWith(worker);
+    const chat = supervisor.request("chat", { brainId: "live-brain", streamId: "live-turn" }, ENGINE_REQUEST_NO_DEADLINE, undefined, "foreground", { requestId: "live-turn", owner: "chat", label: "Live capture fixture", turnId: "live-turn" });
+    await vi.waitFor(() => expect(worker.stdin.write).toHaveBeenCalledOnce());
+    let releasePreparation: (() => void) | undefined;
+    const preparation = new Promise<void>(resolve => { releasePreparation = resolve; });
+    const internals = supervisor as unknown as {
+      activeRequest: unknown;
+      prepareRequestedVideoRuntime(...args: unknown[]): Promise<void>;
+    };
+    const original = internals.activeRequest;
+    const prepare = vi.spyOn(internals, "prepareRequestedVideoRuntime").mockImplementation(async (...args) => {
+      await preparation;
+      await (args[2] as (configuration: Record<string, unknown>) => Promise<void>)({ verified: "inert codec metadata" });
+    });
+    const packet = supervisor.requestLiveObservation("observe_packet", { brainId: "live-brain", mimeType: "audio/webm" });
+    const outcome = expect(packet).rejects.toThrow("exact loaded reply worker");
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    internals.activeRequest = undefined;
+    releasePreparation?.();
+    await outcome;
+    internals.activeRequest = original;
+    expect(worker.stdin.write).toHaveBeenCalledOnce();
+    const request = JSON.parse(String(worker.stdin.write.mock.calls[0]?.[0])) as { id: string };
+    (supervisor as unknown as { consumeLine(line: string): void }).consumeLine(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }));
+    await chat;
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
   it("uses flags-only lifecycle controls beside an active chat without releasing or cancelling that turn", async () => {
     const worker = new FakeWorker(), supervisor = supervisorWith(worker);
     const consume = (result: unknown, index: number) => {

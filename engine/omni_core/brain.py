@@ -14724,12 +14724,16 @@ class AdaptiveBrain:
         return scores, actions
 
     @torch.no_grad()
-    def _generation_observation_callback(self, provider):
+    def _generation_observation_callback(self, provider, episode_assembly_id="", *, sensory_boundary=None):
         """Current external evidence enters shared native vectors, not prose."""
-        def integrate(current, observations):
-            bindings = []
-            refined = current
+        def integrate(current, observations, step):
+            bindings, refined = [], current
             try:
+                live = getattr(provider, "live_sensory_conditioning", None)
+                sensory = (sensory_boundary.condition(current, step) if sensory_boundary is not None else
+                    live(current, step, episode_assembly_id) if callable(live) else {})
+                bindings = list(sensory.get("observationBindings", []))
+                refined = sensory.get("memoryBias", current)
                 for observation in observations:
                     text = observation["payloadJson"]
                     image_receipt = None
@@ -14779,9 +14783,11 @@ class AdaptiveBrain:
                     if callable(release): release()
             return {"memoryBias": refined, "observationBindings": bindings} if bindings else {}
         def callback(current, step):
-            return integrate(current, provider())
+            return integrate(current, provider(), step)
         if callable(getattr(provider, "wait_pending", None)):
-            callback.wait_for_evidence = lambda current, step: integrate(current, provider.wait_pending())
+            callback.wait_for_evidence = lambda current, step: integrate(current, provider.wait_pending(), step)
+        if sensory_boundary is not None:
+            callback.suspension_conditioning = sensory_boundary.condition_pending
         return callback
 
     @torch.no_grad()
@@ -14802,6 +14808,7 @@ class AdaptiveBrain:
         self_activity_observer: Optional[Callable[[torch.Tensor, Mapping[str, Any]], None]] = None,
         continuation_state: Optional[Mapping[str, Any]] = None,
         suspension_check: Optional[Callable[[], bool]] = None,
+        sensory_boundary=None,
     ) -> Callable[[torch.Tensor, int, float], Dict[str, Any]]:
         """Reevaluate native action heads from every actual prefix state.
 
@@ -14848,6 +14855,7 @@ class AdaptiveBrain:
                             noise=float(live_organic.get("organicNoise", 0.0)),
                             cancel_check=cancel_check, steer_check=steer_check,
                             suspension_check=suspension_check,
+                            sensory_boundary=sensory_boundary,
                             progress_callback=progress_callback or ((lambda progress: emit("cognition-progress", progress)) if emit is not None else None),
                         )
                         ponder_trace["phase"] = "mid-generation" if step else "pre-speech"
@@ -14931,6 +14939,7 @@ class AdaptiveBrain:
         transition_callback: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
         completion_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         suspension_check: Optional[Callable[[], bool]] = None,
+        sensory_boundary=None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Refine this turn's latent memory after a learned Ponder proposal.
 
@@ -14970,6 +14979,28 @@ class AdaptiveBrain:
             if suspension_check is not None and suspension_check(): return "suspended"
             return None
 
+        def sensory_step():
+            nonlocal current, refined, anchor, liquid_state, membrane, spike_count
+            if sensory_boundary is None or not sensory_boundary.has_pending():
+                return
+            # Ponder's scratch router is not the actual observation owner.
+            # Restore that owner before admission; afterward preserve its NEW
+            # baseline, so finally never undoes an admitted world observation.
+            scratch_membrane = self.router.population.membrane.detach().clone()
+            scratch_spikes = self.router.population.spike_count.detach().clone()
+            self.router.population.membrane.copy_(membrane)
+            self.router.population.spike_count.copy_(spike_count)
+            received = sensory_boundary.poll(refined, passes)
+            if received.get("observationBindings"):
+                membrane = self.router.population.membrane.detach().clone()
+                spike_count = self.router.population.spike_count.detach().clone()
+                current = refined = received["memoryBias"].detach()
+                anchor = current + exploration
+                liquid_state = self.liquid_state.detach().clone()
+            else:
+                self.router.population.membrane.copy_(scratch_membrane)
+                self.router.population.spike_count.copy_(scratch_spikes)
+
         try:
             if progress_callback is not None:
                 progress_callback({"phase": "ponder", "active": True, "passes": 0, "elapsedMs": 0.})
@@ -14981,6 +15012,7 @@ class AdaptiveBrain:
                 if readings.get("diskPressure") or readings.get("memoryPressure"):
                     stop_reason = "resource-pressure"
                     break
+                sensory_step()
                 if self.config.liquid_dynamics:
                     liquid_state, controls = self.liquid(
                         current, state=liquid_state, elapsed=1.0
@@ -15787,6 +15819,10 @@ class AdaptiveBrain:
             weight * value for weight, value in components
         )
         internal_memory = self.idea_adapter(combined_memory)
+        from .live_sensory_conditioning import SensoryTurnBoundary
+        sensory_boundary = SensoryTurnBoundary(tool_observation_provider,
+            experience.get("assembly_id", experience.get("idea_id", ""))) if callable(
+                getattr(tool_observation_provider, "live_sensory_conditioning", None)) else None
 
         if seed is None:
             seed_material = (
@@ -15996,6 +16032,7 @@ class AdaptiveBrain:
                         noise=organic_noise,
                         cancel_check=cancel_check, steer_check=steer_check,
                         suspension_check=suspension_check,
+                        sensory_boundary=sensory_boundary,
                         progress_callback=(lambda progress: stream_callback("cognition-progress", progress)) if stream_callback is not None else None,
                     )
                 observe_self_activity(internal_memory, native_ponder_trace)
@@ -16093,6 +16130,7 @@ class AdaptiveBrain:
                 seed=branch_seed, cancel_check=cancel_check, steer_check=steer_check,
                 emit=stream_callback, self_activity_observer=observe_self_activity,
                 suspension_check=suspension_check,
+                sensory_boundary=sensory_boundary,
             )
             try:
                 candidate, branch_entropies = self.decoder.generate(
@@ -16108,7 +16146,7 @@ class AdaptiveBrain:
                     steer_check=steer_check,
                     activity_callback=branch_activity,
                     token_callback=stream_token if stream_callback is not None else None,
-                    conditioning_callback=self._generation_observation_callback(tool_observation_provider)
+                    conditioning_callback=self._generation_observation_callback(tool_observation_provider, experience.get("assembly_id", experience.get("idea_id", "")), sensory_boundary=sensory_boundary)
                         if tool_observation_provider is not None else None,
                     suspension_check=suspension_check,
                     allow_cached_execution=True,
@@ -16197,9 +16235,16 @@ class AdaptiveBrain:
                         for action in metadata["ledger"].actions.values() if action.get("kind") == "tool"],
                     "nativeStopReason": session.stop_reason}
 
+            def sensory_search_boundary():
+                nonlocal internal_memory
+                if sensory_boundary is not None:
+                    received = sensory_boundary.poll(internal_memory, 0)
+                    internal_memory = received.get("memoryBias", internal_memory)
+
             searched = run_best_work(seed=int(seed), ordinary_temperature=self.config.temperature,
                 normalized_entropy=initial_search_entropy, exploration_budget=self.config.best_work_exploration_branches,
                 start=start_branch, finish=finish_branch,
+                world_boundary=sensory_search_boundary,
                 cancelled=cancel_check or (lambda: False), steered=steer_check or (lambda: False),
                 progress=(lambda progress: stream_callback("cognition-progress", progress)) if stream_callback is not None else None)
             cancellation_boundary()
@@ -16275,6 +16320,7 @@ class AdaptiveBrain:
                 cancel_check=cancel_check, steer_check=steer_check,
                 self_activity_observer=observe_self_activity,
                 suspension_check=suspension_check,
+                sensory_boundary=sensory_boundary,
             )
             try:
                 replayed, replay_entropies = (prompt_ids, []) if private_generation_steered else self.decoder.generate(
@@ -16290,7 +16336,7 @@ class AdaptiveBrain:
                     cancelled=cancel_check,
                     activity_callback=replay_activity,
                     steer_check=steer_check,
-                    conditioning_callback=self._generation_observation_callback(tool_observation_provider)
+                    conditioning_callback=self._generation_observation_callback(tool_observation_provider, experience.get("assembly_id", experience.get("idea_id", "")), sensory_boundary=sensory_boundary)
                         if tool_observation_provider is not None else None,
                     suspension_check=suspension_check,
                 )
@@ -16298,7 +16344,7 @@ class AdaptiveBrain:
                 return suspend_visible_generation(suspended.cursor, locals(), ledger=emission_ledger, activity=replay_activity,
                     organic=selected["activityOrganic"], initial=selected["initialActions"], phase="selected-replay")
             cancellation_boundary()
-            observation_uses = list(getattr(self.decoder, "last_generation_tool_observations", []))
+            observation_uses = list(getattr(self.decoder, "last_generation_observations", []))
             comparison_end = prompt_ids.shape[1] + min((int(item["generationStep"]) for item in observation_uses),
                                                        default=max(replayed.shape[1], generated.shape[1]))
             replay_matches = torch.equal(replayed[:, :comparison_end], generated[:, :comparison_end]) if observation_uses \
@@ -16348,6 +16394,10 @@ class AdaptiveBrain:
                 pressure("chat", reclaim=self._release_training_allocator_cache)
             return bool(original_cancel is not None and original_cancel())
         cancel_check = checked_cancel
+        from .live_sensory_conditioning import SensoryTurnBoundary
+        sensory_boundary = SensoryTurnBoundary(tool_observation_provider,
+            context["experience"].get("assembly_id", context["experience"].get("idea_id", ""))) if callable(
+                getattr(tool_observation_provider, "live_sensory_conditioning", None)) else None
         def observe(vector, observation):
             prior = context["ponder_activity_vector"]
             current = vector.detach()
@@ -16357,7 +16407,7 @@ class AdaptiveBrain:
             assembly_ids=assemblies, organic_state=continuation["organic"], action_cue=continuation["actionCue"], ledger=ledger,
             seed=cursor.options["seed"], cancel_check=cancel_check, steer_check=steer_check,
             emit=stream_callback, self_activity_observer=observe, continuation_state=continuation["activity"],
-            suspension_check=suspension_check)
+            suspension_check=suspension_check, sensory_boundary=sensory_boundary)
         started = time.perf_counter()
         context["generation_started_at"] = started - continuation["generationElapsedSeconds"]
         streamed = continuation["streamedTokens"]
@@ -16381,7 +16431,8 @@ class AdaptiveBrain:
                 seed=cursor.options["seed"], printable_only=cursor.options["printable_only"], use_cache=cursor.options["use_cache"],
                 cancelled=cancel_check, steer_check=steer_check, activity_callback=activity,
                 token_callback=stream_token if stream_callback is not None else None,
-                conditioning_callback=self._generation_observation_callback(tool_observation_provider) if tool_observation_provider is not None else None,
+                conditioning_callback=self._generation_observation_callback(tool_observation_provider,
+                    context["experience"].get("assembly_id", context["experience"].get("idea_id", "")), sensory_boundary=sensory_boundary) if tool_observation_provider is not None else None,
                 suspension_check=suspension_check, resume_cursor=cursor)
         except NativeGenerationSuspended as suspended:
             if suspend_callback is None:
@@ -16408,7 +16459,7 @@ class AdaptiveBrain:
                 "activityOrganic": continuation["organic"]}]
         else:
             selected = context["candidates"][context["selected_branch"]]
-            observations = list(getattr(self.decoder, "last_generation_tool_observations", []))
+            observations = list(getattr(self.decoder, "last_generation_observations", []))
             end = context["prompt_ids"].shape[1] + min((int(item["generationStep"]) for item in observations),
                 default=max(generated.shape[1], selected["tensor"].shape[1]))
             matches = torch.equal(generated[:, :end], selected["tensor"][:, :end]) if observations else torch.equal(generated, selected["tensor"])
@@ -17086,6 +17137,7 @@ class AdaptiveBrain:
                 "substrate-capability-embedding" if normalized_tools else "none"
             ),
             "tool_observations_used": list(getattr(self.decoder, "last_generation_tool_observations", [])),
+            "sensory_observations_used": list(getattr(self.decoder, "last_generation_sensory_observations", [])),
             "tool_observation_channel": "typed-current-experience-to-native-vector; no token-prompt injection",
             "memory_injection": self.config.memory_injection,
             "working_memory_channel": (
@@ -18337,8 +18389,17 @@ class AdaptiveBrain:
             raise ValueError("live audio packet contains no finite samples")
         return self._bounded_audio_target(values.clamp(-1.0, 1.0))[0]
 
-    def observe_live_packet(
+    def observe_live_packet(self, **packet):
+        observation, _conditioning = self._integrate_live_packet(None, **packet)
+        return observation
+
+    def condition_live_packet(self, current, **packet):
+        """The real generation boundary receives this actual frame's latent."""
+        return self._integrate_live_packet(current, seed_episode=False, **packet)
+
+    def _integrate_live_packet(
         self,
+        current,
         *,
         modality: str,
         mime_type: str,
@@ -18349,13 +18410,17 @@ class AdaptiveBrain:
         retention: str = "neural",
         settings: Optional[Mapping[str, Any]] = None,
         permission_source: str = "device",
-    ) -> Dict[str, Any]:
+        episode_assembly_id: str = "",
+        cancelled=None,
+        seed_episode: bool = True,
+    ):
         """Admit one bounded live perception without retaining its raw bytes.
 
-        ``working`` updates only recurrent/working activity. ``neural`` also
-        forms a persistent assembly, applies STDP, and trains the same ternary
-        modality route. Dataset cursors are deliberately untouched: capture
-        backpressure is not reported as completed corpus learning.
+        Explicit ``working`` stays transient. Eligible capture reuses the real
+        current episode, or admits the first decoded observation of a capture
+        session through the ordinary sensory path. Later vectors use the same
+        existing afterimage, replay and settling rules, not a new assembly or
+        optimizer for every transport frame. No raw source enters a prompt.
         """
 
         if modality not in IMAGINATION_MODALITIES:
@@ -18364,6 +18429,8 @@ class AdaptiveBrain:
             raise ValueError("live retention must be working or neural")
         if not payload:
             raise ValueError("live observation packet is empty")
+        if cancelled is not None and cancelled():
+            raise InterruptedError("live capture retired before decoding")
         normalized_mime = mime_type.strip().lower().split(";", 1)[0]
         packet_settings = dict(settings or {})
         visual_diagnostics: Dict[str, Any] = {}
@@ -18393,7 +18460,11 @@ class AdaptiveBrain:
             permission_source.replace("\x00", " ").strip()[:64] or "device",
             modality,
         )
-        if retention == "neural":
+        if cancelled is not None and cancelled():
+            raise InterruptedError("live capture retired before admission")
+        if episode_assembly_id and episode_assembly_id not in self.memory.assembly_by_id:
+            raise ValueError("live sensory episode does not belong to the current brain")
+        if retention == "neural" and not episode_assembly_id and seed_episode:
             admitted = self._admit_sensory_embedding(
                 embedding,
                 kind="%s-perception" % modality,
@@ -18402,38 +18473,11 @@ class AdaptiveBrain:
                 importance=0.62,
                 experience_source="live-observation",
             )
-            selector_parameters = list(
-                self.modalities.imagination_selector.parameters()
-            )
-            selector_optimizer = adamw_for_remaining_parameters(
-                selector_parameters,
-                lr=max(1e-5, min(0.01, self.config.learning_rate)),
-                weight_decay=1e-5,
-            )
-            selector_optimizer.zero_grad(set_to_none=True)
-            target = torch.full(
-                (embedding.shape[0],),
-                IMAGINATION_MODALITIES.index(modality),
-                dtype=torch.long,
-                device=self.device,
-            )
-            route_loss = F.cross_entropy(
-                self.modalities.imagination_logits(embedding.detach()), target
-            )
-            route_loss.backward()
-            self._accumulate_slow_importance(selector_parameters)
-            torch.nn.utils.clip_grad_norm_(
-                selector_parameters, self.config.grad_clip
-            )
-            selector_optimizer.step()
-            self._commit_slow_anchors(
-                rate=0.04, parameters=selector_parameters
-            )
-            self.counters["training_steps"] += 1
             assembly_id: Optional[str] = str(admitted["assemblyId"])
             spike_rate = float(admitted["spikeRate"])
             novelty = float(admitted["novelty"])
-            route_loss_value = float(route_loss.detach().item())
+            routed = self.working_memory[-1].detach()
+            memory_settling = admitted["memorySettling"]
         else:
             substrate = self._sensory_substrate_vector(
                 embedding, modality, content_hash
@@ -18458,15 +18502,26 @@ class AdaptiveBrain:
                     controls["threshold_offset"].detach().mean().item()
                 ),
             )
-            self._append_working_memory(
-                routed,
-                source="live-%s" % modality,
-                salience=0.58,
-            )
-            assembly_id = None
             spike_rate = float(spike_metrics["spike_rate"])
-            novelty = 0.0
-            route_loss_value = 0.0
+            novelty = (float((1.0 - F.cosine_similarity(routed.reshape(1, -1), current.reshape(1, -1))).clamp(0, 1).item())
+                if current is not None else 0.0)
+            assembly_id = (episode_assembly_id or None) if retention == "neural" else None
+            importance = 0.62
+            salience = max(0.0, min(1.0, 0.45 * novelty + 0.35 * importance + 0.20 * spike_rate))
+            if assembly_id:
+                self._append_replay(routed, importance=importance,
+                    replay_priority=self._organic_replay_priority(assembly_id=assembly_id, salience=salience,
+                        novelty=novelty, prediction_error=novelty, spike_rate=spike_rate), assembly_id=assembly_id)
+            self._append_working_memory(routed, assembly_id=assembly_id or "", source="live-%s" % modality,
+                salience=salience if assembly_id else 0.58)
+            memory_settling = self._settle_memory_automatically(routed, assembly_id=assembly_id, source="live-observation",
+                salience=salience, novelty=novelty, prediction_error=novelty, importance=importance,
+                spike_rate=spike_rate) if assembly_id else None
+        with torch.no_grad():
+            merged = self.liquid_state if self.config.liquid_dynamics else routed
+            if current is not None:
+                merged = F.normalize(current + merged, dim=-1)
+            conditioning = self.idea_adapter(merged).detach()
         self.current_context = {
             **self.current_context,
             "sensorySlots": min(
@@ -18485,7 +18540,9 @@ class AdaptiveBrain:
             "assemblyId": assembly_id,
             "spikeRate": spike_rate,
             "novelty": novelty,
-            "routeLoss": route_loss_value,
+            "routeLoss": 0.0,
+            "memoryAdmission": "episode-replay-and-settling" if assembly_id else "working-only",
+            "memorySettling": memory_settling,
             "packetSha256": content_hash,
             "packetBytes": len(payload),
             "rawPacketStored": False,
@@ -18522,7 +18579,7 @@ class AdaptiveBrain:
                 if key not in {"brainId"}
             },
         )
-        return result
+        return result, conditioning
 
     def _attention_epoch(self) -> int:
         boundary = self.fresh_attention_boundary

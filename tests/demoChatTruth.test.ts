@@ -23,7 +23,8 @@ describe("browser design preview chat boundary", () => {
 
   it("keeps static preview fixtures but has no synthetic chat or plasticity mutation", () => {
     expect(app).toContain("const demo = !window.omni;");
-    expect(app).toContain('demo ? "Design preview" : "Local engine"');
+    expect(app).toContain("<span>Preview · no engine</span>");
+    expect(app).not.toContain('demo ? "Design preview" : "Local engine"');
     expect(app).not.toContain("makeDemoChat");
     expect(demo).not.toContain("makeDemoChat");
     expect(demo).not.toContain("plasticityEvents: brain.counters.plasticityEvents + 7");
