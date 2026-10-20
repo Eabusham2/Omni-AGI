@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { _electron as electron, expect, test, type Page } from "@playwright/test";
+import type { OmniApi } from "../../src/shared/types";
 
 const repository = resolve(process.cwd());
 const artifactDirectory = resolve(repository, "test-results", "ui-audit");
@@ -30,14 +31,10 @@ const supportedViewports = [
 
 const workspaceViews = [
   { label: "Conversation", marker: ".chat-layout:not([hidden])" },
-  { label: "Data & training", marker: ".data-page" },
-  { label: "Brain map", marker: ".map-page" },
-  { label: "Trace & journal", marker: ".trace-page" },
-  { label: "Imagination", marker: ".imagine-page" },
+  { label: "Training & Evolution", marker: ".training-evolution-page" },
+  { label: "Brain map", marker: ".whole-brain-map" },
   { label: "Tools & permissions", marker: ".tools-page" },
-  { label: "Device & runtime", marker: ".resource-settings-page" },
-  { label: "Forks & agents", marker: ".agents-page" },
-  { label: "Evolution", marker: ".evolution-page" }
+  { label: "Settings", marker: ".resource-settings-page" }
 ] as const;
 
 const workspaceArrangements = [
@@ -130,7 +127,22 @@ async function openAster(page: Page): Promise<void> {
   await expect(page.getByLabel("Message Aster")).toBeVisible();
 }
 
-async function installMeasuredResourceAuditFixture(
+async function chooseBuildFiles(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Add source", exact: true }).click();
+  await page.getByRole("button", { name: "Files & media", exact: true }).click();
+}
+
+/** Opens only the existing confirmation UI; never confirms deletion. */
+async function openAsterDeleteReview(page: Page): Promise<void> {
+  await page.getByLabel("Open brain library", { exact: true }).click();
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Select brain Aster", exact: true }).click();
+  await page.getByRole("toolbar", { name: "Manage selected brains" })
+    .getByRole("button", { name: "Delete", exact: true }).click();
+}
+
+/** Synthetic read-only UI data; never a hardware measurement or native receipt. */
+async function installSyntheticResourceAuditFixture(
   page: Page,
   constrained: boolean
 ): Promise<void> {
@@ -379,6 +391,47 @@ async function installMeasuredResourceAuditFixture(
       };
     };
 
+    const fixtureTime = "2026-10-19T00:00:00.000Z";
+    const unavailable = async (): Promise<never> => {
+      throw new Error("Synthetic resource UI only: no brain, Load, learning, capture, tool, or host action is available.");
+    };
+    const noEvents = () => () => undefined;
+    // Only actual queries/events consumed by the mounted App are represented.
+    // There is deliberately no generic method fallback or native success receipt.
+    const brain = {
+      health: async () => ({ ready: false, worker: "unavailable" as const, protocolVersion: 1,
+        detail: "Synthetic resource UI · neural engine disconnected" }),
+      lifecycle: async (brainId: string) => ({ brainId, phase: "unloaded" as const, autoLoad: false,
+        revision: 0, updatedAt: fixtureTime, learnedRuntimeResident: false, pausedJobIds: [], reconnect: [] }),
+      loadFit: async (brainId: string) => ({ brainId, checkedAt: fixtureTime, allowed: false,
+        minimumContextTokens: 0, blockers: ["Synthetic resource UI: neural loading is unavailable."] }),
+      onLifecycle: noEvents,
+      load: unavailable, unload: unavailable, setAutoLoad: unavailable,
+      resumePresentation: async () => null,
+      listSnapshots: async () => [],
+      snapshot: unavailable, restoreSnapshot: unavailable, update: unavailable, setActiveMode: unavailable,
+      get: unavailable,
+      onBuild: noEvents, onImported: noEvents, onImportFailed: noEvents
+    } satisfies Pick<OmniApi["brain"], "health" | "lifecycle" | "loadFit" | "onLifecycle" | "load" | "unload" |
+      "setAutoLoad" | "resumePresentation" | "listSnapshots" | "snapshot" | "restoreSnapshot" | "update" |
+      "setActiveMode" | "get" | "onBuild" | "onImported" | "onImportFailed">;
+    const chat = {
+      listPage: async (brainId: string) => ({ brainId, entries: [], totalEntries: 0, hasOlder: false,
+        headSequence: 0, headSha256: "0".repeat(64) }),
+      onAction: noEvents, onStream: noEvents,
+      send: unavailable, cancel: unavailable
+    } satisfies Pick<OmniApi["chat"], "listPage" | "onAction" | "onStream" | "send" | "cancel">;
+    const train = { list: async () => [], onEvent: noEvents, cancel: unavailable } satisfies
+      Pick<OmniApi["train"], "list" | "onEvent" | "cancel">;
+    const modality = {
+      capabilities: unavailable, onObservation: noEvents,
+      startObservation: unavailable, pushObservation: unavailable, stopObservation: unavailable,
+      cancelObservation: unavailable, requestObservationControl: unavailable, resolveObservationControl: unavailable
+    } satisfies Pick<OmniApi["modality"], "capabilities" | "onObservation" | "startObservation" | "pushObservation" |
+      "stopObservation" | "cancelObservation" | "requestObservationControl" | "resolveObservationControl">;
+    const nativeWindow = { setAppearance: unavailable, revealDataFolder: unavailable } satisfies
+      Pick<OmniApi["window"], "setAppearance" | "revealDataFolder">;
+    document.documentElement.dataset.resourceAuditScope = "synthetic-no-engine";
     Object.defineProperty(window, "omni", {
       configurable: true,
       value: {
@@ -393,12 +446,11 @@ async function installMeasuredResourceAuditFixture(
               ? { available: false }
               : { available: true, vendor: "Apple", device: "Integrated accelerator" },
             recommendedTier: constrainedDevice ? "personal" : "workstation",
-            recommendation: constrainedDevice
-              ? "Use measured paging for cold neural memory."
-              : "Keep the foundation, context, and neural memory resident."
+            recommendation: "Synthetic resource metadata for renderer layout only; hardware was not measured."
           }),
           resourcePlan
         },
+        brain, chat, train, modality, window: nativeWindow,
         mobile: {
           status: async () => ({
             schemaVersion: 1,
@@ -407,11 +459,8 @@ async function installMeasuredResourceAuditFixture(
             allowLan: false,
             baseUrls: [],
             devices: []
-          })
-        },
-        chat: {
-          onAction: () => () => undefined,
-          onStream: () => () => undefined
+          }),
+          startPairing: unavailable, stop: unavailable, revoke: unavailable
         },
         data: {
           listBuildResources: async () => [],
@@ -423,7 +472,8 @@ async function installMeasuredResourceAuditFixture(
             fileCount: kind === "folder" ? 12 : 1,
             bytes: 6 * gib
           }),
-          discardBuildResource: async () => undefined
+          discardBuildResource: async () => undefined,
+          onPreviewProgress: noEvents
         }
       }
     });
@@ -1033,17 +1083,13 @@ async function moveScrollAudit(
           ".builder-footer",
           ".message-stream > :last-child",
           ".composer-wrap",
-          ".data-page > :last-child",
-          ".map-page > :last-child",
-          ".trace-page > :last-child",
-          ".imagine-page > :last-child",
+          ".training-evolution-page > :last-child",
+          ".whole-brain-map > :last-child",
           ".tools-page > :last-child",
           ".resource-settings-page > :last-child",
-          ".agents-page > :last-child",
-          ".evolution-page > :last-child",
           ".instance-delete-dialog__actions",
           ".appearance-panel > :last-child",
-          ".live-perception-panel__body > :last-child"
+          ".chat-call-panel > :last-child"
         ];
         for (const selector of terminalSelectors) {
           for (const element of document.querySelectorAll<HTMLElement>(selector)) {
@@ -1141,70 +1187,12 @@ async function auditAppearancePanel(page: Page, matrix: string): Promise<void> {
   await expect(panel).toBeHidden();
 }
 
-/**
- * Device permission prompts cannot be accepted in the headless matrix, so the
- * audited fixture mirrors the expanded, negotiated panel without fabricating a
- * media session. Controller behavior is covered by focused unit tests.
- */
-async function mountLivePerceptionAuditFixture(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    document.querySelector("[data-ui-audit-live-perception]")?.remove();
-    const host = document.querySelector<HTMLElement>(".composer-wrap");
-    if (!host) throw new Error("Chat composer was not found.");
-    const panel = document.createElement("details");
-    panel.open = true;
-    panel.className = "live-perception-panel";
-    panel.dataset.uiAuditLivePerception = "true";
-    panel.innerHTML = `
-      <summary>
-        <span class="live-perception-panel__icon" aria-hidden="true"></span>
-        <span><strong>Live Perception</strong><small>Camera · 1920×1080 @ 24 FPS</small></span>
-        <em class="is-active"><i></i> Observing</em>
-      </summary>
-      <div class="live-perception-panel__body">
-        <div class="live-perception-toolbar">
-          <fieldset><legend>Source</legend>
-            <button aria-pressed="true">Camera</button><button>Microphone</button><button>Screen</button><button>Mixed</button>
-          </fieldset>
-          <fieldset><legend>Quality</legend>
-            <button aria-pressed="true">Auto</button><button>Motion</button><button>Balanced</button><button>Detail</button>
-          </fieldset>
-          <div class="live-perception-actions"><button>Stop</button><button class="is-danger">Cancel</button></div>
-        </div>
-        <div class="live-perception-facts">
-          <span><small>Applied capture</small><strong>1920×1080 @ 24 FPS</strong></span>
-          <span><small>Resource class</small><strong>High</strong></span>
-          <span><small>Accepted</small><strong>1,248</strong></span>
-          <span><small>Backpressure</small><strong>2</strong></span>
-        </div>
-        <p class="live-perception-control-status"><span>Brain configure · applied · 1920×1080 @ 24 FPS · 15s · r4</span></p>
-        <details class="live-perception-advanced" open>
-          <summary>Snapshot bursts, source bounds, and control audit</summary>
-          <div>
-            <section class="live-perception-snapshot">
-              <div><strong>Snapshot burst</strong><small>Temporary visual samples enter this same brain only after every frame is accepted.</small></div>
-              <fieldset><legend>Resolution</legend><button aria-pressed="true">Native</button><button>Current</button><button>Custom</button></fieldset>
-              <div class="live-perception-burst-values">
-                <label><span>Frames</span><input type="number" value="3" /></label>
-                <label><span>Interval (ms)</span><input type="number" value="250" /></label>
-              </div>
-              <div class="live-perception-snapshot-actions"><button class="is-primary">Capture burst</button><button>Cancel burst</button><span>Capturing · 2/3 accepted</span></div>
-            </section>
-            <dl class="live-perception-audit">
-              <div><dt>Source native</dt><dd>3840×2160 @ 60 FPS</dd></div>
-              <div><dt>Capture revision</dt><dd>r4</dd></div>
-              <div><dt>Transport window</dt><dd>4 in flight · 8,388,608 bytes/packet</dd></div>
-              <div><dt>Auto plan</dt><dd>Scaled from measured resources and the source-native signal.</dd></div>
-              <div><dt>Last control</dt><dd>Brain configure · applied</dd></div>
-              <div><dt>Brain actions</dt><dd>ponder, learn</dd></div>
-            </dl>
-            <p class="live-perception-privacy">Raw packets are not stored. Accepted perception does not commit dataset coverage.</p>
-          </div>
-        </details>
-      </div>`;
-    host.prepend(panel);
-  });
-  await expect(page.locator("[data-ui-audit-live-perception]")).toBeVisible();
+/** Visits real Call controls without starting a session or granting device access. */
+async function openCallForAudit(page: Page): Promise<void> {
+  const call = page.getByRole("button", { name: "Call", exact: true });
+  await call.click();
+  await expect(call).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("region", { name: "Call controls", exact: true })).toBeVisible();
 }
 
 test("nested terminal coverage samples the ancestor-clipped visible area", async () => {
@@ -1312,7 +1300,7 @@ test("all themes keep Library, every Build step, and chat usable at every suppor
             const captureScrollReferences =
               matrix === "mobile/light/classic" ||
               matrix === "design-target/dark/liquid-glass";
-            const captureLivePerceptionScroll =
+            const captureCallScroll =
               captureScrollReferences || matrix === "floor/light/liquid-glass";
             await auditScrollableJourney(
               page,
@@ -1386,16 +1374,16 @@ test("all themes keep Library, every Build step, and chat usable at every suppor
               captureScrollReferences ? `${matrix}-conversation` : undefined
             );
 
-            await mountLivePerceptionAuditFixture(page);
+            await openCallForAudit(page);
             await auditScrollableJourney(
               page,
-              `${matrix}/live-perception-expanded`,
-              captureLivePerceptionScroll ? `${matrix}-live-perception-expanded` : undefined
+              `${matrix}/call-controls-expanded`,
+              captureCallScroll ? `${matrix}-call-controls-expanded` : undefined
             );
 
             if (matrix === "design-target/dark/liquid-glass") {
               await page.screenshot({
-                path: resolve(artifactDirectory, "desktop-dark-liquid-glass-live-perception.png")
+                path: resolve(artifactDirectory, "desktop-dark-liquid-glass-call-controls.png")
               });
             }
           });
@@ -1407,7 +1395,7 @@ test("all themes keep Library, every Build step, and chat usable at every suppor
   }
 });
 
-test("measured context and placement stay legible across every theme", async () => {
+test("synthetic resource metadata and placement stay legible across every theme", async () => {
   test.setTimeout(480_000);
   mkdirSync(artifactDirectory, { recursive: true });
   const application = await launchAuditApplication();
@@ -1429,15 +1417,16 @@ test("measured context and placement stay legible across every theme", async () 
           if (!matrixRequested(baseMatrix)) continue;
           await test.step(baseMatrix, async () => {
             await setAppearance(page, mode, pack);
-            await installMeasuredResourceAuditFixture(page, viewport.constrained);
+            await installSyntheticResourceAuditFixture(page, viewport.constrained);
+            await expect(page.locator("html")).toHaveAttribute("data-resource-audit-scope", "synthetic-no-engine");
             await page.getByRole("button", { name: "Build a new brain" }).click();
             await page.getByRole("button", { name: "Continue" }).click();
             await expect(page.getByText("Step 2 of 4", { exact: true })).toBeVisible();
-            await page.getByRole("button", { name: "Files & datasets", exact: true }).click();
+            await chooseBuildFiles(page);
             await expect(page.getByText("Audit corpus.parquet", { exact: true })).toBeVisible();
             await page.getByRole("button", { name: "Remove Audit corpus.parquet from this build" }).click();
-            await expect(page.getByText("No user resources selected.", { exact: false })).toBeVisible();
-            await page.getByRole("button", { name: "Files & datasets", exact: true }).click();
+            await expect(page.getByText("No data selected.", { exact: false })).toBeVisible();
+            await chooseBuildFiles(page);
             await page.getByRole("button", { name: "Continue" }).click();
             await expect(page.getByText("Step 3 of 4", { exact: true })).toBeVisible();
             await expect(page.locator(".memory-storage-inputs")).toContainText("6.0 GB local data");
@@ -1456,7 +1445,7 @@ test("measured context and placement stay legible across every theme", async () 
             await expect(placement).toBeVisible();
             await expect(placement).toContainText("Core + runtime");
             await expect(placement).toContainText("Active context");
-            await expect(placement).toContainText("never paged to storage");
+            await expect(placement).toContainText("hot activity in RAM, cold attention can use the designated pool");
             await expect(placement).toContainText("Neural memory");
             await expect(placement).toContainText(
               viewport.constrained
@@ -1478,7 +1467,7 @@ test("measured context and placement stay legible across every theme", async () 
             await expect(capacitySlider).toHaveAttribute("max", String(maximumTokens));
             await expect(capacitySlider).toHaveValue(String(autoTokens));
             await expect(page.locator(".working-memory-planner__manual > small")).toContainText(
-              `Floor ${floorTokens.toLocaleString()} · Auto ${autoTokens.toLocaleString()} · resident/model maximum ${maximumTokens.toLocaleString()}`
+              `Baseline ${floorTokens.toLocaleString()} · Auto ${autoTokens.toLocaleString()} · RAM + storage maximum ${maximumTokens.toLocaleString()}`
             );
 
             const bands = await capacitySlider.evaluate((element) => {
@@ -1554,8 +1543,8 @@ test("measured context and placement stay legible across every theme", async () 
             });
             await auditScrollableJourney(
               page,
-              `${baseMatrix}/measured-context`,
-              `${baseMatrix}-measured-context`
+              `${baseMatrix}/synthetic-resource-context`,
+              `${baseMatrix}-synthetic-resource-context`
             );
 
             await page.getByLabel("Open brain library").click();
@@ -1567,12 +1556,17 @@ test("measured context and placement stay legible across every theme", async () 
               Reflect.deleteProperty(window, "omni");
             });
             await openAster(page);
-            await installMeasuredResourceAuditFixture(page, viewport.constrained);
+            await installSyntheticResourceAuditFixture(page, viewport.constrained);
             const workspace = page.getByLabel("Workspace");
-            await workspace.getByRole("button", { name: "Device & runtime", exact: true }).click();
+            await workspace.getByRole("button", { name: "Settings", exact: true }).click();
+            const loadReview = page.getByRole("dialog", { name: "Load Aster", exact: true });
+            await expect(loadReview).toBeVisible();
+            await expect(loadReview).toContainText("Synthetic resource UI: neural loading is unavailable.");
+            await loadReview.getByRole("button", { name: "Close load review", exact: true }).click();
             await expect.poll(() => pageErrors).toEqual([]);
             const settings = page.locator(".resource-settings-page");
             await expect(settings).toBeVisible();
+            await settings.locator(".resource-settings-device > summary").click();
             await expect(settings).toContainText("Physical RAM");
             await expect(settings).toContainText("Free or reclaimable now");
             await expect(settings).toContainText("Saved Omni RAM capacity");
@@ -1587,8 +1581,8 @@ test("measured context and placement stay legible across every theme", async () 
             const manualContextMode = settings.getByRole("button", { name: /^Manual/ });
             await manualContextMode.click();
             await expect(manualContextMode).toHaveAttribute("aria-pressed", "true");
-            const contextInput = settings.getByLabel("Active context tokens", { exact: true });
-            const contextSlider = settings.getByLabel("Resident active-context tokens", { exact: true });
+            const contextInput = settings.getByLabel("Working-memory tokens", { exact: true });
+            const contextSlider = settings.getByLabel("Working-memory token limit", { exact: true });
             await expect(contextInput).toBeVisible();
             await expect(contextSlider).toHaveAttribute("max", String(maximumTokens));
             await contextInput.fill(String(autoTokens));
@@ -1674,11 +1668,7 @@ test("every in-brain workspace, dialog, rail label, and layout arrangement stays
             });
           }
 
-          const deleteButton = page.getByRole("button", {
-            name: "Delete instance Aster",
-            exact: true
-          });
-          await deleteButton.click();
+          await openAsterDeleteReview(page);
           const deleteDialog = page.getByRole("dialog", { name: "Delete instance Aster?" });
           await expect(deleteDialog).toBeVisible();
           await auditScrollableJourney(page, `${matrix}/delete-dialog-1`);
@@ -1690,9 +1680,8 @@ test("every in-brain workspace, dialog, rail label, and layout arrangement stays
           await deleteDialog.getByRole("button", { name: "Cancel" }).click();
           await expect(deleteDialog).toBeHidden();
 
-          await workspace
-            .getByRole("button", { name: "Conversation", exact: true })
-            .click();
+          await page.getByRole("button", { name: "Done", exact: true }).click();
+          await openAster(page);
 
           if (viewport.width > 720) {
             const railButtons = workspace.getByRole("button");
@@ -1794,7 +1783,7 @@ test("visual review references cover every pack and mode from mobile through des
           path: resolve(artifactDirectory, `${pack.id}-${mode}-desktop-conversation.png`)
         });
         await page.getByRole("button", { name: "Brain map", exact: true }).click();
-        await expect(page.locator(".map-page")).toBeVisible();
+        await expect(page.locator(".whole-brain-map")).toBeVisible();
         await page.screenshot({
           animations: "disabled",
           path: resolve(artifactDirectory, `${pack.id}-${mode}-desktop-brain-map.png`)
@@ -1804,7 +1793,7 @@ test("visual review references cover every pack and mode from mobile through des
         await setAppearance(page, mode, pack);
         await openAster(page);
         await page.getByRole("button", { name: "Brain map", exact: true }).click();
-        await expect(page.locator(".map-page")).toBeVisible();
+        await expect(page.locator(".whole-brain-map")).toBeVisible();
         await page.screenshot({
           animations: "disabled",
           path: resolve(artifactDirectory, `${pack.id}-${mode}-mobile-brain-map.png`)
@@ -1834,12 +1823,12 @@ test("focused and highlighted edge controls keep their geometry in every theme",
           await openAster(page);
           const mapNavigation = page.getByRole("button", { name: "Brain map", exact: true });
           await mapNavigation.click();
-          await expect(page.locator(".map-page")).toBeVisible();
+          await expect(page.locator(".whole-brain-map")).toBeVisible();
           await expect(mapNavigation).toHaveClass(/is-active/);
 
           const controls = [
             page.getByRole("button", { name: "Appearance settings" }),
-            page.getByRole("button", { name: "Delete instance Aster" }),
+            page.getByRole("button", { name: "Open brain library", exact: true }),
             mapNavigation,
             page.getByRole("button", { name: "Conversation", exact: true }).first()
           ];

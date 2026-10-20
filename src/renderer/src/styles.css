@@ -2980,7 +2980,6 @@ textarea:focus-visible,
   height: calc(100% - var(--titlebar-total-h));
   overflow: auto;
   background:
-    linear-gradient(90deg, transparent 0 49.94%, rgba(255, 255, 255, 0.012) 49.94% 50.06%, transparent 50.06%),
     radial-gradient(circle at 75% 14%, rgba(118, 86, 213, 0.13), transparent 24%);
 }
 
@@ -12545,7 +12544,6 @@ textarea:focus-visible,
 
 :root[data-color-scheme="light"] .library-page {
   background:
-    linear-gradient(90deg, transparent 0 49.94%, rgba(20, 17, 28, 0.035) 49.94% 50.06%, transparent 50.06%),
     radial-gradient(circle at 75% 14%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 27%),
     var(--canvas);
 }

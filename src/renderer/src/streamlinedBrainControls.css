@@ -110,6 +110,12 @@
   cursor: not-allowed;
 }
 
+.resource-settings-page .button--primary:disabled,
+.simple-builder .button--primary:disabled {
+  color: var(--on-accent);
+  -webkit-text-fill-color: var(--on-accent);
+}
+
 .resource-settings-page .resource-settings-mode-picker button:hover:not(:disabled),
 .resource-settings-page .resource-settings-mode-picker button:focus-visible {
   color: var(--text);

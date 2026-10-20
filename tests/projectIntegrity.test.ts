@@ -190,7 +190,9 @@ describe("project integrity", () => {
     expect(renderer).not.toContain("curiosityDrive");
     expect(renderer).not.toContain("crawlConcurrency");
     expect(renderer).toContain('imagination: "auto"');
-    expect(renderer).toContain("Remove only changes this build list");
+    expect(renderer).toContain('title="Remove from this build; original files are not deleted"');
+    expect(renderer).toContain("onClick={() => removeInitialResource(resource)}");
+    expect(renderer).toContain("(candidate) => candidate.id !== resource.id");
     expect(renderer).toContain("window.omni?.data.discardBuildResource");
     expect(renderer).toContain("window.omni.brain.duplicate");
     expect(renderer.includes("Your brains")).toBe(true);

@@ -8,6 +8,27 @@ const styles = readFileSync(stylesPath, "utf8");
 const app = readFileSync(appPath, "utf8");
 
 describe("UI visual integrity", () => {
+  it("keeps disabled primary labels readable on their accent fill without enabling them", () => {
+    const controls = readFileSync(resolve(process.cwd(), "src/renderer/src/streamlinedBrainControls.css"), "utf8");
+    const disabled = controls.match(/\.resource-settings-page \.button--primary:disabled,\s*\.simple-builder \.button--primary:disabled\s*\{([^}]+)\}/)?.[1];
+    expect(disabled).toContain("color: var(--on-accent)");
+    expect(disabled).toContain("-webkit-text-fill-color: var(--on-accent)");
+    expect(disabled).not.toMatch(/pointer-events|cursor\s*:\s*(?:auto|pointer)|background\s*:/);
+    expect(controls).toContain("cursor: not-allowed");
+    expect(app).toContain('disabled={Boolean(busy) || !window.omni || foregroundTurnActive}');
+  });
+
+  it("does not draw the unwanted full-height center seam through the Home background", () => {
+    const home = styles.match(/\.library-page\s*\{([^}]+)\}/)?.[1];
+    const lightHome = styles.match(/:root\[data-color-scheme="light"\] \.library-page\s*\{([^}]+)\}/)?.[1];
+    for (const background of [home, lightHome]) {
+      expect(background).toContain("radial-gradient");
+      expect(background).not.toContain("linear-gradient");
+      expect(background).not.toMatch(/49\.94%|50\.06%/);
+    }
+    expect(lightHome).toContain("var(--canvas)");
+  });
+
   it("keeps explicit pixel typography at or above the readability floor", () => {
     const offenders: string[] = [];
     for (const match of styles.matchAll(/font-size:\s*([0-9.]+)px/g)) {
