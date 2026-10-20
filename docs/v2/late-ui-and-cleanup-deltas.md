@@ -77,3 +77,43 @@ inspected the Graphite/Classic light and dark images; six further representative
 images have separate independent review. That finite review is distinct from
 the32 measured views and the still-running full384 matrix. Do not rerun the
 other unchanged41 states per cell for this color-only consumer change.
+
+## Aqua Classic control-paint audit correction
+
+The immutable d948 cohort stopped on four Aqua/Classic/light chat records,
+cells312–315. It had180 fully completed cells; all failed attempts and STOP
+remain intact. The checker read the active button's teal parent color as
+text, although its SVG inherits that color while the visible label span is
+dark. Compact layouts hide the label entirely. Independent screenshot and
+source review confirmed a measurement-target error, not a reason to recolor
+the existing interface.
+
+Only original enabled, visible parent estimates below4.5:1 now request extra
+observational evidence. Original paint remains recorded. Every measured text
+run still needs4.5:1 and meaningful SVG/pseudo fill needs3:1; unknown paint
+keeps the original failure. Zero-area empty pseudo backgrounds are separately
+recorded as excluded decorative shadows, without claiming shadow contrast.
+Positive-area pseudo fills require a bounded opaque covering backdrop. The
+old passing and originally unmeasured parent paths are unchanged.
+
+Eight initial pure regressions and one new zero-area regression passed, with
+targeted types checked. The first actual compact probe remained failed on an
+unmeasured pseudo decoration; its evidence is retained. A single312-base
+diagnostic established the zero-area fill and the opaque rail covering an
+outer gradient. Neither attempt was relabelled passing.
+
+The corrected isolated no-engine check then passed the four affected chat
+states, all12base/hover/focus observations, with no renderer/external errors
+and clean child exit0. Actual label estimates were10.403–10.490:1; SVG and
+bounded positive-area indicator estimates were4.111–4.145:1. All eight saved
+base/focus screenshots were directly inspected. Evidence is PRIMARY
+`.runtime/aqua-control-paint-delta-0bpZQU/result.json`; earlier failed and
+diagnostic records are distinct sibling directories. The record explicitly
+distinguishes retained old parent estimates from fresh descendant paint.
+
+This resolves only four control-paint findings, not full384 acceptance or
+WCAG conformance. The remaining200unvisited cells must continue separately;
+the180complete cells and164clean records inside the failed four-cell batch
+must not be rerun or rewritten. New static manifests explicitly bind the
+additional audit-helper bytes. Runtime App/CSS, real engine behavior, package
+and neural-quality claims are unchanged by this tests-only correction.

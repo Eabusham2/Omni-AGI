@@ -15,6 +15,7 @@ const auditScope = JSON.parse(readFileSync(new URL("./whole-app-audit-scope.json
 };
 import { assertAuditResources, AuditResourcePauseError, type AuditResourceSnapshot } from "./whole-app-audit-resources.mjs";
 import { appearanceAuditFailureMessage, createAppearanceAuditObservation, type AppearanceAuditObservations, type AppearanceAuditSnapshot } from "./appearance-audit-observation.mjs";
+import { adjudicateLowParentPaint, measureVisibleControlInk, type ControlContentsPaint, type ControlPaintAdjudication } from "./control-paint-evidence";
 
 /**
  * Missing U1 composition coverage, not a replacement for the closed 11 UI tests.
@@ -72,10 +73,11 @@ type ControlSample = {
   width: number; height: number; clippedX: number; initialClippedX?: number; visible: boolean;
   color: string; background: string; opacity: string;
   contrast: number | null; contrastScope: "estimated-solid-composite" | "unmeasured-image-or-filter";
+  contentsPaint?: ControlContentsPaint; contentsAdjudication?: ControlPaintAdjudication;
   basePaint?: ControlPaint; hoverPaint?: ControlPaint; focusPaint?: ControlPaint;
   focused: boolean; hovered: boolean; invocation: "not-invoked-no-host-authority";
 };
-type ControlPaint = Pick<ControlSample, "color" | "background" | "opacity" | "contrast" | "contrastScope">;
+type ControlPaint = Pick<ControlSample, "color" | "background" | "opacity" | "contrast" | "contrastScope" | "contentsPaint" | "contentsAdjudication">;
 type Visit = {
   key: string; cellIndex: number; route: string; state: string; status: "visited" | "failed";
   startedAt: string; elapsedMs: number; controls: ControlSample[];
@@ -152,7 +154,7 @@ async function configureCell(page: Page, cell: Cell): Promise<void> {
 
 /** Real computed styles, not inserted look-alike controls. No CSS is changed. */
 async function sampleControls(root: Locator, onlyId?: string): Promise<ControlSample[]> {
-  return root.evaluate((element, selectedId) => {
+  const samples: ControlSample[] = await root.evaluate((element, selectedId) => {
     const query = 'button, input:not([type="hidden"]), select, textarea, summary, a[href], [role="button"], [role="switch"], [role="tab"], [role="checkbox"]';
     const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
     const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -209,16 +211,31 @@ async function sampleControls(root: Locator, onlyId?: string): Promise<ControlSa
         focused: document.activeElement === node, hovered: node.matches(":hover"), invocation: "not-invoked-no-host-authority" as const };
     });
   }, onlyId);
+  // Successful old measurements take precisely the old semantic path. Only
+  // a low parent-color estimate needs actual descendant text/icon evidence.
+  for (const sample of samples) if (sample.visible && !sample.disabled && !sample.inert && sample.contrast !== null && sample.contrast < 4.5) {
+    try {
+      sample.contentsPaint = await root.locator(`[data-whole-app-audit-control="${sample.id}"]`).evaluate(measureVisibleControlInk);
+    } catch (error) {
+      sample.contentsPaint = { format: "visible-control-ink-v1", complete: false, textRuns: [], graphics: [],
+        unmeasured: [`Actual visible paint measurement failed: ${error instanceof Error ? error.message : String(error)}`] };
+    }
+  }
+  return samples;
 }
 
 async function inspectPresentControls(root: Locator, page: Page, record: Visit, seen: Set<string>): Promise<void> {
   await requireInspectedAppearance(page, record, "control scan");
   const paintOf = (value: ControlSample): ControlPaint => ({ color: value.color, background: value.background,
-    opacity: value.opacity, contrast: value.contrast, contrastScope: value.contrastScope });
+    opacity: value.opacity, contrast: value.contrast, contrastScope: value.contrastScope,
+    ...(value.contentsPaint ? { contentsPaint: value.contentsPaint } : {}) });
   const checkPaint = (sample: ControlSample, phase: string, paint: ControlPaint) => {
-    if (!sample.disabled && !sample.inert && paint.contrast !== null && paint.contrast < 4.5)
+    if (!sample.disabled && !sample.inert && paint.contrast !== null && paint.contrast < 4.5) {
+      paint.contentsAdjudication = adjudicateLowParentPaint(paint.contrast, paint.contentsPaint);
+      if (paint.contentsAdjudication.qualified) return;
       record.issues.push({ kind: `contrast-${phase}`, control: sample.name || sample.id,
-        detail: `${phase}: ${paint.contrast.toFixed(3)}:1 below 4.5:1; ${paint.color} on ${paint.background}. Solid-composite estimate only.` });
+        detail: `${phase}: original parent ${paint.contrast.toFixed(3)}:1 below 4.5:1; ${paint.color} on ${paint.background}. Solid-composite estimate only. ${paint.contentsAdjudication.failures.join(" ")}` });
+    }
   };
   const samples = await sampleControls(root);
   for (const sample of samples) {
@@ -424,7 +441,7 @@ async function verifyStaticFixture(url: URL, expected: { sourceCommit: string; s
   expect(manifest.buildInputs).toEqual(["tests/e2e/whole-app-state-composition-fixture.html", "tests/e2e/whole-app-state-composition-fixture.tsx",
     "tests/e2e/whole-app-audit-contract.ts", "tests/e2e/whole-app-audit-scope.json", "tests/e2e/whole-app-audit-resources.mjs", "tests/e2e/whole-app-audit-resources.d.mts",
     "tests/e2e/appearance-audit-observation.mjs", "tests/e2e/appearance-audit-observation.d.mts",
-    "tests/e2e/whole-app-audit-matrix.spec.ts", "tests/e2e/responsive-main.cjs", "package.json", "package-lock.json", "work/u1-static-fixture.mjs"]
+    "tests/e2e/whole-app-audit-matrix.spec.ts", "tests/e2e/control-paint-evidence.ts", "tests/e2e/responsive-main.cjs", "package.json", "package-lock.json", "work/u1-static-fixture.mjs"]
     .map(path => { const bytes = readFileSync(resolve(repository, path)); return { path, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") }; }));
   expect(manifest.auditSpecSha256).toBe(createHash("sha256").update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex"));
   expect(manifest.productRendererBytesSha256).toBe(rendererFingerprint()); expect(manifest.noHmr).toBe(true);
@@ -754,7 +771,8 @@ test("U1 whole-App active chronology, off-page completion and overlay compositio
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-scope.json")))
     .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-resources.mjs")))
     .update(readFileSync(resolve(repository, "tests/e2e/appearance-audit-observation.mjs")))
-    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts"))).digest("hex");
+    .update(readFileSync(resolve(repository, "tests/e2e/whole-app-audit-matrix.spec.ts")))
+    .update(readFileSync(resolve(repository, "tests/e2e/control-paint-evidence.ts"))).digest("hex");
   const staticArtifact = await verifyStaticFixture(url, { sourceCommit, sourceFingerprint, fixtureSha256 });
   const loopbackPreload = loopbackPreloadInventory();
   const directory = process.env.OMNI_WHOLE_APP_AUDIT_OUTPUT_DIR
