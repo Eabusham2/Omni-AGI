@@ -243,3 +243,12 @@ tensor bytes remain in the originating installation's content-addressed store.
 ## License
 
 Original Omni AGI Studio code is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). Personal and noncommercial use, modification, and redistribution are allowed under those terms. Commercial use requires a [separate license](COMMERCIAL_LICENSE.md). Third-party components retain their own licenses.
+
+## Search keywords (ignore)
+
+`experimental-ai`, `ai-research`, `continual-learning`, `local-ai`, `neural-networks`, `ternary-neural-networks`,
+`spiking-neural-networks`, `stdp`, `liquid-neural-networks`, `fast-weights`, `associative-memory`, `recurrent-networks`,
+`neural-plasticity`, `pytorch`, `python`, `electron`, `typescript`, `react`,
+`desktop-app`, `windows`, `macos`, `linux`, `multimodal-learning`, `model-training`,
+`checkpoints`, `model-forking`, `content-addressed-storage`, `model-context-protocol`, `mcp`, `tool-permissions`,
+`plugin-sdk`, `sandboxed-artifacts`, `android-companion`, `ios-companion`, `streaming-archives`, `language-model`
